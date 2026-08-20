@@ -37,6 +37,7 @@ from sky.serve import serve_utils
 from sky.serve import service_spec
 from sky.serve import spot_placer
 from sky.serve import zero_cost_actuation
+from sky.server.requests import reserved_fill_admission
 from sky.utils import locks
 
 _SCALE_UP = autoscalers.AutoscalerDecisionOperator.SCALE_UP
@@ -3673,6 +3674,55 @@ class TestFillLaunchPath(unittest.TestCase):
                 provider_phase_admission=admission,
                 zero_cost_actuation_lease=(actuation_lease))
 
+    @staticmethod
+    def _enable_durable_intent(manager):
+        """Install the only protocol-v2 manager admission authority."""
+        _promote_generic_binding(manager)
+        manager._reserved_fill_actuation_mode = (
+            zero_cost_actuation.ActuationMode.DURABLE_INTENT)
+        return mock.sentinel.intent_lease
+
+    @staticmethod
+    def _committed_admission(spec):
+        spec.replica_info.zero_cost_admission_sequence = 1
+        return reserved_fill_admission.AdmissionResult(
+            reserved_fill_admission.AdmissionDisposition.COMMITTED,
+            reserved_fill_admission.AdmissionReceipt(
+                replica_id=7,
+                replica_record_id=spec.replica_info.replica_record_id,
+                association_id='association-id',
+                request_id='request-id',
+                launch_generation=1))
+
+    @staticmethod
+    def _actuation_harness():
+        manager = _make_manager(None)
+        manager.lock = threading.RLock()
+        manager._workspace = 'default'
+        manager._zero_cost_actuation_executor_id = uuid.UUID(
+            '00000000-0000-4000-8000-000000000789')
+        manager._zero_cost_actuation_repository = mock.Mock()
+        manager._scale_reconciliation_event = mock.Mock()
+        intent = types.SimpleNamespace(
+            allowed_locations=(types.SimpleNamespace(region='phx-context'),),
+            physical_cluster_uid='physical-uid')
+        lease = types.SimpleNamespace(intent=intent)
+        manager._zero_cost_actuation_repository.lease_next.return_value = lease
+        manager._zero_cost_actuation_authority_current = mock.Mock(
+            return_value=True)
+        preflight = replica_managers._ReservedFillPhysicalPreflight(
+            kubernetes_context='phx-context',
+            physical_cluster_uid='physical-uid')
+        batch = replica_managers._ReservedFillPhysicalPreflightBatch(
+            preflights={('phx-context', 'physical-uid'): preflight},
+            threads=(),
+            deadline_monotonic=time.monotonic() + 30)
+        manager._start_reserved_fill_physical_preflights = mock.Mock(
+            return_value=batch)
+        manager._reserved_fill_override = mock.Mock(
+            return_value={'typed-v2': True})
+        return manager, lease, batch
+
     def test_v2_batch_requires_typed_plan_before_lock_or_provider(self):
         manager = _make_manager(None)
         manager.lock = mock.MagicMock()
@@ -3743,6 +3793,7 @@ class TestFillLaunchPath(unittest.TestCase):
         placer = mock.Mock()
         placer.active_locations.return_value = [location]
         manager = _make_manager(placer)
+        lease = self._enable_durable_intent(manager)
         override = self._v2_override(location)
         override.pop(_EPOCH_KEY)
         with mock.patch.object(replica_managers,
@@ -3751,10 +3802,11 @@ class TestFillLaunchPath(unittest.TestCase):
              mock.patch.object(replica_managers,
                                '_get_resources_ports',
                                return_value='8080'), \
-             mock.patch.object(reserved_capacity_broker,
-                               'persist_fill_replica') as persist:
-            self.assertFalse(self._launch_v2(manager, override))
-        persist.assert_not_called()
+             mock.patch.object(reserved_fill_admission,
+                               'admit') as admit:
+            self.assertFalse(
+                self._launch_v2(manager, override, actuation_lease=lease))
+        admit.assert_not_called()
 
     def test_v2_batch_item_requests_zero_wait_phase_at_persist_seam(self):
         manager = _make_manager(None)
@@ -3771,6 +3823,74 @@ class TestFillLaunchPath(unittest.TestCase):
             override,
             try_provider_phase_admission=True)
 
+    def test_v2_replica_id_publication_baseexception_escapes_exactly(self):
+
+        class PublicationInterrupt(BaseException):
+            pass
+
+        interrupt = PublicationInterrupt('replica id publication interrupted')
+
+        class InterruptingReplicaId(int):
+
+            def __add__(self, _increment):
+                raise interrupt
+
+        manager = _make_manager(None)
+        lease = self._enable_durable_intent(manager)
+        manager._next_replica_id = InterruptingReplicaId(7)
+        manager._launch_replica = mock.Mock(
+            return_value=(replica_managers._ReplicaLaunchResult(
+                replica_id=7,
+                planned_capacity=1,
+                funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)))
+        override = {
+            _FILL_KEY: True,
+            _PROTOCOL_KEY: reserved_capacity_broker.PROTOCOL_V2,
+        }
+
+        with self.assertRaises(PublicationInterrupt) as raised:
+            manager._scale_up_one_locked(override,
+                                         set(),
+                                         zero_cost_actuation_lease=lease)
+
+        self.assertIs(raised.exception, interrupt)
+        self.assertEqual(manager._next_replica_id, 7)
+        manager._launch_replica.assert_called_once_with(
+            manager._next_replica_id,
+            override,
+            try_provider_phase_admission=True,
+            zero_cost_actuation_lease=lease)
+
+    def test_v2_replica_id_publication_exception_is_ambiguous(self):
+        failure = RuntimeError('replica id publication failed')
+
+        class FailingReplicaId(int):
+
+            def __add__(self, _increment):
+                raise failure
+
+        manager = _make_manager(None)
+        lease = self._enable_durable_intent(manager)
+        manager._next_replica_id = FailingReplicaId(7)
+        manager._launch_replica = mock.Mock(
+            return_value=(replica_managers._ReplicaLaunchResult(
+                replica_id=7,
+                planned_capacity=1,
+                funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)))
+        override = {
+            _FILL_KEY: True,
+            _PROTOCOL_KEY: reserved_capacity_broker.PROTOCOL_V2,
+        }
+
+        with self.assertRaises(
+                reserved_fill_admission.AdmissionAmbiguousError) as raised:
+            manager._scale_up_one_locked(override,
+                                         set(),
+                                         zero_cost_actuation_lease=lease)
+
+        self.assertIs(raised.exception.__cause__, failure)
+        self.assertEqual(manager._next_replica_id, 7)
+
     def test_v2_batch_busy_phase_leaks_no_row_or_launch_thread(self):
         location = make_location('phx-context',
                                  accelerators={'H200': 1},
@@ -3780,6 +3900,7 @@ class TestFillLaunchPath(unittest.TestCase):
         placer.active_locations.return_value = [location]
         placer.select_next_zero_cost_location.return_value = location
         manager = _make_manager(placer)
+        lease = self._enable_durable_intent(manager)
 
         class _BusyPhase:
 
@@ -3799,25 +3920,23 @@ class TestFillLaunchPath(unittest.TestCase):
              mock.patch.object(replica_managers,
                                '_get_resources_ports',
                                return_value='8080'), \
-             mock.patch.object(reserved_capacity_broker,
-                               'current_epoch',
-                               return_value=3), \
              mock.patch.object(provider_phase,
                                'try_provider_phase',
                                side_effect=_busy_phase), \
              mock.patch.object(kubernetes_adaptor,
                                'physical_cluster_uid_fence') as physical, \
-             mock.patch.object(reserved_capacity_broker,
-                               'persist_fill_replica') as persist, \
+             mock.patch.object(reserved_fill_admission,
+                               'admit') as admit, \
              mock.patch.object(replica_managers,
                                '_ReplicaLaunchThread') as launch_thread:
             with self.assertRaises(exceptions.ProviderPhaseBusyError):
                 manager._launch_replica(7,
                                         self._v2_override(location),
-                                        try_provider_phase_admission=True)
+                                        try_provider_phase_admission=True,
+                                        zero_cost_actuation_lease=lease)
 
         physical.assert_not_called()
-        persist.assert_not_called()
+        admit.assert_not_called()
         launch_thread.assert_not_called()
         self.assertNotIn(7, manager._launch_thread_pool)
         placer.release_retry.assert_called_once_with(location)
@@ -3831,6 +3950,7 @@ class TestFillLaunchPath(unittest.TestCase):
         placer.active_locations.return_value = [location]
         placer.select_next_zero_cost_location.return_value = location
         manager = _make_manager(placer)
+        lease = self._enable_durable_intent(manager)
         physical_busy = exceptions.KubernetesPhysicalClusterFenceBusyError(
             'initializer busy', 'phx-context', 0)
 
@@ -3840,26 +3960,24 @@ class TestFillLaunchPath(unittest.TestCase):
              mock.patch.object(replica_managers,
                                '_get_resources_ports',
                                return_value='8080'), \
-             mock.patch.object(reserved_capacity_broker,
-                               'current_epoch',
-                               return_value=3), \
              mock.patch.object(
                  kubernetes_adaptor,
                  'physical_cluster_uid_fence',
                  side_effect=physical_busy) as physical, \
-             mock.patch.object(reserved_capacity_broker,
-                               'persist_fill_replica') as persist, \
+             mock.patch.object(reserved_fill_admission,
+                               'admit') as admit, \
              mock.patch.object(replica_managers,
                                '_ReplicaLaunchThread') as launch_thread:
             with self.assertRaises(exceptions.ProviderPhaseBusyError):
                 manager._launch_replica(7,
                                         self._v2_override(location),
-                                        try_provider_phase_admission=True)
+                                        try_provider_phase_admission=True,
+                                        zero_cost_actuation_lease=lease)
 
         physical.assert_called_once_with('phx-context',
                                          'physical-uid',
                                          wait_for_initializer=False)
-        persist.assert_not_called()
+        admit.assert_not_called()
         launch_thread.assert_not_called()
         self.assertNotIn(7, manager._launch_thread_pool)
         placer.release_retry.assert_called_once_with(location)
@@ -3877,18 +3995,17 @@ class TestFillLaunchPath(unittest.TestCase):
         placer.active_locations.return_value = [location]
         placer.select_next_zero_cost_location.return_value = location
         manager = _make_manager(placer)
+        lease = self._enable_durable_intent(manager)
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
-             mock.patch.object(reserved_capacity_broker,
-                               'current_epoch',
-                               return_value=3), \
-             mock.patch.object(reserved_capacity_broker,
-                               'persist_fill_replica') as persist:
+             mock.patch.object(reserved_fill_admission,
+                               'admit') as admit:
             self.assertFalse(
-                self._launch_v2(manager, self._v2_override(location,
-                                                           gpu='H200')))
-        persist.assert_not_called()
+                self._launch_v2(manager,
+                                self._v2_override(location, gpu='H200'),
+                                actuation_lease=lease))
+        admit.assert_not_called()
         placer.release_retry.assert_called_once_with(location)
 
     def test_v2_uid_retarget_releases_consumed_retry(self):
@@ -3900,25 +4017,25 @@ class TestFillLaunchPath(unittest.TestCase):
         placer.active_locations.return_value = [location]
         placer.select_next_zero_cost_location.return_value = location
         manager = _make_manager(placer)
+        lease = self._enable_durable_intent(manager)
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
              mock.patch.object(replica_managers,
                                '_get_resources_ports',
                                return_value='8080'), \
-             mock.patch.object(reserved_capacity_broker,
-                               'current_epoch',
-                               return_value=3), \
              mock.patch.object(
                  kubernetes_adaptor,
                  'physical_cluster_uid_fence',
                  side_effect=exceptions.
                  KubernetesPhysicalClusterIdentityError('retargeted')), \
-             mock.patch.object(reserved_capacity_broker,
-                               'persist_fill_replica') as persist:
+             mock.patch.object(reserved_fill_admission,
+                               'admit') as admit:
             self.assertFalse(
-                self._launch_v2(manager, self._v2_override(location)))
-        persist.assert_not_called()
+                self._launch_v2(manager,
+                                self._v2_override(location),
+                                actuation_lease=lease))
+        admit.assert_not_called()
         placer.release_retry.assert_called_once_with(location)
 
     def test_v2_exact_shape_rejects_placer_returning_other_card(self):
@@ -3941,19 +4058,18 @@ class TestFillLaunchPath(unittest.TestCase):
             l4.to_pickleable(),
             h200.to_pickleable(),
         ]
+        lease = self._enable_durable_intent(manager)
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
-             mock.patch.object(reserved_capacity_broker,
-                               'current_epoch',
-                               return_value=3), \
-             mock.patch.object(reserved_capacity_broker,
-                               'persist_fill_replica') as persist:
-            self.assertFalse(self._launch_v2(manager, override))
-        persist.assert_not_called()
+             mock.patch.object(reserved_fill_admission,
+                               'admit') as admit:
+            self.assertFalse(
+                self._launch_v2(manager, override, actuation_lease=lease))
+        admit.assert_not_called()
         placer.release_retry.assert_called_once_with(l4)
 
-    def test_v2_persist_fence_releases_consumed_retry(self):
+    def test_v2_atomic_admission_rejection_releases_consumed_retry(self):
         location = make_location('phx-context',
                                  accelerators={'H200': 1},
                                  cloud_name='Kubernetes',
@@ -3962,27 +4078,49 @@ class TestFillLaunchPath(unittest.TestCase):
         placer.active_locations.return_value = [location]
         placer.select_next_zero_cost_location.return_value = location
         manager = _make_manager(placer)
+        lease = self._enable_durable_intent(manager)
+        bound_task = types.SimpleNamespace(
+            resources=[types.SimpleNamespace(cloud=clouds.Kubernetes())])
+        rejected = reserved_fill_admission.AdmissionResult(
+            reserved_fill_admission.AdmissionDisposition.REJECTED,
+            detail='stale atomic authority')
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
              mock.patch.object(replica_managers,
                                '_get_resources_ports',
                                return_value='8080'), \
-             mock.patch.object(reserved_capacity_broker,
-                               'current_epoch',
-                               return_value=3), \
              mock.patch.object(
                  kubernetes_adaptor,
                  'physical_cluster_uid_fence',
                  return_value=contextlib.nullcontext()), \
-             mock.patch.object(reserved_capacity_broker,
-                               'persist_fill_replica',
-                               return_value=False):
+             mock.patch.object(replica_managers,
+                               '_build_replica_launch_task',
+                               return_value=bound_task), \
+             mock.patch.object(manager,
+                               '_bound_ordinary_launch_fence_context',
+                               return_value={'bound': True}), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'stable_bound_ordinary_launch_submission_id',
+                 return_value='00000000-0000-4000-8000-000000000456'), \
+             mock.patch.object(
+                 replica_managers.sdk,
+                 'prepare_launch_request_for_server_controller',
+                 return_value=mock.sentinel.prepared), \
+             mock.patch.object(reserved_fill_admission,
+                               'admit',
+                               return_value=rejected) as admit:
             self.assertFalse(
-                self._launch_v2(manager, self._v2_override(location)))
+                self._launch_v2(manager,
+                                self._v2_override(location,
+                                                  exact_shape={'H200': 1},
+                                                  attributed=True),
+                                actuation_lease=lease))
+        admit.assert_called_once()
         placer.release_retry.assert_called_once_with(location)
 
-    def test_v2_thread_construction_failure_persists_nothing(self):
+    def test_v2_request_freeze_failure_precedes_atomic_admission(self):
         location = make_location('phx-context',
                                  accelerators={'H200': 1},
                                  cloud_name='Kubernetes',
@@ -3991,32 +4129,43 @@ class TestFillLaunchPath(unittest.TestCase):
         placer.active_locations.return_value = [location]
         placer.select_next_zero_cost_location.return_value = location
         manager = _make_manager(placer)
+        lease = self._enable_durable_intent(manager)
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
              mock.patch.object(replica_managers,
                                '_get_resources_ports',
                                return_value='8080'), \
-             mock.patch.object(reserved_capacity_broker,
-                               'current_epoch',
-                               return_value=3), \
              mock.patch.object(
                  kubernetes_adaptor,
                  'physical_cluster_uid_fence',
                  return_value=contextlib.nullcontext()), \
-             mock.patch.object(reserved_capacity_broker,
-                               'persist_fill_replica') as persist, \
              mock.patch.object(replica_managers,
-                               '_ReplicaLaunchThread',
-                               side_effect=RuntimeError('cannot freeze')):
+                               '_build_replica_launch_task',
+                               side_effect=RuntimeError('cannot freeze')), \
+             mock.patch.object(reserved_fill_admission,
+                               'admit') as admit:
             with self.assertRaisesRegex(RuntimeError, 'cannot freeze'):
-                self._launch_v2(manager, self._v2_override(location))
+                self._launch_v2(manager,
+                                self._v2_override(location,
+                                                  exact_shape={'H200': 1},
+                                                  attributed=True),
+                                actuation_lease=lease)
 
-        persist.assert_not_called()
+        admit.assert_not_called()
         placer.release_retry.assert_called_once_with(location)
         self.assertNotIn(7, manager._launch_thread_pool)
 
-    def test_v2_launch_persists_every_authority_field(self):
+    def test_v2_request_freeze_baseexception_wins_over_release_failure(self):
+
+        class FreezeInterrupt(BaseException):
+            pass
+
+        class ReleaseInterrupt(BaseException):
+            pass
+
+        freeze_interrupt = FreezeInterrupt('request freeze interrupted')
+        release_interrupt = ReleaseInterrupt('location release interrupted')
         location = make_location('phx-context',
                                  accelerators={'H200': 1},
                                  cloud_name='Kubernetes',
@@ -4025,32 +4174,99 @@ class TestFillLaunchPath(unittest.TestCase):
         placer.active_locations.return_value = [location]
         placer.select_next_zero_cost_location.return_value = location
         manager = _make_manager(placer)
-        override = self._v2_override(location,
-                                     exact_shape={'H200': 1},
-                                     attributed=True)
+        lease = self._enable_durable_intent(manager)
+
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
              mock.patch.object(replica_managers,
                                '_get_resources_ports',
                                return_value='8080'), \
-             mock.patch.object(reserved_capacity_broker,
-                               'current_epoch',
-                               return_value=3), \
              mock.patch.object(
                  kubernetes_adaptor,
                  'physical_cluster_uid_fence',
                  return_value=contextlib.nullcontext()), \
+             mock.patch.object(replica_managers,
+                               '_build_replica_launch_task',
+                               side_effect=freeze_interrupt), \
+             mock.patch.object(
+                 manager,
+                 '_release_unstarted_location_retry',
+                 side_effect=release_interrupt), \
+             mock.patch.object(reserved_fill_admission,
+                               'admit') as admit:
+            with self.assertRaises(FreezeInterrupt) as raised:
+                self._launch_v2(manager,
+                                self._v2_override(location,
+                                                  exact_shape={'H200': 1},
+                                                  attributed=True),
+                                actuation_lease=lease)
+
+        self.assertIs(raised.exception, freeze_interrupt)
+        self.assertIsNot(raised.exception, release_interrupt)
+        admit.assert_not_called()
+        self.assertNotIn(7, manager._launch_thread_pool)
+
+    def test_v2_atomic_spec_carries_every_authority_field(self):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        lease = self._enable_durable_intent(manager)
+        override = self._v2_override(location,
+                                     exact_shape={'H200': 1},
+                                     attributed=True)
+        bound_task = types.SimpleNamespace(
+            resources=[types.SimpleNamespace(cloud=clouds.Kubernetes())])
+        admitted_specs = []
+
+        def _reject(spec):
+            admitted_specs.append(spec)
+            return reserved_fill_admission.AdmissionResult(
+                reserved_fill_admission.AdmissionDisposition.REJECTED,
+                detail='test inspected atomic spec')
+
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(
+                 kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 return_value=contextlib.nullcontext()), \
+             mock.patch.object(replica_managers,
+                               '_build_replica_launch_task',
+                               return_value=bound_task), \
+             mock.patch.object(manager,
+                               '_bound_ordinary_launch_fence_context',
+                               return_value={'bound': True}), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'stable_bound_ordinary_launch_submission_id',
+                 return_value='00000000-0000-4000-8000-000000000456'), \
+             mock.patch.object(
+                 replica_managers.sdk,
+                 'prepare_launch_request_for_server_controller',
+                 return_value=mock.sentinel.prepared), \
              mock.patch.object(
                  ordinary_launch_binding,
                  'classify_uncommitted_protocol_v2_reserved_fill_profile',
                  wraps=(ordinary_launch_binding.
                         classify_uncommitted_protocol_v2_reserved_fill_profile)) as classify, \
-             mock.patch.object(reserved_capacity_broker,
-                               'persist_fill_replica',
-                               return_value=True) as persist:
-            self.assertTrue(self._launch_v2(manager, override))
-        info = persist.call_args.args[2]
+             mock.patch.object(reserved_fill_admission,
+                               'admit',
+                               side_effect=_reject) as admit:
+            self.assertFalse(
+                self._launch_v2(manager, override, actuation_lease=lease))
+        admit.assert_called_once()
+        admission_spec = admitted_specs[0]
+        info = admission_spec.replica_info
         classify.assert_called_once_with(info, protocol_version=2)
         self.assertEqual(info.reserved_fill_pool_key, override[_POOL_KEY])
         self.assertEqual(info.reserved_fill_service_generation, 7)
@@ -4072,15 +4288,9 @@ class TestFillLaunchPath(unittest.TestCase):
         self.assertEqual(info.reserved_fill_intent_idempotency_key, 'b' * 64)
         self.assertIsNone(info.zero_cost_admission_sequence)
         self.assertEqual(info.resources_override['accelerators'], {'H200': 1})
-        self.assertEqual(persist.call_args.kwargs['expected_epoch'], 3)
-        self.assertEqual(
-            persist.call_args.kwargs['expected_service_generation'], 7)
-        self.assertEqual(
-            persist.call_args.
-            kwargs['expected_ordinary_zero_cost_admission_sequence'], 17)
+        self.assertIs(admission_spec.actuation_lease, lease)
 
-    def _assert_v2_promoted_profile_before_persist(self, actuation_mode,
-                                                   actuation_lease):
+    def _assert_v2_atomic_profile(self, actuation_mode, actuation_lease):
         location = make_location('phx-context',
                                  accelerators={'H200': 1},
                                  cloud_name='Kubernetes',
@@ -4094,26 +4304,39 @@ class TestFillLaunchPath(unittest.TestCase):
         override = self._v2_override(location,
                                      exact_shape={'H200': 1},
                                      attributed=True)
-        worker = mock.sentinel.launch_worker
+        worker = mock.Mock()
+        events = []
+        admitted_specs = []
 
-        def _persist(_service_name, _replica_id, info, **_kwargs):
-            self.assertIsNone(info.zero_cost_admission_sequence)
-            info.zero_cost_admission_sequence = 1
-            return True
+        def _admit(spec):
+            self.assertEqual(events, [])
+            admitted_specs.append(spec)
+            spec.replica_info.zero_cost_admission_sequence = 1
+            events.append('commit')
+            return reserved_fill_admission.AdmissionResult(
+                reserved_fill_admission.AdmissionDisposition.COMMITTED,
+                reserved_fill_admission.AdmissionReceipt(
+                    replica_id=7,
+                    replica_record_id=spec.replica_info.replica_record_id,
+                    association_id='association-id',
+                    request_id='request-id',
+                    launch_generation=1))
+
+        def _worker(*_args, **_kwargs):
+            events.append('adopter')
+            return worker
 
         bound_task = types.SimpleNamespace(
             resources=[types.SimpleNamespace(cloud=clouds.Kubernetes())])
         callbacks = (mock.Mock(), mock.Mock(), mock.Mock())
+        reduction = types.SimpleNamespace(context=types.SimpleNamespace(
+            request_id='request-id'))
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
              mock.patch.object(replica_managers,
                                '_get_resources_ports',
                                return_value='8080'), \
-             mock.patch.object(reserved_capacity_broker,
-                               'current_epoch',
-                               return_value=(3 if actuation_lease is None else
-                                             5)) as current_epoch, \
              mock.patch.object(
                  kubernetes_adaptor,
                  'physical_cluster_uid_fence',
@@ -4130,41 +4353,51 @@ class TestFillLaunchPath(unittest.TestCase):
              mock.patch.object(
                  replica_managers.request_postgres,
                  'stable_bound_ordinary_launch_submission_id',
-                 return_value=uuid.UUID(
-                     '00000000-0000-4000-8000-000000000456')), \
+                 return_value='00000000-0000-4000-8000-000000000456'), \
+             mock.patch.object(
+                 replica_managers.sdk,
+                 'prepare_launch_request_for_server_controller',
+                 return_value=mock.sentinel.prepared), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 return_value=reduction), \
+             mock.patch.object(reserved_fill_admission,
+                               'admit',
+                               side_effect=_admit) as admit, \
              mock.patch.object(replica_managers,
                                '_ReplicaLaunchThread',
-                               return_value=worker) as worker_ctor, \
-             mock.patch.object(reserved_capacity_broker,
-                               'persist_fill_replica',
-                               side_effect=_persist) as persist, \
+                               side_effect=_worker) as worker_ctor, \
              mock.patch.object(replica_managers.paid_capacity,
                                'build_launch_budget') as paid_budget:
             result = self._launch_v2(manager,
                                      override,
                                      actuation_lease=actuation_lease)
 
-        self.assertTrue(result)
         if actuation_lease is None:
-            current_epoch.assert_called_once_with(override[_POOL_KEY])
-        else:
-            current_epoch.assert_not_called()
-        persist.assert_called_once()
+            self.assertFalse(result)
+            admit.assert_not_called()
+            worker_ctor.assert_not_called()
+            self.assertEqual(events, [])
+            self.assertNotIn(7, manager._launch_thread_pool)
+            self.assertNotIn(7, manager._replica_to_request_id)
+            paid_budget.assert_not_called()
+            return
+        self.assertTrue(result)
+        admit.assert_called_once()
+        self.assertEqual(events, ['commit', 'adopter'])
+        info = admitted_specs[0].replica_info
         worker_ctor.assert_called_once()
         self.assertTrue(worker_ctor.call_args.kwargs['bound_ordinary_launch'])
-        self.assertEqual(
-            worker_ctor.call_args.kwargs['kwargs']
-            ['non_pool_launch_profile_kind'], ordinary_launch_binding.
-            NonPoolLaunchProfileKind.RESERVED_FILL.value)
+        worker.start.assert_called_once_with()
         self.assertIs(manager._launch_thread_pool[7], worker)
-        info = persist.call_args.args[2]
         self.assertEqual(
             ordinary_launch_binding.classify_non_pool_launch_profile(info),
             ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
         self.assertIsNone(info.zero_cost_materialization_sequence)
         paid_budget.assert_not_called()
 
-    def test_v2_promoted_profile_is_frozen_before_persist_in_both_modes(self):
+    def test_v2_direct_rejects_and_durable_profile_is_atomically_admitted(self):
         cases = (
             (zero_cost_actuation.ActuationMode.DIRECT_REPLICA, None),
             (zero_cost_actuation.ActuationMode.DURABLE_INTENT,
@@ -4172,8 +4405,647 @@ class TestFillLaunchPath(unittest.TestCase):
         )
         for actuation_mode, actuation_lease in cases:
             with self.subTest(actuation_mode=actuation_mode):
-                self._assert_v2_promoted_profile_before_persist(
-                    actuation_mode, actuation_lease)
+                self._assert_v2_atomic_profile(actuation_mode, actuation_lease)
+
+    def test_v2_committed_inspection_baseexception_escapes_exactly(self):
+
+        class InspectInterrupt(BaseException):
+            pass
+
+        interrupt = InspectInterrupt('inspect interrupted after commit')
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        lease = self._enable_durable_intent(manager)
+        completion_event = mock.Mock()
+        manager._launch_completion_event = completion_event
+        bound_task = types.SimpleNamespace(
+            resources=[types.SimpleNamespace(cloud=clouds.Kubernetes())])
+
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(
+                 kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 return_value=contextlib.nullcontext()), \
+             mock.patch.object(replica_managers,
+                               '_build_replica_launch_task',
+                               return_value=bound_task), \
+             mock.patch.object(manager,
+                               '_bound_ordinary_launch_fence_context',
+                               return_value={'bound': True}), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'stable_bound_ordinary_launch_submission_id',
+                 return_value='00000000-0000-4000-8000-000000000456'), \
+             mock.patch.object(
+                 replica_managers.sdk,
+                 'prepare_launch_request_for_server_controller',
+                 return_value=mock.sentinel.prepared), \
+             mock.patch.object(reserved_fill_admission,
+                               'admit',
+                               side_effect=self._committed_admission), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 side_effect=interrupt), \
+             mock.patch.object(manager,
+                               '_install_bound_launch_adopter') as install, \
+             mock.patch.object(
+                 manager,
+                 '_release_unstarted_location_retry') as release_retry, \
+             mock.patch.object(manager, '_remove_replica') as cleanup:
+            with self.assertRaises(InspectInterrupt) as raised:
+                self._launch_v2(manager,
+                                self._v2_override(location,
+                                                  exact_shape={'H200': 1},
+                                                  attributed=True),
+                                actuation_lease=lease)
+
+        self.assertIs(raised.exception, interrupt)
+        completion_event.set.assert_called_once_with()
+        install.assert_not_called()
+        release_retry.assert_not_called()
+        cleanup.assert_not_called()
+        placer.release_retry.assert_not_called()
+        placer.set_preemptive.assert_not_called()
+
+    def test_v2_committed_adopter_registration_baseexception_escapes_exactly(
+            self):
+
+        class RegistrationInterrupt(BaseException):
+            pass
+
+        interrupt = RegistrationInterrupt(
+            'adopter registration interrupted after commit')
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        lease = self._enable_durable_intent(manager)
+        completion_event = mock.Mock()
+        manager._launch_completion_event = completion_event
+        bound_task = types.SimpleNamespace(
+            resources=[types.SimpleNamespace(cloud=clouds.Kubernetes())])
+        reduction = types.SimpleNamespace(context=types.SimpleNamespace(
+            request_id='request-id'))
+        worker = mock.Mock()
+
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(
+                 kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 return_value=contextlib.nullcontext()), \
+             mock.patch.object(replica_managers,
+                               '_build_replica_launch_task',
+                               return_value=bound_task), \
+             mock.patch.object(manager,
+                               '_bound_ordinary_launch_fence_context',
+                               return_value={'bound': True}), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'stable_bound_ordinary_launch_submission_id',
+                 return_value='00000000-0000-4000-8000-000000000456'), \
+             mock.patch.object(
+                 replica_managers.sdk,
+                 'prepare_launch_request_for_server_controller',
+                 return_value=mock.sentinel.prepared), \
+             mock.patch.object(reserved_fill_admission,
+                               'admit',
+                               side_effect=self._committed_admission), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 return_value=reduction), \
+             mock.patch.object(manager,
+                               '_build_bound_launch_adopter',
+                               return_value=worker), \
+             mock.patch.object(manager,
+                               '_register_bound_launch_adopter',
+                               side_effect=interrupt) as register, \
+             mock.patch.object(
+                 manager,
+                 '_release_unstarted_location_retry') as release_retry, \
+             mock.patch.object(manager, '_remove_replica') as cleanup:
+            with self.assertRaises(RegistrationInterrupt) as raised:
+                self._launch_v2(manager,
+                                self._v2_override(location,
+                                                  exact_shape={'H200': 1},
+                                                  attributed=True),
+                                actuation_lease=lease)
+
+        self.assertIs(raised.exception, interrupt)
+        completion_event.set.assert_called_once_with()
+        register.assert_called_once()
+        worker.start.assert_not_called()
+        release_retry.assert_not_called()
+        cleanup.assert_not_called()
+        placer.release_retry.assert_not_called()
+        placer.set_preemptive.assert_not_called()
+        self.assertNotIn(7, manager._launch_thread_pool)
+        self.assertNotIn(7, manager._replica_to_request_id)
+
+    def test_v2_committed_adopter_start_baseexception_keeps_registration(self):
+
+        class StartInterrupt(BaseException):
+            pass
+
+        class CleanupInterrupt(BaseException):
+            pass
+
+        start_interrupt = StartInterrupt('adopter start interrupted')
+        cleanup_interrupt = CleanupInterrupt(
+            'post-commit registration cleanup interrupted')
+
+        class NoCleanupMap(dict):
+
+            def __init__(self):
+                super().__init__()
+                self.pop_calls = 0
+
+            def pop(self, *_args, **_kwargs):
+                self.pop_calls += 1
+                raise cleanup_interrupt
+
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        lease = self._enable_durable_intent(manager)
+        completion_event = mock.Mock()
+        manager._launch_completion_event = completion_event
+        launch_threads = NoCleanupMap()
+        request_ids = NoCleanupMap()
+        manager._launch_thread_pool = launch_threads
+        manager._replica_to_request_id = request_ids
+        existing = []
+        bound_task = types.SimpleNamespace(
+            resources=[types.SimpleNamespace(cloud=clouds.Kubernetes())])
+        reduction = types.SimpleNamespace(context=types.SimpleNamespace(
+            request_id='request-id'))
+        worker = mock.Mock()
+        worker.ident = None
+        worker.start.side_effect = start_interrupt
+        admitted_infos = []
+
+        def _commit(spec):
+            admitted_infos.append(spec.replica_info)
+            return self._committed_admission(spec)
+
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(
+                 kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 return_value=contextlib.nullcontext()), \
+             mock.patch.object(replica_managers,
+                               '_build_replica_launch_task',
+                               return_value=bound_task), \
+             mock.patch.object(manager,
+                               '_bound_ordinary_launch_fence_context',
+                               return_value={'bound': True}), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'stable_bound_ordinary_launch_submission_id',
+                 return_value='00000000-0000-4000-8000-000000000456'), \
+             mock.patch.object(
+                 replica_managers.sdk,
+                 'prepare_launch_request_for_server_controller',
+                 return_value=mock.sentinel.prepared), \
+             mock.patch.object(reserved_fill_admission,
+                               'admit',
+                               side_effect=_commit), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 return_value=reduction), \
+             mock.patch.object(manager,
+                               '_build_bound_launch_adopter',
+                               return_value=worker), \
+             mock.patch.object(
+                 manager,
+                 '_release_unstarted_location_retry') as release_retry, \
+             mock.patch.object(manager, '_remove_replica') as cleanup:
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.V2_FENCED
+            ) as admission, self.assertRaises(StartInterrupt) as raised:
+                manager._launch_replica(7,
+                                        self._v2_override(
+                                            location,
+                                            exact_shape={'H200': 1},
+                                            attributed=True),
+                                        existing_replica_infos=existing,
+                                        provider_phase_admission=admission,
+                                        zero_cost_actuation_lease=lease)
+
+        self.assertIs(raised.exception, start_interrupt)
+        self.assertIsNot(raised.exception, cleanup_interrupt)
+        completion_event.set.assert_called_once_with()
+        worker.start.assert_called_once_with()
+        self.assertEqual(launch_threads.pop_calls, 0)
+        self.assertEqual(request_ids.pop_calls, 0)
+        self.assertIs(launch_threads[7], worker)
+        self.assertEqual(request_ids[7], 'request-id')
+        self.assertEqual(existing, admitted_infos)
+        release_retry.assert_not_called()
+        cleanup.assert_not_called()
+        placer.release_retry.assert_not_called()
+        placer.set_preemptive.assert_not_called()
+
+    def test_v2_actuation_primary_baseexception_wins_preflight_release(self):
+
+        class ActuationInterrupt(BaseException):
+            pass
+
+        class ReleaseInterrupt(BaseException):
+            pass
+
+        actuation_interrupt = ActuationInterrupt('actuation interrupted')
+        release_interrupt = ReleaseInterrupt('preflight release interrupted')
+        manager, lease, _ = self._actuation_harness()
+        manager._scale_up_one_locked = mock.Mock(
+            side_effect=actuation_interrupt)
+        manager._release_reserved_fill_physical_preflights = mock.Mock(
+            side_effect=release_interrupt)
+
+        with mock.patch.object(
+                provider_phase,
+                'try_provider_phase',
+                return_value=contextlib.nullcontext(mock.sentinel.admission)), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[]):
+            with self.assertRaises(ActuationInterrupt) as raised:
+                manager._actuate_zero_cost_pool('pool')
+
+        self.assertIs(raised.exception, actuation_interrupt)
+        self.assertIsNot(raised.exception, release_interrupt)
+        self.assertEqual(
+            manager._release_reserved_fill_physical_preflights.call_count, 2)
+        manager._zero_cost_actuation_repository.release_retryable.assert_not_called(
+        )
+        manager._zero_cost_actuation_repository.terminate.assert_not_called()
+        self.assertIs(
+            manager._zero_cost_actuation_repository.lease_next.return_value,
+            lease)
+
+    def test_v2_actuation_primary_signal_baseexception_wins_cleanup_signal(
+            self):
+
+        class PrimarySignalInterrupt(BaseException):
+            pass
+
+        class CleanupSignalInterrupt(BaseException):
+            pass
+
+        primary = PrimarySignalInterrupt('initial reconciliation signal')
+        cleanup = CleanupSignalInterrupt('cleanup reconciliation signal')
+        manager, _, _ = self._actuation_harness()
+        manager._scale_up_one_locked = mock.Mock(
+            return_value=(replica_managers._ReplicaLaunchResult(
+                replica_id=7,
+                planned_capacity=1,
+                funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)))
+        manager._release_reserved_fill_physical_preflights = mock.Mock()
+        manager._scale_reconciliation_event.set.side_effect = [primary, cleanup]
+
+        with mock.patch.object(
+                provider_phase,
+                'try_provider_phase',
+                return_value=contextlib.nullcontext(mock.sentinel.admission)), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[]):
+            with self.assertRaises(PrimarySignalInterrupt) as raised:
+                manager._actuate_zero_cost_pool('pool')
+
+        self.assertIs(raised.exception, primary)
+        self.assertIsNot(raised.exception, cleanup)
+        self.assertEqual(manager._scale_reconciliation_event.set.call_count, 2)
+        manager._zero_cost_actuation_repository.release_retryable.assert_not_called(
+        )
+        manager._zero_cost_actuation_repository.terminate.assert_not_called()
+
+    def test_v2_actuation_cleanup_signal_interrupt_wins_ordinary_ambiguity(
+            self):
+
+        class SignalInterrupt(BaseException):
+            pass
+
+        ambiguity = reserved_fill_admission.AdmissionAmbiguousError(
+            'commit acknowledgement is ambiguous')
+        signal_interrupt = SignalInterrupt('reconciliation signal interrupted')
+        manager, _, _ = self._actuation_harness()
+        manager._scale_up_one_locked = mock.Mock(side_effect=ambiguity)
+        manager._release_reserved_fill_physical_preflights = mock.Mock()
+        manager._scale_reconciliation_event.set.side_effect = signal_interrupt
+
+        with mock.patch.object(
+                provider_phase,
+                'try_provider_phase',
+                return_value=contextlib.nullcontext(mock.sentinel.admission)), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[]):
+            with self.assertRaises(SignalInterrupt) as raised:
+                manager._actuate_zero_cost_pool('pool')
+
+        self.assertIs(raised.exception, signal_interrupt)
+        self.assertIsNot(raised.exception, ambiguity)
+        manager._scale_reconciliation_event.set.assert_called_once_with()
+        manager._zero_cost_actuation_repository.release_retryable.assert_not_called(
+        )
+        manager._zero_cost_actuation_repository.terminate.assert_not_called()
+
+    def test_v2_actuation_outer_cleanup_interrupt_wins_committed_exception(
+            self):
+
+        class FinalCleanupInterrupt(BaseException):
+            pass
+
+        ambiguity = reserved_fill_admission.AdmissionAmbiguousError(
+            'materialization may be committed')
+        first_cleanup = RuntimeError('first preflight release failed')
+        final_cleanup = FinalCleanupInterrupt(
+            'outer preflight cleanup interrupted')
+        manager, _, _ = self._actuation_harness()
+        manager._scale_up_one_locked = mock.Mock(side_effect=ambiguity)
+        manager._release_reserved_fill_physical_preflights = mock.Mock(
+            side_effect=[first_cleanup, final_cleanup])
+
+        with mock.patch.object(
+                provider_phase,
+                'try_provider_phase',
+                return_value=contextlib.nullcontext(mock.sentinel.admission)), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[]):
+            with self.assertRaises(FinalCleanupInterrupt) as raised:
+                manager._actuate_zero_cost_pool('pool')
+
+        self.assertIs(raised.exception, final_cleanup)
+        self.assertIsNot(raised.exception, ambiguity)
+        self.assertEqual(
+            manager._release_reserved_fill_physical_preflights.call_count, 2)
+        manager._scale_reconciliation_event.set.assert_called_once_with()
+        manager._zero_cost_actuation_repository.release_retryable.assert_not_called(
+        )
+        manager._zero_cost_actuation_repository.terminate.assert_not_called()
+
+    def test_durable_postcommit_registration_faults_remain_adoptable(self):
+
+        class FailingMap(dict):
+            """Map that fails its first process-local publication."""
+
+            def __init__(self):
+                super().__init__()
+                self.fail_once = True
+
+            def __setitem__(self, key, value):
+                if self.fail_once:
+                    self.fail_once = False
+                    raise RuntimeError('local map publication failed')
+                super().__setitem__(key, value)
+
+        class FailingList(list):
+            """List that fails after its first process-local publication."""
+
+            def __init__(self):
+                super().__init__()
+                self.fail_once = True
+
+            def append(self, value):
+                super().append(value)
+                if self.fail_once:
+                    self.fail_once = False
+                    raise RuntimeError('local list publication failed')
+
+        for failure in ('factory', 'replica_list', 'request_map', 'thread_map'):
+            for shallow_disposition in ('ADOPT_ACTIVE', 'WAIT_QUIESCENCE'):
+                with self.subTest(failure=failure,
+                                  shallow_disposition=shallow_disposition):
+                    self._assert_durable_postcommit_registration_fault(
+                        failure, shallow_disposition, FailingMap, FailingList)
+
+    def _assert_durable_postcommit_registration_fault(self, failure,
+                                                      shallow_disposition,
+                                                      failing_map_cls,
+                                                      failing_list_cls):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        _promote_generic_binding(manager)
+        manager._reserved_fill_actuation_mode = (
+            zero_cost_actuation.ActuationMode.DURABLE_INTENT)
+        if failure == 'request_map':
+            manager._replica_to_request_id = failing_map_cls()
+        if failure == 'thread_map':
+            manager._launch_thread_pool = failing_map_cls()
+        existing = (failing_list_cls() if failure == 'replica_list' else [])
+        events = []
+        admitted_info = []
+        real_worker = replica_managers._ReplicaLaunchThread
+        worker_constructions = 0
+
+        def _admit(spec):
+            events.append('commit')
+            admitted_info.append(spec.replica_info)
+            spec.replica_info.zero_cost_admission_sequence = 1
+            return reserved_fill_admission.AdmissionResult(
+                reserved_fill_admission.AdmissionDisposition.COMMITTED,
+                reserved_fill_admission.AdmissionReceipt(
+                    replica_id=7,
+                    replica_record_id=(spec.replica_info.replica_record_id),
+                    association_id='association-id',
+                    request_id='request-id',
+                    launch_generation=1))
+
+        def _worker(*args, **kwargs):
+            nonlocal worker_constructions
+            worker_constructions += 1
+            self.assertEqual(events, ['commit'])
+            if failure == 'factory' and worker_constructions == 1:
+                raise RuntimeError('adopter construction failed')
+            return real_worker(*args, **kwargs)
+
+        bound_task = types.SimpleNamespace(
+            resources=[types.SimpleNamespace(cloud=clouds.Kubernetes())])
+        profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+            authorization_reference='test:reserved-fill',
+            authorization_generation=1,
+            authorization_payload={'kind': 'RESERVED_FILL'})
+        binding_context = ordinary_launch_binding.BoundNonPoolLaunchContext(
+            association_id=uuid.UUID('11111111-1111-4111-8111-111111111111'),
+            request_id='request-id',
+            service_name=manager._service_name,
+            replica_id=7,
+            replica_record_id=uuid.UUID('22222222-2222-4222-8222-222222222222'),
+            launch_generation=1,
+            input_digest='a' * 64,
+            profile=profile,
+            capability_cohort_epoch=(
+                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+            capability_profile_set_digest=(
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            ),
+            receipt_protocol_version=(
+                ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
+        reduction = types.SimpleNamespace(context=binding_context,
+                                          disposition=shallow_disposition)
+        terminal = types.SimpleNamespace(disposition='PROJECTED',
+                                         projected=True,
+                                         request=types.SimpleNamespace(
+                                             status='SUCCEEDED', error=None),
+                                         cancel_reason=None)
+        reduce_bound = mock.Mock(return_value=terminal)
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(
+                 kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 return_value=contextlib.nullcontext()), \
+             mock.patch.object(replica_managers,
+                               '_build_replica_launch_task',
+                               return_value=bound_task), \
+             mock.patch.object(
+                 manager,
+                 '_bound_ordinary_launch_fence_context',
+                 return_value={'bound': True}), \
+             mock.patch.object(
+                 manager,
+                 '_bound_ordinary_launch_callbacks',
+                 return_value=(mock.Mock(), reduce_bound, mock.Mock())), \
+             mock.patch.object(
+                 manager,
+                 '_launch_owner_watchdog_allows_continue',
+                 return_value=True), \
+             mock.patch.object(
+                 manager,
+                 '_queued_launch_generation_decision',
+                 return_value=True), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'stable_bound_ordinary_launch_submission_id',
+                 return_value=(
+                     '00000000-0000-4000-8000-000000000456')), \
+             mock.patch.object(
+                 replica_managers.sdk,
+                 'prepare_launch_request_for_server_controller',
+                 return_value=mock.sentinel.prepared), \
+             mock.patch.object(reserved_fill_admission,
+                               'admit',
+                               side_effect=_admit), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_info_from_id',
+                 side_effect=lambda *_args: admitted_info[0]), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 return_value=reduction), \
+             mock.patch.object(
+                 ordinary_launch_binding,
+                 'list_provider_reconciliation_contexts',
+                 return_value=[]):
+            factory_fault = (mock.patch.object(replica_managers,
+                                               '_ReplicaLaunchThread',
+                                               side_effect=_worker) if failure
+                             == 'factory' else contextlib.nullcontext())
+            with factory_fault:
+                with provider_phase.provider_phase(
+                        provider_phase.ProviderPhaseMode.V2_FENCED
+                ) as admission, self.assertRaises(
+                        reserved_fill_admission.AdmissionAmbiguousError):
+                    manager._launch_replica(
+                        7,
+                        self._v2_override(location,
+                                          exact_shape={'H200': 1},
+                                          attributed=True),
+                        existing_replica_infos=existing,
+                        provider_phase_admission=admission,
+                        zero_cost_actuation_lease=mock.sentinel.lease)
+
+            self.assertEqual(events[:1], ['commit'])
+            self.assertEqual(existing, [])
+            self.assertNotIn(7, manager._replica_to_request_id)
+            self.assertNotIn(7, manager._launch_thread_pool)
+
+            # The next controller scan must rediscover the committed
+            # tuple from its durable replica/request association.  No
+            # in-memory retry registry participates, including when
+            # the request terminalized before this scan. Model a
+            # saturated provider-launch budget and a newly benched
+            # location: this observer is not provider admission and
+            # must start immediately without either gate or deletion.
+            placer.reset_mock()
+            placer.is_launch_admissible.return_value = False
+            with mock.patch.object(
+                    replica_managers.controller_utils,
+                    'can_provision',
+                    return_value=False) as can_provision, \
+                 mock.patch.object(
+                     replica_managers.serve_state,
+                     'mark_bound_replica_launch_running_if_active'
+                 ) as mark_running, \
+                 mock.patch.object(
+                     replica_managers.context.SkyPilotContext,
+                     'redirect_log',
+                     side_effect=AssertionError(
+                         'durable-store adoption must not open launch logs')) \
+                     as redirect_log, \
+                 mock.patch.object(manager,
+                                   '_remove_replica') as remove:
+                manager._reconcile_unowned_bound_non_pool_launches(
+                    [admitted_info[0]])
+                adopter = manager._launch_thread_pool[7]
+                adopter.join(timeout=2)
+                self.assertFalse(adopter.is_alive())
+                self.assertIsNone(adopter.exception)
+            self.assertEqual(manager._replica_to_request_id[7], 'request-id')
+            reduce_bound.assert_called_once_with(None, None)
+            redirect_log.assert_not_called()
+            can_provision.assert_not_called()
+            mark_running.assert_not_called()
+            remove.assert_not_called()
+            placer.is_launch_admissible.assert_not_called()
+            placer.set_preemptive.assert_not_called()
+            placer.release_retry.assert_not_called()
 
     def test_v2_partial_typed_attribution_fails_before_persistence(self):
         location = make_location('phx-context',
@@ -4188,19 +5060,18 @@ class TestFillLaunchPath(unittest.TestCase):
                                      exact_shape={'H200': 1},
                                      attributed=True)
         override.pop(constants.RESERVED_FILL_OBSERVATION_SEQUENCE_OVERRIDE_KEY)
+        lease = self._enable_durable_intent(manager)
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
-             mock.patch.object(reserved_capacity_broker,
-                               'current_epoch',
-                               return_value=3), \
-             mock.patch.object(reserved_capacity_broker,
-                               'persist_fill_replica') as persist:
-            self.assertFalse(self._launch_v2(manager, override))
-        persist.assert_not_called()
+             mock.patch.object(reserved_fill_admission,
+                               'admit') as admit:
+            self.assertFalse(
+                self._launch_v2(manager, override, actuation_lease=lease))
+        admit.assert_not_called()
         placer.select_next_zero_cost_location.assert_not_called()
 
-    def test_v2_stale_epoch_fails_closed_before_authority_read(self):
+    def test_v2_durable_lease_is_checked_only_by_atomic_admission(self):
         location = make_location('phx-context',
                                  accelerators={'H200': 1},
                                  cloud_name='Kubernetes',
@@ -4209,54 +5080,53 @@ class TestFillLaunchPath(unittest.TestCase):
         placer.active_locations.return_value = [location]
         placer.select_next_zero_cost_location.return_value = location
         manager = _make_manager(placer)
-        snapshot_time = time.time() - 1
-        allocation = reserved_capacity_broker.Allocation(
-            grant=1,
-            feed=1,
-            round_id=9,
-            epoch=5,
-            snapshot_time=snapshot_time,
-            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
-            service_generation=7,
-            physical_cluster_uid='physical-uid',
-            edge_cap=1,
-            pool_key=self._v2_override(location)[_POOL_KEY],
-            feed_by_accelerator={'h200': 1})
-        override = self._v2_override(location, epoch=3, exact_shape={'H200': 1})
-        # This ordinary row can consume the sole current feed without changing
-        # the broker epoch.  More importantly, no row/timestamp classifier can
-        # prove whether the broker's post-provider-query debit scan already
-        # included it.  The stale decision must therefore be rejected before
-        # reading or trying to reinterpret the newer allocation.
-        ordinary = mock.Mock()
-        ordinary.is_terminal = False
-        ordinary.reserved_fill = False
-        ordinary.created_at = snapshot_time + 0.5
-        ordinary.location = location.to_pickleable()
+        lease = self._enable_durable_intent(manager)
+        override = self._v2_override(location,
+                                     epoch=3,
+                                     exact_shape={'H200': 1},
+                                     attributed=True)
+        bound_task = types.SimpleNamespace(
+            resources=[types.SimpleNamespace(cloud=clouds.Kubernetes())])
+        admitted_specs = []
+
+        def _reject_stale(spec):
+            admitted_specs.append(spec)
+            return reserved_fill_admission.AdmissionResult(
+                reserved_fill_admission.AdmissionDisposition.REJECTED,
+                detail='round epoch changed')
+
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
-             mock.patch.object(reserved_capacity_broker,
-                               'current_epoch',
-                               return_value=5) as current_epoch, \
-             mock.patch.object(reserved_capacity_broker,
-                               'get_my_allocation',
-                               return_value=allocation) as get_allocation, \
-             mock.patch.object(reserved_capacity_broker,
-                               'persist_fill_replica') as persist:
-            with provider_phase.provider_phase(
-                    provider_phase.ProviderPhaseMode.V2_FENCED) as admission:
-                launched = manager._launch_replica(
-                    7,
-                    override,
-                    existing_replica_infos=[ordinary],
-                    provider_phase_admission=admission)
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(
+                 kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 return_value=contextlib.nullcontext()), \
+             mock.patch.object(replica_managers,
+                               '_build_replica_launch_task',
+                               return_value=bound_task), \
+             mock.patch.object(manager,
+                               '_bound_ordinary_launch_fence_context',
+                               return_value={'bound': True}), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'stable_bound_ordinary_launch_submission_id',
+                 return_value='00000000-0000-4000-8000-000000000456'), \
+             mock.patch.object(
+                 replica_managers.sdk,
+                 'prepare_launch_request_for_server_controller',
+                 return_value=mock.sentinel.prepared), \
+             mock.patch.object(reserved_fill_admission,
+                               'admit',
+                               side_effect=_reject_stale):
+            launched = self._launch_v2(manager, override, actuation_lease=lease)
 
         self.assertFalse(launched)
-        current_epoch.assert_called_once_with(override[_POOL_KEY])
-        get_allocation.assert_not_called()
-        persist.assert_not_called()
-        placer.select_next_zero_cost_location.assert_not_called()
+        self.assertIs(admitted_specs[0].actuation_lease, lease)
+        placer.release_retry.assert_called_once_with(location)
 
     def test_v2_launch_capture_and_queued_static_pin_guard(self):
         location = make_location('phx-context',
@@ -4267,11 +5137,16 @@ class TestFillLaunchPath(unittest.TestCase):
         placer.active_locations.return_value = [location]
         placer.select_next_zero_cost_location.return_value = location
         manager = _make_manager(placer)
+        lease = self._enable_durable_intent(manager)
         # Catalog shapes may represent a whole count as an integral float.
         # The immutable expected pin canonicalizes it while still comparing
         # against the actual queued override below.
-        override = self._v2_override(location)
+        override = self._v2_override(location,
+                                     exact_shape={'H200': 1},
+                                     attributed=True)
         events = []
+        admitted_specs = []
+        prepared = {}
 
         @contextlib.contextmanager
         def _physical_fence(context, physical_uid):
@@ -4283,15 +5158,30 @@ class TestFillLaunchPath(unittest.TestCase):
             finally:
                 events.append('physical-exit')
 
-        def _persist(*_args, **_kwargs):
-            self.assertEqual(events, ['physical-enter', 'thread'])
-            events.append('persist')
-            return True
-
-        def _thread(*_args, **_kwargs):
+        def _prepare(task, *_args, **kwargs):
             self.assertEqual(events, ['physical-enter'])
-            events.append('thread')
-            return mock.Mock()
+            prepared['task'] = task
+            prepared['context'] = kwargs['extra_launch_context']
+            return mock.sentinel.prepared
+
+        def _admit(spec):
+            self.assertEqual(events, ['physical-enter'])
+            events.append('commit')
+            admitted_specs.append(spec)
+            spec.replica_info.zero_cost_admission_sequence = 1
+            return reserved_fill_admission.AdmissionResult(
+                reserved_fill_admission.AdmissionDisposition.COMMITTED,
+                reserved_fill_admission.AdmissionReceipt(
+                    replica_id=7,
+                    replica_record_id=spec.replica_info.replica_record_id,
+                    association_id='association-id',
+                    request_id='request-id',
+                    launch_generation=1))
+
+        bound_task = types.SimpleNamespace(
+            resources=[types.SimpleNamespace(cloud=clouds.Kubernetes())])
+        reduction = types.SimpleNamespace(context=types.SimpleNamespace(
+            request_id='request-id'))
 
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
@@ -4299,26 +5189,38 @@ class TestFillLaunchPath(unittest.TestCase):
              mock.patch.object(replica_managers,
                                '_get_resources_ports',
                                return_value='8080'), \
-             mock.patch.object(reserved_capacity_broker,
-                               'current_epoch',
-                               return_value=3), \
              mock.patch.object(
                  kubernetes_adaptor,
                  'physical_cluster_uid_fence',
                  side_effect=_physical_fence) as physical_fence, \
-             mock.patch.object(reserved_capacity_broker,
-                               'persist_fill_replica',
-                               side_effect=_persist), \
              mock.patch.object(replica_managers,
-                               '_ReplicaLaunchThread',
-                               side_effect=_thread) as launch_thread, \
+                               '_build_replica_launch_task',
+                               return_value=bound_task), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'stable_bound_ordinary_launch_submission_id',
+                 return_value='00000000-0000-4000-8000-000000000456'), \
+             mock.patch.object(
+                 replica_managers.sdk,
+                 'prepare_launch_request_for_server_controller',
+                 side_effect=_prepare), \
+             mock.patch.object(reserved_fill_admission,
+                               'admit',
+                               side_effect=_admit), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 return_value=reduction), \
+             mock.patch.object(manager,
+                               '_install_bound_launch_adopter',
+                               return_value=True) as install, \
              mock.patch.object(
                  reserved_capacity,
                  'get_kubernetes_physical_cluster_uid') as ambient_uid:
-            self.assertTrue(self._launch_v2(manager, override))
+            self.assertTrue(
+                self._launch_v2(manager, override, actuation_lease=lease))
 
-            thread_call = launch_thread.call_args.kwargs
-            durable_fence = thread_call['kwargs']['launch_fence']
+            durable_fence = prepared['context']
             self.assertIsNotNone(durable_fence)
             parsed_fence = reserved_capacity.parse_protocol_v2_launch_fence(
                 durable_fence)
@@ -4329,24 +5231,31 @@ class TestFillLaunchPath(unittest.TestCase):
             self.assertEqual(parsed_fence.kubernetes_context, 'phx-context')
             self.assertEqual(parsed_fence.accelerator, 'h200')
             self.assertEqual(parsed_fence.accelerator_count, 1)
-            cloud_guard = thread_call['kwargs']['cloud_launch_guard']
-            self.assertIsNotNone(cloud_guard)
-            self.assertEqual(cloud_guard(), (True, 'authorized'))
+            info = admitted_specs[0].replica_info
+            self.assertEqual(
+                replica_managers._protocol_v2_fill_cloud_launch_guard(
+                    parsed_fence.pool_key, parsed_fence.service_generation,
+                    parsed_fence.physical_cluster_uid,
+                    parsed_fence.kubernetes_context, parsed_fence.accelerator,
+                    parsed_fence.accelerator_count, info.resources_override),
+                (True, 'authorized'))
             physical_fence.assert_called_once_with('phx-context',
                                                    'physical-uid')
-            self.assertEqual(
-                events,
-                ['physical-enter', 'thread', 'persist', 'physical-exit'])
+            self.assertEqual(events,
+                             ['physical-enter', 'commit', 'physical-exit'])
+            install.assert_called_once()
             ambient_uid.assert_not_called()
 
-            # The guard reads the same override mapping launch_cluster will
-            # build its Task from, while retaining an immutable expected pin.
             # A queued mutation fails provider-free. The executor later proves
             # the immutable durable tuple for every provider attempt.
-            queued_override = thread_call['args'][6]
-            queued_override['accelerators'] = {'H200': 2}
-            self.assertEqual(cloud_guard(),
-                             (False, 'fill-accelerator-shape-mismatch'))
+            info.resources_override['accelerators'] = {'H200': 2}
+            self.assertEqual(
+                replica_managers._protocol_v2_fill_cloud_launch_guard(
+                    parsed_fence.pool_key, parsed_fence.service_generation,
+                    parsed_fence.physical_cluster_uid,
+                    parsed_fence.kubernetes_context, parsed_fence.accelerator,
+                    parsed_fence.accelerator_count, info.resources_override),
+                (False, 'fill-accelerator-shape-mismatch'))
             physical_fence.assert_called_once()
 
     def test_abort_creates_no_record_and_keeps_id(self):

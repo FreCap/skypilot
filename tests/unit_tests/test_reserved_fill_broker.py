@@ -28,6 +28,7 @@ from sky.serve import pool_capacity_observation
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_state
+from sky.serve import zero_cost_actuation
 from sky.utils import common_utils
 from sky.utils import locks
 
@@ -728,14 +729,14 @@ class TestProtocolV2ReplicaPoolProvenance:
         monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
                             mock.Mock(return_value={}))
         monkeypatch.setattr(
-            broker.zero_cost_actuation, 'pending_pool_debits',
+            zero_cost_actuation, 'pending_pool_debits',
             mock.Mock(return_value=(
-                broker.zero_cost_actuation.PendingPoolDebit(
+                zero_cost_actuation.PendingPoolDebit(
                     service_name='svc-a',
                     pool_key=self._POOL,
                     accelerator='h200',
                     replica_slots=2),
-                broker.zero_cost_actuation.PendingPoolDebit(
+                zero_cost_actuation.PendingPoolDebit(
                     service_name='svc-gone',
                     pool_key=self._POOL,
                     accelerator='h200',

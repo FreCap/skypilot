@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -158,6 +159,90 @@ def test_direct_prepare_preserves_launch_client_boundaries(
 
     assert sdk.prepare_launch_request(sky.Task(run='echo hello')) is prepared
     health_check.assert_called_once_with(False, '127.0.0.1')
+
+
+def test_server_controller_prepare_is_local_and_uses_current_api(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    forbidden = mock.Mock(side_effect=AssertionError('ambient I/O is forbidden'))
+    upload = mock.Mock(side_effect=AssertionError('upload is forbidden'))
+    remote_version = mock.Mock(
+        side_effect=AssertionError('remote version lookup is forbidden'))
+    authenticated_request = mock.Mock(
+        side_effect=AssertionError('HTTP is forbidden'))
+    public_validate = mock.Mock(
+        side_effect=AssertionError('HTTP validation is forbidden'))
+    monkeypatch.setattr(sdk.admin_policy_utils,
+                        'apply_and_use_config_in_current_request', forbidden)
+    monkeypatch.setattr(sdk.client_common, 'upload_mounts_to_api_server',
+                        upload)
+    monkeypatch.setattr(sdk.client_common.server_common,
+                        'is_api_server_local', forbidden)
+    monkeypatch.setattr(sdk.payloads.common, 'is_api_server_local', forbidden)
+    monkeypatch.setattr(sdk.payloads, 'request_body_env_vars', forbidden)
+    monkeypatch.setattr(sdk.payloads,
+                        'get_override_skypilot_config_from_client', forbidden)
+    monkeypatch.setattr(sdk.payloads,
+                        'get_override_skypilot_config_path_from_client',
+                        forbidden)
+    monkeypatch.setattr(sdk.versions, 'get_remote_api_version', remote_version)
+    monkeypatch.setattr(server_common, 'make_authenticated_request',
+                        authenticated_request)
+    monkeypatch.setattr(sdk, 'validate', public_validate)
+
+    prepared = sdk.prepare_launch_request_for_server_controller(
+        sky.Task(run='echo hello'),
+        'reserved-fill-1',
+        workspace='default',
+        extra_launch_context={'service_name': 'svc'})
+
+    upload.assert_not_called()
+    forbidden.assert_not_called()
+    remote_version.assert_not_called()
+    authenticated_request.assert_not_called()
+    public_validate.assert_not_called()
+    assert prepared.body.is_launched_by_sky_serve_controller
+    assert prepared.body.client_api_version == sdk.server_constants.API_VERSION
+    assert prepared.body.override_skypilot_config['active_workspace'] == (
+        'default')
+    assert prepared.body.extra_launch_context == {'service_name': 'svc'}
+
+
+@pytest.mark.parametrize('local_input', ('workdir', 'file_mount', 'mapping',
+                                         'storage', 'tls'))
+def test_server_controller_prepare_rejects_local_inputs_before_http(
+        monkeypatch: pytest.MonkeyPatch, tmp_path, local_input: str) -> None:
+    monkeypatch.setattr(
+        sdk.admin_policy_utils, 'apply_and_use_config_in_current_request',
+        mock.Mock(side_effect=AssertionError('policy I/O is forbidden')))
+    authenticated_request = mock.Mock(
+        side_effect=AssertionError('HTTP is forbidden'))
+    monkeypatch.setattr(server_common, 'make_authenticated_request',
+                        authenticated_request)
+    local_file = tmp_path / 'input.txt'
+    local_file.write_text('data', encoding='utf-8')
+    task = sky.Task(run='echo hello')
+    if local_input == 'workdir':
+        task.workdir = str(tmp_path)
+    elif local_input == 'file_mount':
+        task.file_mounts = {'/input': str(local_file)}
+    elif local_input == 'mapping':
+        task.file_mounts_mapping = {str(local_file): str(local_file)}
+    elif local_input == 'storage':
+        task.storage_mounts = {
+            '/data': sky.Storage(name='server-controller-local-input',
+                                 source=str(tmp_path))
+        }
+    else:
+        task._service = SimpleNamespace(  # pylint: disable=protected-access
+            tls_credential=SimpleNamespace(keyfile=str(local_file),
+                                           certfile=str(local_file)))
+
+    with pytest.raises(ValueError, match='cannot upload local inputs'):
+        sdk.prepare_launch_request_for_server_controller(task,
+                                                         'reserved-fill-1',
+                                                         workspace='default')
+
+    authenticated_request.assert_not_called()
 
 
 @pytest.mark.usefixtures('prepare_dependencies')

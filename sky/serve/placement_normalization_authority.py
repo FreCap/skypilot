@@ -20,7 +20,7 @@ AUTHORITY_REVISION = '040'
 # the Alembic head merely identifies a recognized descendant installation.
 RECOGNIZED_ADDITIVE_REVISIONS = frozenset(
     ('040', '041', '042', '043', '044', '045', '046', '047', '048', '049',
-     '050', '051', '052', '053', '054'))
+     '050', '051', '052', '053', '054', '055'))
 AUTHORITY_FUNCTION = ('skyserve040_assert_placement_normalization_authority')
 AUTHORITY_GATE = 'placement_normalization_write_fence'
 RUNS_RELATION = 'placement_normalization_runs'

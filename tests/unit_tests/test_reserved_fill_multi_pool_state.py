@@ -662,7 +662,7 @@ def test_disable_reenable_never_reuses_claim_generation(state_engine):
     )['claim_generation'] == 2
 
 
-def test_service_name_reuse_fences_old_round_and_decision_generation(
+def test_service_name_reuse_advances_generation_without_rewriting_old_round(
         state_engine):
     assert _activate_v2()
     edge = _edge('east', 0)
@@ -706,34 +706,11 @@ def test_service_name_reuse_fences_old_round_and_decision_generation(
     old_round = serve_state.get_reserved_fill_round(pool_key)
     assert old_round is not None
     assert old_round['claim_generations'] == '{"svc":1}'
-    stale_replica = replica_managers.ReplicaInfo(replica_id=1,
-                                                 cluster_name='svc-1',
-                                                 replica_port='8080',
-                                                 is_spot=False,
-                                                 location=None,
-                                                 version=1,
-                                                 resources_override=None)
-    stale_replica.reserved_fill = True
-    stale_replica.reserved_fill_pool_key = pool_key
-    stale_replica.reserved_fill_service_generation = old_decision_generation
-    stale_replica.reserved_fill_physical_cluster_uid = 'uid-east'
-    assert not serve_state.add_replica_if_round_epoch(
-        'svc',
-        1,
-        stale_replica,
-        pool_key=pool_key,
-        expected_epoch=1,
-        expected_service_hash='successor-hash',
-        expected_controller_owner=(23, '10.0.0.23'),
-        expected_protocol_version=2,
-        expected_service_generation=old_decision_generation,
-        expected_physical_cluster_uid='uid-east',
-        expected_lease_token=9)
     assert serve_state.get_reserved_fill_protocol_state(
     )['claim_generation'] == successor_generation
 
 
-def test_postgres_fill_persist_requires_exact_positive_lease_token(
+def test_standalone_protocol_v2_persistence_is_removed_and_leaks_nothing(
         state_engine):
     assert _activate_v2()
     edge = _demotion_edge('east', 0)
@@ -780,11 +757,12 @@ def test_postgres_fill_persist_requires_exact_positive_lease_token(
         'expected_physical_cluster_uid': 'uid-east',
     }
 
-    assert not serve_state.add_replica_if_round_epoch('svc', 1, replica, **
-                                                      persist_kwargs)
-    assert serve_state.get_replica_info_from_id('svc', 1) is None
-    assert serve_state.add_replica_if_round_epoch('svc',
-                                                  1,
-                                                  replica,
-                                                  expected_lease_token=11,
-                                                  **persist_kwargs)
+    for lease_token in (None, 11):
+        with pytest.raises(ValueError, match='protocol-v1 only'):
+            serve_state.add_replica_if_round_epoch(
+                'svc',
+                1,
+                replica,
+                expected_lease_token=lease_token,
+                **persist_kwargs)
+        assert serve_state.get_replica_info_from_id('svc', 1) is None

@@ -1148,13 +1148,14 @@ def _protocol_v2_reserved_fill_launch_context() -> dict[str, object]:
     return context
 
 
+@pytest.mark.parametrize('binding_mode', [
+    server.ordinary_launch_binding.BindingMode.LEGACY,
+    server.ordinary_launch_binding.BindingMode.BOUND,
+])
 @pytest.mark.asyncio
-async def test_reserved_fill_launch_accepts_complete_durable_fence():
-    from sky import execution
-    from sky.serve import reserved_capacity
+async def test_reserved_fill_launch_rejects_complete_fence_before_any_admission(
+        binding_mode):
     from sky.server.requests import payloads
-    from sky.server.requests import preconditions
-    from sky.server.requests import requests as requests_lib
 
     request = mock.MagicMock()
     request.state.request_id = 'launch-request-id'
@@ -1166,31 +1167,31 @@ async def test_reserved_fill_launch_accepts_complete_durable_fence():
         extra_launch_context=_protocol_v2_reserved_fill_launch_context())
 
     with mock.patch('sky.server.server.executor.schedule_request_async',
-                    new_callable=mock.AsyncMock) as mock_schedule:
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         mock.patch.object(server.ordinary_launch_binding,
+                           'binding_mode',
+                           return_value=binding_mode) as read_mode, \
+         mock.patch.object(
+             server.preconditions,
+             'ServiceReplicaLaunchPrecondition') as build_precondition, \
+         mock.patch.object(server.non_pool_admission, 'build') as build, \
+         mock.patch.object(server,
+                           '_bind_and_enqueue_non_pool_launch') as bind_non_pool, \
+         mock.patch.object(server,
+                           '_bind_and_enqueue_ordinary_launch') as bind_ordinary, \
+         mock.patch.object(server.execution, 'launch') as provider_effect, \
+         pytest.raises(fastapi.HTTPException,
+                       match='internal atomic replica/request') as exc:
         await server.launch(launch_body, request)
 
-    condition = mock_schedule.await_args.kwargs['precondition']
-    assert isinstance(condition, preconditions.ServiceReplicaLaunchPrecondition)
-    queued_body = mock_schedule.await_args.kwargs['request_body']
-    assert (queued_body.extra_launch_context ==
-            _protocol_v2_reserved_fill_launch_context())
-    # Exercise the production durable JSON codec used to recover an enqueued
-    # launch after API-server restart, not merely the in-memory scheduler call.
-    durable_request = requests_lib.Request(
-        request_id='launch-request-id',
-        name='sky.launch',
-        entrypoint=execution.launch,
-        request_body=queued_body,
-        status=requests_lib.RequestStatus.PENDING,
-        created_at=123.0,
-        user_id='user-1',
-        schedule_type=requests_lib.ScheduleType.LONG)
-    restored = requests_lib.Request.from_durable_values(
-        durable_request.durable_values())
-    assert restored.request_body.extra_launch_context == (
-        _protocol_v2_reserved_fill_launch_context())
-    assert reserved_capacity.parse_protocol_v2_launch_fence(
-        restored.request_body.extra_launch_context) is not None
+    assert exc.value.status_code == 409
+    mock_schedule.assert_not_awaited()
+    read_mode.assert_not_called()
+    build_precondition.assert_not_called()
+    build.assert_not_called()
+    bind_non_pool.assert_not_called()
+    bind_ordinary.assert_not_called()
+    provider_effect.assert_not_called()
 
 
 @pytest.mark.parametrize('missing_key',
@@ -1291,7 +1292,8 @@ async def test_reserved_fill_launch_rejects_non_serve_caller():
 
     with mock.patch('sky.server.server.executor.schedule_request_async',
                     new_callable=mock.AsyncMock) as mock_schedule, \
-         pytest.raises(fastapi.HTTPException, match='ordinary SkyServe') as exc:
+         pytest.raises(fastapi.HTTPException,
+                       match='internal atomic replica/request') as exc:
         await server.launch(launch_body, request)
 
     assert exc.value.status_code == 409

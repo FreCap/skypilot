@@ -74,6 +74,20 @@ class ServiceOwnershipLostError(RuntimeError):
     """Raised when teardown no longer owns the exact service incarnation."""
 
 
+def _service_owner_from_launch_environment() -> tuple[str, str]:
+    """Read the explicit tenant tuple frozen into the controller launch."""
+    user_id = os.environ.get(skylet_constants.USER_ID_ENV_VAR)
+    user_name = os.environ.get(skylet_constants.USER_ENV_VAR)
+    if not isinstance(user_id, str) or not common_utils.is_valid_user_hash(
+            user_id):
+        raise RuntimeError(
+            'Service controller launch has no explicit valid owner user ID.')
+    if not isinstance(user_name, str) or not user_name:
+        raise RuntimeError(
+            'Service controller launch has no explicit owner user name.')
+    return user_id, user_name
+
+
 def load_task_for_storage_cleanup(yaml_content: str) -> task_lib.Task:
     """Load storage metadata without revalidating historical Serve policy."""
     config = yaml_utils.safe_load(yaml_content)
@@ -1886,6 +1900,10 @@ def _start(service_name: str,
     # Generate ssh key pair to avoid race condition when multiple sky.launch
     # are executed at the same time.
     auth_utils.get_or_generate_keys()
+    # The controller launch environment freezes the initiating tenant. Capture
+    # it once; updates and HA takeovers must never replace this authority.
+    (service_owner_user_id,
+     service_owner_user_name) = _service_owner_from_launch_environment()
 
     service = serve_state.get_service_from_name(service_name)
     is_recovery = service is not None
@@ -2267,6 +2285,8 @@ def _start(service_name: str,
                     service_hash=service_incarnation,
                     lifecycle_epoch=lifecycle_epoch,
                     resource_scope=resource_scope,
+                    owner_user_id=service_owner_user_id,
+                    owner_user_name=service_owner_user_name,
                     created_by=created_by,
                     submitted_yaml_content=submitted_yaml_content,
                     placement_catalog=placement_catalog,
@@ -2403,6 +2423,11 @@ def _start(service_name: str,
                 _exit_on_ownership_loss(False, service_name,
                                         'claiming fresh controller startup',
                                         None)
+
+        if controller_binding_authority is not None:
+            serve_state.attest_service_owner_user_id(
+                controller_binding_authority, service_owner_user_id,
+                service_owner_user_name)
 
         controller_binding_authority = (_promote_fresh_ordinary_launch_binding(
             controller_binding_authority,

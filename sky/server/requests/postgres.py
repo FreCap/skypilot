@@ -48,6 +48,7 @@ from sky.server.requests import registry as request_registry
 from sky.server.requests import requests as requests_lib
 from sky.server.requests import storage as request_storage
 from sky.server.requests.queues import base as queue_base
+from sky.skylet import constants as skylet_constants
 from sky.utils import controller_capability
 from sky.utils import locks
 from sky.utils.db import db_utils
@@ -2894,11 +2895,12 @@ def bind_and_enqueue_ordinary_launch(
         return admission
 
 
-def bind_and_enqueue_non_pool_launch(
+def bind_and_enqueue_non_pool_launch_in_transaction(
+    connection: sqlalchemy.engine.Connection,
     request: requests_lib.Request,
     identity: ordinary_launch_binding_lib.NonPoolBindingIdentity,
 ) -> ordinary_launch_binding_lib.BindingAdmission:
-    """Atomically commit one generic association/request/queue/pin tuple."""
+    """Commit one generic association/request/queue/pin on a caller txn."""
     if not isinstance(identity, ordinary_launch_binding.NonPoolBindingIdentity):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Generic launch admission requires a protocol-v2 identity.')
@@ -2915,37 +2917,58 @@ def bind_and_enqueue_non_pool_launch(
         raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
             'Generic launch binding requires the built-in PostgreSQL '
             'request and queue backends.')
+    if connection.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Generic launch binding requires central PostgreSQL state.')
+    submitted_user_id = request.request_body.env_vars.get(
+        skylet_constants.USER_ID_ENV_VAR)
+    if (request.user_id != identity.tenant_scope or
+            submitted_user_id != identity.tenant_scope):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Generic launch request, binding, and LaunchBody tenant scopes '
+            'must be identical.')
+    admission = ordinary_launch_binding.insert_or_get_locked(
+        connection, identity)
+    if (admission.association_id != str(identity.association_id) or
+            admission.request_id != identity.request_id):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Generic admission returned a different deterministic identity.')
+    (ordinary_launch_binding.
+     validate_non_pool_submission_execution_context_in_connection(
+         connection, identity, request.request_body.extra_launch_context))
+    ordinary_launch_binding.install_bound_non_pool_context(
+        request.request_body, identity, admission.launch_generation)
+    if admission.created:
+        inserted = insert_bound_non_pool_request_and_queue_in_transaction(
+            connection, request, identity=identity)
+        if not inserted:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'New generic association collided with an API request ID.')
+    else:
+        _validate_existing_bound_request_in_transaction(connection, request,
+                                                        identity, admission)
+    return admission
+
+
+def bind_and_enqueue_non_pool_launch(
+    request: requests_lib.Request,
+    identity: ordinary_launch_binding_lib.NonPoolBindingIdentity,
+) -> ordinary_launch_binding_lib.BindingAdmission:
+    """Atomically commit one generic association/request/queue/pin tuple."""
     engine = initialize_and_get_db()
     if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
         raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
             'Generic launch binding requires central PostgreSQL state.')
+    # SERVER_INSTANCES is heartbeat-owned rather than transactional request
+    # authority. Observe rollout readiness before taking service/replica locks;
+    # the locked service capability tuple remains the commit-time fence.
+    if not non_pool_launch_binding_fleet_capable():
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Generic launch binding is waiting for one exact capable '
+            'API/executor cohort stale window.')
     with engine.begin() as connection:
-        if not non_pool_launch_binding_fleet_capable(connection=connection):
-            raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
-                'Generic launch binding is waiting for one exact capable '
-                'API/executor cohort stale window.')
-        admission = ordinary_launch_binding.insert_or_get_locked(
-            connection, identity)
-        if (admission.association_id != str(identity.association_id) or
-                admission.request_id != identity.request_id):
-            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                'Generic admission returned a different deterministic '
-                'identity.')
-        (ordinary_launch_binding.
-         validate_non_pool_submission_execution_context_in_connection(
-             connection, identity, request.request_body.extra_launch_context))
-        ordinary_launch_binding.install_bound_non_pool_context(
-            request.request_body, identity, admission.launch_generation)
-        if admission.created:
-            inserted = insert_bound_non_pool_request_and_queue_in_transaction(
-                connection, request, identity=identity)
-            if not inserted:
-                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                    'New generic association collided with an API request ID.')
-        else:
-            _validate_existing_bound_request_in_transaction(
-                connection, request, identity, admission)
-        return admission
+        return bind_and_enqueue_non_pool_launch_in_transaction(
+            connection, request, identity)
 
 
 def _bound_context_from_association(
@@ -3850,8 +3873,11 @@ def _lock_bound_non_pool_provider_present_cleanup(
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Provider-present cleanup could not decode the exact bound '
             'request payload.') from error
-    if (parsed_context != context or
-            request_input_digest != context.input_digest or
+    atomic_fill_digest_changed = bool(
+        context.profile.kind
+        is ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL and
+        request_input_digest != context.input_digest)
+    if (parsed_context != context or atomic_fill_digest_changed or
             request_service_job_id is not None or
             association['service_job_id'] is not None):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(

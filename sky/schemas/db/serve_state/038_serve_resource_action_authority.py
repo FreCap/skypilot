@@ -79,6 +79,8 @@ _POST_SERVE038_FUTURE_COLUMNS = {
         'reserved_fill_actuation_capable',
         'reserved_fill_actuation_controller_incarnation',
         'reserved_fill_actuation_protocol_version',
+        'owner_user_id',
+        'owner_user_name',
     }),
     _REPLICAS: frozenset({'ordinary_launch_association_id'}),
 }
@@ -97,6 +99,7 @@ _POST_SERVE038_FUTURE_CHECKS = {
         'serve052_fill_actuation_epoch_ck',
         'serve052_fill_actuation_capability_shape_ck',
         'serve052_durable_fill_actuation_capability_ck',
+        'serve055_owner_user_id_nonempty',
     }),
 }
 

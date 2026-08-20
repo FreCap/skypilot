@@ -341,6 +341,30 @@ def _compute_zip_blob_id(zip_path: str) -> str:
     return h.hexdigest()
 
 
+def validate_no_local_inputs(dag: 'sky.Dag') -> None:
+    """Reject inputs that a server-local controller would have to upload."""
+    for task_ in dag.tasks:
+        local_storage_sources: list[str] = []
+        for storage in (task_.storage_mounts or {}).values():
+            source = storage.source
+            if isinstance(source, str):
+                source = [source]
+            local_storage_sources.extend(
+                item for item in source or []
+                if not data_utils.is_cloud_store_url(item))
+        local_file_mounts = [
+            source for source in (task_.file_mounts or {}).values()
+            if not data_utils.is_cloud_store_url(source)
+        ]
+        tls = (task_.service.tls_credential
+               if task_.service is not None else None)
+        if (task_.workdir or local_file_mounts or local_storage_sources or
+                task_.file_mounts_mapping or tls is not None):
+            raise ValueError(
+                'Server-controller launch preparation cannot upload local '
+                'inputs; the service must reference server-accessible data.')
+
+
 def upload_mounts_to_api_server(
     dag: 'sky.Dag',
     workdir_only: bool = False,
@@ -360,7 +384,6 @@ def upload_mounts_to_api_server(
         dag: The dag where the file mounts are defined.
         workdir_only: Whether to only upload the workdir, which is used for
             `exec`, as it does not need other files/folders in file_mounts.
-
     Returns:
         A tuple of (dag, file_mounts_blob_id). The dag has file_mounts_mapping
         updated. file_mounts_blob_id is the blob ID of file mounts if /upload_v2

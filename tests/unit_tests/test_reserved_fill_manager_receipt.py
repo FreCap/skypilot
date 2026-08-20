@@ -21,6 +21,7 @@ from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
 from sky.serve import zero_cost_actuation
+from sky.server.requests import reserved_fill_admission
 from sky.utils import common_utils
 
 _SERVICE_HASH = 'service-incarnation'
@@ -189,95 +190,6 @@ def _isolate_demand_capacity_lock():
         yield
 
 
-def test_accept_reserved_fill_returns_exact_rows_and_preflights_in_parallel(
-) -> None:
-    manager = _manager()
-    east = _snapshot('east-context', 'uid-east', 1)
-    west = _snapshot('west-context', 'uid-west', 1)
-    plan = _plan((east, west))
-    barrier = threading.Barrier(2)
-    entered: list[tuple[str, str]] = []
-    observed_overrides = []
-
-    @contextlib.contextmanager
-    def physical_fence(context_name, physical_uid, **kwargs):
-        assert kwargs == {'wait_for_initializer': False}
-        assert not manager.lock.locked()
-        entered.append((context_name, physical_uid))
-        barrier.wait(timeout=2)
-        yield
-
-    def accept_one(resources_override, _used_ids, _infos, **kwargs):
-        assert manager.lock.locked()
-        assert 'provider_phase_admission' in kwargs
-        assert kwargs['require_preinitialized_physical_fence'] is True
-        observed_overrides.append(resources_override)
-        return replica_managers._ReplicaLaunchResult(  # pylint: disable=protected-access
-            replica_id=100 + len(observed_overrides),
-            planned_capacity=1,
-            funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)  # pylint: disable=protected-access
-
-    with mock.patch.object(
-            replica_managers.serve_state,
-            'get_service_controller_owner',
-            return_value=_owner_record()), mock.patch.object(
-                replica_managers.serve_state,
-                'get_replica_infos',
-                return_value=[]), mock.patch.object(
-                    replica_managers.reserved_capacity_broker,
-                    'current_epoch',
-                    return_value=23), mock.patch.object(
-                        replica_managers.kubernetes_adaptor,
-                        'physical_cluster_uid_fence',
-                        side_effect=physical_fence), mock.patch.object(
-                            manager,
-                            '_scale_up_one_locked',
-                            side_effect=accept_one):
-        receipt = manager.accept_reserved_fill(plan)
-
-    assert set(entered) == {('east-context', 'uid-east'),
-                            ('west-context', 'uid-west')}
-    assert [(item.intent_idempotency_key, item.replica_id)
-            for item in receipt.accepted] == [
-                (plan.intents[0].idempotency_key, 101),
-                (plan.intents[1].idempotency_key, 102),
-            ]
-    assert not receipt.deferred
-    assert receipt.authority_current
-    for intent, override in zip(plan.intents, observed_overrides):
-        assert override['accelerators'] == {
-            intent.accelerator: intent.accelerator_count
-        }
-        assert override['_reserved_fill_pool_key'] == intent.pool_key
-        assert override['_reserved_fill_physical_cluster_uid'] == (
-            intent.physical_cluster_uid)
-        assert override['_reserved_fill_allowed_locations'] == list(
-            intent.allowed_location_keys())
-        assert override['_reserved_fill_allocation_generation'] == (
-            intent.allocation_generation)
-        assert override['_reserved_fill_allocation_input_sha256'] == (
-            intent.allocation_input_sha256)
-        assert override['_reserved_fill_allocation_claim_generation'] == (
-            intent.allocation_claim_generation)
-        assert override['_reserved_fill_reconciliation_gate_generation'] == (
-            intent.reconciliation_gate_generation)
-        assert override['_reserved_fill_reclaim_fleet_bundle_sha256'] == (
-            intent.reclaim_fleet_bundle_sha256)
-        assert override['_reserved_fill_reclaim_policy_revision'] == (
-            intent.reclaim_policy_revision)
-        assert override['_reserved_fill_reclaim_provider_inventory_sha256'] == (
-            intent.reclaim_provider_inventory_sha256)
-        assert override['_reserved_fill_observation_generation'] == (
-            intent.observation_generation)
-        assert override['_reserved_fill_observation_sequence'] == (
-            intent.observation_sequence)
-        assert override['_reserved_fill_ordinary_admission_sequence'] == (
-            intent.ordinary_zero_cost_admission_sequence)
-        assert override['_reserved_fill_intent_idempotency_key'] == (
-            intent.idempotency_key)
-        assert '_zero_cost_admission_sequence' not in override
-
-
 def test_durable_accept_publishes_grants_without_provider_or_replica_io(
 ) -> None:
     manager = _manager(maximum=7)
@@ -429,6 +341,90 @@ def test_durable_pool_executor_does_not_serialize_independent_pools() -> None:
     assert not healthy.is_alive()
     assert repository.lease_next.call_count == 2
     repository.release_retryable.assert_not_called()
+    repository.terminate.assert_not_called()
+
+
+def test_ambiguous_atomic_admission_preserves_intent_without_cleanup() -> None:
+    manager = _manager()
+    manager.lock = threading.Lock()
+    manager._workspace = 'workspace-a'  # pylint: disable=protected-access
+    manager._zero_cost_actuation_executor_id = (  # pylint: disable=protected-access
+        mock.sentinel.executor_id)
+    manager._scale_reconciliation_event = threading.Event()  # pylint: disable=protected-access
+    intent = _plan((_snapshot('east-context', 'uid-east', 1),)).intents[0]
+    lease = SimpleNamespace(intent=intent)
+    repository = mock.Mock()
+    repository.lease_next.return_value = lease
+    manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
+    preflights = SimpleNamespace(
+        preflights={('east-context', 'uid-east'): SimpleNamespace(error=None)})
+    provider_admission = contextlib.nullcontext(mock.sentinel.admission)
+
+    with mock.patch.object(
+            manager,
+            '_zero_cost_actuation_authority_current',
+            return_value=True), mock.patch.object(
+                replica_managers.provider_phase,
+                'try_provider_phase',
+                return_value=provider_admission), \
+            mock.patch.object(
+                manager,
+                '_start_reserved_fill_physical_preflights',
+                return_value=preflights), mock.patch.object(
+                    manager,
+                    '_release_reserved_fill_physical_preflights') as release, \
+            mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[]), mock.patch.object(
+                    manager,
+                    '_scale_up_one_locked',
+                    side_effect=(reserved_fill_admission.
+                                 AdmissionAmbiguousError('commit unknown'))):
+        manager._actuate_zero_cost_pool(intent.pool_key)
+
+    repository.release_retryable.assert_not_called()
+    repository.terminate.assert_not_called()
+    release.assert_called_once_with(preflights)
+    assert manager._scale_reconciliation_event.is_set()  # pylint: disable=protected-access
+
+
+def test_rejected_atomic_admission_releases_intent_for_retry() -> None:
+    manager = _manager()
+    manager.lock = threading.Lock()
+    manager._workspace = 'workspace-a'  # pylint: disable=protected-access
+    manager._zero_cost_actuation_executor_id = (  # pylint: disable=protected-access
+        mock.sentinel.executor_id)
+    intent = _plan((_snapshot('east-context', 'uid-east', 1),)).intents[0]
+    lease = SimpleNamespace(intent=intent)
+    repository = mock.Mock()
+    repository.lease_next.return_value = lease
+    manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
+    preflights = SimpleNamespace(
+        preflights={('east-context', 'uid-east'): SimpleNamespace(error=None)})
+
+    with mock.patch.object(
+            manager,
+            '_zero_cost_actuation_authority_current',
+            return_value=True), mock.patch.object(
+                replica_managers.provider_phase,
+                'try_provider_phase',
+                return_value=contextlib.nullcontext(mock.sentinel.admission)), \
+            mock.patch.object(
+                manager,
+                '_start_reserved_fill_physical_preflights',
+                return_value=preflights), mock.patch.object(
+                    manager,
+                    '_release_reserved_fill_physical_preflights'), \
+            mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[]), mock.patch.object(
+                    manager, '_scale_up_one_locked', return_value=None):
+        manager._actuate_zero_cost_pool(intent.pool_key)
+
+    repository.release_retryable.assert_called_once_with(
+        lease, 'replica_commit_deferred')
     repository.terminate.assert_not_called()
 
 
@@ -655,527 +651,6 @@ def test_preflight_timeout_cancels_only_the_blocked_context() -> None:
     assert healthy_exited.is_set()
 
 
-def test_bad_first_context_does_not_consume_headroom_or_starve_healthy_tail(
-) -> None:
-    manager = _manager(maximum=1)
-    east = _snapshot('east-context', 'uid-east', 1)
-    west = _snapshot('west-context', 'uid-west', 1)
-    plan = _plan((east, west))
-    preflight_contexts = []
-
-    @contextlib.contextmanager
-    def physical_fence(context_name, _physical_uid, **_kwargs):
-        preflight_contexts.append(context_name)
-        if context_name == 'east-context':
-            raise (replica_managers.exceptions.
-                   KubernetesPhysicalClusterIdentityError('retargeted context'))
-        yield
-
-    launched = replica_managers._ReplicaLaunchResult(  # pylint: disable=protected-access
-        replica_id=91,
-        planned_capacity=1,
-        funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)  # pylint: disable=protected-access
-    with mock.patch.object(
-            replica_managers.serve_state,
-            'get_service_controller_owner',
-            return_value=_owner_record()), mock.patch.object(
-                replica_managers.serve_state,
-                'get_replica_infos',
-                return_value=[]), mock.patch.object(
-                    replica_managers.reserved_capacity_broker,
-                    'current_epoch',
-                    return_value=23), mock.patch.object(
-                        replica_managers.kubernetes_adaptor,
-                        'physical_cluster_uid_fence',
-                        side_effect=physical_fence), mock.patch.object(
-                            manager,
-                            '_scale_up_one_locked',
-                            return_value=launched) as scale_one:
-        receipt = manager.accept_reserved_fill(plan)
-
-    receipt.validate_for_plan(plan)
-    assert set(preflight_contexts) == {'east-context', 'west-context'}
-    assert receipt.accepted == (reserved_fill_planner.AcceptedFillIntent(
-        plan.intents[1].idempotency_key, 91),)
-    assert [item.intent for item in receipt.deferred] == [plan.intents[0]]
-    assert receipt.deferred[0].reason is (
-        reserved_fill_planner.DeferredFillReason.PHYSICAL_CLUSTER_UID_MISMATCH)
-    assert not receipt.authority_current
-    scale_one.assert_called_once()
-
-
-def test_stale_first_intent_does_not_starve_fresh_tail() -> None:
-    manager = _manager(maximum=1)
-    east = _snapshot('east-context', 'uid-east', 1, valid_until=time.time() - 1)
-    west = _snapshot('west-context', 'uid-west', 1)
-    plan = _plan((east, west))
-    launched = replica_managers._ReplicaLaunchResult(  # pylint: disable=protected-access
-        replica_id=92,
-        planned_capacity=1,
-        funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)  # pylint: disable=protected-access
-    with mock.patch.object(
-            replica_managers.serve_state,
-            'get_service_controller_owner',
-            return_value=_owner_record()), mock.patch.object(
-                replica_managers.serve_state,
-                'get_replica_infos',
-                return_value=[]), mock.patch.object(
-                    replica_managers.reserved_capacity_broker,
-                    'current_epoch',
-                    return_value=23), mock.patch.object(
-                        replica_managers.kubernetes_adaptor,
-                        'physical_cluster_uid_fence',
-                        side_effect=lambda *_args, **_kwargs: _physical_fence(
-                        )), mock.patch.object(manager,
-                                              '_scale_up_one_locked',
-                                              return_value=launched):
-        receipt = manager.accept_reserved_fill(plan)
-
-    assert receipt.accepted == (reserved_fill_planner.AcceptedFillIntent(
-        plan.intents[1].idempotency_key, 92),)
-    assert [item.intent for item in receipt.deferred] == [plan.intents[0]]
-    assert receipt.deferred[0].reason is (
-        reserved_fill_planner.DeferredFillReason.STALE_OBSERVATION)
-    assert not receipt.authority_current
-
-
-def test_changed_epoch_first_intent_does_not_starve_current_tail() -> None:
-    manager = _manager(maximum=1)
-    east = _snapshot('east-context', 'uid-east', 1)
-    west = _snapshot('west-context', 'uid-west', 1)
-    plan = _plan((east, west))
-    current_by_pool = {
-        east.pool_key: 24,
-        west.pool_key: 23,
-    }
-    launched = replica_managers._ReplicaLaunchResult(  # pylint: disable=protected-access
-        replica_id=93,
-        planned_capacity=1,
-        funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)  # pylint: disable=protected-access
-    with mock.patch.object(
-            replica_managers.serve_state,
-            'get_service_controller_owner',
-            return_value=_owner_record()), mock.patch.object(
-                replica_managers.serve_state,
-                'get_replica_infos',
-                return_value=[]), mock.patch.object(
-                    replica_managers.reserved_capacity_broker,
-                    'current_epoch',
-                    side_effect=lambda pool_key: current_by_pool[pool_key]), \
-            mock.patch.object(
-                replica_managers.kubernetes_adaptor,
-                'physical_cluster_uid_fence',
-                side_effect=lambda *_args, **_kwargs: _physical_fence()), \
-            mock.patch.object(manager,
-                              '_scale_up_one_locked',
-                              return_value=launched):
-        receipt = manager.accept_reserved_fill(plan)
-
-    assert receipt.accepted == (reserved_fill_planner.AcceptedFillIntent(
-        plan.intents[1].idempotency_key, 93),)
-    assert [item.intent for item in receipt.deferred] == [plan.intents[0]]
-    assert receipt.deferred[0].reason is (
-        reserved_fill_planner.DeferredFillReason.CHANGED_EPOCH)
-    assert not receipt.authority_current
-
-
-def test_provider_target_failure_is_sparse_but_provider_root_stops_tail(
-) -> None:
-    manager = _manager(maximum=2)
-    east = _snapshot('east-context', 'uid-east', 1)
-    west = _snapshot('west-context', 'uid-west', 1)
-    plan = _plan((east, west))
-    target_busy = (
-        replica_managers.exceptions.KubernetesPhysicalClusterFenceBusyError(
-            'capture disappeared', 'east-context', 0))
-    launched = replica_managers._ReplicaLaunchResult(  # pylint: disable=protected-access
-        replica_id=94,
-        planned_capacity=1,
-        funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)  # pylint: disable=protected-access
-    common_patches = (
-        mock.patch.object(replica_managers.serve_state,
-                          'get_service_controller_owner',
-                          return_value=_owner_record()),
-        mock.patch.object(replica_managers.serve_state,
-                          'get_replica_infos',
-                          return_value=[]),
-        mock.patch.object(replica_managers.reserved_capacity_broker,
-                          'current_epoch',
-                          return_value=23),
-        mock.patch.object(
-            replica_managers.kubernetes_adaptor,
-            'physical_cluster_uid_fence',
-            side_effect=lambda *_args, **_kwargs: _physical_fence()),
-    )
-    with contextlib.ExitStack() as stack:
-        for patcher in common_patches:
-            stack.enter_context(patcher)
-        stack.enter_context(
-            mock.patch.object(manager,
-                              '_scale_up_one_locked',
-                              side_effect=(target_busy, launched)))
-        receipt = manager.accept_reserved_fill(plan)
-
-    assert receipt.accepted == (reserved_fill_planner.AcceptedFillIntent(
-        plan.intents[1].idempotency_key, 94),)
-    assert [item.intent for item in receipt.deferred] == [plan.intents[0]]
-    assert receipt.deferred[0].reason is (
-        reserved_fill_planner.DeferredFillReason.PROVIDER_QUEUE_BACKPRESSURE)
-    assert receipt.authority_current
-
-    manager = _manager(maximum=2)
-    with contextlib.ExitStack() as stack:
-        for patcher in (
-                mock.patch.object(replica_managers.serve_state,
-                                  'get_service_controller_owner',
-                                  return_value=_owner_record()),
-                mock.patch.object(replica_managers.serve_state,
-                                  'get_replica_infos',
-                                  return_value=[]),
-                mock.patch.object(replica_managers.reserved_capacity_broker,
-                                  'current_epoch',
-                                  return_value=23),
-                mock.patch.object(
-                    replica_managers.kubernetes_adaptor,
-                    'physical_cluster_uid_fence',
-                    side_effect=lambda *_args, **_kwargs: _physical_fence()),
-                mock.patch.object(manager,
-                                  '_scale_up_one_locked',
-                                  side_effect=replica_managers.exceptions.
-                                  ProviderPhaseBusyError('root retired'))):
-            stack.enter_context(patcher)
-        receipt = manager.accept_reserved_fill(plan)
-
-    assert not receipt.accepted
-    assert [item.intent for item in receipt.deferred] == list(plan.intents)
-    assert {item.reason for item in receipt.deferred} == {
-        reserved_fill_planner.DeferredFillReason.PROVIDER_QUEUE_BACKPRESSURE
-    }
-
-
-def test_accepted_row_spends_exact_headroom_and_defers_global_tail() -> None:
-    manager = _manager(maximum=1)
-    plan = _plan((_snapshot('east-context', 'uid-east', 3),))
-    launched = replica_managers._ReplicaLaunchResult(  # pylint: disable=protected-access
-        replica_id=95,
-        planned_capacity=1,
-        funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)  # pylint: disable=protected-access
-    with mock.patch.object(replica_managers.serve_state,
-                           'get_service_controller_owner',
-                           return_value=_owner_record()), mock.patch.object(
-                               replica_managers.serve_state,
-                               'get_replica_infos',
-                               return_value=[]), mock.patch.object(
-                                   replica_managers.reserved_capacity_broker,
-                                   'current_epoch',
-                                   return_value=23), mock.patch.object(
-                                       replica_managers.kubernetes_adaptor,
-                                       'physical_cluster_uid_fence',
-                                       side_effect=lambda *_args, **_kwargs:
-                                       _physical_fence()), mock.patch.object(
-                                           manager,
-                                           '_scale_up_one_locked',
-                                           return_value=launched) as scale_one:
-        receipt = manager.accept_reserved_fill(plan)
-
-    assert receipt.accepted == (reserved_fill_planner.AcceptedFillIntent(
-        plan.intents[0].idempotency_key, 95),)
-    assert [item.intent for item in receipt.deferred] == list(plan.intents[1:])
-    assert {item.reason for item in receipt.deferred} == {
-        reserved_fill_planner.DeferredFillReason.MAX_REPLICAS_EXHAUSTED
-    }
-    scale_one.assert_called_once()
-
-
-def test_newer_pending_version_defers_without_provider_preflight() -> None:
-    manager = _manager()
-    manager._pending_version = 20  # pylint: disable=protected-access
-    plan = _plan((_snapshot('east-context', 'uid-east', 2),))
-    with mock.patch.object(replica_managers.serve_state,
-                           'get_service_controller_owner',
-                           return_value=_owner_record()), mock.patch.object(
-                               replica_managers.kubernetes_adaptor,
-                               'physical_cluster_uid_fence') as physical_fence:
-        receipt = manager.accept_reserved_fill(plan)
-
-    physical_fence.assert_not_called()
-    assert not receipt.accepted
-    assert [item.intent for item in receipt.deferred] == list(plan.intents)
-    assert {item.reason for item in receipt.deferred
-           } == {reserved_fill_planner.DeferredFillReason.SUPERSEDED_POLICY}
-    assert not receipt.authority_current
-
-
-@pytest.mark.parametrize('pending_version', [18, 19])
-def test_equal_or_older_pending_version_does_not_fence_plan(
-        pending_version) -> None:
-    manager = _manager()
-    manager._pending_version = pending_version  # pylint: disable=protected-access
-    plan = _plan((_snapshot('east-context', 'uid-east', 1),))
-    launched = replica_managers._ReplicaLaunchResult(  # pylint: disable=protected-access
-        replica_id=96,
-        planned_capacity=1,
-        funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)  # pylint: disable=protected-access
-    with mock.patch.object(
-            replica_managers.serve_state,
-            'get_service_controller_owner',
-            return_value=_owner_record()), mock.patch.object(
-                replica_managers.serve_state,
-                'get_replica_infos',
-                return_value=[]), mock.patch.object(
-                    replica_managers.reserved_capacity_broker,
-                    'current_epoch',
-                    return_value=23), mock.patch.object(
-                        replica_managers.kubernetes_adaptor,
-                        'physical_cluster_uid_fence',
-                        side_effect=lambda *_args, **_kwargs: _physical_fence(
-                        )), mock.patch.object(manager,
-                                              '_scale_up_one_locked',
-                                              return_value=launched):
-        receipt = manager.accept_reserved_fill(plan)
-
-    assert receipt.accepted == (reserved_fill_planner.AcceptedFillIntent(
-        plan.intents[0].idempotency_key, 96),)
-    assert not receipt.deferred
-    assert receipt.authority_current
-
-
-def test_newer_pending_version_after_first_persist_stops_global_tail() -> None:
-    manager = _manager(maximum=3)
-    plan = _plan((_snapshot('east-context', 'uid-east', 3),))
-    launch_calls = 0
-
-    def accept_first(*_args, **_kwargs):
-        nonlocal launch_calls
-        launch_calls += 1
-        manager._pending_version = 20  # pylint: disable=protected-access
-        return replica_managers._ReplicaLaunchResult(  # pylint: disable=protected-access
-            replica_id=97,
-            planned_capacity=1,
-            funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)  # pylint: disable=protected-access
-
-    with mock.patch.object(
-            replica_managers.serve_state,
-            'get_service_controller_owner',
-            return_value=_owner_record()), mock.patch.object(
-                replica_managers.serve_state,
-                'get_replica_infos',
-                return_value=[]), mock.patch.object(
-                    replica_managers.reserved_capacity_broker,
-                    'current_epoch',
-                    return_value=23), mock.patch.object(
-                        replica_managers.kubernetes_adaptor,
-                        'physical_cluster_uid_fence',
-                        side_effect=lambda *_args, **_kwargs: _physical_fence(
-                        )), mock.patch.object(manager,
-                                              '_scale_up_one_locked',
-                                              side_effect=accept_first):
-        receipt = manager.accept_reserved_fill(plan)
-
-    assert launch_calls == 1
-    assert receipt.accepted == (reserved_fill_planner.AcceptedFillIntent(
-        plan.intents[0].idempotency_key, 97),)
-    assert [item.intent for item in receipt.deferred] == list(plan.intents[1:])
-    assert {item.reason for item in receipt.deferred
-           } == {reserved_fill_planner.DeferredFillReason.SUPERSEDED_POLICY}
-    assert not receipt.authority_current
-
-
-def test_partial_admission_reports_exact_prefix_and_every_tail() -> None:
-    manager = _manager()
-    plan = _plan((_snapshot('east-context', 'uid-east', 3),))
-    launch_results = [
-        replica_managers._ReplicaLaunchResult(  # pylint: disable=protected-access
-            replica_id=71,
-            planned_capacity=1,
-            funding=replica_managers._ReplicaLaunchFunding.ZERO_COST),  # pylint: disable=protected-access
-        None,
-    ]
-    with mock.patch.object(
-            replica_managers.serve_state,
-            'get_service_controller_owner',
-            return_value=_owner_record()), mock.patch.object(
-                replica_managers.serve_state,
-                'get_replica_infos',
-                return_value=[]), mock.patch.object(
-                    replica_managers.reserved_capacity_broker,
-                    'current_epoch',
-                    return_value=23), mock.patch.object(
-                        replica_managers.kubernetes_adaptor,
-                        'physical_cluster_uid_fence',
-                        side_effect=lambda *args, **kwargs: _physical_fence(
-                        )), mock.patch.object(manager,
-                                              '_scale_up_one_locked',
-                                              side_effect=launch_results):
-        receipt = manager.accept_reserved_fill(plan)
-
-    receipt.validate_for_plan(plan)
-    assert receipt.accepted == (reserved_fill_planner.AcceptedFillIntent(
-        plan.intents[0].idempotency_key, 71),)
-    assert [item.intent for item in receipt.deferred] == list(plan.intents[1:])
-    assert {item.reason for item in receipt.deferred} == {
-        reserved_fill_planner.DeferredFillReason.ADMISSION_SEQUENCE_CHANGED
-    }
-    assert not receipt.authority_current
-
-
-def test_changed_epoch_after_prefix_marks_authority_stale() -> None:
-    manager = _manager()
-    plan = _plan((_snapshot('east-context', 'uid-east', 2),))
-    accepted = replica_managers._ReplicaLaunchResult(
-        replica_id=81,
-        planned_capacity=1,
-        funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)
-    with mock.patch.object(
-            replica_managers.serve_state,
-            'get_service_controller_owner',
-            return_value=_owner_record()), mock.patch.object(
-                replica_managers.serve_state,
-                'get_replica_infos',
-                return_value=[]), mock.patch.object(
-                    replica_managers.reserved_capacity_broker,
-                    'current_epoch',
-                    side_effect=(23, 24)), mock.patch.object(
-                        replica_managers.kubernetes_adaptor,
-                        'physical_cluster_uid_fence',
-                        side_effect=lambda *args, **kwargs: _physical_fence(
-                        )), mock.patch.object(manager,
-                                              '_scale_up_one_locked',
-                                              side_effect=(accepted, None)):
-        receipt = manager.accept_reserved_fill(plan)
-
-    assert receipt.accepted[0].replica_id == 81
-    assert [item.intent for item in receipt.deferred] == [plan.intents[1]]
-    assert receipt.deferred[0].reason is (
-        reserved_fill_planner.DeferredFillReason.CHANGED_EPOCH)
-    assert not receipt.authority_current
-
-
-def test_owner_mismatch_defers_without_provider_preflight() -> None:
-    manager = _manager()
-    plan = _plan((_snapshot('east-context', 'uid-east', 2),))
-    with mock.patch.object(
-            replica_managers.serve_state,
-            'get_service_controller_owner',
-            return_value=_owner_record(controller_pid=99)), mock.patch.object(
-                replica_managers.kubernetes_adaptor,
-                'physical_cluster_uid_fence') as physical_fence:
-        receipt = manager.accept_reserved_fill(plan)
-
-    physical_fence.assert_not_called()
-    assert not receipt.accepted
-    assert len(receipt.deferred) == len(plan.intents)
-    assert {item.reason for item in receipt.deferred
-           } == {reserved_fill_planner.DeferredFillReason.LOST_OWNER}
-    assert not receipt.authority_current
-
-
-def test_zero_headroom_skips_preflight_but_partial_headroom_preflights_all(
-) -> None:
-    physical_manager = _manager(maximum=2)
-    physical_plan = _plan((_snapshot('east-context', 'uid-east', 2),))
-    occupying = [
-        SimpleNamespace(replica_id=index, is_terminal=False, planned_capacity=1)
-        for index in (1, 2)
-    ]
-    with mock.patch.object(
-            replica_managers.serve_state,
-            'get_service_controller_owner',
-            return_value=_owner_record()), mock.patch.object(
-                replica_managers.serve_state,
-                'get_replica_infos',
-                return_value=occupying), mock.patch.object(
-                    replica_managers.kubernetes_adaptor,
-                    'physical_cluster_uid_fence') as physical_fence:
-        receipt = physical_manager.accept_reserved_fill(physical_plan)
-    physical_fence.assert_not_called()
-    assert {item.reason for item in receipt.deferred} == {
-        reserved_fill_planner.DeferredFillReason.MAX_REPLICAS_EXHAUSTED
-    }
-
-    logical_manager = _manager(maximum=3, logical=True)
-    logical_plan = _plan(
-        (_snapshot('east-context', 'uid-east', 1, accelerator_count=2),),
-        capacity_unit=reserved_fill_planner.FillCapacityUnit.LOGICAL)
-    with mock.patch.object(
-            replica_managers.serve_state,
-            'get_service_controller_owner',
-            return_value=_owner_record()), mock.patch.object(
-                replica_managers.serve_state,
-                'get_replica_infos',
-                return_value=[
-                    SimpleNamespace(replica_id=1,
-                                    is_terminal=False,
-                                    planned_capacity=2)
-                ]), mock.patch.object(
-                    replica_managers.reserved_capacity_broker,
-                    'current_epoch',
-                    return_value=23), mock.patch.object(
-                        replica_managers.kubernetes_adaptor,
-                        'physical_cluster_uid_fence') as physical_fence:
-        receipt = logical_manager.accept_reserved_fill(logical_plan)
-    physical_fence.assert_called_once_with('east-context',
-                                           'uid-east',
-                                           wait_for_initializer=False)
-    assert receipt.deferred[0].reason is (
-        reserved_fill_planner.DeferredFillReason.MAX_REPLICAS_EXHAUSTED)
-
-
-@pytest.mark.parametrize('cleanup_status', [
-    serve_state.ReplicaStatus.SHUTTING_DOWN,
-    serve_state.ReplicaStatus.FAILED_CLEANUP,
-])
-def test_cleanup_unproven_drainer_still_consumes_service_headroom(
-        cleanup_status) -> None:
-    manager = _manager(maximum=1)
-    plan = _plan((_snapshot('east-context', 'uid-east', 1),))
-    down_status = (common_utils.ProcessStatus.RUNNING
-                   if cleanup_status is serve_state.ReplicaStatus.SHUTTING_DOWN
-                   else common_utils.ProcessStatus.FAILED)
-    drainer = SimpleNamespace(
-        replica_id=1,
-        is_terminal=True,
-        status=cleanup_status,
-        status_property=SimpleNamespace(sky_down_status=down_status),
-        planned_capacity=1)
-    with mock.patch.object(
-            replica_managers.serve_state,
-            'get_service_controller_owner',
-            return_value=_owner_record()), mock.patch.object(
-                replica_managers.serve_state,
-                'get_replica_infos',
-                return_value=[drainer]), mock.patch.object(
-                    replica_managers.kubernetes_adaptor,
-                    'physical_cluster_uid_fence') as physical_fence:
-        receipt = manager.accept_reserved_fill(plan)
-
-    physical_fence.assert_not_called()
-    assert receipt.deferred[0].reason is (
-        reserved_fill_planner.DeferredFillReason.MAX_REPLICAS_EXHAUSTED)
-
-
-def test_cleanup_proven_terminal_row_releases_service_headroom() -> None:
-    manager = _manager(maximum=1)
-    plan = _plan((_snapshot('east-context', 'uid-east', 1),))
-    cleaned = SimpleNamespace(
-        replica_id=1,
-        is_terminal=True,
-        status=serve_state.ReplicaStatus.FAILED,
-        status_property=SimpleNamespace(
-            sky_down_status=common_utils.ProcessStatus.SUCCEEDED),
-        planned_capacity=1)
-
-    with mock.patch.object(replica_managers.serve_state,
-                           'get_replica_infos',
-                           return_value=[cleaned]):
-        headroom, infos, used_ids = (
-            manager._reserved_fill_fleet_headroom_locked(plan))
-
-    assert headroom == 1
-    assert infos == [cleaned]
-    assert used_ids == {1}
-
-
 def test_same_allocation_drainer_is_debited_until_cleanup_proven() -> None:
     snapshot = _snapshot('east-context', 'uid-east', 1)
     allocation = reserved_fill_planner.AuthenticatedAllocationMap.create(
@@ -1294,40 +769,6 @@ def test_committed_fill_debits_do_not_coalesce_across_allocations() -> None:
     assert len(debits) == 2
     with pytest.raises(ValueError, match='different authenticated'):
         _plan((snapshot,), committed_fill_debits=debits)
-
-
-def test_stale_observation_is_locally_deferred_after_parallel_preflight(
-) -> None:
-    manager = _manager()
-    stale = _snapshot('east-context',
-                      'uid-east',
-                      1,
-                      valid_until=time.time() - 1.0)
-    plan = _plan((stale,))
-    with mock.patch.object(
-            replica_managers.serve_state,
-            'get_service_controller_owner',
-            return_value=_owner_record()), mock.patch.object(
-                replica_managers.serve_state,
-                'get_replica_infos',
-                return_value=[]), mock.patch.object(
-                replica_managers.reserved_capacity_broker,
-                'current_epoch',
-                return_value=23), mock.patch.object(
-                    replica_managers.kubernetes_adaptor,
-                    'physical_cluster_uid_fence',
-                    side_effect=lambda *_args, **_kwargs: _physical_fence()), \
-            mock.patch.object(
-                        replica_managers.provider_phase,
-                        'try_provider_phase',
-                        wraps=replica_managers.provider_phase.
-                        try_provider_phase) as provider_admission:
-        receipt = manager.accept_reserved_fill(plan)
-
-    provider_admission.assert_called_once()
-    assert receipt.deferred[0].reason is (
-        reserved_fill_planner.DeferredFillReason.STALE_OBSERVATION)
-    assert not receipt.authority_current
 
 
 def test_rejects_a_tampered_typed_plan_at_boundary() -> None:

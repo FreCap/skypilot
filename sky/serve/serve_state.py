@@ -24,6 +24,7 @@ from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite
 
+from sky import global_user_state_schema
 from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.serve import capacity_admission
@@ -50,6 +51,7 @@ from sky.serve.lb_cutover_state import lb_cutover_kubernetes_guard as _lb_guard
 from sky.serve.serve_statuses import ReplicaStatus
 from sky.serve.serve_statuses import ServiceStatus
 from sky.server.requests import postgres_schema as request_postgres_schema
+from sky.skylet import constants as skylet_constants
 from sky.utils import common_utils
 from sky.utils import locks
 from sky.utils import yaml_utils
@@ -64,6 +66,7 @@ if typing.TYPE_CHECKING:
 
     from sky.serve import demand_state
     from sky.serve import kubernetes_identity
+    from sky.serve import ordinary_launch_binding
     from sky.serve import paid_retirement
     from sky.serve import placement_contract_normalization
     from sky.serve import replica_managers
@@ -113,6 +116,8 @@ _SERVE038_SERVICE_COLUMN_NAMES = frozenset(
     column.name
     for column in resource_action_m4_state_schema.service_candidate_columns())
 _POST_SERVE037_SERVICE_COLUMN_NAMES = frozenset({
+    'owner_user_id',
+    'owner_user_name',
     'controller_incarnation',
     'controller_owner_epoch',
     'ordinary_launch_binding_capable',
@@ -352,10 +357,14 @@ def service_lifecycle_epoch_matches(service_name: str, epoch: int) -> bool:
     return row is not None and int(row[0]) == epoch
 
 
-def _lifecycle_epoch_matches_in_session(session: orm.Session, service_name: str,
-                                        epoch: int | None) -> bool:
+def _lifecycle_epoch_matches_in_session(
+    session: orm.Session | sqlalchemy.engine.Connection,
+    service_name: str,
+    epoch: int | None,
+) -> bool:
     """Lock and validate a lifecycle fence row inside a mutation txn."""
-    is_postgres = (session.bind is not None and session.bind.dialect.name
+    bind = session.bind if isinstance(session, orm.Session) else session
+    is_postgres = (bind is not None and bind.dialect.name
                    == db_utils.SQLAlchemyDialect.POSTGRESQL.value)
     if epoch is None and not is_postgres:
         # Compatibility for old direct/unit-test callers. Production lifecycle
@@ -406,6 +415,10 @@ class OrphanedVersionRecordsError(RuntimeError):
 
 class MalformedReplicaResourceActionIdentityError(RuntimeError):
     """A replica row has an unsafe partial resource-action identity."""
+
+
+class ServiceOwnerAuthorityError(RuntimeError):
+    """The immutable service launch tenant cannot be safely established."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -804,6 +817,8 @@ def add_service(
         service_hash: str | None = None,
         lifecycle_epoch: int | None = None,
         resource_scope: str | None = None,
+        owner_user_id: str | None = None,
+        owner_user_name: str | None = None,
         created_by: str | None = None,
         submitted_yaml_content: str | None = None,
         placement_catalog: dict[str, Any] | None = None,
@@ -838,6 +853,21 @@ def add_service(
          controller_job_projection, controller_work_cache,
          worker_placement_projections))
     engine = _db_manager.get_engine()
+    if owner_user_id is None:
+        owner_user_id = os.environ.get(skylet_constants.USER_ID_ENV_VAR)
+    if owner_user_name is None:
+        owner_user_name = os.environ.get(skylet_constants.USER_ENV_VAR)
+    if not common_utils.is_valid_user_hash(owner_user_id):
+        raise ValueError('Service owner_user_id is invalid.')
+    owner_columns_available = {'owner_user_id', 'owner_user_name'} <= {
+        column['name']
+        for column in sqlalchemy.inspect(engine).get_columns('services')
+    }
+    if not isinstance(owner_user_name, str) or not owner_user_name:
+        raise ValueError('Service owner_user_name is invalid.')
+    if (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value and
+            not owner_columns_available):
+        raise RuntimeError('Serve055 owner authority is not installed.')
     projection_columns_available = _require_projection_columns_if_nonnull(
         engine, controller_job_projection, controller_work_cache,
         worker_placement_projections)
@@ -946,6 +976,10 @@ def add_service(
                     controller_ip=controller_ip,
                     hash=(str(uuid.uuid4())
                           if service_hash is None else service_hash),
+                    **({
+                        'owner_user_id': owner_user_id,
+                        'owner_user_name': owner_user_name,
+                    } if owner_columns_available else {}),
                     lifecycle_epoch=lifecycle_epoch,
                     resource_scope=resource_scope,
                     entrypoint=entrypoint,
@@ -1037,6 +1071,84 @@ def add_service(
                 return False
         raise RuntimeError('Unexpected database error') from e
     return True
+
+
+def attest_service_owner_user_id(
+    authority: 'ordinary_launch_binding.ControllerBindingAuthority',
+    frozen_user_id: str,
+    frozen_user_name: str,
+) -> None:
+    """Attest one retained service owner under the exact controller fence."""
+    if not common_utils.is_valid_user_hash(frozen_user_id):
+        raise ServiceOwnerAuthorityError(
+            'Controller has no valid frozen service owner identity.')
+    if not isinstance(frozen_user_name, str) or not frozen_user_name:
+        raise ServiceOwnerAuthorityError(
+            'Controller has no valid frozen service owner name.')
+    engine = _db_manager.get_engine()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ServiceOwnerAuthorityError(
+            'Service owner attestation requires central PostgreSQL.')
+    with _replica_launch_authority_write_session(
+            authority.service_name) as (_, session):
+        lifecycle = session.execute(
+            sqlalchemy.select(service_lifecycle_fences_table).where(
+                service_lifecycle_fences_table.c.name == authority.service_name
+            ).with_for_update()).mappings().one_or_none()
+        service = session.execute(
+            sqlalchemy.select(services_table).where(
+                services_table.c.name == authority.service_name).
+            with_for_update()).mappings().one_or_none()
+        if (lifecycle is None or service is None or
+                lifecycle['epoch'] != authority.service_lifecycle_epoch or
+                service['hash'] != authority.service_hash or
+                service['workspace'] != authority.service_workspace or
+                service['lifecycle_epoch'] != authority.service_lifecycle_epoch
+                or service['controller_pid'] != authority.controller_pid or
+                service['controller_ip'] != authority.controller_ip or
+                service['controller_incarnation']
+                != authority.controller_incarnation or
+                service['controller_owner_epoch']
+                != authority.controller_owner_epoch):
+            raise ServiceOwnerAuthorityError(
+                'Controller lost authority before service-owner attestation.')
+        user = session.execute(
+            sqlalchemy.select(global_user_state_schema.user_table.c.id).where(
+                global_user_state_schema.user_table.c.id == frozen_user_id).
+            with_for_update(read=True)).scalar_one_or_none()
+        if user != frozen_user_id:
+            raise ServiceOwnerAuthorityError(
+                'Frozen service owner no longer exists.')
+        current_owner = service['owner_user_id']
+        current_owner_name = service['owner_user_name']
+        if ((current_owner is None) != (current_owner_name is None)):
+            raise ServiceOwnerAuthorityError(
+                'Durable service owner identity is malformed.')
+        if (current_owner is not None and
+            (current_owner != frozen_user_id or
+             current_owner_name != frozen_user_name)):
+            raise ServiceOwnerAuthorityError(
+                'Frozen controller identity does not match service owner.')
+        if current_owner is None:
+            updated = session.execute(
+                sqlalchemy.update(services_table).where(
+                    services_table.c.name == authority.service_name,
+                    services_table.c.hash == authority.service_hash,
+                    services_table.c.lifecycle_epoch ==
+                    authority.service_lifecycle_epoch,
+                    services_table.c.controller_pid == authority.controller_pid,
+                    services_table.c.controller_ip == authority.controller_ip,
+                    services_table.c.controller_incarnation ==
+                    authority.controller_incarnation,
+                    services_table.c.controller_owner_epoch ==
+                    authority.controller_owner_epoch,
+                    services_table.c.owner_user_id.is_(None)).values(
+                        owner_user_id=frozen_user_id,
+                        owner_user_name=frozen_user_name))
+            if updated.rowcount != 1:
+                raise ServiceOwnerAuthorityError(
+                    'Service owner attestation lost its controller fence.')
+        session.commit()
 
 
 def set_service_workspace_if_owner(service_name: str, workspace: str,
@@ -1831,6 +1943,44 @@ def get_num_services(pool: bool | None = None) -> int:
         query = query.where(services_table.c.pool == int(pool))
     with orm.Session(engine) as session:
         return session.execute(query).fetchone()[0]
+
+
+def service_owner_attestation_transition_active() -> bool:
+    """Whether the schema can still admit a service without an owner.
+
+    User deletion must fail closed for the whole Serve055 transition.  A
+    per-user scan cannot close the race with an old writer that is still able
+    to insert a NULL owner tuple.
+    """
+    engine = _db_manager.get_engine()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return True
+    columns = {
+        str(column['name']): column
+        for column in sqlalchemy.inspect(engine).get_columns('services')
+    }
+    return any(name not in columns or columns[name].get('nullable') is not False
+               for name in ('owner_user_id', 'owner_user_name'))
+
+
+def get_service_names_owned_by_user_id(owner_user_id: str) -> list[str]:
+    """List durable services that prevent deletion of one owner identity."""
+    if not isinstance(owner_user_id, str) or not owner_user_id:
+        raise ValueError('Service owner user ID is invalid.')
+    engine = _db_manager.get_engine()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return []
+    if 'owner_user_id' not in {
+            column['name']
+            for column in sqlalchemy.inspect(engine).get_columns('services')
+    }:
+        return []
+    with orm.Session(engine) as session:
+        return list(
+            session.execute(
+                sqlalchemy.select(services_table.c.name).where(
+                    services_table.c.owner_user_id == owner_user_id).order_by(
+                        services_table.c.name)).scalars())
 
 
 def get_service_from_name(service_name: str) -> dict[str, Any] | None:
@@ -3610,6 +3760,148 @@ def _replica_write_may_touch_zero_cost_sequence(
             # global protocol->service->replica order.
             return True
     return False
+
+
+@dataclasses.dataclass(frozen=True)
+class StagedReservedFillReplica:
+    """Replica persistence staged on a caller-owned PostgreSQL transaction."""
+
+    replica_id: int
+    caller_info: 'replica_managers.ReplicaInfo'
+    persisted_info: 'replica_managers.ReplicaInfo'
+    already_committed: bool
+
+    def publish_after_commit(self) -> None:
+        """Publish database-assigned sequences after the outer commit."""
+        _publish_committed_zero_cost_sequences(
+            [(self.replica_id, self.caller_info)],
+            [(self.replica_id, self.persisted_info)])
+
+
+def add_replica_if_round_epoch(
+    service_name: str,
+    replica_id: int,
+    replica_info: 'replica_managers.ReplicaInfo',
+    *,
+    pool_key: str,
+    expected_epoch: int,
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+    expected_protocol_version: int = RESERVED_FILL_PROTOCOL_V1,
+    expected_service_generation: int | None = None,
+    expected_physical_cluster_uid: str | None = None,
+    expected_ordinary_zero_cost_admission_sequence: int | None = None,
+    expected_lease_token: int | None = None,
+    expected_actuation_mode: str | None = None,
+    actuation_lease: 'zero_cost_actuation.IntentLease | None' = None,
+) -> bool:
+    """Commit one historical protocol-v1 fill replica."""
+    if (expected_protocol_version != RESERVED_FILL_PROTOCOL_V1 or
+            expected_actuation_mode is not None or actuation_lease is not None):
+        raise ValueError('Standalone fill persistence is protocol-v1 only.')
+    engine = _db_manager.get_engine()
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+        return _persist_protocol_v1_sqlite(
+            engine,
+            service_name,
+            replica_id,
+            replica_info,
+            pool_key=pool_key,
+            expected_epoch=expected_epoch,
+            expected_service_hash=expected_service_hash,
+            expected_controller_owner=expected_controller_owner)
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise RuntimeError('Unsupported reserved-fill database dialect.')
+    if expected_lease_token is None:
+        return False
+    connection = engine.connect()
+    operation_error: BaseException | None = None
+    try:
+        transaction = connection.begin()
+        try:
+            staged = _stage_postgres_replica_if_round_epoch(
+                connection,
+                service_name,
+                replica_id,
+                replica_info,
+                pool_key=pool_key,
+                expected_epoch=expected_epoch,
+                expected_service_hash=expected_service_hash,
+                expected_controller_owner=expected_controller_owner,
+                expected_protocol_version=RESERVED_FILL_PROTOCOL_V1,
+                expected_service_generation=expected_service_generation,
+                expected_physical_cluster_uid=expected_physical_cluster_uid,
+                expected_ordinary_zero_cost_admission_sequence=(
+                    expected_ordinary_zero_cost_admission_sequence),
+                expected_lease_token=expected_lease_token)
+            if staged is None:
+                transaction.rollback()
+                return False
+            transaction.commit()
+        except BaseException as error:
+            if transaction.is_active:
+                try:
+                    transaction.rollback()
+                except BaseException as rollback_error:
+                    if not isinstance(error, Exception):
+                        raise error from rollback_error
+                    if not isinstance(rollback_error, Exception):
+                        raise
+                    raise
+            raise
+    except BaseException as error:
+        operation_error = error
+        raise
+    finally:
+        try:
+            connection.close()
+        except BaseException as close_error:
+            if (operation_error is not None and
+                    not isinstance(operation_error, Exception)):
+                raise operation_error from close_error
+            raise
+    staged.publish_after_commit()
+    return True
+
+
+def stage_protocol_v2_reserved_fill_replica_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    service_name: str,
+    replica_id: int,
+    replica_info: 'replica_managers.ReplicaInfo',
+    *,
+    pool_key: str,
+    expected_epoch: int,
+    expected_service_hash: str | None = None,
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+    expected_service_generation: int | None = None,
+    expected_physical_cluster_uid: str | None = None,
+    expected_ordinary_zero_cost_admission_sequence: int | None = None,
+    expected_lease_token: int | None = None,
+    expected_actuation_mode: str | None = None,
+    actuation_lease: 'zero_cost_actuation.IntentLease | None' = None,
+) -> StagedReservedFillReplica | None:
+    """Stage one protocol-v2 replica on the caller-owned transaction."""
+    if actuation_lease is None:
+        raise ValueError('Atomic request admission requires one protocol-v2 '
+                         'durable actuation lease.')
+    return _stage_postgres_replica_if_round_epoch(
+        connection,
+        service_name,
+        replica_id,
+        replica_info,
+        pool_key=pool_key,
+        expected_epoch=expected_epoch,
+        expected_service_hash=expected_service_hash,
+        expected_controller_owner=expected_controller_owner,
+        expected_protocol_version=RESERVED_FILL_PROTOCOL_V2,
+        expected_service_generation=expected_service_generation,
+        expected_physical_cluster_uid=expected_physical_cluster_uid,
+        expected_ordinary_zero_cost_admission_sequence=(
+            expected_ordinary_zero_cost_admission_sequence),
+        expected_lease_token=expected_lease_token,
+        expected_actuation_mode=expected_actuation_mode,
+        actuation_lease=actuation_lease)
 
 
 def _prelock_zero_cost_protocol_for_replica_write(
@@ -9256,7 +9548,7 @@ def get_recent_reserved_fill_writer_instances(
 
 
 def _reserved_fill_protocol_row_in_session(
-        session: orm.Session,
+        session: orm.Session | sqlalchemy.engine.Connection,
         engine: sqlalchemy.engine.Engine,
         *,
         for_update: bool = False) -> sqlalchemy.engine.Row:
@@ -11099,233 +11391,8 @@ def _reserved_fill_exact_location_snapshot(
         return None
 
 
-def _reserved_fill_v2_capacity_ledger_allows(
-    session: orm.Session,
-    service_name: str,
-    replica_id: int,
-    replica_info: 'replica_managers.ReplicaInfo',
-    allocation_map: dict[str, Any],
-    *,
-    pool_key: str,
-    expected_epoch: int,
-    expected_service_generation: int,
-    expected_physical_cluster_uid: str,
-    expected_ordinary_zero_cost_admission_sequence: int,
-    logical_replica_semantics: int,
-    spec_blob: bytes,
-) -> bool:
-    """Spend one authenticated fill slot against locked durable state.
-
-    The protocol sequencer and service owner are already locked by the caller.
-    Replica rows are the durable spending ledger: rows from this exact
-    authenticated allocation debit its post-observation physical slots, while
-    every capacity-owning row debits the service maximum.
-    """
-    try:
-        allocation = (reserved_fill_planner.AuthenticatedAllocationMap.
-                      from_mapping(allocation_map))
-        durable_spec = pickle.loads(spec_blob)
-    except Exception:  # pylint: disable=broad-except
-        # Both payloads are durable authority. Any decode failure closes this
-        # admission instead of selecting a permissive default.
-        return False
-    if not isinstance(durable_spec, service_spec.SkyServiceSpec):
-        return False
-    maximum = (durable_spec.max_replicas if durable_spec.max_replicas
-               is not None else durable_spec.min_replicas)
-    if type(maximum) is not int or maximum < 0:
-        return False
-    if (type(logical_replica_semantics) is not int or
-            logical_replica_semantics not in (0, 1)):
-        return False
-
-    current_identity = (
-        replica_info.reserved_fill_allocation_generation,
-        replica_info.reserved_fill_allocation_input_sha256,
-        replica_info.reserved_fill_allocation_claim_generation,
-        replica_info.reserved_fill_reconciliation_gate_generation,
-        replica_info.reserved_fill_reclaim_fleet_bundle_sha256,
-        replica_info.reserved_fill_reclaim_policy_revision,
-        replica_info.reserved_fill_reclaim_provider_inventory_sha256,
-    )
-    allocation_identity = (
-        allocation.allocation_generation,
-        allocation.allocation_input_sha256,
-        allocation.allocation_claim_generation,
-        allocation.reconciliation_gate_generation,
-        allocation.reclaim_fleet_bundle_sha256,
-        allocation.reclaim_policy_revision,
-        allocation.reclaim_provider_inventory_sha256,
-    )
-    if (current_identity != allocation_identity or
-            allocation.service_version != replica_info.version or
-            allocation.ordinary_zero_cost_admission_sequence_high_water
-            != expected_ordinary_zero_cost_admission_sequence):
-        return False
-    snapshots = {
-        snapshot.pool_key: snapshot for snapshot in allocation.pool_snapshots
-    }
-    snapshot = snapshots.get(pool_key)
-    candidate_location = _reserved_fill_exact_location_snapshot(replica_info)
-    if (snapshot is None or candidate_location is None or
-            snapshot.physical_cluster_uid != expected_physical_cluster_uid or
-            snapshot.service_generation != expected_service_generation or
-            snapshot.grant_epoch != expected_epoch or
-            snapshot.observation_generation
-            != replica_info.reserved_fill_observation_generation or
-            snapshot.observation_sequence
-            != replica_info.reserved_fill_observation_sequence or
-            snapshot.ordinary_zero_cost_admission_sequence
-            != expected_ordinary_zero_cost_admission_sequence or
-            candidate_location not in snapshot.locations or
-            candidate_location.region
-            != replica_info.reserved_fill_kubernetes_context or
-            candidate_location.accelerator_count != snapshot.broker_slot_width
-            or replica_info.reserved_fill is not True or
-            replica_info.is_zero_cost is not True):
-        return False
-    candidate_card = candidate_location.accelerator.casefold()
-    candidate_width = candidate_location.accelerator_count
-    candidate_projection_digest = (
-        replica_info.reserved_fill_worker_projection_sha256)
-    if (not isinstance(candidate_projection_digest, str) or
-            dict(snapshot.worker_projection_sha256_by_accelerator).get(
-                candidate_card) != candidate_projection_digest):
-        return False
-    capacity_unit = (reserved_fill_planner.FillCapacityUnit.LOGICAL
-                     if logical_replica_semantics == 1 else
-                     reserved_fill_planner.FillCapacityUnit.PHYSICAL)
-    candidate_capacity = capacity_unit.intent_cost(candidate_width)
-    if replica_info.planned_capacity != candidate_capacity:
-        return False
-
-    replica_rows = session.execute(
-        sqlalchemy.select(
-            replicas_table.c.replica_id,
-            replicas_table.c.replica_state_version,
-            replicas_table.c.replica_state,
-            replicas_table.c.status,
-            replicas_table.c.sky_down_status,
-            replicas_table.c.version,
-        ).where(replicas_table.c.service_name == service_name).order_by(
-            replicas_table.c.replica_id).with_for_update()).mappings().all()
-    current_capacity = 0
-    pool_debits: dict[str, int] = collections.defaultdict(int)
-    card_debits: dict[tuple[str, str], int] = collections.defaultdict(int)
-    seen_intent_keys: set[str] = set()
-    candidate_intent_key = replica_info.reserved_fill_intent_idempotency_key
-    for replica_row in replica_rows:
-        if replica_row['replica_id'] == replica_id:
-            return False
-        replica_state = replica_row['replica_state']
-        state_version = replica_row['replica_state_version']
-        if (type(state_version) is not int or type(replica_state) is not dict):
-            return False
-        try:
-            existing = _replica_from_state(state_version, replica_state)
-            sky_down_status = existing.status_property.sky_down_status
-            scalar_sky_down_status = (None if sky_down_status is None else
-                                      sky_down_status.value)
-            scalar_status = existing.status.value
-        except Exception:  # pylint: disable=broad-except
-            # Durable rows are authority. A row that cannot be decoded or
-            # reconciled with its query scalars cannot safely be omitted.
-            return False
-        if (existing.replica_id != replica_row['replica_id'] or
-                existing.version != replica_row['version'] or
-                scalar_status != replica_row['status'] or
-                scalar_sky_down_status != replica_row['sky_down_status']):
-            return False
-
-        intent_key = existing.reserved_fill_intent_idempotency_key
-        if intent_key is not None:
-            if (not isinstance(intent_key, str) or
-                    re.fullmatch(r'[0-9a-f]{64}', intent_key) is None or
-                    intent_key in seen_intent_keys or
-                    intent_key == candidate_intent_key):
-                return False
-            seen_intent_keys.add(intent_key)
-
-        may_consume = replica_managers.replica_may_consume_physical_capacity(
-            existing)
-        if may_consume:
-            if capacity_unit is (
-                    reserved_fill_planner.FillCapacityUnit.PHYSICAL):
-                current_capacity += 1
-            else:
-                planned_capacity = existing.planned_capacity
-                if type(planned_capacity) is not int or planned_capacity < 1:
-                    return False
-                current_capacity += planned_capacity
-
-        if existing.reserved_fill is not True:
-            continue
-        attribution = (
-            existing.reserved_fill_allocation_generation,
-            existing.reserved_fill_allocation_input_sha256,
-            existing.reserved_fill_allocation_claim_generation,
-            existing.reserved_fill_reconciliation_gate_generation,
-            existing.reserved_fill_reclaim_fleet_bundle_sha256,
-            existing.reserved_fill_reclaim_policy_revision,
-            existing.reserved_fill_reclaim_provider_inventory_sha256,
-            existing.reserved_fill_observation_generation,
-            existing.reserved_fill_observation_sequence,
-            existing.reserved_fill_intent_idempotency_key,
-        )
-        if all(value is None for value in attribution):
-            # Pre-authenticated fill rows still debit the service maximum, but
-            # cannot have consumed a slot from this allocation publication.
-            continue
-        if any(value is None for value in attribution):
-            return False
-        if attribution[:7] != allocation_identity or not may_consume:
-            continue
-        existing_pool_key = existing.reserved_fill_pool_key
-        if existing_pool_key is None:
-            return False
-        existing_snapshot = snapshots.get(existing_pool_key)
-        existing_location = _reserved_fill_exact_location_snapshot(existing)
-        if (existing_snapshot is None or existing_location is None or
-                existing.version != allocation.service_version or
-                existing_snapshot.service_generation
-                != existing.reserved_fill_service_generation or
-                existing_snapshot.physical_cluster_uid
-                != existing.reserved_fill_physical_cluster_uid or
-                existing_snapshot.observation_generation
-                != existing.reserved_fill_observation_generation or
-                existing_snapshot.observation_sequence
-                != existing.reserved_fill_observation_sequence or
-                existing_location not in existing_snapshot.locations or
-                existing_location.region
-                != existing.reserved_fill_kubernetes_context or
-                existing_location.accelerator_count
-                != existing_snapshot.broker_slot_width or
-                dict(existing_snapshot.worker_projection_sha256_by_accelerator
-                    ).get(existing_location.accelerator.casefold())
-                != existing.reserved_fill_worker_projection_sha256):
-            return False
-        existing_card = existing_location.accelerator.casefold()
-        # Allocation snapshots, CommittedFillDebit and exact-card feeds are
-        # deliberately denominated in physical backend slots even when the
-        # service maximum is logical GPU capacity.
-        pool_debits[existing_pool_key] += 1
-        card_debits[(existing_pool_key, existing_card)] += 1
-
-    if current_capacity + candidate_capacity > maximum:
-        return False
-    aggregate_limit = min(snapshot.free_slots, snapshot.grant,
-                          snapshot.edge_cap)
-    if pool_debits[pool_key] + 1 > aggregate_limit:
-        return False
-    exact_feed = snapshot.free_slots_by_accelerator
-    if exact_feed is None:
-        card_limit = snapshot.free_slots
-    else:
-        card_limit = dict(exact_feed).get(candidate_card, 0)
-    return card_debits[(pool_key, candidate_card)] + 1 <= card_limit
-
-
-def add_replica_if_round_epoch(
+def _stage_postgres_replica_if_round_epoch(
+    connection: sqlalchemy.engine.Connection,
     service_name: str,
     replica_id: int,
     replica_info: 'replica_managers.ReplicaInfo',
@@ -11334,34 +11401,26 @@ def add_replica_if_round_epoch(
     expected_epoch: int,
     expected_service_hash: str | None = None,
     expected_controller_owner: tuple[int | None, str | None] | None = None,
-    expected_protocol_version: int = RESERVED_FILL_PROTOCOL_V1,
+    expected_protocol_version: int,
     expected_service_generation: int | None = None,
     expected_physical_cluster_uid: str | None = None,
     expected_ordinary_zero_cost_admission_sequence: int | None = None,
     expected_lease_token: int | None = None,
     expected_actuation_mode: str | None = None,
     actuation_lease: 'zero_cost_actuation.IntentLease | None' = None,
-) -> bool:
-    """Persist a fill row iff every protocol, set, claim, and round fence holds.
-
-    Callers additionally take the global broker lock.  PostgreSQL production
-    callers advance the global lease epoch on that exact advisory-lock session
-    and pass ``expected_lease_token``; this transaction locks and validates the
-    token, closing silent advisory-session loss around a round's scan-to-publish
-    window.  In v2, the service generation is the cross-pool fence: any budget
-    repartition invalidates queued decisions from every edge before this insert
-    can land.
-    """
+) -> StagedReservedFillReplica | None:
+    """Stage a fill replica without committing the caller-owned transaction."""
+    if connection.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ValueError('Reserved-fill staging requires PostgreSQL.')
     if expected_protocol_version not in (RESERVED_FILL_PROTOCOL_V1,
                                          RESERVED_FILL_PROTOCOL_V2):
         raise ValueError('Expected reserved-fill protocol must be 1 or 2.')
-    if (expected_lease_token is not None and
-        (isinstance(expected_lease_token, bool) or
-         not isinstance(expected_lease_token, int) or
-         expected_lease_token <= 0)):
-        raise ValueError(
-            'Expected reserved-fill lease token must be a positive '
-            'integer.')
+    if (expected_lease_token is None or
+            isinstance(expected_lease_token, bool) or
+            not isinstance(expected_lease_token, int) or
+            expected_lease_token <= 0):
+        raise ValueError('Expected reserved-fill lease token must be a '
+                         'positive integer.')
     if (expected_ordinary_zero_cost_admission_sequence is not None and
         (type(expected_ordinary_zero_cost_admission_sequence) is not int or
          expected_ordinary_zero_cost_admission_sequence < 0)):
@@ -11372,466 +11431,360 @@ def add_replica_if_round_epoch(
          replica_info.zero_cost_materialization_sequence is not None)):
         raise ValueError('New zero-cost replica sequences must be assigned '
                          'by PostgreSQL.')
-    if expected_actuation_mode is not None:
+    if actuation_lease is None:
+        if (expected_protocol_version != RESERVED_FILL_PROTOCOL_V1 or
+                expected_actuation_mode is not None):
+            raise ValueError('Standalone staging is protocol-v1 only.')
+    elif (expected_protocol_version != RESERVED_FILL_PROTOCOL_V2 or
+          expected_actuation_mode
+          != zero_cost_actuation.ActuationMode.DURABLE_INTENT.value):
+        raise ValueError('Protocol-v2 staging requires one durable intent.')
+    engine = connection.engine
+    session = connection
+    transaction_replica_info = copy.deepcopy(replica_info)
+    transaction_infos = [(replica_id, transaction_replica_info)]
+    # The event sequencer is the first SQL mutex for every zero-cost
+    # insert, including typed fill.  Generic ordinary writers use the
+    # same order before lifecycle/service rows; taking this after the
+    # service owner would create a crossed-lock deadlock.
+    sequence_row = _lock_zero_cost_protocol_sequence_for_update(session)
+    protocol = _reserved_fill_protocol_row_in_session(session,
+                                                      engine,
+                                                      for_update=True)
+    if int(protocol.protocol_version) != expected_protocol_version:
+        return None
+    if expected_lease_token is not None:
+        lease = session.execute(
+            sqlalchemy.select(reserved_fill_lease_table.c.epoch).where(
+                reserved_fill_lease_table.c.id ==
+                1).with_for_update()).fetchone()
+        if (lease is None or int(lease.epoch) != expected_lease_token):
+            return None
+    gate_state = sequence_row['reconciliation_gate_state']
+    _lifecycle_epoch_matches_in_session(session, service_name, None)
+    owner = None
+    owner_required = (
+        expected_service_hash is not None or
+        expected_actuation_mode is not None or
+        (expected_protocol_version == RESERVED_FILL_PROTOCOL_V2 and
+         gate_state == pool_capacity_observation_schema.SEQUENCED_ACTIVE))
+    if owner_required:
+        owner = session.execute(
+            sqlalchemy.select(
+                services_table.c.hash, services_table.c.controller_pid,
+                services_table.c.controller_ip,
+                services_table.c.current_version,
+                services_table.c.logical_replica_semantics,
+                services_table.c.status, services_table.c.resource_scope,
+                services_table.c.reserved_fill_actuation_mode).where(
+                    services_table.c.name ==
+                    service_name).with_for_update()).fetchone()
+        if owner is None:
+            return None
+        if expected_service_hash is not None and (
+                owner[0] != expected_service_hash or
+            (expected_controller_owner is not None and
+             (owner[1], owner[2]) != expected_controller_owner)):
+            return None
+        if (expected_actuation_mode is not None and
+                owner[7] != expected_actuation_mode):
+            return None
+    replica_record_id: uuid.UUID | None = None
+    actuation_already_committed = False
+    if actuation_lease is not None:
         try:
-            actuation_mode = zero_cost_actuation.ActuationMode(
-                expected_actuation_mode)
-        except ValueError as error:
-            raise ValueError('Expected actuation mode is invalid.') from error
-        if ((actuation_lease is None)
-                != (actuation_mode
-                    is zero_cost_actuation.ActuationMode.DIRECT_REPLICA)):
-            raise ValueError('Durable actuation mode requires one exact lease; '
-                             'direct mode forbids a lease.')
-    elif actuation_lease is not None:
-        raise ValueError('An actuation lease requires an expected mode.')
-    durable_intent_handoff = actuation_lease is not None
-    engine = _db_manager.get_engine()
-    if engine.dialect.name != db_utils.SQLAlchemyDialect.SQLITE.value:
-        # A PostgreSQL fill persist is safe only when its caller minted the
-        # token on the exact session holding the advisory broker lock.  Lock
-        # auto-detection deliberately has a FileLock fallback, so enforcing
-        # this at the transaction boundary is essential: a transient
-        # detection failure must not turn a production persist into the
-        # historical tokenless SQLite path.
-        if expected_lease_token is None:
-            return False
-        caller_infos = [(replica_id, replica_info)]
-        transaction_replica_info = copy.deepcopy(replica_info)
-        transaction_infos = [(replica_id, transaction_replica_info)]
-        with orm.Session(engine) as session:
-            # The event sequencer is the first SQL mutex for every zero-cost
-            # insert, including typed fill.  Generic ordinary writers use the
-            # same order before lifecycle/service rows; taking this after the
-            # service owner would create a crossed-lock deadlock.
-            sequence_row = _lock_zero_cost_protocol_sequence_for_update(session)
-            protocol = _reserved_fill_protocol_row_in_session(session,
-                                                              engine,
-                                                              for_update=True)
-            if int(protocol.protocol_version) != expected_protocol_version:
-                session.rollback()
-                return False
-            if expected_lease_token is not None:
-                lease = session.execute(
-                    sqlalchemy.select(reserved_fill_lease_table.c.epoch).where(
-                        reserved_fill_lease_table.c.id ==
-                        1).with_for_update()).fetchone()
-                if (lease is None or int(lease.epoch) != expected_lease_token):
-                    session.rollback()
-                    return False
-            gate_state = sequence_row['reconciliation_gate_state']
-            _lifecycle_epoch_matches_in_session(session, service_name, None)
-            owner = None
-            owner_required = (
-                expected_service_hash is not None or
-                expected_actuation_mode is not None or
-                (expected_protocol_version == RESERVED_FILL_PROTOCOL_V2 and
-                 gate_state
-                 == pool_capacity_observation_schema.SEQUENCED_ACTIVE))
-            if owner_required:
-                owner = session.execute(
-                    sqlalchemy.select(
-                        services_table.c.hash, services_table.c.controller_pid,
-                        services_table.c.controller_ip,
-                        services_table.c.current_version,
-                        services_table.c.logical_replica_semantics,
-                        services_table.c.status,
-                        services_table.c.resource_scope,
-                        services_table.c.reserved_fill_actuation_mode).where(
-                            services_table.c.name ==
-                            service_name).with_for_update()).fetchone()
-                if owner is None:
-                    session.rollback()
-                    return False
-                if expected_service_hash is not None and (
-                        owner[0] != expected_service_hash or
-                    (expected_controller_owner is not None and
-                     (owner[1], owner[2]) != expected_controller_owner)):
-                    session.rollback()
-                    return False
-                if (expected_actuation_mode is not None and
-                        owner[7] != expected_actuation_mode):
-                    session.rollback()
-                    return False
-            spec_blob: bytes | None = None
-            logical_replica_semantics: int | None = None
-            if (expected_protocol_version == RESERVED_FILL_PROTOCOL_V2 and
-                    gate_state
-                    == pool_capacity_observation_schema.SEQUENCED_ACTIVE):
-                assert owner is not None
-                if (not isinstance(expected_service_hash, str) or
-                        not expected_service_hash or
-                        owner[6] != expected_service_hash or owner[5] in {
-                            status.value for status in
-                            ServiceStatus.replica_launch_blocking_statuses()
-                        }):
-                    session.rollback()
-                    return False
-                current_version = owner[3]
-                logical_replica_semantics = owner[4]
-                if (type(current_version) is not int or current_version < 1 or
-                        transaction_replica_info.version != current_version):
-                    session.rollback()
-                    return False
-                spec_row = session.execute(
-                    sqlalchemy.select(version_specs_table.c.spec).where(
-                        version_specs_table.c.service_name == service_name,
-                        version_specs_table.c.version == current_version,
-                        version_specs_table.c.yaml_content.isnot(None),
-                        version_specs_table.c.quarantined_at.is_(None),
-                        version_specs_table.c.retired_at.is_(None),
-                    ).with_for_update(read=True)).fetchone()
-                if spec_row is None or spec_row[0] is None:
-                    session.rollback()
-                    return False
-                spec_blob = spec_row[0]
-            row = session.execute(
-                sqlalchemy.select(
-                    reserved_fill_rounds_table.c.epoch,
-                    reserved_fill_rounds_table.c.fence_pending,
-                    reserved_fill_rounds_table.c.protocol_version,
-                    reserved_fill_rounds_table.c.claim_generations).where(
-                        reserved_fill_rounds_table.c.pool_key ==
-                        pool_key).with_for_update(read=True)).fetchone()
-            if (row is not None and
-                ((not durable_intent_handoff and
-                  int(row.epoch) != expected_epoch) or bool(row.fence_pending)
-                 or int(row.protocol_version) != expected_protocol_version)):
-                session.rollback()
-                return False
-            if expected_protocol_version == RESERVED_FILL_PROTOCOL_V1:
-                # Preserve the v1 missing-round behavior: the carried protocol
-                # still fences activation, and no v2 decision can use it.
-                claim = session.execute(
-                    sqlalchemy.select(
-                        reserved_fill_claims_table.c.service_name).where(
-                            reserved_fill_claims_table.c.service_name ==
-                            service_name, reserved_fill_claims_table.c.pool_key
-                            == pool_key).with_for_update(read=True)).fetchone()
-                if claim is None:
-                    session.rollback()
-                    return False
-            else:
-                if ((row is None and not durable_intent_handoff) or
-                        expected_service_generation is None or
-                        expected_service_generation <= 0 or
-                        not expected_physical_cluster_uid):
-                    session.rollback()
-                    return False
-                if not durable_intent_handoff:
-                    assert row is not None
-                    try:
-                        round_generations = json.loads(row.claim_generations or
-                                                       '{}')
-                    except (TypeError, ValueError):
-                        session.rollback()
-                        return False
-                    if (round_generations.get(service_name)
-                            != expected_service_generation):
-                        session.rollback()
-                        return False
-                set_row = session.execute(
-                    sqlalchemy.select(reserved_fill_service_claim_sets_table).
-                    where(reserved_fill_service_claim_sets_table.c.service_name
-                          == service_name).with_for_update(
-                              read=True)).fetchone()
-                edge_rows = session.execute(
-                    sqlalchemy.select(reserved_fill_pool_claims_table).where(
-                        reserved_fill_pool_claims_table.c.service_name ==
-                        service_name).with_for_update(read=True)).fetchall()
-                matching = next(
-                    (edge for edge in edge_rows if edge.pool_key == pool_key),
-                    None)
-                transaction_location = _reserved_fill_exact_location_snapshot(
-                    transaction_replica_info)
-                transaction_accelerator = (
-                    None if transaction_location is None else
-                    transaction_location.accelerator.casefold())
-                if set_row is None:
-                    session.rollback()
-                    return False
-                current_service_generation = int(set_row.generation)
-                if (set_row.claim_set_state
-                        != RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2 or
-                    (not durable_intent_handoff and
-                     current_service_generation != expected_service_generation)
-                        or current_service_generation > int(
-                            protocol.claim_generation) or
-                        len(edge_rows) != int(set_row.edge_count) or any(
-                            int(edge.service_generation) !=
-                            current_service_generation for edge in edge_rows) or
-                        matching is None or matching.physical_cluster_uid
-                        != expected_physical_cluster_uid or
-                        transaction_replica_info.
-                        reserved_fill_service_generation
-                        != expected_service_generation or
-                        transaction_replica_info.
-                        reserved_fill_physical_cluster_uid
-                        != expected_physical_cluster_uid or
-                        not isinstance(transaction_accelerator, str)):
-                    session.rollback()
-                    return False
-                sequence_table = (pool_capacity_observation_schema.
-                                  protocol_state_sequence_table)
-                attribution = (
-                    transaction_replica_info.
-                    reserved_fill_allocation_generation,
-                    transaction_replica_info.
-                    reserved_fill_allocation_input_sha256,
-                    transaction_replica_info.
-                    reserved_fill_allocation_claim_generation,
-                    transaction_replica_info.
-                    reserved_fill_reconciliation_gate_generation,
-                    transaction_replica_info.
-                    reserved_fill_reclaim_fleet_bundle_sha256,
-                    transaction_replica_info.
-                    reserved_fill_reclaim_policy_revision,
-                    transaction_replica_info.
-                    reserved_fill_reclaim_provider_inventory_sha256,
-                    transaction_replica_info.
-                    reserved_fill_observation_generation,
-                    transaction_replica_info.reserved_fill_observation_sequence,
-                    transaction_replica_info.
-                    reserved_fill_intent_idempotency_key,
-                )
-                if gate_state == pool_capacity_observation_schema.LEGACY_ACTIVE:
-                    if (set_row.service_version is not None or
-                            any(edge.worker_projection_sha256_by_accelerator
-                                is not None for edge in edge_rows) or
-                            any(value is not None for value in attribution)):
-                        # A typed planner decision cannot bypass activation.
-                        session.rollback()
-                        return False
-                elif gate_state == (
-                        pool_capacity_observation_schema.SEQUENCED_ACTIVE):
-                    try:
-                        matching_projection_map = (
-                            _decode_reserved_fill_projection_digest_map(
-                                matching.
-                                worker_projection_sha256_by_accelerator,
-                                matching.accelerator_names))
-                    except ValueError:
-                        session.rollback()
-                        return False
-                    if (set_row.service_version
-                            != transaction_replica_info.version or
-                            matching_projection_map.get(transaction_accelerator)
-                            != transaction_replica_info.
-                            reserved_fill_worker_projection_sha256 or
-                            any(value is None for value in attribution)):
-                        # An old speculative decision cannot persist after the
-                        # one-way gate selects authenticated allocation maps.
-                        session.rollback()
-                        return False
-                    (allocation_generation, allocation_sha256,
-                     allocation_claim_generation, gate_generation,
-                     reclaim_fleet_bundle_sha256, reclaim_policy_revision,
-                     reclaim_provider_inventory_sha256, observation_generation,
-                     observation_sequence, intent_idempotency_key) = attribution
-                    if (type(allocation_generation) is not int or
-                            allocation_generation <= 0 or
-                            not isinstance(allocation_sha256, str) or
-                            re.fullmatch(r'[0-9a-f]{64}', allocation_sha256)
-                            is None or allocation_claim_generation
-                            != expected_service_generation or
-                            type(gate_generation) is not int or
-                            gate_generation <= 0 or
-                            not isinstance(reclaim_fleet_bundle_sha256, str) or
-                            re.fullmatch(r'[0-9a-f]{64}',
-                                         reclaim_fleet_bundle_sha256) is None or
-                            not isinstance(reclaim_policy_revision, str) or
-                            not reclaim_policy_revision or not isinstance(
-                                reclaim_provider_inventory_sha256, str) or
-                            re.fullmatch(
-                                r'[0-9a-f]{64}',
-                                reclaim_provider_inventory_sha256) is None or
-                            type(observation_generation) is not int or
-                            observation_generation <= 0 or
-                            type(observation_sequence) is not int or
-                            observation_sequence < 0 or
-                            not isinstance(intent_idempotency_key, str) or
-                            re.fullmatch(r'[0-9a-f]{64}',
-                                         intent_idempotency_key) is None):
-                        session.rollback()
-                        return False
-                    if (gate_generation
-                            != sequence_row['reconciliation_gate_generation'] or
-                            reclaim_fleet_bundle_sha256
-                            != sequence_row['reclaim_fleet_bundle_sha256'] or
-                            reclaim_policy_revision
-                            != sequence_row['reclaim_policy_revision'] or
-                            reclaim_provider_inventory_sha256 !=
-                            sequence_row['reclaim_provider_inventory_sha256']):
-                        session.rollback()
-                        return False
-                    allocation_table = (pool_capacity_observation_schema.
-                                        reserved_fill_service_allocation_table)
-                    allocation_row = session.execute(
-                        sqlalchemy.select(allocation_table).where(
-                            allocation_table.c.service_name ==
-                            service_name)).mappings().one_or_none()
-                    if (allocation_row is None or
-                        (not durable_intent_handoff and
-                         (allocation_row['allocation_generation']
-                          != allocation_generation or
-                          allocation_row['allocation_input_sha256']
-                          != allocation_sha256 or
-                          allocation_row['allocation_claim_generation']
-                          != allocation_claim_generation)) or
-                            allocation_row['allocation_gate_generation']
-                            != gate_generation):
-                        session.rollback()
-                        return False
-                    allocation_map = allocation_row['allocation_map']
-                    if (type(allocation_map) is not dict or allocation_map.get(
-                            'ordinary_zero_cost_admission_sequence_high_water')
-                            != expected_ordinary_zero_cost_admission_sequence or
-                            allocation_map.get('reconciliation_gate_generation')
-                            != gate_generation or
-                            allocation_map.get('reclaim_fleet_bundle_sha256')
-                            != reclaim_fleet_bundle_sha256 or
-                            allocation_map.get('reclaim_policy_revision')
-                            != reclaim_policy_revision or allocation_map.get(
-                                'reclaim_provider_inventory_sha256')
-                            != reclaim_provider_inventory_sha256):
-                        session.rollback()
-                        return False
-                    provenance_table = (pool_capacity_observation_schema.
-                                        reserved_fill_round_observation_table)
-                    provenance = session.execute(
-                        sqlalchemy.select(provenance_table).where(
-                            provenance_table.c.pool_key ==
-                            pool_key)).mappings().one_or_none()
-                    if (not durable_intent_handoff and
-                        (provenance is None or
-                         provenance['observation_generation']
-                         != observation_generation or
-                         provenance['observation_sequence']
-                         != observation_sequence)):
-                        session.rollback()
-                        return False
-                    observation_table = (pool_capacity_observation_schema.
-                                         demand_capacity_observations_v2_table)
-                    # SQLAlchemy exposes generated SQL functions dynamically.
-                    # pylint: disable-next=not-callable
-                    database_epoch = sqlalchemy.func.extract(
-                        'epoch', sqlalchemy.func.clock_timestamp())
-                    exact_observation = session.execute(
-                        sqlalchemy.select(observation_table).where(
-                            observation_table.c.pool_key == pool_key,
-                            observation_table.c.observation_generation ==
-                            observation_generation,
-                            observation_table.c.observation_sequence ==
-                            observation_sequence,
-                            observation_table.c.observation_status ==
-                            pool_capacity_observation_schema.SUCCESS,
-                            observation_table.c.valid_until >= database_epoch,
-                        ).with_for_update(read=True)).mappings().one_or_none()
-                    if (not durable_intent_handoff and
-                        (exact_observation is None or provenance is None or
-                         exact_observation['payload_sha256']
-                         != provenance['observation_payload_sha256'] or
-                         exact_observation['materialization_sequence']
-                         != provenance['observation_materialization_sequence']
-                         or exact_observation['ordinary_admission_sequence']
-                         != expected_ordinary_zero_cost_admission_sequence)):
-                        session.rollback()
-                        return False
+            replica_record_id = uuid.UUID(
+                transaction_replica_info.replica_record_id)
+            # Normalize the cross-subsystem lock order before the
+            # capacity-ledger replica scan: service -> intent ->
+            # replicas. Grant publication uses the same order.
+            actuation_already_committed = (
+                zero_cost_actuation.lock_materialization_lease_in_connection(
+                    connection,
+                    actuation_lease,
+                    service_name=service_name,
+                    replica_id=replica_id,
+                    replica_record_id=replica_record_id))
+        except (TypeError, ValueError,
+                zero_cost_actuation.ZeroCostActuationError):
+            return None
+    if actuation_already_committed:
+        assert actuation_lease is not None
+        # This can only be a lost acknowledgement of the exact outer
+        # transaction. Historical partial materializations are not
+        # repaired here; the request layer must exact-match the
+        # existing association/request suffix before committing.
+        replica_row = session.execute(
+            sqlalchemy.select(replicas_table).where(
+                replicas_table.c.service_name == service_name,
+                replicas_table.c.replica_id ==
+                replica_id).with_for_update()).mappings().one_or_none()
+        if replica_row is None:
+            return None
+        try:
+            persisted_info = _replica_from_state(
+                replica_row['replica_state_version'],
+                replica_row['replica_state'])
+            committed_intent = (
+                zero_cost_actuation.committed_intent_for_replica_in_connection(
+                    connection,
+                    service_name=service_name,
+                    service_hash=(actuation_lease.intent.service_incarnation),
+                    replica_info=persisted_info))
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            return None
+        if (persisted_info.replica_record_id != str(replica_record_id) or
+                committed_intent is None or committed_intent.idempotency_key
+                != actuation_lease.intent.idempotency_key):
+            return None
+        return StagedReservedFillReplica(replica_id=replica_id,
+                                         caller_info=replica_info,
+                                         persisted_info=persisted_info,
+                                         already_committed=True)
+    if (expected_protocol_version == RESERVED_FILL_PROTOCOL_V2 and
+            gate_state == pool_capacity_observation_schema.SEQUENCED_ACTIVE):
+        assert owner is not None
+        if (not isinstance(expected_service_hash, str) or
+                not expected_service_hash or
+                owner[6] != expected_service_hash or owner[5] in {
+                    status.value for status in
+                    ServiceStatus.replica_launch_blocking_statuses()
+                }):
+            return None
+        current_version = owner[3]
+        if (type(current_version) is not int or current_version < 1 or
+                transaction_replica_info.version != current_version):
+            return None
+    row = session.execute(
+        sqlalchemy.select(reserved_fill_rounds_table.c.epoch,
+                          reserved_fill_rounds_table.c.fence_pending,
+                          reserved_fill_rounds_table.c.protocol_version,
+                          reserved_fill_rounds_table.c.claim_generations).where(
+                              reserved_fill_rounds_table.c.pool_key ==
+                              pool_key).with_for_update(read=True)).fetchone()
+    if (row is not None and
+        ((expected_protocol_version == RESERVED_FILL_PROTOCOL_V1 and
+          int(row.epoch) != expected_epoch) or bool(row.fence_pending) or
+         int(row.protocol_version) != expected_protocol_version)):
+        return None
+    if expected_protocol_version == RESERVED_FILL_PROTOCOL_V1:
+        # Preserve the v1 missing-round behavior: the carried protocol
+        # still fences activation, and no v2 decision can use it.
+        claim = session.execute(
+            sqlalchemy.select(reserved_fill_claims_table.c.service_name).where(
+                reserved_fill_claims_table.c.service_name == service_name,
+                reserved_fill_claims_table.c.pool_key ==
+                pool_key).with_for_update(read=True)).fetchone()
+        if claim is None:
+            return None
+    else:
+        if (expected_service_generation is None or
+                expected_service_generation <= 0 or
+                not expected_physical_cluster_uid):
+            return None
+        set_row = session.execute(
+            sqlalchemy.select(reserved_fill_service_claim_sets_table).where(
+                reserved_fill_service_claim_sets_table.c.service_name ==
+                service_name).with_for_update(read=True)).fetchone()
+        edge_rows = session.execute(
+            sqlalchemy.select(reserved_fill_pool_claims_table).where(
+                reserved_fill_pool_claims_table.c.service_name ==
+                service_name).with_for_update(read=True)).fetchall()
+        matching = next(
+            (edge for edge in edge_rows if edge.pool_key == pool_key), None)
+        transaction_location = _reserved_fill_exact_location_snapshot(
+            transaction_replica_info)
+        transaction_accelerator = (None if transaction_location is None else
+                                   transaction_location.accelerator.casefold())
+        if set_row is None:
+            return None
+        current_service_generation = int(set_row.generation)
+        if (set_row.claim_set_state != RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2
+                or
+                current_service_generation > int(protocol.claim_generation) or
+                len(edge_rows) != int(set_row.edge_count) or any(
+                    int(edge.service_generation) != current_service_generation
+                    for edge in edge_rows) or matching is None or
+                matching.physical_cluster_uid != expected_physical_cluster_uid
+                or transaction_replica_info.reserved_fill_service_generation
+                != expected_service_generation or
+                transaction_replica_info.reserved_fill_physical_cluster_uid
+                != expected_physical_cluster_uid or
+                not isinstance(transaction_accelerator, str)):
+            return None
+        sequence_table = (
+            pool_capacity_observation_schema.protocol_state_sequence_table)
+        attribution = (
+            transaction_replica_info.reserved_fill_allocation_generation,
+            transaction_replica_info.reserved_fill_allocation_input_sha256,
+            transaction_replica_info.reserved_fill_allocation_claim_generation,
+            transaction_replica_info.
+            reserved_fill_reconciliation_gate_generation,
+            transaction_replica_info.reserved_fill_reclaim_fleet_bundle_sha256,
+            transaction_replica_info.reserved_fill_reclaim_policy_revision,
+            transaction_replica_info.
+            reserved_fill_reclaim_provider_inventory_sha256,
+            transaction_replica_info.reserved_fill_observation_generation,
+            transaction_replica_info.reserved_fill_observation_sequence,
+            transaction_replica_info.reserved_fill_intent_idempotency_key,
+        )
+        if gate_state == pool_capacity_observation_schema.LEGACY_ACTIVE:
+            if (set_row.service_version is not None or
+                    any(edge.worker_projection_sha256_by_accelerator is not None
+                        for edge in edge_rows) or
+                    any(value is not None for value in attribution)):
+                # A typed planner decision cannot bypass activation.
+                return None
+        elif gate_state == (pool_capacity_observation_schema.SEQUENCED_ACTIVE):
+            try:
+                matching_projection_map = (
+                    _decode_reserved_fill_projection_digest_map(
+                        matching.worker_projection_sha256_by_accelerator,
+                        matching.accelerator_names))
+            except ValueError:
+                return None
+            if (set_row.service_version != transaction_replica_info.version or
+                    matching_projection_map.get(transaction_accelerator)
+                    != transaction_replica_info.
+                    reserved_fill_worker_projection_sha256 or
+                    any(value is None for value in attribution)):
+                # An old speculative decision cannot persist after the
+                # one-way gate selects authenticated allocation maps.
+                return None
+            (allocation_generation, allocation_sha256,
+             allocation_claim_generation, gate_generation,
+             reclaim_fleet_bundle_sha256, reclaim_policy_revision,
+             reclaim_provider_inventory_sha256, observation_generation,
+             observation_sequence, intent_idempotency_key) = attribution
+            if (type(allocation_generation) is not int or
+                    allocation_generation <= 0 or
+                    not isinstance(allocation_sha256, str) or
+                    re.fullmatch(r'[0-9a-f]{64}', allocation_sha256) is None or
+                    allocation_claim_generation != expected_service_generation
+                    or type(gate_generation) is not int or
+                    gate_generation <= 0 or
+                    not isinstance(reclaim_fleet_bundle_sha256, str) or
+                    re.fullmatch(r'[0-9a-f]{64}', reclaim_fleet_bundle_sha256)
+                    is None or not isinstance(reclaim_policy_revision, str) or
+                    not reclaim_policy_revision or
+                    not isinstance(reclaim_provider_inventory_sha256, str) or
+                    re.fullmatch(r'[0-9a-f]{64}',
+                                 reclaim_provider_inventory_sha256) is None or
+                    type(observation_generation) is not int or
+                    observation_generation <= 0 or
+                    type(observation_sequence) is not int or
+                    observation_sequence < 0 or
+                    not isinstance(intent_idempotency_key, str) or re.fullmatch(
+                        r'[0-9a-f]{64}', intent_idempotency_key) is None):
+                return None
+            if (gate_generation
+                    != sequence_row['reconciliation_gate_generation'] or
+                    reclaim_fleet_bundle_sha256
+                    != sequence_row['reclaim_fleet_bundle_sha256'] or
+                    reclaim_policy_revision
+                    != sequence_row['reclaim_policy_revision'] or
+                    reclaim_provider_inventory_sha256
+                    != sequence_row['reclaim_provider_inventory_sha256']):
+                return None
+            allocation_table = (pool_capacity_observation_schema.
+                                reserved_fill_service_allocation_table)
+            allocation_row = session.execute(
+                sqlalchemy.select(allocation_table).where(
+                    allocation_table.c.service_name ==
+                    service_name)).mappings().one_or_none()
+            if (allocation_row is None or
+                    allocation_row['allocation_gate_generation']
+                    != gate_generation):
+                return None
+            allocation_map = allocation_row['allocation_map']
+            if (type(allocation_map) is not dict or allocation_map.get(
+                    'ordinary_zero_cost_admission_sequence_high_water')
+                    != expected_ordinary_zero_cost_admission_sequence or
+                    allocation_map.get('reconciliation_gate_generation')
+                    != gate_generation or
+                    allocation_map.get('reclaim_fleet_bundle_sha256')
+                    != reclaim_fleet_bundle_sha256 or
+                    allocation_map.get('reclaim_policy_revision')
+                    != reclaim_policy_revision or
+                    allocation_map.get('reclaim_provider_inventory_sha256')
+                    != reclaim_provider_inventory_sha256):
+                return None
+            current_sequence = sequence_row['zero_cost_admission_sequence']
+            current_ordinary_sequence = sequence_row[
+                'ordinary_zero_cost_admission_sequence']
+            if (expected_ordinary_zero_cost_admission_sequence is None or
+                    type(current_sequence) is not int or current_sequence < 0 or
+                    type(current_ordinary_sequence) is not int or
+                    current_ordinary_sequence < 0 or
+                    current_ordinary_sequence > current_sequence or
+                    current_ordinary_sequence
+                    != expected_ordinary_zero_cost_admission_sequence or
+                    current_sequence >= 2**63 - 1):
+                return None
+            admission_sequence = current_sequence + 1
+            sequence_update = session.execute(
+                sqlalchemy.update(sequence_table).where(
+                    sequence_table.c.id == 1,
+                    sequence_table.c.zero_cost_admission_sequence ==
+                    current_sequence).values(
+                        zero_cost_admission_sequence=(admission_sequence)))
+            if sequence_update.rowcount != 1:
+                raise RuntimeError(
+                    'Reserved-fill admission sequence lost its locked '
+                    'compare-and-swap.')
+            transaction_replica_info.zero_cost_admission_sequence = (
+                admission_sequence)
+        else:
+            raise RuntimeError('Reserved-fill reconciliation gate is '
+                               'malformed at replica admission.')
+    materializations = (_stamp_zero_cost_replica_materializations_in_session(
+        session, transaction_infos))
+    _apply_zero_cost_sequence_assignments(transaction_infos,
+                                          materializations=materializations)
+    row_values = _reserved_fill_replica_row_values(
+        service_name,
+        replica_id,
+        transaction_replica_info,
+        pool_key=pool_key,
+        expected_protocol_version=expected_protocol_version)
+    if row_values is None:
+        return None
+    insert_stmt = _upsert_insert_func(engine)(replicas_table).values(
+        **row_values)
+    session.execute(insert_stmt)
+    if actuation_lease is not None:
+        try:
+            assert replica_record_id is not None
+            zero_cost_actuation.commit_lease_in_connection(
+                connection,
+                actuation_lease,
+                service_name=service_name,
+                replica_id=replica_id,
+                replica_record_id=replica_record_id,
+                replica_info=transaction_replica_info)
+        except (TypeError, ValueError,
+                zero_cost_actuation.ZeroCostActuationError):
+            return None
 
-                    current_sequence = sequence_row[
-                        'zero_cost_admission_sequence']
-                    current_ordinary_sequence = sequence_row[
-                        'ordinary_zero_cost_admission_sequence']
-                    if (expected_ordinary_zero_cost_admission_sequence is None
-                            or type(current_sequence) is not int or
-                            current_sequence < 0 or
-                            type(current_ordinary_sequence) is not int or
-                            current_ordinary_sequence < 0 or
-                            current_ordinary_sequence > current_sequence or
-                            current_ordinary_sequence
-                            != expected_ordinary_zero_cost_admission_sequence or
-                            current_sequence >= 2**63 - 1):
-                        session.rollback()
-                        return False
-                    assert spec_blob is not None
-                    assert logical_replica_semantics is not None
-                    if (not durable_intent_handoff and
-                            not _reserved_fill_v2_capacity_ledger_allows(
-                                session,
-                                service_name,
-                                replica_id,
-                                transaction_replica_info,
-                                allocation_map,
-                                pool_key=pool_key,
-                                expected_epoch=expected_epoch,
-                                expected_service_generation=(
-                                    expected_service_generation),
-                                expected_physical_cluster_uid=(
-                                    expected_physical_cluster_uid),
-                                expected_ordinary_zero_cost_admission_sequence=
-                                (expected_ordinary_zero_cost_admission_sequence
-                                ),
-                                logical_replica_semantics=(
-                                    logical_replica_semantics),
-                                spec_blob=spec_blob)):
-                        session.rollback()
-                        return False
-                    admission_sequence = current_sequence + 1
-                    sequence_update = session.execute(
-                        sqlalchemy.update(sequence_table).where(
-                            sequence_table.c.id == 1,
-                            sequence_table.c.zero_cost_admission_sequence ==
-                            current_sequence).values(
-                                zero_cost_admission_sequence=(
-                                    admission_sequence)))
-                    if sequence_update.rowcount != 1:
-                        raise RuntimeError(
-                            'Reserved-fill admission sequence lost its locked '
-                            'compare-and-swap.')
-                    transaction_replica_info.zero_cost_admission_sequence = (
-                        admission_sequence)
-                else:
-                    raise RuntimeError('Reserved-fill reconciliation gate is '
-                                       'malformed at replica admission.')
-            materializations = (
-                _stamp_zero_cost_replica_materializations_in_session(
-                    session, transaction_infos))
-            _apply_zero_cost_sequence_assignments(
-                transaction_infos, materializations=materializations)
-            row_values = _reserved_fill_replica_row_values(
-                service_name,
-                replica_id,
-                transaction_replica_info,
-                pool_key=pool_key,
-                expected_protocol_version=expected_protocol_version)
-            if row_values is None:
-                session.rollback()
-                return False
-            insert_stmt = _upsert_insert_func(engine)(replicas_table).values(
-                **row_values)
-            session.execute(insert_stmt)
-            if actuation_lease is not None:
-                try:
-                    replica_record_id = uuid.UUID(
-                        transaction_replica_info.replica_record_id)
-                    zero_cost_actuation.commit_lease_in_connection(
-                        session.connection(),
-                        actuation_lease,
-                        service_name=service_name,
-                        replica_id=replica_id,
-                        replica_record_id=replica_record_id,
-                        replica_info=transaction_replica_info)
-                except (TypeError, ValueError,
-                        zero_cost_actuation.ZeroCostActuationError):
-                    session.rollback()
-                    return False
-            session.commit()
-        _publish_committed_zero_cost_sequences(caller_infos, transaction_infos)
-        return True
-    # Protocol v2 belongs to the PostgreSQL central state path.  Keep v1's
-    # historical single-statement SQLite fence for local controllers.
-    if expected_protocol_version != RESERVED_FILL_PROTOCOL_V1:
-        return False
+    return StagedReservedFillReplica(replica_id=replica_id,
+                                     caller_info=replica_info,
+                                     persisted_info=transaction_replica_info,
+                                     already_committed=False)
+
+
+def _persist_protocol_v1_sqlite(
+    engine: sqlalchemy.engine.Engine,
+    service_name: str,
+    replica_id: int,
+    replica_info: 'replica_managers.ReplicaInfo',
+    *,
+    pool_key: str,
+    expected_epoch: int,
+    expected_service_hash: str | None,
+    expected_controller_owner: tuple[int | None, str | None] | None,
+) -> bool:
+    """Keep the historical local-controller protocol-v1 SQLite fence."""
+    expected_protocol_version = RESERVED_FILL_PROTOCOL_V1
     with orm.Session(engine) as session:
         _reserved_fill_protocol_row_in_session(session, engine)
         session.commit()

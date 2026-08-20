@@ -341,17 +341,14 @@ def test_endpoint_uses_derived_ids_distinct_handler_and_no_generic_retry(
     }
 
 
-def test_non_pool_endpoint_recomputes_profile_and_uses_distinct_handler(
+def test_non_pool_endpoint_routes_system_oom_through_shared_builder(
         monkeypatch: pytest.MonkeyPatch) -> None:
     launch_body = _launch_body(retry_until_up=True)
     profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
-        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
-        authorization_reference='paid-claim:svc:3',
+        ordinary_launch_binding.NonPoolLaunchProfileKind.SYSTEM_OOM_RECOVERY,
+        authorization_reference='system-oom:launch-nonce',
         authorization_generation=11,
-        authorization_payload={
-            'pool_key': 'paid-pool-a',
-            'claim_generation': 11,
-        })
+        authorization_payload={'launch_nonce': 'launch-nonce'})
     submission = server._NonPoolServeLaunchSubmission(
         submission_uuid=str(_SUBMISSION_UUID),
         profile_kind=profile.kind,
@@ -362,12 +359,12 @@ def test_non_pool_endpoint_recomputes_profile_and_uses_distinct_handler(
     association_id, request_id = server._derive_ordinary_launch_binding_ids(
         _SUBMISSION_UUID, auth_user.id, 'workspace-a')
     observed: dict[str, object] = {}
+    actual_build = server.non_pool_admission.build
 
-    async def _build_request_async(**kwargs):
-        observed.update(kwargs)
-        return types.SimpleNamespace(request_id=kwargs['request_id'],
-                                     request_body=kwargs['request_body'],
-                                     log_path=mock.Mock())
+    def _build(*args, **kwargs):
+        admission = actual_build(*args, **kwargs)
+        observed['admission'] = admission
+        return admission
 
     def _bind_request(request_task, identity):
         del request_task
@@ -395,20 +392,24 @@ def test_non_pool_endpoint_recomputes_profile_and_uses_distinct_handler(
         lambda *_args: (_ for _ in ()).throw(
             AssertionError('exact retry must use its stored '
                            'immutable profile')))
-    monkeypatch.setattr(server.executor, 'build_request_async',
-                        _build_request_async)
+    monkeypatch.setattr(server.non_pool_admission, 'build', _build)
     monkeypatch.setattr(server, '_bind_and_enqueue_non_pool_launch',
                         _bind_request)
 
     response = asyncio.run(server.non_pool_serve_launch(submission, request))
 
-    assert observed['request_id'] == request_id
-    assert observed['func'] is non_pool_launch_request.launch
-    assert observed['retryable'] is False
-    assert observed['should_enqueue'] is True
-    assert observed['request_body'].retry_until_up is True
-    assert observed['precondition'].request_id == request_id
-    assert observed['precondition'].association_id == association_id
+    built = observed['admission']
+    assert built.request.request_id == request_id
+    assert built.request.entrypoint is non_pool_launch_request.launch
+    assert built.request.retryable is False
+    assert built.request.should_enqueue is True
+    assert built.request.request_body.retry_until_up is True
+    assert built.request.precondition_type == 'ordinary-launch-binding.v1'
+    assert built.request.precondition_payload == {
+        'check_interval': 1,
+        'association_id': association_id,
+    }
+    assert built.request.precondition_deadline is None
     assert response.model_dump(mode='json') == {
         'submission_uuid': str(_SUBMISSION_UUID),
         'association_id': association_id,
@@ -416,6 +417,40 @@ def test_non_pool_endpoint_recomputes_profile_and_uses_distinct_handler(
         'launch_generation': 7,
         'created': False,
     }
+
+
+def test_non_pool_endpoint_rejects_reserved_fill_before_binding(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    launch_body = _launch_body()
+    profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+        authorization_reference='reserved-fill:' + 'e' * 64,
+        authorization_generation=8,
+        authorization_payload={'physical_cluster_uid': 'physical-uid-a'})
+    submission = server._NonPoolServeLaunchSubmission(
+        submission_uuid=str(_SUBMISSION_UUID),
+        profile_kind=profile.kind,
+        launch=launch_body)
+    request = types.SimpleNamespace(state=types.SimpleNamespace(
+        request_id='transport-attempt-id', auth_user=None))
+    build = mock.Mock()
+    bind = mock.Mock()
+    monkeypatch.setattr(server.serve_state,
+                        'get_service_config_recovery_identity',
+                        lambda _service_name: ('svc-hash', 'workspace-a'))
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'get_existing_non_pool_launch_profile',
+                        lambda _association_id: profile)
+    monkeypatch.setattr(server.non_pool_admission, 'build', build)
+    monkeypatch.setattr(server, '_bind_and_enqueue_non_pool_launch', bind)
+
+    with pytest.raises(fastapi.HTTPException) as raised:
+        asyncio.run(server.non_pool_serve_launch(submission, request))
+
+    assert raised.value.status_code == 409
+    assert 'require atomic replica/request admission' in raised.value.detail
+    build.assert_not_called()
+    bind.assert_not_called()
 
 
 def test_non_pool_endpoint_rejects_profile_claimed_by_controller_when_planner_disagrees(

@@ -168,9 +168,13 @@ def stream_response(request_id: server_common.RequestId[T] | None,
                                            logger=logger)
 
 
-def _check_container_image_api_support(dag: 'sky.Dag') -> None:
+def _check_container_image_api_support(
+    dag: 'sky.Dag',
+    remote_api_version: int | None = None,
+) -> None:
     """Fails clearly before serializing container_image to an old server."""
-    remote_api_version = versions.get_remote_api_version()
+    if remote_api_version is None:
+        remote_api_version = versions.get_remote_api_version()
     if (remote_api_version is None or remote_api_version
             >= server_constants.MIN_CONTAINER_IMAGES_API_VERSION):
         return
@@ -552,8 +556,30 @@ def validate(
             validation. This is only required when a admin policy is in use,
             see: https://docs.skypilot.co/en/latest/cloud-setup/policy.html
     """
-    _check_container_image_api_support(dag)
     remote_api_version = versions.get_remote_api_version()
+    _validate_dag_locally(dag,
+                          workdir_only=workdir_only,
+                          remote_api_version=remote_api_version)
+
+    dag_str = dag_utils.dump_dag_to_yaml_str(dag)
+    body = payloads.ValidateBody(dag=dag_str,
+                                 request_options=admin_policy_request_options)
+    response = server_common.make_authenticated_request(
+        'POST', '/validate', json=json.loads(body.model_dump_json()))
+    if response.status_code == 400:
+        _raise_exception_object_on_client(
+            exceptions.deserialize_exception(response.json().get('detail')))
+
+
+def _validate_dag_locally(
+    dag: 'sky.Dag',
+    *,
+    workdir_only: bool,
+    remote_api_version: int | None,
+) -> None:
+    """Apply client-side validation/version projection without HTTP."""
+    _check_container_image_api_support(dag,
+                                       remote_api_version=remote_api_version)
 
     def _omit(version: int) -> bool:
         return remote_api_version is None or remote_api_version < version
@@ -609,15 +635,6 @@ def validate(
                 resource._max_hourly_cost = None
             logger.debug('`max_hourly_cost` is ignored because the server '
                          'does not support it yet.')
-
-    dag_str = dag_utils.dump_dag_to_yaml_str(dag)
-    body = payloads.ValidateBody(dag=dag_str,
-                                 request_options=admin_policy_request_options)
-    response = server_common.make_authenticated_request(
-        'POST', '/validate', json=json.loads(body.model_dump_json()))
-    if response.status_code == 400:
-        _raise_exception_object_on_client(
-            exceptions.deserialize_exception(response.json().get('detail')))
 
 
 @usage_lib.entrypoint
@@ -863,6 +880,8 @@ def _prepared_launch_request_in_current_context(
     _file_mounts_blob_id: str | None = None,
     _extra_launch_context: dict[str, Any] | None = None,
     _include_credentials: bool = False,
+    _target_api_version: int | None = None,
+    _server_side_only: bool = False,
 ) -> Iterator[PreparedLaunchRequest]:
     """Yields a frozen launch while its preparation context remains active.
 
@@ -879,7 +898,8 @@ def _prepared_launch_request_in_current_context(
                                       'Please contact the SkyPilot team if you '
                                       'need this feature at slack.skypilot.co.')
 
-    remote_api_version = versions.get_remote_api_version()
+    remote_api_version = (_target_api_version if _target_api_version is not None
+                          else versions.get_remote_api_version())
     if wait_for is not None and (remote_api_version is None or
                                  remote_api_version < 13):
         logger.warning('wait_for is not supported in your API server. '
@@ -911,14 +931,16 @@ def _prepared_launch_request_in_current_context(
         idle_minutes_to_autostop=idle_minutes_to_autostop,
         down=down,
         dryrun=dryrun)
-    # The context deliberately spans the yield so launch submission observes
-    # the policy's temporary transport configuration.
+    policy_context = (contextlib.nullcontext(dag) if _server_side_only else
+                      admin_policy_utils.apply_and_use_config_in_current_request(
+                          dag,
+                          request_name=(request_names.AdminPolicyRequestName.
+                                        CLUSTER_LAUNCH),
+                          request_options=request_options,
+                          at_client_side=True))
+    # Public submission keeps policy transport overrides active through yield.
     # pylint: disable-next=contextmanager-generator-missing-cleanup
-    with admin_policy_utils.apply_and_use_config_in_current_request(
-            dag,
-            request_name=request_names.AdminPolicyRequestName.CLUSTER_LAUNCH,
-            request_options=request_options,
-            at_client_side=True) as dag:
+    with policy_context as dag:
         prepared_request = _freeze_launch_request(
             dag,
             cluster_name,
@@ -939,6 +961,8 @@ def _prepared_launch_request_in_current_context(
             _file_mounts_blob_id,
             _extra_launch_context,
             _include_credentials,
+            _target_api_version,
+            _server_side_only,
         )
         yield prepared_request
 
@@ -1000,6 +1024,48 @@ def prepare_launch_request(
         return prepared_request
 
 
+def prepare_launch_request_for_server_controller(
+    task: Union['sky.Task', 'sky.Dag'],
+    cluster_name: str,
+    *,
+    workspace: str,
+    retry_until_up: bool = False,
+    backend: Optional['backends.Backend'] = None,
+    optimize_target: common.OptimizeTarget = common.OptimizeTarget.COST,
+    no_setup: bool = False,
+    extra_launch_context: dict[str, Any] | None = None,
+) -> PreparedLaunchRequest:
+    """Freeze one server-local controller launch without HTTP or uploads."""
+    if not isinstance(workspace, str) or not workspace:
+        raise ValueError('Server controller workspace must be non-empty.')
+    with skypilot_config.local_active_workspace_ctx(
+            workspace), _prepared_launch_request_in_current_context(
+                task=task,
+                cluster_name=cluster_name,
+                retry_until_up=retry_until_up,
+                backend=backend,
+                optimize_target=optimize_target,
+                no_setup=no_setup,
+                _is_launched_by_sky_serve_controller=True,
+                _extra_launch_context=extra_launch_context,
+                _target_api_version=server_constants.API_VERSION,
+                _server_side_only=True) as prepared_request:
+        launch_body = prepared_request.body
+        if launch_body.override_skypilot_config_path is not None:
+            raise ValueError(
+                'Server controller launches cannot use a mutable config path.')
+        override_config = dict(launch_body.override_skypilot_config or {})
+        configured_workspace = override_config.get('active_workspace')
+        if (configured_workspace is not None and
+                configured_workspace != workspace):
+            raise ValueError('Server controller launch workspace conflicts '
+                             'with its service workspace.')
+        override_config['active_workspace'] = workspace
+        launch_body.override_skypilot_config = override_config
+        return PreparedLaunchRequest(
+            submitted_bytes=_canonical_launch_body_bytes(launch_body))
+
+
 def _freeze_launch_request(
     dag: 'sky.Dag',
     cluster_name: str,
@@ -1022,10 +1088,20 @@ def _freeze_launch_request(
     _file_mounts_blob_id: str | None = None,
     _extra_launch_context: dict[str, Any] | None = None,
     _include_credentials: bool = False,
+    _target_api_version: int | None = None,
+    _server_side_only: bool = False,
 ) -> PreparedLaunchRequest:
     """Freezes a launch DAG after high-level policy and option preparation."""
 
-    validate(dag, admin_policy_request_options=request_options)
+    if _server_side_only:
+        if _target_api_version is None:
+            raise ValueError(
+                'Server-side launch preparation requires a target API version.')
+        _validate_dag_locally(dag,
+                              workdir_only=False,
+                              remote_api_version=_target_api_version)
+    else:
+        validate(dag, admin_policy_request_options=request_options)
     # The flags have been applied to the task YAML and the backward
     # compatibility of admin policy has been handled. We should no longer use
     # these flags.
@@ -1091,6 +1167,9 @@ def _freeze_launch_request(
         # Caller (e.g. job controller) has a blob for this dag's file mounts,
         # skip the re-upload.
         file_mounts_blob_id = _file_mounts_blob_id
+    elif _server_side_only:
+        client_common.validate_no_local_inputs(dag)
+        file_mounts_blob_id = None
     else:
         dag, file_mounts_blob_id = client_common.upload_mounts_to_api_server(
             dag)
@@ -1104,11 +1183,22 @@ def _freeze_launch_request(
     # discard it anyway and makes the gating intent explicit.
     include_credentials = _include_credentials
     if include_credentials:
-        remote_api_version = versions.get_remote_api_version()
+        remote_api_version = (_target_api_version
+                              if _target_api_version is not None else
+                              versions.get_remote_api_version())
         if (remote_api_version is None or remote_api_version
                 < server_constants.MIN_LAUNCH_CREDENTIALS_API_VERSION):
             include_credentials = False
 
+    request_context = ({
+        'env_vars': {},
+        'entrypoint': '',
+        'entrypoint_command': '',
+        'using_remote_api_server': False,
+        'override_skypilot_config': {},
+        'override_skypilot_config_path': None,
+        'client_api_version': server_constants.API_VERSION,
+    } if _server_side_only else {})
     body = payloads.LaunchBody(
         task=dag_str,
         cluster_name=cluster_name,
@@ -1128,6 +1218,7 @@ def _freeze_launch_request(
         file_mounts_blob_id=file_mounts_blob_id,
         extra_launch_context=_extra_launch_context or {},
         include_credentials=include_credentials,
+        **request_context,
     )
 
     # Keep the submitted representation detached from both the source Dag and

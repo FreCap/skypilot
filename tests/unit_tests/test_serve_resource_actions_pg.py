@@ -12,6 +12,7 @@ import sqlalchemy
 from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
 
+from sky import global_user_state_schema
 from sky.serve import replica_managers
 from sky.serve import resource_action_m4_state_schema as m4_schema
 from sky.serve import resource_action_state_schema as action_schema
@@ -78,6 +79,8 @@ def empty_postgres(postgres_engine):
     with postgres_engine.begin() as connection:
         connection.exec_driver_sql('DROP SCHEMA public CASCADE')
         connection.exec_driver_sql('CREATE SCHEMA public')
+    global_user_state_schema.user_table.create(postgres_engine,
+                                               checkfirst=True)
     return postgres_engine
 
 

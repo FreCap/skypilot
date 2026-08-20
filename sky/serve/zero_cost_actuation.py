@@ -687,28 +687,17 @@ def committed_intent_matches_replica_in_connection(
         replica_info=replica_info) is not None
 
 
-def commit_lease_in_connection(
+def _lock_materialization_authority(
     connection: sqlalchemy.engine.Connection,
     lease: IntentLease,
     *,
     service_name: str,
-    replica_id: int,
-    replica_record_id: uuid.UUID,
-    replica_info: Any,
-) -> None:
-    """Transfer one pending debit to its replica in the caller transaction.
-
-    The caller has already inserted the replica row but has not committed.
-    Any mismatch raises, rolling that insert back with this transition.  This
-    is deliberately not exposed as a second transaction: there must be no
-    crash window in which both the intent and replica consume capacity.
-    """
+) -> tuple[Any, Mapping[str, Any]]:
+    """Lock and validate the common service/intent authority prefix."""
     _require_postgres(connection)
     if (not isinstance(lease, IntentLease) or
-            not isinstance(service_name, str) or not service_name or
-            not isinstance(replica_id, int) or isinstance(replica_id, bool) or
-            replica_id < 1 or not isinstance(replica_record_id, uuid.UUID)):
-        raise ValueError('Intent commit requires exact durable identities.')
+            not isinstance(service_name, str) or not service_name):
+        raise ValueError('Intent materialization authority is malformed.')
     now = connection.execute(
         sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
     service = connection.execute(
@@ -720,7 +709,7 @@ def commit_lease_in_connection(
         with_for_update()).mappings().one_or_none()
     if service is None or intent_row is None:
         raise ZeroCostActuationConflict(
-            'Actuation commit lost its service or intent authority.')
+            'Actuation materialization lost its service or intent authority.')
     try:
         owner = controller_transport.make_controller_owner_fingerprint(
             service['hash'], service['controller_pid'],
@@ -728,7 +717,8 @@ def commit_lease_in_connection(
     except (KeyError, TypeError, ValueError,
             controller_transport.ControllerOwnerError) as error:
         raise ZeroCostActuationConflict(
-            'Actuation commit found malformed controller authority.') from error
+            'Actuation materialization found malformed controller authority.'
+        ) from error
     if (service['pool'] != 0 or service['status'] in {
             status.value for status in
             serve_statuses.ServiceStatus.replica_launch_blocking_statuses()
@@ -745,14 +735,72 @@ def commit_lease_in_connection(
             service['reserved_fill_actuation_protocol_version']
             != PROTOCOL_VERSION):
         raise ZeroCostActuationConflict(
-            'Service actuation authority changed before replica commit.')
+            'Service actuation authority changed before materialization.')
     expected_values = _intent_values(
         lease.intent,
         service_name=service_name,
         service_lifecycle_epoch=lease.service_lifecycle_epoch,
         actuation_epoch=lease.actuation_epoch)
-    if (not _row_matches_values(intent_row, expected_values) or
-            intent_row['state'] != IntentState.ACTUATING.value or
+    if not _row_matches_values(intent_row, expected_values):
+        raise ZeroCostActuationConflict(
+            'Actuation intent no longer matches the leased authority.')
+    return now, intent_row
+
+
+def lock_materialization_lease_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    lease: IntentLease,
+    *,
+    service_name: str,
+    replica_id: int,
+    replica_record_id: uuid.UUID,
+) -> bool:
+    """Lock the materialization authority before any replica ledger row."""
+    if (type(replica_id) is not int or replica_id < 1 or
+            not isinstance(replica_record_id, uuid.UUID)):
+        raise ValueError('Intent materialization requires exact identities.')
+    now, intent_row = _lock_materialization_authority(connection,
+                                                      lease,
+                                                      service_name=service_name)
+    if intent_row['state'] == IntentState.COMMITTED.value:
+        if (intent_row['replica_id'] != replica_id or
+                intent_row['replica_record_id'] != replica_record_id):
+            raise ZeroCostActuationConflict(
+                'Committed actuation intent names a different replica.')
+        return True
+    if (intent_row['state'] != IntentState.ACTUATING.value or
+            intent_row['lease_owner'] != lease.owner or
+            intent_row['lease_generation'] != lease.generation or
+            intent_row['lease_expires_at'] != lease.expires_at or
+            intent_row['valid_until'] <= now):
+        raise ZeroCostActuationConflict(
+            'Actuation lease changed before replica materialization.')
+    return False
+
+
+def commit_lease_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    lease: IntentLease,
+    *,
+    service_name: str,
+    replica_id: int,
+    replica_record_id: uuid.UUID,
+    replica_info: Any,
+) -> None:
+    """Transfer one pending debit to its replica in the caller transaction.
+
+    The caller has already inserted the replica row but has not committed.
+    Any mismatch raises, rolling that insert back with this transition.  This
+    is deliberately not exposed as a second transaction: there must be no
+    crash window in which both the intent and replica consume capacity.
+    """
+    if (not isinstance(replica_id, int) or isinstance(replica_id, bool) or
+            replica_id < 1 or not isinstance(replica_record_id, uuid.UUID)):
+        raise ValueError('Intent commit requires exact durable identities.')
+    now, intent_row = _lock_materialization_authority(connection,
+                                                      lease,
+                                                      service_name=service_name)
+    if (intent_row['state'] != IntentState.ACTUATING.value or
             intent_row['lease_owner'] != lease.owner or
             intent_row['lease_generation'] != lease.generation or
             intent_row['lease_expires_at'] != lease.expires_at or

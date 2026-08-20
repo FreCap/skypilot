@@ -26,6 +26,8 @@ from sky import core
 from sky import exceptions
 from sky import execution
 from sky import global_user_state
+from sky import global_user_state_schema
+from sky import models
 from sky.events import api_models as event_api_models
 from sky.jobs import state_schema as managed_job_state_schema
 from sky.jobs.server import core as managed_jobs_core
@@ -43,12 +45,14 @@ from sky.server.events import schema as event_schema
 from sky.server.events import store as event_store
 from sky.server.requests import cutover
 from sky.server.requests import executor
+from sky.server.requests import non_pool_admission
 from sky.server.requests import non_pool_launch as non_pool_launch_request
 from sky.server.requests import ordinary_launch as ordinary_launch_request
 from sky.server.requests import payloads
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import preconditions
 from sky.server.requests import registry
+from sky.server.requests import request_names
 from sky.server.requests import requests
 from sky.server.requests import storage
 from sky.server.requests.queues import base as queue_base
@@ -167,6 +171,7 @@ def request_database(postgres_engine, monkeypatch):
     with postgres_engine.begin() as connection:
         connection.exec_driver_sql('DROP SCHEMA public CASCADE')
         connection.exec_driver_sql('CREATE SCHEMA public')
+    global_user_state_schema.user_table.create(postgres_engine, checkfirst=True)
     request_postgres._initialize_schema(postgres_engine)
     async_url = postgres_engine.url.set(
         drivername='postgresql+asyncpg').render_as_string(hide_password=False)
@@ -292,6 +297,33 @@ def _bound_non_pool_request(request_id: str) -> requests.Request:
         retryable=False,
         should_enqueue=True,
     )
+
+
+def _gc_unbound_non_pool_launch_body() -> payloads.LaunchBody:
+    return payloads.LaunchBody(
+        task='name: generic-serve-launch\nrun: echo bound\n',
+        cluster_name='gc-service-3',
+        is_launched_by_sky_serve_controller=True,
+        client_api_version=None,
+        env_vars={
+            constants.USER_ID_ENV_VAR: 'submitted-owner',
+            constants.USER_ENV_VAR: 'Submitted Owner',
+        },
+        extra_launch_context={
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'gc-service',
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'gc-service-hash',
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: 2,
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: 123,
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: '10.0.0.2',
+            ordinary_launch_binding.REPLICA_ID_KEY: 3,
+            ordinary_launch_binding.REPLICA_RECORD_ID_KEY:
+                str(_GC_REPLICA_RECORD_ID),
+            ordinary_launch_binding.LIFECYCLE_EPOCH_KEY: 4,
+            ordinary_launch_binding.BINDING_EPOCH_KEY: 6,
+            ordinary_launch_binding.CONTROLLER_INCARNATION_KEY:
+                str(_GC_CONTROLLER_ID),
+            ordinary_launch_binding.CONTROLLER_OWNER_EPOCH_KEY: 6,
+        })
 
 
 def _legacy_serve_launch_request(request_id: str) -> requests.Request:
@@ -1378,8 +1410,30 @@ def test_generic_binding_atomically_commits_exact_profile_request_queue_and_pin(
 
     profile = ordinary_launch_binding.resolve_non_pool_launch_profile(
         'gc-service', 3, _GC_REPLICA_RECORD_ID)
-    identity = _gc_non_pool_binding_identity(profile)
-    request = _bound_non_pool_request(identity.request_id)
+    submission_id = uuid.UUID('44444444-4444-4444-8444-444444444444')
+    submitted_body = _gc_unbound_non_pool_launch_body()
+    legacy_digest = ordinary_launch_binding.canonical_launch_digest(
+        submitted_body)
+    identity = _gc_non_pool_binding_identity(profile,
+                                             submission_id=submission_id,
+                                             input_digest=legacy_digest)
+    auth_user = models.User(id='tenant-a', name='Tenant A')
+    # Reproduce the ordering used by the original HTTP writer: derive the
+    # immutable identity from submitted bytes, then normalize the executable
+    # request body in the request builder.
+    request = executor._build_request(
+        request_id=identity.request_id,
+        request_name=request_names.RequestName.CLUSTER_LAUNCH,
+        request_body=submitted_body.model_copy(deep=True),
+        func=non_pool_launch_request.launch,
+        request_cluster_name=submitted_body.cluster_name,
+        schedule_type=requests.ScheduleType.LONG,
+        auth_user=auth_user,
+        retryable=False,
+        should_enqueue=True,
+        precondition=preconditions.OrdinaryLaunchBindingPrecondition(
+            identity.request_id, str(identity.association_id)),
+        client_api_version=77)
     monkeypatch.setattr(request_postgres,
                         '_resolved_request_backend_capability', lambda:
                         ('postgres-storage', 'postgres-queue', True))
@@ -1388,13 +1442,60 @@ def test_generic_binding_atomically_commits_exact_profile_request_queue_and_pin(
                         lambda **_kwargs: True)
 
     first = request_postgres.bind_and_enqueue_non_pool_launch(request, identity)
+    retry_authority = non_pool_admission.AdmissionAuthority(
+        tenant_id='tenant-a',
+        creator_name='Tenant A',
+        service_workspace='workspace-a',
+        capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+        capability_profile_set_digest=(
+            ordinary_launch_binding.supported_non_pool_profile_set_digest()),
+        receipt_protocol_version=(
+            ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
+    retry = non_pool_admission.build(_gc_unbound_non_pool_launch_body(),
+                                     submission_id,
+                                     profile,
+                                     retry_authority,
+                                     auth_user=auth_user,
+                                     client_api_version=77)
+    assert retry.identity == identity
+    assert ordinary_launch_binding.canonical_launch_digest(
+        retry.request.request_body) != retry.identity.input_digest
     monkeypatch.setattr(
         ordinary_launch_binding,
         'resolve_non_pool_launch_profile_in_connection',
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError('exact retry must not re-resolve planner state')))
     second = request_postgres.bind_and_enqueue_non_pool_launch(
-        request, identity)
+        retry.request, retry.identity)
+
+    changed_body = _gc_unbound_non_pool_launch_body()
+    changed_body.task += 'run: echo changed\n'
+    changed = non_pool_admission.build(changed_body,
+                                       submission_id,
+                                       profile,
+                                       retry_authority,
+                                       auth_user=auth_user,
+                                       client_api_version=77)
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict):
+        request_postgres.bind_and_enqueue_non_pool_launch(
+            changed.request, changed.identity)
+
+    for creator_name, api_version in (('Renamed Tenant A', 77), ('Tenant A',
+                                                                 78)):
+        normalized_drift = non_pool_admission.build(
+            _gc_unbound_non_pool_launch_body(),
+            submission_id,
+            profile,
+            dataclasses.replace(retry_authority, creator_name=creator_name),
+            auth_user=models.User(id='tenant-a', name=creator_name),
+            client_api_version=api_version)
+        assert normalized_drift.identity == identity
+        with pytest.raises(
+                ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                match='exact binding intent'):
+            request_postgres.bind_and_enqueue_non_pool_launch(
+                normalized_drift.request, normalized_drift.identity)
 
     assert first.created
     assert not second.created
@@ -1724,12 +1825,23 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
     request_template = _bound_non_pool_request('digest-template')
     request_template.request_body.extra_launch_context = dict(
         unbound_launch_context)
+    request_template.request_body.env_vars = {
+        constants.USER_ID_ENV_VAR: 'tenant-a',
+        constants.USER_ENV_VAR: 'Tenant A',
+    }
+    request_template.request_body.client_api_version = 77
     identity = _gc_non_pool_binding_identity(
         profile,
         input_digest=ordinary_launch_binding.canonical_launch_digest(
             request_template.request_body))
     request = _bound_non_pool_request(identity.request_id)
     request.request_body.extra_launch_context = dict(unbound_launch_context)
+    request.user_id = 'tenant-a'
+    request.request_body.env_vars = {
+        constants.USER_ID_ENV_VAR: 'tenant-a',
+        constants.USER_ENV_VAR: 'Tenant A',
+    }
+    request.request_body.client_api_version = 77
     monkeypatch.setattr(request_postgres,
                         '_resolved_request_backend_capability', lambda:
                         ('postgres-storage', 'postgres-queue', True))
@@ -1738,6 +1850,8 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
                         lambda **_kwargs: True)
     admission = request_postgres.bind_and_enqueue_non_pool_launch(
         request, identity)
+    assert ordinary_launch_binding.canonical_launch_digest(
+        request.request_body) == identity.input_digest
     context = ordinary_launch_binding.BoundNonPoolLaunchContext(
         association_id=identity.association_id,
         request_id=identity.request_id,
@@ -1855,6 +1969,54 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
                           ordinary_launch_associations_table.c.owner_revision +
                           1),
                       updated_at=sqlalchemy.func.clock_timestamp()))
+    with engine.connect() as connection:
+        original_payload = dict(
+            connection.execute(
+                sqlalchemy.select(
+                    request_postgres.REQUESTS.c.payload_json).where(
+                        request_postgres.REQUESTS.c.request_id ==
+                        identity.request_id)).scalar_one())
+    tampered_payloads = []
+    tampered_task = dict(original_payload)
+    tampered_task['task'] = str(tampered_task['task']) + '\n# tampered'
+    tampered_payloads.append(tampered_task)
+    tampered_env = dict(original_payload)
+    tampered_env['env_vars'] = dict(tampered_env['env_vars'])
+    tampered_env['env_vars'][constants.USER_ENV_VAR] = 'Tampered Owner'
+    tampered_payloads.append(tampered_env)
+    tampered_api = dict(original_payload)
+    tampered_api['client_api_version'] = 78
+    tampered_payloads.append(tampered_api)
+    for tampered_payload in tampered_payloads:
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    identity.request_id).values(payload_json=tampered_payload))
+        with pytest.raises(
+                ordinary_launch_binding.OrdinaryLaunchBindingConflict):
+            request_postgres.authorize_bound_non_pool_provider_present_cleanup(
+                context, authority, project_replica_result=_project_replica)
+    for context_key in (ordinary_launch_binding.INPUT_DIGEST_KEY,
+                        ordinary_launch_binding.PROFILE_DIGEST_KEY):
+        tampered_payload = dict(original_payload)
+        tampered_context = dict(tampered_payload['extra_launch_context'])
+        tampered_context[context_key] = 'f' * 64
+        tampered_payload['extra_launch_context'] = tampered_context
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    identity.request_id).values(payload_json=tampered_payload))
+        with pytest.raises(
+                ordinary_launch_binding.OrdinaryLaunchBindingConflict):
+            request_postgres.authorize_bound_non_pool_provider_present_cleanup(
+                context, authority, project_replica_result=_project_replica)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                identity.request_id).values(payload_json=original_payload))
     assert request_postgres.authorize_bound_non_pool_provider_present_cleanup(
         context, authority, project_replica_result=_project_replica)
     assert (

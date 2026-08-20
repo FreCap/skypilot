@@ -303,21 +303,20 @@ class RequestBody(BasePayload):
         return cls.model_construct()
 
     def __init__(self, **data):
-        data['env_vars'] = data.get('env_vars', request_body_env_vars())
-        usage_lib_entrypoint = usage_lib.messages.usage.entrypoint
-        if usage_lib_entrypoint is None:
-            usage_lib_entrypoint = ''
-        data['entrypoint'] = data.get('entrypoint', usage_lib_entrypoint)
-        data['entrypoint_command'] = data.get(
-            'entrypoint_command', common_utils.get_pretty_entrypoint_cmd())
-        data['using_remote_api_server'] = data.get(
-            'using_remote_api_server', not common.is_api_server_local())
-        data['override_skypilot_config'] = data.get(
-            'override_skypilot_config',
-            get_override_skypilot_config_from_client())
-        data['override_skypilot_config_path'] = data.get(
-            'override_skypilot_config_path',
-            get_override_skypilot_config_path_from_client())
+        if 'env_vars' not in data:
+            data['env_vars'] = request_body_env_vars()
+        if 'entrypoint' not in data:
+            data['entrypoint'] = usage_lib.messages.usage.entrypoint or ''
+        if 'entrypoint_command' not in data:
+            data['entrypoint_command'] = common_utils.get_pretty_entrypoint_cmd()
+        if 'using_remote_api_server' not in data:
+            data['using_remote_api_server'] = not common.is_api_server_local()
+        if 'override_skypilot_config' not in data:
+            data['override_skypilot_config'] = (
+                get_override_skypilot_config_from_client())
+        if 'override_skypilot_config_path' not in data:
+            data['override_skypilot_config_path'] = (
+                get_override_skypilot_config_path_from_client())
         super().__init__(**data)
 
     def to_kwargs(self) -> dict[str, Any]:

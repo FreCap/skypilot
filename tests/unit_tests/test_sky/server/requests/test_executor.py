@@ -1245,21 +1245,21 @@ aws:
 
 @pytest.fixture()
 def mock_global_user_state():
-    mock_user = mock.Mock()
-    mock_user.id = 'test-user-id'
-    mock_user.name = 'test-user'
 
     def mock_add_or_update_user(user,
                                 allow_duplicate_name=True,
                                 return_user=False):
+        del allow_duplicate_name
         if return_user:
-            return True, mock_user
+            return True, models.User(id=user.id, name=user.name)
         return True
 
     with mock.patch('sky.global_user_state.add_or_update_user',
                     side_effect=mock_add_or_update_user), \
-         mock.patch('sky.global_user_state.get_user') as mock_get_user:
-        mock_get_user.return_value = mock_user
+         mock.patch(
+             'sky.global_user_state.get_user',
+             side_effect=lambda user_id: models.User(id=user_id,
+                                                     name=user_id)):
         yield
 
 
@@ -2969,17 +2969,16 @@ def stub_override_request_env_deps(monkeypatch):
     monkeypatch.setattr('sky.server.requests.requests.set_event_workspace',
                         mock.Mock(return_value=True))
 
-    fake_user = mock.Mock()
-    fake_user.id = 'client-user-id'
-    fake_user.name = 'client-user'
-
     def fake_add_or_update_user(user, return_user=False, **kwargs):
+        del kwargs
         if return_user:
-            return True, fake_user
+            return True, models.User(id=user.id, name=user.name)
         return True
 
     monkeypatch.setattr('sky.global_user_state.add_or_update_user',
                         fake_add_or_update_user)
+    monkeypatch.setattr('sky.global_user_state.get_user',
+                        lambda user_id: models.User(id=user_id, name=user_id))
 
 
 def test_override_env_applied_for_client_request(stub_override_request_env_deps,
@@ -2998,6 +2997,82 @@ def test_override_env_applied_for_client_request(stub_override_request_env_deps,
             body, request_id='not-a-daemon-uuid', request_name='sky.launch'):
         assert os.environ['SKYPILOT_POD_MEMORY_BYTES_LIMIT'] == str(100 * 1024 *
                                                                     1024)
+
+
+def test_bound_override_resolves_current_user_without_upserting_queued_name(
+        stub_override_request_env_deps, monkeypatch):
+    body = payloads.RequestBody(
+        env_vars={
+            constants.USER_ID_ENV_VAR: 'client-user-id',
+            constants.USER_ENV_VAR: 'old-name',
+        })
+    current = models.User(id='client-user-id', name='renamed-user')
+    get_user = mock.Mock(return_value=current)
+    upsert = mock.Mock()
+    monkeypatch.setattr(executor.global_user_state, 'get_user', get_user)
+    monkeypatch.setattr(executor.global_user_state, 'add_or_update_user',
+                        upsert)
+
+    with executor.override_request_env_and_config(body,
+                                                  request_id='bound-request-id',
+                                                  request_name='sky.launch',
+                                                  require_existing_user=True):
+        assert os.environ[constants.USER_ID_ENV_VAR] == current.id
+        assert os.environ[constants.USER_ENV_VAR] == current.name
+
+    assert body.env_vars[constants.USER_ENV_VAR] == 'old-name'
+    get_user.assert_called_once_with('client-user-id')
+    upsert.assert_not_called()
+
+
+def test_ordinary_override_preserves_legacy_user_metadata_upsert(
+        stub_override_request_env_deps, monkeypatch):
+    body = payloads.RequestBody(
+        env_vars={
+            constants.USER_ID_ENV_VAR: 'client-user-id',
+            constants.USER_ENV_VAR: 'submitted-new-name',
+        })
+    effective = models.User(id='client-user-id', name='submitted-new-name')
+    upsert = mock.Mock(return_value=(False, effective))
+    get_user = mock.Mock()
+    monkeypatch.setattr(executor.global_user_state, 'add_or_update_user',
+                        upsert)
+    monkeypatch.setattr(executor.global_user_state, 'get_user', get_user)
+
+    with executor.override_request_env_and_config(
+            body, request_id='ordinary-request-id', request_name='sky.launch'):
+        assert os.environ[constants.USER_ENV_VAR] == effective.name
+
+    upsert.assert_called_once()
+    submitted = upsert.call_args.args[0]
+    assert submitted.id == effective.id
+    assert submitted.name == effective.name
+    assert upsert.call_args.kwargs == {'return_user': True}
+    get_user.assert_not_called()
+
+
+def test_bound_override_rejects_deleted_user_without_recreation(
+        stub_override_request_env_deps, monkeypatch):
+    body = payloads.RequestBody(
+        env_vars={
+            constants.USER_ID_ENV_VAR: 'deleted-user-id',
+            constants.USER_ENV_VAR: 'historical-name',
+        })
+    upsert = mock.Mock()
+    monkeypatch.setattr(executor.global_user_state, 'get_user',
+                        mock.Mock(return_value=None))
+    monkeypatch.setattr(executor.global_user_state, 'add_or_update_user',
+                        upsert)
+
+    with pytest.raises(RuntimeError, match='owner no longer exists'):
+        with executor.override_request_env_and_config(
+                body,
+                request_id='bound-request-id',
+                request_name='sky.launch',
+                require_existing_user=True):
+            pytest.fail('The bound handler must not execute.')
+
+    upsert.assert_not_called()
 
 
 def test_override_env_blocks_when_event_workspace_loses_execution_fence(

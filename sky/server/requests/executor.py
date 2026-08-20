@@ -1149,10 +1149,33 @@ def _should_apply_workspace_resolver(client_api_version: int | None) -> bool:
     return not skypilot_config.is_active_workspace_set()
 
 
+def _resolve_request_execution_user(
+        request_body: payloads.RequestBody,
+        *,
+        require_existing_user: bool = False) -> models.User:
+    """Resolve current identity without replaying stale queued metadata."""
+    submitted = models.User(id=request_body.env_vars[constants.USER_ID_ENV_VAR],
+                            name=request_body.env_vars[constants.USER_ENV_VAR])
+    if not require_existing_user:
+        _, current = global_user_state.add_or_update_user(submitted,
+                                                          return_user=True)
+    else:
+        current = global_user_state.get_user(submitted.id)
+        if current is None:
+            raise RuntimeError('Bound internal request owner no longer exists.')
+    if (current.id != submitted.id or not isinstance(current.name, str) or
+            not current.name):
+        raise RuntimeError('Request execution user identity is malformed.')
+    return current
+
+
 @contextlib.contextmanager
 def override_request_env_and_config(
-        request_body: payloads.RequestBody, request_id: str,
-        request_name: str) -> Generator[None, None, None]:
+        request_body: payloads.RequestBody,
+        request_id: str,
+        request_name: str,
+        *,
+        require_existing_user: bool = False) -> Generator[None, None, None]:
     """Override the environment and SkyPilot config for a request."""
     original_env = os.environ.copy()
     try:
@@ -1165,9 +1188,14 @@ def override_request_env_and_config(
             kubernetes_adaptor.IN_CLUSTER_CONTEXT_NAME_ENV_VAR, None)
         payloads.remove_server_owned_env_vars(request_body.env_vars)
         os.environ.update(request_body.env_vars)
-        user = models.User(id=request_body.env_vars[constants.USER_ID_ENV_VAR],
-                           name=request_body.env_vars[constants.USER_ENV_VAR])
-        _, user = global_user_state.add_or_update_user(user, return_user=True)
+        user = _resolve_request_execution_user(
+            request_body, require_existing_user=require_existing_user)
+        # Keep the persisted body immutable for exact retries/digest hydration,
+        # but execute under the current display name for its immutable user ID.
+        user_name = user.name
+        assert isinstance(user_name, str)
+        os.environ[constants.USER_ID_ENV_VAR] = user.id
+        os.environ[constants.USER_ENV_VAR] = user_name
         using_remote_api_server = request_body.using_remote_api_server
 
         # Force color to be enabled.
@@ -1510,7 +1538,11 @@ def _request_execution_wrapper(
                 _verified_managed_job_execution_origin(
                     request_task, managed_job_origin), \
                 override_request_env_and_config(
-                    request_body, request_id, request_name), \
+                    request_body,
+                    request_id,
+                    request_name,
+                    require_existing_user=(request_task.precondition_type ==
+                                           'ordinary-launch-binding.v1')), \
                 _controller_execution_environment(
                     controller_generation, controller_instance_id), \
                 tempstore.tempdir():
@@ -1712,12 +1744,15 @@ def execute_request_in_coroutine(
 def _execute_with_config_override(func: Callable,
                                   request_body: payloads.RequestBody,
                                   request_id: str, request_name: str,
-                                  **kwargs) -> Any:
+                                  require_existing_user: bool, **kwargs) -> Any:
     """Execute a function with env and config override inside a thread."""
     # Override the environment and config within this thread's context,
     # which gets copied when we call to_thread.
-    with override_request_env_and_config(request_body, request_id,
-                                         request_name):
+    with override_request_env_and_config(
+            request_body,
+            request_id,
+            request_name,
+            require_existing_user=(require_existing_user)):
         return func(**kwargs)
 
 
@@ -1753,6 +1788,7 @@ async def _execute_request_coroutine(request: api_requests.Request):
         fut: asyncio.Future = context_utils.to_thread_with_executor(
             get_request_thread_executor(), _execute_with_config_override, func,
             request_body, request.request_id, request.name,
+            request.precondition_type == 'ordinary-launch-binding.v1',
             **request_body.to_kwargs())
     except Exception as e:  # pylint: disable=broad-except
         ctx.redirect_log(original_output)
@@ -1818,7 +1854,7 @@ async def _execute_request_coroutine(request: api_requests.Request):
         ctx.cancel()
 
 
-async def build_request_async(
+def _build_request(
     request_id: str,
     request_name: request_names.RequestName,
     request_body: payloads.RequestBody,
@@ -1832,6 +1868,7 @@ async def build_request_async(
     should_enqueue: bool = False,
     precondition: preconditions.Precondition | None = None,
     managed_job_origin: tuple[int, str, int, int, str] | None = None,
+    client_api_version: int | None = None,
 ) -> api_requests.Request:
     """Build a complete request without persisting or publishing it.
 
@@ -1890,7 +1927,9 @@ async def build_request_async(
     # Python SDK nor the dashboard need their own stamping logic. Old
     # clients (no header) yield None, which the worker-side gate treats
     # as "skip the workspace resolver".
-    request_body.client_api_version = versions.get_remote_api_version()
+    request_body.client_api_version = (versions.get_remote_api_version()
+                                       if client_api_version is None else
+                                       client_api_version)
     durable_precondition = preconditions.serialize(precondition)
     request = api_requests.Request(
         request_id=request_id,
@@ -1931,6 +1970,41 @@ async def build_request_async(
     )
 
     return request
+
+
+async def build_request_async(
+    request_id: str,
+    request_name: request_names.RequestName,
+    request_body: payloads.RequestBody,
+    func: Callable[P, Any],
+    request_cluster_name: str | None = None,
+    schedule_type: api_requests.ScheduleType = (api_requests.ScheduleType.LONG),
+    is_skypilot_system: bool = False,
+    auth_user: models.User | None = None,
+    ignore_return_value: bool = False,
+    retryable: bool = False,
+    should_enqueue: bool = False,
+    precondition: preconditions.Precondition | None = None,
+    managed_job_origin: tuple[int, str, int, int, str] | None = None,
+    client_api_version: int | None = None,
+) -> api_requests.Request:
+    """Async compatibility wrapper around the synchronous request builder."""
+    return _build_request(
+        request_id=request_id,
+        request_name=request_name,
+        request_body=request_body,
+        func=func,
+        request_cluster_name=request_cluster_name,
+        schedule_type=schedule_type,
+        is_skypilot_system=is_skypilot_system,
+        auth_user=auth_user,
+        ignore_return_value=ignore_return_value,
+        retryable=retryable,
+        should_enqueue=should_enqueue,
+        precondition=precondition,
+        managed_job_origin=managed_job_origin,
+        client_api_version=client_api_version,
+    )
 
 
 async def prepare_request_async(

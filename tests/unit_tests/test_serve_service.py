@@ -31,6 +31,13 @@ from sky.serve import placement_policy
 from sky.serve import serve_state
 from sky.serve import service
 from sky.serve import service_spec as service_spec_lib
+from sky.skylet import constants as skylet_constants
+
+
+@pytest.fixture(autouse=True)
+def _explicit_controller_launch_owner(monkeypatch):
+    monkeypatch.setenv(skylet_constants.USER_ID_ENV_VAR, 'owner-123')
+    monkeypatch.setenv(skylet_constants.USER_ENV_VAR, 'owner@example.com')
 
 
 def _bind_socket_async(host, port, delay):
@@ -89,6 +96,32 @@ def _listen_on_transferred_socket(controller_socket, ready):
     connection, _ = controller_socket.accept()
     connection.close()
     controller_socket.close()
+
+
+def test_service_owner_round_trips_explicit_controller_launch_environment(
+        monkeypatch):
+    monkeypatch.setenv(skylet_constants.USER_ID_ENV_VAR, 'owner-123')
+    monkeypatch.setenv(skylet_constants.USER_ENV_VAR, 'owner@example.com')
+    with mock.patch.object(service.common_utils,
+                           'get_user_hash') as fallback_id, \
+         mock.patch.object(service.common_utils,
+                           'get_current_user_name') as fallback_name:
+        assert service._service_owner_from_launch_environment() == (
+            'owner-123', 'owner@example.com')
+    fallback_id.assert_not_called()
+    fallback_name.assert_not_called()
+
+
+@pytest.mark.parametrize('missing', ('id', 'name'))
+def test_service_owner_attestation_source_fails_closed_when_env_is_partial(
+        monkeypatch, missing):
+    monkeypatch.setenv(skylet_constants.USER_ID_ENV_VAR, 'owner-123')
+    monkeypatch.setenv(skylet_constants.USER_ENV_VAR, 'owner@example.com')
+    monkeypatch.delenv(skylet_constants.USER_ID_ENV_VAR if missing ==
+                       'id' else skylet_constants.USER_ENV_VAR)
+
+    with pytest.raises(RuntimeError, match='explicit'):
+        service._service_owner_from_launch_environment()
 
 
 def test_controller_hold_rejects_service_before_boot_mutation(monkeypatch):
@@ -154,6 +187,9 @@ class TestPromoteFreshOrdinaryLaunchBinding:
     @staticmethod
     def _fresh_start_patches(task):
         return [
+            mock.patch.object(service,
+                              '_service_owner_from_launch_environment',
+                              return_value=('owner-id', 'owner-name')),
             mock.patch.object(service.auth_utils, 'get_or_generate_keys'),
             mock.patch.object(service.serve_state,
                               'get_service_from_name',
@@ -178,6 +214,8 @@ class TestPromoteFreshOrdinaryLaunchBinding:
             mock.patch.object(service.serve_state,
                               'add_service',
                               return_value=True),
+            mock.patch.object(service.serve_state,
+                              'attest_service_owner_user_id'),
             mock.patch.object(service.os, 'makedirs'),
             mock.patch.object(service.filelock, 'FileLock'),
             mock.patch.object(service, '_run_cleanup_and_finalize'),

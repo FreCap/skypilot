@@ -1144,7 +1144,8 @@ def test_api014_serve051_lineage_and_sqlite_stays_at_serve037(
     assert api_scripts.get_revision('013').down_revision == '012'
     assert api_scripts.get_revision('012').down_revision == '011'
     assert api_scripts.get_revision('011').down_revision == '010'
-    assert serve_scripts.get_heads() == ['054']
+    assert serve_scripts.get_heads() == ['055']
+    assert serve_scripts.get_revision('055').down_revision == '054'
     assert serve_scripts.get_revision('053').down_revision == '052'
     assert serve_scripts.get_revision('052').down_revision == '051'
     assert serve_scripts.get_revision('050').down_revision == '049'
