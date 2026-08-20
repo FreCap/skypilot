@@ -1059,8 +1059,17 @@ class EffectAuthorization:
     context: BoundLaunchContext
     claim: ExecutionClaim
     owner_revision: int
+    durable_replica_info: Any
     guard: Any
     claim_validator: ClaimValidator
+
+
+@dataclasses.dataclass(frozen=True)
+class EffectAuthoritySnapshot:
+    """Exact association and replica state proven at an effect boundary."""
+
+    association: Mapping[str, Any]
+    durable_replica_info: Any
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3762,7 +3771,7 @@ def validate_effect_authority_in_connection(
     claim_validator: ClaimValidator,
     *,
     launch_context: Mapping[str, Any] | None = None,
-) -> Mapping[str, Any]:
+) -> EffectAuthoritySnapshot:
     _require_postgres(connection)
     if (getattr(claim, 'request_id', None) != context.request_id or
             getattr(claim, 'execution_generation', 0) < 1 or
@@ -3794,7 +3803,8 @@ def validate_effect_authority_in_connection(
     if not claim_validator(connection, context.association_id, claim):
         raise OrdinaryLaunchBindingConflict(
             'The exact API request execution claim is no longer active.')
-    return association
+    return EffectAuthoritySnapshot(dict(association),
+                                   _locked_replica_info(replica))
 
 
 def _advance_effect_phase(
@@ -3807,17 +3817,19 @@ def _advance_effect_phase(
     *,
     service_job_id: int | None = None,
     launch_context: Mapping[str, Any] | None = None,
-) -> int:
-    association = validate_effect_authority_in_connection(
+) -> tuple[int, Any]:
+    authority = validate_effect_authority_in_connection(
         connection,
         context,
         claim,
         claim_validator,
         launch_context=launch_context)
+    association = authority.association
     if association['effect_phase'] == target.value:
         if (target != EffectPhase.SERVICE_JOB_RECORDED or
                 association['service_job_id'] == service_job_id):
-            return int(association['owner_revision'])
+            return (int(association['owner_revision']),
+                    authority.durable_replica_info)
         raise OrdinaryLaunchBindingConflict(
             'Service-job replay used a different exact job ID.')
     if association['effect_phase'] != expected.value:
@@ -3847,7 +3859,7 @@ def _advance_effect_phase(
     if updated.rowcount != 1:
         raise OrdinaryLaunchBindingConflict(
             'Effect phase lost its exact compare-and-swap.')
-    return next_revision
+    return next_revision, authority.durable_replica_info
 
 
 _ACTIVE_EFFECT_AUTHORIZATION: contextvars.ContextVar[
@@ -3878,15 +3890,17 @@ def provider_effect_guard(
                 'Service launch authority guard lost its database session.')
         engine = serve_state.get_database_engine()
         with engine.begin() as connection:
-            next_revision = _advance_effect_phase(connection,
-                                                  context,
-                                                  claim,
-                                                  claim_validator,
-                                                  EffectPhase.NOT_STARTED,
-                                                  EffectPhase.PROVIDER_IO,
-                                                  launch_context=launch_context)
+            next_revision, durable_replica_info = _advance_effect_phase(
+                connection,
+                context,
+                claim,
+                claim_validator,
+                EffectPhase.NOT_STARTED,
+                EffectPhase.PROVIDER_IO,
+                launch_context=launch_context)
         authorization = EffectAuthorization(context, claim, next_revision,
-                                            guard, claim_validator)
+                                            durable_replica_info, guard,
+                                            claim_validator)
         token = _ACTIVE_EFFECT_AUTHORIZATION.set(authorization)
         try:
             yield authorization
@@ -3918,15 +3932,17 @@ def non_pool_provider_effect_guard(
                 'Service launch authority guard lost its database session.')
         engine = serve_state.get_database_engine()
         with engine.begin() as connection:
-            next_revision = _advance_effect_phase(connection,
-                                                  context,
-                                                  claim,
-                                                  claim_validator,
-                                                  EffectPhase.NOT_STARTED,
-                                                  EffectPhase.PROVIDER_IO,
-                                                  launch_context=launch_context)
+            next_revision, durable_replica_info = _advance_effect_phase(
+                connection,
+                context,
+                claim,
+                claim_validator,
+                EffectPhase.NOT_STARTED,
+                EffectPhase.PROVIDER_IO,
+                launch_context=launch_context)
         authorization = EffectAuthorization(context, claim, next_revision,
-                                            guard, claim_validator)
+                                            durable_replica_info, guard,
+                                            claim_validator)
         token = _ACTIVE_EFFECT_AUTHORIZATION.set(authorization)
         try:
             yield authorization
@@ -3956,7 +3972,7 @@ def _active_authorization(
 
 
 def require_active_provider_effect_authorization(
-        launch_context: Mapping[str, Any]) -> None:
+        launch_context: Mapping[str, Any]) -> EffectAuthorization:
     """Prove the exact bound request still owns its outer provider guard.
 
     Cloud backends retain a legacy per-provider guard for ordinary Serve
@@ -3964,9 +3980,11 @@ def require_active_provider_effect_authorization(
     takeover deliberately replaces those values with fail-closed sentinels,
     but only while this exact association is inside ``provider_effect_guard``.
     """
-    if _active_authorization(launch_context) is None:
+    authorization = _active_authorization(launch_context)
+    if authorization is None:
         raise OrdinaryLaunchBindingConflict(
             'Bound provider I/O has no active association authorization.')
+    return authorization
 
 
 def begin_service_job_io(launch_context: Mapping[str, Any]) -> int | None:
@@ -3975,15 +3993,18 @@ def begin_service_job_io(launch_context: Mapping[str, Any]) -> int | None:
         return None
     engine = serve_state.get_database_engine()
     with engine.begin() as connection:
-        next_revision = _advance_effect_phase(connection,
-                                              authorization.context,
-                                              authorization.claim,
-                                              authorization.claim_validator,
-                                              EffectPhase.PROVIDER_IO,
-                                              EffectPhase.SERVICE_JOB_IO,
-                                              launch_context=launch_context)
+        next_revision, durable_replica_info = _advance_effect_phase(
+            connection,
+            authorization.context,
+            authorization.claim,
+            authorization.claim_validator,
+            EffectPhase.PROVIDER_IO,
+            EffectPhase.SERVICE_JOB_IO,
+            launch_context=launch_context)
     _ACTIVE_EFFECT_AUTHORIZATION.set(
-        dataclasses.replace(authorization, owner_revision=next_revision))
+        dataclasses.replace(authorization,
+                            owner_revision=next_revision,
+                            durable_replica_info=durable_replica_info))
     return next_revision
 
 
@@ -3994,16 +4015,19 @@ def record_service_job(launch_context: Mapping[str, Any],
         return None
     engine = serve_state.get_database_engine()
     with engine.begin() as connection:
-        next_revision = _advance_effect_phase(connection,
-                                              authorization.context,
-                                              authorization.claim,
-                                              authorization.claim_validator,
-                                              EffectPhase.SERVICE_JOB_IO,
-                                              EffectPhase.SERVICE_JOB_RECORDED,
-                                              service_job_id=job_id,
-                                              launch_context=launch_context)
+        next_revision, durable_replica_info = _advance_effect_phase(
+            connection,
+            authorization.context,
+            authorization.claim,
+            authorization.claim_validator,
+            EffectPhase.SERVICE_JOB_IO,
+            EffectPhase.SERVICE_JOB_RECORDED,
+            service_job_id=job_id,
+            launch_context=launch_context)
     _ACTIVE_EFFECT_AUTHORIZATION.set(
-        dataclasses.replace(authorization, owner_revision=next_revision))
+        dataclasses.replace(authorization,
+                            owner_revision=next_revision,
+                            durable_replica_info=durable_replica_info))
     return next_revision
 
 

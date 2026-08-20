@@ -1874,9 +1874,12 @@ def test_effect_guard_service_job_and_projection_are_monotonic(
         validations.append(association_id)
         return True
 
-    with binding.provider_effect_guard(body.extra_launch_context,
-                                       claim,
-                                       claim_validator=_validate):
+    with binding.provider_effect_guard(
+            body.extra_launch_context, claim,
+            claim_validator=_validate) as authorization:
+        assert authorization is not None
+        assert (authorization.durable_replica_info.replica_record_id == str(
+            identity.replica_record_id))
         binding.begin_service_job_io(body.extra_launch_context)
         binding.record_service_job(body.extra_launch_context, 17)
     assert validations == [identity.association_id] * 3
