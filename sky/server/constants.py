@@ -185,7 +185,9 @@ def is_serve_controller_api_request(method: str, path: str) -> bool:
 # Minimum API version whose Serve version-history response exposes immutable
 # cross-context placement with Kubernetes/Kueue admission. Consumers must also
 # require the exact advertised placement_projection_protocol_version; API 79
-# advances new writes to protocol 3 with typed worker scratch.
+# advanced new writes to protocol 3 with typed worker scratch. Protocol 4 uses
+# the same response shape and advances projected workers to UID-bound runtime
+# readiness.
 MIN_SERVE_PLACEMENT_PROJECTION_API_VERSION = 77
 
 # Kubernetes node info includes the SkyServe-attributed subset of preemptible

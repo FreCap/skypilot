@@ -11,6 +11,8 @@ import copy
 import dataclasses
 from decimal import Decimal
 from decimal import InvalidOperation
+import hashlib
+import json
 import posixpath
 from typing import Any, Literal
 
@@ -21,11 +23,27 @@ from sky.utils import config_utils
 
 PodRole = Literal['head', 'worker']
 
-SERVE_WORKER_PROJECTION_PROTOCOL_VERSION = 3
-_SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({1, 2, 3})
-_STRICT_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({2, 3})
+SERVE_WORKER_PROJECTION_PROTOCOL_VERSION = 4
+_SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({1, 2, 3, 4})
+_STRICT_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({2, 3, 4})
+_SCRATCH_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({3, 4})
+_RUNTIME_READY_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({4})
 SERVE_WORKER_SCRATCH_MOUNT_PATH = '/tmp'
 SERVE_WORKER_SCRATCH_VOLUME_NAME = 'skypilot-serve-worker-tmp'
+SERVE_WORKER_RUNTIME_READY_MARKER = ('/tmp/skypilot-serve-worker-runtime-ready')
+SERVE_WORKER_RUNTIME_READY_POD_UID_ENV_VAR = 'SKYPILOT_POD_UID'
+# The startup probe starts only after image pull and container creation.  This
+# bound covers the in-container SSH, environment, SkyPilot, and Ray bootstrap;
+# provider scheduling retains its separate projected provision_timeout.
+SERVE_WORKER_RUNTIME_STARTUP_TIMEOUT_SECONDS = 30 * 60
+_SERVE_WORKER_RUNTIME_PROBE_PERIOD_SECONDS = 2
+_SERVE_WORKER_RUNTIME_PROBE_TIMEOUT_SECONDS = 1
+_SERVE_WORKER_RUNTIME_STARTUP_FAILURE_THRESHOLD = (
+    SERVE_WORKER_RUNTIME_STARTUP_TIMEOUT_SECONDS //
+    _SERVE_WORKER_RUNTIME_PROBE_PERIOD_SECONDS)
+_SERVE_WORKER_RUNTIME_READINESS_FAILURE_THRESHOLD = 1
+_SERVE_WORKER_RUNTIME_BOOTSTRAP_COMMAND = ('/bin/bash', '-c', '--')
+_SHA256_HEX_DIGITS = frozenset('0123456789abcdef')
 _SERVE_WORKER_SCRATCH_NONE_KEYS = frozenset({'kind'})
 _SERVE_WORKER_SCRATCH_MEMORY_KEYS = frozenset(
     {'kind', 'mount_path', 'volume_name', 'size_limit_bytes'})
@@ -52,6 +70,10 @@ class ProjectedScratchContractError(ValueError):
     """A projected worker Pod has an ambiguous scratch-volume shape."""
 
 
+class ProjectedRuntimeReadinessContractError(ValueError):
+    """A projected worker Pod has an ambiguous runtime-readiness shape."""
+
+
 @dataclasses.dataclass(frozen=True)
 class ProjectedAcceleratorContract:
     """Whole-Pod accelerator ownership observed at one contract boundary."""
@@ -72,6 +94,15 @@ class ProjectedScratchContract:
     actual: dict[str, object]
 
 
+@dataclasses.dataclass(frozen=True)
+class ProjectedRuntimeReadinessContract:
+    """Whole-Pod bootstrap readiness observed at one contract boundary."""
+
+    matches: bool
+    expected: dict[str, object]
+    actual: dict[str, object]
+
+
 def validate_serve_worker_projection_protocol_version(
     value: object,
     *,
@@ -83,7 +114,7 @@ def validate_serve_worker_projection_protocol_version(
     if (type(value) is not int or
             value not in _SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS):
         raise ValueError('SkyServe worker projection protocol version must be '
-                         '1, 2, or 3.')
+                         '1, 2, 3, or 4.')
     return value
 
 
@@ -99,7 +130,7 @@ def serve_worker_projection_protocol_has_scratch(value: object) -> bool:
     """Whether a protocol carries the closed worker scratch contract."""
     version = validate_serve_worker_projection_protocol_version(value,
                                                                 allow_none=True)
-    return version == SERVE_WORKER_PROJECTION_PROTOCOL_VERSION
+    return version in _SCRATCH_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS
 
 
 def serve_worker_projection_protocol_has_provision_timeout(
@@ -107,11 +138,19 @@ def serve_worker_projection_protocol_has_provision_timeout(
     """Whether a protocol carries the terminal provisioning timeout."""
     version = validate_serve_worker_projection_protocol_version(value,
                                                                 allow_none=True)
-    return version == SERVE_WORKER_PROJECTION_PROTOCOL_VERSION
+    return version in _SCRATCH_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS
+
+
+def serve_worker_projection_protocol_has_runtime_readiness(
+        value: object) -> bool:
+    """Whether a protocol requires UID-bound bootstrap readiness."""
+    version = validate_serve_worker_projection_protocol_version(value,
+                                                                allow_none=True)
+    return version in _RUNTIME_READY_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS
 
 
 def validate_projected_worker_provision_timeout(value: object) -> int:
-    """Validate the closed v3 provisioning-wait contract."""
+    """Validate the closed v3/v4 provisioning-wait contract."""
     if type(value) is not int or value < -1:
         raise ValueError('Projected worker provision_timeout must be -1 or a '
                          'non-negative integer.')
@@ -178,6 +217,12 @@ def _pod_api_field(owner: object, yaml_name: str, api_name: str) -> Any:
         return None
     if api_name in state:
         return state[api_name]
+    # ``exec`` is exposed by the Kubernetes client as the ``_exec`` property,
+    # backed by a name-mangled attribute.  Restrict property access to real
+    # descriptors so a loose mock cannot synthesize a missing field.
+    descriptor = getattr(type(owner), api_name, None)
+    if isinstance(descriptor, property):
+        return getattr(owner, api_name)
     # kubernetes.client models expose public properties backed by private
     # fields (for example ``containers`` -> ``_containers``). Read the stored
     # value directly so generic mocks cannot synthesize a truthy missing field.
@@ -511,6 +556,370 @@ def enforce_projected_worker_scratch_contract(
         expected=expected,
         actual=actual,
     )
+
+
+def _projected_worker_runtime_ready_probe() -> dict[str, object]:
+    command = [
+        '/bin/sh', '-c',
+        ('test -n "$SKYPILOT_POD_UID" && '
+         'test "$(cat '
+         f'{SERVE_WORKER_RUNTIME_READY_MARKER} 2>/dev/null)" = '
+         '"$SKYPILOT_POD_UID"')
+    ]
+    return {
+        'exec': {
+            'command': command,
+        },
+        'initialDelaySeconds': 0,
+        'periodSeconds': _SERVE_WORKER_RUNTIME_PROBE_PERIOD_SECONDS,
+        'timeoutSeconds': _SERVE_WORKER_RUNTIME_PROBE_TIMEOUT_SECONDS,
+        'successThreshold': 1,
+    }
+
+
+def _expected_projected_worker_runtime_readiness() -> dict[str, object]:
+    startup_probe = _projected_worker_runtime_ready_probe()
+    startup_probe['failureThreshold'] = (
+        _SERVE_WORKER_RUNTIME_STARTUP_FAILURE_THRESHOLD)
+    readiness_probe = _projected_worker_runtime_ready_probe()
+    readiness_probe['failureThreshold'] = (
+        _SERVE_WORKER_RUNTIME_READINESS_FAILURE_THRESHOLD)
+    startup_exec = startup_probe['exec']
+    readiness_exec = readiness_probe['exec']
+    assert isinstance(startup_exec, dict)
+    assert isinstance(readiness_exec, dict)
+    return {
+        'restart_policy': 'Never',
+        'pod_uid_env': [{
+            'name': SERVE_WORKER_RUNTIME_READY_POD_UID_ENV_VAR,
+            'value_from': {
+                'field_ref': {
+                    'api_version': 'v1',
+                    'field_path': 'metadata.uid',
+                    'extra_fields': [],
+                },
+                'extra_fields': [],
+            },
+            'extra_fields': [],
+        }],
+        'startup_probe': {
+            **startup_probe,
+            'extra_fields': [],
+            'exec': {
+                **startup_exec,
+                'extra_fields': [],
+            },
+        },
+        'readiness_probe': {
+            **readiness_probe,
+            'extra_fields': [],
+            'exec': {
+                **readiness_exec,
+                'extra_fields': [],
+            },
+        },
+        'ray_node_container_count': 1,
+    }
+
+
+def _observe_projected_worker_runtime_probe(
+        probe: object) -> dict[str, object] | None:
+    if probe is None:
+        return None
+    exec_action = _pod_api_field(probe, 'exec', '_exec')
+    command = _pod_api_field(exec_action, 'command', 'command')
+    if isinstance(command, (list, tuple)):
+        command = list(command)
+    initial_delay_seconds = _pod_api_field(probe, 'initialDelaySeconds',
+                                           'initial_delay_seconds')
+    return {
+        'exec': {
+            'command': command,
+            'extra_fields':
+                sorted(_present_json_fields(exec_action) - {'command'}),
+        },
+        # The API may omit the zero-valued default from a read response.
+        'initialDelaySeconds':
+            (0 if initial_delay_seconds is None else initial_delay_seconds),
+        'periodSeconds': _pod_api_field(probe, 'periodSeconds',
+                                        'period_seconds'),
+        'timeoutSeconds': _pod_api_field(probe, 'timeoutSeconds',
+                                         'timeout_seconds'),
+        'successThreshold': _pod_api_field(probe, 'successThreshold',
+                                           'success_threshold'),
+        'failureThreshold': _pod_api_field(probe, 'failureThreshold',
+                                           'failure_threshold'),
+        'extra_fields': sorted(
+            _present_json_fields(probe) - {
+                'exec', 'initialDelaySeconds', 'periodSeconds',
+                'timeoutSeconds', 'successThreshold', 'failureThreshold'
+            }),
+    }
+
+
+def _observe_projected_worker_runtime_env(entry: object) -> dict[str, object]:
+    value_from = _pod_api_field(entry, 'valueFrom', 'value_from')
+    field_ref = _pod_api_field(value_from, 'fieldRef', 'field_ref')
+    api_version = _pod_api_field(field_ref, 'apiVersion', 'api_version')
+    return {
+        'name': _pod_api_field(entry, 'name', 'name'),
+        'value_from': {
+            'field_ref': {
+                # Kubernetes defaults this omitted field to v1.
+                'api_version': 'v1' if api_version is None else api_version,
+                'field_path': _pod_api_field(field_ref, 'fieldPath',
+                                             'field_path'),
+                'extra_fields': sorted(
+                    _present_json_fields(field_ref) -
+                    {'apiVersion', 'fieldPath'}),
+            },
+            'extra_fields':
+                sorted(_present_json_fields(value_from) - {'fieldRef'}),
+        },
+        'extra_fields':
+            sorted(_present_json_fields(entry) - {'name', 'valueFrom'}),
+    }
+
+
+def _canonicalize_projected_worker_runtime_bootstrap_value(
+        value: object, location: str) -> object:
+    """Serialize one bootstrap field identically from YAML or API models."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [
+            _canonicalize_projected_worker_runtime_bootstrap_value(
+                item, f'{location}[]') for item in value
+        ]
+    if isinstance(value, Mapping):
+        canonical: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ProjectedRuntimeReadinessContractError(
+                    f'{location} contains a non-string field name.')
+            if item is None:
+                continue
+            canonical[key] = (
+                _canonicalize_projected_worker_runtime_bootstrap_value(
+                    item, f'{location}.{key}'))
+        return canonical
+    attribute_map = getattr(value, 'attribute_map', None)
+    if isinstance(attribute_map, Mapping):
+        canonical = {}
+        for api_name, yaml_name in attribute_map.items():
+            if not isinstance(api_name, str) or not isinstance(yaml_name, str):
+                raise ProjectedRuntimeReadinessContractError(
+                    f'{location} has an invalid Kubernetes model schema.')
+            item = _pod_api_field(value, yaml_name, api_name)
+            if item is None:
+                continue
+            canonical[yaml_name] = (
+                _canonicalize_projected_worker_runtime_bootstrap_value(
+                    item, f'{location}.{yaml_name}'))
+        return canonical
+    raise ProjectedRuntimeReadinessContractError(
+        f'{location} contains an unsupported value type.')
+
+
+def _projected_worker_runtime_bootstrap_identity(
+        pod_spec: object) -> dict[str, object]:
+    """Extract the exact template-owned bootstrap producer identity."""
+    containers = _pod_api_field(pod_spec, 'containers', 'containers')
+    if not isinstance(containers, (list, tuple)):
+        containers = []
+    runtime_containers = [
+        container for container in containers
+        if _pod_api_field(container, 'name', 'name') == 'ray-node'
+    ]
+    if len(runtime_containers) != 1:
+        raise ProjectedRuntimeReadinessContractError(
+            'Projected SkyServe Kubernetes Pods must contain exactly one '
+            'ray-node bootstrap producer.')
+    runtime = runtime_containers[0]
+    command = _pod_api_field(runtime, 'command', 'command')
+    if (not isinstance(command, (list, tuple)) or
+            tuple(command) != _SERVE_WORKER_RUNTIME_BOOTSTRAP_COMMAND):
+        raise ProjectedRuntimeReadinessContractError(
+            'Projected SkyServe worker bootstrap command must use the exact '
+            'canonical /bin/bash producer.')
+    args = _pod_api_field(runtime, 'args', 'args')
+    if (not isinstance(args, (list, tuple)) or len(args) != 1 or
+            not isinstance(args[0], str) or not args[0]):
+        raise ProjectedRuntimeReadinessContractError(
+            'Projected SkyServe worker bootstrap args must contain exactly '
+            'one non-empty canonical script.')
+    lifecycle = _pod_api_field(runtime, 'lifecycle', 'lifecycle')
+    return {
+        'command': list(command),
+        'args': list(args),
+        'lifecycle': _canonicalize_projected_worker_runtime_bootstrap_value(
+            lifecycle, 'ray-node.lifecycle'),
+    }
+
+
+def projected_worker_runtime_bootstrap_sha256(pod_spec: object) -> str:
+    """Return the immutable identity of the runtime marker producer."""
+    identity = _projected_worker_runtime_bootstrap_identity(pod_spec)
+    encoded = json.dumps(identity,
+                         sort_keys=True,
+                         separators=(',', ':'),
+                         ensure_ascii=True).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_projected_worker_runtime_bootstrap_sha256(value: object) -> str:
+    """Validate the persisted digest for one canonical bootstrap producer."""
+    if (not isinstance(value, str) or len(value) != 64 or
+            any(character not in _SHA256_HEX_DIGITS for character in value)):
+        raise ProjectedRuntimeReadinessContractError(
+            'Projected SkyServe worker runtime bootstrap SHA256 must be '
+            'exactly 64 lowercase hexadecimal characters.')
+    return value
+
+
+def _observe_projected_worker_runtime_readiness(
+        pod_spec: object) -> dict[str, object]:
+    containers = _pod_api_field(pod_spec, 'containers', 'containers')
+    if not isinstance(containers, (list, tuple)):
+        containers = []
+    runtime_containers = [
+        container for container in containers
+        if _pod_api_field(container, 'name', 'name') == 'ray-node'
+    ]
+    runtime = runtime_containers[0] if len(runtime_containers) == 1 else None
+    env = _pod_api_field(runtime, 'env', 'env')
+    if not isinstance(env, (list, tuple)):
+        env = []
+    pod_uid_env = [
+        _observe_projected_worker_runtime_env(entry)
+        for entry in env
+        if _pod_api_field(entry, 'name', 'name') ==
+        SERVE_WORKER_RUNTIME_READY_POD_UID_ENV_VAR
+    ]
+    observed = {
+        'restart_policy': _pod_api_field(pod_spec, 'restartPolicy',
+                                         'restart_policy'),
+        'pod_uid_env': pod_uid_env,
+        'startup_probe': _observe_projected_worker_runtime_probe(
+            _pod_api_field(runtime, 'startupProbe', 'startup_probe')),
+        'readiness_probe': _observe_projected_worker_runtime_probe(
+            _pod_api_field(runtime, 'readinessProbe', 'readiness_probe')),
+        'ray_node_container_count': len(runtime_containers),
+    }
+    try:
+        observed['bootstrap_sha256'] = (
+            projected_worker_runtime_bootstrap_sha256(pod_spec))
+    except ProjectedRuntimeReadinessContractError as error:
+        observed['bootstrap_sha256'] = None
+        observed['bootstrap_error'] = str(error)
+    return observed
+
+
+def enforce_projected_worker_runtime_readiness_contract(
+    pod_spec: object,
+    *,
+    rewrite: bool,
+    expected_bootstrap_sha256: object,
+) -> ProjectedRuntimeReadinessContract:
+    """Own the UID-bound bootstrap readiness surface for one worker Pod.
+
+    The marker writer lives in the canonical Kubernetes bootstrap template.
+    This contract owns its downward-API UID input and both kubelet probes, so a
+    merge, webhook, or same-name replacement cannot turn mere Running state
+    into projected-worker provisioning success.
+    """
+    expected_digest = validate_projected_worker_runtime_bootstrap_sha256(
+        expected_bootstrap_sha256)
+    expected = _expected_projected_worker_runtime_readiness()
+    expected['bootstrap_sha256'] = expected_digest
+    if rewrite:
+        if not isinstance(pod_spec, dict):
+            raise ProjectedRuntimeReadinessContractError(
+                'Projected SkyServe Kubernetes Pod spec must be a mapping.')
+        restart_policy = pod_spec.get('restartPolicy')
+        if restart_policy not in (None, 'Never'):
+            raise ProjectedRuntimeReadinessContractError(
+                'Projected SkyServe worker runtime readiness requires '
+                'restartPolicy Never.')
+        pod_spec['restartPolicy'] = 'Never'
+        containers = pod_spec.get('containers')
+        if (not isinstance(containers, list) or any(
+                not isinstance(container, dict) for container in containers)):
+            raise ProjectedRuntimeReadinessContractError(
+                'Projected SkyServe Kubernetes containers must be a list of '
+                'mappings.')
+        runtime_containers = [
+            container for container in containers
+            if container.get('name') == 'ray-node'
+        ]
+        if len(runtime_containers) != 1:
+            raise ProjectedRuntimeReadinessContractError(
+                'Projected SkyServe Kubernetes Pods must contain exactly one '
+                'ray-node container.')
+        runtime = runtime_containers[0]
+        actual_digest = projected_worker_runtime_bootstrap_sha256(pod_spec)
+        if actual_digest != expected_digest:
+            raise ProjectedRuntimeReadinessContractError(
+                'Projected SkyServe worker bootstrap command, args, or '
+                'lifecycle changed after canonical template rendering.')
+        env = runtime.get('env')
+        if env is None:
+            env = []
+        if (not isinstance(env, list) or
+                any(not isinstance(entry, dict) for entry in env)):
+            raise ProjectedRuntimeReadinessContractError(
+                'Projected SkyServe Kubernetes env must be a list of '
+                'mappings.')
+        uid_entries = [
+            entry for entry in env
+            if entry.get('name') == SERVE_WORKER_RUNTIME_READY_POD_UID_ENV_VAR
+        ]
+        expected_uid = expected['pod_uid_env']
+        if uid_entries and [
+                _observe_projected_worker_runtime_env(entry)
+                for entry in uid_entries
+        ] != expected_uid:
+            raise ProjectedRuntimeReadinessContractError(
+                'Projected SkyServe worker Pod UID environment identity '
+                'collides with the runtime-readiness contract.')
+        env[:] = [
+            entry for entry in env
+            if entry.get('name') != SERVE_WORKER_RUNTIME_READY_POD_UID_ENV_VAR
+        ]
+        env.append({
+            'name': SERVE_WORKER_RUNTIME_READY_POD_UID_ENV_VAR,
+            'valueFrom': {
+                'fieldRef': {
+                    'apiVersion': 'v1',
+                    'fieldPath': 'metadata.uid',
+                },
+            },
+        })
+        runtime['env'] = env
+        for yaml_field, expected_key in (('startupProbe', 'startup_probe'),
+                                         ('readinessProbe', 'readiness_probe')):
+            existing = runtime.get(yaml_field)
+            if (existing is not None and
+                    _observe_projected_worker_runtime_probe(existing)
+                    != expected[expected_key]):
+                raise ProjectedRuntimeReadinessContractError(
+                    'Projected SkyServe worker runtime probe identity '
+                    f'collides at {yaml_field}.')
+            observed_expected = expected[expected_key]
+            assert isinstance(observed_expected, dict)
+            probe = {
+                key: copy.deepcopy(value)
+                for key, value in observed_expected.items()
+                if key != 'extra_fields'
+            }
+            exec_action = probe['exec']
+            assert isinstance(exec_action, dict)
+            exec_action.pop('extra_fields', None)
+            runtime[yaml_field] = probe
+    actual = _observe_projected_worker_runtime_readiness(pod_spec)
+    return ProjectedRuntimeReadinessContract(matches=actual == expected,
+                                             expected=expected,
+                                             actual=actual)
 
 
 def _resource_mapping(owner: object, section: str, location: str,

@@ -656,6 +656,11 @@ available_node_types:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
+            {% elif k8s_projected_serve_worker_runtime_readiness %}
+            - name: SKYPILOT_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             {% endif %}
             - name: SKYPILOT_POD_CPU_CORE_LIMIT
               valueFrom:
@@ -807,7 +812,22 @@ available_node_types:
               # Set -x to print the commands and their arguments as they are executed.
               # Useful for debugging.
               set -x
-
+{% if k8s_projected_serve_worker_runtime_readiness %}              # A container writable layer can survive a same-Pod container
+              # restart. Projected workers use restartPolicy Never, but clear
+              # both names defensively before any bootstrap step so only this
+              # invocation can publish readiness.
+              set -e
+              rm -f {{k8s_projected_worker_runtime_ready_marker}} \
+                {{k8s_projected_worker_runtime_ready_marker}}.tmp \
+                /tmp/ray_skypilot_runtime_complete \
+                /tmp/apt_ssh_setup_complete \
+                /tmp/ray_skypilot_installation_complete \
+                /tmp/env_setup_complete \
+                /tmp/apt-ssh-setup.failed \
+                /tmp/runtime-setup.failed \
+                /tmp/env-setup.failed \
+                /tmp/sky_host_network_ports.env
+{% endif %}
               # Execute user-provided post-provision runcmd
               # before any of the SkyPilot setup commands.
               {%- if runcmd %}
@@ -815,7 +835,21 @@ available_node_types:
               {{cmd}}
               {%- endfor %}
               {%- endif %}
-
+{% if k8s_projected_serve_worker_runtime_readiness %}              # A trusted runcmd is part of this bootstrap. Reassert fail-fast
+              # execution and clear the complete marker set again so a
+              # synchronous command cannot satisfy this invocation's probes.
+              set -e
+              rm -f {{k8s_projected_worker_runtime_ready_marker}} \
+                {{k8s_projected_worker_runtime_ready_marker}}.tmp \
+                /tmp/ray_skypilot_runtime_complete \
+                /tmp/apt_ssh_setup_complete \
+                /tmp/ray_skypilot_installation_complete \
+                /tmp/env_setup_complete \
+                /tmp/apt-ssh-setup.failed \
+                /tmp/runtime-setup.failed \
+                /tmp/env-setup.failed \
+                /tmp/sky_host_network_ports.env
+{% endif %}
               # Helper function to conditionally use sudo
               # TODO(zhwu): consolidate the two prefix_cmd and sudo replacements
               prefix_cmd() { if [ $(id -u) -ne 0 ]; then echo "sudo"; else echo ""; fi; }
@@ -1118,7 +1152,11 @@ available_node_types:
                 {{ k8s_fusermount_setup_command | indent(16) }}
                 {% endif %}
 
-                $(prefix_cmd) mkdir -p /var/run/sshd;
+{% if k8s_projected_serve_worker_runtime_readiness %}                # Optional-package fallback may leave errexit disabled. A
+                # projected worker cannot publish readiness unless every
+                # subsequent SSH configuration step succeeds.
+                set -e
+{% endif %}                $(prefix_cmd) mkdir -p /var/run/sshd;
                 $(prefix_cmd) sed -i "s/PermitRootLogin prohibit-password/PermitRootLogin yes/" /etc/ssh/sshd_config;
                 $(prefix_cmd) sed "s@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g" -i /etc/pam.d/sshd;
                 cd /etc/ssh/ && $(prefix_cmd) ssh-keygen -A;
@@ -1129,8 +1167,13 @@ available_node_types:
               skypilot:ssh_public_key_content
               SKYPILOT_SSH_KEY_EOF
                 $(prefix_cmd) chmod 644 ~/.ssh/authorized_keys;
-                $(prefix_cmd) service ssh restart;
-                $(prefix_cmd) sed -i "s/mesg n/tty -s \&\& mesg n/" ~/.profile;
+{% if k8s_projected_serve_worker_runtime_readiness and k8s_host_network %}                # Port 22 is normally owned by the host. The Ray bootstrap
+                # probe below selects the Pod's unique port and restarts sshd;
+                # the final listener proof is still mandatory.
+                set +e
+{% endif %}                $(prefix_cmd) service ssh restart;
+{% if k8s_projected_serve_worker_runtime_readiness and k8s_host_network %}                set -e
+{% endif %}                $(prefix_cmd) sed -i "s/mesg n/tty -s \&\& mesg n/" ~/.profile;
 
                 {% if k8s_enable_docker_build %}
                 # Register BuildKit sidecar as a remote buildx builder so
@@ -1216,7 +1259,15 @@ available_node_types:
                   set +e
                   {{ ray_worker_start_command }}
                 fi
-                ) > /tmp/${STEPS[1]}.log 2>&1
+{% if k8s_projected_serve_worker_runtime_readiness %}                # This section deliberately runs under set +e. Capture the
+                # generated Ray command's status through the enclosing if
+                # before any later command can mask a failed start/join.
+                RAY_START_STATUS=$?
+                if [ "$RAY_START_STATUS" -ne 0 ]; then
+                  exit "$RAY_START_STATUS"
+                fi
+                touch /tmp/ray_skypilot_runtime_complete
+{% endif %}                ) > /tmp/${STEPS[1]}.log 2>&1
                 if [ "$?" -ne "0" ]; then
                   {
                   echo "Error: ${STEPS[1]} failed. Continuing anyway..." > /tmp/${STEPS[1]}.failed 2>&1
@@ -1336,7 +1387,59 @@ available_node_types:
                   exit 1
                 fi
               done
-
+{% if k8s_projected_serve_worker_runtime_readiness %}              # The historical runtime-install marker precedes Ray start.
+              # Projected Serve workers additionally wait for the successful
+              # Ray completion above, then atomically bind readiness to this
+              # exact Pod object through its immutable UID.
+              until [ -f /tmp/ray_skypilot_runtime_complete ] || \
+                    [ -f "/tmp/${STEPS[1]}.failed" ]; do
+                sleep 1
+              done
+              if [ -f "/tmp/${STEPS[1]}.failed" ]; then
+                echo "Error: ${STEPS[1]} failed before runtime readiness."
+                exit 1
+              fi
+              # Verify the final sshd listener, not merely the earlier setup
+              # command's exit status. hostNetwork selects its unique port in
+              # the Ray bootstrap subprocess, so import that exact result.
+              if [ "${SKYPILOT_HOST_NETWORK:-0}" = "1" ]; then
+                if [ ! -s /tmp/sky_host_network_ports.env ]; then
+                  echo "Error: hostNetwork sshd port identity is absent."
+                  exit 1
+                fi
+                . /tmp/sky_host_network_ports.env
+                SKYPILOT_RUNTIME_SSH_PORT="${SKYPILOT_SSHD_PORT:-}"
+              else
+                SKYPILOT_RUNTIME_SSH_PORT=22
+              fi
+              case "$SKYPILOT_RUNTIME_SSH_PORT" in
+                ''|*[!0-9]*)
+                  echo "Error: invalid projected worker sshd port."
+                  exit 1
+                  ;;
+              esac
+              SKYPILOT_RUNTIME_SSH_READY=0
+              for _ in {1..10}; do
+                SKYPILOT_RUNTIME_SSH_BANNER=""
+                if exec 3<>"/dev/tcp/127.0.0.1/${SKYPILOT_RUNTIME_SSH_PORT}"; then
+                  IFS= read -r -t 1 SKYPILOT_RUNTIME_SSH_BANNER <&3 || true
+                  exec 3>&-
+                  if [[ "$SKYPILOT_RUNTIME_SSH_BANNER" == SSH-* ]]; then
+                    SKYPILOT_RUNTIME_SSH_READY=1
+                    break
+                  fi
+                fi
+                sleep 0.2
+              done
+              if [ "$SKYPILOT_RUNTIME_SSH_READY" -ne 1 ]; then
+                echo "Error: projected worker sshd listener is not ready."
+                exit 1
+              fi
+              printf '%s\n' "$SKYPILOT_POD_UID" > \
+                {{k8s_projected_worker_runtime_ready_marker}}.tmp
+              mv -f {{k8s_projected_worker_runtime_ready_marker}}.tmp \
+                {{k8s_projected_worker_runtime_ready_marker}}
+{% endif %}
               {% if high_availability %}
               mkdir -p {{k8s_high_availability_deployment_run_script_dir}}
               if [ -f {{k8s_high_availability_deployment_volume_mount_path}}/k8s_container_ready ]; then

@@ -438,6 +438,142 @@ def _wait_for_pods_to_run(namespace, context, cluster_name,
         time.sleep(1)
 
 
+def _projected_serve_worker_pod_is_runtime_ready(pod: object) -> bool:
+    """Whether one exact Pod reports marker-gated ray-node readiness."""
+    status = getattr(pod, 'status', None)
+    if getattr(status, 'phase', None) != 'Running':
+        return False
+    conditions = getattr(status, 'conditions', None)
+    if not isinstance(conditions, (list, tuple)):
+        return False
+    ready_conditions = [
+        condition for condition in conditions
+        if getattr(condition, 'type', None) == 'Ready'
+    ]
+    if (len(ready_conditions) != 1 or
+            getattr(ready_conditions[0], 'status', None) != 'True'):
+        return False
+    container_statuses = getattr(status, 'container_statuses', None)
+    if not isinstance(container_statuses, (list, tuple)):
+        return False
+    runtime_statuses = [
+        container_status for container_status in container_statuses
+        if getattr(container_status, 'name', None) == 'ray-node'
+    ]
+    return (len(runtime_statuses) == 1 and
+            getattr(runtime_statuses[0], 'ready', None) is True and
+            getattr(getattr(runtime_statuses[0], 'state', None), 'running',
+                    None) is not None)
+
+
+def _raise_projected_runtime_readiness_failure(
+    message: str,
+    namespace: str,
+    expected_pod_uids: Mapping[str, str],
+    provider_effect_guard_factory: (common.ProviderEffectGuardFactory | None),
+) -> NoReturn:
+    if provider_effect_guard_factory is not None:
+        provider_resource_ids = tuple(
+            f'{namespace}/{pod_name}@{pod_uid}'
+            for pod_name, pod_uid in sorted(expected_pod_uids.items()))
+        raise exceptions.ReservedFillProviderPresentError(
+            message + ' Protocol-v2 reconciliation retains exact cleanup '
+            'authority.', provider_resource_ids)
+    raise config_lib.KubernetesError(message)
+
+
+@timeline.event
+def _wait_for_projected_serve_worker_runtime_ready(
+    namespace: str,
+    context: str | None,
+    cluster_name: str,
+    cluster_name_on_cloud: str,
+    expected_pod_uids: Mapping[str, str],
+    *,
+    timeout: int = (pod_spec_lib.SERVE_WORKER_RUNTIME_STARTUP_TIMEOUT_SECONDS),
+    provider_effect_guard_factory: (common.ProviderEffectGuardFactory |
+                                    None) = None,
+) -> None:
+    """Wait for marker-gated Ready on the exact already-Running Pod UIDs."""
+    if not expected_pod_uids:
+        return
+    deadline = time.monotonic() + timeout
+    expected_names = set(expected_pod_uids)
+    while True:
+        try:
+            pod_list = kubernetes.core_api(context).list_namespaced_pod(
+                namespace,
+                label_selector=(f'{constants.TAG_SKYPILOT_CLUSTER_NAME}='
+                                f'{cluster_name_on_cloud}'),
+                _request_timeout=kubernetes.API_TIMEOUT)
+        except kubernetes.api_exception() as error:
+            _raise_projected_runtime_readiness_failure(
+                'Kubernetes failed to observe the exact projected worker '
+                'Pods while SkyPilot waited for runtime readiness: '
+                f'{common_utils.format_exception(error)}.', namespace,
+                expected_pod_uids, provider_effect_guard_factory)
+        observed = getattr(pod_list, 'items', None)
+        if not isinstance(observed, list):
+            _raise_projected_runtime_readiness_failure(
+                'Kubernetes returned an invalid Pod list while SkyPilot '
+                'waited for projected worker runtime readiness.', namespace,
+                expected_pod_uids, provider_effect_guard_factory)
+        observed_by_name = {
+            getattr(getattr(pod, 'metadata', None), 'name', None): pod
+            for pod in observed
+            if getattr(getattr(pod, 'metadata', None), 'name', None) in
+            expected_names
+        }
+        missing = expected_names - set(observed_by_name)
+        if missing:
+            _raise_projected_runtime_readiness_failure(
+                'Projected SkyServe worker runtime readiness lost the exact '
+                f'Pod objects {sorted(missing)!r}; SkyPilot refused to adopt '
+                'a deletion or same-name replacement.', namespace,
+                expected_pod_uids, provider_effect_guard_factory)
+        waiting = []
+        for pod_name, expected_uid in expected_pod_uids.items():
+            pod = observed_by_name[pod_name]
+            metadata = getattr(pod, 'metadata', None)
+            actual_uid = getattr(metadata, 'uid', None)
+            if actual_uid != expected_uid:
+                _raise_projected_runtime_readiness_failure(
+                    'Projected SkyServe worker runtime readiness observed a '
+                    f'same-name replacement for {pod_name!r}: UID '
+                    f'{actual_uid!r}; expected {expected_uid!r}.', namespace,
+                    expected_pod_uids, provider_effect_guard_factory)
+            if getattr(metadata, 'deletion_timestamp', None) is not None:
+                _raise_projected_runtime_readiness_failure(
+                    f'Projected SkyServe worker Pod {pod_name!r} entered '
+                    'deletion before runtime readiness.', namespace,
+                    expected_pod_uids, provider_effect_guard_factory)
+            phase = getattr(getattr(pod, 'status', None), 'phase', None)
+            if phase != 'Running':
+                condensed = _condensed_pod_reason(pod)
+                _raise_projected_runtime_readiness_failure(
+                    f'Projected SkyServe worker Pod {pod_name!r} left '
+                    f'Running before runtime readiness: {phase!r}; '
+                    f'{condensed}.', namespace, expected_pod_uids,
+                    provider_effect_guard_factory)
+            if not _projected_serve_worker_pod_is_runtime_ready(pod):
+                waiting.append(pod_name)
+        if not waiting:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _raise_projected_runtime_readiness_failure(
+                f'Timed out after {timeout}s waiting for projected SkyServe '
+                'worker runtime readiness on exact Pods '
+                f'{sorted(waiting)!r}. Inspect the ray-node startup probe and '
+                'bootstrap logs.', namespace, expected_pod_uids,
+                provider_effect_guard_factory)
+        rich_utils.force_update_status(
+            ux_utils.spinner_message(
+                'Launching (waiting for projected worker runtime bootstrap)',
+                cluster_name=cluster_name))
+        time.sleep(min(POLL_INTERVAL, remaining))
+
+
 @timeline.event
 def pre_init(namespace: str, context: str | None, new_nodes: list) -> None:
     """Pre-initialization step for SkyPilot pods.
@@ -1890,6 +2026,36 @@ def _attest_serve_worker_scratch(
                                            defer_cleanup=defer_cleanup)
 
 
+def _attest_serve_worker_runtime_readiness(
+    pod: object,
+    namespace: str,
+    context: str | None,
+    required: bool,
+    expected_bootstrap_sha256: object,
+    *,
+    defer_cleanup: bool = False,
+) -> None:
+    """Reject a projected worker whose producer or UID probes changed."""
+    if not required:
+        return
+    pod_spec = (pod.get('spec') if isinstance(pod, Mapping) else getattr(
+        pod, 'spec', None))
+    contract = (
+        pod_spec_lib.enforce_projected_worker_runtime_readiness_contract(
+            pod_spec,
+            rewrite=False,
+            expected_bootstrap_sha256=expected_bootstrap_sha256))
+    if contract.matches:
+        return
+    _reject_admitted_serve_worker_identity(pod,
+                                           namespace,
+                                           context,
+                                           'worker runtime-readiness contract',
+                                           contract.actual,
+                                           contract.expected,
+                                           defer_cleanup=defer_cleanup)
+
+
 def _attest_created_serve_worker_pod(
     pod: Any,
     namespace: str,
@@ -1911,6 +2077,8 @@ def _attest_created_serve_worker_pod(
     expected_accelerator_resource_key: object,
     expected_accelerator_count: object,
     expected_scratch: object,
+    require_runtime_readiness: bool,
+    expected_runtime_bootstrap_sha256: object,
     expected_kueue_lifecycle: _RequiredKueuePodLifecycle = 'create_response',
 ) -> None:
     """Attest one admitted Pod before its create thread returns."""
@@ -1963,6 +2131,12 @@ def _attest_created_serve_worker_pod(
                                  context,
                                  expected_scratch,
                                  defer_cleanup=True)
+    _attest_serve_worker_runtime_readiness(pod,
+                                           namespace,
+                                           context,
+                                           require_runtime_readiness,
+                                           expected_runtime_bootstrap_sha256,
+                                           defer_cleanup=True)
 
 
 def _attest_pod_with_provider_guard(
@@ -2174,8 +2348,10 @@ def _read_and_attest_pod_with_provider_guard(
     context: str | None,
     post_create_attestation: Callable[[Any], None],
     provider_effect_guard_factory: (common.ProviderEffectGuardFactory | None),
+    *,
+    require_runtime_readiness: bool = False,
 ) -> None:
-    """Fresh-read and attest one exact Running Pod in one authority epoch."""
+    """Fresh-read and attest one exact publishable Pod in one authority epoch."""
     try:
         with _provider_mutation_guard(provider_effect_guard_factory):
             pod = kubernetes.core_api(context).read_namespaced_pod(
@@ -2208,6 +2384,44 @@ def _read_and_attest_pod_with_provider_guard(
                                                        actual_phase,
                                                        'Running',
                                                        defer_cleanup=True)
+            if (require_runtime_readiness and
+                    not _projected_serve_worker_pod_is_runtime_ready(pod)):
+                status = getattr(pod, 'status', None)
+                ready_conditions = [
+                    getattr(condition, 'status', None)
+                    for condition in (getattr(status, 'conditions', None) or [])
+                    if getattr(condition, 'type', None) == 'Ready'
+                ]
+                runtime_ready = [
+                    getattr(container_status, 'ready', None)
+                    for container_status in (
+                        getattr(status, 'container_statuses', None) or [])
+                    if getattr(container_status, 'name', None) == 'ray-node'
+                ]
+                readiness_actual = {
+                    'pod_ready_conditions': ready_conditions,
+                    'ray_node_ready': runtime_ready,
+                }
+                readiness_expected = {
+                    'pod_ready_conditions': ['True'],
+                    'ray_node_ready': [True],
+                }
+                if provider_effect_guard_factory is not None:
+                    _raise_projected_runtime_readiness_failure(
+                        'Projected SkyServe worker runtime readiness '
+                        'regressed during the final guarded read: '
+                        f'{readiness_actual!r}; expected '
+                        f'{readiness_expected!r}.', namespace,
+                        {pod_name: expected_pod_uid},
+                        provider_effect_guard_factory)
+                _reject_admitted_serve_worker_identity(
+                    pod,
+                    namespace,
+                    context,
+                    'post-wait Pod runtime readiness',
+                    readiness_actual,
+                    readiness_expected,
+                    defer_cleanup=True)
             post_create_attestation(pod)
     except _ServeWorkerIdentityRejection as rejection:
         _raise_rejected_serve_worker_after_cleanup(
@@ -2248,9 +2462,12 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     except ValueError as error:
         raise config_lib.KubernetesError(
             'The rendered SkyServe worker projection protocol version must be '
-            '1, 2, 3, or absent.') from error
+            '1, 2, 3, 4, or absent.') from error
     strict_kueue_projection = (
         pod_spec_lib.serve_worker_projection_protocol_has_strict_admission(
+            serve_worker_projection_protocol_version))
+    require_runtime_readiness = (
+        pod_spec_lib.serve_worker_projection_protocol_has_runtime_readiness(
             serve_worker_projection_protocol_version))
     if (kueue_workload_priority_class_name is not None and
         (not isinstance(kueue_workload_priority_class_name, str) or
@@ -2287,21 +2504,41 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
     serve_worker_expected_scratch = provider_config.get(
         'serve_worker_expected_scratch', _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
+    serve_worker_expected_runtime_bootstrap_sha256 = provider_config.get(
+        'serve_worker_expected_runtime_bootstrap_sha256',
+        _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
     if pod_spec_lib.serve_worker_projection_protocol_has_scratch(
             serve_worker_projection_protocol_version):
         if (serve_worker_expected_scratch
                 is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
             raise config_lib.KubernetesError(
-                'Projection protocol v3 requires the complete worker scratch '
-                'attestation contract.')
+                'Projection protocol v3/v4 requires the complete worker '
+                'scratch attestation contract.')
         serve_worker_expected_scratch = (
             _validate_serve_worker_scratch_contract(
                 serve_worker_expected_scratch))
     elif (serve_worker_expected_scratch
           is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
         raise config_lib.KubernetesError(
-            'Only projection protocol v3 may carry a worker scratch '
+            'Only projection protocol v3/v4 may carry a worker scratch '
             'attestation contract.')
+    if require_runtime_readiness:
+        if (serve_worker_expected_runtime_bootstrap_sha256
+                is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+            raise config_lib.KubernetesError(
+                'Projection protocol v4 requires the complete worker runtime '
+                'bootstrap SHA256 contract.')
+        try:
+            serve_worker_expected_runtime_bootstrap_sha256 = (
+                pod_spec_lib.validate_projected_worker_runtime_bootstrap_sha256(
+                    serve_worker_expected_runtime_bootstrap_sha256))
+        except pod_spec_lib.ProjectedRuntimeReadinessContractError as error:
+            raise config_lib.KubernetesError(str(error)) from error
+    elif (serve_worker_expected_runtime_bootstrap_sha256
+          is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+        raise config_lib.KubernetesError(
+            'Only projection protocol v4 may carry a worker runtime '
+            'bootstrap SHA256 contract.')
     priority_attestation_presence = tuple(
         value is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION
         for value in (serve_worker_expected_priority_class_name,
@@ -2426,7 +2663,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             serve_worker_expected_accelerator_label_key
             is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION or
             serve_worker_expected_scratch
-            is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+            is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION or
+            require_runtime_readiness):
 
         def attest_pod(
             pod: Any,
@@ -2463,6 +2701,9 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 expected_accelerator_count=(
                     serve_worker_expected_accelerator_count),
                 expected_scratch=serve_worker_expected_scratch,
+                require_runtime_readiness=require_runtime_readiness,
+                expected_runtime_bootstrap_sha256=(
+                    serve_worker_expected_runtime_bootstrap_sha256),
                 expected_kueue_lifecycle=expected_kueue_lifecycle)
 
         def attest_created_pod(pod: Any) -> None:
@@ -2732,6 +2973,20 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                     'scratch contract: '
                     f'{scratch_contract.actual!r}; expected '
                     f'{scratch_contract.expected!r}.')
+        if require_runtime_readiness:
+            runtime_readiness_contract = (
+                pod_spec_lib.
+                enforce_projected_worker_runtime_readiness_contract(
+                    pod_spec_copy['spec'],
+                    rewrite=False,
+                    expected_bootstrap_sha256=(
+                        serve_worker_expected_runtime_bootstrap_sha256)))
+            if not runtime_readiness_contract.matches:
+                raise config_lib.KubernetesError(
+                    'The finalized SkyServe worker Pod changed the immutable '
+                    'runtime-readiness contract: '
+                    f'{runtime_readiness_contract.actual!r}; expected '
+                    f'{runtime_readiness_contract.expected!r}.')
 
         if kueue_require_managed:
             assert kueue_local_queue_name is not None
@@ -2882,6 +3137,24 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     # fail early if there is an error
     logger.debug(f'run_instances: waiting for pods to be running: '
                  f'{[pod.metadata.name for pod in pods]}')
+    projected_expected_pod_uids: dict[str, str] | None = None
+    if require_runtime_readiness:
+        if admitted_kueue_pod_uids is not None:
+            projected_expected_pod_uids = dict(admitted_kueue_pod_uids)
+        else:
+            projected_expected_pod_uids = {}
+            for pod in pods:
+                pod_name = getattr(getattr(pod, 'metadata', None), 'name', None)
+                pod_uid = getattr(getattr(pod, 'metadata', None), 'uid', None)
+                if (not isinstance(pod_name, str) or not pod_name or
+                        not isinstance(pod_uid, str) or not pod_uid or
+                        pod_name in projected_expected_pod_uids):
+                    _raise_projected_runtime_readiness_failure(
+                        'Projected SkyServe worker runtime readiness requires '
+                        'one exact non-empty Pod name and UID per worker.',
+                        namespace, projected_expected_pod_uids,
+                        config.provider_effect_guard_factory)
+                projected_expected_pod_uids[pod_name] = pod_uid
     running_pod_uids = _wait_for_pods_to_run(namespace, context, cluster_name,
                                              pods)
     # Reset spinner message here because it might have hinted the reason
@@ -2891,14 +3164,32 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     logger.debug(f'run_instances: all pods are scheduled and running: '
                  f'{[pod.metadata.name for pod in pods]}')
 
+    if projected_expected_pod_uids is not None:
+        if running_pod_uids != projected_expected_pod_uids:
+            _raise_projected_runtime_readiness_failure(
+                'Projected SkyServe worker Running observation changed the '
+                'exact Pod UID set; SkyPilot refused to publish provisioning '
+                'success.', namespace, projected_expected_pod_uids,
+                config.provider_effect_guard_factory)
+        _wait_for_projected_serve_worker_runtime_ready(
+            namespace,
+            context,
+            cluster_name,
+            cluster_name_on_cloud,
+            projected_expected_pod_uids,
+            provider_effect_guard_factory=(
+                config.provider_effect_guard_factory))
+
     if post_wait_pod_attestation is not None:
         # The create response proves the webhook installed the closed,
         # pre-admission contract. Scheduling can take arbitrarily long, during
         # which a LocalQueue could be retargeted. Re-read every exact Pod only
         # after it is Running and require the admitted identity (including the
         # preflight ClusterQueue) before publishing provisioning success.
-        expected_pod_uids = (running_pod_uids if admitted_kueue_pod_uids is None
-                             else admitted_kueue_pod_uids)
+        expected_pod_uids = (projected_expected_pod_uids
+                             if projected_expected_pod_uids is not None else
+                             (running_pod_uids if admitted_kueue_pod_uids
+                              is None else admitted_kueue_pod_uids))
         expected_pod_names = set(expected_pod_uids)
         if set(running_pod_uids) != expected_pod_names:
             raise config_lib.KubernetesError(
@@ -2907,8 +3198,13 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 'provisioning success.')
         for pod_name, pod_uid in expected_pod_uids.items():
             _read_and_attest_pod_with_provider_guard(
-                pod_name, pod_uid, namespace, context,
-                post_wait_pod_attestation, config.provider_effect_guard_factory)
+                pod_name,
+                pod_uid,
+                namespace,
+                context,
+                post_wait_pod_attestation,
+                config.provider_effect_guard_factory,
+                require_runtime_readiness=require_runtime_readiness)
 
     assert head_pod_name is not None, 'head_instance_id should not be None'
     return common.ProvisionRecord(

@@ -17,6 +17,7 @@ from sky.backends import backend_utils
 from sky.data import storage as storage_lib
 from sky.provision.kubernetes import config as kubernetes_config
 from sky.provision.kubernetes import instance as kubernetes_instance
+from sky.provision.kubernetes import pod_spec as kubernetes_pod_spec
 from sky.serve import constants
 from sky.serve import kubernetes_identity
 from sky.skylet import constants as skylet_constants
@@ -97,14 +98,14 @@ def _worker_projection(*,
             'kind': 'none'
         },
     }
-    if protocol_version in (2, 3):
+    if protocol_version in (2, 3, 4):
         projection = {
             'projection_version': protocol_version,
             **projection,
             'scheduler_name': scheduler_name,
             'kueue_admission': kueue_admission,
         }
-    if protocol_version == 3:
+    if protocol_version in (3, 4):
         projection['provision_timeout'] = provision_timeout
         projection['scratch'] = ({
             'kind': 'none'
@@ -153,7 +154,7 @@ def test_worker_projection_protocol_v2_is_explicit_and_v1_is_isolated():
         })
 
 
-def test_worker_projection_protocol_v3_is_canonical_and_v2_is_isolated():
+def test_worker_projection_protocol_v4_is_canonical_and_v3_is_isolated():
     admission = {
         'local_queue_name': 'inference',
         'workload_priority_class_name': 'inference-low',
@@ -167,25 +168,41 @@ def test_worker_projection_protocol_v3_is_canonical_and_v2_is_isolated():
                                 'volume_name': 'skypilot-serve-worker-tmp',
                                 'size_limit_bytes': 20 * 1024**3,
                             })
+    v4 = {
+        **v3,
+        'projection_version': 4,
+    }
 
     assert kubernetes_identity.worker_projection_protocol_version(v2) == 2
     assert kubernetes_identity.worker_projection_protocol_version(v3) == 3
+    assert kubernetes_identity.worker_projection_protocol_version(v4) == 4
     assert kubernetes_identity.worker_projection_has_strict_admission(v2)
     assert kubernetes_identity.worker_projection_has_strict_admission(v3)
+    assert kubernetes_identity.worker_projection_has_strict_admission(v4)
+    assert kubernetes_identity.worker_projection_has_scratch(v3)
+    assert kubernetes_identity.worker_projection_has_scratch(v4)
+    assert not (kubernetes_pod_spec.
+                serve_worker_projection_protocol_has_runtime_readiness(3))
+    assert (kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_runtime_readiness(4))
     assert kubernetes_identity.validate_worker_placement_projections(
         [v2], require_protocol_version=2) == [v2]
     assert kubernetes_identity.validate_worker_placement_projections(
         [v3], require_protocol_version=3) == [v3]
+    assert kubernetes_identity.validate_worker_placement_projections(
+        [v4], require_protocol_version=4) == [v4]
     with pytest.raises(ValueError, match='must not mix protocol versions'):
-        kubernetes_identity.validate_worker_placement_projections([v2, v3])
-    with pytest.raises(ValueError, match='protocol-v3 keys'):
+        kubernetes_identity.validate_worker_placement_projections([v3, v4])
+    with pytest.raises(ValueError, match='protocol-v3/v4 keys'):
         kubernetes_identity.worker_projection_protocol_version({
-            **v3, 'unknown': True
+            **v4, 'unknown': True
         })
-    missing_timeout = copy.deepcopy(v3)
+    missing_timeout = copy.deepcopy(v4)
     missing_timeout.pop('provision_timeout')
-    with pytest.raises(ValueError, match='protocol-v3 keys'):
+    with pytest.raises(ValueError, match='protocol-v3/v4 keys'):
         kubernetes_identity.worker_projection_protocol_version(missing_timeout)
+    assert (kubernetes_identity.worker_projection_sha256(v3)
+            != kubernetes_identity.worker_projection_sha256(v4))
 
 
 def test_worker_projection_v3_digest_covers_scratch():
@@ -349,7 +366,7 @@ def test_worker_projection_v2_digest_covers_complete_validated_candidate():
     mutated_scheduler['scheduler_name'] = 'trusted-batch-scheduler'
     assert (kubernetes_identity.worker_projection_sha256(mutated_scheduler)
             != expected)
-    with pytest.raises(ValueError, match='requires protocol 2 or 3'):
+    with pytest.raises(ValueError, match='requires protocol 2, 3, or 4'):
         kubernetes_identity.worker_projection_sha256(_worker_projection())
 
 
@@ -1320,7 +1337,7 @@ run: echo hi
         _worker_role('east'),
         _worker_role('phx'),
     ]
-    assert all(item['projection_version'] == 3 for item in projected)
+    assert all(item['projection_version'] == 4 for item in projected)
     assert all(item['provision_timeout'] == -1 for item in projected)
     assert all(item['scratch'] == {'kind': 'none'} for item in projected)
     assert all(
@@ -1331,7 +1348,7 @@ run: echo hi
     assert projected[1]['accelerator_scheduling'] == (_accelerator_scheduling())
 
 
-def test_worker_catalog_preserves_identity_free_v3_candidates(monkeypatch):
+def test_worker_catalog_preserves_identity_free_v4_candidates(monkeypatch):
     task = task_lib.Task.from_yaml_str('''
 resources:
   infra: k8s/phx
@@ -1374,7 +1391,7 @@ run: echo hi
         task, workspace='inference', placement_catalog={})
 
     assert projected is not None
-    assert projected[0]['projection_version'] == 3
+    assert projected[0]['projection_version'] == 4
     assert projected[0]['provision_timeout'] == -1
     assert projected[0]['scratch'] == {'kind': 'none'}
     assert projected[0]['pod_identity_role_arn'] is None
@@ -1946,9 +1963,9 @@ def test_final_kubernetes_yaml_reasserts_v2_kueue_admission():
                     'kueue.x-k8s.io/priority-class', 'kueue.x-k8s.io/managed'))
 
 
-def test_final_v3_yaml_composes_kueue_cache_and_memory_scratch_idempotently():
+def test_final_v4_yaml_composes_kueue_cache_scratch_and_readiness():
     projection = _worker_projection(
-        protocol_version=3,
+        protocol_version=4,
         scheduler_name='trusted-batch-scheduler',
         kueue_admission={
             'local_queue_name': 'inference',
@@ -1972,6 +1989,8 @@ def test_final_v3_yaml_composes_kueue_cache_and_memory_scratch_idempotently():
                     'spec': {
                         'containers': [{
                             'name': 'ray-node',
+                            'command': ['/bin/bash', '-c', '--'],
+                            'args': ['canonical bootstrap'],
                             'env': [{
                                 'name': 'SKYPILOT_SERVE_SCRATCH_KIND',
                                 'value': 'caller',
@@ -1982,17 +2001,27 @@ def test_final_v3_yaml_composes_kueue_cache_and_memory_scratch_idempotently():
             },
         },
     }
+    pod_spec = cluster_yaml['available_node_types']['ray_head_default'][
+        'node_config']['spec']
+    bootstrap_sha256 = (
+        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
 
     backend_utils._enforce_worker_projection_on_kubernetes_yaml(
-        cluster_yaml, projection)
+        cluster_yaml,
+        projection,
+        expected_runtime_bootstrap_sha256=bootstrap_sha256)
     first = copy.deepcopy(cluster_yaml)
     backend_utils._enforce_worker_projection_on_kubernetes_yaml(
-        cluster_yaml, projection)
+        cluster_yaml,
+        projection,
+        expected_runtime_bootstrap_sha256=bootstrap_sha256)
 
     assert cluster_yaml == first
     assert cluster_yaml['provider'][
-        'serve_worker_projection_protocol_version'] == 3
+        'serve_worker_projection_protocol_version'] == 4
     assert cluster_yaml['provider']['timeout'] == -1
+    assert cluster_yaml['provider'][
+        'serve_worker_expected_runtime_bootstrap_sha256'] == bootstrap_sha256
     assert cluster_yaml['provider']['serve_worker_expected_scratch'] == {
         'kind': 'memory',
         'mount_path': '/tmp',
@@ -2026,7 +2055,11 @@ def test_final_v3_yaml_composes_kueue_cache_and_memory_scratch_idempotently():
         'name': 'skypilot-serve-worker-tmp',
         'mountPath': '/tmp',
     }]
-    environment = {entry['name']: entry['value'] for entry in runtime['env']}
+    environment = {
+        entry['name']: entry['value']
+        for entry in runtime['env']
+        if 'value' in entry
+    }
     assert {
         key: value
         for key, value in environment.items()
@@ -2036,6 +2069,224 @@ def test_final_v3_yaml_composes_kueue_cache_and_memory_scratch_idempotently():
         'SKYPILOT_SERVE_SCRATCH_MOUNT_PATH': '/tmp',
         'SKYPILOT_SERVE_SCRATCH_SIZE_LIMIT_BYTES': str(20 * 1024**3),
     }
+    assert node['spec']['restartPolicy'] == 'Never'
+    assert [
+        entry for entry in runtime['env'] if entry['name'] == 'SKYPILOT_POD_UID'
+    ] == [{
+        'name': 'SKYPILOT_POD_UID',
+        'valueFrom': {
+            'fieldRef': {
+                'apiVersion': 'v1',
+                'fieldPath': 'metadata.uid',
+            },
+        },
+    }]
+    expected_probe_command = [
+        '/bin/sh', '-c',
+        ('test -n "$SKYPILOT_POD_UID" && '
+         'test "$(cat /tmp/skypilot-serve-worker-runtime-ready '
+         '2>/dev/null)" = "$SKYPILOT_POD_UID"')
+    ]
+    assert runtime['startupProbe'] == {
+        'exec': {
+            'command': expected_probe_command,
+        },
+        'initialDelaySeconds': 0,
+        'periodSeconds': 2,
+        'timeoutSeconds': 1,
+        'successThreshold': 1,
+        'failureThreshold': 900,
+    }
+    assert runtime['readinessProbe'] == {
+        'exec': {
+            'command': expected_probe_command,
+        },
+        'initialDelaySeconds': 0,
+        'periodSeconds': 2,
+        'timeoutSeconds': 1,
+        'successThreshold': 1,
+        'failureThreshold': 1,
+    }
+
+
+@pytest.mark.parametrize('protocol_version', [1, 2, 3])
+def test_historical_projection_does_not_install_runtime_readiness(
+        protocol_version):
+    cluster_yaml = _v3_scratch_cluster_yaml()
+    backend_utils._enforce_worker_projection_on_kubernetes_yaml(
+        cluster_yaml, _worker_projection(protocol_version=protocol_version))
+
+    pod_spec = cluster_yaml['available_node_types']['ray_head_default'][
+        'node_config']['spec']
+    runtime = pod_spec['containers'][0]
+    assert 'restartPolicy' not in pod_spec
+    assert 'startupProbe' not in runtime
+    assert 'readinessProbe' not in runtime
+    assert all(
+        entry.get('name') != 'SKYPILOT_POD_UID'
+        for entry in runtime.get('env', []))
+
+
+@pytest.mark.parametrize('collision', [
+    'restart_policy',
+    'pod_uid_env',
+    'startup_probe',
+    'readiness_probe',
+])
+def test_projected_runtime_readiness_rejects_owned_surface_collision(collision):
+    pod_spec = {
+        'containers': [{
+            'name': 'ray-node',
+            'command': ['/bin/bash', '-c', '--'],
+            'args': ['canonical bootstrap'],
+        }]
+    }
+    bootstrap_sha256 = (
+        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
+    runtime = pod_spec['containers'][0]
+    if collision == 'restart_policy':
+        pod_spec['restartPolicy'] = 'Always'
+    elif collision == 'pod_uid_env':
+        runtime['env'] = [{
+            'name': 'SKYPILOT_POD_UID',
+            'value': 'caller',
+        }]
+    elif collision == 'startup_probe':
+        runtime['startupProbe'] = {'exec': {'command': ['true']}}
+    else:
+        runtime['readinessProbe'] = {'exec': {'command': ['true']}}
+
+    with pytest.raises(
+            kubernetes_pod_spec.ProjectedRuntimeReadinessContractError,
+            match='runtime|UID|restartPolicy'):
+        kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
+            pod_spec, rewrite=True, expected_bootstrap_sha256=bootstrap_sha256)
+
+
+@pytest.mark.parametrize('mutation', [
+    lambda runtime: runtime.__setitem__('command', ['/bin/sh', '-c']),
+    lambda runtime: runtime.__setitem__('args', ['forged bootstrap']),
+    lambda runtime: runtime.__setitem__(
+        'lifecycle', {
+            'postStart': {
+                'exec': {
+                    'command':
+                        ['touch', '/tmp/skypilot-serve-worker-runtime-ready']
+                }
+            },
+        }),
+    lambda runtime: runtime.__setitem__('lifecycle', {
+        'preStop': {
+            'exec': {
+                'command': ['/bin/sh', '-c', 'true']
+            }
+        },
+    }),
+])
+def test_final_v4_yaml_rejects_bootstrap_producer_mutation(mutation):
+    cluster_yaml = _v3_scratch_cluster_yaml()
+    pod_spec = cluster_yaml['available_node_types']['ray_head_default'][
+        'node_config']['spec']
+    bootstrap_sha256 = (
+        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
+    mutation(pod_spec['containers'][0])
+
+    with pytest.raises(exceptions.InvalidCloudConfigs,
+                       match='bootstrap command|bootstrap producer'):
+        backend_utils._enforce_worker_projection_on_kubernetes_yaml(
+            cluster_yaml,
+            _worker_projection(protocol_version=4),
+            expected_runtime_bootstrap_sha256=bootstrap_sha256)
+
+
+@pytest.mark.parametrize('mutation', [
+    lambda runtime: runtime.__setitem__('command', ['/bin/sh', '-c']),
+    lambda runtime: runtime.__setitem__('args', ['forged bootstrap']),
+    lambda runtime: runtime.__setitem__(
+        'lifecycle', {
+            **runtime['lifecycle'],
+            'postStart': {
+                'exec': {
+                    'command':
+                        ['touch', '/tmp/skypilot-serve-worker-runtime-ready']
+                }
+            },
+        }),
+    lambda runtime: runtime['lifecycle']['preStop']['exec'].__setitem__(
+        'command', ['/bin/sh', '-c', 'true']),
+])
+def test_admitted_runtime_readiness_rejects_bootstrap_producer_mutation(
+        mutation):
+    pod_spec = {
+        'containers': [{
+            'name': 'ray-node',
+            'command': ['/bin/bash', '-c', '--'],
+            'args': ['canonical bootstrap'],
+            'lifecycle': {
+                'preStop': {
+                    'exec': {
+                        'command': ['/bin/sh', '-c', 'echo stopping'],
+                    },
+                },
+            },
+        }]
+    }
+    bootstrap_sha256 = (
+        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
+    canonical = (
+        kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
+            pod_spec, rewrite=True, expected_bootstrap_sha256=bootstrap_sha256))
+    assert canonical.matches
+
+    mutation(pod_spec['containers'][0])
+    admitted = (
+        kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
+            pod_spec, rewrite=False,
+            expected_bootstrap_sha256=bootstrap_sha256))
+
+    assert not admitted.matches
+    assert admitted.actual['bootstrap_sha256'] != bootstrap_sha256
+    pod = mock.Mock()
+    pod.metadata.name = 'mutated-worker'
+    pod.spec = pod_spec
+    with pytest.raises(kubernetes_instance._ServeWorkerIdentityRejection):
+        kubernetes_instance._attest_serve_worker_runtime_readiness(
+            pod, 'inference', 'phx', True, bootstrap_sha256, defer_cleanup=True)
+
+
+def test_real_kubernetes_client_runtime_readiness_contract_is_accepted():
+    pod_spec = {
+        'containers': [{
+            'name': 'ray-node',
+            'command': ['/bin/bash', '-c', '--'],
+            'args': ['canonical bootstrap'],
+            'lifecycle': {
+                'preStop': {
+                    'exec': {
+                        'command': ['/bin/sh', '-c', 'echo stopping'],
+                    },
+                },
+            },
+        }]
+    }
+    bootstrap_sha256 = (
+        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
+    expected = (
+        kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
+            pod_spec, rewrite=True, expected_bootstrap_sha256=bootstrap_sha256))
+    client = kubernetes_adaptor.kubernetes.client
+    api_pod_spec = client.ApiClient()._ApiClient__deserialize(  # pylint: disable=protected-access
+        pod_spec, 'V1PodSpec')
+
+    observed = (
+        kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
+            api_pod_spec,
+            rewrite=False,
+            expected_bootstrap_sha256=bootstrap_sha256))
+
+    assert expected.matches
+    assert observed.matches
+    assert observed.actual == expected.expected
 
 
 def _v3_scratch_cluster_yaml():
@@ -2047,6 +2298,8 @@ def _v3_scratch_cluster_yaml():
                     'spec': {
                         'containers': [{
                             'name': 'ray-node',
+                            'command': ['/bin/bash', '-c', '--'],
+                            'args': ['canonical bootstrap'],
                         }],
                     },
                 },
@@ -2194,7 +2447,7 @@ def test_final_v3_none_rejects_inherited_scratch_owner(collision):
             cluster_yaml, _worker_projection(protocol_version=3))
 
 
-@pytest.mark.parametrize('protocol_version', [2, 3])
+@pytest.mark.parametrize('protocol_version', [2, 3, 4])
 def test_kubernetes_deploy_vars_use_only_strict_projected_admission(
         monkeypatch, protocol_version):
     resources = mock.MagicMock()
@@ -2283,11 +2536,15 @@ def test_kubernetes_deploy_vars_use_only_strict_projected_admission(
         'k8s_kueue_workload_priority_class_name'] == 'inference-low'
     assert deploy_vars['k8s_acc_label_key'] == 'nvidia.com/gpu.product'
     assert deploy_vars['k8s_resource_key'] == 'nvidia.com/gpu'
+    assert deploy_vars['k8s_projected_serve_worker_runtime_readiness'] is (
+        protocol_version == 4)
+    assert deploy_vars['k8s_projected_worker_runtime_ready_marker'] == (
+        '/tmp/skypilot-serve-worker-runtime-ready')
     timeout_calls = [
         call for call in config_resolver.call_args_list
         if call.kwargs['keys'] == ('provision_timeout',)
     ]
-    if protocol_version == 3:
+    if protocol_version in (3, 4):
         assert deploy_vars['timeout'] == '-1'
         assert timeout_calls == []
     else:

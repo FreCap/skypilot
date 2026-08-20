@@ -85,10 +85,10 @@ def _make_provision_config(count):
 
 
 @pytest.mark.parametrize(('protocol_version', 'scratch', 'message'), [
-    (3, None, 'v3 requires the complete worker scratch'),
+    (3, None, 'v3/v4 requires the complete worker scratch'),
     (2, {
         'kind': 'none'
-    }, 'Only projection protocol v3'),
+    }, 'Only projection protocol v3/v4'),
     (3, {
         'kind': 'memory',
         'size_limit_bytes': 1024,
@@ -105,6 +105,33 @@ def test_create_pods_rejects_invalid_worker_scratch_provider_contract(
         'serve_worker_projection_protocol_version'] = protocol_version
     if scratch is not None:
         config.provider_config['serve_worker_expected_scratch'] = scratch
+
+    with pytest.raises(config_lib.KubernetesError, match=message):
+        instance._create_pods('us', 'cluster', 'cluster', config)
+
+
+@pytest.mark.parametrize(('protocol_version', 'bootstrap_sha256', 'message'), [
+    (4, None, 'v4 requires the complete worker runtime bootstrap'),
+    (4, 'A' * 64, '64 lowercase hexadecimal'),
+    (3, '0' * 64, 'Only projection protocol v4'),
+])
+def test_create_pods_rejects_invalid_worker_runtime_bootstrap_contract(
+        monkeypatch, protocol_version, bootstrap_sha256, message):
+    monkeypatch.setattr(kubernetes_utils, 'get_namespace_from_config',
+                        lambda *_args, **_kwargs: 'ns')
+    monkeypatch.setattr(kubernetes_utils, 'get_context_from_config',
+                        lambda *_args, **_kwargs: 'ctx')
+    config = _make_provision_config(count=1)
+    config.provider_config.update({
+        'serve_worker_projection_protocol_version': protocol_version,
+        'serve_worker_expected_scratch': {
+            'kind': 'none',
+        },
+    })
+    if bootstrap_sha256 is not None:
+        config.provider_config[
+            'serve_worker_expected_runtime_bootstrap_sha256'] = (
+                bootstrap_sha256)
 
     with pytest.raises(config_lib.KubernetesError, match=message):
         instance._create_pods('us', 'cluster', 'cluster', config)
@@ -166,6 +193,70 @@ def test_create_pods_rejects_finalizer_scratch_drift_before_api_create(
             'volume_name': 'skypilot-serve-worker-tmp',
             'size_limit_bytes': 20 * 1024**3,
         },
+    })
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='finalized SkyServe worker Pod changed'):
+        instance._create_pods('us', cluster_on_cloud, cluster_on_cloud, config)
+
+    create_pod.assert_not_called()
+
+
+def test_create_pods_rejects_finalizer_runtime_bootstrap_drift_before_create(
+        monkeypatch):
+    cluster_on_cloud = 'runtime-bootstrap-finalizer-drift'
+    _patch_create_pods_k8s_boundary(monkeypatch, {}, None)
+    monkeypatch.setattr(kubernetes_utils, 'get_allowed_nodes_config',
+                        lambda _context: None)
+    monkeypatch.setattr(kubernetes_utils, 'inject_allowed_nodes_affinity',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(subprocess_utils, 'run_in_parallel',
+                        lambda fn, items, *_args: [fn(i) for i in items])
+    create_pod = mock.Mock()
+    monkeypatch.setattr(instance, '_create_namespaced_pod_with_retries',
+                        create_pod)
+
+    pod_spec = {
+        'containers': [{
+            'name': 'ray-node',
+            'command': ['/bin/bash', '-c', '--'],
+            'args': ['canonical bootstrap'],
+        }],
+    }
+    bootstrap_sha256 = (instance.pod_spec_lib.
+                        projected_worker_runtime_bootstrap_sha256(pod_spec))
+    readiness = (instance.pod_spec_lib.
+                 enforce_projected_worker_runtime_readiness_contract(
+                     pod_spec,
+                     rewrite=True,
+                     expected_bootstrap_sha256=bootstrap_sha256))
+    assert readiness.matches
+
+    def mutate_bootstrap_after_finalization(template, **kwargs):
+        finalized = copy.deepcopy(template)
+        finalized['metadata']['name'] = kwargs['pod_name']
+        finalized['spec']['containers'][0]['args'] = ['forged bootstrap']
+        return finalized
+
+    monkeypatch.setattr(instance.pod_spec_lib, 'finalize_pod_spec',
+                        mutate_bootstrap_after_finalization)
+    config = _make_provision_config(count=1)
+    config.node_config['spec'] = pod_spec
+    config.provider_config.update({
+        'serve_worker_projection_protocol_version': 4,
+        'serve_worker_expected_priority_class_name': None,
+        'serve_worker_expected_priority_value': None,
+        'serve_worker_expected_preemption_policy': None,
+        'serve_worker_expected_service_account_name': 'inference-worker',
+        'serve_worker_expected_scheduler_name': 'default-scheduler',
+        'serve_worker_expected_accelerator_label_key': 'nvidia.com/gpu.product',
+        'serve_worker_expected_accelerator_label_values': ['NVIDIA-H200'],
+        'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
+        'serve_worker_expected_accelerator_count': 1,
+        'serve_worker_expected_scratch': {
+            'kind': 'none',
+        },
+        'serve_worker_expected_runtime_bootstrap_sha256': bootstrap_sha256,
     })
 
     with pytest.raises(config_lib.KubernetesError,
@@ -286,8 +377,135 @@ class _KueueAdmissionClock:
     def time(self):
         return self.now
 
+    def monotonic(self):
+        return self.now
+
     def sleep(self, seconds):
         self.now += seconds
+
+
+def _projected_runtime_pod(*,
+                           pod_name='service-replica-head',
+                           pod_uid='pod-uid',
+                           ready=False,
+                           phase='Running'):
+    return types.SimpleNamespace(
+        metadata=types.SimpleNamespace(name=pod_name,
+                                       uid=pod_uid,
+                                       namespace='inference-ns',
+                                       deletion_timestamp=None),
+        status=types.SimpleNamespace(
+            phase=phase,
+            conditions=[
+                types.SimpleNamespace(type='Ready',
+                                      status='True' if ready else 'False')
+            ],
+            container_statuses=[
+                types.SimpleNamespace(
+                    name='ray-node',
+                    ready=ready,
+                    state=types.SimpleNamespace(running=object()))
+            ]),
+        spec=types.SimpleNamespace())
+
+
+def test_projected_runtime_readiness_waits_for_exact_ready_uid(monkeypatch):
+    clock = _KueueAdmissionClock()
+    core_api = mock.MagicMock()
+    core_api.list_namespaced_pod.side_effect = [
+        types.SimpleNamespace(items=[_projected_runtime_pod()]),
+        types.SimpleNamespace(items=[_projected_runtime_pod(ready=True)]),
+    ]
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(instance, 'time', clock)
+
+    instance._wait_for_projected_serve_worker_runtime_ready(  # pylint: disable=protected-access
+        'inference-ns',
+        None,
+        'service-replica',
+        'service-replica', {'service-replica-head': 'pod-uid'},
+        timeout=4)
+
+    assert clock.now == 2
+    assert core_api.list_namespaced_pod.call_count == 2
+
+
+@pytest.mark.parametrize(('mutation', 'message'), [
+    ('replacement', 'same-name replacement'),
+    ('deleted', 'entered deletion'),
+    ('missing', 'lost the exact Pod'),
+])
+def test_projected_runtime_readiness_rejects_identity_loss(
+        monkeypatch, mutation, message):
+    pod = _projected_runtime_pod(ready=True)
+    items = [pod]
+    if mutation == 'replacement':
+        pod.metadata.uid = 'replacement-uid'
+    elif mutation == 'deleted':
+        pod.metadata.deletion_timestamp = object()
+    else:
+        items = []
+    core_api = mock.MagicMock()
+    core_api.list_namespaced_pod.return_value = types.SimpleNamespace(
+        items=items)
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+
+    with pytest.raises(config_lib.KubernetesError, match=message):
+        instance._wait_for_projected_serve_worker_runtime_ready(  # pylint: disable=protected-access
+            'inference-ns',
+            None,
+            'service-replica',
+            'service-replica', {'service-replica-head': 'pod-uid'},
+            timeout=4)
+
+    core_api.delete_namespaced_pod.assert_not_called()
+
+
+def test_projected_runtime_readiness_wait_is_bounded(monkeypatch):
+    clock = _KueueAdmissionClock()
+    core_api = mock.MagicMock()
+    core_api.list_namespaced_pod.return_value = types.SimpleNamespace(
+        items=[_projected_runtime_pod()])
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(instance, 'time', clock)
+
+    with pytest.raises(config_lib.KubernetesError, match='Timed out after 4s'):
+        instance._wait_for_projected_serve_worker_runtime_ready(  # pylint: disable=protected-access
+            'inference-ns',
+            None,
+            'service-replica',
+            'service-replica', {'service-replica-head': 'pod-uid'},
+            timeout=4)
+
+    assert clock.now == 4
+
+
+def test_projected_runtime_timeout_preserves_reserved_provider_present(
+        monkeypatch):
+    clock = _KueueAdmissionClock()
+    core_api = mock.MagicMock()
+    core_api.list_namespaced_pod.return_value = types.SimpleNamespace(
+        items=[_projected_runtime_pod()])
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(instance, 'time', clock)
+
+    with pytest.raises(
+            sky_exceptions.ReservedFillProviderPresentError) as exc_info:
+        instance._wait_for_projected_serve_worker_runtime_ready(  # pylint: disable=protected-access
+            'inference-ns',
+            None,
+            'service-replica',
+            'service-replica', {'service-replica-head': 'pod-uid'},
+            timeout=4,
+            provider_effect_guard_factory=mock.Mock())
+
+    assert exc_info.value.provider_resource_ids == (
+        'inference-ns/service-replica-head@pod-uid',)
+    core_api.delete_namespaced_pod.assert_not_called()
 
 
 def test_required_kueue_admission_wait_does_not_consume_scheduling_timeout(
@@ -766,6 +984,9 @@ def _patch_create_pods_k8s_boundary(monkeypatch,
         instance, '_wait_for_pods_to_run',
         lambda _namespace, _context, _cluster_name, pods:
         {pod.metadata.name: f'uid-{pod.metadata.name}' for pod in pods})
+    monkeypatch.setattr(instance,
+                        '_wait_for_projected_serve_worker_runtime_ready',
+                        lambda *_args, **_kwargs: None)
     monkeypatch.setattr(instance, 'is_high_availability_cluster_by_kubectl',
                         lambda *a, **k: False)
     monkeypatch.setattr(instance, '_preflight_required_kueue_local_queue',
@@ -774,6 +995,79 @@ def _patch_create_pods_k8s_boundary(monkeypatch,
         monkeypatch.setattr(instance,
                             '_read_and_attest_pod_with_provider_guard',
                             lambda *a, **k: None)
+
+
+def test_v4_create_pods_waits_for_runtime_ready_before_final_read(monkeypatch):
+    cluster_on_cloud = 'test-v4-runtime-ready-order'
+    head_name = f'{cluster_on_cloud}-head'
+    expected_uid = f'uid-{head_name}'
+    existing_pod = _fake_pod(head_name)
+    existing_pod.metadata.uid = expected_uid
+    _patch_create_pods_k8s_boundary(monkeypatch, {head_name: existing_pod},
+                                    head_name,
+                                    stub_post_wait_attestation=False)
+    monkeypatch.setattr(instance, '_attest_created_serve_worker_pod',
+                        lambda *_args, **_kwargs: None)
+
+    events = []
+
+    def wait_running(_namespace, _context, _cluster_name, pods):
+        events.append('running')
+        return {pod.metadata.name: pod.metadata.uid for pod in pods}
+
+    def wait_runtime(_namespace,
+                     _context,
+                     _cluster_name,
+                     _cluster_name_on_cloud,
+                     expected_pod_uids,
+                     *,
+                     provider_effect_guard_factory=None):
+        assert expected_pod_uids == {head_name: expected_uid}
+        assert provider_effect_guard_factory is None
+        events.append('runtime-ready')
+
+    def final_read(pod_name,
+                   pod_uid,
+                   _namespace,
+                   _context,
+                   _attestation,
+                   _guard_factory,
+                   *,
+                   require_runtime_readiness=False):
+        assert (pod_name, pod_uid) == (head_name, expected_uid)
+        assert require_runtime_readiness
+        events.append('final-read')
+
+    monkeypatch.setattr(instance, '_wait_for_pods_to_run', wait_running)
+    monkeypatch.setattr(instance,
+                        '_wait_for_projected_serve_worker_runtime_ready',
+                        wait_runtime)
+    monkeypatch.setattr(instance, '_read_and_attest_pod_with_provider_guard',
+                        final_read)
+
+    config = _make_provision_config(count=1)
+    config.provider_config.update({
+        'serve_worker_projection_protocol_version': 4,
+        'serve_worker_expected_priority_class_name': None,
+        'serve_worker_expected_priority_value': None,
+        'serve_worker_expected_preemption_policy': None,
+        'serve_worker_expected_service_account_name': 'inference-worker',
+        'serve_worker_expected_scheduler_name': 'default-scheduler',
+        'serve_worker_expected_accelerator_label_key': 'nvidia.com/gpu.product',
+        'serve_worker_expected_accelerator_label_values': ['NVIDIA-H200'],
+        'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
+        'serve_worker_expected_accelerator_count': 1,
+        'serve_worker_expected_scratch': {
+            'kind': 'none',
+        },
+        'serve_worker_expected_runtime_bootstrap_sha256': '0' * 64,
+    })
+
+    record = instance._create_pods('us', cluster_on_cloud, cluster_on_cloud,
+                                   config)
+
+    assert record.head_instance_id == head_name
+    assert events == ['running', 'runtime-ready', 'final-read']
 
 
 def test_create_pods_is_idempotent_when_all_pods_exist(monkeypatch):
@@ -2219,6 +2513,58 @@ def test_required_kueue_rejects_nonexact_post_wait_pod(monkeypatch,
             attest_admitted, None)
 
     core_api.delete_namespaced_pod.assert_called_once()
+
+
+def test_projected_post_wait_rejects_running_but_not_runtime_ready(monkeypatch):
+    pod = _projected_runtime_pod(ready=False)
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = [
+        pod, _make_api_exception(404, 'Not Found')
+    ]
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+    attestation = mock.Mock()
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='post-wait Pod runtime readiness'):
+        instance._read_and_attest_pod_with_provider_guard(  # pylint: disable=protected-access
+            'service-replica-head',
+            'pod-uid',
+            'inference-ns',
+            None,
+            attestation,
+            None,
+            require_runtime_readiness=True)
+
+    attestation.assert_not_called()
+    core_api.delete_namespaced_pod.assert_called_once()
+
+
+def test_reserved_post_wait_readiness_regression_preserves_exact_pod(
+        monkeypatch):
+    pod = _projected_runtime_pod(ready=False)
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.return_value = pod
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    attestation = mock.Mock()
+
+    with pytest.raises(
+            sky_exceptions.ReservedFillProviderPresentError) as exc_info:
+        instance._read_and_attest_pod_with_provider_guard(  # pylint: disable=protected-access
+            'service-replica-head',
+            'pod-uid',
+            'inference-ns',
+            None,
+            attestation,
+            lambda: contextlib.nullcontext(),
+            require_runtime_readiness=True)
+
+    assert exc_info.value.provider_resource_ids == (
+        'inference-ns/service-replica-head@pod-uid',)
+    attestation.assert_not_called()
+    core_api.delete_namespaced_pod.assert_not_called()
 
 
 def test_required_kueue_adoption_rejects_ungated_finalizer_only_pod(
