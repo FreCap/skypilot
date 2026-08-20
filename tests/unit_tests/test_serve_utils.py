@@ -1483,6 +1483,28 @@ def test_postgres_lifecycle_epoch_uses_lock_owning_session():
     assert lifecycle_lock.epoch == 7
 
 
+def test_postgres_controller_preserving_lock_reads_current_epoch():
+    pg_lock = mock.MagicMock(spec=serve_utils.locks.PostgresLock)
+    pg_lock.is_session_alive.return_value = True
+    connection = object()
+    pg_lock.run_in_lock_session.side_effect = lambda operation: operation(
+        connection)
+    lifecycle_lock = serve_utils.ServiceLifecycleLock('svc',
+                                                      pg_lock,
+                                                      advance_epoch=False)
+
+    with mock.patch.object(serve_utils.serve_state,
+                           'read_service_lifecycle_epoch',
+                           return_value=7) as read, \
+         mock.patch.object(serve_utils.serve_state,
+                           'claim_service_lifecycle_epoch') as claim:
+        lifecycle_lock.acquire()
+
+    read.assert_called_once_with('svc', connection)
+    claim.assert_not_called()
+    assert lifecycle_lock.epoch == 7
+
+
 def test_lifecycle_epoch_cancellation_releases_lock():
     pg_lock = mock.MagicMock(spec=serve_utils.locks.PostgresLock)
     pg_lock.run_in_lock_session.side_effect = KeyboardInterrupt

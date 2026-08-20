@@ -307,6 +307,39 @@ def claim_service_lifecycle_epoch(service_name: str,
     return epoch
 
 
+def read_service_lifecycle_epoch(service_name: str,
+                                 lock_connection: Any) -> int:
+    """Read one live service's epoch on its advisory-lock session.
+
+    Controller-preserving mutations serialize on the same name-scoped
+    advisory lock as destructive lifecycles, but must not replace the live
+    controller's durable identity.  Read both copies on the lock-owning
+    session so loss of that session fails the operation instead of silently
+    falling back to an unrelated database connection.
+    """
+    cursor = lock_connection.cursor()
+    try:
+        cursor.execute(
+            'SELECT service.lifecycle_epoch, fence.epoch '
+            'FROM services AS service '
+            'JOIN service_lifecycle_fences AS fence '
+            'ON fence.name = service.name '
+            'WHERE service.name = %s', (service_name,))
+        row = cursor.fetchone()
+        if (row is None or not isinstance(row[0], int) or row[0] < 1 or
+                row[0] != row[1]):
+            raise RuntimeError(
+                f'Service {service_name!r} has no consistent live lifecycle '
+                'epoch.')
+        lock_connection.commit()
+        return int(row[0])
+    except Exception:
+        lock_connection.rollback()
+        raise
+    finally:
+        cursor.close()
+
+
 def service_lifecycle_epoch_matches(service_name: str, epoch: int) -> bool:
     """Whether ``epoch`` is still the latest token for ``service_name``."""
     engine = _db_manager.get_engine()

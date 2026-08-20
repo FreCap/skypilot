@@ -829,6 +829,15 @@ the old waiter and adopts the association without legacy owner-loss
 cancellation. Cancellation is reserved for a committed supersession/teardown
 intent owned by the current epoch/revision.
 
+A configuration update, immutable-version election, or external-LB topology
+change preserves the live controller and therefore preserves its service
+lifecycle epoch. These operations still take the exclusive cross-pod
+name-scoped advisory lock and retain service-hash, version, owner, and request
+fences. Advancing the lifecycle epoch for such an operation is invalid: the
+epoch is part of every unresolved association's immutable controller identity
+and would otherwise make both the update and later evidence reduction
+impossible. Destructive lifecycle ownership continues to mint a fresh epoch.
+
 ### Pre-I/O fence
 
 Immediately before provider I/O, the generic non-pool executor handler
