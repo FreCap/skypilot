@@ -666,15 +666,25 @@ class ServiceLifecycleLock:
     this token under a row lock.
     """
 
-    def __init__(self, service_name: str, lock: locks.DistributedLock) -> None:
+    def __init__(self,
+                 service_name: str,
+                 lock: locks.DistributedLock,
+                 *,
+                 advance_epoch: bool = True) -> None:
         self.service_name = service_name
         self.lock = lock
+        self.advance_epoch = advance_epoch
         self.epoch: int | None = None
 
     def acquire(self) -> 'ServiceLifecycleLock':
         self.lock.acquire()
         try:
-            if isinstance(self.lock, locks.PostgresLock):
+            if (isinstance(self.lock, locks.PostgresLock) and
+                    not self.advance_epoch):
+                self.epoch = self.lock.run_in_lock_session(
+                    lambda connection: serve_state.read_service_lifecycle_epoch(
+                        self.service_name, connection))
+            elif isinstance(self.lock, locks.PostgresLock):
                 self.epoch = self.lock.run_in_lock_session(
                     lambda connection:
                     serve_state.claim_service_lifecycle_epoch(
@@ -708,7 +718,10 @@ class ServiceLifecycleLock:
         self.release()
 
 
-def get_service_lifecycle_lock(service_name: str) -> ServiceLifecycleLock:
+def get_service_lifecycle_lock(
+        service_name: str,
+        *,
+        advance_epoch: bool = True) -> ServiceLifecycleLock:
     """Return the cross-pod lock serializing destructive service lifecycles.
 
     The lock ID is outside the service working directory: deleting or
@@ -735,7 +748,7 @@ def get_service_lifecycle_lock(service_name: str) -> ServiceLifecycleLock:
                            f'lifecycle lock: {engine.dialect.name!r}.')
     digest = hashlib.sha256(service_name.encode('utf-8')).hexdigest()
     lock = locks.get_lock(f'skyserve-lifecycle-{digest}', lock_type=lock_type)
-    return ServiceLifecycleLock(service_name, lock)
+    return ServiceLifecycleLock(service_name, lock, advance_epoch=advance_epoch)
 
 
 def lifecycle_lock_is_valid(lock: ServiceLifecycleLock) -> bool:

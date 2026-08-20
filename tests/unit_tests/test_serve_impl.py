@@ -1457,7 +1457,7 @@ class TestLifecycleLocking:
                         return_value=file_lock) as mock_lock_cls, \
              mock.patch('sky.serve.server.impl.serve_utils.'
                         'get_service_lifecycle_lock',
-                        return_value=lifecycle_lock), \
+                        return_value=lifecycle_lock) as get_lifecycle_lock, \
              mock.patch('sky.serve.server.impl.serve_utils.'
                         'get_service_filelock_path',
                         return_value='/tmp/svc.lock'), \
@@ -1465,6 +1465,7 @@ class TestLifecycleLocking:
                         side_effect=lambda *a, **k: calls.append('impl')):
             impl.update(task=mock.Mock(), service_name='svc')
         mock_lock_cls.assert_called_once_with('/tmp/svc.lock')
+        get_lifecycle_lock.assert_called_once_with('svc', advance_epoch=False)
         assert calls == [
             'file-lock', 'lifecycle-lock', 'impl', 'lifecycle-unlock',
             'file-unlock'
