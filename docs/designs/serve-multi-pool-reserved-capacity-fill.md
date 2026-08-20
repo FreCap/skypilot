@@ -17,11 +17,25 @@ This change supplies the narrowly fenced reconciliation needed to settle those
 nine rows; it is not yet merged or deployed. Platform PR #8652 is merged and
 does not pin the SkyPilot runtime.
 
-A projected-worker runtime-readiness fix-forward is open as PR #1618; it is not
-merged, deployed, or production-proven. Draft cleanup PR #1619 is stacked on
-it and removes the rollout-only v1/v2/v3 projection readers after the production
-gate. The candidate strengthens only canonical projection protocol v4 and adds
-no schema, EFS/RWX, KubeRay, Terraform, Terragrunt, or platform-pin dependency.
+Projected-worker runtime-readiness PR #1618 is merged at
+`6ad2407d813d04aed79de2fea62723987ee56670` and published in release
+`1.1.1394`; it is not yet deployed or production-proven. Draft cleanup PR
+#1619 removes the rollout-only v1/v2/v3 projection readers after its separate
+production gate. The change strengthens only canonical projection protocol v4
+and adds no schema, EFS/RWX, KubeRay, Terraform, Terragrunt, or platform-pin
+dependency.
+
+The 2026-08-20 canonical-birth correction is source-implemented in PR #1621
+and is not yet merged, deployed, activated, or production-proven. It makes a
+fresh lifecycle-fenced PostgreSQL
+non-pool service commit its service/version row with one complete generic
+bound, durable-route, durable-demand, and durable-intent authority tuple tied
+to one controller incarnation. Startup verifies that tuple instead of
+promoting a fresh legacy row. This is schema-free and does not alter pools,
+SQLite/local compatibility, or retained services. Consequently the existing
+`boltz-l4-fleet` must either pass its explicit retained-row promotion or be
+normally torn down and recreated after its effect/quiescence evidence settles;
+recreation is the cleaner cut when service interruption is acceptable.
 
 ## Convergence goal and remaining work
 
@@ -46,6 +60,9 @@ The completed system has these invariants:
 - controllers and adopters recover exclusively from PostgreSQL. Reserved-fill
   correctness, request observation, and takeover do not open or require an
   RWX/EFS launch log;
+- every fresh lifecycle-fenced PostgreSQL non-pool service is born on the same
+  canonical authority tuple; it has no committed legacy/direct interval and
+  performs no controller-startup promotion;
 - each physical pool converges independently, stale or ambiguous historical
   rows cannot block healthy pools, and UI request/capacity totals remain
   available during provider stalls;
@@ -3064,9 +3081,13 @@ before activation. If it does not, the new image may deploy but the gate stays
 - Pure planner, autoscaler adapter, manager sparse receipt, and receipt-driven
   rotation.
 - The generalized non-pool association/profile/cohort and atomic binding IDs
-  described above are present in source and deployed dark. The last verified
-  service authority remained legacy; promotion and fresh live readback remain
-  open gates.
+  described above are present in source and deployed dark. The canonical-
+  birth correction is implemented in the current unmerged branch: a fresh
+  eligible service commits generic `bound`, `DURABLE_PROJECTED`,
+  `DURABLE_FEED`, and `DURABLE_INTENT` authority at epoch 1 under one
+  incarnation, then verifies it before child spawn. The last verified
+  production service authority remained legacy; recreation or retained-row
+  promotion and fresh live readback remain open gates.
 - Fleet transition CLI requiring protocol v2, Serve046, API010, an exact stable
   split-role `api`/`controller`/`executor` writer cohort on one immutable image
   digest, and one entry-point-loaded deployment reclaim policy. The same
@@ -3325,6 +3346,7 @@ either case.
 | 1b | PR #1483 precursor: replica state v18 plus its one-shot normalizer | Merged and published as 1.1.1277, but activation-ineligible because it lacks A's pre-activation contracts. |
 | 1c | Exact-shape read bridge for the live v3/v6/v7/v12/v13/v14 JSON inventory | Merged in PR #1492 and published as v1.1.1284; removable only after the v18 normalization receipt. Its rollout is `LEGACY_ACTIVE` only. |
 | 1d | Generalized binding, demand/route projection, and G1S execution-termination evidence through API014/Serve050 | Merged and deployed. Route authority is live at `DURABLE_PROJECTED` epoch 1; ordinary binding and demand remain legacy. |
+| 1e | Canonical birth for fresh lifecycle-fenced PostgreSQL non-pool services | Implemented on `feature/canonical-fresh-service-birth`, not merged or deployed. `add_service()` uses the existing Serve047-allowed adjacent update inside the service/version transaction, so PostgreSQL exposes only the final generic bound/route/demand/fill tuple. `_start()` verifies rather than promotes it. No schema, EFS, Helm, Terraform/Terragrunt, provider, pool, or SQLite change is included. |
 | 2a | Policy-bundle schema v3 plus exact live PHX queue/service-account contract | Merged in PR #1529 and deployed in revision 418; superseded in place by schema v4 because PHX intentionally replaced its custom scheduler with Kueue TAS. |
 | 2a.1 | Policy-bundle schema v4, PHX Kueue TAS/default-scheduler contract, exact spoke audit roles, and PostgreSQL-backed server-config transaction | Merged and deployed through release 1.1.1332 / platform configuration; server config is corrected, but version 61 retained the pre-correction PHX scheduler projection. |
 | 2a.2 | Isolated audit-role Kubernetes authentication and exact east identity-free inventory | Merged and deployed through revision 429 / release 1.1.1336. East passes. PHX now explicitly enables `AssignQueueLabelsForPods=true`; a clean current platform plan is empty. The successful full two-context preflight remains gated by 2a.4. |
@@ -4772,18 +4794,19 @@ legacy activation.
   leave the selected slot healthy, and bounded role telemetry must record the
   closed/open gate and cutover CAS result. These production failover exercises
   remain required before the cleanup horizon opens.
-- [ ] Promote ordinary bound launch authority to generic non-pool binding,
-  freshly verify and, if required, generation-fenced reauthorize the
-  last-recorded `SEQUENCED_ACTIVE` generation 1 reconciliation gate, then
-  promote durable demand plus
-  `DURABLE_INTENT` actuation through one canonical generation-fenced
-  transaction. No reconciliation tick
-  may observe the intermediate `DURABLE_FEED`/`DIRECT_REPLICA` pair. Clean
-  demand-gated successor version 63 is already committed, elected, and
-  controller-applied; route authority is already
-  `DURABLE_PROJECTED` at epoch 1 and must be verified rather than promoted.
-  Resource-action authority remains gated by its separate shadow horizon.
-  Promotion is one way and fix-forward only.
+- [ ] Merge and deploy canonical fresh-service birth, then move
+  `boltz-l4-fleet` onto it. The preferred clean cut, because interruption is
+  acceptable, is evidence-backed normal teardown followed by recreation; do
+  not manually delete rows or bypass quiescence/provider proof. Read back one
+  service row at generic `bound`, `DURABLE_PROJECTED`, `DURABLE_FEED`, and
+  `DURABLE_INTENT` epoch 1, with one birth incarnation and no committed legacy
+  interval, then prove the claimed controller has rebound generic/demand/fill
+  authority and published fresh route evidence. If recreation is not possible,
+  the retained-row path must explicitly promote ordinary binding and atomically
+  promote demand plus actuation; no reconciliation tick may observe an
+  intermediate `DURABLE_FEED`/`DIRECT_REPLICA` pair. Resource-action authority
+  remains gated by its separate shadow horizon. Either activation is one way
+  and fix-forward only.
 - [x] Merge Platform PR #8652 after CI and review. It is a service-spec change
   only: no Terraform/Terragrunt or platform runtime pin is part of this path.
 - [ ] After the successor controller rollout, apply #8652's production
@@ -4821,7 +4844,11 @@ legacy activation.
   no-paid-spill, and full restart/adoption tests.
 - [ ] After the complete capability, stale-writer, route, demand, and
   actuation horizon proves zero old-path use and zero unsettled unbound work,
-  re-derive a deletion-only cleanup from current source. Closed/superseded PRs
+  complete the deletion-only
+  `cleanup/remove-legacy-serve-authority-transitions` branch from current
+  source. Its additional gate is that every live central-PostgreSQL non-pool
+  service was canonically recreated or evidence-backed retired, and no
+  production registration omits a lifecycle epoch. Closed/superseded PRs
   #1506/#1510 reserve no schema or API heads and must not be revived.
 - [ ] Keep atomic-authority cleanup #1556 stacked on feature PR #1555 until
   the immediate, +10 minute, +30 minute, and complete stale/quiescence horizon

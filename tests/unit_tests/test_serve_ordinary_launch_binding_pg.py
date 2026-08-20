@@ -15,13 +15,19 @@ from sqlalchemy.dialects import postgresql
 from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
+from sky import global_user_state_schema
+from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
+from sky.serve import demand_state
 from sky.serve import ordinary_launch_binding as binding
 from sky.serve import replica_managers
+from sky.serve import route_projection
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import serve_statuses
+from sky.serve import service_spec
 from sky.serve import system_recovery_state
+from sky.serve import zero_cost_actuation
 from sky.server.requests import payloads
 from sky.utils import common_utils
 from sky.utils.db import migration_utils
@@ -126,6 +132,199 @@ def binding_database(empty_postgres, monkeypatch):
                 is_spot=False,
                 replica_state=_stored_replica_state()))
     return empty_postgres
+
+
+def _register_fresh_service(
+    engine,
+    name: str,
+    *,
+    lifecycle_epoch: int,
+    pool: bool = False,
+    status: serve_statuses.ServiceStatus = serve_statuses.ServiceStatus.
+    CONTROLLER_INIT
+) -> bool:
+    with engine.begin() as connection:
+        connection.execute(
+            postgresql.insert(global_user_state_schema.user_table).values(
+                id='owner-a', name='Owner A',
+                created_at=int(time.time())).on_conflict_do_nothing(
+                    index_elements=[global_user_state_schema.user_table.c.id]))
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.service_lifecycle_fences_table).values(
+                    name=name, epoch=lifecycle_epoch))
+    spec = service_spec.SkyServiceSpec.from_yaml_config({
+        'pool': {},
+        'workers': 1
+    } if pool else {'replicas': 1})
+    return serve_state.add_service(name,
+                                   controller_job_id=1,
+                                   policy='policy',
+                                   requested_resources_str='H200:1',
+                                   load_balancing_policy='round_robin',
+                                   status=status,
+                                   tls_encrypted=False,
+                                   pool=pool,
+                                   controller_pid=321,
+                                   controller_ip='10.0.0.3',
+                                   entrypoint='python app.py',
+                                   spec=spec,
+                                   yaml_content='service:\n  replicas: 1\n',
+                                   workspace='workspace-a',
+                                   service_hash=f'{name}-hash',
+                                   lifecycle_epoch=lifecycle_epoch,
+                                   resource_scope=f'{name}-hash',
+                                   owner_user_id='owner-a',
+                                   owner_user_name='Owner A')
+
+
+def test_fresh_postgres_non_pool_is_born_on_one_canonical_authority(
+        binding_database) -> None:
+    engine = binding_database
+    assert _register_fresh_service(engine, 'fresh', lifecycle_epoch=9)
+
+    services = serve_state_schema.services_table
+    versions = serve_state_schema.version_specs_table
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(services).where(
+                services.c.name == 'fresh')).mappings().one()
+        version = connection.execute(
+            sqlalchemy.select(versions).where(
+                versions.c.service_name == 'fresh')).mappings().one()
+
+    birth_incarnation = row['controller_incarnation']
+    assert isinstance(birth_incarnation, uuid.UUID)
+    assert row['controller_owner_epoch'] == 1
+    assert row['status'] == serve_statuses.ServiceStatus.CONTROLLER_INIT.value
+    assert row['controller_port'] is None
+    assert row['ordinary_launch_binding_capable'] is True
+    assert row[
+        'ordinary_launch_binding_mode'] == binding.BindingMode.BOUND.value
+    assert row['ordinary_launch_binding_epoch'] == 1
+    assert row['non_pool_launch_binding_capable'] is True
+    assert row['non_pool_launch_controller_incarnation'] == birth_incarnation
+    assert (row['non_pool_launch_binding_protocol_version'] ==
+            binding.NON_POOL_BINDING_PROTOCOL_VERSION)
+    assert (row['non_pool_launch_capability_profile_set_digest'] ==
+            binding.supported_non_pool_profile_set_digest())
+    assert (row['non_pool_launch_capability_cohort_epoch'] ==
+            binding.NON_POOL_CAPABILITY_COHORT_EPOCH)
+    assert (row['non_pool_launch_receipt_protocol_version'] ==
+            binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)
+    assert row['route_source_mode'] == 'DURABLE_PROJECTED'
+    assert row['route_source_epoch'] == 1
+    assert row['route_projection_capable'] is True
+    assert row['route_projection_controller_incarnation'] == birth_incarnation
+    assert (row['route_projection_protocol_version'] ==
+            route_projection.INCREMENTAL_PRODUCER_PROTOCOL_VERSION)
+    assert (row['demand_source_mode'] ==
+            capacity_admission.DemandSourceMode.DURABLE_FEED.value)
+    assert row['demand_source_epoch'] == 1
+    assert row['demand_authority_capable'] is True
+    assert row['demand_authority_controller_incarnation'] == birth_incarnation
+    assert (row['demand_authority_protocol_version'] ==
+            capacity_admission.PROTOCOL_VERSION)
+    assert (row['reserved_fill_actuation_mode'] ==
+            zero_cost_actuation.ActuationMode.DURABLE_INTENT.value)
+    assert row['reserved_fill_actuation_epoch'] == 1
+    assert row['reserved_fill_actuation_capable'] is True
+    assert (row['reserved_fill_actuation_controller_incarnation'] ==
+            birth_incarnation)
+    assert (row['reserved_fill_actuation_protocol_version'] ==
+            zero_cost_actuation.PROTOCOL_VERSION)
+    assert version['version'] == serve_constants.INITIAL_VERSION
+    assert version['yaml_content'] == 'service:\n  replicas: 1\n'
+
+
+def test_fresh_canonical_claim_rebinds_capacity_and_waits_for_new_route(
+        binding_database) -> None:
+    engine = binding_database
+    assert _register_fresh_service(engine, 'fresh-claim', lifecycle_epoch=10)
+    services = serve_state_schema.services_table
+    with engine.connect() as connection:
+        birth_incarnation = connection.execute(
+            sqlalchemy.select(services.c.controller_incarnation).where(
+                services.c.name == 'fresh-claim')).scalar_one()
+
+    claimed_incarnation = uuid.uuid4()
+    authority = binding.claim_controller_incarnation(
+        'fresh-claim',
+        'fresh-claim-hash', (321, '10.0.0.3'),
+        claimed_incarnation,
+        new_parent_owner=(321, '10.0.0.3'),
+        expected_lifecycle_epoch=10,
+        expected_status=serve_statuses.ServiceStatus.CONTROLLER_INIT,
+        expected_recovery_version=serve_constants.INITIAL_VERSION)
+
+    assert authority is not None
+    assert authority.binding_mode is binding.BindingMode.BOUND
+    assert authority.binding_epoch == 1
+    assert authority.generic_launches_required
+    with binding.refresh_controller_authority(authority) as refreshed:
+        assert refreshed == authority
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(services).where(
+                services.c.name == 'fresh-claim')).mappings().one()
+    assert row['controller_incarnation'] == claimed_incarnation
+    assert row['controller_owner_epoch'] == 2
+    assert (
+        row['non_pool_launch_controller_incarnation'] == claimed_incarnation)
+    assert (
+        row['demand_authority_controller_incarnation'] == claimed_incarnation)
+    assert (row['reserved_fill_actuation_controller_incarnation'] ==
+            claimed_incarnation)
+    # Route capability is deliberately not blessed by ownership transfer.
+    # The child must publish a fresh owner-fenced generation first.
+    assert row['route_projection_controller_incarnation'] == birth_incarnation
+    assert demand_state.get_autoscaling_snapshot('fresh-claim',
+                                                 'fresh-claim-hash') is None
+    with pytest.raises(route_projection.RouteProjectionUnavailable):
+        route_projection.RouteProjectionRepository(engine).resolve_sync(
+            'fresh-claim', 'fresh-claim-hash', 'fresh-session')
+
+
+def test_lifecycle_fenced_pool_preserves_separate_legacy_authority(
+        binding_database) -> None:
+    engine = binding_database
+    assert _register_fresh_service(engine,
+                                   'fresh-pool',
+                                   lifecycle_epoch=11,
+                                   pool=True)
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'fresh-pool')).mappings().one()
+    assert row['ordinary_launch_binding_capable'] is False
+    assert row[
+        'ordinary_launch_binding_mode'] == binding.BindingMode.LEGACY.value
+    assert row['ordinary_launch_binding_epoch'] == 0
+    assert row['non_pool_launch_binding_capable'] is False
+    assert row['route_source_mode'] == 'LEGACY_PROXY'
+    assert row['demand_source_mode'] == 'LEGACY_CONTROLLER'
+    assert row['reserved_fill_actuation_mode'] == 'DIRECT_REPLICA'
+
+
+def test_canonical_birth_rejects_non_initializing_status_without_rows(
+        binding_database) -> None:
+    engine = binding_database
+    with pytest.raises(ValueError, match='CONTROLLER_INIT'):
+        _register_fresh_service(engine,
+                                'fresh-ready',
+                                lifecycle_epoch=12,
+                                status=serve_statuses.ServiceStatus.READY)
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table.c.name).where(
+                serve_state_schema.services_table.c.name ==
+                'fresh-ready')).scalar_one_or_none() is None
+        assert connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.version_specs_table.c.service_name).where(
+                    serve_state_schema.version_specs_table.c.service_name ==
+                    'fresh-ready')).scalar_one_or_none() is None
 
 
 def _unbound_context() -> dict[str, object]:
