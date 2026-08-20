@@ -148,6 +148,34 @@ def test_non_pool_provider_reconciliation_is_scheduled_without_inline_io():
     worker.start.assert_called_once_with()
 
 
+def test_unowned_ambiguous_non_pool_launch_schedules_provider_reconciliation(
+        monkeypatch):
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    authority = _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                                   binding_epoch=2,
+                                   generic=True)
+    context = _bound_non_pool_context()
+    info = types.SimpleNamespace(replica_id=context.replica_id,
+                                 replica_record_id=str(
+                                     context.replica_record_id))
+    runtime = types.SimpleNamespace(launch_thread_pool={})
+    manager._ordinary_launch_binding_authority = authority
+    manager._non_pool_reconciliation_threads = {}
+    manager._non_pool_reconciliation_attempts = {}
+    manager._non_pool_reconciliation_retry_at = {}
+    manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
+    manager._schedule_non_pool_provider_reconciliation = mock.Mock()
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'list_provider_reconciliation_contexts',
+                        lambda actual: [context] if actual is authority else [])
+
+    manager._reconcile_unowned_bound_non_pool_launches([info])
+
+    manager._schedule_non_pool_provider_reconciliation.assert_called_once_with(
+        info, context)
+
+
 def _physical_service_spec_mock() -> mock.Mock:
     return mock.Mock(spot_placer=None,
                      placement_contract=_DISABLED_PLACEMENT_CONTRACT)

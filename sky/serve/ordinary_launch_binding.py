@@ -3476,6 +3476,64 @@ def get_for_replica(service_name: str, replica_id: int,
     return None if row is None else dict(row)
 
 
+def list_provider_reconciliation_contexts(
+    authority: ControllerBindingAuthority,) -> list[BoundNonPoolLaunchContext]:
+    """List exact ambiguous non-pool actions still pinned to replicas.
+
+    Provider reconciliation normally starts when a local launch worker
+    finishes.  A controller can instead recover a replica after teardown has
+    already persisted ``INTERRUPTED``; that row has no launch worker, but its
+    exact ambiguous association still needs the same provider-evidence path.
+    This single indexed query finds both shapes without scanning every
+    replica or inferring authority from status.
+    """
+    if not isinstance(authority, ControllerBindingAuthority):
+        raise TypeError('authority must be a ControllerBindingAuthority.')
+    if not authority.generic_launches_required:
+        return []
+    engine = serve_state.get_database_engine()
+    if not _serve042_supported(engine):
+        return []
+    associations = ordinary_launch_associations_table
+    replicas = serve_state_schema.replicas_table
+    with engine.connect() as connection:
+        rows = connection.execute(
+            sqlalchemy.select(associations).join(
+                replicas,
+                sqlalchemy.and_(
+                    replicas.c.service_name == associations.c.service_name,
+                    replicas.c.replica_id == associations.c.replica_id,
+                    replicas.c.ordinary_launch_association_id ==
+                    associations.c.association_id)).
+            where(
+                associations.c.service_name == authority.service_name,
+                associations.c.service_hash == authority.service_hash,
+                associations.c.service_workspace == authority.service_workspace,
+                associations.c.service_lifecycle_epoch ==
+                authority.service_lifecycle_epoch,
+                associations.c.service_binding_epoch == authority.binding_epoch,
+                associations.c.owner_controller_incarnation ==
+                authority.controller_incarnation,
+                associations.c.owner_controller_epoch ==
+                authority.controller_owner_epoch,
+                associations.c.resolution == Resolution.AMBIGUOUS.value,
+                associations.c.reconciliation_outcome ==
+                ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value,
+                associations.c.binding_protocol_version ==
+                NON_POOL_BINDING_PROTOCOL_VERSION,
+                associations.c.profile_kind.is_not(None)).order_by(
+                    associations.c.replica_id)).mappings().all()
+    contexts = []
+    for row in rows:
+        context = bound_context_from_association(row)
+        if not isinstance(context, BoundNonPoolLaunchContext):
+            raise OrdinaryLaunchBindingConflict(
+                'Provider reconciliation selected a non-generic '
+                'association.')
+        contexts.append(context)
+    return contexts
+
+
 def binding_allows_request(association_id: str, request_id: str) -> bool:
     """Conservative non-locking pre-claim qualification.
 
