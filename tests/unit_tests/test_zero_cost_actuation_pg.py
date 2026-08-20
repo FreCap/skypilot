@@ -615,12 +615,22 @@ def test_committed_intent_exactly_owns_replica(actuation_database) -> None:
             replica_info=info)
 
     with actuation_database.connect() as connection:
+        assert zero_cost_actuation.committed_intent_for_replica_in_connection(
+            connection,
+            service_name='svc',
+            service_hash=_SERVICE_HASH,
+            replica_info=info) == lease.intent
         assert zero_cost_actuation.committed_intent_matches_replica_in_connection(
             connection,
             service_name='svc',
             service_hash=_SERVICE_HASH,
             replica_info=info)
         info.reserved_fill_physical_cluster_uid = 'other-uid'
+        assert zero_cost_actuation.committed_intent_for_replica_in_connection(
+            connection,
+            service_name='svc',
+            service_hash=_SERVICE_HASH,
+            replica_info=info) is None
         assert not zero_cost_actuation.committed_intent_matches_replica_in_connection(
             connection,
             service_name='svc',

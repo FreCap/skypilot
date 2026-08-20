@@ -46,6 +46,8 @@ reserved_fill_planner = adaptors_common.LazyImport(
     'sky.serve.reserved_fill_planner')
 system_oom_recovery = adaptors_common.LazyImport(
     'sky.serve.system_oom_recovery')
+zero_cost_actuation = adaptors_common.LazyImport(
+    'sky.serve.zero_cost_actuation')
 
 SUBMISSION_ID_KEY = 'sky_serve_ordinary_launch_submission_id'
 ASSOCIATION_ID_KEY = 'sky_serve_ordinary_launch_association_id'
@@ -2274,6 +2276,48 @@ def _reserved_fill_payload(
     info: Any,
 ) -> dict[str, Any]:
     """Resolve one fill intent against its allocation and observation rows."""
+    if (service.get('reserved_fill_actuation_mode') ==
+            zero_cost_actuation.ActuationMode.DURABLE_INTENT.value):
+        intent = zero_cost_actuation.committed_intent_for_replica_in_connection(
+            connection,
+            service_name=service['name'],
+            service_hash=service['hash'],
+            replica_info=info)
+        if intent is None:
+            raise OrdinaryLaunchBindingConflict(
+                'Durable reserved-fill profile lost its exact committed '
+                'intent handoff.')
+        observations = (pool_capacity_observation_schema.
+                        demand_capacity_observations_v2_table)
+        observation = connection.execute(
+            sqlalchemy.select(observations).where(
+                observations.c.pool_key == intent.pool_key,
+                observations.c.observation_generation ==
+                intent.observation_generation,
+                observations.c.observation_sequence ==
+                intent.observation_sequence, observations.c.observation_status
+                == pool_capacity_observation_schema.SUCCESS)).mappings(
+                ).one_or_none()
+        if observation is None:
+            raise OrdinaryLaunchBindingConflict(
+                'Durable reserved-fill profile lost its committed '
+                'observation evidence.')
+        sequence = _zero_cost_sequence_payload(connection, info)
+        return {
+            'allocation_input_sha256': intent.allocation_input_sha256,
+            'claim_generation': intent.allocation_claim_generation,
+            'intent_idempotency_key': intent.idempotency_key,
+            'observation_payload_sha256': observation['payload_sha256'],
+            'physical_cluster_uid': intent.physical_cluster_uid,
+            'pool_key': intent.pool_key,
+            'reclaim_fleet_bundle_sha256': intent.reclaim_fleet_bundle_sha256,
+            'reclaim_policy_revision': intent.reclaim_policy_revision,
+            'reclaim_provider_inventory_sha256':
+                intent.reclaim_provider_inventory_sha256,
+            'sequence': sequence,
+            'worker_projection_sha256': intent.worker_projection_sha256,
+        }
+
     allocation_table = (
         pool_capacity_observation_schema.reserved_fill_service_allocation_table)
     allocation_row = connection.execute(
