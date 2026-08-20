@@ -37,6 +37,7 @@ from sky.serve import pool_capacity_observation_schema
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
+from sky.serve import zero_cost_actuation
 from sky.serve.server import core as serve_core
 from sky.server import daemons
 from sky.server.events import cursors as event_cursors
@@ -1627,7 +1628,6 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
                     status='PROVISIONING',
                     paid_capacity_pool_key=None,
                     replica_state=info.to_storage_dict()))
-
     profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
         ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
         authorization_reference='reserved-fill:' + 'e' * 64,
@@ -1770,6 +1770,67 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
     assert pin_count == 0
 
 
+def test_provider_present_cleanup_exact_digest_requires_owner_relations(
+        bound_request_database) -> None:
+    """Atomic digest equality cannot replace tenant/owner/cluster checks."""
+    engine, _ = bound_request_database
+    body = _gc_unbound_non_pool_launch_body()
+    body.env_vars[constants.USER_ID_ENV_VAR] = 'tenant-a'
+    body.env_vars[constants.USER_ENV_VAR] = 'Tenant A'
+    body.client_api_version = 77
+    request = requests.Request(request_id='atomic-cleanup-request',
+                               name='sky.launch',
+                               entrypoint=non_pool_launch_request.launch,
+                               request_body=body,
+                               status=requests.RequestStatus.CANCELLED,
+                               created_at=time.time(),
+                               user_id='tenant-a',
+                               cluster_name='gc-service-3',
+                               schedule_type=requests.ScheduleType.LONG,
+                               retryable=False,
+                               should_enqueue=False)
+    association = {
+        'tenant_scope': 'tenant-a',
+        'cluster_name': 'gc-service-3',
+    }
+    request_row = {
+        'user_id': 'tenant-a',
+        'cluster_name': 'gc-service-3',
+    }
+    context = mock.Mock(
+        service_name='gc-service',
+        input_digest=ordinary_launch_binding.canonical_launch_digest(body))
+    original = body.model_dump_json()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(global_user_state_schema.user_table).values(
+                id='tenant-a', name='Tenant A', created_at=int(time.time())))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'gc-service').values(owner_user_id='tenant-a',
+                                     owner_user_name='Tenant A'))
+        assert request_postgres._provider_present_cleanup_input_digest_matches(
+            connection, association, request_row, request, context)
+
+        changed_name = body.model_copy(deep=True)
+        changed_name.env_vars[constants.USER_ENV_VAR] = 'Different Name'
+        changed_request = dataclasses.replace(request,
+                                              request_body=changed_name)
+        changed_context = mock.Mock(
+            service_name='gc-service',
+            input_digest=ordinary_launch_binding.canonical_launch_digest(
+                changed_name))
+        assert not request_postgres._provider_present_cleanup_input_digest_matches(
+            connection, association, request_row, changed_request,
+            changed_context)
+        assert not request_postgres._provider_present_cleanup_input_digest_matches(
+            connection, {
+                **association, 'tenant_scope': 'different-tenant'
+            }, request_row, request, context)
+    assert body.model_dump_json() == original
+
+
 def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
         bound_request_database, monkeypatch) -> None:
     """PRESENT retains authority until a later exact ABSENT projection."""
@@ -1798,6 +1859,24 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
                     status='PROVISIONING',
                     paid_capacity_pool_key=None,
                     replica_state=info.to_storage_dict()))
+        connection.execute(
+            sqlalchemy.insert(global_user_state_schema.user_table).values(
+                id='submitted-owner',
+                name='Submitted Owner',
+                created_at=int(time.time())))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'gc-service').values(
+                    owner_user_id='submitted-owner',
+                    owner_user_name='Submitted Owner',
+                    reserved_fill_actuation_mode=(
+                        zero_cost_actuation.ActuationMode.DURABLE_INTENT.value),
+                    reserved_fill_actuation_epoch=1,
+                    reserved_fill_actuation_capable=True,
+                    reserved_fill_actuation_controller_incarnation=(
+                        _GC_CONTROLLER_ID),
+                    reserved_fill_actuation_protocol_version=1))
 
     profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
         ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
@@ -1807,41 +1886,28 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
     monkeypatch.setattr(ordinary_launch_binding,
                         'resolve_non_pool_launch_profile_in_connection',
                         lambda *_args, **_kwargs: profile)
-    unbound_launch_context = {
-        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'gc-service',
-        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'gc-service-hash',
-        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: 2,
-        serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: 123,
-        serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: '10.0.0.2',
-        ordinary_launch_binding.REPLICA_ID_KEY: 3,
-        ordinary_launch_binding.REPLICA_RECORD_ID_KEY:
-            str(_GC_REPLICA_RECORD_ID),
-        ordinary_launch_binding.LIFECYCLE_EPOCH_KEY: 4,
-        ordinary_launch_binding.BINDING_EPOCH_KEY: 6,
-        ordinary_launch_binding.CONTROLLER_INCARNATION_KEY:
-            str(_GC_CONTROLLER_ID),
-        ordinary_launch_binding.CONTROLLER_OWNER_EPOCH_KEY: 6,
-    }
-    request_template = _bound_non_pool_request('digest-template')
-    request_template.request_body.extra_launch_context = dict(
-        unbound_launch_context)
-    request_template.request_body.env_vars = {
-        constants.USER_ID_ENV_VAR: 'tenant-a',
-        constants.USER_ENV_VAR: 'Tenant A',
-    }
-    request_template.request_body.client_api_version = 77
-    identity = _gc_non_pool_binding_identity(
+    monkeypatch.setattr(
+        ordinary_launch_binding, '_reserved_fill_payload',
+        lambda *_args, **_kwargs: {'physical_cluster_uid': 'physical-uid-a'})
+    built = non_pool_admission.build(
+        _gc_unbound_non_pool_launch_body(),
+        uuid.UUID('44444444-4444-4444-8444-444444444444'),
         profile,
-        input_digest=ordinary_launch_binding.canonical_launch_digest(
-            request_template.request_body))
-    request = _bound_non_pool_request(identity.request_id)
-    request.request_body.extra_launch_context = dict(unbound_launch_context)
-    request.user_id = 'tenant-a'
-    request.request_body.env_vars = {
-        constants.USER_ID_ENV_VAR: 'tenant-a',
-        constants.USER_ENV_VAR: 'Tenant A',
-    }
-    request.request_body.client_api_version = 77
+        non_pool_admission.AdmissionAuthority(
+            tenant_id='tenant-a',
+            creator_name='Tenant A',
+            service_workspace='workspace-a',
+            capability_cohort_epoch=(
+                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+            capability_profile_set_digest=(
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            ),
+            receipt_protocol_version=(
+                ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)),
+        auth_user=models.User(id='tenant-a', name='Tenant A'),
+        client_api_version=77)
+    identity = built.identity
+    request = built.request
     monkeypatch.setattr(request_postgres,
                         '_resolved_request_backend_capability', lambda:
                         ('postgres-storage', 'postgres-queue', True))
@@ -1850,8 +1916,11 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
                         lambda **_kwargs: True)
     admission = request_postgres.bind_and_enqueue_non_pool_launch(
         request, identity)
+    # The authenticated HTTP contract hashes submitted bytes before request
+    # construction normalizes tenant and API fields.  Provider cleanup must
+    # not mistake this legitimate representation boundary for mutation.
     assert ordinary_launch_binding.canonical_launch_digest(
-        request.request_body) == identity.input_digest
+        request.request_body) != identity.input_digest
     context = ordinary_launch_binding.BoundNonPoolLaunchContext(
         association_id=identity.association_id,
         request_id=identity.request_id,
@@ -1982,11 +2051,15 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
     tampered_payloads.append(tampered_task)
     tampered_env = dict(original_payload)
     tampered_env['env_vars'] = dict(tampered_env['env_vars'])
-    tampered_env['env_vars'][constants.USER_ENV_VAR] = 'Tampered Owner'
+    tampered_env['env_vars']['UNRELATED_TAMPER'] = 'true'
     tampered_payloads.append(tampered_env)
-    tampered_api = dict(original_payload)
-    tampered_api['client_api_version'] = 78
-    tampered_payloads.append(tampered_api)
+    tampered_tenant = dict(original_payload)
+    tampered_tenant['env_vars'] = dict(tampered_tenant['env_vars'])
+    tampered_tenant['env_vars'][constants.USER_ID_ENV_VAR] = 'other-tenant'
+    tampered_payloads.append(tampered_tenant)
+    tampered_cluster = dict(original_payload)
+    tampered_cluster['cluster_name'] = 'different-cluster'
+    tampered_payloads.append(tampered_cluster)
     for tampered_payload in tampered_payloads:
         with engine.begin() as connection:
             connection.execute(
@@ -2017,14 +2090,51 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
             sqlalchemy.update(request_postgres.REQUESTS).where(
                 request_postgres.REQUESTS.c.request_id ==
                 identity.request_id).values(payload_json=original_payload))
+    # Historical cancellation rows retain the source exception metadata while
+    # the encoded object is the client-safe CloudError projection.  That exact
+    # serializer shape is valid terminal evidence; arbitrary metadata drift is
+    # not.
+    wrapped_cancel_error = requests._build_error_dict(
+        concurrent.futures.CancelledError())
+    assert wrapped_cancel_error['type'] == 'CancelledError'
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                identity.request_id).values(error=wrapped_cancel_error))
     assert request_postgres.authorize_bound_non_pool_provider_present_cleanup(
         context, authority, project_replica_result=_project_replica)
+    with engine.connect() as connection:
+        assert dict(
+            connection.execute(
+                sqlalchemy.select(
+                    request_postgres.REQUESTS.c.payload_json).where(
+                        request_postgres.REQUESTS.c.request_id ==
+                        identity.request_id)).scalar_one()) == original_payload
     assert (
         request_postgres.bound_non_pool_provider_present_cleanup_is_authorized(
             context, authority))
     # Exact replay is read-only and remains authorized.
     assert request_postgres.authorize_bound_non_pool_provider_present_cleanup(
         context, authority, project_replica_result=_project_replica)
+    tampered_error = dict(wrapped_cancel_error)
+    tampered_error['type'] = 'DifferentError'
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                identity.request_id).values(error=tampered_error))
+    assert not (
+        request_postgres.bound_non_pool_provider_present_cleanup_is_authorized(
+            context, authority))
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                identity.request_id).values(error=wrapped_cancel_error))
+    assert (
+        request_postgres.bound_non_pool_provider_present_cleanup_is_authorized(
+            context, authority))
     with engine.begin() as connection:
         stored_state = connection.execute(
             sqlalchemy.select(

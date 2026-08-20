@@ -3111,13 +3111,7 @@ def _lock_bound_request_evidence(
             candidate_error = _request_from_mapping(
                 typing.cast(sqlalchemy.engine.RowMapping,
                             request_row)).get_error()
-            if (not isinstance(candidate_error, dict) or
-                    set(candidate_error) != {'object', 'type', 'message'} or
-                    not isinstance(candidate_error.get('object'), BaseException)
-                    or candidate_error.get('type') != type(
-                        candidate_error['object']).__name__ or
-                    candidate_error.get('message') != str(
-                        candidate_error['object'])):
+            if not requests_lib.decoded_error_is_valid(candidate_error):
                 error_decode_failed = True
             else:
                 decoded_error = candidate_error
@@ -3863,8 +3857,6 @@ def _lock_bound_non_pool_provider_present_cleanup(
         parsed_context = (
             ordinary_launch_binding.parse_bound_non_pool_launch_context(
                 request.request_body.extra_launch_context))
-        request_input_digest = ordinary_launch_binding.canonical_launch_digest(
-            request.request_body)
         request_service_job_id = _request_service_job_id(
             request_row, str(association['cluster_name']))
     except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
@@ -3873,11 +3865,9 @@ def _lock_bound_non_pool_provider_present_cleanup(
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Provider-present cleanup could not decode the exact bound '
             'request payload.') from error
-    atomic_fill_digest_changed = bool(
-        context.profile.kind
-        is ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL and
-        request_input_digest != context.input_digest)
-    if (parsed_context != context or atomic_fill_digest_changed or
+    if (parsed_context != context or
+            not _provider_present_cleanup_input_digest_matches(
+                connection, association, request_row, request, context) or
             request_service_job_id is not None or
             association['service_job_id'] is not None):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
@@ -3892,6 +3882,66 @@ def _lock_bound_non_pool_provider_present_cleanup(
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Provider-present cleanup found unexpected paid capacity.')
     return checked_association, facts, locked_replica_info
+
+
+def _provider_present_cleanup_input_digest_matches(
+    connection: sqlalchemy.engine.Connection,
+    association: Mapping[str, Any],
+    request_row: sqlalchemy.engine.RowMapping,
+    request: requests_lib.Request,
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+) -> bool:
+    """Match current atomic or one exact historical HTTP digest contract."""
+    body = request.request_body
+    env_vars = getattr(body, 'env_vars', None)
+    tenant_scope = association.get('tenant_scope')
+    cluster_name = association.get('cluster_name')
+    if (not isinstance(env_vars, Mapping) or
+            request_row['user_id'] != tenant_scope or
+            env_vars.get(skylet_constants.USER_ID_ENV_VAR) != tenant_scope or
+            request_row['cluster_name'] != cluster_name or
+            getattr(body, 'cluster_name', None) != cluster_name):
+        return False
+    try:
+        executable_exact = (ordinary_launch_binding.canonical_launch_digest(
+            body) == context.input_digest)
+    except ValueError:
+        return False
+    service_owner = connection.execute(
+        sqlalchemy.select(
+            serve_state_schema.services_table.c.owner_user_id,
+            serve_state_schema.services_table.c.owner_user_name).where(
+                serve_state_schema.services_table.c.name ==
+                context.service_name)).mappings().one_or_none()
+    if service_owner is None:
+        return False
+    owner_user_id = service_owner['owner_user_id']
+    owner_user_name = service_owner['owner_user_name']
+    if (not isinstance(owner_user_id, str) or not owner_user_id or
+            not isinstance(owner_user_name, str) or not owner_user_name):
+        return False
+    if executable_exact:
+        # Atomic fill stamps the immutable service-owner tuple before hashing.
+        return bool(
+            tenant_scope == owner_user_id and
+            env_vars.get(skylet_constants.USER_ENV_VAR) == owner_user_name)
+
+    # Before atomic fill admission, the authenticated HTTP request builder
+    # normalized the service-owner environment and client API version after
+    # the submitted body had been hashed.  Reconstruct only that exact legacy
+    # representation from the immutable, already locked service owner tuple.
+    # Any other body mutation remains ineligible for provider teardown.
+    try:
+        submitted_body = body.model_copy(deep=True)
+        submitted_env = dict(submitted_body.env_vars)
+        submitted_env[skylet_constants.USER_ID_ENV_VAR] = owner_user_id
+        submitted_env[skylet_constants.USER_ENV_VAR] = owner_user_name
+        submitted_body.env_vars = submitted_env
+        submitted_body.client_api_version = None
+        return (ordinary_launch_binding.canonical_launch_digest(submitted_body)
+                == context.input_digest)
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def authorize_bound_non_pool_provider_present_cleanup(

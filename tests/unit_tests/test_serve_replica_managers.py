@@ -15,6 +15,7 @@ Covers:
 # pylint: disable=missing-class-docstring,unnecessary-dunder-call
 import asyncio
 import collections.abc
+import concurrent.futures
 import contextlib
 import copy
 import dataclasses
@@ -50,6 +51,7 @@ from sky.serve import service_spec
 from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state
 from sky.serve import system_recovery_state as recovery_state
+from sky.server.requests import payloads
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import requests as api_requests
 from sky.skylet import job_lib
@@ -63,6 +65,25 @@ _DISABLED_PLACEMENT_CONTRACT = placement_policy.resolve_fresh_contract(
     None, pool=False)
 _LOGICAL_PLACEMENT_CONTRACT = placement_policy.resolve_fresh_contract(
     placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
+
+
+def test_decoded_bound_request_error_accepts_exact_safe_wrapper() -> None:
+    request = api_requests.Request(request_id='wrapped-bound-error',
+                                   name='sky.launch',
+                                   entrypoint=lambda: None,
+                                   request_body=payloads.RequestBody(),
+                                   status=api_requests.RequestStatus.FAILED,
+                                   created_at=0.0,
+                                   user_id='test-user')
+    request.set_error(concurrent.futures.CancelledError())
+    decoded = request.get_error()
+
+    assert decoded is not None
+    restored = replica_managers._decoded_bound_request_error(decoded)
+    assert type(restored) is exceptions.CloudError
+    tampered = dict(decoded)
+    tampered['message'] = 'tampered'
+    assert replica_managers._decoded_bound_request_error(tampered) is None
 
 
 def _binding_authority(mode=ordinary_launch_binding.BindingMode.LEGACY,

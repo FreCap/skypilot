@@ -384,9 +384,13 @@ def test_durable_reserved_fill_profile_uses_committed_handoff(
     info.reserved_fill = True
     info.is_zero_cost = True
     info.zero_cost_admission_sequence = 6
+    info.reserved_fill_reconciliation_gate_generation = 9
+    info.reserved_fill_intent_idempotency_key = 'b' * 64
     intent = types.SimpleNamespace(allocation_input_sha256='a' * 64,
                                    allocation_claim_generation=7,
                                    idempotency_key='b' * 64,
+                                   protocol_version=2,
+                                   reconciliation_gate_generation=9,
                                    observation_generation=10,
                                    observation_sequence=0,
                                    physical_cluster_uid='physical-uid',
@@ -402,7 +406,7 @@ def test_durable_reserved_fill_profile_uses_committed_handoff(
         'admission_sequence': 6,
         'materialization_sequence': None,
         'protocol_version': 2,
-        'reconciliation_gate_generation': 9,
+        'reconciliation_gate_generation': 12,
     }
     monkeypatch.setattr(binding, '_zero_cost_sequence_payload',
                         lambda *_args, **_kwargs: sequence)
@@ -437,6 +441,26 @@ def test_durable_reserved_fill_profile_uses_committed_handoff(
         'sequence': sequence,
         'worker_projection_sha256': 'e' * 64,
     }
+    frozen_payload = binding._reserved_fill_payload(
+        connection, {
+            'name': 'svc',
+            'hash': 'svc-hash',
+            'reserved_fill_actuation_mode':
+                zero_cost_actuation.ActuationMode.DURABLE_INTENT.value,
+        },
+        info,
+        freeze_reconciliation_gate=True)
+    assert frozen_payload['sequence'] == {
+        **sequence,
+        'reconciliation_gate_generation': 9,
+    }
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='lost its monotonic gate history'):
+        binding._freeze_reserved_fill_sequence_gate(info, {
+            **sequence,
+            'protocol_version': 1,
+        },
+                                                    committed_intent=intent)
 
 
 def test_durable_reserved_fill_profile_never_falls_back_without_intent(
