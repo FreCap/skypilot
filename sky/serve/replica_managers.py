@@ -9987,6 +9987,21 @@ class SkyPilotReplicaManager(ReplicaManager):
             info.status_property.sky_down_status = (
                 common_utils.ProcessStatus.SUCCEEDED)
             self._clear_failed_cleanup_retry(info.replica_id)
+        # Teardown writes INTERRUPTED before joining/cancelling an in-flight
+        # launch.  If that cleanup succeeds but this was not an autoscaler,
+        # purge, or preemption removal, the row is intentionally retained as
+        # the current version's failure record.  Leaving INTERRUPTED in that
+        # retained row derives SHUTTING_DOWN forever, so every controller
+        # restart replays cleanup for capacity already proven gone.  Settle
+        # the launch side as failed; FAILED_PROVISION preserves the diagnostic
+        # row while SUCCEEDED remains the durable provider-cleanup evidence.
+        if (info.status_property.sky_launch_status
+                == common_utils.ProcessStatus.INTERRUPTED and
+                not info.status_property.is_scale_down and
+                not info.status_property.preempted and
+                not info.status_property.purged):
+            info.status_property.sky_launch_status = (
+                common_utils.ProcessStatus.FAILED)
         # Failed replica still count as a replica. In our current design, we
         # want to fail early if user code have any error. This will prevent
         # infinite loop of teardown and re-provision. However, there is a

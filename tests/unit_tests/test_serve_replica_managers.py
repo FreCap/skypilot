@@ -13335,6 +13335,24 @@ class TestFailedCleanupReconciliation:
         assert not manager._failed_cleanup_retry_attempts
         assert not manager._failed_cleanup_retry_at
 
+    def test_successful_interrupted_failure_cleanup_becomes_terminal(self):
+        manager = _make_manager()
+        info = self._info()
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.INTERRUPTED)
+
+        with mock.patch.object(manager, '_persist_replica') as persist, \
+             mock.patch.object(manager, '_remove_replica') as remove:
+            manager._handle_sky_down_finish(info, format_exc=None)
+
+        persist.assert_called_once_with(1, info)
+        remove.assert_not_called()
+        assert (info.status_property.sky_launch_status ==
+                common_utils.ProcessStatus.FAILED)
+        assert (info.status_property.sky_down_status ==
+                common_utils.ProcessStatus.SUCCEEDED)
+        assert info.status == replica_managers.serve_state.ReplicaStatus.FAILED_PROVISION
+
     def test_synchronous_reconcile_error_is_backed_off(self):
         manager = _make_manager()
         info = self._info()
