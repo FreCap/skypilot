@@ -330,6 +330,23 @@ def test_backend_bound_provider_guard_requires_active_association():
     legacy_guard.assert_not_called()
 
 
+def test_backend_bound_provider_guard_carries_exact_replica_snapshot():
+    context = _bound_context()
+    provisioner = _retrying_provisioner(context)
+    durable_replica = mock.sentinel.durable_replica
+    authorization = types.SimpleNamespace(durable_replica_info=durable_replica)
+
+    with mock.patch.object(cloud_vm_ray_backend.ordinary_launch_binding,
+                           'require_active_provider_effect_authorization',
+                           return_value=authorization) as active:
+        with provisioner._service_replica_launch_provider_owner_guard(
+        ) as snapshot:
+            assert snapshot is not None
+            assert snapshot.durable_replica_info is durable_replica
+
+    assert active.call_args_list == [mock.call(context), mock.call(context)]
+
+
 def test_backend_bound_standalone_validation_uses_active_association():
     context = _bound_context()
     provisioner = _retrying_provisioner(context)

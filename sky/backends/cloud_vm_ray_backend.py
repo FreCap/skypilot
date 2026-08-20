@@ -1008,7 +1008,8 @@ class RetryingVmProvisioner:
                         'Reserved-fill reclaim guard lost its database '
                         'session before the provider operation.')
                 if not serve_state.reserved_fill_reclaim_launch_authority_holds(
-                        scope, authorization, self._extra_launch_context):
+                        scope, authorization, self._extra_launch_context,
+                        launch_snapshot):
                     raise reserved_capacity.ReservedFillLaunchFenceError(
                         'Reserved-fill reclaim authority changed before the '
                         'provider operation.')
@@ -1064,15 +1065,20 @@ class RetryingVmProvisioner:
             # strict contextvar check prevents a forged or directly invoked
             # bound context from using this bypass.
             try:
-                ordinary_launch_binding.require_active_provider_effect_authorization(
-                    launch_context)
+                association_authorization = (
+                    ordinary_launch_binding.
+                    require_active_provider_effect_authorization(launch_context)
+                )
             except Exception as error:
                 raise exceptions.ServeReplicaLaunchFenceError(
                     'Bound SkyServe provider I/O has no exact active '
                     'association authority.') from error
+            bound_launch_snapshot = (
+                serve_state.ServiceReplicaLaunchFenceSnapshot(
+                    association_authorization.durable_replica_info))
             provider_completed = False
             try:
-                yield None
+                yield bound_launch_snapshot
                 provider_completed = True
             finally:
                 if provider_completed:

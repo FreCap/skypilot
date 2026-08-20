@@ -800,8 +800,9 @@ def test_service_guard_precedes_policy_authorization_and_global_guard(
                         _global_guard)
     monkeypatch.setattr(
         serve_state, 'reserved_fill_reclaim_launch_authority_holds',
-        lambda scope, authorization, launch_context: events.append('recheck') or
-        (scope == expected_scope and authorization is not None))
+        lambda scope, authorization, launch_context, launch_snapshot: events.
+        append('recheck') or (scope == expected_scope and authorization is
+                              not None and launch_snapshot is not None))
     monkeypatch.setattr(provisioner,
                         '_service_replica_launch_provider_owner_guard',
                         _owner_guard)
@@ -945,8 +946,9 @@ def test_provider_exception_classification_is_preserved(monkeypatch):
         lambda *, shared: contextlib.nullcontext() if shared else None)
     monkeypatch.setattr(
         serve_state, 'reserved_fill_reclaim_launch_authority_holds',
-        lambda scope, authorization, launch_context: scope == expected_scope and
-        authorization is not None)
+        lambda scope, authorization, launch_context, launch_snapshot: scope ==
+        expected_scope and authorization is not None and launch_snapshot is
+        not None)
     monkeypatch.setattr(
         provisioner, '_service_replica_launch_provider_owner_guard',
         lambda: contextlib.nullcontext(_launch_snapshot(context)))
@@ -979,8 +981,9 @@ def test_lost_global_guard_never_reports_an_authorized_provider_effect(
                         lambda _: validity.pop(0))
     monkeypatch.setattr(
         serve_state, 'reserved_fill_reclaim_launch_authority_holds',
-        lambda scope, authorization, launch_context: scope == expected_scope and
-        authorization is not None)
+        lambda scope, authorization, launch_context, launch_snapshot: scope ==
+        expected_scope and authorization is not None and launch_snapshot is
+        not None)
     owner_guard = mock.Mock(
         return_value=contextlib.nullcontext(_launch_snapshot(context)))
     monkeypatch.setattr(provisioner,

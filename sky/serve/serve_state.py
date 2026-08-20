@@ -2754,9 +2754,9 @@ def reserved_fill_reclaim_launch_authority_holds(
     authorization: (reserved_fill_reclaim_attestation.ReclaimLaunchAuthorization
                     | None),
     launch_context: dict[str, Any],
+    launch_snapshot: ServiceReplicaLaunchFenceSnapshot | None,
 ) -> bool:
     """Revalidate durable row, immutable gate and policy ticket before effect."""
-    launch_snapshot = service_replica_launch_fence_snapshot(launch_context)
     if (launch_snapshot is None or
             launch_snapshot.durable_replica_info is None or
             launch_snapshot.durable_replica_info.reserved_fill is not True):
