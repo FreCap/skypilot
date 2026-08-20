@@ -4,6 +4,7 @@
 import copy
 import dataclasses
 import pathlib
+import types
 import uuid
 
 from alembic import command as alembic_command
@@ -18,6 +19,7 @@ from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import system_oom_recovery
 from sky.serve import system_recovery_state
+from sky.serve import zero_cost_actuation
 from sky.server import constants as server_constants
 from sky.server.requests import ordinary_launch as ordinary_launch_request
 from sky.server.requests import payloads
@@ -362,6 +364,86 @@ def test_non_pool_profile_classification_rejects_partial_authority() -> None:
     recovery.system_recovery_disposition = (
         system_recovery_state.SystemRecoveryDisposition.CANDIDATE)
     assert binding.classify_non_pool_launch_profile(recovery) is None
+
+
+def test_durable_reserved_fill_profile_uses_committed_handoff(
+        monkeypatch) -> None:
+    info = _profile_info()
+    info.reserved_fill = True
+    info.is_zero_cost = True
+    info.zero_cost_admission_sequence = 6
+    intent = types.SimpleNamespace(allocation_input_sha256='a' * 64,
+                                   allocation_claim_generation=7,
+                                   idempotency_key='b' * 64,
+                                   observation_generation=10,
+                                   observation_sequence=0,
+                                   physical_cluster_uid='physical-uid',
+                                   pool_key='pool-a',
+                                   reclaim_fleet_bundle_sha256='c' * 64,
+                                   reclaim_policy_revision='policy-v1',
+                                   reclaim_provider_inventory_sha256='d' * 64,
+                                   worker_projection_sha256='e' * 64)
+    committed = lambda *_args, **_kwargs: intent
+    monkeypatch.setattr(binding.zero_cost_actuation,
+                        'committed_intent_for_replica_in_connection', committed)
+    sequence = {
+        'admission_sequence': 6,
+        'materialization_sequence': None,
+        'protocol_version': 2,
+        'reconciliation_gate_generation': 9,
+    }
+    monkeypatch.setattr(binding, '_zero_cost_sequence_payload',
+                        lambda *_args, **_kwargs: sequence)
+
+    class _Result:
+
+        def mappings(self):
+            return self
+
+        def one_or_none(self):
+            return {'payload_sha256': 'f' * 64}
+
+    connection = types.SimpleNamespace(execute=lambda _statement: _Result())
+    payload = binding._reserved_fill_payload(
+        connection, {
+            'name': 'svc',
+            'hash': 'svc-hash',
+            'reserved_fill_actuation_mode':
+                zero_cost_actuation.ActuationMode.DURABLE_INTENT.value,
+        }, info)
+
+    assert payload == {
+        'allocation_input_sha256': 'a' * 64,
+        'claim_generation': 7,
+        'intent_idempotency_key': 'b' * 64,
+        'observation_payload_sha256': 'f' * 64,
+        'physical_cluster_uid': 'physical-uid',
+        'pool_key': 'pool-a',
+        'reclaim_fleet_bundle_sha256': 'c' * 64,
+        'reclaim_policy_revision': 'policy-v1',
+        'reclaim_provider_inventory_sha256': 'd' * 64,
+        'sequence': sequence,
+        'worker_projection_sha256': 'e' * 64,
+    }
+
+
+def test_durable_reserved_fill_profile_never_falls_back_without_intent(
+        monkeypatch) -> None:
+    monkeypatch.setattr(binding.zero_cost_actuation,
+                        'committed_intent_for_replica_in_connection',
+                        lambda *_args, **_kwargs: None)
+    connection = types.SimpleNamespace(
+        execute=lambda _statement: pytest.fail('live allocation fallback used'))
+
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='committed intent handoff'):
+        binding._reserved_fill_payload(
+            connection, {
+                'name': 'svc',
+                'hash': 'svc-hash',
+                'reserved_fill_actuation_mode':
+                    zero_cost_actuation.ActuationMode.DURABLE_INTENT.value,
+            }, _profile_info())
 
 
 def _excluded_owner(fields: dict[str, object],

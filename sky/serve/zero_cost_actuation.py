@@ -621,14 +621,14 @@ def _replica_matches_intent(replica_info: Any,
         return False
 
 
-def committed_intent_matches_replica_in_connection(
+def committed_intent_for_replica_in_connection(
     connection: sqlalchemy.engine.Connection,
     *,
     service_name: str,
     service_hash: str,
     replica_info: Any,
-) -> bool:
-    """Return whether an exact committed intent still owns one replica.
+) -> reserved_fill_planner.FillIntent | None:
+    """Return the exact committed intent that still owns one replica.
 
     A committed intent is the durable handoff from a broker generation to a
     replica.  It remains immutable after commit, so this read deliberately
@@ -649,7 +649,7 @@ def committed_intent_matches_replica_in_connection(
                 type(replica_id) is not int or replica_id < 1 or
                 type(raw_record_id) is not str or
                 str(replica_record_id) != raw_record_id):
-            return False
+            return None
         row = connection.execute(
             sqlalchemy.select(_INTENTS).where(
                 _INTENTS.c.intent_idempotency_key == intent_key,
@@ -660,13 +660,31 @@ def committed_intent_matches_replica_in_connection(
                 _INTENTS.c.replica_record_id == replica_record_id,
             )).mappings().one_or_none()
         if row is None:
-            return False
+            return None
         intent = _intent_from_row(row)
         planned_capacity = row['planned_capacity']
-        return (type(planned_capacity) is int and planned_capacity > 0 and
-                _replica_matches_intent(replica_info, intent, planned_capacity))
+        if (type(planned_capacity) is not int or
+                planned_capacity <= 0 or not _replica_matches_intent(
+                    replica_info, intent, planned_capacity)):
+            return None
+        return intent
     except (AttributeError, TypeError, ValueError, ZeroCostActuationError):
-        return False
+        return None
+
+
+def committed_intent_matches_replica_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    service_name: str,
+    service_hash: str,
+    replica_info: Any,
+) -> bool:
+    """Return whether an exact committed intent still owns one replica."""
+    return committed_intent_for_replica_in_connection(
+        connection,
+        service_name=service_name,
+        service_hash=service_hash,
+        replica_info=replica_info) is not None
 
 
 def commit_lease_in_connection(
