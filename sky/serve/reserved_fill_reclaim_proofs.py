@@ -40,6 +40,11 @@ _DATABASE_STATEMENT_TIMEOUT_MILLISECONDS = 200
 _DATABASE_SOCKET_TIMEOUT_MILLISECONDS = 200
 _DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS = 6000
 _PROVIDER_PUBLICATION_RESERVE_SECONDS = 0.5
+# A receipt handed back to the launch policy must leave time for the caller to
+# enter the terminal PostgreSQL authority transaction.  The terminal guard
+# still checks the full five-second freshness bound on the database clock; this
+# reserve is a liveness qualification, not an extension of proof authority.
+_TERMINAL_GUARD_RESERVE_SECONDS = 0.5
 _DATABASE_APPLICATION_NAME = 'skypilot-reclaim-proof'
 _DATABASE_OWNER_APPLICATION_NAME = 'skypilot-reclaim-proof-owner'
 _PROVIDER_PROOF_MAX_JSON_DEPTH = 32
@@ -89,6 +94,17 @@ class ReclaimProviderProofReceipt:
     def is_fresh(self) -> bool:
         age = (self.database_now - self.completed_at).total_seconds()
         return age < reclaim.AUTHORIZATION_MAX_AGE_SECONDS
+
+    @property
+    def has_terminal_guard_reserve(self) -> bool:
+        """Whether a caller can still enter the terminal authority guard."""
+        # completed_monotonic is conservatively anchored to the beginning of
+        # the database read that produced this receipt.  Unlike database_now,
+        # this live comparison includes payload validation, transaction close,
+        # physical connection close, and every other local handoff delay.
+        age = time.monotonic() - self.reference.completed_monotonic
+        return 0 <= age < (reclaim.AUTHORIZATION_MAX_AGE_SECONDS -
+                           _TERMINAL_GUARD_RESERVE_SECONDS)
 
 
 def _require_deadline(deadline_monotonic: float) -> float:
@@ -452,10 +468,22 @@ class ReclaimProviderProofRepository:
             'completed_at': completed_at,
         }
         insert = postgresql.insert(table).values(**values)
+        same_proof = sqlalchemy.and_(
+            table.c.proof_schema_version ==
+            insert.excluded.proof_schema_version,
+            table.c.proof_sha256 == insert.excluded.proof_sha256,
+            table.c.proof_payload == insert.excluded.proof_payload)
         statement = insert.on_conflict_do_update(
             constraint='serve054_reclaim_proof_authority_uq',
             set_={
-                'receipt_nonce': insert.excluded.receipt_nonce,
+                # An identical completed fact is a monotonic freshness renewal,
+                # not a new authority.  Keeping its nonce prevents one launch's
+                # refresh from revoking concurrently minted exact references.
+                # Any schema or proof-content change still rotates the nonce and
+                # makes every older reference fail closed.
+                'receipt_nonce': sqlalchemy.case(
+                    (same_proof, table.c.receipt_nonce),
+                    else_=insert.excluded.receipt_nonce),
                 'proof_schema_version': insert.excluded.proof_schema_version,
                 'proof_payload': insert.excluded.proof_payload,
                 'proof_sha256': insert.excluded.proof_sha256,
@@ -481,8 +509,10 @@ class ReclaimProviderProofRepository:
             kubernetes_context=kubernetes_context,
             local_read_started=local_started,
             local_read_finished=local_finished)
-        if (receipt is None or
-                receipt.reference.receipt_nonce != receipt_nonce):
+        if (receipt is None or receipt.proof_payload != proof_payload or
+                receipt.reference.proof_sha256 != proof_sha256 or
+                receipt.completed_at != completed_at or
+                not receipt.has_terminal_guard_reserve):
             raise ReclaimProviderProofError(
                 'The published provider proof receipt is indeterminate.')
         _require_deadline(deadline)
@@ -533,8 +563,9 @@ class ReclaimProviderProofRepository:
             except ReclaimProviderProofError:
                 waiting = None
             _remaining_wait()
-            if (waiting is not None and waiting.is_fresh and
-                    self._payload_is_accepted(waiting.proof_payload, validate)):
+            if (waiting is not None and self._payload_is_accepted(
+                    waiting.proof_payload, validate) and
+                    waiting.has_terminal_guard_reserve):
                 _remaining_wait()
                 return waiting
             poll_seconds = min(_RECEIPT_POLL_MAX_SECONDS, poll_seconds * 2)
@@ -562,9 +593,9 @@ class ReclaimProviderProofRepository:
                     kubernetes_context=kubernetes_context,
                     deadline=deadline,
                     connection=connection)
-                if (receipt is not None and
-                        receipt.is_fresh and self._payload_is_accepted(
-                            receipt.proof_payload, validate)):
+                if (receipt is not None and self._payload_is_accepted(
+                        receipt.proof_payload, validate) and
+                        receipt.has_terminal_guard_reserve):
                     selected = receipt
                 else:
                     _require_deadline(deadline)
@@ -603,9 +634,9 @@ class ReclaimProviderProofRepository:
                             kubernetes_context=kubernetes_context,
                             deadline=deadline,
                             connection=connection)
-                        if (existing is not None and existing.is_fresh and
-                                self._payload_is_accepted(
-                                    existing.proof_payload, validate)):
+                        if (existing is not None and self._payload_is_accepted(
+                                existing.proof_payload, validate) and
+                                existing.has_terminal_guard_reserve):
                             selected = existing
                         else:
                             provider_deadline = provider_proof_deadline(
@@ -680,24 +711,32 @@ class ReclaimProviderProofRepository:
                              initial_remaining / 10)
         if initial_jitter > 0:
             time.sleep(initial_jitter * secrets.randbelow(1024) / 1024)
-        selected = self._read_elect_and_maybe_publish(
-            identity=identity,
-            gate_generation=gate_generation,
-            kubernetes_context=kubernetes_context,
-            deadline=deadline,
-            prove=prove,
-            validate=validate)
-        _require_deadline(deadline)
-        if selected is not None:
-            return selected
-        # A loser never reacquires. Its election transaction is physically gone
-        # before these bounded, independently closed receipt reads begin.
-        return self._wait_for_published_receipt(
-            identity=identity,
-            gate_generation=gate_generation,
-            kubernetes_context=kubernetes_context,
-            deadline=deadline,
-            validate=validate)
+        while True:
+            selected = self._read_elect_and_maybe_publish(
+                identity=identity,
+                gate_generation=gate_generation,
+                kubernetes_context=kubernetes_context,
+                deadline=deadline,
+                prove=prove,
+                validate=validate)
+            _require_deadline(deadline)
+            if selected is None:
+                # A loser does not reacquire while the elected owner is still
+                # proving. Its election transaction is physically gone before
+                # these bounded, independently closed receipt reads begin.
+                selected = self._wait_for_published_receipt(
+                    identity=identity,
+                    gate_generation=gate_generation,
+                    kubernetes_context=kubernetes_context,
+                    deadline=deadline,
+                    validate=validate)
+                _require_deadline(deadline)
+            # This is the actual handoff boundary: validation and every
+            # commit/rollback/physical-close delay have already elapsed. If
+            # they consumed the reserve, re-enter election under the original
+            # deadline and never expose the near-expiry receipt.
+            if selected.has_terminal_guard_reserve:
+                return selected
 
 
 def provider_proof_reference_holds_in_connection(
@@ -714,16 +753,32 @@ def provider_proof_reference_holds_in_connection(
         return False
     if not isinstance(reference, reclaim.ReclaimProviderProofReference):
         return False
+    # READ COMMITTED gives each terminal statement a current committed MVCC
+    # snapshot. A transaction-wide stale snapshot would not observe a proof
+    # replacement that committed after an earlier Serve fence read.
+    if connection.get_isolation_level().upper() != 'READ COMMITTED':
+        return False
     table = proof_schema.serve_reserved_fill_reclaim_provider_proofs_table
+    # One READ COMMITTED MVCC statement is the terminal proof linearization
+    # point. A committed replacement is visible and rejects the old exact
+    # nonce; an uncommitted replacement leaves the prior committed proof
+    # visible and therefore orders this guard before that transition. A row
+    # lock would add false failures without protecting the later provider
+    # effect, because this transaction ends before that effect starts.
     row = connection.execute(
-        sqlalchemy.select(table).where(
-            table.c.receipt_nonce == reference.receipt_nonce).with_for_update(
-                read=True, nowait=True)).mappings().one_or_none()
-    database_now = connection.execute(
-        sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        sqlalchemy.select(
+            table,
+            sqlalchemy.func.clock_timestamp().label('_database_now')).where(
+                table.c.receipt_nonce ==
+                reference.receipt_nonce)).mappings().one_or_none()
     if row is None:
         return False
+    database_now = row['_database_now']
     local_now = time.monotonic()
+    reference_age = local_now - reference.completed_monotonic
+    if (not math.isfinite(reference_age) or reference_age < 0 or
+            reference_age >= reclaim.AUTHORIZATION_MAX_AGE_SECONDS):
+        return False
     try:
         receipt = _decode_receipt(
             row,

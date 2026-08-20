@@ -1034,9 +1034,19 @@ class RetryingVmProvisioner:
         launch_snapshot: serve_state.ServiceReplicaLaunchFenceSnapshot | None,
     ) -> typing.Iterator[None]:
         """Hold fleet gate authority across one terminal provider effect."""
-        (durable_reserved_fill, scope, authorization
-        ) = self._reserved_fill_reclaim_authorization(launch_snapshot)
+        durable_replica = (None if launch_snapshot is None else
+                           launch_snapshot.durable_replica_info)
+        durable_reserved_fill = bool(durable_replica is not None and
+                                     durable_replica.reserved_fill is True)
         if not durable_reserved_fill:
+            # Preserve strict durable-fence validation for malformed contexts,
+            # but ordinary launches never acquire the reserved-fill fleet gate.
+            (authorized_reserved_fill, _,
+             _) = self._reserved_fill_reclaim_authorization(launch_snapshot)
+            if authorized_reserved_fill:
+                raise reserved_capacity.ReservedFillLaunchFenceError(
+                    'Reserved-fill durable authority changed before the '
+                    'provider operation.')
             yield
             return
         provider_started = False
@@ -1049,6 +1059,22 @@ class RetryingVmProvisioner:
                     raise reserved_capacity.ReservedFillLaunchFenceError(
                         'Reserved-fill reclaim guard lost its database '
                         'session before the provider operation.')
+                # Mint the five-second ticket only after the shared gate has
+                # been acquired. Gate acquisition is intentionally unbounded;
+                # doing this first prevents its wait from consuming proof
+                # freshness before the terminal validation below.
+                (authorized_reserved_fill, scope, authorization
+                ) = self._reserved_fill_reclaim_authorization(launch_snapshot)
+                if not authorized_reserved_fill:
+                    raise reserved_capacity.ReservedFillLaunchFenceError(
+                        'Reserved-fill durable authority changed before the '
+                        'provider operation.')
+                if not (serve_state.
+                        reserved_fill_reclaim_gate_authority_guard_is_valid(
+                            gate_guard)):
+                    raise reserved_capacity.ReservedFillLaunchFenceError(
+                        'Reserved-fill reclaim guard became indeterminate '
+                        'while proving provider authority.')
                 if not serve_state.reserved_fill_reclaim_launch_authority_holds(
                         scope, authorization, self._extra_launch_context,
                         launch_snapshot):
@@ -1076,8 +1102,8 @@ class RetryingVmProvisioner:
     def _service_replica_launch_provider_guard(self) -> typing.Iterator[None]:
         """Hold one bounded effect epoch across concrete provider I/O."""
         # Canonical order: existing service (or already-held association)
-        # authority, a fresh five-second policy ticket, then the fleet gate
-        # immediately around provider mutation.
+        # authority, the shared fleet gate, then a fresh five-second policy
+        # ticket immediately before terminal validation and provider mutation.
         try:
             reserved_fill_fence = (
                 reserved_capacity.parse_protocol_v2_launch_fence(

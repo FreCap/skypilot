@@ -141,6 +141,24 @@ path is the already-planned atomic PostgreSQL
 replica/association/request admission followed by asynchronous provider
 actuation; neither more retries nor EFS is authority.
 
+The first atomic launch wave on release `1.1.1389` then exposed a receipt
+renewal race inside that single-flight boundary. Replicas 55746--55755 proved
+that the v2 request can reach real Kubernetes Pods, while sibling launches
+failed either during policy authorization or at the final reclaim-authority
+check with no gate-generation change. The Serve054 row was replacing its
+random nonce on every five-second refresh, so an unchanged provider proof could
+revoke a concurrently minted exact reference between policy return and the
+terminal guard. A cached receipt was also reusable until the last instant of
+its five-second horizon, leaving no time for the terminal PostgreSQL check. The
+fix-forward below keeps the nonce for an identical canonical proof renewal,
+rotates it for every schema or proof-content change, uses one nonblocking
+READ-COMMITTED MVCC statement as the terminal linearization point, and
+reserves the final 0.5 seconds for the terminal guard using live local elapsed
+time at actual handoff. The shared fleet gate is acquired before that
+five-second ticket is minted, so an unbounded gate wait cannot consume the
+reserve. This changes neither the five-second maximum age nor any gate,
+service, projection, physical-cluster, or provider-proof predicate.
+
 Historical rollout record: the additive reserved-fill, exact worker-projection, generalized
 non-pool binding, demand, route, executor-termination, provider-independent
 route, durable actuation-intent, supply-aware paid-residual, successor-schema,
@@ -2133,10 +2151,14 @@ specific, so they carry no fixed-value purpose or provider-domain
 discriminator. Each row otherwise carries only proof schema version, one safe
 JSONB object containing the exact `aws` and `kubernetes` summaries, its
 canonical SHA-256, and database-clock `completed_at`. There is no persisted
-generation or expiry: the nonce changes on every insert or refresh, and
-freshness is derived as `completed_at + 5 seconds > clock_timestamp()`.
-Delete/reinsert of the same authority and payload therefore cannot match an
-older ticket.
+generation or expiry. A new authority row or a refresh whose proof schema,
+canonical digest, or JSONB content changed receives a fresh nonce. A refresh of
+the identical canonical proof retains the existing nonce and advances only the
+proof payload/completion fields. Freshness remains derived as
+`completed_at + 5 seconds > clock_timestamp()`. Delete/reinsert of the same
+authority and payload still receives a new nonce and therefore cannot match an
+older ticket; an in-place identical renewal remains the same external fact and
+does not revoke sibling launch references.
 
 The application accepts contexts of at most 1,024 UTF-8 bytes and canonical
 proof JSON of at most 32 KiB with at most 32 nested container levels.
@@ -2168,14 +2190,27 @@ to tag the elected phase rolls back and fails closed. It then
 captures the database-clock proof-start anchor, runs the AWS and Kubernetes
 provider reads concurrently under the same outer deadline, validates the exact
 complete pair, and performs one authority-tuple
-`INSERT ... ON CONFLICT DO UPDATE` with a fresh nonce. It decodes `RETURNING`,
-commits, and physically closes before the receipt can authorize its caller.
+`INSERT ... ON CONFLICT DO UPDATE`. The conflict update retains the incumbent
+nonce only when proof schema, canonical digest, and JSONB payload all exactly
+match; otherwise it installs the newly generated nonce. It decodes
+`RETURNING`, exact-checks the published payload, digest, completion, and
+terminal reserve, commits, and physically closes before the receipt can
+authorize its caller.
 Transaction commit, rollback, connection loss, or process death releases the
 lock atomically; no custom session-lock lifecycle, DBAPI facade,
 prior-generation CAS, or unlock query remains. Receipt waits never consume or
 retain an ordinary API/Serve `QueuePool` slot.
 The provider deadline reserves the final 0.5 seconds of the outer horizon for
-publication and physical session close.
+publication and physical session close. Independently, a receipt may be reused
+or published to a caller only while at least 0.5 seconds remain before its
+five-second expiry. The database read maps completion conservatively to the
+caller's monotonic clock, and the live reserve check runs after payload
+validation, transaction commit/rollback, and physical `NullPool` connection
+close at the actual return boundary. If those steps consumed the reserve, the
+caller re-enters election under its unchanged absolute deadline and never sees
+the near-expiry receipt. That second reserve gives the caller time to enter the
+terminal PostgreSQL guard; the guard still checks the full maximum age and
+fails closed if the reserve was insufficient under actual contention.
 
 The receipt-owned connection path is PostgreSQL-only, `NullPool`, and
 instrumented under the bounded `reserved-fill-reclaim-proof` metric label. It
@@ -2198,8 +2233,8 @@ stops, kills, reaps, and proves absence of the exact handler family before its
 typed `family_drained` result becomes visible. No new warden protocol or
 long-lived execution path is introduced.
 
-A caller that loses its one election attempt never reacquires the lock and
-never joins an exclusive-lock handoff convoy. It waits locally and makes a
+A caller that loses its one election attempt never joins an exclusive-lock
+handoff convoy. It waits locally and makes a
 bounded number of jittered, exponentially spaced `NullPool` receipt reads,
 starting at 400 milliseconds and capped at one second. A
 waiter may spend its remaining outer horizon on a final client-bounded read;
@@ -2211,9 +2246,14 @@ receipt; a prior stale or malformed row may remain but cannot authorize. A lost
 commit acknowledgement may leave either no row or exactly one complete
 canonical row. Partial receipt rows and partial launch authority are impossible,
 and a later invocation may safely read that committed row or reprove it.
-Already-observed
-losers fail closed at their
-original deadline and never re-elect. Because failures are deliberately not
+Already-observed losers fail closed at their original deadline and do not
+re-elect while the elected proof is outstanding. The sole exception is an
+observed completed receipt whose validation or connection-close handoff
+consumed the required terminal reserve; that caller begins a new nonblocking
+election attempt under the same original deadline rather than returning an
+unusable ticket. This cannot create a lock-handoff convoy because the prior
+transaction is physically closed and the new attempt still uses
+`pg_try_advisory_xact_lock`. Because failures are deliberately not
 persisted, a slow contemporaneous handler that has not yet attempted the lock
 may become leader after the failed leader releases it; this is a later
 independent attempt, not a waiter handoff. The existing durable actuation
@@ -2238,22 +2278,27 @@ falling back to an independent provider read.
 Receipt readers conservatively map database age back to local monotonic time by
 adding the full SQL round-trip to the database-reported age. Each caller then
 mints its own exact `ReclaimLaunchAuthorization` carrying the one immutable
-context receipt reference and its conservative completion time. The final
-existing PostgreSQL launch-authority transaction selects and share-locks that
-row by nonce with `FOR SHARE NOWAIT`, requires its exact
-policy/gate/context/schema/digest, derives database-clock age from
-`completed_at`, and revalidates the nested Kubernetes physical UID in the
-terminal SQL authorization immediately before provider I/O. A concurrent
-refresh or delete conflicts with that row lock. If the updater holds the lock
-first, the final guard rejects immediately through `NOWAIT`; if the guard holds
-it first, the proof-engine updater waits only for its 200-millisecond
-statement/lock bound and then rejects. The row lock linearizes only this
-terminal SQL authorization and is released when its transaction ends; it does
-not span the provider effect. The existing shared fleet-gate advisory guard
-does remain held across that effect. A
-policy rotation, gate advance, context mismatch, receipt ABA, expiry,
-deletion, malformed payload, or database loss therefore rejects the launch.
-Distinct context locks remain parallel.
+context receipt reference and its conservative completion time. The terminal
+helper independently rejects a locally stale reference even if an identical
+row has since been renewed. The final PostgreSQL launch-authority transaction
+requires `READ COMMITTED` isolation and performs one ordinary MVCC `SELECT` by
+nonce, with `clock_timestamp()` in that same statement. It requires the exact
+policy/gate/context/schema/digest, database-clock freshness, and nested
+Kubernetes physical UID immediately before provider I/O. A changed refresh or
+delete committed before this statement is visible and rejects the old
+reference. An uncommitted update leaves the prior committed row visible, so a
+passing guard linearizes before that transition. This is the same authority
+ordering the former share lock provided: that lock ended with the terminal
+transaction before provider I/O and therefore never protected the effect, but
+it did make valid identical renewals spuriously fail or time out. The
+nonblocking MVCC read removes that false conflict. An identical committed
+renewal retains the nonce; any changed committed proof rotates it and rejects
+the older reference. The existing shared fleet-gate advisory guard remains
+held across proof minting, terminal validation, and the provider effect. A
+policy rotation, gate advance, context mismatch, changed proof, receipt ABA,
+expiry, deletion, malformed payload, non-READ-COMMITTED transaction, or
+database loss therefore rejects the launch. Distinct context proofs remain
+parallel.
 
 This deliberately reuses completed evidence inside, but never beyond, the
 same five-second horizon already accepted for one launch ticket. It does not
@@ -2318,30 +2363,38 @@ invalidates the prior allocation even when pool topology and capacity policy
 are unchanged.
 
 Provider and Kubernetes reads for activation and claims complete before the
-broker and PostgreSQL row locks are acquired. Launch authorization completes
-before the fleet-wide reclaim guard and before any PostgreSQL transaction or
-row lock; the short-lived typed result is then revalidated by the atomic row
-and generalized binding admission. Reserved fill must carry the
+broker and PostgreSQL row locks are acquired. A terminal launch first holds
+its existing service/association authority, then acquires the shared
+fleet-wide reclaim guard, verifies that exact guard session, and only then
+mints the short-lived launch authorization. It verifies the fleet session
+again after the bounded proof and revalidates the typed result through the
+atomic row and generalized binding admission before provider I/O. Reserved
+fill must carry the
 `RESERVED_FILL/v1` bound-launch profile and exact authorization references. It
 does not carry ordinary defaults or create a second association.
 For built-in Kubernetes reserved fill, every provider-mutation factory call
-acquires the service-owner guard, obtains a fresh deployment-policy ticket,
-then acquires the fleet guard, revalidates exact durable authority, performs
-one bounded mutation, and releases all three before any passive wait. Other
+acquires the service-owner guard, obtains the shared fleet guard, mints a fresh
+deployment-policy ticket, revalidates exact durable authority, performs one
+bounded mutation, and releases all three before any passive wait. Other
 bound profiles and opaque provisioners retain their existing whole-call
-service guard. The deployment policy call receives one absolute five-second
-monotonic deadline and must be cancellation-aware; a result returned after
-that deadline is rejected before any authority lock or mutation. No path
-acquires the per-service guard after the fleet-wide reclaim guard, so the lock
-order remains acyclic. The returned typed authorization is short-lived and
-exact-scope. The
+service guard. The deployment policy call receives a new absolute five-second
+monotonic deadline only after fleet-gate acquisition and must be
+cancellation-aware; a result returned after that deadline is rejected before
+terminal validation or mutation. The canonical launch order is therefore
+service-shared, fleet-shared, context-proof transaction advisory lock, central
+authority row locks, and provider effect. No path acquires the per-service
+guard after the fleet-wide reclaim guard, so the order remains acyclic. The
+fleet guard already requires one dedicated session per active provider effect;
+this order extends that session's lifetime only across the bounded proof and
+adds no third guard session. The returned typed authorization is short-lived
+and exact-scope. The
 claim transaction locks and revalidates the current gate generation and
 identity plus the exact normalized edges, version row, projections, and
 digests before persistence. Allocation publication and replica insertion
 repeat the locked version/digest comparison. At launch, the executor reloads
 the exact committed version projection, verifies the protocol-v2 digest carried
-by the durable fence, and obtains a fresh exact authorization immediately
-before the provider guard. Inside that guard it revalidates the typed
+by the durable fence, and enters the service and fleet provider guards before
+obtaining a fresh exact authorization. Inside those guards it revalidates the typed
 authorization, durable launch fence, current claim edge, current version row,
 and generation-bound gate identity before yielding to provider mutation. A
 restarted executor with a missing plugin, a differently identified bundle, a
@@ -3808,17 +3861,27 @@ durable retry, waiter timeout without leader cancellation, semantic cache
 mismatch, malformed exact-authority-row repair, delete/reinsert ABA, scope
 mismatch despite a valid context proof, and final-guard rejection of missing,
 expired, malformed, wrong-nonce, wrong-digest, wrong-gate, wrong-identity,
-or wrong-context rows. A reverse row-lock race holds an update lock first and
-proves the final guard uses `FOR SHARE NOWAIT`, fails closed promptly without
-running the downstream provider effect, then succeeds after the conflicting
-transaction ends:
+or wrong-context rows. It also proves that an identical expired renewal
+preserves the nonce and an already minted reference, a receipt inside the final
+0.5-second reserve is refreshed before return, slow payload validation and
+physical connection close cannot consume that reserve at handoff, and any
+proof-content change rotates the nonce and rejects the older reference. The
+terminal test requires READ COMMITTED, rejects an independently stale local
+reference, proves an uncommitted identical update neither blocks nor rejects a
+valid MVCC guard, and proves a changed commit is visible to the next statement
+and rejects the old nonce. A staggered 90-launch wave runs for ten seconds,
+crosses at least two identical renewals, retains one nonce, and admits every
+terminal guard. Backend tests hold a delayed fleet-gate acquisition open and
+prove no policy deadline/reference is minted until the gate is entered, then
+verify the gate session both after proof and after provider I/O:
 
 ```bash
 pytest -n 0 -q \
   tests/unit_tests/test_reserved_fill_reclaim_proofs.py \
   tests/unit_tests/test_boltz_reserved_fill_reclaim_policy.py \
   -k 'multiprocess_launches_share_fresh_provider_receipt or \
-      expired_receipt_refreshes_once or \
+      expired_identical_receipt_refreshes_once or \
+      staggered_launches_span_two_identical_renewals or \
       failed_provider_proof_is_not_persisted or \
       lost_advisory_session_cannot_publish or \
       final_guard_rejects_stale_or_mismatched_receipt or \
@@ -3846,8 +3909,14 @@ sessions, and zero advisory waiters. Both waves produced one AWS call, one
 Kubernetes call, one row, one nonce, matching returned references and terminal
 guards, and zero surviving proof/worker/counter sessions. Cross-pod production
 qualification remains a rollout gate and is not inferred from this local
-process evidence. Earlier diagnostic measurement of the narrow 90-worker
-topology found 3,553,361 KiB aggregate worker PSS and 3,818,638 KiB including
+process evidence. Read-only production PostgreSQL inspection on 2026-08-20
+reported `max_connections = 844`, three superuser-reserved slots, and 40
+current connections. A conservative 90-launch overlap of 90 service sessions,
+90 fleet sessions, the measured 71 proof-session peak, and that 40-session
+baseline is 291 total, leaving 550 non-reserved slots; extending the
+already-required fleet session across the bounded proof is therefore within
+the present production budget. Earlier diagnostic measurement of the narrow
+90-worker topology found 3,553,361 KiB aggregate worker PSS and 3,818,638 KiB including
 pytest and the manager, but the shared local pod's historical cgroup peak makes
 that evidence ineligible to qualify a 16-GiB runner or claim production worker
 RSS. The dedicated fresh CI job sets a 12-GiB absolute cgroup limit; the

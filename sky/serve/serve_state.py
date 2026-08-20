@@ -593,7 +593,11 @@ def reserved_fill_reclaim_gate_authority_guard(
     PostgreSQL session around its claim reread and CAS. Losing that session
     therefore drops both authorities and makes the transaction on it fail,
     instead of letting a replacement broker writer race activation.
-    Deployment-policy reads must happen before entering this guard.
+    Terminal launch callers acquire the shared side before minting their
+    short-lived deployment-policy ticket, then revalidate this exact lock
+    session and the durable fence before provider I/O. This extends the
+    already-required fleet session by at most the bounded policy proof while
+    preventing an unbounded gate wait from aging the ticket.
     """
     engine = _db_manager.get_engine()
     if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
