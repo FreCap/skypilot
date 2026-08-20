@@ -17,11 +17,11 @@ This change supplies the narrowly fenced reconciliation needed to settle those
 nine rows; it is not yet merged or deployed. Platform PR #8652 is merged and
 does not pin the SkyPilot runtime.
 
-A projected-worker runtime-readiness fix-forward is implemented locally on
-`fix/serve-projected-worker-runtime-readiness`; it is not merged, deployed, or
-production-proven. The candidate strengthens only canonical projection
-protocol v4 and adds no schema, EFS/RWX, KubeRay, Terraform, Terragrunt, or
-platform-pin dependency.
+A projected-worker runtime-readiness fix-forward is open as PR #1618; it is not
+merged, deployed, or production-proven. Draft cleanup PR #1619 is stacked on
+it and removes the rollout-only v1/v2/v3 projection readers after the production
+gate. The candidate strengthens only canonical projection protocol v4 and adds
+no schema, EFS/RWX, KubeRay, Terraform, Terragrunt, or platform-pin dependency.
 
 ## Convergence goal and remaining work
 
@@ -2527,7 +2527,11 @@ inherited from an image or writable layer both before and after the trusted
 server-owned `runcmd`, then starts the bootstrap producers. It atomically
 publishes the UID marker only after the asynchronous SSH, environment, and
 SkyPilot installation steps succeed and the generated Ray head start or worker
-join returns successfully. It then connects to the final local sshd port
+join returns successfully. The Ray head initialization loop captures both
+output and exit status under fail-fast shell execution, retries only the
+explicit `No cluster status.` initialization response, and propagates every
+other nonzero `ray status` result; a failed status pipeline cannot become a
+successful marker producer. It then connects to the final local sshd port
 (including the dynamically selected host-network port) and requires an SSH
 banner before publication. The startup probe runs every two seconds with 900
 failures, bounding this in-container base bootstrap to 30 minutes after
@@ -3912,6 +3916,9 @@ following before merge:
   command, args, `postStart`, and lifecycle mutations cannot retain the
   template-owned producer digest; and a real Kubernetes client `V1PodSpec`
   round-trips the same exact producer and readiness contract;
+- the Ray head status wait retries a nonzero response only when it carries the
+  explicit not-yet-initialized condition and propagates every other nonzero
+  response even under `set -e`;
 - historical v1/v2/v3 projections and an ordinary generic Kubernetes render do
   not receive the marker or probes;
 - a Running/not-Ready exact UID remains in the bounded passive wait, a Ready
@@ -4642,6 +4649,11 @@ legacy activation.
   runtime-readiness fix-forward, then prove exact-UID Ready in east and PHX and
   prove a failed base bootstrap never publishes provider success. This gate has
   no schema, EFS/RWX, KubeRay, Terraform, Terragrunt, or platform-pin change.
+- [x] Open cross-linked draft projection cleanup PR #1619. Keep it draft until
+  a complete protocol-v4-capable cohort, retained-row and in-flight/provider
+  evidence, east/PHX/generic/no-paid proofs, and the full 180-second
+  stale-authority/quiescence horizon are complete; then remove the v1/v2/v3
+  projection readers through that stacked cleanup.
 - [ ] Open the cross-linked Serve056 cleanup and, only after a complete capable
   cohort, zero nullable owner tuples, no old writers, backups, and the full
   stale/HA production horizon, make service owner columns `NOT NULL` and remove

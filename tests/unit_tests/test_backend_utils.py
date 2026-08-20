@@ -996,24 +996,24 @@ def test_host_network_probe_is_only_builtin_render_delta(
         current_render.replace(canonical_root, b'<TMP>')).hexdigest()
     expected_hashes = {
         'kubernetes-host-network-false': (
-            '76166866c2408054bcb2786da0696e1f6583798416aefdd8b130fa180b77ec79',
-            '96a3e08dffb31b73cdc85e6737b01129fb77c028e090193f56cf4dc538c28a0e',
+            '388196c00e5031bdee6d0d54545ffdc0d34a3e8d7415012b5572809cd0fa4ba5',
+            '37ecd33134e545581ace328fe4c106d04091c958cd7956cacde1cc2e0f2ed680',
         ),
         'kubernetes-host-network-true': (
-            'bd8e7645de9dbb93a4969c2567706db2f042da39557e28172188299f9fe4abe5',
-            'd85e40332956c3a0d4b0a0f4029542d844fdaaca04a9e6fbfdad341dff4ea6e8',
+            'e7e19f3fd1690e5dedfe94fdbf69282a144e94590f0be76eb82075a9475ada66',
+            'b4aa2a197fcb685a88383185644e4cbdb30d882506f56f90cc7177d358b86b9c',
         ),
         'kubernetes-oci-roce': (
-            '3b9095baa1f2b7527257aa9c35dc32180a1da73ead12ab4a1d547c4714fcc337',
-            '875ca4f82941cb886b2f40009a84601be77ee2afb777754ebb4131e330749711',
+            'b078ee6bbe839458e18e0b79c044cba3126d1b803605b4b0b087fbb3b2ed20cc',
+            'f64b78f407cc1e35d2cf1201f81657bbf902a84376c5aefcf38744e5ab44ce64',
         ),
         'ssh-host-network-false': (
-            'd941a6b8ca41be28c9bef1b77ff5791d47b40961f0c3f8ae5da3173dc2710e2c',
-            '893f010283e009b3197eb00602089bf259c5f5fd2f03f2a2c184778e76c0e9eb',
+            '2407f33438cd47f42d8c76e30d1197ed67950c9e51a34bd19049de457188f4ee',
+            '433d1e5c2bc88e309d15bda6ba70b5df2fa58daf07dd34d029a57c3ee5d2281f',
         ),
         'ssh-host-network-true': (
-            '7bfddc5a3d8699d2c5bda12fbb15a9997a5880dd792d6717be180c12f93ebc9f',
-            '562ea0fd5e67c87b99de45c0c94b96e7cec2e4dae9e929f55b7ecfeee19afea8',
+            '48945419d3f9ba8f70d9c2637079b743e4af594cfa5478f3611a1eb738f55b04',
+            '62caad95d52a724ab821702cd6b9dd52590f63a3f732395b3c58e326fd00c166',
         ),
     }
     assert (legacy_hash, current_hash) == expected_hashes[scenario]
