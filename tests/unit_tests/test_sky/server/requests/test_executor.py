@@ -22,6 +22,7 @@ from sky import models
 from sky import skypilot_config
 from sky.container_images import errors as container_image_errors
 from sky.serve import constants as serve_constants
+from sky.serve import ordinary_launch_binding
 from sky.server import config as server_config
 from sky.server import constants as server_constants
 from sky.server import versions
@@ -3023,6 +3024,96 @@ def test_bound_override_resolves_current_user_without_upserting_queued_name(
     assert body.env_vars[constants.USER_ENV_VAR] == 'old-name'
     get_user.assert_called_once_with('client-user-id')
     upsert.assert_not_called()
+
+
+def _bound_non_pool_override_body() -> payloads.LaunchBody:
+    return payloads.LaunchBody(
+        task='name: bound-non-pool\nresources:\n  cpus: 1\n',
+        cluster_name='bound-non-pool-1',
+        is_launched_by_sky_serve_controller=True,
+        env_vars={
+            constants.USER_ID_ENV_VAR: 'service-owner-id',
+            constants.USER_ENV_VAR: 'service-owner@example.com',
+        },
+        override_skypilot_config={
+            'active_workspace': 'default',
+        },
+        extra_launch_context={
+            ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY:
+                ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION,
+        })
+
+
+def test_reserved_fill_db_authority_skips_only_owner_workspace_membership(
+        stub_override_request_env_deps, monkeypatch):
+    body = _bound_non_pool_override_body()
+    owner = models.User(id='service-owner-id', name='current-owner@example.com')
+    get_user = mock.Mock(return_value=owner)
+    authorize_workspace = mock.Mock(return_value=True)
+    permission_check = mock.Mock(
+        side_effect=AssertionError('membership check must be bypassed'))
+    reload_request = mock.Mock()
+    set_event_workspace = mock.Mock(return_value=True)
+    monkeypatch.setattr(executor.global_user_state, 'get_user', get_user)
+    monkeypatch.setattr(executor.ordinary_launch_binding,
+                        'reserved_fill_binding_authorizes_workspace',
+                        authorize_workspace)
+    monkeypatch.setattr(executor.workspaces_core,
+                        'reject_request_for_unauthorized_workspace',
+                        permission_check)
+    monkeypatch.setattr(executor.server_common, 'reload_for_new_request',
+                        reload_request)
+    monkeypatch.setattr(executor.api_requests, 'set_event_workspace',
+                        set_event_workspace)
+
+    with executor.override_request_env_and_config(
+            body,
+            request_id='reserved-fill-request',
+            request_name='sky.launch',
+            require_existing_user=False):
+        assert os.environ[constants.USER_ID_ENV_VAR] == owner.id
+        assert os.environ[constants.USER_ENV_VAR] == owner.name
+        assert skypilot_config.get_active_workspace() == 'default'
+
+    assert body.env_vars[constants.USER_ENV_VAR] == (
+        'service-owner@example.com')
+    authorize_workspace.assert_called_once_with('reserved-fill-request',
+                                                owner.id, 'default')
+    permission_check.assert_not_called()
+    assert reload_request.call_args.kwargs['user'] == owner
+    set_event_workspace.assert_called_once_with('reserved-fill-request',
+                                                'default')
+    get_user.assert_called_once_with(owner.id)
+
+
+def test_non_fill_bound_launch_does_not_bypass_owner_workspace_permission(
+        stub_override_request_env_deps, monkeypatch):
+    body = _bound_non_pool_override_body()
+    owner = models.User(id='service-owner-id', name='current-owner@example.com')
+    get_user = mock.Mock(return_value=owner)
+    authorize_workspace = mock.Mock(return_value=False)
+    permission_check = mock.Mock(
+        side_effect=exceptions.PermissionDeniedError('denied'))
+    monkeypatch.setattr(executor.global_user_state, 'get_user', get_user)
+    monkeypatch.setattr(executor.ordinary_launch_binding,
+                        'reserved_fill_binding_authorizes_workspace',
+                        authorize_workspace)
+    monkeypatch.setattr(executor.workspaces_core,
+                        'reject_request_for_unauthorized_workspace',
+                        permission_check)
+
+    with pytest.raises(exceptions.PermissionDeniedError, match='denied'):
+        with executor.override_request_env_and_config(
+                body,
+                request_id='ordinary-zero-cost-request',
+                request_name='sky.launch',
+                require_existing_user=True):
+            pytest.fail('permission denial must stop execution')
+
+    authorize_workspace.assert_called_once_with('ordinary-zero-cost-request',
+                                                owner.id, 'default')
+    permission_check.assert_called_once_with(owner)
+    get_user.assert_called_once_with(owner.id)
 
 
 def test_ordinary_override_preserves_legacy_user_metadata_upsert(

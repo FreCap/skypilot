@@ -41,6 +41,7 @@ from sky import global_user_state
 from sky import models
 from sky import sky_logging
 from sky import skypilot_config
+from sky.adaptors import common as adaptors_common
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.events import api_models as event_api_models
 from sky.metrics import utils as metrics_utils
@@ -83,6 +84,9 @@ if typing.TYPE_CHECKING:
 
 P = ParamSpec('P')
 logger = sky_logging.init_logger(__name__)
+
+ordinary_launch_binding = adaptors_common.LazyImport(
+    'sky.serve.ordinary_launch_binding')
 
 # On macOS, the default start method for multiprocessing is 'fork', which
 # can cause issues with certain types of resources, including those used in
@@ -1169,6 +1173,29 @@ def _resolve_request_execution_user(
     return current
 
 
+def _reserved_fill_authorized_workspace(
+    request_body: payloads.RequestBody,
+    request_id: str,
+) -> str | None:
+    """Return the exact DB-authorized workspace for internal reserved fill."""
+    if (not isinstance(request_body, payloads.LaunchBody) or
+            not request_body.is_launched_by_sky_serve_controller or
+            request_body.is_launched_by_jobs_controller):
+        return None
+    owner_user_id = request_body.env_vars.get(constants.USER_ID_ENV_VAR)
+    override = request_body.override_skypilot_config
+    workspace = (override.get('active_workspace')
+                 if isinstance(override, dict) else None)
+    if (not isinstance(owner_user_id, str) or not owner_user_id or
+            not isinstance(workspace, str) or not workspace or
+            request_body.override_skypilot_config_path is not None):
+        return None
+    if not ordinary_launch_binding.reserved_fill_binding_authorizes_workspace(
+            request_id, owner_user_id, workspace):
+        return None
+    return workspace
+
+
 @contextlib.contextmanager
 def override_request_env_and_config(
         request_body: payloads.RequestBody,
@@ -1188,8 +1215,12 @@ def override_request_env_and_config(
             kubernetes_adaptor.IN_CLUSTER_CONTEXT_NAME_ENV_VAR, None)
         payloads.remove_server_owned_env_vars(request_body.env_vars)
         os.environ.update(request_body.env_vars)
+        reserved_fill_workspace = _reserved_fill_authorized_workspace(
+            request_body, request_id)
         user = _resolve_request_execution_user(
-            request_body, require_existing_user=require_existing_user)
+            request_body,
+            require_existing_user=(require_existing_user or
+                                   reserved_fill_workspace is not None))
         # Keep the persisted body immutable for exact retries/digest hydration,
         # but execute under the current display name for its immutable user ID.
         user_name = user.name
@@ -1261,16 +1292,18 @@ def override_request_env_and_config(
                         logger.info(f'Using workspace {resolution.workspace!r} '
                                     f'(source: {resolution.source}).')
                 with workspace_ctx:
-                    try:
-                        # Reject requests that the user does not have
-                        # permission to access.
-                        workspaces_core.reject_request_for_unauthorized_workspace(  # pylint: disable=line-too-long
-                            user)
-                    except exceptions.PermissionDeniedError as e:
-                        logger.debug(
-                            f'{request_id} permission denied to workspace: '
-                            f'{skypilot_config.get_active_workspace()}: {e}')
-                        raise e
+                    active_workspace = skypilot_config.get_active_workspace()
+                    if reserved_fill_workspace != active_workspace:
+                        try:
+                            # Reject requests that the user does not have
+                            # permission to access.
+                            workspaces_core.reject_request_for_unauthorized_workspace(  # pylint: disable=line-too-long
+                                user)
+                        except exceptions.PermissionDeniedError as e:
+                            logger.debug(
+                                f'{request_id} permission denied to workspace: '
+                                f'{active_workspace}: {e}')
+                            raise e
                     if event_models.request_kind(request_name) is not None:
                         if not api_requests.set_event_workspace(
                                 request_id,

@@ -31,6 +31,18 @@ _RECORD_ID = uuid.UUID('22222222-2222-4222-8222-222222222222')
 _CONTROLLER_ID = uuid.UUID('33333333-3333-4333-8333-333333333333')
 
 
+def test_reserved_fill_workspace_authority_fails_closed_before_serve055(
+        monkeypatch) -> None:
+    engine = types.SimpleNamespace(dialect=types.SimpleNamespace(
+        name='postgresql'))
+    monkeypatch.setattr(serve_state, 'get_database_engine', lambda: engine)
+    monkeypatch.setattr(migration_utils, 'get_current_alembic_revision',
+                        lambda *_args, **_kwargs: '054')
+
+    assert not binding.reserved_fill_binding_authorizes_workspace(
+        'request-id', 'owner-id', 'workspace-a')
+
+
 def _profile_info() -> replica_managers.ReplicaInfo:
     info = replica_managers.ReplicaInfo(replica_id=3,
                                         cluster_name='svc-3',

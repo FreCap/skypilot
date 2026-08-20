@@ -900,6 +900,32 @@ def test_outer_commit_publishes_sequences_and_hydrates_exact_request(
                 input_digest)).scalar_one()
         assert ordinary_launch_binding.canonical_launch_digest(
             body) == association_digest
+    assert ordinary_launch_binding.reserved_fill_binding_authorizes_workspace(
+        receipt.request_id, _CREATOR_ID, _WORKSPACE)
+    assert not ordinary_launch_binding.reserved_fill_binding_authorizes_workspace(
+        receipt.request_id, 'different-owner', _WORKSPACE)
+    assert not ordinary_launch_binding.reserved_fill_binding_authorizes_workspace(
+        receipt.request_id, _CREATOR_ID, 'different-workspace')
+
+
+def test_workspace_authority_requires_durable_intent(atomic_database) -> None:
+    spec = _atomic_spec(atomic_database)
+    _, receipt = reserved_fill_admission._transaction(spec,
+                                                      7,
+                                                      require_existing=False)
+    assert ordinary_launch_binding.reserved_fill_binding_authorizes_workspace(
+        receipt.request_id, _CREATOR_ID, _WORKSPACE)
+
+    with atomic_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == _SERVICE).values(
+                    reserved_fill_actuation_mode=(
+                        zero_cost_actuation.ActuationMode.DIRECT_REPLICA.value
+                    )))
+
+    assert not ordinary_launch_binding.reserved_fill_binding_authorizes_workspace(
+        receipt.request_id, _CREATOR_ID, _WORKSPACE)
 
 
 def test_public_admit_uses_real_broker_and_postgres_transaction(
@@ -1440,15 +1466,20 @@ def test_user_rename_after_commit_executes_as_current_without_digest_rewrite(
                         atomic_database)
     monkeypatch.setattr(executor.server_common, 'reload_for_new_request',
                         reload_request)
-    monkeypatch.setattr(executor.skypilot_config, 'override_skypilot_config',
-                        lambda *_args, **_kwargs: contextlib.nullcontext())
+    monkeypatch.setattr(
+        executor.skypilot_config, 'override_skypilot_config',
+        lambda *_args, **_kwargs: executor.skypilot_config.
+        local_active_workspace_ctx(_WORKSPACE))
     monkeypatch.setattr(executor, '_should_apply_workspace_resolver',
                         lambda _version: False)
+    permission_check = mock.Mock(
+        side_effect=AssertionError('membership check must be bypassed'))
+    set_event_workspace = mock.Mock(return_value=True)
     monkeypatch.setattr(executor.workspaces_core,
                         'reject_request_for_unauthorized_workspace',
-                        lambda _user: None)
+                        permission_check)
     monkeypatch.setattr(executor.api_requests, 'set_event_workspace',
-                        lambda *_args: True)
+                        set_event_workspace)
 
     assert isinstance(body, payloads.LaunchBody)
     assert body.env_vars[skylet_constants.USER_ENV_VAR] == _CREATOR_NAME
@@ -1461,6 +1492,9 @@ def test_user_rename_after_commit_executes_as_current_without_digest_rewrite(
         effective_user = reload_request.call_args.kwargs['user']
         assert effective_user.id == _CREATOR_ID
         assert effective_user.name == renamed
+
+    permission_check.assert_not_called()
+    set_event_workspace.assert_called_once_with(receipt.request_id, _WORKSPACE)
 
     with atomic_database.connect() as connection:
         assert connection.execute(

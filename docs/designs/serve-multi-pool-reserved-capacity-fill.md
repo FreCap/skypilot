@@ -1021,7 +1021,22 @@ The feature physically removes protocol-v2 direct/non-atomic persistence and
 rejects `RESERVED_FILL` at the controller HTTP launch surface; the generic HTTP
 surface remains canonical for other profiles such as `SYSTEM_OOM_RECOVERY`.
 There is no reserved-fill system-identity or RWX/EFS correctness branch left
-for a cleanup to remove. The required stacked removal branch is planned as
+for a cleanup to remove. The immutable request body, digest, environment, and
+association continue to carry the durable service owner. Execution may skip
+only that owner's mutable workspace-membership check when one PostgreSQL read,
+keyed by the request ID's unique current association, proves all ordinary
+current-binding fences plus the canonical
+`RESERVED_FILL/RESERVED_FILL_ALLOCATION` profile, association tenant equal to
+the current service owner, association/frozen/current workspace equality, and
+current `DURABLE_INTENT` actuation. The executor then resolves the same owner
+as an existing user and rechecks that the applied workspace is exactly the
+database-authorized frozen workspace; its environment, reload identity, event
+actor, and event workspace remain that owner tuple. Stale, malformed, legacy,
+ordinary, or caller-crafted requests fall through to ordinary owner RBAC, and
+the final provider guard still revalidates the binding before provider I/O.
+The request body is only a query-scope hint and never authorization authority.
+
+The required stacked removal branch is planned as
 `fix/serve-atomic-fill-admission-cleanup`, but has not yet been authored or
 opened; a cross-linked draft is a feature-merge gate, not completed work. Its
 only steady-state change is Serve056: after the transition gates below, make
@@ -3158,7 +3173,7 @@ either case.
 | 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed dark in revision 431 / release 1.1.1338: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Activation remains gated by 2a.3, 2a.4, and a successful full-fleet re-attestation. |
 | 2f | Promoted capacity-authority controller takeover | The fix-forward implementation is merged in PR #1562: the existing owner-transfer transaction preserves both one-way epochs, rebinds demand and zero-cost capability together, invalidates pre-row predecessor intents, and leaves route/report admission cold until fresh replacement evidence. No schema, chart, provider, or platform change is required. Deployment and child/Pod takeover qualification remain activation prerequisites. |
 | 2g | Production full reserved backfill | Platform PR #8652 is merged, but its merged deployment workflow has not successfully completed and version 64 is not elected or activated at the last observation. A pre-merge attempt durably stored an equivalent version 64 after API acceptance and then failed before election; fresh live readback is required. The PR changes only the existing service policy and its validator/docs: production uses `utilization_gate: false`; test explicitly retains `true`. Complete the live workflow only after 2e/2f activation, changing one boolean relative to the clean demand-gated successor and preserving its known-good model image and immutable worker projections. |
-| 2h | Atomic reserved-fill replica/request admission | Implementation candidate on `fix/serve-atomic-fill-admission`; production gates remain open. It uses the existing durable intent, generalized association, request/queue/pin, and reducer. One atomic-admission module owns the root PostgreSQL transaction and savepoint; the manager only prepares immutable server-local input before it and starts the returned request reducer immediately after commit. Serve055 adds the owner audit tuple, user FK, and retained-row one-shot transition. The durable body/digest uses the immutable audit name; execution resolves current `users.name` by tenant ID without an upsert. This feature already removes protocol-v2 direct/non-atomic admission and reserved-fill HTTP/system-identity/RWX correctness branches; it allocates no table or infrastructure. |
+| 2h | Atomic reserved-fill replica/request admission | Implementation candidate on `fix/serve-atomic-fill-admission`; production gates remain open. It uses the existing durable intent, generalized association, request/queue/pin, and reducer. One atomic-admission module owns the root PostgreSQL transaction and savepoint; the manager only prepares immutable server-local input before it and starts the returned request reducer immediately after commit. Serve055 adds the owner audit tuple, user FK, and retained-row one-shot transition. The durable body/digest uses the immutable audit name; execution resolves current `users.name` by tenant ID without an upsert. A request-ID-keyed PostgreSQL proof permits only current atomic reserved fill to bypass the owner's mutable workspace-membership check while retaining owner identity and all final provider fences. This feature already removes protocol-v2 direct/non-atomic admission and reserved-fill HTTP/system-identity/RWX correctness branches; it allocates no table or infrastructure. |
 | 3 | Stacked Serve055 transition cleanup after the production horizon | The required but not-yet-authored `fix/serve-atomic-fill-admission-cleanup` branch adds Serve056 `NOT NULL` owner columns and removes only the application one-shot `NULL` attestation branch, the schema-derived temporary global user-deletion guard, and transition-only observability/tests. It retains or atomically simplifies the permanent database owner-immutability trigger. Its draft PR must be cross-linked before feature merge and remains blocked on a complete capable cohort, zero `NULL` tuples, no old writers, backups, and the complete stale/HA production horizon. Closed PRs #1506/#1510 are not revived; Serve054 belongs only to the provider-proof receipt. |
 
 Durable acceptance atomically binds rows to the existing asynchronous launch

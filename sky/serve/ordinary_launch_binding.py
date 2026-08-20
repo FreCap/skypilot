@@ -3447,6 +3447,14 @@ def _serve042_supported(engine: sqlalchemy.engine.Engine) -> bool:
     return revision is not None and int(revision) >= 42
 
 
+def _serve055_supported(engine: sqlalchemy.engine.Engine) -> bool:
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return False
+    revision = migration_utils.get_current_alembic_revision(
+        engine, migration_utils.SERVE_DB_NAME)
+    return revision is not None and int(revision) >= 55
+
+
 def binding_mode(service_name: str) -> BindingMode | None:
     """Return the durable service cutover mode, or None before Serve042."""
     service_name = _nonempty(service_name, 'service_name')
@@ -3579,25 +3587,47 @@ def list_provider_reconciliation_contexts(
     return contexts
 
 
-def binding_allows_request(association_id: str, request_id: str) -> bool:
+def _binding_allows_request(
+    association_id: str | None,
+    request_id: str,
+    *,
+    reserved_fill_workspace_authority: tuple[str, str] | None = None,
+) -> bool:
     """Conservative non-locking pre-claim qualification.
 
     This read can only reject queue work early.  It never grants provider
     authority; the later shared-guard transaction locks and revalidates the
     complete request/Serve tuple.
     """
+    tenant_scope: str | None = None
+    service_workspace: str | None = None
     try:
-        association_uuid = _canonical_uuid(association_id, 'association_id')
+        association_uuid = (None if association_id is None else _canonical_uuid(
+            association_id, 'association_id'))
         request_id = _nonempty(request_id, 'request_id')
+        if reserved_fill_workspace_authority is not None:
+            tenant_scope = _nonempty(reserved_fill_workspace_authority[0],
+                                     'tenant_scope')
+            service_workspace = _nonempty(reserved_fill_workspace_authority[1],
+                                          'service_workspace')
     except ValueError:
         return False
     engine = serve_state.get_database_engine()
-    if not _serve042_supported(engine):
+    if reserved_fill_workspace_authority is not None:
+        if not _serve055_supported(engine):
+            return False
+    elif not _serve042_supported(engine):
         return False
     association = ordinary_launch_associations_table
     service = serve_state_schema.services_table
     replica = serve_state_schema.replicas_table
     lifecycle = serve_state_schema.service_lifecycle_fences_table
+    association_predicates = ([
+        association.c.request_id == request_id
+    ] if association_uuid is None else [
+        association.c.association_id == association_uuid,
+        association.c.request_id == request_id,
+    ])
     statement = sqlalchemy.select(
         association,
         service.c.hash.label('_current_service_hash'),
@@ -3634,9 +3664,13 @@ def binding_allows_request(association_id: str, request_id: str) -> bool:
             sqlalchemy.and_(
                 replica.c.service_name == association.c.service_name,
                 replica.c.replica_id == association.c.replica_id)).where(
-                    association.c.association_id == association_uuid,
-                    association.c.request_id == request_id,
+                    *association_predicates,
                     association.c.resolution == Resolution.BOUND.value)
+    if reserved_fill_workspace_authority is not None:
+        statement = statement.add_columns(
+            service.c.owner_user_id.label('_current_owner_user_id'),
+            service.c.reserved_fill_actuation_mode.label(
+                '_current_reserved_fill_actuation_mode'))
     with engine.connect() as connection:
         row = connection.execute(statement).mappings().one_or_none()
         elected_version = (None if row is None else
@@ -3670,8 +3704,11 @@ def binding_allows_request(association_id: str, request_id: str) -> bool:
          row['_current_non_pool_cohort'] == row['capability_cohort_epoch'] and
          row['_current_non_pool_receipt'] == row['receipt_protocol_version'] ==
          NON_POOL_RECEIPT_PROTOCOL_VERSION))
-    return bool(
-        generic_matches and row['_replica_pointer'] == association_uuid and
+    expected_association_id = (row['association_id'] if association_uuid is None
+                               else association_uuid)
+    authorized = bool(
+        generic_matches and
+        row['_replica_pointer'] == expected_association_id and
         _replica_snapshot_matches_association(
             replica_snapshot, row, require_launch_authorized=True) and
         elected_version == row['service_version'] and
@@ -3685,6 +3722,41 @@ def binding_allows_request(association_id: str, request_id: str) -> bool:
         row['_current_incarnation'] == row['owner_controller_incarnation'] and
         row['_current_owner_epoch'] == row['owner_controller_epoch'] and status
         not in serve_statuses.ServiceStatus.replica_launch_blocking_statuses())
+    if not authorized or reserved_fill_workspace_authority is None:
+        return authorized
+    assert tenant_scope is not None
+    assert service_workspace is not None
+    try:
+        profile = _association_profile(row)
+    except OrdinaryLaunchBindingConflict:
+        return False
+    return bool(profile is not None and
+                profile.kind is NonPoolLaunchProfileKind.RESERVED_FILL and
+                profile.authorization_kind
+                is NonPoolLaunchAuthorizationKind.RESERVED_FILL_ALLOCATION and
+                row['tenant_scope'] == tenant_scope and
+                row['_current_owner_user_id'] == tenant_scope and
+                row['_current_reserved_fill_actuation_mode']
+                == zero_cost_actuation.ActuationMode.DURABLE_INTENT.value and
+                row['service_workspace'] == service_workspace and
+                row['_current_workspace'] == service_workspace)
+
+
+def binding_allows_request(association_id: str, request_id: str) -> bool:
+    """Conservative non-locking pre-claim qualification."""
+    return _binding_allows_request(association_id, request_id)
+
+
+def reserved_fill_binding_authorizes_workspace(
+    request_id: str,
+    tenant_scope: str,
+    service_workspace: str,
+) -> bool:
+    """Authorize one internal fill against its current durable owner tuple."""
+    return _binding_allows_request(
+        None,
+        request_id,
+        reserved_fill_workspace_authority=(tenant_scope, service_workspace))
 
 
 def _lock_effect_rows(
