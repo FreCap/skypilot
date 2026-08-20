@@ -287,7 +287,7 @@ def _gate(*,
         generation=0)
 
 
-def _install_gate(monkeypatch, gate) -> None:
+def _install_gate(monkeypatch, gate, *, claim_generation: int = 7) -> None:
     repository = types.SimpleNamespace(read_reconciliation_gate=mock.Mock(
         return_value=gate))
     monkeypatch.setattr(pool_capacity_observation,
@@ -328,7 +328,7 @@ def _install_gate(monkeypatch, gate) -> None:
                                     physical_cluster_uid='physical-uid')
     sequenced_rows = [
         {
-            'claim_generation': 7,
+            'claim_generation': claim_generation,
         },
         {
             'hash': 'incarnation-a',
@@ -342,7 +342,7 @@ def _install_gate(monkeypatch, gate) -> None:
             'claim_set_state':
                 serve_state.RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2,
             'service_version': 3,
-            'generation': 7,
+            'generation': claim_generation,
             'edge_count': 1,
         },
         [{
@@ -350,7 +350,7 @@ def _install_gate(monkeypatch, gate) -> None:
             'access_context': 'phx-context',
             'physical_cluster_uid': 'physical-uid',
             'gpus_per_replica': 1,
-            'service_generation': 7,
+            'service_generation': claim_generation,
             'accelerator_names': ['h200'],
             'worker_projection_sha256_by_accelerator': {
                 'h200': _WORKER_PROJECTION_DIGEST,
@@ -359,6 +359,7 @@ def _install_gate(monkeypatch, gate) -> None:
     ]
 
     class _Result:
+        """Minimal SQLAlchemy result stub for the authority snapshot."""
 
         def __init__(self, value):
             self._value = value
@@ -375,6 +376,7 @@ def _install_gate(monkeypatch, gate) -> None:
             return self._value
 
     class _Connection:
+        """Ordered row source for the authority snapshot."""
 
         def __init__(self):
             self._rows = [authority]
@@ -392,6 +394,30 @@ def _install_gate(monkeypatch, gate) -> None:
     engine = types.SimpleNamespace(
         dialect=types.SimpleNamespace(name='postgresql'), begin=_begin)
     monkeypatch.setattr(serve_state._db_manager, 'get_engine', lambda: engine)
+
+
+@pytest.mark.parametrize('committed', [True, False])
+def test_new_claim_generation_retains_only_exact_committed_intent(
+        monkeypatch, committed):
+    context = _launch_context()
+    snapshot = _launch_snapshot(context)
+    intent_match = mock.Mock(return_value=committed)
+    monkeypatch.setattr(serve_state.zero_cost_actuation,
+                        'committed_intent_matches_replica_in_connection',
+                        intent_match)
+    _install_gate(monkeypatch, _gate(sequenced=True), claim_generation=8)
+
+    holds = serve_state.reserved_fill_reclaim_launch_authority_holds(
+        _scope(context), _launch_authorization(_scope(context)), context,
+        snapshot)
+
+    assert holds is committed
+    intent_match.assert_called_once()
+    assert intent_match.call_args.kwargs == {
+        'service_name': 'svc',
+        'service_hash': 'incarnation-a',
+        'replica_info': snapshot.durable_replica_info,
+    }
 
 
 class _Policy(reclaim.ReservedFillReclaimPolicy):

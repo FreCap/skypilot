@@ -590,6 +590,44 @@ def test_replica_and_intent_commit_in_one_transaction(
     assert row['replica_record_id'] == record_id
 
 
+def test_committed_intent_exactly_owns_replica(actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1)
+    _grant_plan(repository, plan, max_capacity=1)
+    lease = repository.lease_next(service_name='svc',
+                                  pool_key=plan.intents[0].pool_key,
+                                  owner=uuid.uuid4(),
+                                  lease_seconds=30)
+    assert lease is not None
+    info = _replica_for_intent(lease.intent, 1)
+    record_id = uuid.UUID(info.replica_record_id)
+    with actuation_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                **serve_state._replica_row_values('svc', 1, info)))
+        zero_cost_actuation.commit_lease_in_connection(
+            connection,
+            lease,
+            service_name='svc',
+            replica_id=1,
+            replica_record_id=record_id,
+            replica_info=info)
+
+    with actuation_database.connect() as connection:
+        assert zero_cost_actuation.committed_intent_matches_replica_in_connection(
+            connection,
+            service_name='svc',
+            service_hash=_SERVICE_HASH,
+            replica_info=info)
+        info.reserved_fill_physical_cluster_uid = 'other-uid'
+        assert not zero_cost_actuation.committed_intent_matches_replica_in_connection(
+            connection,
+            service_name='svc',
+            service_hash=_SERVICE_HASH,
+            replica_info=info)
+
+
 def test_committed_replica_id_high_water_survives_replica_cleanup(
         actuation_database) -> None:
     repository = zero_cost_actuation.ZeroCostActuationRepository(
