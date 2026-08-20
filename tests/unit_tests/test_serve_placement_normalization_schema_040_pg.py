@@ -1077,7 +1077,7 @@ def test_serve040_runtime_authority_rejects_wrong_revision(serve040) -> None:
 
 @pytest.mark.parametrize('revision', [
     '041', '042', '043', '044', '045', '046', '047', '048', '049', '050', '051',
-    '052'
+    '052', '053'
 ])
 def test_serve040_runtime_authority_accepts_recognized_additive_head(
         serve040, revision: str) -> None:
@@ -1112,7 +1112,7 @@ def test_serve040_runtime_authority_rejects_unknown_later_head(
         serve040) -> None:
     with serve040.begin() as connection:
         connection.exec_driver_sql(
-            "UPDATE alembic_version_serve_state_db SET version_num = '053'")
+            "UPDATE alembic_version_serve_state_db SET version_num = '054'")
     with serve040.connect() as connection:
         with pytest.raises(placement_normalization_authority.
                            PlacementNormalizationAuthorityError,
