@@ -1148,8 +1148,15 @@ def _project_worker_provision_timeout(
     num_nodes: int,
     volume_mounts: list[Any] | None,
     kueue_admission: dict[str, str] | None,
+    reserved_capacity_fill: bool,
 ) -> int:
-    """Freeze the existing effective timeout under the version's config."""
+    """Freeze the provisioning wait owned by the service version."""
+    if reserved_capacity_fill:
+        # Reserved-fill workers are low-priority claims on reclaimable
+        # capacity.  Queueing or temporary occupancy is not evidence that the
+        # committed capacity disappeared, so a wall-clock timeout must not
+        # turn a valid claim into an ambiguous launch or paid residual.
+        return -1
     dws_config = skypilot_config.get_effective_workspace_region_config(
         cloud='kubernetes',
         region=context,
@@ -1282,6 +1289,7 @@ def build_worker_placement_projections(
     task: 'task_lib.Task',
     *,
     workspace: str | None,
+    reserved_capacity_fill: bool,
     placement_catalog: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]] | None:
     """Build exact per-candidate worker identities, or null if ambiguous."""
@@ -1319,7 +1327,8 @@ def build_worker_placement_projections(
                 workspace,
                 num_nodes=task.num_nodes,
                 volume_mounts=task.volume_mounts,
-                kueue_admission=kueue_admission),
+                kueue_admission=kueue_admission,
+                reserved_capacity_fill=reserved_capacity_fill),
             'accelerator_name': accelerator_name,
             'accelerator_count': accelerator_count,
             'accelerator_scheduling': _project_accelerator_scheduling(
