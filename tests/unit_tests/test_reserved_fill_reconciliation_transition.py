@@ -241,11 +241,107 @@ def test_activation_attests_then_commits_one_successor() -> None:
 
     assert changed is True
     assert observed == after
-    attest.assert_called_once_with()
+    assert attest.call_args_list == [mock.call(), mock.call()]
     repository.authorize_sequenced_reconciliation.assert_called_once_with(
         expected_generation=4,
         receipt=_receipt(),
         connection=mock.sentinel.activation_connection)
+
+
+def test_activation_accepts_slow_reclaim_proof_for_stable_writer_cohort(
+) -> None:
+    before = _status()
+    after = _status(gate_state='SEQUENCED_ACTIVE', gate_generation=5)
+    pre_proof = _attestation(completed_monotonic=100.0)
+    post_proof = _attestation(completed_monotonic=118.0)
+    reclaim_evidence = _reclaim_evidence(completed_monotonic=118.0)
+    repository = _repository(before, receipt=_receipt(post_proof))
+    now = 100.0
+
+    def attest_reclaim(
+        writer_attestation: transition._WriterCohortAttestation,
+        claimed_contexts: tuple[Any, ...],
+    ) -> reserved_fill_reclaim_attestation.ReclaimEnforcementEvidence:
+        nonlocal now
+        assert writer_attestation is pre_proof
+        assert claimed_contexts == ()
+        now = 118.0
+        return reclaim_evidence
+
+    with mock.patch.object(transition, '_engine', return_value=object()), \
+         mock.patch.object(
+             transition, '_status', side_effect=[before, after]), \
+         mock.patch.object(
+             transition,
+             '_attest_split_role_writer_cohort',
+             side_effect=[pre_proof, post_proof]) as attest, \
+         mock.patch.object(transition, '_durable_claim_scope', return_value=()), \
+         mock.patch.object(
+             transition,
+             '_attest_reclaim_enforcement',
+             side_effect=attest_reclaim), \
+         mock.patch.object(
+             transition.time, 'monotonic', side_effect=lambda: now), \
+         mock.patch.object(
+             transition.serve_state,
+             'reserved_fill_reclaim_gate_authority_guard',
+             return_value=contextlib.nullcontext(mock.sentinel.gate_guard)), \
+         mock.patch.object(
+             transition.pool_capacity_observation,
+             'PoolCapacityObservationRepository',
+             return_value=repository):
+        changed, observed = transition.activate()
+
+    assert changed is True
+    assert observed == after
+    assert attest.call_args_list == [mock.call(), mock.call()]
+    repository.authorize_sequenced_reconciliation.assert_called_once_with(
+        expected_generation=4,
+        receipt=_receipt(post_proof),
+        connection=mock.sentinel.activation_connection)
+
+
+@pytest.mark.parametrize(('field', 'changed_value'), (
+    ('image_digest', 'sha256:' + 'e' * 64),
+    ('deployment_generation', 'next-generation'),
+    ('deployment_uid', 'next-uid'),
+    ('pod_inventory_count', 4),
+    ('pod_inventory_sha256', 'f' * 64),
+))
+def test_activation_rejects_writer_cohort_change_after_reclaim_proof(
+        field: str, changed_value: object) -> None:
+    before = _status()
+    pre_proof = _attestation(completed_monotonic=100.0)
+    post_proof = dataclasses.replace(pre_proof,
+                                     completed_monotonic=118.0,
+                                     **{field: changed_value})
+    repository = _repository(before)
+    with mock.patch.object(transition, '_engine', return_value=object()), \
+         mock.patch.object(transition, '_status', return_value=before), \
+         mock.patch.object(
+             transition,
+             '_attest_split_role_writer_cohort',
+             side_effect=[pre_proof, post_proof]) as attest, \
+         mock.patch.object(transition, '_durable_claim_scope', return_value=()), \
+         mock.patch.object(
+             transition,
+             '_attest_reclaim_enforcement',
+             return_value=_reclaim_evidence(completed_monotonic=118.0)), \
+         mock.patch.object(transition.time, 'monotonic', return_value=100.0), \
+         mock.patch.object(
+             transition.serve_state,
+             'reserved_fill_reclaim_gate_authority_guard') as guard, \
+         mock.patch.object(
+             transition.pool_capacity_observation,
+             'PoolCapacityObservationRepository',
+             return_value=repository), \
+         pytest.raises(transition.ReconciliationTransitionError,
+                       match='writer rollout changed during reclaim'):
+        transition.activate()
+
+    assert attest.call_args_list == [mock.call(), mock.call()]
+    guard.assert_not_called()
+    repository.authorize_sequenced_reconciliation.assert_not_called()
 
 
 def test_activation_never_reads_rollout_while_authority_is_held() -> None:
@@ -294,7 +390,7 @@ def test_activation_never_reads_rollout_while_authority_is_held() -> None:
 
     assert changed is True
     assert observed == after
-    rollout_reader.assert_called_once_with()
+    assert rollout_reader.call_args_list == [mock.call(), mock.call()]
     assert not lock_held
 
 
@@ -315,7 +411,7 @@ def test_activation_rejects_attestation_that_ages_out_waiting_for_lock(
          mock.patch.object(
              transition.time,
              'monotonic',
-             side_effect=[102.0, 102.0, 106.0]), \
+             side_effect=[102.0, 102.0, 102.0, 106.0]), \
          mock.patch.object(
              transition.serve_state,
              'reserved_fill_reclaim_gate_authority_guard',
@@ -348,6 +444,7 @@ def test_current_build_blocks_before_authority_or_gate_cas() -> None:
              'require_unique_policy',
              side_effect=(reserved_fill_reclaim_attestation.
                           ReclaimAttestationError('no policy'))), \
+         mock.patch.object(transition.time, 'monotonic', return_value=100.0), \
          mock.patch.object(
              transition.serve_state,
              'reserved_fill_reclaim_gate_authority_guard') as guard, \
@@ -410,7 +507,7 @@ def test_active_service_reattests_and_reauthorizes_next_generation() -> None:
 
     assert changed is True
     assert observed == after
-    attest.assert_called_once_with()
+    assert attest.call_args_list == [mock.call(), mock.call()]
     reclaim_attest.assert_called_once_with(_attestation(), ())
     repository.authorize_sequenced_reconciliation.assert_called_once_with(
         expected_generation=5,
@@ -446,7 +543,7 @@ def test_active_service_exact_receipt_is_idempotent_after_reattest() -> None:
 
     assert changed is False
     assert observed == active
-    attest.assert_called_once_with()
+    assert attest.call_args_list == [mock.call(), mock.call()]
     reclaim_attest.assert_called_once_with(_attestation(), ())
     repository.authorize_sequenced_reconciliation.assert_called_once_with(
         expected_generation=5,
