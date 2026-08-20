@@ -1467,7 +1467,8 @@ def test_multiprocess_launches_share_fresh_provider_receipt(
             f'the dedicated-runner limit {cgroup_memory_limit}.')
 
 
-def test_expired_receipt_refreshes_once(proof_engine):
+def test_expired_identical_receipt_refreshes_once_without_revoking_reference(
+        proof_engine):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
     calls = 0
     calls_lock = threading.Lock()
@@ -1506,7 +1507,229 @@ def test_expired_receipt_refreshes_once(proof_engine):
     assert calls == 2
     refreshed_nonces = {item.reference.receipt_nonce for item in refreshed}
     assert len(refreshed_nonces) == 1
-    assert first.reference.receipt_nonce not in refreshed_nonces
+    assert refreshed_nonces == {first.reference.receipt_nonce}
+    with proof_engine.begin() as connection:
+        assert proofs.provider_proof_reference_holds_in_connection(
+            connection,
+            first.reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
+
+
+def test_receipt_without_terminal_guard_reserve_is_refreshed(proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    calls = 0
+
+    def prove():
+        nonlocal calls
+        calls += 1
+        return _proof_candidate()
+
+    kwargs = {
+        'identity': _identity(),
+        'gate_generation': _GATE_GENERATION,
+        'kubernetes_context': _CONTEXT,
+        'prove': prove,
+        'validate': _accept_payload,
+    }
+    first = repository.get_or_prove(**kwargs,
+                                    deadline_monotonic=time.monotonic() + 5)
+    near_expiry_age = (reclaim.AUTHORIZATION_MAX_AGE_SECONDS -
+                       proofs._TERMINAL_GUARD_RESERVE_SECONDS / 2)
+    with proof_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                UPDATE serve_reserved_fill_reclaim_provider_proofs
+                SET completed_at = clock_timestamp()
+                    - make_interval(secs => :age)
+            """), {'age': near_expiry_age})
+
+    refreshed = repository.get_or_prove(**kwargs,
+                                        deadline_monotonic=time.monotonic() + 5)
+
+    assert calls == 2
+    assert refreshed.reference.receipt_nonce == first.reference.receipt_nonce
+    assert refreshed.has_terminal_guard_reserve
+    with proof_engine.begin() as connection:
+        assert proofs.provider_proof_reference_holds_in_connection(
+            connection,
+            first.reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
+
+
+def test_slow_validation_cannot_consume_terminal_guard_reserve(proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    common = {
+        'identity': _identity(),
+        'gate_generation': _GATE_GENERATION,
+        'kubernetes_context': _CONTEXT,
+    }
+    repository.get_or_prove(**common,
+                            deadline_monotonic=time.monotonic() + 5,
+                            prove=_proof_candidate,
+                            validate=_accept_payload)
+    age_before_validation = (reclaim.AUTHORIZATION_MAX_AGE_SECONDS -
+                             proofs._TERMINAL_GUARD_RESERVE_SECONDS - 0.2)
+    with proof_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                UPDATE serve_reserved_fill_reclaim_provider_proofs
+                SET completed_at = clock_timestamp()
+                    - make_interval(secs => :age)
+            """), {'age': age_before_validation})
+    validation_calls = 0
+    prove_calls = 0
+
+    def slow_validate(_payload):
+        nonlocal validation_calls
+        validation_calls += 1
+        time.sleep(0.3)
+        return True
+
+    def prove():
+        nonlocal prove_calls
+        prove_calls += 1
+        return _proof_candidate()
+
+    refreshed = repository.get_or_prove(**common,
+                                        deadline_monotonic=time.monotonic() + 5,
+                                        prove=prove,
+                                        validate=slow_validate)
+
+    assert validation_calls >= 2
+    assert prove_calls == 1
+    assert refreshed.has_terminal_guard_reserve
+
+
+def test_connection_close_cannot_consume_terminal_guard_reserve(proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    common = {
+        'identity': _identity(),
+        'gate_generation': _GATE_GENERATION,
+        'kubernetes_context': _CONTEXT,
+    }
+    repository.get_or_prove(**common,
+                            deadline_monotonic=time.monotonic() + 5,
+                            prove=_proof_candidate,
+                            validate=_accept_payload)
+    age_before_close = (reclaim.AUTHORIZATION_MAX_AGE_SECONDS -
+                        proofs._TERMINAL_GUARD_RESERVE_SECONDS - 0.4)
+    with proof_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                UPDATE serve_reserved_fill_reclaim_provider_proofs
+                SET completed_at = clock_timestamp()
+                    - make_interval(secs => :age)
+            """), {'age': age_before_close})
+    prove_calls = 0
+    proof_calls_at_close = []
+
+    def prove():
+        nonlocal prove_calls
+        prove_calls += 1
+        return _proof_candidate()
+
+    def delay_first_physical_close(_dbapi_connection, _connection_record):
+        proof_calls_at_close.append(prove_calls)
+        if len(proof_calls_at_close) == 1:
+            time.sleep(0.55)
+
+    sqlalchemy.event.listen(repository._proof_engine, 'close',
+                            delay_first_physical_close)
+    try:
+        refreshed = repository.get_or_prove(**common,
+                                            deadline_monotonic=time.monotonic()
+                                            + 5,
+                                            prove=prove,
+                                            validate=_accept_payload)
+    finally:
+        sqlalchemy.event.remove(repository._proof_engine, 'close',
+                                delay_first_physical_close)
+
+    assert proof_calls_at_close[0] == 0
+    assert prove_calls == 1
+    assert refreshed.has_terminal_guard_reserve
+
+
+def test_changed_proof_refresh_rotates_nonce_and_revokes_old_reference(
+        proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    old_payload = {
+        **_proof_payload(),
+        'inventory_revision': 'old',
+    }
+    first = repository.get_or_prove(identity=_identity(),
+                                    gate_generation=_GATE_GENERATION,
+                                    kubernetes_context=_CONTEXT,
+                                    deadline_monotonic=time.monotonic() + 5,
+                                    prove=lambda: _proof_candidate(old_payload),
+                                    validate=_accept_payload)
+    new_payload = {
+        **_proof_payload(),
+        'inventory_revision': 'new',
+    }
+
+    refreshed = repository.get_or_prove(
+        identity=_identity(),
+        gate_generation=_GATE_GENERATION,
+        kubernetes_context=_CONTEXT,
+        deadline_monotonic=time.monotonic() + 5,
+        prove=lambda: _proof_candidate(new_payload),
+        validate=lambda payload: payload.get('inventory_revision') == 'new')
+
+    assert refreshed.reference.receipt_nonce != first.reference.receipt_nonce
+    with proof_engine.begin() as connection:
+        assert not proofs.provider_proof_reference_holds_in_connection(
+            connection,
+            first.reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
+        assert proofs.provider_proof_reference_holds_in_connection(
+            connection,
+            refreshed.reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
+
+
+def test_staggered_launches_span_two_identical_renewals(proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    proof_calls = 0
+    proof_calls_lock = threading.Lock()
+    worker_count = 90
+    wave_horizon_seconds = 10.0
+    wave_started = time.monotonic() + 0.1
+
+    def prove():
+        nonlocal proof_calls
+        with proof_calls_lock:
+            proof_calls += 1
+        time.sleep(0.03)
+        return _proof_candidate()
+
+    def launch(index):
+        scheduled = (wave_started + wave_horizon_seconds * index /
+                     (worker_count - 1))
+        remaining = scheduled - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        receipt = repository.get_or_prove(identity=_identity(),
+                                          gate_generation=_GATE_GENERATION,
+                                          kubernetes_context=_CONTEXT,
+                                          deadline_monotonic=time.monotonic() +
+                                          5,
+                                          prove=prove,
+                                          validate=_accept_payload)
+        with proof_engine.begin() as connection:
+            holds = proofs.provider_proof_reference_holds_in_connection(
+                connection,
+                receipt.reference,
+                expected_physical_cluster_uid='physical-cluster-uid')
+        return receipt.reference.receipt_nonce, holds
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=worker_count) as executor:
+        results = tuple(executor.map(launch, range(worker_count)))
+
+    assert proof_calls >= 3
+    assert len({nonce for nonce, _ in results}) == 1
+    assert all(holds for _, holds in results)
 
 
 def test_distinct_context_authorities_prove_in_parallel(proof_engine):
@@ -2001,6 +2224,14 @@ def test_final_guard_rejects_stale_or_mismatched_receipt(proof_engine):
             connection,
             wrong_digest,
             expected_physical_cluster_uid='physical-cluster-uid')
+        locally_stale = dataclasses.replace(
+            reference,
+            completed_monotonic=(reference.completed_monotonic -
+                                 reclaim.AUTHORIZATION_MAX_AGE_SECONDS - 1))
+        assert not proofs.provider_proof_reference_holds_in_connection(
+            connection,
+            locally_stale,
+            expected_physical_cluster_uid='physical-cluster-uid')
         assert not proofs.provider_proof_reference_holds_in_connection(
             connection,
             reference,
@@ -2032,6 +2263,23 @@ def test_final_guard_rejects_stale_or_mismatched_receipt(proof_engine):
             connection,
             reference,
             expected_physical_cluster_uid='physical-cluster-uid')
+
+
+def test_final_guard_requires_read_committed_isolation(proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    receipt = repository.get_or_prove(identity=_identity(),
+                                      gate_generation=_GATE_GENERATION,
+                                      kubernetes_context=_CONTEXT,
+                                      deadline_monotonic=time.monotonic() + 5,
+                                      prove=_proof_candidate,
+                                      validate=_accept_payload)
+    with proof_engine.connect().execution_options(
+            isolation_level='REPEATABLE READ') as connection:
+        with connection.begin():
+            assert not proofs.provider_proof_reference_holds_in_connection(
+                connection,
+                receipt.reference,
+                expected_physical_cluster_uid='physical-cluster-uid')
 
 
 @pytest.mark.parametrize(('column', 'value'), (
@@ -2121,7 +2369,7 @@ def test_final_guard_rejects_delete_reinsert_aba(proof_engine):
             expected_physical_cluster_uid='physical-cluster-uid')
 
 
-def test_final_guard_row_locks_block_nonce_refresh_until_guard_transaction_ends(
+def test_mvcc_guard_orders_before_changed_refresh_commit_without_blocking(
         proof_engine):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
     old_payload = {
@@ -2157,34 +2405,29 @@ def test_final_guard_row_locks_block_nonce_refresh_until_guard_transaction_ends(
             old_reference,
             expected_physical_cluster_uid='physical-cluster-uid')
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            blocked_refresh = executor.submit(
-                repository.get_or_prove,
-                identity=_identity(),
-                gate_generation=_GATE_GENERATION,
-                kubernetes_context=_CONTEXT,
-                deadline_monotonic=time.monotonic() + 5,
-                prove=prove_refresh,
-                validate=accept_new)
-            with pytest.raises(sqlalchemy.exc.OperationalError,
-                               match='timeout'):
-                blocked_refresh.result(timeout=2)
-        assert guard_connection.execute(
-            sqlalchemy.select(
-                proof_schema.serve_reserved_fill_reclaim_provider_proofs_table.
-                c.receipt_nonce)).scalar_one() == old_reference.receipt_nonce
+            refresh = executor.submit(repository.get_or_prove,
+                                      identity=_identity(),
+                                      gate_generation=_GATE_GENERATION,
+                                      kubernetes_context=_CONTEXT,
+                                      deadline_monotonic=time.monotonic() + 5,
+                                      prove=prove_refresh,
+                                      validate=accept_new)
+            replacement = refresh.result(timeout=2)
+        assert refresh_calls == 1
+        assert replacement.reference.receipt_nonce != (
+            old_reference.receipt_nonce)
+        assert not proofs.provider_proof_reference_holds_in_connection(
+            guard_connection,
+            old_reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
+        assert proofs.provider_proof_reference_holds_in_connection(
+            guard_connection,
+            replacement.reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
     finally:
         guard_transaction.rollback()
         guard_connection.close()
 
-    replacement = repository.get_or_prove(identity=_identity(),
-                                          gate_generation=_GATE_GENERATION,
-                                          kubernetes_context=_CONTEXT,
-                                          deadline_monotonic=time.monotonic() +
-                                          5,
-                                          prove=prove_refresh,
-                                          validate=accept_new)
-    assert refresh_calls == 2
-    assert replacement.reference.receipt_nonce != (old_reference.receipt_nonce)
     with proof_engine.begin() as connection:
         assert not proofs.provider_proof_reference_holds_in_connection(
             connection,
@@ -2196,7 +2439,7 @@ def test_final_guard_row_locks_block_nonce_refresh_until_guard_transaction_ends(
             expected_physical_cluster_uid='physical-cluster-uid')
 
 
-def test_concurrent_refresh_row_lock_makes_final_guard_fail_promptly(
+def test_uncommitted_identical_refresh_does_not_block_or_reject_final_guard(
         proof_engine):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
     receipt = repository.get_or_prove(identity=_identity(),
@@ -2213,28 +2456,25 @@ def test_concurrent_refresh_row_lock_makes_final_guard_fail_promptly(
         refresh_connection.execute(
             sqlalchemy.update(table).where(
                 table.c.receipt_nonce == receipt.reference.receipt_nonce).
-            values(proof_schema_version=table.c.proof_schema_version))
+            values(completed_at=table.c.completed_at))
         started = time.monotonic()
         with proof_engine.begin() as guard_connection:
-            with pytest.raises(sqlalchemy.exc.OperationalError,
-                               match='could not obtain lock'):
-                if proofs.provider_proof_reference_holds_in_connection(
-                        guard_connection,
-                        receipt.reference,
-                        expected_physical_cluster_uid='physical-cluster-uid'):
-                    provider_effect()
+            if proofs.provider_proof_reference_holds_in_connection(
+                    guard_connection,
+                    receipt.reference,
+                    expected_physical_cluster_uid='physical-cluster-uid'):
+                provider_effect()
         assert time.monotonic() - started < 1
-        provider_effect.assert_not_called()
+        provider_effect.assert_called_once()
     finally:
         refresh_transaction.rollback()
         refresh_connection.close()
 
     with proof_engine.begin() as connection:
-        if proofs.provider_proof_reference_holds_in_connection(
-                connection,
-                receipt.reference,
-                expected_physical_cluster_uid='physical-cluster-uid'):
-            provider_effect()
+        assert proofs.provider_proof_reference_holds_in_connection(
+            connection,
+            receipt.reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
     provider_effect.assert_called_once()
 
 

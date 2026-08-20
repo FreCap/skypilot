@@ -1,7 +1,9 @@
 """Non-PostgreSQL tests for terminal reserved-fill reclaim enforcement."""
 # pylint: disable=protected-access,unexpected-keyword-arg
 
+import concurrent.futures
 import contextlib
+import threading
 import time
 import types
 from unittest import mock
@@ -745,7 +747,8 @@ def test_ordinary_zero_cost_replica_does_not_enter_reclaim_gate(monkeypatch):
     require_policy.assert_not_called()
 
 
-def test_durable_row_mismatch_fails_before_policy_or_global_guard(monkeypatch):
+def test_durable_row_mismatch_fails_inside_global_guard_before_policy(
+        monkeypatch):
     context = _launch_context()
     provisioner = _provisioner(context)
     durable = _durable_replica(context)
@@ -753,7 +756,7 @@ def test_durable_row_mismatch_fails_before_policy_or_global_guard(monkeypatch):
     snapshot = serve_state.ServiceReplicaLaunchFenceSnapshot(durable)
     owner_guard = mock.Mock(return_value=contextlib.nullcontext(snapshot))
     require_policy = mock.Mock()
-    global_guard = mock.Mock()
+    global_guard = mock.Mock(return_value=contextlib.nullcontext())
     monkeypatch.setattr(provisioner,
                         '_service_replica_launch_provider_owner_guard',
                         owner_guard)
@@ -769,10 +772,10 @@ def test_durable_row_mismatch_fails_before_policy_or_global_guard(monkeypatch):
 
     owner_guard.assert_called_once_with()
     require_policy.assert_not_called()
-    global_guard.assert_not_called()
+    global_guard.assert_called_once_with(shared=True)
 
 
-def test_terminal_policy_identity_mismatch_precedes_ticket_global_and_provider(
+def test_terminal_policy_identity_mismatch_precedes_ticket_and_provider(
         monkeypatch):
     context = _launch_context()
     provisioner = _provisioner(context)
@@ -801,11 +804,10 @@ def test_terminal_policy_identity_mismatch_precedes_ticket_global_and_provider(
     assert not provider_ran
     owner_guard.assert_called_once_with()
     authorize_launch.assert_not_called()
-    global_guard.assert_not_called()
+    global_guard.assert_called_once_with(shared=True)
 
 
-def test_service_guard_precedes_policy_authorization_and_global_guard(
-        monkeypatch):
+def test_service_and_global_guards_precede_policy_authorization(monkeypatch):
     context = _launch_context()
     provisioner = _provisioner(context)
     expected_scope = _scope(context)
@@ -851,8 +853,63 @@ def test_service_guard_precedes_policy_authorization_and_global_guard(
         events.append('provider')
 
     assert events == [
-        'service-enter', 'policy', 'global-enter', 'recheck', 'provider',
+        'service-enter', 'global-enter', 'policy', 'recheck', 'provider',
         'global-exit', 'service-exit'
+    ]
+
+
+def test_delayed_global_gate_acquisition_precedes_ticket_mint(monkeypatch):
+    context = _launch_context()
+    provisioner = _provisioner(context)
+    expected_scope = _scope(context)
+    gate_wait_started = threading.Event()
+    release_gate = threading.Event()
+    authorization_started = threading.Event()
+    events = []
+
+    def _authorize(scope, **_kwargs):
+        assert release_gate.is_set()
+        events.append('policy')
+        authorization_started.set()
+        return _launch_authorization(scope)
+
+    @contextlib.contextmanager
+    def _delayed_global_guard(*, shared):
+        assert shared
+        events.append('global-wait')
+        gate_wait_started.set()
+        assert release_gate.wait(timeout=2)
+        events.append('global-enter')
+        yield object()
+        events.append('global-exit')
+
+    monkeypatch.setattr(reclaim, 'require_unique_policy',
+                        lambda: _Policy(_authorize))
+    monkeypatch.setattr(serve_state,
+                        'reserved_fill_reclaim_gate_authority_guard',
+                        _delayed_global_guard)
+    monkeypatch.setattr(
+        serve_state, 'reserved_fill_reclaim_launch_authority_holds',
+        lambda scope, authorization, launch_context, launch_snapshot: scope ==
+        expected_scope and authorization is not None and launch_snapshot is
+        not None)
+    monkeypatch.setattr(
+        provisioner, '_service_replica_launch_provider_owner_guard',
+        lambda: contextlib.nullcontext(_launch_snapshot(context)))
+
+    def _run_provider_guard():
+        with provisioner._service_replica_launch_provider_guard():
+            events.append('provider')
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        guarded = executor.submit(_run_provider_guard)
+        assert gate_wait_started.wait(timeout=2)
+        assert not authorization_started.wait(timeout=0.1)
+        release_gate.set()
+        guarded.result(timeout=2)
+
+    assert events == [
+        'global-wait', 'global-enter', 'policy', 'provider', 'global-exit'
     ]
 
 
@@ -889,7 +946,7 @@ def test_failed_service_authority_mints_no_policy_ticket_or_global_guard(
 
 
 @pytest.mark.parametrize('ticket_kind', ['missing-policy', 'stale', 'mismatch'])
-def test_invalid_policy_ticket_fails_before_any_guard_or_provider(
+def test_invalid_policy_ticket_fails_inside_global_guard_before_provider(
         monkeypatch, ticket_kind):
     context = _launch_context()
     provisioner = _provisioner(context)
@@ -929,7 +986,7 @@ def test_invalid_policy_ticket_fails_before_any_guard_or_provider(
             provider_ran = True
 
     assert not provider_ran
-    global_guard.assert_not_called()
+    global_guard.assert_called_once_with(shared=True)
     owner_guard.assert_called_once_with()
 
 
@@ -1036,7 +1093,7 @@ def test_provider_exception_classification_is_preserved(monkeypatch):
     assert exc_info.value is provider_error
 
 
-@pytest.mark.parametrize('loss_point', ['before', 'after'])
+@pytest.mark.parametrize('loss_point', ['before', 'during-proof', 'after'])
 def test_lost_global_guard_never_reports_an_authorized_provider_effect(
         monkeypatch, loss_point):
     context = _launch_context()
@@ -1049,7 +1106,12 @@ def test_lost_global_guard_never_reports_an_authorized_provider_effect(
     monkeypatch.setattr(
         serve_state, 'reserved_fill_reclaim_gate_authority_guard',
         lambda *, shared: contextlib.nullcontext(object()) if shared else None)
-    validity = ([False] if loss_point == 'before' else [True, False])
+    if loss_point == 'before':
+        validity = [False]
+    elif loss_point == 'during-proof':
+        validity = [True, False]
+    else:
+        validity = [True, True, False]
     monkeypatch.setattr(serve_state,
                         'reserved_fill_reclaim_gate_authority_guard_is_valid',
                         lambda _: validity.pop(0))
