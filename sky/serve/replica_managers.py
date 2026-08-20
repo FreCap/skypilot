@@ -10074,17 +10074,24 @@ class SkyPilotReplicaManager(ReplicaManager):
                 isinstance(launch_thread, _ReplicaLaunchThread) and
                 launch_thread.bound_ordinary_launch)
             if launch_thread.is_alive():
-                legacy_runtime.replica_to_launch_cancelled[replica_id] = True
                 if bound_ordinary_launch:
-                    # Deliver cancellation from the manager thread before
-                    # joining. The waiter may still be inside the provider's
-                    # shared guard; waiting for it before this direct
-                    # row-locked cancel would make the provider and join
-                    # depend cyclically on each other.
-                    self._request_bound_ordinary_launch_cancel_for_teardown(
-                        info)
+                    if provider_present_cleanup_context is None:
+                        legacy_runtime.replica_to_launch_cancelled[
+                            replica_id] = True
+                        # Deliver cancellation from the manager thread before
+                        # joining. The waiter may still be inside the
+                        # provider's shared guard; waiting for it before this
+                        # direct row-locked cancel would make the provider and
+                        # join depend cyclically on each other. Exact
+                        # provider-present cleanup authority is already
+                        # terminal, so it must not re-enter cancellation while
+                        # the local worker finishes unwinding.
+                        self._request_bound_ordinary_launch_cancel_for_teardown(
+                            info)
                     launch_thread.join()
                 else:
+                    legacy_runtime.replica_to_launch_cancelled[
+                        replica_id] = True
                     wait_deadline = (time.monotonic() +
                                      _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS)
                     timeout_reached = False

@@ -1694,6 +1694,121 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         settle.assert_not_called()
         reconcile.assert_called_once_with(info, context)
 
+    def test_provider_present_cleanup_does_not_cancel_live_bound_worker(self):
+        manager = _make_manager()
+        manager._ordinary_launch_binding_authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=2,
+            generic=True)
+        runtime = manager._legacy_mutation_runtime_state()
+        context = _bound_non_pool_context(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+        info = _fake_replica_info(
+            context.replica_id,
+            replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.replica_record_id = str(context.replica_record_id)
+        info.reserved_fill = True
+        info.is_zero_cost = True
+        status = info.status_property
+        status.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
+        status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+        status.is_scale_down = True
+        status.drain_cap_seconds = 0
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+
+        def _live_worker():
+            worker_started.set()
+            assert release_worker.wait(timeout=5)
+
+        launch_thread = replica_managers._ReplicaLaunchThread(
+            target=_live_worker,
+            replica_id=context.replica_id,
+            completion_queue=queue.SimpleQueue(),
+            completion_event=threading.Event(),
+            bound_ordinary_launch=True)
+        launch_thread.start()
+        assert worker_started.wait(timeout=1)
+        assert launch_thread.is_alive()
+        runtime.launch_thread_pool[context.replica_id] = launch_thread
+        runtime.replica_to_request_id[context.replica_id] = context.request_id
+        registry = mock.Mock()
+        join_entered = threading.Event()
+        real_join = launch_thread.join
+
+        def _observed_join(*args, **kwargs):
+            join_entered.set()
+            return real_join(*args, **kwargs)
+
+        termination_errors: list[BaseException] = []
+
+        def _terminate():
+            try:
+                manager._terminate_replica(context.replica_id,
+                                           sync_down_logs=False,
+                                           replica_drain_delay_seconds=0,
+                                           is_scale_down=True,
+                                           in_flight_drain_cap_seconds=0)
+            except BaseException as error:  # pylint: disable=broad-except
+                termination_errors.append(error)
+
+        terminate_thread = threading.Thread(target=_terminate)
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=info), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_info_with_resource_action_identity',
+                 return_value=(info, None)), \
+             mock.patch.object(
+                 manager,
+                 '_bound_non_pool_provider_present_cleanup_context',
+                 return_value=context), \
+             mock.patch.object(
+                 manager,
+                 '_request_bound_ordinary_launch_cancel_for_teardown') \
+                     as cancel, \
+             mock.patch.object(
+                 manager,
+                 '_settle_bound_ordinary_launch_for_teardown') as settle, \
+             mock.patch.object(manager, '_persist_replica'), \
+             mock.patch.object(manager,
+                               '_route_lease_registry',
+                               return_value=registry), \
+             mock.patch.object(
+                 replica_managers.reserved_capacity,
+                 'parse_protocol_v2_cleanup_fence',
+                 return_value=mock.sentinel.cleanup_fence), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'cluster_with_name_exists',
+                 return_value=False), \
+             mock.patch.object(
+                 manager,
+                 '_schedule_non_pool_provider_reconciliation') as reconcile, \
+             mock.patch.object(launch_thread,
+                               'join',
+                               side_effect=_observed_join):
+            terminate_thread.start()
+            try:
+                assert join_entered.wait(timeout=1)
+                assert launch_thread.is_alive()
+                assert context.replica_id not in (
+                    runtime.replica_to_launch_cancelled)
+                cancel.assert_not_called()
+            finally:
+                release_worker.set()
+                terminate_thread.join(timeout=5)
+                real_join(timeout=5)
+
+        assert not terminate_thread.is_alive()
+        assert not launch_thread.is_alive()
+        assert not termination_errors
+        assert context.replica_id not in runtime.replica_to_launch_cancelled
+        cancel.assert_not_called()
+        settle.assert_not_called()
+        reconcile.assert_called_once_with(info, context)
+
     def test_provider_present_cleanup_restart_skips_ordinary_settlement(self):
         manager = _make_manager()
         manager._ordinary_launch_binding_authority = _binding_authority(
