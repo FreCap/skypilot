@@ -292,13 +292,21 @@ def test_durable_accept_publishes_grants_without_provider_or_replica_io(
     repository = mock.Mock()
     repository.grant_plan.return_value = receipt
     manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
+    allocation_repository = mock.Mock()
+    allocation_repository.read_current.return_value = SimpleNamespace(
+        allocation_generation=plan.allocation_generation,
+        allocation_input_sha256=plan.allocation_input_sha256,
+        allocation_claim_generation=plan.allocation_claim_generation)
 
     with mock.patch.object(
             replica_managers.serve_state,
             'get_service_controller_owner',
             return_value=_owner_record()), mock.patch.object(
-                replica_managers.provider_phase,
-                'try_provider_phase') as provider_admission, mock.patch.object(
+                replica_managers.reserved_fill_allocation,
+                'ReservedFillAllocationRepository',
+                return_value=allocation_repository), mock.patch.object(
+                    replica_managers.provider_phase, 'try_provider_phase'
+                ) as provider_admission, mock.patch.object(
                     replica_managers.serve_state,
                     'get_replica_infos') as replica_read:
         actual = manager.accept_reserved_fill(plan)
@@ -310,6 +318,8 @@ def test_durable_accept_publishes_grants_without_provider_or_replica_io(
         max_capacity=7,
         expected_controller_incarnation=_CONTROLLER_INCARNATION,
         expected_controller_owner_epoch=_CONTROLLER_OWNER_EPOCH)
+    allocation_repository.read_current.assert_called_once_with(
+        'svc', _SERVICE_HASH, (_CONTROLLER_PID, _CONTROLLER_IP))
     provider_admission.assert_not_called()
     replica_read.assert_not_called()
 
