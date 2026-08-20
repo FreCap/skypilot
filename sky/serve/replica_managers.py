@@ -10456,11 +10456,31 @@ class SkyPilotReplicaManager(ReplicaManager):
         now = time.monotonic()
         _, retry_at_by_replica = self._failed_cleanup_retry_state()
         for info in sorted(replica_infos, key=_provider_cleanup_phase_order):
-            down_failed = (info.status_property.sky_down_status ==
-                           common_utils.ProcessStatus.FAILED)
+            down_status = info.status_property.sky_down_status
+            # Exact retirement owns successful teardown tombstones.  Ignore
+            # even a stale process-local retry deadline left by an earlier
+            # attempt so provider cleanup can never be repeated after success.
+            if down_status == common_utils.ProcessStatus.SUCCEEDED:
+                continue
+            down_failed = down_status == common_utils.ProcessStatus.FAILED
             retry_pending = info.replica_id in retry_at_by_replica
+            # SCHEDULED/RUNNING and the pre-scheduling ``None`` state are
+            # durable cleanup intent, but their process-local down worker is
+            # lost on controller restart.  Re-drive them through this same
+            # bounded cleanup path.  A SUCCEEDED tombstone must never re-enter
+            # provider cleanup; exact retirement owns that separate terminal
+            # state.
+            logical_retirement_present = (
+                info.status_property.logical_retirement_version is not None)
+            unfinished_teardown = (
+                info.status in (serve_state.ReplicaStatus.SHUTTING_DOWN,
+                                serve_state.ReplicaStatus.PREEMPTED) and
+                info.status_property.wait_for_idle_before_termination is False
+                and (not logical_retirement_present or
+                     self._is_committed_logical_retirement(info)))
             if (info.status != serve_state.ReplicaStatus.FAILED_CLEANUP and
-                    not down_failed and not retry_pending):
+                    not down_failed and not retry_pending and
+                    not unfinished_teardown):
                 continue
             replica_id = info.replica_id
             if (replica_id in legacy_runtime.down_thread_pool or

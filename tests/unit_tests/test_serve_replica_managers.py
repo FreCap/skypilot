@@ -13256,6 +13256,88 @@ class TestFailedCleanupReconciliation:
                                           purge=False,
                                           in_flight_drain_cap_seconds=0)
 
+    def test_unowned_durable_teardown_is_reconciled(self):
+        manager = _make_manager()
+        info = self._info()
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.INTERRUPTED)
+        info.status_property.is_scale_down = True
+        info.status_property.drain_cap_seconds = 0
+        assert info.status == (
+            replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN)
+        assert info.status_property.sky_down_status is None
+
+        with mock.patch.object(manager, '_terminate_replica') as terminate, \
+             mock.patch('sky.serve.replica_managers.time.monotonic',
+                        return_value=100):
+            manager._reconcile_failed_cleanup([info])
+
+        terminate.assert_called_once_with(1,
+                                          sync_down_logs=False,
+                                          replica_drain_delay_seconds=0,
+                                          is_scale_down=True,
+                                          purge=False,
+                                          in_flight_drain_cap_seconds=0)
+
+    def test_pre_admission_idle_wait_is_not_reconciled(self):
+        manager = _make_manager()
+        info = self._info()
+        info.status_property.is_scale_down = True
+        info.status_property.wait_for_idle_before_termination = True
+        info.status_property.sky_down_status = (
+            common_utils.ProcessStatus.SCHEDULED)
+        assert info.status == (
+            replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN)
+
+        with mock.patch.object(manager, '_terminate_replica') as terminate, \
+             mock.patch('sky.serve.replica_managers.time.monotonic',
+                        return_value=100):
+            manager._reconcile_failed_cleanup([info])
+
+        terminate.assert_not_called()
+
+    @pytest.mark.parametrize('down_status', [
+        common_utils.ProcessStatus.SCHEDULED,
+        common_utils.ProcessStatus.RUNNING,
+    ])
+    def test_unowned_preempted_teardown_is_reconciled(self, down_status):
+        manager = _make_manager()
+        info = self._info()
+        info.status_property.preempted = True
+        info.status_property.sky_down_status = down_status
+        assert info.status == (
+            replica_managers.serve_state.ReplicaStatus.PREEMPTED)
+
+        with mock.patch.object(manager, '_terminate_replica') as terminate, \
+             mock.patch('sky.serve.replica_managers.time.monotonic',
+                        return_value=100):
+            manager._reconcile_failed_cleanup([info])
+
+        terminate.assert_called_once_with(1,
+                                          sync_down_logs=False,
+                                          replica_drain_delay_seconds=0,
+                                          is_scale_down=True,
+                                          purge=False,
+                                          in_flight_drain_cap_seconds=0)
+
+    def test_completed_teardown_tombstone_is_not_reconciled(self):
+        manager = _make_manager()
+        info = self._info()
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.INTERRUPTED)
+        info.status_property.sky_down_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        assert info.status == (
+            replica_managers.serve_state.ReplicaStatus.SHUTTING_DOWN)
+        manager._failed_cleanup_retry_at[info.replica_id] = 0
+
+        with mock.patch.object(manager, '_terminate_replica') as terminate, \
+             mock.patch('sky.serve.replica_managers.time.monotonic',
+                        return_value=100):
+            manager._reconcile_failed_cleanup([info])
+
+        terminate.assert_not_called()
+
     def test_cleanup_retry_wave_schedules_v2_before_ordinary(self):
         manager = _make_manager()
         ordinary = self._info(1)
