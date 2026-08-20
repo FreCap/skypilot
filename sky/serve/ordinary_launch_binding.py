@@ -5337,7 +5337,8 @@ def provider_absence_projection_authority_in_connection(
             != ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value or
             association['provider_evidence'] != ProviderEvidence.ABSENT.value or
             association['effect_phase']
-            not in (EffectPhase.PROVIDER_IO.value,
+            not in (EffectPhase.NOT_STARTED.value,
+                    EffectPhase.PROVIDER_IO.value,
                     EffectPhase.SERVICE_JOB_IO.value) or
             association['paid_capacity_pool_key'] is not None):
         raise OrdinaryLaunchBindingConflict(

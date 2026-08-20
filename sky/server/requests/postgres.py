@@ -3902,6 +3902,27 @@ def bound_non_pool_provider_reconciliation_ready(
             facts.retention_pin_active)
 
 
+def bound_non_pool_provider_absence_is_recorded(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+) -> bool:
+    """Return whether immutable exact absence is ready for projection."""
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return False
+    with engine.begin() as connection:
+        association = ordinary_launch_binding.lock_reduction_authority_in_connection(
+            connection, context)
+        return bool(
+            _controller_authority_matches_reduction(association, authority) and
+            association['resolution']
+            == ordinary_launch_binding.Resolution.AMBIGUOUS.value and
+            association['reconciliation_outcome'] == ordinary_launch_binding.
+            ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value and
+            association['provider_evidence']
+            == ordinary_launch_binding.ProviderEvidence.ABSENT.value)
+
+
 def _commit_bound_ordinary_launch_cancel_intent(
     context: ordinary_launch_binding_lib.BoundLaunchContext,
     authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
