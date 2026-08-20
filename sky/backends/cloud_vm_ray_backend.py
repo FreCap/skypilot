@@ -903,6 +903,45 @@ class RetryingVmProvisioner:
                 'Refusing a SkyServe replica launch after its durable '
                 'service generation changed.')
 
+    def _validate_service_replica_launch_preflight(self) -> None:
+        """Reject stale protocol-v2 planning without granting provider I/O.
+
+        Protocol-v2 reserved fill deliberately releases its active association
+        guard between bounded provider effects so a passive Kubernetes/Kueue
+        wait cannot retain the service advisory lock.  Planning and local INIT
+        bookkeeping in that interval therefore use the existing conservative
+        non-locking qualification.  Every provider-bearing call still enters
+        ``_service_replica_launch_provider_guard()`` and requires the exact
+        active effect authorization there.
+        """
+        try:
+            reserved_fill_fence = (
+                reserved_capacity.parse_protocol_v2_launch_fence(
+                    self._extra_launch_context))
+        except ValueError as error:
+            raise reserved_capacity.ReservedFillLaunchFenceError(
+                'Reserved-fill preflight context is malformed.') from error
+        if reserved_fill_fence is None:
+            self._validate_service_replica_launch_fence()
+            return
+        try:
+            context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
+                self._extra_launch_context)
+            claim = request_storage.active_execution_claim()
+            authorized = bool(
+                claim is not None and claim.worker_instance_id is not None and
+                claim.request_id == context.request_id and
+                ordinary_launch_binding.binding_allows_request(
+                    str(context.association_id), context.request_id))
+        except Exception as error:
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'Unable to prove current bound SkyServe preflight authority.'
+            ) from error
+        if not authorized:
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'Bound SkyServe preflight has no current association '
+                'authority.')
+
     def _reserved_fill_reclaim_authorization(
         self,
         launch_snapshot: serve_state.ServiceReplicaLaunchFenceSnapshot | None,
@@ -1595,7 +1634,7 @@ class RetryingVmProvisioner:
                     region=to_provision.region):
                 # Do not create even a local INIT record for a request that
                 # lost authority while placement/config generation ran.
-                self._validate_service_replica_launch_fence()
+                self._validate_service_replica_launch_preflight()
                 try:
                     config_dict = backend_utils.write_cluster_config(
                         to_provision,
@@ -1706,7 +1745,7 @@ class RetryingVmProvisioner:
                 workload_id, workload_task_id = _get_workload_attribution(
                     task, cluster_name, self._workload_type,
                     self._extra_launch_context)
-                self._validate_service_replica_launch_fence()
+                self._validate_service_replica_launch_preflight()
                 try:
                     self._active_cluster_hash = (
                         global_user_state.add_or_update_cluster(
@@ -2553,7 +2592,7 @@ class RetryingVmProvisioner:
                 # exactly one context and accelerator shape, never a general
                 # cross-cloud/cross-pool retry.
                 self._validate_reserved_fill_candidate(to_provision)
-                self._validate_service_replica_launch_fence()
+                self._validate_service_replica_launch_preflight()
                 # Recheck cluster name as the 'except:' block below may
                 # change the cloud assignment.
                 common_utils.check_cluster_name_is_valid(cluster_name)
