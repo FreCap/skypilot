@@ -742,15 +742,7 @@ def test_worker_provision_timeout_projection_freezes_context_value(monkeypatch):
                         'get_effective_workspace_region_config', resolver)
 
     assert kubernetes_identity._project_worker_provision_timeout(
-        'phx',
-        'research',
-        num_nodes=1,
-        volume_mounts=None,
-        kueue_admission={
-            'local_queue_name': 'inference',
-            'workload_priority_class_name': 'inference-low',
-        },
-        reserved_capacity_fill=False) == -1
+        'phx', 'research', num_nodes=1, volume_mounts=None) == -1
     assert resolver.call_args_list == [
         mock.call(cloud='kubernetes',
                   region='phx',
@@ -761,25 +753,18 @@ def test_worker_provision_timeout_projection_freezes_context_value(monkeypatch):
                   region='phx',
                   keys=('provision_timeout',),
                   workspace='research',
-                  default_value=24 * 60 * 60),
+                  default_value=10),
     ]
 
 
-@pytest.mark.parametrize(
-    ('dws_config', 'kueue_admission', 'expected_default'), [
-        ({}, None, 10),
-        ({
-            'enabled': True
-        }, None, 1200),
-        ({
-            'enabled': True
-        }, {
-            'local_queue_name': 'inference',
-            'workload_priority_class_name': 'inference-low',
-        }, 24 * 60 * 60),
-    ])
+@pytest.mark.parametrize(('dws_config', 'expected_default'), [
+    ({}, 10),
+    ({
+        'enabled': True
+    }, 1200),
+])
 def test_worker_provision_timeout_projection_preserves_existing_default(
-        monkeypatch, dws_config, kueue_admission, expected_default):
+        monkeypatch, dws_config, expected_default):
 
     def resolver(*, keys, default_value, **_kwargs):
         if keys == ('dws',):
@@ -791,36 +776,7 @@ def test_worker_provision_timeout_projection_preserves_existing_default(
                         'get_effective_workspace_region_config', resolver)
 
     assert kubernetes_identity._project_worker_provision_timeout(
-        'phx',
-        'research',
-        num_nodes=1,
-        volume_mounts=None,
-        kueue_admission=kueue_admission,
-        reserved_capacity_fill=False) == expected_default
-
-
-@pytest.mark.parametrize('kueue_admission', [
-    None,
-    {
-        'local_queue_name': 'inference',
-        'workload_priority_class_name': 'inference-low',
-    },
-])
-def test_reserved_fill_projection_always_waits_for_committed_capacity(
-        monkeypatch, kueue_admission):
-    resolver = mock.Mock(side_effect=AssertionError(
-        'reserved fill must not inherit a finite ambient timeout'))
-    monkeypatch.setattr(skypilot_config,
-                        'get_effective_workspace_region_config', resolver)
-
-    assert kubernetes_identity._project_worker_provision_timeout(
-        'phx',
-        'research',
-        num_nodes=1,
-        volume_mounts=None,
-        kueue_admission=kueue_admission,
-        reserved_capacity_fill=True) == -1
-    resolver.assert_not_called()
+        'phx', 'research', num_nodes=1, volume_mounts=None) == expected_default
 
 
 def test_worker_accelerator_scheduling_freezes_verified_east_and_phx_labels(
@@ -1084,7 +1040,7 @@ run: echo hi
 
     with pytest.raises(ValueError, match='task resource labels'):
         kubernetes_identity.build_worker_placement_projections(
-            task, workspace='research', reserved_capacity_fill=False)
+            task, workspace='research')
 
     dag = execution.dag_utils.convert_entrypoint_to_dag(task)
     launch_context = {
@@ -1161,7 +1117,7 @@ run: echo hi
 
     with pytest.raises(ValueError, match=key):
         kubernetes_identity.build_worker_placement_projections(
-            task, workspace='research', reserved_capacity_fill=False)
+            task, workspace='research')
 
     dag = execution.dag_utils.convert_entrypoint_to_dag(task)
     launch_context = {
@@ -1192,7 +1148,7 @@ run: echo hi
 
     with pytest.raises(ValueError, match='provision_timeout'):
         kubernetes_identity.build_worker_placement_projections(
-            task, workspace='research', reserved_capacity_fill=False)
+            task, workspace='research')
 
     dag = execution.dag_utils.convert_entrypoint_to_dag(task)
     launch_context = {
@@ -1221,7 +1177,7 @@ run: echo hi
 
     with pytest.raises(ValueError, match='direct FUSE activation'):
         kubernetes_identity.build_worker_placement_projections(
-            task, workspace='research', reserved_capacity_fill=False)
+            task, workspace='research')
 
     dag = execution.dag_utils.convert_entrypoint_to_dag(task)
     launch_context = {
@@ -1354,10 +1310,7 @@ run: echo hi
                         lambda *_args, **_kwargs: -1)
 
     projected = kubernetes_identity.build_worker_placement_projections(
-        task,
-        workspace='research',
-        reserved_capacity_fill=True,
-        placement_catalog={})
+        task, workspace='research', placement_catalog={})
 
     assert projected is not None
     assert [
@@ -1418,10 +1371,7 @@ run: echo hi
                         lambda *_args, **_kwargs: -1)
 
     projected = kubernetes_identity.build_worker_placement_projections(
-        task,
-        workspace='inference',
-        reserved_capacity_fill=True,
-        placement_catalog={})
+        task, workspace='inference', placement_catalog={})
 
     assert projected is not None
     assert projected[0]['projection_version'] == 3
@@ -1457,10 +1407,7 @@ run: echo hi
                         project_location)
 
     assert kubernetes_identity.build_worker_placement_projections(
-        task,
-        workspace='research',
-        reserved_capacity_fill=False,
-        placement_catalog=placement_catalog) is None
+        task, workspace='research', placement_catalog=placement_catalog) is None
     project_location.assert_not_called()
 
 

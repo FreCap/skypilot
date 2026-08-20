@@ -1,10 +1,10 @@
 # Fail-closed Kueue management for Kubernetes pods
 
 - Status: Incident root cause proven; Phase 1 merged; protocol-v2 response,
-  adoption, and post-wait admitted-only/Pod-UID continuity hardening
-  implemented in the reserved-fill feature worktree; final feature validation
-  and cluster policy rollout pending
-- Last updated: 2026-08-13
+  adoption, post-wait admitted-only/Pod-UID continuity, and two-phase Kueue
+  admission/scheduling deadlines implemented and unit-verified; final feature
+  validation and cluster policy rollout pending
+- Last updated: 2026-08-20
 - Owners: SkyPilot Kubernetes and Serve
 
 ## Context
@@ -88,6 +88,9 @@ References:
 - Preserve existing behavior for placements with no effective Kueue queue.
 - Cover SkyServe replicas because they use the same Kubernetes Pod provisioning
   path as ordinary SkyPilot clusters.
+- Keep Kueue quota waiting out of the ordinary Pod scheduling timeout. A
+  required-Kueue Pod gets a bounded queue-admission phase followed by a fresh
+  configured scheduling deadline after admission.
 
 ## Non-goals
 
@@ -182,15 +185,61 @@ When an effective queue is present, or `require_managed` is `true`:
    `cluster-queue=<preflight-cluster-queue>` outputs are mandatory and exact
    after admission. This requires Kueue's `AssignQueueLabelsForPods` feature
    and closes a LocalQueue-retargeting race between preflight and admission.
-   Protocol v2 rejects unknown
-   Kueue-prefixed metadata and any scheduling gate other than Kueue admission
-   or topology. Non-compliant Pods are deleted rather than adopted.
+   With Kueue v0.19 implicit Topology Aware Scheduling, admission may also add
+   `podset-unconstrained-topology="true"`; SkyPilot permits only that exact
+   literal on an otherwise exact admitted, ungated Pod. It remains forbidden
+   on the submitted or still-gated projection. Protocol v2 rejects every other
+   unknown Kueue-prefixed metadata field and any scheduling gate other than
+   Kueue admission or topology. Non-compliant Pods are deleted rather than
+   adopted.
 8. On the generic non-projected path, a resource-level `priority_class` is
    emitted as the official `kueue.x-k8s.io/priority-class` label. If that
    WorkloadPriorityClass does not exist, Kueue keeps the workload from being
    admitted; SkyPilot does not fall back to an unprioritized workload.
    Protocol-v2 projected workers instead reject task-owned priority and attest
    the immutable server-owned projection admission.
+9. Required-Kueue provisioning has two sequential, bounded phases. First,
+   SkyPilot waits up to the existing 24-hour Kubernetes queueing deadline for
+   every exact Pod name and UID to lose the Kueue admission gate. While gated,
+   each observation retains the managed finalizer and exact request labels and
+   role hash; when the gate disappears it must also carry the exact PodSet
+   binding and LocalQueue/ClusterQueue outputs. Every observation reuses the
+   adoption attestation contract, so deletion, same-name replacement, identity
+   mutation, or an ungated but incompletely admitted Pod fails closed. Time
+   spent behind Kueue quota does not consume `provision_timeout`. After all Pods
+   are admitted, SkyPilot starts a fresh `provision_timeout` clock for scheduler
+   binding and then uses the existing unbounded container-initialization wait.
+   Placements without required Kueue retain the existing single scheduling
+   clock. The Pod lifecycle remains the runtime correctness boundary; reading
+   Kueue Workloads is optional diagnostics and is not an RBAC prerequisite.
+   Passive gated observations hold no service advisory lock, fleet guard, or
+   process provider phase. Optional ephemeral-volume provisioning and the
+   bounded Kubernetes bootstrap transaction (including Service/RBAC upserts)
+   each run in a fresh short effect epoch; a stale launch cannot leak those
+   provider objects before reaching Pod creation. The immediate create response
+   is captured under another short effect epoch; after the passive watcher
+   first observes all gates
+   removed, it reacquires exact request/association and provider authority and
+   repeats the full batch UID, finalizer, PodSet, and LocalQueue/ClusterQueue
+   proof before handing off to scheduling. Database-only service updates,
+   correctly fenced same-UID protocol-v2 recovery, and compatible v2
+   materialization therefore remain able to make progress during the queue
+   wait. The immutable physical-cluster capture deliberately remains active:
+   another v2 caller may join it only with the same physical UID, while a
+   tokenless legacy provider call against that same context fails busy until
+   the capture retires. Isolated ambient work for another context remains
+   independent. The same exact Pods are fresh-read under a later short epoch
+   after Running before provisioning success is published.
+   If the 24-hour admission deadline expires, protocol-v2 reserved fill emits
+   a wire-safe typed `ReservedFillProviderPresentError` carrying the exact Pod
+   name/UID set. It performs no request-owned deletion, absence publication,
+   capacity failover, or legacy teardown proof. The durable association and
+   replica pin remain authoritative until reconciliation freshly observes
+   `PRESENT`, performs the single UID-fenced down, and proves `ABSENT`; an
+   authority change at the timeout has the same fail-closed result. Generic
+   required-Kueue launches retain the ordinary Kubernetes timeout error. The
+   cleanup consumer is stacked PR #1608; #1607 must not deploy without that
+   canonical adjudication path available in the rollout.
 
 Kueue plain-Pod management does not cover Deployment-owned Pods with the same
 create-response attestation boundary.  Required mode therefore rejects
@@ -323,24 +372,33 @@ The following invariants hold whenever an effective queue exists or
 - A caller cannot forge attestation by supplying the managed label in its Pod
   config.
 - The immediate create response proves that Kueue admission mutation ran but
-  not that quota was admitted; normal provisioning waits while Kueue retains
-  the scheduling gate. The all-containers-Running observation returns each
-  Pod's exact UID. Successful provisioning additionally requires a fresh
-  post-wait GET of that same name and UID, still in `Running`, and attests its
-  admitted-only identity. The fresh Pod must retain its exact projected
-  scheduler and bind a non-empty `nodeName`; a fresh read of that exact Node
-  must carry the immutable projection's exact accelerator label. A same-name
-  replacement, still-gated or unbound object, alternate scheduler, or wrong
-  accelerator Node fails closed.
+  not that quota was admitted. Required-Kueue provisioning first waits under
+  the bounded queue-admission deadline while Kueue retains the scheduling gate,
+  continuously binding every observation to the exact original Pod UID and
+  adoption identity without holding service/fleet authority or the process
+  provider phase. Once all gates are removed and exact admission outputs are
+  present, one fresh bounded authority epoch repeats that exact batch proof;
+  only then does the ordinary configured scheduling timeout begin from zero.
+  It is not charged for time spent waiting on Kueue quota. The
+  all-containers-Running observation returns each Pod's exact UID. Successful
+   provisioning additionally requires a fresh post-wait GET of that same name
+  and UID, still in `Running`, and attests its admitted-only identity. The fresh
+  Pod must retain its exact projected scheduler and bind a non-empty
+  `nodeName`; a fresh read of that exact Node must carry the immutable
+  projection's exact accelerator label. A missing or same-name replacement
+  Pod, mutated admission identity, still-gated or unbound post-wait object,
+  alternate scheduler, or wrong accelerator Node fails closed.
 - Immediate creation and later adoption are distinct attestation phases. The
   create response must have pre-admission metadata plus Kueue's role hash and
   admission gate and must remain unbound. Adoption accepts only that state or
   an admitted state with
   `podset=role-hash`, optional TAS workload identity, the mandatory exact
-  local/cluster queue output pair, and Kueue's managed finalizer. A bound
-  admitted adoption is accepted only after the exact bound Node passes the
-  projected accelerator-label check; an admitted Pending Pod may remain
-  unbound until the post-wait proof.
+  local/cluster queue output pair, and Kueue's managed finalizer. Kueue v0.19's
+  implicit-TAS admission output may additionally be the exact annotation
+  `podset-unconstrained-topology="true"`; all other values, phases, and unknown
+  Kueue metadata fail closed. A bound admitted adoption is accepted only after
+  the exact bound Node passes the projected accelerator-label check; an
+  admitted Pending Pod may remain unbound until the post-wait proof.
 - Multi-node clusters remain one Kueue pod group, so partial admission cannot
   make a subset of the requested nodes run.
 - Kueue preemption may delete a Pod.  SkyPilot/SkyServe recovery recreates the
@@ -425,10 +483,18 @@ preemption contract.
   rather than a version-specific raw-JSON fallback; 32.0.0 remains unsupported
   because of its authentication regression.
 - Gate, normalize, attest, and clean up direct Pods in the provisioner.
+- Split required-Kueue waiting into an exact-Pod, bounded admission phase and a
+  fresh ordinary scheduler-binding phase. Reuse the existing 24-hour queueing
+  default for the first phase and the rendered `provision_timeout` for the
+  second; do not make reserved-fill provisioning indefinite. Split protocol-v2
+  provider authority at the same boundary: concrete create/read/mutation
+  effects use short idempotent association/provider epochs, while passive
+  admission and scheduling waits retain no service lock or provider phase.
 - For projection protocol v2, expose an explicit provider protocol marker,
-  strip every caller Kueue metadata/gate surface, and attest Kueue v0.18's
+  strip every caller Kueue metadata/gate surface, and attest Kueue's
   phase-specific role-hash, PodSet, optional workload, mandatory exact queue
-  outputs, and narrow response allowlists. The all-containers-Running wait
+  outputs, and narrow response allowlists, including only v0.19's exact
+  admitted implicit-TAS output. The all-containers-Running wait
   returns exact Pod UIDs; fresh-read and admitted-only reattest those same
   names and UIDs after the passive wait. Do not infer this strict contract from
   the accidental presence of individual projection fields.
@@ -661,7 +727,21 @@ Automated tests must prove:
   `nodeName`, and a fresh exact Node with the projected accelerator label; a
   gated object, same-name replacement, unbound/wrong-node object, alternate
   scheduler, or non-Running object is deleted and rejected; and
+- a correctly gated Pod may wait longer than `provision_timeout`, admit before
+  the queue deadline, and then receive the full fresh scheduling timeout;
+- a non-Kueue unscheduled Pod retains the existing single timeout;
+- an admitted but still-unbound Kueue Pod fails after the fresh configured
+  scheduling timeout; and
+- a Pod deleted, recreated under the same name, or mutated while awaiting
+  Kueue admission fails closed; and
 - required mode rejects Deployment-owned Pods.
+
+The 2026-08-20 implementation verification ran the complete Kubernetes
+provisioner unit-test module plus the Serve platform-projection and Kubernetes
+cloud timeout suites. It covers a 16-second valid quota wait with a 15-second
+configured scheduling timeout, a full fresh 15-second post-admission timeout,
+the unchanged non-Kueue path, the bounded queue deadline, and fail-closed
+deletion, recreation, finalizer loss, and queue-identity mutation.
 
 Production non-compute inspection, with exact namespace, queue, and classes
 substituted:
@@ -754,6 +834,15 @@ read-only LocalQueue preflight preserves fail-closed behavior and returns the
 actionable error before creating any object.  SkyPilot still does not create
 the queue because its ClusterQueue, quota, cohort, and preemption policy are
 operator-owned decisions.
+
+### Make reserved-fill provisioning wait indefinitely
+
+Rejected as the steady-state timeout contract. An indefinite ambient
+provisioning timeout prevents legitimate Kueue queueing from failing early, but
+also erases the scheduler-placement bound, affects non-Kueue pools, and can
+retain a malformed or permanently blocked claim forever. The two-phase watcher
+preserves a long but bounded Kueue admission window and starts the operator's
+short scheduling timeout only after admission.
 
 ### Require cluster-wide `manageJobsWithoutQueueName`
 

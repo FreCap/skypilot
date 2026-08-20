@@ -2227,8 +2227,6 @@ def _start(service_name: str,
                 kubernetes_identity.build_worker_placement_projections(
                     task,
                     workspace=workspace,
-                    reserved_capacity_fill=(
-                        service_spec.reserved_capacity_fill),
                     placement_catalog=placement_catalog))
         else:
             (controller_job_projection, controller_work_cache,

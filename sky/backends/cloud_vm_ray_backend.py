@@ -112,6 +112,9 @@ from sky.utils.plugin_extensions import ExternalFailureSource
 metrics_utils = adaptors_common.LazyImport('sky.metrics.utils')
 ordinary_launch_binding = adaptors_common.LazyImport(
     'sky.serve.ordinary_launch_binding')
+ordinary_launch_request = adaptors_common.LazyImport(
+    'sky.server.requests.ordinary_launch')
+provider_phase = adaptors_common.LazyImport('sky.serve.provider_phase')
 serve_placement_history = adaptors_common.LazyImport(
     'sky.serve.placement_history')
 
@@ -1032,14 +1035,36 @@ class RetryingVmProvisioner:
 
     @contextlib.contextmanager
     def _service_replica_launch_provider_guard(self) -> typing.Iterator[None]:
-        """Hold fleet reclaim and per-service authority across provider I/O."""
+        """Hold one bounded effect epoch across concrete provider I/O."""
         # Canonical order: existing service (or already-held association)
         # authority, a fresh five-second policy ticket, then the fleet gate
         # immediately around provider mutation.
-        with self._service_replica_launch_provider_owner_guard(
-        ) as launch_snapshot:
-            with self._reserved_fill_reclaim_provider_guard(launch_snapshot):
-                yield
+        try:
+            reserved_fill_fence = (
+                reserved_capacity.parse_protocol_v2_launch_fence(
+                    self._extra_launch_context))
+        except ValueError as error:
+            raise reserved_capacity.ReservedFillLaunchFenceError(
+                'Reserved-fill provider effect context is malformed.') from (
+                    error)
+        # Ordinary and transitional paths retain execution.py's outer
+        # provider scope. Protocol-v2 Kubernetes fill deliberately does not:
+        # a Kueue quota wait may last hours and must not retain either the
+        # per-service advisory lock or the process provider phase. Re-enter
+        # the idempotent association boundary for each exact effect instead.
+        effect_authority = (
+            ordinary_launch_request._provider_effect_guard(  # pylint: disable=protected-access
+                self._extra_launch_context)
+            if reserved_fill_fence is not None else contextlib.nullcontext())
+        phase = (provider_phase.provider_phase(
+            provider_phase.ProviderPhaseMode.V2_FENCED) if reserved_fill_fence
+                 is not None else contextlib.nullcontext())
+        with effect_authority, phase:
+            with self._service_replica_launch_provider_owner_guard(
+            ) as launch_snapshot:
+                with self._reserved_fill_reclaim_provider_guard(
+                        launch_snapshot):
+                    yield
 
     @contextlib.contextmanager
     def _service_replica_launch_provider_owner_guard(

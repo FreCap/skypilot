@@ -232,6 +232,436 @@ def _set_admitted_kueue_identity(pod,
     pod.metadata.labels[k8s_constants.KUEUE_CLUSTER_QUEUE_LABEL] = cluster_queue
 
 
+def _required_kueue_wait_pod(*,
+                             pod_name='service-replica-head',
+                             pod_uid='pod-uid',
+                             pod_group='service-replica',
+                             admitted=False):
+    pod = _fake_pod(pod_name)
+    pod.metadata.namespace = 'inference-ns'
+    pod.metadata.uid = pod_uid
+    pod.metadata.deletion_timestamp = None
+    pod.metadata.labels = {
+        k8s_constants.KUEUE_MANAGED_KEY: 'true',
+        k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+        k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
+        instance.constants.TAG_SKYPILOT_CLUSTER_NAME: pod_group,
+    }
+    _set_required_kueue_group_identity(pod, pod_group)
+    pod.metadata.finalizers = [k8s_constants.KUEUE_MANAGED_FINALIZER]
+    pod.spec.scheduling_gates = [
+        types.SimpleNamespace(
+            name=k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE)
+    ]
+    pod.spec.node_name = None
+    pod.status.conditions = []
+    if admitted:
+        _set_admitted_kueue_identity(pod,
+                                     pod_group=pod_group,
+                                     queue='inference')
+        pod.spec.scheduling_gates = []
+    return pod
+
+
+def _attest_required_kueue_wait_pod(pod):
+    instance._attest_required_kueue_pod(  # pylint: disable=protected-access
+        pod,
+        'inference-ns',
+        None,
+        'inference',
+        'service-replica',
+        1,
+        'inference-low',
+        expected_cluster_queue='inference-reserved',
+        strict_projection=True,
+        expected_lifecycle='adoption',
+        defer_cleanup=True)
+
+
+class _KueueAdmissionClock:
+
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def test_required_kueue_admission_wait_does_not_consume_scheduling_timeout(
+        monkeypatch):
+    """A valid queue wait may exceed the short scheduler placement bound."""
+    gated_pod = _required_kueue_wait_pod()
+    admitted_pod = _required_kueue_wait_pod(admitted=True)
+    clock = _KueueAdmissionClock()
+    core_api = mock.MagicMock()
+
+    def list_pods(*_args, **_kwargs):
+        pod = gated_pod if clock.now < 16 else admitted_pod
+        return types.SimpleNamespace(items=[pod])
+
+    core_api.list_namespaced_pod.side_effect = list_pods
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(instance, 'time', clock)
+
+    pod_uids = instance._wait_for_required_kueue_admission(  # pylint: disable=protected-access
+        'inference-ns',
+        None, [gated_pod],
+        _attest_required_kueue_wait_pod,
+        None,
+        timeout=30)
+
+    assert clock.now == 16
+    assert pod_uids == {'service-replica-head': 'pod-uid'}
+    core_api.delete_namespaced_pod.assert_not_called()
+
+
+def test_required_kueue_admission_holds_no_authority_while_gated(monkeypatch):
+    """Only the admitted handoff, never passive quota polling, is guarded."""
+    gated_pod = _required_kueue_wait_pod()
+    admitted_pod = _required_kueue_wait_pod(admitted=True)
+    clock = _KueueAdmissionClock()
+    core_api = mock.MagicMock()
+    observed_polls = iter([gated_pod, admitted_pod, admitted_pod])
+    events = []
+    guard_active = False
+
+    def list_pods(*_args, **_kwargs):
+        events.append(f'list-guard-{guard_active}')
+        return types.SimpleNamespace(items=[next(observed_polls)])
+
+    @contextlib.contextmanager
+    def provider_effect_guard():
+        nonlocal guard_active
+        assert not guard_active
+        guard_active = True
+        events.append('guard-enter')
+        try:
+            yield
+        finally:
+            events.append('guard-exit')
+            guard_active = False
+
+    def attest(pod):
+        lifecycle = ('admitted' if not pod.spec.scheduling_gates else 'gated')
+        events.append(f'attest-{lifecycle}-guard-{guard_active}')
+        _attest_required_kueue_wait_pod(pod)
+
+    def sleep(seconds):
+        assert not guard_active
+        events.append('sleep')
+        clock.now += seconds
+
+    clock.sleep = sleep
+    core_api.list_namespaced_pod.side_effect = list_pods
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(instance, 'time', clock)
+
+    pod_uids = instance._wait_for_required_kueue_admission(  # pylint: disable=protected-access
+        'inference-ns',
+        None, [gated_pod],
+        attest,
+        provider_effect_guard,
+        timeout=30)
+
+    assert pod_uids == {'service-replica-head': 'pod-uid'}
+    assert events == [
+        'list-guard-False', 'attest-gated-guard-False', 'sleep',
+        'list-guard-False', 'attest-admitted-guard-False', 'guard-enter',
+        'list-guard-True', 'attest-admitted-guard-True', 'guard-exit'
+    ]
+
+
+def test_required_kueue_admission_preserves_authority_cancellation(monkeypatch):
+    """A lost association rejects the admitted handoff fail closed."""
+    admitted_pod = _required_kueue_wait_pod(admitted=True)
+    core_api = mock.MagicMock()
+    core_api.list_namespaced_pod.return_value = types.SimpleNamespace(
+        items=[admitted_pod])
+
+    def rejected_provider_effect_guard():
+        guard = mock.MagicMock()
+        guard.__enter__.side_effect = sky_exceptions.RequestCancelled(
+            'launch authority changed')
+        return guard
+
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+
+    with pytest.raises(sky_exceptions.RequestCancelled,
+                       match='launch authority changed'):
+        instance._wait_for_required_kueue_admission(  # pylint: disable=protected-access
+            'inference-ns',
+            None, [admitted_pod],
+            _attest_required_kueue_wait_pod,
+            rejected_provider_effect_guard,
+            timeout=30)
+
+    core_api.delete_namespaced_pod.assert_not_called()
+
+
+def test_required_kueue_admission_has_no_six_minute_inner_deadline(monkeypatch):
+    """The bounded admission phase, not an implicit 6m timer, owns waiting."""
+    gated_pod = _required_kueue_wait_pod()
+    admitted_pod = _required_kueue_wait_pod(admitted=True)
+    clock = _KueueAdmissionClock()
+    core_api = mock.MagicMock()
+
+    def list_pods(*_args, **_kwargs):
+        pod = gated_pod if clock.now < 362 else admitted_pod
+        return types.SimpleNamespace(items=[pod])
+
+    core_api.list_namespaced_pod.side_effect = list_pods
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(instance, 'time', clock)
+
+    pod_uids = instance._wait_for_required_kueue_admission(  # pylint: disable=protected-access
+        'inference-ns',
+        None, [gated_pod],
+        _attest_required_kueue_wait_pod,
+        None,
+        timeout=400)
+
+    assert clock.now == 362
+    assert pod_uids == {'service-replica-head': 'pod-uid'}
+
+
+def test_required_kueue_admitted_pod_gets_fresh_scheduling_timeout(monkeypatch):
+    """The 15-second scheduler clock starts only after Kueue admission."""
+    gated_pod = _required_kueue_wait_pod()
+    admitted_pod = _required_kueue_wait_pod(admitted=True)
+    clock = _KueueAdmissionClock()
+    core_api = mock.MagicMock()
+
+    def list_pods(*_args, **_kwargs):
+        pod = gated_pod if clock.now < 16 else admitted_pod
+        return types.SimpleNamespace(items=[pod])
+
+    core_api.list_namespaced_pod.side_effect = list_pods
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(instance, 'time', clock)
+    monkeypatch.setattr(pod_scheduling, 'time', clock)
+    monkeypatch.setattr('sky.skypilot_config.get_effective_region_config',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pod_scheduling,
+                        '_raise_for_karpenter_gpu_incompatibility',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pod_scheduling, '_update_spinner_message',
+                        lambda **_kwargs: None)
+    monkeypatch.setattr(
+        pod_scheduling, '_raise_pod_scheduling_errors',
+        mock.Mock(side_effect=config_lib.KubernetesError('schedule timeout')))
+
+    instance._wait_for_required_kueue_admission(  # pylint: disable=protected-access
+        'inference-ns',
+        None, [gated_pod],
+        _attest_required_kueue_wait_pod,
+        None,
+        timeout=30)
+    assert clock.now == 16
+
+    with pytest.raises(config_lib.KubernetesError, match='schedule timeout'):
+        pod_scheduling._wait_for_pods_to_schedule(  # pylint: disable=protected-access
+            namespace='inference-ns',
+            context=None,
+            new_nodes=[admitted_pod],
+            timeout=15,
+            cluster_name='service-replica',
+            create_pods_start=datetime.datetime.now(datetime.timezone.utc))
+
+    assert clock.now == 31
+
+
+def test_non_kueue_create_pods_retains_single_configured_timeout(monkeypatch):
+    cluster_on_cloud = 'ordinary-cluster'
+    head_name = f'{cluster_on_cloud}-head'
+    existing_pod = _fake_pod(head_name)
+    existing_pod.metadata.uid = 'ordinary-uid'
+    existing_pod.metadata.labels = {
+        instance.constants.TAG_SKYPILOT_CLUSTER_NAME: cluster_on_cloud,
+    }
+    _patch_create_pods_k8s_boundary(monkeypatch, {head_name: existing_pod},
+                                    head_name)
+    admission_wait = mock.Mock(side_effect=AssertionError(
+        'non-Kueue provisioning must not enter the admission watcher'))
+    schedule_wait = mock.Mock()
+    monkeypatch.setattr(instance, '_wait_for_required_kueue_admission',
+                        admission_wait)
+    monkeypatch.setattr(instance, '_wait_for_pods_to_schedule', schedule_wait)
+    config = _make_provision_config(count=1)
+    config.provider_config['timeout'] = 15
+
+    instance._create_pods(  # pylint: disable=protected-access
+        'us', cluster_on_cloud, cluster_on_cloud, config)
+
+    admission_wait.assert_not_called()
+    assert schedule_wait.call_args.args[3] == 15
+
+
+def test_required_kueue_create_pods_starts_scheduling_phase_after_admission(
+        monkeypatch):
+    cluster_on_cloud = 'kueue-cluster'
+    head_name = f'{cluster_on_cloud}-head'
+    existing_pod = _required_kueue_wait_pod(pod_name=head_name,
+                                            pod_uid='admitted-uid',
+                                            pod_group=cluster_on_cloud)
+    _patch_create_pods_k8s_boundary(monkeypatch, {head_name: existing_pod},
+                                    head_name)
+    # The focused admission watcher tests own exact identity validation. This
+    # integration test owns only phase ordering and deadline propagation.
+    monkeypatch.setattr(instance, '_attest_created_serve_worker_pod',
+                        lambda *_args, **_kwargs: None)
+
+    create_time = datetime.datetime(2026,
+                                    8,
+                                    20,
+                                    1,
+                                    tzinfo=datetime.timezone.utc)
+    admission_time = create_time + datetime.timedelta(seconds=16)
+    now_values = iter([create_time, admission_time])
+
+    class FakeDateTime:
+
+        @classmethod
+        def now(cls, tz):
+            del cls
+            value = next(now_values)
+            assert value.tzinfo == tz
+            return value
+
+    monkeypatch.setattr(
+        instance, 'datetime',
+        types.SimpleNamespace(datetime=FakeDateTime,
+                              timezone=datetime.timezone))
+    events = []
+
+    def wait_for_admission(*_args, **_kwargs):
+        events.append('admission')
+        return {head_name: 'admitted-uid'}
+
+    def wait_for_schedule(*args, **_kwargs):
+        events.append('schedule')
+        assert args[3] == 15
+        assert args[5] == admission_time
+
+    monkeypatch.setattr(instance, '_wait_for_required_kueue_admission',
+                        wait_for_admission)
+    monkeypatch.setattr(instance, '_wait_for_pods_to_schedule',
+                        wait_for_schedule)
+    config = _make_provision_config(count=1)
+    config.provider_config.update({
+        'timeout': 15,
+        'kueue_local_queue_name': 'inference',
+        'kueue_workload_priority_class_name': 'inference-low',
+    })
+
+    instance._create_pods(  # pylint: disable=protected-access
+        'us', cluster_on_cloud, cluster_on_cloud, config)
+
+    assert events == ['admission', 'schedule']
+
+
+@pytest.mark.parametrize(
+    'failure', ['deleted', 'recreated', 'missing_finalizer', 'queue_mutated'])
+def test_required_kueue_admission_wait_rejects_identity_loss(
+        monkeypatch, failure):
+    initial_pod = _required_kueue_wait_pod()
+    observed_pod = _required_kueue_wait_pod()
+    observed_items = [observed_pod]
+    if failure == 'deleted':
+        observed_items = []
+    elif failure == 'recreated':
+        observed_pod.metadata.uid = 'replacement-uid'
+    elif failure == 'missing_finalizer':
+        observed_pod.metadata.finalizers = []
+    else:
+        assert failure == 'queue_mutated'
+        observed_pod.metadata.labels[
+            k8s_constants.KUEUE_CLUSTER_QUEUE_LABEL] = 'wrong-queue'
+        observed_pod.spec.scheduling_gates = []
+
+    core_api = mock.MagicMock()
+    core_api.list_namespaced_pod.return_value = types.SimpleNamespace(
+        items=observed_items)
+    core_api.read_namespaced_pod.side_effect = _make_api_exception(
+        404, 'Not Found')
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+
+    with pytest.raises(
+            config_lib.KubernetesError,
+            match=('lost the exact Pod' if failure == 'deleted' else 'Kueue')):
+        instance._wait_for_required_kueue_admission(  # pylint: disable=protected-access
+            'inference-ns',
+            None, [initial_pod],
+            _attest_required_kueue_wait_pod,
+            None,
+            timeout=30)
+
+    if failure == 'deleted':
+        core_api.delete_namespaced_pod.assert_not_called()
+    else:
+        core_api.delete_namespaced_pod.assert_called_once()
+
+
+def test_required_kueue_admission_wait_is_bounded(monkeypatch):
+    gated_pod = _required_kueue_wait_pod()
+    clock = _KueueAdmissionClock()
+    core_api = mock.MagicMock()
+    core_api.list_namespaced_pod.return_value = types.SimpleNamespace(
+        items=[gated_pod])
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(instance, 'time', clock)
+
+    with pytest.raises(config_lib.KubernetesError, match='Timed out after 4s'):
+        instance._wait_for_required_kueue_admission(  # pylint: disable=protected-access
+            'inference-ns',
+            None, [gated_pod],
+            _attest_required_kueue_wait_pod,
+            None,
+            timeout=4)
+
+    assert clock.now == 4
+
+
+def test_reserved_fill_kueue_timeout_is_terminal_provider_present(monkeypatch):
+    """A v2 timeout keeps the exact Pod pinned for durable adjudication."""
+    gated_pod = _required_kueue_wait_pod()
+    clock = _KueueAdmissionClock()
+    core_api = mock.MagicMock()
+    core_api.list_namespaced_pod.return_value = types.SimpleNamespace(
+        items=[gated_pod])
+    provider_effect_guard = mock.MagicMock(side_effect=AssertionError(
+        'a passive timeout must not acquire request-owned delete authority'))
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(instance, 'time', clock)
+
+    with pytest.raises(
+            sky_exceptions.ReservedFillProviderPresentError,
+            match='reconciliation retains cleanup authority') as exc_info:
+        instance._wait_for_required_kueue_admission(  # pylint: disable=protected-access
+            'inference-ns',
+            None, [gated_pod],
+            _attest_required_kueue_wait_pod,
+            provider_effect_guard,
+            timeout=4)
+
+    assert exc_info.value.provider_resource_ids == (
+        'inference-ns/service-replica-head@pod-uid',)
+    assert clock.now == 4
+    provider_effect_guard.assert_not_called()
+    core_api.delete_namespaced_pod.assert_not_called()
+
+
 _INVALID_KUEUE_ROLE_HASHES = (
     '',
     '4cb13f910',
@@ -328,6 +758,10 @@ def _patch_create_pods_k8s_boundary(monkeypatch,
                         lambda *a, **k: False)
     monkeypatch.setattr(instance, '_wait_for_pods_to_schedule',
                         lambda *a, **k: None)
+    monkeypatch.setattr(
+        instance, '_wait_for_required_kueue_admission',
+        lambda _namespace, _context, pods, *_args, **_kwargs:
+        {pod.metadata.name: f'uid-{pod.metadata.name}' for pod in pods})
     monkeypatch.setattr(
         instance, '_wait_for_pods_to_run',
         lambda _namespace, _context, _cluster_name, pods:
@@ -1193,6 +1627,63 @@ def test_required_kueue_adoption_accepts_optional_tas_workload_metadata():
         expected_cluster_queue='inference-reserved',
         strict_projection=True,
         expected_lifecycle='adoption')
+
+
+def test_required_kueue_adoption_accepts_v019_implicit_tas_output():
+    """Kueue v0.19 may inject one exact annotation for implicit TAS."""
+    pod_group = 'service-replica'
+    admitted_pod = _required_kueue_wait_pod(pod_group=pod_group, admitted=True)
+    admitted_pod.metadata.annotations[
+        k8s_constants.KUEUE_PODSET_UNCONSTRAINED_TOPOLOGY_ANNOTATION] = 'true'
+
+    instance._attest_required_kueue_pod(  # pylint: disable=protected-access
+        admitted_pod,
+        'inference-ns',
+        None,
+        'inference',
+        pod_group,
+        1,
+        'inference-low',
+        expected_cluster_queue='inference-reserved',
+        strict_projection=True,
+        expected_lifecycle='adoption')
+
+
+@pytest.mark.parametrize('lifecycle,value', [
+    ('gated', 'true'),
+    ('admitted', 'false'),
+    ('admitted', 'TRUE'),
+    ('admitted', True),
+    ('admitted', 1),
+])
+def test_required_kueue_rejects_nonexact_implicit_tas_output(
+        monkeypatch, lifecycle, value):
+    """The v0.19 exception is phase- and value-exact, never a wildcard."""
+    admitted = lifecycle == 'admitted'
+    pod = _required_kueue_wait_pod(admitted=admitted)
+    pod.metadata.annotations[
+        k8s_constants.KUEUE_PODSET_UNCONSTRAINED_TOPOLOGY_ANNOTATION] = value
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = _make_api_exception(
+        404, 'Not Found')
+    monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='Kueue admission contract'):
+        instance._attest_required_kueue_pod(  # pylint: disable=protected-access
+            pod,
+            'inference-ns',
+            None,
+            'inference',
+            'service-replica',
+            1,
+            'inference-low',
+            expected_cluster_queue='inference-reserved',
+            strict_projection=True,
+            expected_lifecycle=('admitted' if admitted else 'create_response'))
+
+    core_api.delete_namespaced_pod.assert_called_once()
 
 
 def _projected_scheduler_pod(*,

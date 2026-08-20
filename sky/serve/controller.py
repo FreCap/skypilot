@@ -4718,8 +4718,6 @@ class SkyServeController:
                         kubernetes_identity.build_worker_placement_projections(
                             update_task,
                             workspace=workspace,
-                            reserved_capacity_fill=(
-                                validation_service.reserved_capacity_fill),
                             placement_catalog=placement_catalog),
                     )
 

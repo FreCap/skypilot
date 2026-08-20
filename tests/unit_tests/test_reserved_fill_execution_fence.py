@@ -1,5 +1,6 @@
 """Executor-side tests for durable reserved-fill placement fencing."""
 # pylint: disable=protected-access
+import concurrent.futures
 import types
 from unittest import mock
 
@@ -729,7 +730,7 @@ def test_execute_dag_ordinary_launch_does_not_install_provider_fence():
     get_uid.assert_not_called()
 
 
-def test_execute_dag_enters_v2_phase_before_physical_capture():
+def test_execute_dag_bounds_v2_phase_to_physical_capture():
     task = _task()
     dag = _Dag(task)
     backend = mock.MagicMock()
@@ -780,7 +781,131 @@ def test_execute_dag_enters_v2_phase_before_physical_capture():
 
     assert result_handle is mock.sentinel.handle
     assert events == [
-        'phase-enter', 'physical-enter', 'physical-exit', 'phase-exit'
+        'phase-enter', 'physical-enter', 'phase-exit', 'physical-exit'
+    ]
+
+
+def test_pool_a_gated_wait_allows_compatible_v2_work_but_not_ambient_context(
+        monkeypatch, tmp_path):
+    """A passive wait retains only its joinable exact physical capture."""
+    task = _task()
+    dag = _Dag(task)
+    backend = mock.MagicMock()
+    events = []
+    service_authority_active = False
+    provider_phase_active = False
+
+    @execution.contextlib.contextmanager
+    def effect_guard(context):
+        nonlocal service_authority_active
+        assert context is launch_context
+        assert not service_authority_active
+        service_authority_active = True
+        events.append('service-effect-enter')
+        try:
+            yield
+        finally:
+            events.append('service-effect-exit')
+            service_authority_active = False
+
+    @execution.contextlib.contextmanager
+    def phase(mode):
+        nonlocal provider_phase_active
+        assert not provider_phase_active
+        provider_phase_active = True
+        events.append(f'phase-{mode.value}-enter')
+        try:
+            yield
+        finally:
+            events.append(f'phase-{mode.value}-exit')
+            provider_phase_active = False
+
+    def provision(*_args, **_kwargs):
+        # Model pool A blocked behind Kueue. Database-only update/recovery and
+        # same-UID protocol-v2 work must make progress here; the old whole-tail
+        # service/provider scopes kept both flags true for this callback. The
+        # immutable physical capture remains active and fails closed for an
+        # unrelated tokenless legacy caller against this exact context.
+        assert not service_authority_active
+        assert not provider_phase_active
+        assert kubernetes._active_physical_cluster_uid_fence(  # pylint: disable=protected-access
+            'phx-context') == 'physical-uid'
+        events.append('pool-a-passive-wait')
+        events.append('service-update')
+
+        def same_uid_v2_work():
+            with kubernetes.physical_cluster_uid_fence('phx-context',
+                                                       'physical-uid',
+                                                       require_existing=True):
+                with phase(
+                        execution.provider_phase.ProviderPhaseMode.V2_FENCED):
+                    events.append('same-uid-v2-recovery')
+                with effect_guard(launch_context), phase(
+                        execution.provider_phase.ProviderPhaseMode.V2_FENCED):
+                    events.append('pool-b-materialize')
+
+        def tokenless_same_context_read():
+            kubernetes.active_physical_cluster_command_target('phx-context')
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(same_uid_v2_work).result(timeout=5)
+            blocked_read = executor.submit(tokenless_same_context_read)
+            with pytest.raises(
+                    kubernetes.KubernetesPhysicalClusterFenceBusyError):
+                blocked_read.result(timeout=5)
+        events.append('same-context-ambient-blocked')
+        return mock.sentinel.handle, False
+
+    launch_context = _fill_context()
+    backend.provision.side_effect = provision
+    capture_path = tmp_path / 'capture.yaml'
+    capture_path.write_text('capture', encoding='utf-8')
+    monkeypatch.setattr(kubernetes, '_capture_fenced_kubeconfig',
+                        lambda _context: str(capture_path))
+    monkeypatch.setattr(kubernetes, '_new_api_client_from_fence_capture',
+                        lambda _context, _path: mock.MagicMock())
+    monkeypatch.setattr(kubernetes,
+                        '_read_physical_cluster_uid_from_api_client',
+                        lambda _client: 'physical-uid')
+    with mock.patch.object(execution.global_user_state,
+                           'cluster_with_name_exists',
+                           return_value=False), \
+         mock.patch.object(execution.container_image_consumers,
+                           'derive',
+                           return_value=mock.sentinel.image_consumer), \
+         mock.patch.object(execution.ordinary_launch_request,
+                           '_provider_effect_guard',
+                           side_effect=effect_guard), \
+         mock.patch.object(execution.provider_phase,
+                           'provider_phase',
+                           side_effect=phase):
+        _, result_handle = execution._execute_dag(
+            dag,
+            dryrun=False,
+            stream_logs=False,
+            handle=None,
+            backend=backend,
+            retry_until_up=False,
+            optimize_target=common.OptimizeTarget.COST,
+            stages=[execution.Stage.PROVISION],
+            cluster_name='svc-replica-a',
+            detach_setup=False,
+            no_setup=False,
+            clone_disk_from=None,
+            skip_unnecessary_provisioning=False,
+            _quiet_optimizer=False,
+            _is_launched_by_jobs_controller=False,
+            _is_launched_by_sky_serve_controller=True,
+            _extra_launch_context=launch_context)
+
+    assert result_handle is mock.sentinel.handle
+    assert events == [
+        'service-effect-enter', 'phase-v2-fenced-enter', 'phase-v2-fenced-exit',
+        'service-effect-exit', 'pool-a-passive-wait', 'service-update',
+        'phase-v2-fenced-enter', 'same-uid-v2-recovery', 'phase-v2-fenced-exit',
+        'service-effect-enter', 'phase-v2-fenced-enter', 'pool-b-materialize',
+        'phase-v2-fenced-exit', 'service-effect-exit',
+        'same-context-ambient-blocked'
     ]
 
 

@@ -48,11 +48,22 @@ KUEUE_LOCAL_QUEUE_LABEL = 'kueue.x-k8s.io/local-queue-name'
 KUEUE_PODSET_LABEL = 'kueue.x-k8s.io/podset'
 KUEUE_ROLE_HASH_ANNOTATION = 'kueue.x-k8s.io/role-hash'
 KUEUE_WORKLOAD_ANNOTATION = 'kueue.x-k8s.io/workload'
+# Kueue v0.19 injects this exact annotation with the literal string ``true``
+# after admission when implicit Topology Aware Scheduling is active.  It is an
+# admission output, not part of SkyPilot's submitted worker projection.
+KUEUE_PODSET_UNCONSTRAINED_TOPOLOGY_ANNOTATION = (
+    'kueue.x-k8s.io/podset-unconstrained-topology')
 KUEUE_API_GROUP = 'kueue.x-k8s.io'
 KUEUE_API_VERSIONS = ('v1beta2', 'v1beta1')
 KUEUE_LOCAL_QUEUE_PLURAL = 'localqueues'
 KUEUE_CLUSTER_QUEUE_PLURAL = 'clusterqueues'
 KUEUE_ACTIVE_CONDITION = 'Active'
+
+# Required-Kueue Pods can legitimately remain admission-gated while quota is
+# borrowed or reclaimed. Keep that wait separate from the ordinary scheduler
+# placement timeout, but bounded so a permanently blocked queue cannot retain
+# a provider launch forever.
+KUEUE_ADMISSION_TIMEOUT_SECONDS = 24 * 60 * 60
 
 # Pod phases that are not holding PVCs
 PVC_NOT_HOLD_POD_PHASES = ['Succeeded', 'Failed']

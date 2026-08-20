@@ -1050,6 +1050,8 @@ def _attest_required_kueue_pod(
         re.fullmatch(r'[0-9a-f]{8}', actual_role_hash))
     actual_podset = labels.get(k8s_constants.KUEUE_PODSET_LABEL)
     actual_workload = annotations.get(k8s_constants.KUEUE_WORKLOAD_ANNOTATION)
+    actual_unconstrained_topology = annotations.get(
+        k8s_constants.KUEUE_PODSET_UNCONSTRAINED_TOPOLOGY_ANNOTATION)
     actual_local_queue = labels.get(k8s_constants.KUEUE_LOCAL_QUEUE_LABEL)
     actual_cluster_queue = labels.get(k8s_constants.KUEUE_CLUSTER_QUEUE_LABEL)
     # The webhook always stamps role-hash. PodSet/workload/queue outputs are
@@ -1078,6 +1080,16 @@ def _attest_required_kueue_pod(
                   [_kueue_api_field(gate, 'name') for gate in scheduling_gates])
     has_admission_gate = (k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE
                           in gate_names)
+    # Kueue v0.19's implicit-TAS admission path injects this annotation while
+    # applying the admitted PodSet assignment.  Permit only that exact
+    # server-produced value and only once the rest of the admitted identity is
+    # present and the admission gate is gone.  Keeping the lifecycle check
+    # here means a caller cannot smuggle the annotation into the submitted or
+    # still-gated projection, and unknown future Kueue metadata remains closed.
+    unconstrained_topology_output_exact = bool(
+        not strict_projection or actual_unconstrained_topology is None or
+        (actual_unconstrained_topology == 'true' and not has_admission_gate and
+         admitted_metadata_exact))
     allowed_gate_names = {
         k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE,
         k8s_constants.KUEUE_TOPOLOGY_SCHEDULING_GATE,
@@ -1103,6 +1115,7 @@ def _attest_required_kueue_pod(
         k8s_constants.KUEUE_RETRIABLE_IN_GROUP_ANNOTATION,
         k8s_constants.KUEUE_ROLE_HASH_ANNOTATION,
         k8s_constants.KUEUE_WORKLOAD_ANNOTATION,
+        k8s_constants.KUEUE_PODSET_UNCONSTRAINED_TOPOLOGY_ANNOTATION,
     }
     unexpected_kueue_annotations = ([] if not strict_projection else sorted(
         key for key in annotations
@@ -1137,6 +1150,7 @@ def _attest_required_kueue_pod(
             and actual_retriable_in_group == 'false' and role_hash_is_valid and
             lifecycle_contract_matches and
             competing_pod_group_annotation is None and
+            unconstrained_topology_output_exact and
             not unexpected_scheduling_gates and not unexpected_kueue_labels and
             not unexpected_kueue_annotations):
         return
@@ -1152,11 +1166,13 @@ def _attest_required_kueue_pod(
         'role_hash_is_valid': role_hash_is_valid,
         'podset_label': actual_podset,
         'workload_annotation': actual_workload,
+        'podset_unconstrained_topology_annotation': actual_unconstrained_topology,
         'local_queue_label': actual_local_queue,
         'cluster_queue_label': actual_cluster_queue,
         'admitted_metadata_absent': admitted_metadata_absent,
         'admitted_metadata_exact': admitted_metadata_exact,
         'queue_outputs_exact': queue_outputs_exact,
+        'unconstrained_topology_output_exact': unconstrained_topology_output_exact,
         'competing_pod_group_annotation': competing_pod_group_annotation,
         'unexpected_scheduling_gates': unexpected_scheduling_gates,
         'unexpected_kueue_labels': unexpected_kueue_labels,
@@ -1173,6 +1189,9 @@ def _attest_required_kueue_pod(
         'pod_group_label': expected_pod_group_name,
         'pod_group_total_count_annotation': str(expected_pod_group_total_count),
         'retriable_in_group_annotation': 'false',
+        'podset_unconstrained_topology_annotation':
+            ('absent before admission; absent or the literal string "true" '
+             'with exact admitted identity after admission'),
         'role_hash_annotation': '8 lowercase hexadecimal characters',
         'admitted_metadata': ('absent from create response; on adoption, '
                               'podset=role-hash, optional workload='
@@ -1960,6 +1979,194 @@ def _attest_pod_with_provider_guard(
             rejection, provider_effect_guard_factory)
 
 
+def _wait_for_required_kueue_admission(
+    namespace: str,
+    context: str | None,
+    pods: list[Any],
+    admission_attestation: Callable[[Any], None],
+    provider_effect_guard_factory: common.ProviderEffectGuardFactory | None,
+    *,
+    timeout: int = k8s_constants.KUEUE_ADMISSION_TIMEOUT_SECONDS,
+) -> dict[str, str]:
+    """Wait for exact required-Kueue Pods to become admitted.
+
+    Kueue quota waiting is intentionally not charged to the ordinary Pod
+    scheduling timeout. Every poll reattests the existing/adoption lifecycle;
+    once the admission gate is absent that contract also proves the exact
+    admitted PodSet and queue outputs. The returned UIDs bind the following
+    scheduling and Running proofs to these same objects.
+    """
+    if not pods:
+        return {}
+
+    expected_pod_uids: dict[str, str] = {}
+    cluster_name_on_cloud: str | None = None
+    for pod in pods:
+        metadata = getattr(pod, 'metadata', None)
+        initial_pod_name = getattr(metadata, 'name', None)
+        pod_uid = getattr(metadata, 'uid', None)
+        labels = getattr(metadata, 'labels', None)
+        if (not isinstance(initial_pod_name, str) or not initial_pod_name or
+                not isinstance(pod_uid, str) or not pod_uid):
+            raise config_lib.KubernetesError(
+                'Required Kueue admission cannot bind a Pod without an exact '
+                f'non-empty name and UID (name={initial_pod_name!r}, '
+                f'uid={pod_uid!r}).')
+        if initial_pod_name in expected_pod_uids:
+            raise config_lib.KubernetesError(
+                f'Required Kueue admission received duplicate Pod name '
+                f'{initial_pod_name!r}.')
+        if not isinstance(labels, Mapping):
+            raise config_lib.KubernetesError(
+                f'Required Kueue Pod {namespace}/{initial_pod_name} has invalid '
+                'metadata labels.')
+        pod_cluster_name = labels.get(constants.TAG_SKYPILOT_CLUSTER_NAME)
+        if (not isinstance(pod_cluster_name, str) or not pod_cluster_name or
+            (cluster_name_on_cloud is not None and
+             pod_cluster_name != cluster_name_on_cloud)):
+            raise config_lib.KubernetesError(
+                f'Required Kueue Pod {namespace}/{initial_pod_name} has an '
+                'invalid SkyPilot cluster identity.')
+        cluster_name_on_cloud = pod_cluster_name
+        expected_pod_uids[initial_pod_name] = pod_uid
+
+    assert cluster_name_on_cloud is not None
+    expected_pod_names = set(expected_pod_uids)
+    deadline = time.time() + timeout
+
+    def observe_exact_pods() -> list[str]:
+        """Return gated Pod names from one fresh, exact batch observation."""
+        pod_list = kubernetes.core_api(context).list_namespaced_pod(
+            namespace,
+            label_selector=(f'{constants.TAG_SKYPILOT_CLUSTER_NAME}='
+                            f'{cluster_name_on_cloud}'),
+            _request_timeout=kubernetes.API_TIMEOUT)
+        observed_pods = getattr(pod_list, 'items', None)
+        if not isinstance(observed_pods, list):
+            raise config_lib.KubernetesError(
+                'Kubernetes returned an invalid Pod list while SkyPilot '
+                'waited for required Kueue admission.')
+        observed_by_name = {
+            getattr(getattr(pod, 'metadata', None), 'name', None): pod
+            for pod in observed_pods
+            if getattr(getattr(pod, 'metadata', None), 'name', None) in
+            expected_pod_names
+        }
+        missing_pod_names = expected_pod_names - set(observed_by_name)
+        if missing_pod_names:
+            raise config_lib.KubernetesError(
+                'Required Kueue admission lost the exact Pod objects '
+                f'{sorted(missing_pod_names)!r}; SkyPilot refused to adopt '
+                'a deletion or same-name replacement.')
+
+        waiting_pod_names: list[str] = []
+        for pod_name, expected_pod_uid in expected_pod_uids.items():
+            observed_pod = observed_by_name[pod_name]
+
+            def attest_exact_pod(candidate: Any,
+                                 *,
+                                 expected_name: str = pod_name,
+                                 expected_uid: str = expected_pod_uid) -> None:
+                metadata = getattr(candidate, 'metadata', None)
+                actual_name = getattr(metadata, 'name', None)
+                actual_uid = getattr(metadata, 'uid', None)
+                deletion_timestamp = getattr(metadata, 'deletion_timestamp',
+                                             None)
+                finalizers = getattr(metadata, 'finalizers', None)
+                has_managed_finalizer = (isinstance(finalizers,
+                                                    (list, tuple)) and
+                                         k8s_constants.KUEUE_MANAGED_FINALIZER
+                                         in finalizers)
+                phase = getattr(getattr(candidate, 'status', None), 'phase',
+                                None)
+                identity = {
+                    'name': actual_name,
+                    'uid': actual_uid,
+                    'deletion_timestamp': deletion_timestamp,
+                    'has_kueue_managed_finalizer': has_managed_finalizer,
+                    'phase': phase,
+                }
+                expected_identity = {
+                    'name': expected_name,
+                    'uid': expected_uid,
+                    'deletion_timestamp': None,
+                    'has_kueue_managed_finalizer': True,
+                    'phase': 'Pending or Running',
+                }
+                if (actual_name != expected_name or
+                        actual_uid != expected_uid or
+                        deletion_timestamp is not None or
+                        not has_managed_finalizer or
+                        phase not in ('Pending', 'Running')):
+                    _reject_admitted_serve_worker_identity(
+                        candidate,
+                        namespace,
+                        context,
+                        'Kueue admission Pod identity',
+                        identity,
+                        expected_identity,
+                        defer_cleanup=True)
+                admission_attestation(candidate)
+
+            # Passive quota observation is not a provider effect. In
+            # particular, do not retain or repeatedly reacquire service/fleet
+            # authority while Kueue keeps this Pod scheduling-gated. A
+            # rejected identity reacquires authority only for its exact
+            # cleanup below, and the admitted transition is re-read under one
+            # fresh authority epoch before this helper returns.
+            attest_exact_pod(observed_pod)
+            if (k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE
+                    in _pod_scheduling_gate_names(observed_pod)):
+                waiting_pod_names.append(pod_name)
+        return waiting_pod_names
+
+    while True:
+        try:
+            waiting_pod_names = observe_exact_pods()
+        except _ServeWorkerIdentityRejection as rejection:
+            _raise_rejected_serve_worker_after_cleanup(
+                rejection, provider_effect_guard_factory)
+
+        if not waiting_pod_names:
+            # The passive read above can race a service update or association
+            # transfer. Reacquire exact request/service/fleet authority, then
+            # repeat the full Pod UID and Kueue queue proof in that same
+            # bounded epoch. Scheduling and post-wait publication may proceed
+            # only from this admitted handoff.
+            try:
+                with _provider_mutation_guard(provider_effect_guard_factory):
+                    waiting_pod_names = observe_exact_pods()
+            except _ServeWorkerIdentityRejection as rejection:
+                _raise_rejected_serve_worker_after_cleanup(
+                    rejection, provider_effect_guard_factory)
+            if not waiting_pod_names:
+                return expected_pod_uids
+        if time.time() >= deadline:
+            timeout_message = (
+                f'Timed out after {timeout}s waiting for required Kueue '
+                f'admission of Pods {sorted(waiting_pod_names)!r}. The Pods '
+                'remained safely scheduling-gated; this is not proof that '
+                'the Kubernetes cluster lacks capacity.')
+            if provider_effect_guard_factory is not None:
+                # The injected guard is exclusive to protocol-v2 Kubernetes
+                # reserved fill. Exact Pod creation/adoption already advanced
+                # the durable association to provider I/O. Do not enter a
+                # second request-owned deletion authority at this timeout: an
+                # admission or owner transition can race the passive read.
+                # Preserve the exact observed identities for diagnosis and
+                # leave the pinned row to the canonical durable
+                # PRESENT -> UID-fenced down -> ABSENT reconciliation path.
+                provider_resource_ids = tuple(
+                    f'{namespace}/{pod_name}@{pod_uid}'
+                    for pod_name, pod_uid in sorted(expected_pod_uids.items()))
+                raise exceptions.ReservedFillProviderPresentError(
+                    timeout_message +
+                    ' Protocol-v2 reconciliation retains cleanup authority.',
+                    provider_resource_ids)
+            raise config_lib.KubernetesError(timeout_message)
+        time.sleep(min(POLL_INTERVAL, max(0, deadline - time.time())))
+
+
 def _read_and_attest_pod_with_provider_guard(
     pod_name: str,
     expected_pod_uid: object,
@@ -2645,10 +2852,28 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     logger.debug(f'run_instances: waiting {wait_str} for pods to schedule and '
                  f'run: {[pod.metadata.name for pod in pods]}')
 
+    admitted_kueue_pod_uids: dict[str, str] | None = None
+    scheduling_wait_start = create_pods_start
+    if kueue_require_managed:
+        assert existing_pod_attestation is not None
+        logger.debug(
+            'run_instances: waiting up to %ss for required Kueue admission '
+            'before starting the configured scheduling timeout (%s): %s',
+            k8s_constants.KUEUE_ADMISSION_TIMEOUT_SECONDS, wait_str,
+            [pod.metadata.name for pod in pods])
+        admitted_kueue_pod_uids = _wait_for_required_kueue_admission(
+            namespace, context, pods, existing_pod_attestation,
+            config.provider_effect_guard_factory)
+        # Autoscaler and scheduling-error evidence from while Kueue retained
+        # the admission gate cannot have been caused by these Pods. Start that
+        # observation window together with the fresh scheduling deadline.
+        scheduling_wait_start = datetime.datetime.now(datetime.timezone.utc)
+
     # Wait until the pods are scheduled and surface cause for error
-    # if there is one
+    # if there is one. Required-Kueue quota waiting completed above, so this
+    # call starts a fresh configured scheduling deadline.
     _wait_for_pods_to_schedule(namespace, context, pods, provision_timeout,
-                               cluster_name, create_pods_start)
+                               cluster_name, scheduling_wait_start)
     # Reset spinner message here because it might have hinted autoscaling
     # while waiting for pods to schedule.
     rich_utils.force_update_status(
@@ -2672,14 +2897,15 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         # which a LocalQueue could be retargeted. Re-read every exact Pod only
         # after it is Running and require the admitted identity (including the
         # preflight ClusterQueue) before publishing provisioning success.
-        expected_pod_names = set(
-            dict.fromkeys(pod.metadata.name for pod in pods))
+        expected_pod_uids = (running_pod_uids if admitted_kueue_pod_uids is None
+                             else admitted_kueue_pod_uids)
+        expected_pod_names = set(expected_pod_uids)
         if set(running_pod_uids) != expected_pod_names:
             raise config_lib.KubernetesError(
                 'The Kubernetes Running wait did not return exact identity '
                 'proof for every expected Pod. SkyPilot refused to publish '
                 'provisioning success.')
-        for pod_name, pod_uid in running_pod_uids.items():
+        for pod_name, pod_uid in expected_pod_uids.items():
             _read_and_attest_pod_with_provider_guard(
                 pod_name, pod_uid, namespace, context,
                 post_wait_pod_attestation, config.provider_effect_guard_factory)
