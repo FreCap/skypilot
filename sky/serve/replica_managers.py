@@ -4173,6 +4173,52 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._non_pool_reconciliation_threads[replica_id] = worker
         worker.start()
 
+    def _reconcile_unowned_bound_non_pool_launches(
+            self, replica_infos: list[ReplicaInfo]) -> None:
+        """Schedule provider evidence even when no launch worker survived."""
+        authority = self._ordinary_launch_binding_authority
+        if authority is None or not authority.generic_launches_required:
+            return
+        try:
+            contexts = (ordinary_launch_binding.
+                        list_provider_reconciliation_contexts(authority))
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                'Unable to list bound non-pool provider reconciliations: %s',
+                common_utils.format_exception(error))
+            return
+        active_ids = {
+            binding_context.replica_id for binding_context in contexts
+        }
+        runtime = self._legacy_mutation_runtime_state()
+        infos = {
+            (info.replica_id, info.replica_record_id): info
+            for info in replica_infos
+        }
+        for binding_context in contexts:
+            if binding_context.replica_id in runtime.launch_thread_pool:
+                # Finished launch workers already own the established
+                # scheduling path, including its retry and logging behavior.
+                continue
+            info = infos.get((binding_context.replica_id,
+                              str(binding_context.replica_record_id)))
+            if info is None:
+                continue
+            self._schedule_non_pool_provider_reconciliation(
+                info, binding_context)
+
+        # A successful projection clears the replica pointer, so the context
+        # disappears from the next query. Retire its completed process-local
+        # bookkeeping without disturbing a worker still finishing that
+        # transaction.
+        for replica_id, worker in list(
+                self._non_pool_reconciliation_threads.items()):
+            if replica_id in active_ids or worker.is_alive():
+                continue
+            self._non_pool_reconciliation_threads.pop(replica_id)
+            self._non_pool_reconciliation_attempts.pop(replica_id, None)
+            self._non_pool_reconciliation_retry_at.pop(replica_id, None)
+
     def _redrive_bound_ordinary_launch_after_pre_effect(
             self, info: ReplicaInfo) -> bool:
         """Re-enqueue one settled pre-effect row with its exact paid claim."""
@@ -13631,6 +13677,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # Historical specs power admin comparison and rollback, while full
         # service teardown remains responsible for deleting all version rows.
         replica_infos = serve_state.get_replica_infos(self._service_name)
+        self._reconcile_unowned_bound_non_pool_launches(replica_infos)
         self._reconcile_failed_cleanup(replica_infos)
 
     def _thread_pool_refresher(self) -> None:
