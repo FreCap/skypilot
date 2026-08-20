@@ -10,6 +10,8 @@ import io
 import json
 import os
 import pathlib
+import socket
+import subprocess
 from types import SimpleNamespace
 from unittest import mock
 
@@ -482,6 +484,7 @@ def test_projected_serve_worker_suppresses_all_static_credential_mounts(
     writer_kwargs['to_provision'] = Resources(
         cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
     writer_kwargs['worker_placement_projections'] = [{
+        'projection_version': 4,
         'candidate_id': 'kubernetes-0000',
         'kubernetes_context': 'test-context',
         'namespace': 'inference',
@@ -501,7 +504,23 @@ def test_projected_serve_worker_suppresses_all_static_credential_mounts(
         'cache': {
             'kind': 'none',
         },
+        'scheduler_name': 'default-scheduler',
+        'kueue_admission': None,
+        'provision_timeout': -1,
+        'scratch': {
+            'kind': 'none',
+        },
     }]
+    original_fill_template = common_utils.fill_template
+    rendered_variables = {}
+
+    def capture_variables(template_ref, variables, output_path):
+        rendered_variables.update(variables)
+        return original_fill_template(template_ref,
+                                      variables,
+                                      output_path=output_path)
+
+    monkeypatch.setattr(common_utils, 'fill_template', capture_variables)
 
     result = backend_utils.write_cluster_config(**writer_kwargs)
     rendered = yaml_utils.read_yaml(result['ray'])
@@ -518,6 +537,8 @@ def test_projected_serve_worker_suppresses_all_static_credential_mounts(
     label_discovery.assert_not_called()
     resource_discovery.assert_not_called()
     allocatable_discovery.assert_not_called()
+    assert rendered_variables[
+        'k8s_projected_serve_worker_runtime_readiness'] is True
     assert pod_spec['affinity']['nodeAffinity'][
         'requiredDuringSchedulingIgnoredDuringExecution']['nodeSelectorTerms'][
             0]['matchExpressions'][-1] == {
@@ -527,10 +548,100 @@ def test_projected_serve_worker_suppresses_all_static_credential_mounts(
             }
     assert ray_node['resources']['requests']['nvidia.com/gpu'] == 1
     assert ray_node['resources']['limits']['nvidia.com/gpu'] == 1
+    assert pod_spec['restartPolicy'] == 'Never'
+    assert ray_node['startupProbe']['failureThreshold'] == 900
+    assert ray_node['readinessProbe']['failureThreshold'] == 1
+    runtime_script = ray_node['args'][0]
+    runtime_marker = '/tmp/skypilot-serve-worker-runtime-ready'
+    assert f'rm -f {runtime_marker}' in runtime_script
+    runcmd_boundary = runtime_script.index(
+        '# Execute user-provided post-provision runcmd')
+    bootstrap_preamble_end = runtime_script.index(
+        '# Helper function to conditionally use sudo')
+    bootstrap_preamble = runtime_script[:bootstrap_preamble_end]
+    first_clear = bootstrap_preamble.index(f'rm -f {runtime_marker}')
+    second_clear = bootstrap_preamble.index(f'rm -f {runtime_marker}',
+                                            first_clear + 1)
+    assert first_clear < runcmd_boundary < second_clear
+    assert bootstrap_preamble.rfind('set -e', 0, first_clear) != -1
+    assert bootstrap_preamble.rfind('set -e', runcmd_boundary,
+                                    second_clear) != -1
+    for stale_marker in (runtime_marker, f'{runtime_marker}.tmp',
+                         '/tmp/ray_skypilot_runtime_complete',
+                         '/tmp/apt_ssh_setup_complete',
+                         '/tmp/ray_skypilot_installation_complete',
+                         '/tmp/env_setup_complete', '/tmp/apt-ssh-setup.failed',
+                         '/tmp/runtime-setup.failed', '/tmp/env-setup.failed',
+                         '/tmp/sky_host_network_ports.env'):
+        assert stale_marker in bootstrap_preamble[:runcmd_boundary]
+        assert stale_marker in bootstrap_preamble[runcmd_boundary:]
+    assert 'touch /tmp/ray_skypilot_runtime_complete' in runtime_script
+    assert 'printf \'%s\\n\' "$SKYPILOT_POD_UID"' in runtime_script
+    assert f'{runtime_marker}.tmp' in runtime_script
+    ray_status_capture = runtime_script.index('RAY_START_STATUS=$?')
+    ray_completion = runtime_script.index(
+        'touch /tmp/ray_skypilot_runtime_complete')
+    readiness_publication = runtime_script.index(
+        'printf \'%s\\n\' "$SKYPILOT_POD_UID"')
+    assert ray_status_capture < ray_completion < readiness_publication
+    assert 'exit "$RAY_START_STATUS"' in runtime_script
+    subprocess.run(['bash', '-n'],
+                   input=runtime_script,
+                   text=True,
+                   capture_output=True,
+                   check=True)
+
+    # A completed install and Ray launch are insufficient: the marker must
+    # remain absent until the exact final sshd port returns an SSH banner.
+    readiness_start = runtime_script.index(
+        '# The historical runtime-install marker precedes Ray start.')
+    readiness_end = runtime_script.rindex(runtime_marker) + len(runtime_marker)
+    readiness_script = runtime_script[readiness_start:readiness_end]
+    readiness_script = readiness_script.replace('/tmp/', f'{tmp_path}/')
+    (tmp_path / 'ray_skypilot_runtime_complete').touch()
+    with socket.socket() as closed_listener:
+        closed_listener.bind(('127.0.0.1', 0))
+        closed_port = closed_listener.getsockname()[1]
+        (tmp_path / 'sky_host_network_ports.env').write_text(
+            f'export SKYPILOT_SSHD_PORT={closed_port}\n', encoding='utf-8')
+        completed = subprocess.run(
+            [
+                'bash', '-c', f'set -e\nSTEPS=(apt runtime env)\n'
+                f'{readiness_script}'
+            ],
+            text=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                'SKYPILOT_HOST_NETWORK': '1',
+                'SKYPILOT_POD_UID': 'exact-pod-uid',
+            },
+            check=False)
+    assert completed.returncode != 0
+    assert 'projected worker sshd listener is not ready' in completed.stdout
+    assert not (tmp_path / 'skypilot-serve-worker-runtime-ready').exists()
     assert 'mutable.example/gpu' not in json.dumps(pod_spec)
     assert '.aws' not in serialized_mounts
     assert '.kube' not in serialized_mounts
     assert 'logging-agent' not in serialized_mounts
+
+
+def test_generic_kubernetes_runtime_has_no_projected_readiness_contract(
+        monkeypatch, tmp_path):
+    writer_kwargs, _ = _builtin_kubernetes_writer_kwargs(
+        monkeypatch, tmp_path, 'generic-worker-runtime-readiness')
+
+    result = backend_utils.write_cluster_config(**writer_kwargs)
+    rendered = yaml_utils.read_yaml(result['ray'])
+    pod_spec = rendered['available_node_types']['ray_head_default'][
+        'node_config']['spec']
+    ray_node = next(container for container in pod_spec['containers']
+                    if container['name'] == 'ray-node')
+
+    assert pod_spec['restartPolicy'] == 'Never'
+    assert 'startupProbe' not in ray_node
+    assert 'readinessProbe' not in ray_node
+    assert '/tmp/skypilot-serve-worker-runtime-ready' not in ray_node['args'][0]
 
 
 def test_builtin_kubernetes_writer_preserves_delegating_wrapper(
@@ -571,7 +682,7 @@ def test_builtin_kubernetes_writer_preserves_replacement_renderer_authority(
                              'templates' / template_ref)
         source_bytes = template_path.read_bytes()
         assert hashlib.sha256(source_bytes).hexdigest() == (
-            'dcb8b332408ffadaf92882a2b510fb9acfb36e5196757932957fb7826d395891')
+            '0a0475194589c7f50501da7a5b267e8d59f28a669f9470aef46a3502c66b5392')
         source = source_bytes.decode('utf-8')
         assert '{{ skypilot_kubernetes_node_config_fragment_v1 }}\n' not in source
         rendered = common_utils.jinja2.Template(source).render(**variables)

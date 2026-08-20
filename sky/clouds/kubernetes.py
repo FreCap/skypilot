@@ -813,6 +813,10 @@ class Kubernetes(clouds.Cloud):
             kubernetes_pod_spec.
             serve_worker_projection_protocol_has_strict_admission(
                 projection_version))
+        has_projected_runtime_readiness = (
+            kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_runtime_readiness(
+                projection_version))
         if projection_version is not None and not has_strict_worker_admission:
             # Protocol v1 has no on-wire marker. An explicit version here is a
             # malformed request rather than a supported v1 projection.
@@ -1010,10 +1014,10 @@ class Kubernetes(clouds.Cloud):
                     f'DWS is only supported in GKE, but the autoscaler type '
                     f'for context {context} is {autoscaler_type}')
 
-        # Timeout for resource provisioning. Protocol v3 freezes this value in
-        # the server-owned candidate at version commit. The terminal launch must
-        # not re-resolve ambient API-server or task configuration. Historical
-        # v1/v2 launches retain their exact launch-time behavior.
+        # Timeout for resource provisioning. Protocols v3/v4 freeze this value
+        # in the server-owned candidate at version commit. The terminal launch
+        # must not re-resolve ambient API-server or task configuration.
+        # Historical v1/v2 launches retain their exact launch-time behavior.
         cloud_config_str = self._REPR.lower()
         has_projected_provision_timeout = (
             kubernetes_pod_spec.
@@ -1142,6 +1146,9 @@ class Kubernetes(clouds.Cloud):
             'k8s_context': context,
             'k8s_namespace': namespace,
             'k8s_host_network': k8s_host_network,
+            'k8s_projected_serve_worker_runtime_readiness': has_projected_runtime_readiness,
+            'k8s_projected_worker_runtime_ready_marker':
+                kubernetes_pod_spec.SERVE_WORKER_RUNTIME_READY_MARKER,
         }
 
         # Pod-level terminationGracePeriodSeconds rendered from any

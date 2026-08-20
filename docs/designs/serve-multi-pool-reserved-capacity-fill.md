@@ -17,6 +17,12 @@ This change supplies the narrowly fenced reconciliation needed to settle those
 nine rows; it is not yet merged or deployed. Platform PR #8652 is merged and
 does not pin the SkyPilot runtime.
 
+A projected-worker runtime-readiness fix-forward is implemented locally on
+`fix/serve-projected-worker-runtime-readiness`; it is not merged, deployed, or
+production-proven. The candidate strengthens only canonical projection
+protocol v4 and adds no schema, EFS/RWX, KubeRay, Terraform, Terragrunt, or
+platform-pin dependency.
+
 ## Convergence goal and remaining work
 
 The goal is one PostgreSQL-authoritative path that automatically assigns every
@@ -44,7 +50,10 @@ The completed system has these invariants:
   rows cannot block healthy pools, and UI request/capacity totals remain
   available during provider stalls;
 - the active service has `min_replicas: 0`, zero fill floor, immutable
-  server-owned worker projections, and no task-owned Kubernetes overrides.
+  server-owned worker projections, no task-owned Kubernetes overrides, and
+  cannot publish a projected Kubernetes provider success until the exact Pod
+  UID is marker-gated `Ready` after base SSH/environment/SkyPilot/Ray
+  bootstrap.
 
 Already implemented, merged, and deployed are the PostgreSQL-backed generic
 non-pool binding, atomic replica/association/request/queue/pin/intent admission,
@@ -1182,8 +1191,9 @@ required for this fix-forward rollout.
 - Preserve and mechanically respect the deployment-owned Kueue admission and
   preemption contract under which BCL work may reclaim preemptible inference
   slots.
-- Make worker placement projection v2 the only owner of projected Kubernetes
-  admission: task inputs cannot select Pod priority, LocalQueue, or
+- Make canonical worker placement projection v4 the only owner of new
+  projected Kubernetes admission: task inputs cannot select Pod priority,
+  LocalQueue, or
   WorkloadPriorityClass, and launch rendering cannot reread those values from
   mutable configuration.
 - Bind the exact deployment reclaim-policy identity into PostgreSQL, allocation
@@ -1203,9 +1213,11 @@ required for this fix-forward rollout.
   initializing or out of capacity.
 - No paid fallback. A reserved-fill intent is zero-cost-only and is skipped if
   its exact zero-cost location cannot be proved.
-- No fixed readiness SLA for a 200-replica wave. Durable admission is bounded;
-  provider scheduling, image pull, setup, and readiness retain their real
-  latencies.
+- No fixed application/model-ready SLA for a 200-replica wave. Durable
+  admission is bounded; provider scheduling and image pull retain their real
+  latencies. Canonical projected workers separately bound only their
+  in-container SSH, environment, SkyPilot, and Ray bootstrap to 30 minutes
+  after container creation before kubelet startup-probe failure.
 - No capacity-consuming canary, shadow planner, dual actuator, per-service
   rollout flag, or supported post-activation demotion.
 - No caller-selectable Kubernetes namespace, service account, PriorityClass,
@@ -1808,16 +1820,17 @@ claim all 200 become ready at once.
 ### 6. BCL reclaim invariant
 
 Reserved fill remains zero-cost-only and uses the server/workspace-owned
-preemptible inference placement. Worker placement projection protocol v2 is
-the single admission owner. Each candidate adds
-`projection_version: 2` and either `kueue_admission: null` or the exact closed
+preemptible inference placement. Canonical worker placement projection protocol
+v4 is the single owner for new admission; v1/v2/v3 are retained readers only.
+Each candidate adds `projection_version: 4`, the closed `provision_timeout` and
+scratch contracts, and either `kueue_admission: null` or the exact closed
 mapping `{local_queue_name, workload_priority_class_name}`. Namespace, service
 account, Pod PriorityClass name/value/preemption policy, accelerator scheduling,
-LocalQueue, and WorkloadPriorityClass are frozen together when the service
-version is committed. `require_managed` is derived from non-null Kueue
-admission; it is not separately caller-selectable.
+LocalQueue, WorkloadPriorityClass, scheduling timeout, and scratch are frozen
+together when the service version is committed. `require_managed` is derived
+from non-null Kueue admission; it is not separately caller-selectable.
 
-Protocol v2 also owns the scheduler and actual binding seam. The immutable
+Protocol v4 also owns the scheduler and actual binding seam. The immutable
 candidate freezes `scheduler_name` from only the server-owned context/workspace
 Pod configuration, defaults it to `default-scheduler`, and binds it through the
 candidate digest and typed reclaim-policy view. Final rendering removes any
@@ -2495,6 +2508,47 @@ protocol-v2 provisioner is rejected before provider mutation; only the in-tree
 Kubernetes provisioner can produce the exact create/adopt attestation required
 to enter the materialized tail.
 
+Canonical projection protocol v4 additionally owns one closed base-runtime
+readiness contract. Final rendering, after caller and restored YAML merging,
+installs exactly one downward-API `SKYPILOT_POD_UID`, `restartPolicy: Never`,
+and startup/readiness exec probes on the sole `ray-node` container. Both probes
+require the contents of `/tmp/skypilot-serve-worker-runtime-ready` to equal the
+current Pod UID. Under fail-fast shell execution, the container clears every
+ready, setup-completion, setup-failure, Ray-completion, and host-network-port
+marker that could be inherited from an image or writable layer both before and
+after the trusted server-owned `runcmd`, then starts the bootstrap producers. It
+atomically publishes the UID marker only after the asynchronous SSH,
+environment, and SkyPilot installation steps succeed and the generated Ray
+head start or worker join returns successfully. It then connects to the final
+local sshd port (including the dynamically selected host-network port) and
+requires an SSH banner before publication. The startup probe runs every two
+seconds with 900 failures, bounding this in-container base bootstrap to 30
+minutes after container creation; the readiness probe continuously withdraws
+Ready if the marker no longer matches.
+
+`Running` is therefore only an intermediate observation for v4. The
+provisioner captures the exact non-empty name/UID set, requires the ordinary
+all-containers-running wait to return the same set, passively waits for Pod
+`Ready=True` and `ray-node.ready=True`, and then repeats Ready, UID, and the
+complete immutable projection attestation in the existing final guarded read
+before publishing provider success. Deletion, missing Pods, a same-name UID
+replacement, bootstrap timeout, or a fresh-read readiness regression fails
+closed. A reserved-fill readiness wait that cannot prove success raises the
+exact provider-present fence with the captured Pod UIDs; it cannot enter
+request-owned cleanup or capacity failover before the bulk call returns.
+Generic Kubernetes launches and historical projection protocols v1/v2/v3
+retain their existing behavior. This marker proves only the base
+SSH/environment/SkyPilot/Ray bootstrap; later workdir/file synchronization,
+task setup, model loading, and application health keep their existing owners.
+No database schema or projection-payload-shape migration is required: v4 uses
+the same closed key set as v3 but a distinct discriminator and therefore a
+distinct candidate digest. Protocol v3 deliberately retains its historical
+Running-only behavior. The existing placement-projection capability handshake
+must report exact protocol v4 across the complete API-server/controller/
+provisioner cohort before a clean service version emits v4; old binaries reject
+that discriminator before provider mutation instead of silently accepting a
+mixed interpretation.
+
 Pre-Pod auxiliary bootstrap and object-storage construction cannot occupy a
 reserved accelerator slot and remain outside the reclaim guard. The successful
 in-tree bulk/adoption return is the single one-way materialization boundary.
@@ -2943,11 +2997,13 @@ bypass or a claim that the current east1 or Phoenix topology is reclaimable.
 
 Historical worker projection v1 rows remain readable only for ordinary launch
 during the pre-activation transition. They cannot participate in a sequenced
-claim, allocation, fill admission, or terminal launch. After all active service
-versions are recommitted with protocol v2 and production has remained
-`SEQUENCED_ACTIVE` through the documented cleanup gate, stacked cleanup PR
-#1452 removes the v1 ordinary-launch decoder and its transition tests. New
-writes always use v2; no compatibility setting can create a v1 projection.
+claim, allocation, fill admission, or terminal launch. Protocol v2 and v3 rows
+also remain exact historical readers, but no new version builder emits them.
+After all active service versions are recommitted with protocol v4 and
+production has remained `SEQUENCED_ACTIVE` through the documented cleanup gate,
+stacked cleanup PR #1452 removes the v1 ordinary-launch decoder and its
+transition tests. New writes always use v4; no compatibility setting can create
+a v1, v2, or v3 projection.
 
 When this external contract holds, a fill intent cannot spill to a paid
 candidate, Kueue can evict lower-priority inference Workloads before admitting
@@ -2974,12 +3030,14 @@ before activation. If it does not, the new image may deploy but the gate stays
   service version and closed accelerator-to-projection digest maps.
 - `reserved_fill_projection_authority.py` is the canonical adapter from one
   immutable worker projection to typed reclaim admission. New writes emit
-  homogeneous explicit projection protocol v2; sequenced paths require
-  non-null typed Kueue admission. Protocol v2 supports both an exact AWS role
+  homogeneous explicit projection protocol v4; sequenced paths require
+  non-null typed Kueue admission. Protocol v4 supports both an exact AWS role
   ARN and an explicit null identity contract, and the value is hash-bound and
-  exposed to the deployment policy. Protocol v1 remains only as the historical
-  ordinary-launch decoder pending cleanup PR #1452.
-- API capability 77 advertises projection protocol v2; allocation-map schema 5
+  exposed to the deployment policy. Protocols v1/v2/v3 remain only as exact
+  historical decoders; v1 ordinary-launch decoding remains pending cleanup PR
+  #1452.
+- API capability 77 exposes the placement-projection capability surface and
+  the exact advertised current discriminator is v4; allocation-map schema 5
   binds service version and the closed digest map; ReplicaInfo v18 persists the
   selected scalar digest. Activation successor A reads only the six sanctioned
   legacy versions/eight exact pre-v17 shapes and the two exact v17 shapes long
@@ -3261,6 +3319,7 @@ either case.
 | 2a.3 | Global activation scope with per-service duplicate-pool validation | Revision 431 preflight exposed that the deployment policy incorrectly treated two services sharing one broker pool/card as a duplicate claim. The fix groups activation claims by service, retains same-service duplicate rejection, and permits the documented cross-service sharing before one fleet-wide provider attestation. |
 | 2a.4 | Remove redundant admission-policy authority from reserved fill | Platform PR #8649 is superseded and must not change the shared KubeRay/HPTO policy for fleet activation. Policy-bundle schema v5 removes ValidatingAdmissionPolicy and binding reads while retaining the stronger exact Kueue controller/webhook and synchronous/fresh Pod lifecycle proof. Activation requires only the SkyPilot fix-forward deployment and a fresh full-fleet preflight; no Terraform or platform Helm change is part of this gate. |
 | 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 63 is committed, elected, and controller-applied at lifecycle epoch 82 on known-good image `v3.682.2-boltz-2`; it is the clean demand-gated activation successor. Version 62 remains rejected historical projection evidence. |
+| 2b.1 | UID-bound base-runtime readiness for canonical projected Kubernetes workers | Local implementation candidate on `fix/serve-projected-worker-runtime-readiness`; 533 focused render, source-composition, typed Kubernetes-model, collision, bounded-wait, UID-replacement, SSH-listener-failure, and final fresh-read tests pass locally. It is not merged, deployed, or production-proven. Generic Kubernetes and projection v1/v2/v3 remain unchanged. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. Historical cleanup #1506 is closed/superseded and reserves no head. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
 | 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed dark in revision 431 / release 1.1.1338: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Activation remains gated by 2a.3, 2a.4, and a successful full-fleet re-attestation. |
@@ -3833,6 +3892,33 @@ to create zero-cost compute automatically; observing that effect is required.
     healthy. A missing map should stop only new fill, not fail the service.
 
 ## Verification plan and evidence
+
+The projected-worker runtime-readiness source gate must prove all of the
+following before merge:
+
+- canonical v4 rendering composes the real guarded Kubernetes fragment and
+  produces the exact UID input, startup/readiness probes, marker ordering, and
+  30-minute startup bound, and a missing final SSH listener/banner prevents
+  marker publication;
+- caller collisions on the owned UID, probes, or restart policy fail closed,
+  and a real Kubernetes client `V1PodSpec` round-trips the same exact contract;
+- historical v1/v2/v3 projections and an ordinary generic Kubernetes render do
+  not receive the marker or probes;
+- a Running/not-Ready exact UID remains in the bounded passive wait, a Ready
+  exact UID succeeds, and deletion, missing Pod, same-name replacement,
+  timeout, or a final-read readiness regression cannot publish success; and
+- the monolithic Kubernetes template remains byte-identical to recomposition
+  from its guarded outer and node-config sources.
+
+Production qualification is separate. After direct-Helm deployment, inspect a
+new east and PHX projected worker and prove the live Pod has the exact probes,
+UID field reference, `restartPolicy: Never`, and same UID from create through
+Ready. A deliberately failed base bootstrap must never return provider success;
+a successful bootstrap must reach Ready without affecting ordinary generic
+Kubernetes launches. Activation must first prove every API-server/controller/
+provisioner replica reports the capable source; an old-render/new-provisioner
+launch must fail static attestation rather than publish success. These checks
+do not substitute for the later model and application health gates.
 
 The 2026-08-20 production trace showed isolated full-fleet preflights at
 2.92--3.32 seconds while a 15-plus-launch wave caused overlapping
@@ -4503,7 +4589,7 @@ route, autoscaler, or sibling-pool progress.
    sequence after activation;
 7. ordinary traffic, no-paid-spill, `max_replicas`, two-context concurrency,
    and the deployment-owned Kueue reclaim contract pass; and
-8. every active service version uses worker projection protocol v2 and no
+8. every active service version uses worker projection protocol v4 and no
    ordinary launch has consumed the v1 decoder for one complete 180-second
    authority horizon; and
 9. after one complete controller-fleet rollout, no non-`INACTIVE`, non-`DONE`
@@ -4542,6 +4628,10 @@ legacy activation.
   replica/association/request receipt. Its feature change already removes
   protocol-v2 direct/non-atomic admission and rejects reserved fill at the HTTP
   surface; no system-identity or RWX/EFS correctness fallback remains.
+- [ ] Merge and direct-Helm deploy the canonical-v4 projected-worker
+  runtime-readiness fix-forward, then prove exact-UID Ready in east and PHX and
+  prove a failed base bootstrap never publishes provider success. This gate has
+  no schema, EFS/RWX, KubeRay, Terraform, Terragrunt, or platform-pin change.
 - [ ] Open the cross-linked Serve056 cleanup and, only after a complete capable
   cohort, zero nullable owner tuples, no old writers, backups, and the full
   stale/HA production horizon, make service owner columns `NOT NULL` and remove

@@ -22,8 +22,8 @@ def projected_admission_for_candidate(
     assert validated is not None
     if not kubernetes_identity.worker_projection_has_strict_admission(
             validated[0]):
-        raise ValueError('Reclaim requires a protocol-v2 or protocol-v3 '
-                         'worker projection.')
+        raise ValueError('Reclaim requires a protocol-v2, protocol-v3, or '
+                         'protocol-v4 worker projection.')
     projection = kubernetes_identity.worker_projection_for_context(
         validated, kubernetes_context, {accelerator: accelerator_count})
     if projection is None:

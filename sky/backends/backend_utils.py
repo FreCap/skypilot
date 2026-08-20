@@ -942,6 +942,21 @@ def _enforce_worker_scratch_on_pod_spec(
             f'{contract.actual!r}; expected {contract.expected!r}.')
 
 
+def _enforce_worker_runtime_readiness_on_pod_spec(
+        pod_spec: dict[str, Any]) -> None:
+    """Install and attest the projected worker bootstrap-ready contract."""
+    try:
+        contract = (
+            k8s_pod_spec.enforce_projected_worker_runtime_readiness_contract(
+                pod_spec, rewrite=True))
+    except k8s_pod_spec.ProjectedRuntimeReadinessContractError as error:
+        raise exceptions.InvalidCloudConfigs(str(error)) from error
+    if not contract.matches:
+        raise exceptions.InvalidCloudConfigs(
+            'Projected SkyServe worker runtime-readiness canonicalization '
+            f'failed: {contract.actual!r}; expected {contract.expected!r}.')
+
+
 def _enforce_worker_projection_on_kubernetes_yaml(
     cluster_yaml: dict[str, Any],
     projection: dict[str, Any],
@@ -967,6 +982,9 @@ def _enforce_worker_projection_on_kubernetes_yaml(
         cluster_yaml['provider']['timeout'] = projection['provision_timeout']
     has_projected_scratch = (
         k8s_pod_spec.serve_worker_projection_protocol_has_scratch(
+            projection_version))
+    has_projected_runtime_readiness = (
+        k8s_pod_spec.serve_worker_projection_protocol_has_runtime_readiness(
             projection_version))
     if has_projected_scratch:
         cluster_yaml['provider'][
@@ -1194,6 +1212,8 @@ def _enforce_worker_projection_on_kubernetes_yaml(
             pod_spec['volumes'] = volumes
         if has_projected_scratch:
             _enforce_worker_scratch_on_pod_spec(pod_spec, projection['scratch'])
+        if has_projected_runtime_readiness:
+            _enforce_worker_runtime_readiness_on_pod_spec(pod_spec)
 
 
 def _restore_projected_worker_kubernetes_fields(
