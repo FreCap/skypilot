@@ -32,6 +32,13 @@ POLICY_REVISION_MAX_BYTES: Final = 1024
 RECLAIM_PROVIDER_CONTEXT_MAX_BYTES: Final = 1024
 AUTHORIZATION_MAX_AGE_SECONDS: Final = 5.0
 POLICY_OPERATION_TIMEOUT_SECONDS: Final = 5.0
+# A launch receipt must retain this much of its five-second freshness window
+# when the policy hands it back.  The caller still has to decode and validate
+# the ticket and enter the multi-statement terminal PostgreSQL authority read.
+# The final database predicate independently enforces the full five-second
+# expiry; this budget prevents normal handoff latency from selecting a receipt
+# that is already too close to that fail-closed boundary.
+LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS: Final = 2.0
 
 
 class ReclaimAttestationError(RuntimeError):
@@ -808,14 +815,28 @@ def require_policy_operation_completed(deadline_monotonic: float) -> None:
             'The deployment reclaim-policy operation exceeded its deadline.')
 
 
-def _require_fresh(completed_monotonic: float, *, now_monotonic: float | None,
-                   subject: str) -> None:
+def _require_fresh(
+    completed_monotonic: float,
+    *,
+    now_monotonic: float | None,
+    subject: str,
+    minimum_remaining_seconds: float = 0.0,
+) -> None:
     completed = _require_monotonic(completed_monotonic,
                                    f'{subject} completed_monotonic')
     now = time.monotonic() if now_monotonic is None else _require_monotonic(
         now_monotonic, 'now_monotonic')
+    if (isinstance(minimum_remaining_seconds, bool) or
+            not isinstance(minimum_remaining_seconds, (int, float)) or
+            not math.isfinite(float(minimum_remaining_seconds)) or
+            minimum_remaining_seconds < 0 or
+            minimum_remaining_seconds >= AUTHORIZATION_MAX_AGE_SECONDS):
+        raise ValueError('minimum_remaining_seconds must be finite and within '
+                         'the authorization freshness horizon.')
     age = now - completed
-    if age < 0 or age > AUTHORIZATION_MAX_AGE_SECONDS:
+    maximum_age = (AUTHORIZATION_MAX_AGE_SECONDS -
+                   float(minimum_remaining_seconds))
+    if age < 0 or age >= maximum_age:
         raise ReclaimAttestationError(f'The reclaim {subject} is stale.')
 
 
@@ -849,6 +870,7 @@ def require_exact_launch_authorization(
     expected_gate_generation: int,
     expected_scope: ReclaimLaunchScope,
     now_monotonic: float | None = None,
+    minimum_remaining_seconds: float = 0.0,
 ) -> ReclaimLaunchAuthorization:
     """Validate one provider-produced ticket at the provider boundary."""
     if not isinstance(authorization, ReclaimLaunchAuthorization):
@@ -862,5 +884,6 @@ def require_exact_launch_authorization(
         )
     _require_fresh(authorization.completed_monotonic,
                    now_monotonic=now_monotonic,
-                   subject='launch authorization')
+                   subject='launch authorization',
+                   minimum_remaining_seconds=minimum_remaining_seconds)
     return authorization

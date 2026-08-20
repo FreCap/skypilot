@@ -1534,7 +1534,7 @@ def test_receipt_without_terminal_guard_reserve_is_refreshed(proof_engine):
     first = repository.get_or_prove(**kwargs,
                                     deadline_monotonic=time.monotonic() + 5)
     near_expiry_age = (reclaim.AUTHORIZATION_MAX_AGE_SECONDS -
-                       proofs._TERMINAL_GUARD_RESERVE_SECONDS / 2)
+                       reclaim.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS / 2)
     with proof_engine.begin() as connection:
         connection.execute(
             sqlalchemy.text("""
@@ -1556,6 +1556,70 @@ def test_receipt_without_terminal_guard_reserve_is_refreshed(proof_engine):
             expected_physical_cluster_uid='physical-cluster-uid')
 
 
+def test_concurrent_launches_refresh_before_delayed_terminal_guard(
+        proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def prove():
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        return _proof_candidate()
+
+    common = {
+        'identity': _identity(),
+        'gate_generation': _GATE_GENERATION,
+        'kubernetes_context': _CONTEXT,
+        'prove': prove,
+        'validate': _accept_payload,
+    }
+    seeded = repository.get_or_prove(**common,
+                                     deadline_monotonic=time.monotonic() + 5)
+    old_handoff_remaining = 1.0
+    assert old_handoff_remaining < (
+        reclaim.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS)
+    with proof_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                UPDATE serve_reserved_fill_reclaim_provider_proofs
+                SET completed_at = clock_timestamp()
+                    - make_interval(secs => :age)
+            """), {
+                'age': (reclaim.AUTHORIZATION_MAX_AGE_SECONDS -
+                        old_handoff_remaining)
+            })
+
+    launch_count = 10
+    handoff_barrier = threading.Barrier(launch_count)
+    terminal_entry_delay = old_handoff_remaining + 0.1
+
+    def launch():
+        receipt = repository.get_or_prove(**common,
+                                          deadline_monotonic=time.monotonic() +
+                                          5)
+        handoff_barrier.wait(timeout=5)
+        time.sleep(terminal_entry_delay)
+        with proof_engine.begin() as connection:
+            holds = proofs.provider_proof_reference_holds_in_connection(
+                connection,
+                receipt.reference,
+                expected_physical_cluster_uid='physical-cluster-uid')
+        return receipt.reference.receipt_nonce, holds
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=launch_count) as executor:
+        results = tuple(executor.map(lambda _: launch(), range(launch_count)))
+
+    # The old 0.5-second handoff reserve reused the aged receipt and every
+    # delayed terminal guard failed.  The shared minimum-remaining contract
+    # elects one refresh before any launch receives its reference.
+    assert calls == 2
+    assert {nonce for nonce, _ in results} == {seeded.reference.receipt_nonce}
+    assert all(holds for _, holds in results)
+
+
 def test_slow_validation_cannot_consume_terminal_guard_reserve(proof_engine):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
     common = {
@@ -1567,8 +1631,9 @@ def test_slow_validation_cannot_consume_terminal_guard_reserve(proof_engine):
                             deadline_monotonic=time.monotonic() + 5,
                             prove=_proof_candidate,
                             validate=_accept_payload)
-    age_before_validation = (reclaim.AUTHORIZATION_MAX_AGE_SECONDS -
-                             proofs._TERMINAL_GUARD_RESERVE_SECONDS - 0.2)
+    age_before_validation = (
+        reclaim.AUTHORIZATION_MAX_AGE_SECONDS -
+        reclaim.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS - 0.2)
     with proof_engine.begin() as connection:
         connection.execute(
             sqlalchemy.text("""
@@ -1612,7 +1677,8 @@ def test_connection_close_cannot_consume_terminal_guard_reserve(proof_engine):
                             prove=_proof_candidate,
                             validate=_accept_payload)
     age_before_close = (reclaim.AUTHORIZATION_MAX_AGE_SECONDS -
-                        proofs._TERMINAL_GUARD_RESERVE_SECONDS - 0.4)
+                        reclaim.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS -
+                        0.4)
     with proof_engine.begin() as connection:
         connection.execute(
             sqlalchemy.text("""

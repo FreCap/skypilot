@@ -40,11 +40,6 @@ _DATABASE_STATEMENT_TIMEOUT_MILLISECONDS = 200
 _DATABASE_SOCKET_TIMEOUT_MILLISECONDS = 200
 _DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS = 6000
 _PROVIDER_PUBLICATION_RESERVE_SECONDS = 0.5
-# A receipt handed back to the launch policy must leave time for the caller to
-# enter the terminal PostgreSQL authority transaction.  The terminal guard
-# still checks the full five-second freshness bound on the database clock; this
-# reserve is a liveness qualification, not an extension of proof authority.
-_TERMINAL_GUARD_RESERVE_SECONDS = 0.5
 _DATABASE_APPLICATION_NAME = 'skypilot-reclaim-proof'
 _DATABASE_OWNER_APPLICATION_NAME = 'skypilot-reclaim-proof-owner'
 _PROVIDER_PROOF_MAX_JSON_DEPTH = 32
@@ -104,7 +99,7 @@ class ReclaimProviderProofReceipt:
         # physical connection close, and every other local handoff delay.
         age = time.monotonic() - self.reference.completed_monotonic
         return 0 <= age < (reclaim.AUTHORIZATION_MAX_AGE_SECONDS -
-                           _TERMINAL_GUARD_RESERVE_SECONDS)
+                           reclaim.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS)
 
 
 def _require_deadline(deadline_monotonic: float) -> float:

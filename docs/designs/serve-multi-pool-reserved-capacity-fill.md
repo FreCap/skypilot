@@ -25,9 +25,9 @@ production gate. The change strengthens only canonical projection protocol v4
 and adds no schema, EFS/RWX, KubeRay, Terraform, Terragrunt, or platform-pin
 dependency.
 
-The 2026-08-20 canonical-birth correction is source-implemented in PR #1621
-and is not yet merged, deployed, activated, or production-proven. It makes a
-fresh lifecycle-fenced PostgreSQL
+The 2026-08-20 canonical-birth correction is merged in PR #1621 at
+`bb81d16f1c2d194ec5bf488c1e1d87c8f44ee391`; it is not yet deployed,
+activated, or production-proven. It makes a fresh lifecycle-fenced PostgreSQL
 non-pool service commit its service/version row with one complete generic
 bound, durable-route, durable-demand, and durable-intent authority tuple tied
 to one controller incarnation. Startup verifies that tuple instead of
@@ -173,14 +173,30 @@ random nonce on every five-second refresh, so an unchanged provider proof could
 revoke a concurrently minted exact reference between policy return and the
 terminal guard. A cached receipt was also reusable until the last instant of
 its five-second horizon, leaving no time for the terminal PostgreSQL check. The
-fix-forward below keeps the nonce for an identical canonical proof renewal,
-rotates it for every schema or proof-content change, uses one nonblocking
+initial fix-forward kept the nonce for an identical canonical proof renewal,
+rotated it for every schema or proof-content change, used one nonblocking
 READ-COMMITTED MVCC statement as the terminal linearization point, and
-reserves the final 0.5 seconds for the terminal guard using live local elapsed
-time at actual handoff. The shared fleet gate is acquired before that
-five-second ticket is minted, so an unbounded gate wait cannot consume the
-reserve. This changes neither the five-second maximum age nor any gate,
-service, projection, physical-cluster, or provider-proof predicate.
+reserved the final 0.5 seconds for the terminal guard using live local elapsed
+time at actual handoff. The shared fleet gate was acquired before that
+five-second ticket was minted, so an unbounded gate wait could not consume the
+reserve. It changed neither the five-second maximum age nor any gate, service,
+projection, physical-cluster, or provider-proof predicate.
+
+The first larger protocol-v2 activation wave at gate generation 7 then showed
+that the 0.5-second launch handoff reserve was not a sufficient contract.
+Replicas 55930 and later often reused one receipt with less than a second left;
+policy decoding, caller validation, and the multi-statement terminal PostgreSQL
+read consumed that remainder under ten-way launch concurrency. An exact
+committed-intent snapshot with the newer broker generation passes every durable
+claim, service, projection, and policy predicate when supplied a freshly
+authorized receipt, isolating that sampled failure to the final provider-proof
+freshness predicate. The fix-forward retains the strict five-second terminal
+expiry and all exact nonce/digest/gate/content checks, but requires at least two
+seconds of freshness at both repository selection and final policy-to-provider
+handoff.
+A receipt inside that bounded entry budget is single-flight refreshed before it
+is returned; there is no generic authority retry and no provider effect on an
+expired or indeterminate proof.
 
 Historical rollout record: the additive reserved-fill, exact worker-projection, generalized
 non-pool binding, demand, route, executor-termination, provider-independent
@@ -2272,15 +2288,16 @@ prior-generation CAS, or unlock query remains. Receipt waits never consume or
 retain an ordinary API/Serve `QueuePool` slot.
 The provider deadline reserves the final 0.5 seconds of the outer horizon for
 publication and physical session close. Independently, a receipt may be reused
-or published to a caller only while at least 0.5 seconds remain before its
-five-second expiry. The database read maps completion conservatively to the
-caller's monotonic clock, and the live reserve check runs after payload
-validation, transaction commit/rollback, and physical `NullPool` connection
-close at the actual return boundary. If those steps consumed the reserve, the
-caller re-enters election under its unchanged absolute deadline and never sees
-the near-expiry receipt. That second reserve gives the caller time to enter the
-terminal PostgreSQL guard; the guard still checks the full maximum age and
-fails closed if the reserve was insufficient under actual contention.
+or published to a caller only while at least two seconds remain before its
+five-second expiry. The same public minimum-remaining value is rechecked after
+policy decoding at the final policy-to-provider handoff. The database read maps
+completion conservatively to the caller's monotonic clock, and the live reserve
+check runs after payload validation, transaction commit/rollback, and physical
+`NullPool` connection close at the actual return boundary. If those steps
+consume the reserve, the caller re-enters election under its unchanged absolute
+deadline and never sees the near-expiry receipt. The terminal PostgreSQL guard
+still checks the full maximum age and fails closed if the bounded entry budget
+is consumed under actual contention.
 
 The receipt-owned connection path is PostgreSQL-only, `NullPool`, and
 instrumented under the bounded `reserved-fill-reclaim-proof` metric label. It
@@ -4028,15 +4045,19 @@ mismatch despite a valid context proof, and final-guard rejection of missing,
 expired, malformed, wrong-nonce, wrong-digest, wrong-gate, wrong-identity,
 or wrong-context rows. It also proves that an identical expired renewal
 preserves the nonce and an already minted reference, a receipt inside the final
-0.5-second reserve is refreshed before return, slow payload validation and
-physical connection close cannot consume that reserve at handoff, and any
+two-second launch-entry budget is refreshed before return, slow payload
+validation and physical connection close cannot consume that budget at
+handoff, and any
 proof-content change rotates the nonce and rejects the older reference. The
 terminal test requires READ COMMITTED, rejects an independently stale local
 reference, proves an uncommitted identical update neither blocks nor rejects a
 valid MVCC guard, and proves a changed commit is visible to the next statement
 and rejects the old nonce. A staggered 90-launch wave runs for ten seconds,
 crosses at least two identical renewals, retains one nonce, and admits every
-terminal guard. Backend tests hold a delayed fleet-gate acquisition open and
+terminal guard. A ten-launch PostgreSQL boundary test starts with a receipt
+that the old 0.5-second reserve admitted, delays entry beyond its remaining
+lifetime, and proves one shared refresh makes every final guard succeed.
+Backend tests hold a delayed fleet-gate acquisition open and
 prove no policy deadline/reference is minted until the gate is entered, then
 verify the gate session both after proof and after provider I/O:
 
