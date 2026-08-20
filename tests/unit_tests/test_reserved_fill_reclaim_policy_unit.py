@@ -858,6 +858,39 @@ def test_service_and_global_guards_precede_policy_authorization(monkeypatch):
     ]
 
 
+def test_provider_guard_rejects_ticket_without_terminal_entry_budget(
+        monkeypatch):
+    context = _launch_context()
+    provisioner = _provisioner(context)
+    expected_scope = _scope(context)
+    remaining = reclaim.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS / 2
+    completed = (time.monotonic() -
+                 (reclaim.AUTHORIZATION_MAX_AGE_SECONDS - remaining))
+    authorization = _launch_authorization(expected_scope,
+                                          completed_monotonic=completed)
+    policy = _Policy(mock.Mock(return_value=authorization))
+    terminal_recheck = mock.Mock(return_value=True)
+
+    monkeypatch.setattr(reclaim, 'require_unique_policy', lambda: policy)
+    monkeypatch.setattr(
+        serve_state, 'reserved_fill_reclaim_gate_authority_guard',
+        lambda *, shared: contextlib.nullcontext() if shared else None)
+    monkeypatch.setattr(serve_state,
+                        'reserved_fill_reclaim_launch_authority_holds',
+                        terminal_recheck)
+    monkeypatch.setattr(
+        provisioner, '_service_replica_launch_provider_owner_guard',
+        lambda: contextlib.nullcontext(_launch_snapshot(context)))
+
+    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
+                       match='policy refused'):
+        with provisioner._service_replica_launch_provider_guard():
+            pytest.fail('provider ran with an expiring authorization')
+
+    policy._authorize_launch.assert_called_once()
+    terminal_recheck.assert_not_called()
+
+
 def test_delayed_global_gate_acquisition_precedes_ticket_mint(monkeypatch):
     context = _launch_context()
     provisioner = _provisioner(context)

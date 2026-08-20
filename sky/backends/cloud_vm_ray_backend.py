@@ -1021,7 +1021,10 @@ class RetryingVmProvisioner:
                  authorization,
                  expected_identity=identity,
                  expected_gate_generation=gate_generation,
-                 expected_scope=scope)
+                 expected_scope=scope,
+                 minimum_remaining_seconds=(
+                     reserved_fill_reclaim_attestation.
+                     LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS))
         except Exception as error:  # pylint: disable=broad-except
             raise reserved_capacity.ReservedFillLaunchFenceError(
                 'Deployment reclaim policy refused the reserved-fill '

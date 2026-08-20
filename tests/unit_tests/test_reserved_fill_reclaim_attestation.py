@@ -141,6 +141,50 @@ def test_launch_authorization_binds_exact_provider_proof_reference() -> None:
     assert authorization.provider_proof_reference == reference
 
 
+def test_launch_authorization_handoff_requires_minimum_remaining_freshness(
+) -> None:
+    identity = attestation.ReclaimPolicyIdentity(
+        fleet_bundle_sha256='a' * 64,
+        policy_revision='bundle-policy-v1',
+        provider_inventory_sha256='b' * 64)
+    completed = 10.0
+    reference = attestation.ReclaimProviderProofReference(
+        receipt_nonce='c' * 64,
+        proof_sha256='d' * 64,
+        identity=identity,
+        gate_generation=7,
+        kubernetes_context='research',
+        completed_monotonic=completed)
+    authorization = attestation.ReclaimLaunchAuthorization(
+        identity=identity,
+        gate_generation=7,
+        scope=_launch_scope(),
+        provider_proof_reference=reference,
+        completed_monotonic=completed)
+    maximum_handoff_age = (
+        attestation.AUTHORIZATION_MAX_AGE_SECONDS -
+        attestation.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS)
+
+    assert attestation.require_exact_launch_authorization(
+        authorization,
+        expected_identity=identity,
+        expected_gate_generation=7,
+        expected_scope=_launch_scope(),
+        now_monotonic=completed + maximum_handoff_age - 0.001,
+        minimum_remaining_seconds=(
+            attestation.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS
+        )) is authorization
+    with pytest.raises(attestation.ReclaimAttestationError, match='stale'):
+        attestation.require_exact_launch_authorization(
+            authorization,
+            expected_identity=identity,
+            expected_gate_generation=7,
+            expected_scope=_launch_scope(),
+            now_monotonic=completed + maximum_handoff_age,
+            minimum_remaining_seconds=(
+                attestation.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS))
+
+
 @pytest.mark.parametrize('mismatch',
                          ('identity', 'gate', 'context', 'completion'))
 def test_launch_authorization_rejects_provider_proof_reference_mismatch(
