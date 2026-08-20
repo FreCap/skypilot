@@ -191,6 +191,30 @@ def _require_fresh_writer_attestation(
             'activation command against a stable rollout.')
 
 
+def _require_same_writer_cohort(before: _WriterCohortAttestation,
+                                after: _WriterCohortAttestation) -> None:
+    """Fail closed if any immutable writer identity changed during proof."""
+    before_identity = (
+        before.image_digest,
+        before.deployment_generation,
+        before.deployment_uid,
+        before.pod_inventory_count,
+        before.pod_inventory_sha256,
+    )
+    after_identity = (
+        after.image_digest,
+        after.deployment_generation,
+        after.deployment_uid,
+        after.pod_inventory_count,
+        after.pod_inventory_sha256,
+    )
+    if before_identity != after_identity:
+        raise ReconciliationTransitionError(
+            'The split-role writer rollout changed during reclaim '
+            'attestation; rerun the activation command against a stable '
+            'rollout.')
+
+
 def _durable_claim_scope(
 ) -> tuple[reserved_fill_reclaim_attestation.ReservedContextClaim, ...]:
     """Read the exact activation scope later revalidated under locks."""
@@ -292,20 +316,27 @@ def activate() -> tuple[bool, ReconciliationTransitionStatus]:
             'Reserved-fill reconciliation gate is malformed.')
 
     # Kubernetes provider reads are deliberately complete before acquiring the
-    # broker lock.  The immutable proof may cross the lock boundary only while
-    # it remains within this short process-monotonic freshness window.
-    attestation = _attest_split_role_writer_cohort()
+    # broker lock. Bind the potentially slow provider proof to one fresh writer
+    # cohort, then prove that exact immutable cohort is still current. Only the
+    # post-proof attestation may cross the lock boundary, within its short
+    # process-monotonic freshness window.
+    pre_proof_attestation = _attest_split_role_writer_cohort()
     claimed_contexts = _durable_claim_scope()
-    reclaim_evidence = _attest_reclaim_enforcement(attestation,
+    _require_fresh_writer_attestation(pre_proof_attestation)
+    reclaim_evidence = _attest_reclaim_enforcement(pre_proof_attestation,
                                                    claimed_contexts)
+    post_proof_attestation = _attest_split_role_writer_cohort()
+    _require_same_writer_cohort(pre_proof_attestation, post_proof_attestation)
     receipt = reserved_fill_reclaim_attestation.activation_receipt(
         reclaim_evidence,
-        writer_image_digest=attestation.image_digest,
-        writer_deployment_generation=attestation.deployment_generation,
-        writer_deployment_uid=attestation.deployment_uid,
-        writer_pod_inventory_count=attestation.pod_inventory_count,
-        writer_pod_inventory_sha256=attestation.pod_inventory_sha256)
-    _require_fresh_writer_attestation(attestation)
+        writer_image_digest=post_proof_attestation.image_digest,
+        writer_deployment_generation=(
+            post_proof_attestation.deployment_generation),
+        writer_deployment_uid=post_proof_attestation.deployment_uid,
+        writer_pod_inventory_count=post_proof_attestation.pod_inventory_count,
+        writer_pod_inventory_sha256=(
+            post_proof_attestation.pod_inventory_sha256))
+    _require_fresh_writer_attestation(post_proof_attestation)
     _require_fresh_reclaim_attestation(reclaim_evidence)
     with serve_state.reserved_fill_reclaim_gate_authority_guard(
             shared=False) as gate_guard:
@@ -315,7 +346,7 @@ def activate() -> tuple[bool, ReconciliationTransitionStatus]:
                 'The fleet reclaim guard lost its PostgreSQL session.')
         # Composite broker/fleet lock acquisition may block. Reject evidence
         # that aged out before consulting or mutating durable state.
-        _require_fresh_writer_attestation(attestation)
+        _require_fresh_writer_attestation(post_proof_attestation)
         _require_fresh_reclaim_attestation(reclaim_evidence)
         repository = (
             pool_capacity_observation.PoolCapacityObservationRepository(engine))
