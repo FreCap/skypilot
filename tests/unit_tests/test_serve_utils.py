@@ -1505,6 +1505,58 @@ def test_postgres_controller_preserving_lock_reads_current_epoch():
     assert lifecycle_lock.epoch == 7
 
 
+def test_postgres_deferred_lifecycle_lock_retains_on_lock_session():
+    pg_lock = mock.MagicMock(spec=serve_utils.locks.PostgresLock)
+    pg_lock.is_session_alive.return_value = True
+    connection = object()
+    pg_lock.run_in_lock_session.side_effect = lambda operation: operation(
+        connection)
+    lifecycle_lock = serve_utils.ServiceLifecycleLock('svc',
+                                                      pg_lock,
+                                                      advance_epoch=None)
+
+    with mock.patch.object(serve_utils.serve_state,
+                           'read_service_lifecycle_epoch',
+                           return_value=7) as read, \
+         mock.patch.object(serve_utils.serve_state,
+                           'claim_service_lifecycle_epoch') as claim:
+        lifecycle_lock.acquire()
+        assert lifecycle_lock.epoch is None
+        read.assert_not_called()
+        claim.assert_not_called()
+        assert serve_utils.retain_service_lifecycle_epoch(lifecycle_lock) == 7
+
+    read.assert_called_once_with('svc', connection)
+    claim.assert_not_called()
+    assert lifecycle_lock.epoch == 7
+
+
+def test_postgres_deferred_lifecycle_lock_advances_on_lock_session():
+    pg_lock = mock.MagicMock(spec=serve_utils.locks.PostgresLock)
+    pg_lock.is_session_alive.return_value = True
+    connection = object()
+    pg_lock.run_in_lock_session.side_effect = lambda operation: operation(
+        connection)
+    lifecycle_lock = serve_utils.ServiceLifecycleLock('svc',
+                                                      pg_lock,
+                                                      advance_epoch=None)
+
+    with mock.patch.object(serve_utils.serve_state,
+                           'read_service_lifecycle_epoch') as read, \
+         mock.patch.object(serve_utils.serve_state,
+                           'claim_service_lifecycle_epoch',
+                           return_value=8) as claim:
+        lifecycle_lock.acquire()
+        assert lifecycle_lock.epoch is None
+        read.assert_not_called()
+        claim.assert_not_called()
+        assert serve_utils.advance_service_lifecycle_epoch(lifecycle_lock) == 8
+
+    claim.assert_called_once_with('svc', connection)
+    read.assert_not_called()
+    assert lifecycle_lock.epoch == 8
+
+
 def test_lifecycle_epoch_cancellation_releases_lock():
     pg_lock = mock.MagicMock(spec=serve_utils.locks.PostgresLock)
     pg_lock.run_in_lock_session.side_effect = KeyboardInterrupt

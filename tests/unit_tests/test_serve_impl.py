@@ -994,6 +994,12 @@ class TestApplyRefusesTerminalStates:
             mock.patch(
                 'sky.serve.server.impl.serve_utils.get_service_filelock_path',
                 return_value='/tmp/test_apply_lock'),
+            mock.patch('sky.serve.server.impl.serve_state.get_service_hash',
+                       return_value='incarnation-a'),
+            mock.patch('sky.serve.server.impl.serve_utils.'
+                       'retain_service_lifecycle_epoch'),
+            mock.patch('sky.serve.server.impl.serve_utils.'
+                       'advance_service_lifecycle_epoch'),
             mock.patch('sky.serve.server.impl.controller_utils.'
                        'get_controller_for_pool'),
             mock.patch(
@@ -1072,6 +1078,12 @@ class TestApplyRefusesTerminalStates:
             mock.patch(
                 'sky.serve.server.impl.serve_utils.get_service_filelock_path',
                 return_value='/tmp/test_apply_lock'),
+            mock.patch('sky.serve.server.impl.serve_state.get_service_hash',
+                       return_value=None),
+            mock.patch('sky.serve.server.impl.serve_utils.'
+                       'retain_service_lifecycle_epoch'),
+            mock.patch('sky.serve.server.impl.serve_utils.'
+                       'advance_service_lifecycle_epoch'),
             mock.patch('sky.serve.server.impl.controller_utils.'
                        'get_controller_for_pool'),
             mock.patch(
@@ -1469,6 +1481,60 @@ class TestLifecycleLocking:
         assert calls == [
             'file-lock', 'lifecycle-lock', 'impl', 'lifecycle-unlock',
             'file-unlock'
+        ]
+
+    @pytest.mark.parametrize('service_hash,expected_choice', [
+        ('incarnation-a', 'retain'),
+        (None, 'advance'),
+    ])
+    def test_apply_selects_lifecycle_epoch_under_name_lock(
+            self, service_hash, expected_choice):
+        calls = []
+        lifecycle_lock = mock.MagicMock()
+        lifecycle_lock.__enter__ = mock.Mock(
+            side_effect=lambda *a: calls.append('lifecycle-lock'))
+        lifecycle_lock.__exit__ = mock.Mock(
+            side_effect=lambda *a: calls.append('lifecycle-unlock'))
+        file_lock = mock.MagicMock()
+        file_lock.__enter__ = mock.Mock(
+            side_effect=lambda *a: calls.append('file-lock'))
+        file_lock.__exit__ = mock.Mock(
+            side_effect=lambda *a: calls.append('file-unlock'))
+        stop = RuntimeError('stop after lifecycle choice')
+        with mock.patch('sky.serve.server.impl.filelock.FileLock',
+                        return_value=file_lock), \
+             mock.patch('sky.serve.server.impl.serve_utils.'
+                        'get_service_lifecycle_lock',
+                        return_value=lifecycle_lock) as get_lifecycle_lock, \
+             mock.patch('sky.serve.server.impl.serve_utils.'
+                        'get_service_filelock_path',
+                        return_value='/tmp/svc.lock'), \
+             mock.patch('sky.serve.server.impl.serve_state.get_service_hash',
+                        side_effect=lambda name: calls.append('read') or
+                        service_hash), \
+             mock.patch('sky.serve.server.impl.serve_utils.'
+                        'retain_service_lifecycle_epoch',
+                        side_effect=lambda lock: calls.append('retain')) \
+             as retain_epoch, \
+             mock.patch('sky.serve.server.impl.serve_utils.'
+                        'advance_service_lifecycle_epoch',
+                        side_effect=lambda lock: calls.append('advance')) \
+             as advance_epoch, \
+             mock.patch('sky.serve.server.impl.controller_utils.'
+                        'get_controller_for_pool', side_effect=stop):
+            with pytest.raises(RuntimeError, match='lifecycle choice'):
+                impl.apply(mock.Mock(), None, 'svc')
+
+        get_lifecycle_lock.assert_called_once_with('svc', advance_epoch=None)
+        if expected_choice == 'retain':
+            retain_epoch.assert_called_once_with(lifecycle_lock)
+            advance_epoch.assert_not_called()
+        else:
+            advance_epoch.assert_called_once_with(lifecycle_lock)
+            retain_epoch.assert_not_called()
+        assert calls == [
+            'file-lock', 'lifecycle-lock', 'read', expected_choice,
+            'lifecycle-unlock', 'file-unlock'
         ]
 
     def test_up_locks_before_any_name_scoped_work(self):
