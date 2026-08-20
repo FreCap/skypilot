@@ -11,6 +11,8 @@ import copy
 import dataclasses
 from decimal import Decimal
 from decimal import InvalidOperation
+import hashlib
+import json
 import posixpath
 from typing import Any, Literal
 
@@ -40,6 +42,8 @@ _SERVE_WORKER_RUNTIME_STARTUP_FAILURE_THRESHOLD = (
     SERVE_WORKER_RUNTIME_STARTUP_TIMEOUT_SECONDS //
     _SERVE_WORKER_RUNTIME_PROBE_PERIOD_SECONDS)
 _SERVE_WORKER_RUNTIME_READINESS_FAILURE_THRESHOLD = 1
+_SERVE_WORKER_RUNTIME_BOOTSTRAP_COMMAND = ('/bin/bash', '-c', '--')
+_SHA256_HEX_DIGITS = frozenset('0123456789abcdef')
 _SERVE_WORKER_SCRATCH_NONE_KEYS = frozenset({'kind'})
 _SERVE_WORKER_SCRATCH_MEMORY_KEYS = frozenset(
     {'kind', 'mount_path', 'volume_name', 'size_limit_bytes'})
@@ -677,6 +681,102 @@ def _observe_projected_worker_runtime_env(entry: object) -> dict[str, object]:
     }
 
 
+def _canonicalize_projected_worker_runtime_bootstrap_value(
+        value: object, location: str) -> object:
+    """Serialize one bootstrap field identically from YAML or API models."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [
+            _canonicalize_projected_worker_runtime_bootstrap_value(
+                item, f'{location}[]') for item in value
+        ]
+    if isinstance(value, Mapping):
+        canonical: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ProjectedRuntimeReadinessContractError(
+                    f'{location} contains a non-string field name.')
+            if item is None:
+                continue
+            canonical[key] = (
+                _canonicalize_projected_worker_runtime_bootstrap_value(
+                    item, f'{location}.{key}'))
+        return canonical
+    attribute_map = getattr(value, 'attribute_map', None)
+    if isinstance(attribute_map, Mapping):
+        canonical = {}
+        for api_name, yaml_name in attribute_map.items():
+            if not isinstance(api_name, str) or not isinstance(yaml_name, str):
+                raise ProjectedRuntimeReadinessContractError(
+                    f'{location} has an invalid Kubernetes model schema.')
+            item = _pod_api_field(value, yaml_name, api_name)
+            if item is None:
+                continue
+            canonical[yaml_name] = (
+                _canonicalize_projected_worker_runtime_bootstrap_value(
+                    item, f'{location}.{yaml_name}'))
+        return canonical
+    raise ProjectedRuntimeReadinessContractError(
+        f'{location} contains an unsupported value type.')
+
+
+def _projected_worker_runtime_bootstrap_identity(
+        pod_spec: object) -> dict[str, object]:
+    """Extract the exact template-owned bootstrap producer identity."""
+    containers = _pod_api_field(pod_spec, 'containers', 'containers')
+    if not isinstance(containers, (list, tuple)):
+        containers = []
+    runtime_containers = [
+        container for container in containers
+        if _pod_api_field(container, 'name', 'name') == 'ray-node'
+    ]
+    if len(runtime_containers) != 1:
+        raise ProjectedRuntimeReadinessContractError(
+            'Projected SkyServe Kubernetes Pods must contain exactly one '
+            'ray-node bootstrap producer.')
+    runtime = runtime_containers[0]
+    command = _pod_api_field(runtime, 'command', 'command')
+    if (not isinstance(command, (list, tuple)) or
+            tuple(command) != _SERVE_WORKER_RUNTIME_BOOTSTRAP_COMMAND):
+        raise ProjectedRuntimeReadinessContractError(
+            'Projected SkyServe worker bootstrap command must use the exact '
+            'canonical /bin/bash producer.')
+    args = _pod_api_field(runtime, 'args', 'args')
+    if (not isinstance(args, (list, tuple)) or len(args) != 1 or
+            not isinstance(args[0], str) or not args[0]):
+        raise ProjectedRuntimeReadinessContractError(
+            'Projected SkyServe worker bootstrap args must contain exactly '
+            'one non-empty canonical script.')
+    lifecycle = _pod_api_field(runtime, 'lifecycle', 'lifecycle')
+    return {
+        'command': list(command),
+        'args': list(args),
+        'lifecycle': _canonicalize_projected_worker_runtime_bootstrap_value(
+            lifecycle, 'ray-node.lifecycle'),
+    }
+
+
+def projected_worker_runtime_bootstrap_sha256(pod_spec: object) -> str:
+    """Return the immutable identity of the runtime marker producer."""
+    identity = _projected_worker_runtime_bootstrap_identity(pod_spec)
+    encoded = json.dumps(identity,
+                         sort_keys=True,
+                         separators=(',', ':'),
+                         ensure_ascii=True).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_projected_worker_runtime_bootstrap_sha256(value: object) -> str:
+    """Validate the persisted digest for one canonical bootstrap producer."""
+    if (not isinstance(value, str) or len(value) != 64 or
+            any(character not in _SHA256_HEX_DIGITS for character in value)):
+        raise ProjectedRuntimeReadinessContractError(
+            'Projected SkyServe worker runtime bootstrap SHA256 must be '
+            'exactly 64 lowercase hexadecimal characters.')
+    return value
+
+
 def _observe_projected_worker_runtime_readiness(
         pod_spec: object) -> dict[str, object]:
     containers = _pod_api_field(pod_spec, 'containers', 'containers')
@@ -696,7 +796,7 @@ def _observe_projected_worker_runtime_readiness(
         if _pod_api_field(entry, 'name', 'name') ==
         SERVE_WORKER_RUNTIME_READY_POD_UID_ENV_VAR
     ]
-    return {
+    observed = {
         'restart_policy': _pod_api_field(pod_spec, 'restartPolicy',
                                          'restart_policy'),
         'pod_uid_env': pod_uid_env,
@@ -706,12 +806,20 @@ def _observe_projected_worker_runtime_readiness(
             _pod_api_field(runtime, 'readinessProbe', 'readiness_probe')),
         'ray_node_container_count': len(runtime_containers),
     }
+    try:
+        observed['bootstrap_sha256'] = (
+            projected_worker_runtime_bootstrap_sha256(pod_spec))
+    except ProjectedRuntimeReadinessContractError as error:
+        observed['bootstrap_sha256'] = None
+        observed['bootstrap_error'] = str(error)
+    return observed
 
 
 def enforce_projected_worker_runtime_readiness_contract(
     pod_spec: object,
     *,
     rewrite: bool,
+    expected_bootstrap_sha256: object,
 ) -> ProjectedRuntimeReadinessContract:
     """Own the UID-bound bootstrap readiness surface for one worker Pod.
 
@@ -720,7 +828,10 @@ def enforce_projected_worker_runtime_readiness_contract(
     merge, webhook, or same-name replacement cannot turn mere Running state
     into projected-worker provisioning success.
     """
+    expected_digest = validate_projected_worker_runtime_bootstrap_sha256(
+        expected_bootstrap_sha256)
     expected = _expected_projected_worker_runtime_readiness()
+    expected['bootstrap_sha256'] = expected_digest
     if rewrite:
         if not isinstance(pod_spec, dict):
             raise ProjectedRuntimeReadinessContractError(
@@ -746,6 +857,11 @@ def enforce_projected_worker_runtime_readiness_contract(
                 'Projected SkyServe Kubernetes Pods must contain exactly one '
                 'ray-node container.')
         runtime = runtime_containers[0]
+        actual_digest = projected_worker_runtime_bootstrap_sha256(pod_spec)
+        if actual_digest != expected_digest:
+            raise ProjectedRuntimeReadinessContractError(
+                'Projected SkyServe worker bootstrap command, args, or '
+                'lifecycle changed after canonical template rendering.')
         env = runtime.get('env')
         if env is None:
             env = []

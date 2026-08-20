@@ -1989,6 +1989,8 @@ def test_final_v4_yaml_composes_kueue_cache_scratch_and_readiness():
                     'spec': {
                         'containers': [{
                             'name': 'ray-node',
+                            'command': ['/bin/bash', '-c', '--'],
+                            'args': ['canonical bootstrap'],
                             'env': [{
                                 'name': 'SKYPILOT_SERVE_SCRATCH_KIND',
                                 'value': 'caller',
@@ -1999,17 +2001,27 @@ def test_final_v4_yaml_composes_kueue_cache_scratch_and_readiness():
             },
         },
     }
+    pod_spec = cluster_yaml['available_node_types']['ray_head_default'][
+        'node_config']['spec']
+    bootstrap_sha256 = (
+        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
 
     backend_utils._enforce_worker_projection_on_kubernetes_yaml(
-        cluster_yaml, projection)
+        cluster_yaml,
+        projection,
+        expected_runtime_bootstrap_sha256=bootstrap_sha256)
     first = copy.deepcopy(cluster_yaml)
     backend_utils._enforce_worker_projection_on_kubernetes_yaml(
-        cluster_yaml, projection)
+        cluster_yaml,
+        projection,
+        expected_runtime_bootstrap_sha256=bootstrap_sha256)
 
     assert cluster_yaml == first
     assert cluster_yaml['provider'][
         'serve_worker_projection_protocol_version'] == 4
     assert cluster_yaml['provider']['timeout'] == -1
+    assert cluster_yaml['provider'][
+        'serve_worker_expected_runtime_bootstrap_sha256'] == bootstrap_sha256
     assert cluster_yaml['provider']['serve_worker_expected_scratch'] == {
         'kind': 'memory',
         'mount_path': '/tmp',
@@ -2122,7 +2134,15 @@ def test_historical_projection_does_not_install_runtime_readiness(
     'readiness_probe',
 ])
 def test_projected_runtime_readiness_rejects_owned_surface_collision(collision):
-    pod_spec = {'containers': [{'name': 'ray-node'}]}
+    pod_spec = {
+        'containers': [{
+            'name': 'ray-node',
+            'command': ['/bin/bash', '-c', '--'],
+            'args': ['canonical bootstrap'],
+        }]
+    }
+    bootstrap_sha256 = (
+        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
     runtime = pod_spec['containers'][0]
     if collision == 'restart_policy':
         pod_spec['restartPolicy'] = 'Always'
@@ -2140,21 +2160,129 @@ def test_projected_runtime_readiness_rejects_owned_surface_collision(collision):
             kubernetes_pod_spec.ProjectedRuntimeReadinessContractError,
             match='runtime|UID|restartPolicy'):
         kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
-            pod_spec, rewrite=True)
+            pod_spec, rewrite=True, expected_bootstrap_sha256=bootstrap_sha256)
+
+
+@pytest.mark.parametrize('mutation', [
+    lambda runtime: runtime.__setitem__('command', ['/bin/sh', '-c']),
+    lambda runtime: runtime.__setitem__('args', ['forged bootstrap']),
+    lambda runtime: runtime.__setitem__(
+        'lifecycle', {
+            'postStart': {
+                'exec': {
+                    'command':
+                        ['touch', '/tmp/skypilot-serve-worker-runtime-ready']
+                }
+            },
+        }),
+    lambda runtime: runtime.__setitem__('lifecycle', {
+        'preStop': {
+            'exec': {
+                'command': ['/bin/sh', '-c', 'true']
+            }
+        },
+    }),
+])
+def test_final_v4_yaml_rejects_bootstrap_producer_mutation(mutation):
+    cluster_yaml = _v3_scratch_cluster_yaml()
+    pod_spec = cluster_yaml['available_node_types']['ray_head_default'][
+        'node_config']['spec']
+    bootstrap_sha256 = (
+        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
+    mutation(pod_spec['containers'][0])
+
+    with pytest.raises(exceptions.InvalidCloudConfigs,
+                       match='bootstrap command|bootstrap producer'):
+        backend_utils._enforce_worker_projection_on_kubernetes_yaml(
+            cluster_yaml,
+            _worker_projection(protocol_version=4),
+            expected_runtime_bootstrap_sha256=bootstrap_sha256)
+
+
+@pytest.mark.parametrize('mutation', [
+    lambda runtime: runtime.__setitem__('command', ['/bin/sh', '-c']),
+    lambda runtime: runtime.__setitem__('args', ['forged bootstrap']),
+    lambda runtime: runtime.__setitem__(
+        'lifecycle', {
+            **runtime['lifecycle'],
+            'postStart': {
+                'exec': {
+                    'command':
+                        ['touch', '/tmp/skypilot-serve-worker-runtime-ready']
+                }
+            },
+        }),
+    lambda runtime: runtime['lifecycle']['preStop']['exec'].__setitem__(
+        'command', ['/bin/sh', '-c', 'true']),
+])
+def test_admitted_runtime_readiness_rejects_bootstrap_producer_mutation(
+        mutation):
+    pod_spec = {
+        'containers': [{
+            'name': 'ray-node',
+            'command': ['/bin/bash', '-c', '--'],
+            'args': ['canonical bootstrap'],
+            'lifecycle': {
+                'preStop': {
+                    'exec': {
+                        'command': ['/bin/sh', '-c', 'echo stopping'],
+                    },
+                },
+            },
+        }]
+    }
+    bootstrap_sha256 = (
+        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
+    canonical = (
+        kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
+            pod_spec, rewrite=True, expected_bootstrap_sha256=bootstrap_sha256))
+    assert canonical.matches
+
+    mutation(pod_spec['containers'][0])
+    admitted = (
+        kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
+            pod_spec, rewrite=False,
+            expected_bootstrap_sha256=bootstrap_sha256))
+
+    assert not admitted.matches
+    assert admitted.actual['bootstrap_sha256'] != bootstrap_sha256
+    pod = mock.Mock()
+    pod.metadata.name = 'mutated-worker'
+    pod.spec = pod_spec
+    with pytest.raises(kubernetes_instance._ServeWorkerIdentityRejection):
+        kubernetes_instance._attest_serve_worker_runtime_readiness(
+            pod, 'inference', 'phx', True, bootstrap_sha256, defer_cleanup=True)
 
 
 def test_real_kubernetes_client_runtime_readiness_contract_is_accepted():
-    pod_spec = {'containers': [{'name': 'ray-node'}]}
+    pod_spec = {
+        'containers': [{
+            'name': 'ray-node',
+            'command': ['/bin/bash', '-c', '--'],
+            'args': ['canonical bootstrap'],
+            'lifecycle': {
+                'preStop': {
+                    'exec': {
+                        'command': ['/bin/sh', '-c', 'echo stopping'],
+                    },
+                },
+            },
+        }]
+    }
+    bootstrap_sha256 = (
+        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
     expected = (
         kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
-            pod_spec, rewrite=True))
+            pod_spec, rewrite=True, expected_bootstrap_sha256=bootstrap_sha256))
     client = kubernetes_adaptor.kubernetes.client
     api_pod_spec = client.ApiClient()._ApiClient__deserialize(  # pylint: disable=protected-access
         pod_spec, 'V1PodSpec')
 
     observed = (
         kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
-            api_pod_spec, rewrite=False))
+            api_pod_spec,
+            rewrite=False,
+            expected_bootstrap_sha256=bootstrap_sha256))
 
     assert expected.matches
     assert observed.matches
@@ -2170,6 +2298,8 @@ def _v3_scratch_cluster_yaml():
                     'spec': {
                         'containers': [{
                             'name': 'ray-node',
+                            'command': ['/bin/bash', '-c', '--'],
+                            'args': ['canonical bootstrap'],
                         }],
                     },
                 },

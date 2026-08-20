@@ -2511,20 +2511,28 @@ to enter the materialized tail.
 Canonical projection protocol v4 additionally owns one closed base-runtime
 readiness contract. Final rendering, after caller and restored YAML merging,
 installs exactly one downward-API `SKYPILOT_POD_UID`, `restartPolicy: Never`,
-and startup/readiness exec probes on the sole `ray-node` container. Both probes
-require the contents of `/tmp/skypilot-serve-worker-runtime-ready` to equal the
-current Pod UID. Under fail-fast shell execution, the container clears every
-ready, setup-completion, setup-failure, Ray-completion, and host-network-port
-marker that could be inherited from an image or writable layer both before and
-after the trusted server-owned `runcmd`, then starts the bootstrap producers. It
-atomically publishes the UID marker only after the asynchronous SSH,
-environment, and SkyPilot installation steps succeed and the generated Ray
-head start or worker join returns successfully. It then connects to the final
-local sshd port (including the dynamically selected host-network port) and
-requires an SSH banner before publication. The startup probe runs every two
-seconds with 900 failures, bounding this in-container base bootstrap to 30
-minutes after container creation; the readiness probe continuously withdraws
-Ready if the marker no longer matches.
+and startup/readiness exec probes on the sole `ray-node` container. Before any
+workspace or resource Pod-config merge, the renderer hashes the canonical
+template's exact `ray-node` `command`, `args`, and `lifecycle` into one
+server-owned SHA256 expectation. Final rendering rejects any merged change to
+that producer and persists only the digest through the provisioner boundary.
+The create response, adoption read, finalized Pod, admitted read, and final
+fresh read must all reproduce the same digest; an injected `postStart`, changed
+pre-stop lifecycle, alternate command, or replacement script therefore cannot
+forge the readiness marker. Both probes require the contents of
+`/tmp/skypilot-serve-worker-runtime-ready` to equal the current Pod UID. Under
+fail-fast shell execution, the container clears every ready, setup-completion,
+setup-failure, Ray-completion, and host-network-port marker that could be
+inherited from an image or writable layer both before and after the trusted
+server-owned `runcmd`, then starts the bootstrap producers. It atomically
+publishes the UID marker only after the asynchronous SSH, environment, and
+SkyPilot installation steps succeed and the generated Ray head start or worker
+join returns successfully. It then connects to the final local sshd port
+(including the dynamically selected host-network port) and requires an SSH
+banner before publication. The startup probe runs every two seconds with 900
+failures, bounding this in-container base bootstrap to 30 minutes after
+container creation; the readiness probe continuously withdraws Ready if the
+marker no longer matches.
 
 `Running` is therefore only an intermediate observation for v4. The
 provisioner captures the exact non-empty name/UID set, requires the ordinary
@@ -3319,7 +3327,7 @@ either case.
 | 2a.3 | Global activation scope with per-service duplicate-pool validation | Revision 431 preflight exposed that the deployment policy incorrectly treated two services sharing one broker pool/card as a duplicate claim. The fix groups activation claims by service, retains same-service duplicate rejection, and permits the documented cross-service sharing before one fleet-wide provider attestation. |
 | 2a.4 | Remove redundant admission-policy authority from reserved fill | Platform PR #8649 is superseded and must not change the shared KubeRay/HPTO policy for fleet activation. Policy-bundle schema v5 removes ValidatingAdmissionPolicy and binding reads while retaining the stronger exact Kueue controller/webhook and synchronous/fresh Pod lifecycle proof. Activation requires only the SkyPilot fix-forward deployment and a fresh full-fleet preflight; no Terraform or platform Helm change is part of this gate. |
 | 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 63 is committed, elected, and controller-applied at lifecycle epoch 82 on known-good image `v3.682.2-boltz-2`; it is the clean demand-gated activation successor. Version 62 remains rejected historical projection evidence. |
-| 2b.1 | UID-bound base-runtime readiness for canonical projected Kubernetes workers | Local implementation candidate on `fix/serve-projected-worker-runtime-readiness`; 533 focused render, source-composition, typed Kubernetes-model, collision, bounded-wait, UID-replacement, SSH-listener-failure, and final fresh-read tests pass locally. It is not merged, deployed, or production-proven. Generic Kubernetes and projection v1/v2/v3 remain unchanged. |
+| 2b.1 | UID-bound base-runtime readiness for canonical projected Kubernetes workers | Local implementation candidate on `fix/serve-projected-worker-runtime-readiness`; the focused render, source-composition, template-owned bootstrap-digest, typed Kubernetes-model, mutation, bounded-wait, UID-replacement, SSH-listener-failure, and final fresh-read tests pass locally. It is not merged, deployed, or production-proven. Generic Kubernetes and projection v1/v2/v3 remain unchanged. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. Historical cleanup #1506 is closed/superseded and reserves no head. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
 | 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed dark in revision 431 / release 1.1.1338: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Activation remains gated by 2a.3, 2a.4, and a successful full-fleet re-attestation. |
@@ -3900,8 +3908,10 @@ following before merge:
   produces the exact UID input, startup/readiness probes, marker ordering, and
   30-minute startup bound, and a missing final SSH listener/banner prevents
   marker publication;
-- caller collisions on the owned UID, probes, or restart policy fail closed,
-  and a real Kubernetes client `V1PodSpec` round-trips the same exact contract;
+- caller collisions on the owned UID, probes, or restart policy fail closed;
+  command, args, `postStart`, and lifecycle mutations cannot retain the
+  template-owned producer digest; and a real Kubernetes client `V1PodSpec`
+  round-trips the same exact producer and readiness contract;
 - historical v1/v2/v3 projections and an ordinary generic Kubernetes render do
   not receive the marker or probes;
 - a Running/not-Ready exact UID remains in the bounded passive wait, a Ready

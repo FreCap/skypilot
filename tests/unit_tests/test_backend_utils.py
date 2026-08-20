@@ -28,6 +28,7 @@ from sky.exceptions import ClusterNotUpError
 from sky.provision import docker_utils
 from sky.provision import instance_setup
 from sky.provision import ray_commands
+from sky.provision.kubernetes import pod_spec as kubernetes_pod_spec
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.resources import Resources
 from sky.utils import common
@@ -539,6 +540,10 @@ def test_projected_serve_worker_suppresses_all_static_credential_mounts(
     allocatable_discovery.assert_not_called()
     assert rendered_variables[
         'k8s_projected_serve_worker_runtime_readiness'] is True
+    assert rendered['provider'][
+        'serve_worker_expected_runtime_bootstrap_sha256'] == (
+            kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(
+                pod_spec))
     assert pod_spec['affinity']['nodeAffinity'][
         'requiredDuringSchedulingIgnoredDuringExecution']['nodeSelectorTerms'][
             0]['matchExpressions'][-1] == {

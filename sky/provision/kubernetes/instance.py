@@ -2031,17 +2031,20 @@ def _attest_serve_worker_runtime_readiness(
     namespace: str,
     context: str | None,
     required: bool,
+    expected_bootstrap_sha256: object,
     *,
     defer_cleanup: bool = False,
 ) -> None:
-    """Reject a canonical projected worker whose UID probes changed."""
+    """Reject a projected worker whose producer or UID probes changed."""
     if not required:
         return
     pod_spec = (pod.get('spec') if isinstance(pod, Mapping) else getattr(
         pod, 'spec', None))
     contract = (
         pod_spec_lib.enforce_projected_worker_runtime_readiness_contract(
-            pod_spec, rewrite=False))
+            pod_spec,
+            rewrite=False,
+            expected_bootstrap_sha256=expected_bootstrap_sha256))
     if contract.matches:
         return
     _reject_admitted_serve_worker_identity(pod,
@@ -2075,6 +2078,7 @@ def _attest_created_serve_worker_pod(
     expected_accelerator_count: object,
     expected_scratch: object,
     require_runtime_readiness: bool,
+    expected_runtime_bootstrap_sha256: object,
     expected_kueue_lifecycle: _RequiredKueuePodLifecycle = 'create_response',
 ) -> None:
     """Attest one admitted Pod before its create thread returns."""
@@ -2131,6 +2135,7 @@ def _attest_created_serve_worker_pod(
                                            namespace,
                                            context,
                                            require_runtime_readiness,
+                                           expected_runtime_bootstrap_sha256,
                                            defer_cleanup=True)
 
 
@@ -2499,6 +2504,9 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
     serve_worker_expected_scratch = provider_config.get(
         'serve_worker_expected_scratch', _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
+    serve_worker_expected_runtime_bootstrap_sha256 = provider_config.get(
+        'serve_worker_expected_runtime_bootstrap_sha256',
+        _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
     if pod_spec_lib.serve_worker_projection_protocol_has_scratch(
             serve_worker_projection_protocol_version):
         if (serve_worker_expected_scratch
@@ -2514,6 +2522,23 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         raise config_lib.KubernetesError(
             'Only projection protocol v3/v4 may carry a worker scratch '
             'attestation contract.')
+    if require_runtime_readiness:
+        if (serve_worker_expected_runtime_bootstrap_sha256
+                is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+            raise config_lib.KubernetesError(
+                'Projection protocol v4 requires the complete worker runtime '
+                'bootstrap SHA256 contract.')
+        try:
+            serve_worker_expected_runtime_bootstrap_sha256 = (
+                pod_spec_lib.validate_projected_worker_runtime_bootstrap_sha256(
+                    serve_worker_expected_runtime_bootstrap_sha256))
+        except pod_spec_lib.ProjectedRuntimeReadinessContractError as error:
+            raise config_lib.KubernetesError(str(error)) from error
+    elif (serve_worker_expected_runtime_bootstrap_sha256
+          is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+        raise config_lib.KubernetesError(
+            'Only projection protocol v4 may carry a worker runtime '
+            'bootstrap SHA256 contract.')
     priority_attestation_presence = tuple(
         value is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION
         for value in (serve_worker_expected_priority_class_name,
@@ -2677,6 +2702,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                     serve_worker_expected_accelerator_count),
                 expected_scratch=serve_worker_expected_scratch,
                 require_runtime_readiness=require_runtime_readiness,
+                expected_runtime_bootstrap_sha256=(
+                    serve_worker_expected_runtime_bootstrap_sha256),
                 expected_kueue_lifecycle=expected_kueue_lifecycle)
 
         def attest_created_pod(pod: Any) -> None:
@@ -2950,7 +2977,10 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             runtime_readiness_contract = (
                 pod_spec_lib.
                 enforce_projected_worker_runtime_readiness_contract(
-                    pod_spec_copy['spec'], rewrite=False))
+                    pod_spec_copy['spec'],
+                    rewrite=False,
+                    expected_bootstrap_sha256=(
+                        serve_worker_expected_runtime_bootstrap_sha256)))
             if not runtime_readiness_contract.matches:
                 raise config_lib.KubernetesError(
                     'The finalized SkyServe worker Pod changed the immutable '

@@ -942,13 +942,45 @@ def _enforce_worker_scratch_on_pod_spec(
             f'{contract.actual!r}; expected {contract.expected!r}.')
 
 
+def _projected_worker_runtime_bootstrap_sha256_for_cluster_yaml(
+        cluster_yaml: dict[str, Any]) -> str:
+    """Freeze the one canonical bootstrap shared by projected node types."""
+    node_types = cluster_yaml.get('available_node_types')
+    if not isinstance(node_types, dict) or not node_types:
+        raise exceptions.InvalidCloudConfigs(
+            'Projected SkyServe Kubernetes YAML must define node types before '
+            'freezing its runtime bootstrap.')
+    digests: set[str] = set()
+    try:
+        for node_type in node_types.values():
+            if not isinstance(node_type, dict):
+                raise k8s_pod_spec.ProjectedRuntimeReadinessContractError(
+                    'Projected SkyServe Kubernetes node types must be '
+                    'mappings.')
+            node_config = node_type.get('node_config')
+            pod_spec = (node_config.get('spec') if isinstance(
+                node_config, dict) else None)
+            digests.add(
+                k8s_pod_spec.projected_worker_runtime_bootstrap_sha256(
+                    pod_spec))
+    except k8s_pod_spec.ProjectedRuntimeReadinessContractError as error:
+        raise exceptions.InvalidCloudConfigs(str(error)) from error
+    if len(digests) != 1:
+        raise exceptions.InvalidCloudConfigs(
+            'Projected SkyServe Kubernetes node types must share one exact '
+            'canonical runtime bootstrap producer.')
+    return digests.pop()
+
+
 def _enforce_worker_runtime_readiness_on_pod_spec(
-        pod_spec: dict[str, Any]) -> None:
+        pod_spec: dict[str, Any], expected_bootstrap_sha256: str) -> None:
     """Install and attest the projected worker bootstrap-ready contract."""
     try:
         contract = (
             k8s_pod_spec.enforce_projected_worker_runtime_readiness_contract(
-                pod_spec, rewrite=True))
+                pod_spec,
+                rewrite=True,
+                expected_bootstrap_sha256=expected_bootstrap_sha256))
     except k8s_pod_spec.ProjectedRuntimeReadinessContractError as error:
         raise exceptions.InvalidCloudConfigs(str(error)) from error
     if not contract.matches:
@@ -960,6 +992,8 @@ def _enforce_worker_runtime_readiness_on_pod_spec(
 def _enforce_worker_projection_on_kubernetes_yaml(
     cluster_yaml: dict[str, Any],
     projection: dict[str, Any],
+    *,
+    expected_runtime_bootstrap_sha256: object = None,
 ) -> None:
     """Apply server-owned identity and cache after all user config merging."""
     try:
@@ -986,6 +1020,23 @@ def _enforce_worker_projection_on_kubernetes_yaml(
     has_projected_runtime_readiness = (
         k8s_pod_spec.serve_worker_projection_protocol_has_runtime_readiness(
             projection_version))
+    if has_projected_runtime_readiness:
+        try:
+            expected_runtime_bootstrap_sha256 = (
+                k8s_pod_spec.validate_projected_worker_runtime_bootstrap_sha256(
+                    expected_runtime_bootstrap_sha256))
+        except k8s_pod_spec.ProjectedRuntimeReadinessContractError as error:
+            raise exceptions.InvalidCloudConfigs(str(error)) from error
+        cluster_yaml['provider'][
+            'serve_worker_expected_runtime_bootstrap_sha256'] = (
+                expected_runtime_bootstrap_sha256)
+    else:
+        if expected_runtime_bootstrap_sha256 is not None:
+            raise exceptions.InvalidCloudConfigs(
+                'Only projection protocol v4 may carry a worker runtime '
+                'bootstrap SHA256 contract.')
+        cluster_yaml['provider'].pop(
+            'serve_worker_expected_runtime_bootstrap_sha256', None)
     if has_projected_scratch:
         cluster_yaml['provider'][
             'serve_worker_expected_scratch'] = copy.deepcopy(
@@ -1213,7 +1264,9 @@ def _enforce_worker_projection_on_kubernetes_yaml(
         if has_projected_scratch:
             _enforce_worker_scratch_on_pod_spec(pod_spec, projection['scratch'])
         if has_projected_runtime_readiness:
-            _enforce_worker_runtime_readiness_on_pod_spec(pod_spec)
+            assert isinstance(expected_runtime_bootstrap_sha256, str)
+            _enforce_worker_runtime_readiness_on_pod_spec(
+                pod_spec, expected_runtime_bootstrap_sha256)
 
 
 def _restore_projected_worker_kubernetes_fields(
@@ -1252,7 +1305,14 @@ def _restore_projected_worker_kubernetes_fields(
         # projected request rejected. The freshly merged server configuration
         # is authoritative for the complete Kubernetes Pod object.
         restored_node['node_config'] = copy.deepcopy(new_node_config)
-    _enforce_worker_projection_on_kubernetes_yaml(restored_config, projection)
+    new_provider = new_config.get('provider')
+    expected_runtime_bootstrap_sha256 = (
+        new_provider.get('serve_worker_expected_runtime_bootstrap_sha256')
+        if isinstance(new_provider, dict) else None)
+    _enforce_worker_projection_on_kubernetes_yaml(
+        restored_config,
+        projection,
+        expected_runtime_bootstrap_sha256=(expected_runtime_bootstrap_sha256))
     return yaml_utils.dump_yaml_str(restored_config)
 
 
@@ -1885,6 +1945,18 @@ def write_cluster_config(
         with open(tmp_yaml_path, encoding='utf-8') as f:
             tmp_yaml_str = f.read()
         cluster_yaml_obj = yaml_utils.safe_load(tmp_yaml_str)
+        expected_runtime_bootstrap_sha256 = None
+        if (worker_projection is not None and k8s_pod_spec.
+                serve_worker_projection_protocol_has_runtime_readiness(
+                    kubernetes_identity.worker_projection_protocol_version(
+                        worker_projection))):
+            # Freeze the marker producer before any workspace or resource
+            # Pod-config merge. The final renderer and every provisioner
+            # boundary below can therefore attest the template's one canonical
+            # bootstrap instead of trusting code that was merged afterward.
+            expected_runtime_bootstrap_sha256 = (
+                _projected_worker_runtime_bootstrap_sha256_for_cluster_yaml(
+                    cluster_yaml_obj))
         combined_yaml_obj = kubernetes_utils.combine_pod_config_fields_and_metadata(
             cluster_yaml_obj,
             cluster_config_overrides=cluster_config_overrides,
@@ -1892,7 +1964,10 @@ def write_cluster_config(
             context=region.name)
         if worker_projection is not None:
             _enforce_worker_projection_on_kubernetes_yaml(
-                combined_yaml_obj, worker_projection)
+                combined_yaml_obj,
+                worker_projection,
+                expected_runtime_bootstrap_sha256=(
+                    expected_runtime_bootstrap_sha256))
         resolved_container_image = to_provision.resolved_container_image
         if resolved_container_image is not None:
             _enforce_managed_kubernetes_image(
