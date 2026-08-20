@@ -806,6 +806,32 @@ class TestProtocolV2ReplicaPoolProvenance:
 
         assert result == (1, 1, {'h200': 1}, {'svc-a': 0}, 0)
 
+    @pytest.mark.parametrize('reserved_fill', [False, True])
+    def test_cleanup_proven_interrupted_row_does_not_debit(
+            self, monkeypatch, reserved_fill):
+        cleaned = self._explicit_row()
+        cleaned.reserved_fill = reserved_fill
+        cleaned.status_property.sky_down_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        cleaned.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.INTERRUPTED)
+        cleaned.zero_cost_admission_sequence = 1
+        cleaned.zero_cost_materialization_sequence = None
+        monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                            mock.Mock(return_value={'svc-gone': [cleaned]}))
+
+        result = broker._occupying_debit(['svc-a'],
+                                         self._POOL,
+                                         10.0,
+                                         access_contexts=('phx-context',),
+                                         physical_cluster_uid='phx-cluster',
+                                         claim_generations={'svc-a': 5},
+                                         pool_gpus_per_replica=1,
+                                         observation_admission_sequence=1,
+                                         observation_materialization_sequence=1)
+
+        assert result == (0, 0, {}, {'svc-a': 0}, 0)
+
     def test_old_alias_prior_width_row_debits_current_slot_equivalent(
             self, monkeypatch):
         prior = self._explicit_row(region='retired-alias')
