@@ -5387,7 +5387,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                 for info in all_replica_infos
                 if info.unknown_capacity_replacement is True)
         existing_replica_ids = [info.replica_id for info in all_replica_infos]
-        self._next_replica_id = max(existing_replica_ids, default=0) + 1
+        intent_replica_id_high_water = 0
+        if (self._reserved_fill_actuation_mode
+                is zero_cost_actuation.ActuationMode.DURABLE_INTENT):
+            # A committed durable intent retains its replica-ID association
+            # after the replica row is cleaned.  Reusing that historical ID
+            # would violate the intent ledger's uniqueness constraint and
+            # prevent every later atomic handoff from committing.
+            intent_replica_id_high_water = (self._zero_cost_actuation_repository
+                                            .committed_replica_id_high_water(
+                                                self._service_name))
+        self._next_replica_id = max(intent_replica_id_high_water, *
+                                    existing_replica_ids) + 1
 
         # There is a FIFO queue with capacity _MAX_NUM_LAUNCH for
         # _launch_replica.
