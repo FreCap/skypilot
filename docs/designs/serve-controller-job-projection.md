@@ -1,9 +1,9 @@
 # Persisted SkyServe Controller and Worker Placement Projection
 
-**Status:** Protocol-v3 typed worker scratch, provisioning timeout, and strict
-worker/Kueue projection binding implemented; platform startup integration and
-non-compute deployment verification pending
-**Last updated:** 2026-08-16
+**Status:** Protocol-v3 typed worker scratch, reserved-fill indefinite wait,
+and strict worker/Kueue projection binding implemented; platform startup
+integration and non-compute deployment verification pending
+**Last updated:** 2026-08-20
 
 ## Goals
 
@@ -155,18 +155,22 @@ used by reserved-fill claims, allocations, replica provenance, and launch
 fences.
 
 `provision_timeout` is a non-boolean integer that is either `-1` (wait
-indefinitely) or non-negative. The builder freezes the effective
-server/workspace/context `kubernetes.provision_timeout`. When it is absent, the
-builder freezes the existing Kubernetes default once, using the same replica
-node count, volume state, DWS mode, and projected Kueue admission that would
-otherwise determine the launch default; a Kueue-managed candidate therefore
-defaults to 24 hours. Task/resource overrides are rejected recursively. A
-protocol-v3 terminal launch consumes only this signed value and never consults
-the API server's ambient config or launch-time cluster overrides. This timeout
-controls how long provisioning waits for a Pending Pod; it is not a capacity or
-reclaim classifier. `NO_CAPACITY`, queue waiting, scheduling, and initialization
-remain typed observer/provider states. In particular, a finite timeout must not
-be interpreted as proof of no capacity, while `-1` permits both Kubernetes
+indefinitely) or non-negative. A service with `reserved_capacity_fill` always
+freezes `-1`: Kueue waiting or temporary occupancy is not evidence that its
+already-committed reclaimable capacity disappeared, and a mutable ambient
+timeout must not turn that claim into ambiguous capacity or paid residual.
+Other services freeze the effective server/workspace/context
+`kubernetes.provision_timeout`. When it is absent, the builder freezes the
+existing Kubernetes default once, using the same replica node count, volume
+state, DWS mode, and projected Kueue admission that would otherwise determine
+the launch default; a non-fill Kueue-managed candidate therefore defaults to
+24 hours. Task/resource overrides are rejected recursively. A protocol-v3
+terminal launch consumes only this signed value and never consults the API
+server's ambient config or launch-time cluster overrides. This timeout controls
+how long provisioning waits for a Pending Pod; it is not a capacity or reclaim
+classifier. `NO_CAPACITY`, queue waiting, scheduling, and initialization remain
+typed observer/provider states. In particular, a finite timeout must not be
+interpreted as proof of no capacity, while `-1` permits both Kubernetes
 contexts and sibling replicas to initialize concurrently without a wall-clock
 placement failure.
 
@@ -736,10 +740,11 @@ source of truth.
    attested caches;
    update the stable service and verify all old replicas are gone.
 7. Advance the sole new-write path to protocol v3/API 79; freeze typed worker
-   scratch and the effective provisioning timeout, reject task-owned timeout,
-   scratch, and Pod configuration, render and attest the final Pod, retain exact
-   v1/v2 readers only until the objective cleanup gate, and update stacked
-   cleanup PR #1452 to remove both readers.
+   scratch and provisioning timeout, force an indefinite wait for committed
+   reserved-fill capacity, reject task-owned timeout, scratch, and Pod
+   configuration, render and attest the final Pod, retain exact v1/v2 readers
+   only until the objective cleanup gate, and update stacked cleanup PR #1452
+   to remove both readers.
 
 ## Deployment and fix forward
 
@@ -874,11 +879,12 @@ for this rollout.
   live PHX GPU nodes visible and prove no node, label, resource-key, autoscaler,
   or `CUSTOM_GPU_RESOURCE_KEY` lookup occurs; the Pod must still require
   `nvidia.com/gpu.product In [NVIDIA-H200]` and `nvidia.com/gpu: 1`.
-- Configure `provision_timeout: -1` and typed `serve_worker_scratch` for every
-  enabled reserved inference context,
-  deploy the matching platform startup verification first, and verify API 79
-  history, final Pods, and startup evidence agree on kind, `/tmp`, and exact
-  size. No task or service YAML may contain a scratch volume or `pod_config`;
+- Configure typed `serve_worker_scratch` for every enabled reserved inference
+  context, deploy the matching platform startup verification first, and verify
+  API 79 history freezes `provision_timeout: -1` independently of the ambient
+  timeout and that final Pods and startup evidence agree on kind, `/tmp`, and
+  exact size. No task or service YAML may contain a scratch volume or
+  `pod_config`;
   task Kubernetes config also cannot select `provision_timeout`, `auto_mounts`,
   `enable_docker`, or `custom_metadata`, and task resources cannot set labels
   for projected workers. Verify a terminal v3 launch renders `timeout: -1`
