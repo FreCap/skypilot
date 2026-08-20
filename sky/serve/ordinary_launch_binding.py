@@ -2484,7 +2484,8 @@ def _freeze_reserved_fill_sequence_gate(
     if (type(frozen_gate) is not int or frozen_gate < 1 or
             type(frozen_protocol) is not int or frozen_protocol < 1 or
             type(current_gate) is not int or current_gate < frozen_gate or
-            type(current_protocol) is not int or current_protocol < 1):
+            type(current_protocol) is not int or
+            current_protocol < frozen_protocol):
         raise OrdinaryLaunchBindingConflict(
             'Reserved-fill cleanup lost its monotonic gate history.')
     return {

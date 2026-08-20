@@ -972,8 +972,10 @@ as a client-safe `CloudError`; the reducer accepts that second representation
 only when the decoded wrapper's nonempty provider, source type, single source
 message argument, and rendered message are mutually exact. The production
 census found four of the nine rows in this canonical
-`concurrent.futures.CancelledError` wrapper shape. Type, message, extra-field,
-or wrapper-attribute drift remains malformed and cannot authorize cleanup.
+`concurrent.futures.CancelledError` wrapper shape. Any mismatch among the outer
+type/message and decoded wrapper attributes, arguments, or rendered message,
+or any extra field, remains malformed. The self-consistent provider label is
+diagnostic metadata and grants no request, provider, or cleanup authority.
 
 The current planner is similarly pre-effect authority, not teardown authority.
 Allocation, observation, and reconciliation-gate generations may advance after

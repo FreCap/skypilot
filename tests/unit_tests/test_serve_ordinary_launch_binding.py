@@ -454,6 +454,13 @@ def test_durable_reserved_fill_profile_uses_committed_handoff(
         **sequence,
         'reconciliation_gate_generation': 9,
     }
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='lost its monotonic gate history'):
+        binding._freeze_reserved_fill_sequence_gate(info, {
+            **sequence,
+            'protocol_version': 1,
+        },
+                                                    committed_intent=intent)
 
 
 def test_durable_reserved_fill_profile_never_falls_back_without_intent(
