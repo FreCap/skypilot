@@ -2963,9 +2963,13 @@ def _occupying_debit(
       undercount by live demand pods is by design; non-claimants'
       nonterminal DEMAND rows stay invisible for the same reason).
       In sequenced rounds, FAILED_CLEANUP fill rows with materialization proof
-      are also conserved until cleanup is proven.  They may persist after the
-      pod eventually dies, but this can only withhold fill; treating unresolved
-      cleanup as free could oversubscribe a still-bound slot.
+      are also conserved until cleanup is proven.  A successful ``sky.down``
+      status is durable cleanup proof even when the retained diagnostic row
+      still renders as SHUTTING_DOWN because its launch was interrupted.  Such
+      a row must not continue withholding capacity after provider absence was
+      proved.  Other retained rows may persist after the pod eventually dies,
+      but this can only withhold fill; treating unresolved cleanup as free
+      could oversubscribe a still-bound slot.
 
     A sequenced round requires the grouped replica scan to succeed completely;
     partial enumeration or decode is not spendable authority. It includes
@@ -3068,8 +3072,11 @@ def _occupying_debit(
                 current_service_generation=(claim_generations or {}).get(name),
                 pool_gpus_per_replica=pool_gpus_per_replica)
             if info.is_terminal:
+                cleanup_succeeded = (info.status_property.sky_down_status ==
+                                     common_utils.ProcessStatus.SUCCEEDED)
                 cleanup_not_proven = (
-                    info.status == serve_state.ReplicaStatus.SHUTTING_DOWN or
+                    (info.status == serve_state.ReplicaStatus.SHUTTING_DOWN and
+                     not cleanup_succeeded) or
                     (has_sequence_boundary and
                      info.status == serve_state.ReplicaStatus.FAILED_CLEANUP))
                 if occupancy is not None and cleanup_not_proven:
