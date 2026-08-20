@@ -77,6 +77,8 @@ if typing.TYPE_CHECKING:
     from sky.serve import zero_cost_actuation
 else:
     demand_state = adaptors_common.LazyImport('sky.serve.demand_state')
+    ordinary_launch_binding = adaptors_common.LazyImport(
+        'sky.serve.ordinary_launch_binding')
     placement_contract_normalization = adaptors_common.LazyImport(
         'sky.serve.placement_contract_normalization')
     paid_retirement = adaptors_common.LazyImport('sky.serve.paid_retirement')
@@ -880,6 +882,73 @@ def add_service(
             engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
         raise RuntimeError('External load balancer high availability requires '
                            'the central PostgreSQL Serve database.')
+    canonical_birth_insert_values: dict[str, Any] = {}
+    canonical_birth_update_values: dict[str, Any] = {}
+    if (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value and
+            not pool and lifecycle_epoch is not None):
+        # A lifecycle-fenced PostgreSQL registration is the central Serve
+        # happy path.  Birth the service under one complete authority tuple;
+        # it must never expose a legacy/direct interval that a concurrent
+        # broker or controller could observe.  CONTROLLER_INIT plus the null
+        # controller port keeps every effect path closed until the claimed
+        # child has published fresh route and demand evidence.
+        if status is not ServiceStatus.CONTROLLER_INIT:
+            raise ValueError('A fresh central non-pool service must be born '
+                             'in CONTROLLER_INIT status.')
+        if not isinstance(workspace, str) or not workspace:
+            raise ValueError('A fresh central non-pool service requires an '
+                             'immutable workspace.')
+        if not isinstance(service_hash, str) or not service_hash:
+            raise ValueError('A fresh central non-pool service requires an '
+                             'explicit service incarnation.')
+        initial_controller_incarnation = uuid.uuid4()
+        # Serve047's forward-only INSERT guard requires the generic capability
+        # fields to start empty.  Install the controller and final
+        # route/demand/actuation authorities on INSERT, then use its permitted
+        # adjacent legacy/0 -> bound/1 UPDATE to install generic launch
+        # authority below.  Both statements share this transaction; the
+        # bootstrap shape is never committed or externally observable.
+        canonical_birth_insert_values = {
+            'controller_incarnation': initial_controller_incarnation,
+            'controller_owner_epoch': 1,
+            'ordinary_launch_binding_capable': True,
+            'route_source_mode':
+                route_projection.RouteSourceMode.DURABLE_PROJECTED.value,
+            'route_source_epoch': 1,
+            'route_projection_capable': True,
+            'route_projection_controller_incarnation': initial_controller_incarnation,
+            'route_projection_protocol_version':
+                route_projection.INCREMENTAL_PRODUCER_PROTOCOL_VERSION,
+            'demand_source_mode':
+                capacity_admission.DemandSourceMode.DURABLE_FEED.value,
+            'demand_source_epoch': 1,
+            'demand_authority_capable': True,
+            'demand_authority_controller_incarnation': initial_controller_incarnation,
+            'demand_authority_protocol_version':
+                capacity_admission.PROTOCOL_VERSION,
+            'reserved_fill_actuation_mode':
+                zero_cost_actuation.ActuationMode.DURABLE_INTENT.value,
+            'reserved_fill_actuation_epoch': 1,
+            'reserved_fill_actuation_capable': True,
+            'reserved_fill_actuation_controller_incarnation': initial_controller_incarnation,
+            'reserved_fill_actuation_protocol_version':
+                zero_cost_actuation.PROTOCOL_VERSION,
+        }
+        canonical_birth_update_values = {
+            'ordinary_launch_binding_mode':
+                ordinary_launch_binding.BindingMode.BOUND.value,
+            'ordinary_launch_binding_epoch': 1,
+            'non_pool_launch_binding_capable': True,
+            'non_pool_launch_controller_incarnation': initial_controller_incarnation,
+            'non_pool_launch_binding_protocol_version':
+                ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION,
+            'non_pool_launch_capability_profile_set_digest':
+                ordinary_launch_binding.supported_non_pool_profile_set_digest(),
+            'non_pool_launch_capability_cohort_epoch':
+                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH,
+            'non_pool_launch_receipt_protocol_version':
+                ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION,
+        }
     storage_generation = _ephemeral_storage_generation_from_yaml(
         yaml_content, resource_scope)
     try:
@@ -978,6 +1047,7 @@ def add_service(
                     pool=int(pool),
                     controller_pid=controller_pid,
                     controller_ip=controller_ip,
+                    **canonical_birth_insert_values,
                     hash=(str(uuid.uuid4())
                           if service_hash is None else service_hash),
                     **({
@@ -1000,6 +1070,20 @@ def add_service(
                     lb_demand_handoff_snapshot=None,
                     lb_demand_handoff_complete_at=None,
                     lb_last_demand_snapshot=None))
+            if canonical_birth_update_values:
+                canonicalized = session.execute(
+                    sqlalchemy.update(services_table).where(
+                        services_table.c.name == name,
+                        services_table.c.controller_incarnation ==
+                        canonical_birth_insert_values['controller_incarnation'],
+                        services_table.c.ordinary_launch_binding_mode ==
+                        ordinary_launch_binding.BindingMode.LEGACY.value,
+                        services_table.c.ordinary_launch_binding_epoch == 0,
+                        services_table.c.non_pool_launch_binding_capable.is_(
+                            False)).values(**canonical_birth_update_values))
+                if canonicalized.rowcount != 1:
+                    raise RuntimeError('Fresh non-pool service canonical birth '
+                                       'lost its uncommitted bootstrap row.')
             initial_version_created_at = time.time()
             projection_values = ({
                 'controller_job_projection': controller_job_projection,
