@@ -54,6 +54,12 @@ The completed system has these invariants:
 - no provider effect is possible before that transaction commits, and a lost
   acknowledgement is recovered by exact tuple hydration rather than a second
   launch;
+- a claim edge authorizes terminal launch only while the service claim set is
+  still at that launch's generation. After a monotonic successor generation is
+  published, the exact committed intent is the immutable handoff authority for
+  the older launch; the successor edge set may replace or remove the old edge
+  without retroactively revoking it. Missing, uncommitted, or corrupt intent
+  state fails closed;
 - reserved capacity is committed before the paid residual is calculated, so
   compatible reserved capacity suppresses new Spot launches and existing paid
   replicas drain as reserved replicas become healthy;
@@ -197,6 +203,31 @@ handoff.
 A receipt inside that bounded entry budget is single-flight refreshed before it
 is returned; there is no generic authority retry and no provider effect on an
 expired or indeterminate proof.
+
+That freshness correction exposed a separate successor-edge race at the same
+terminal boundary. A launch fenced and atomically committed under service
+generation G could reach the provider guard after the broker had published
+G+1. The guard correctly required the current claim set to be an authoritative,
+monotonic successor, but it also required G+1's mutable edge set to contain and
+restate G's exact pool edge. A legitimate G+1 replacement or removal therefore
+revoked an already committed G launch even though its immutable intent,
+replica, service version, policy ticket, projection, and provider proof all
+still matched.
+
+The terminal contract distinguishes the two authorities. At generation G, the
+current matching edge remains mandatory and must exactly match the fenced
+context, physical cluster, GPU width, accelerator, and immutable worker
+projection. At any current generation greater than G, the successor claim set
+must remain structurally valid, but the presence or placement fields of its
+historical matching edge cannot authorize or deny the older launch; instead,
+one exact `COMMITTED` durable intent must still own the replica and match every
+frozen allocation, observation, policy, location, card, width, record, and
+idempotency field. Both branches continue to require the current service
+incarnation and elected version, an authoritative claim set whose generation
+is bounded by the global protocol sequence, the exact sequenced gate and
+reclaim-policy identity, the immutable version projection, the exact typed
+scope/ticket, and a fresh exact provider-proof reference. This changes no
+timeout, retry, schema, provider, or cost fallback.
 
 Historical rollout record: the additive reserved-fill, exact worker-projection, generalized
 non-pool binding, demand, route, executor-termination, provider-independent
