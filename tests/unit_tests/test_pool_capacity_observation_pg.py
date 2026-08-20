@@ -8,6 +8,7 @@ import os
 import subprocess
 import threading
 import types
+from unittest import mock
 import uuid
 
 from alembic import command as alembic_command
@@ -51,6 +52,21 @@ pytestmark = pytest.mark.skipif(not _LOCAL_POSTGRES_AVAILABLE and
 def pg_server():
     """Expose the broker module's PostgreSQL server fixture locally."""
     yield from _broker_pg_server.__wrapped__()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_durable_intent_debits():
+    """Keep Serve046 observation tests on their characterized schema.
+
+    This module deliberately migrates isolated databases only through the
+    Serve046 observation contract.  Durable actuation intents arrive in
+    Serve052 and have their own real-PostgreSQL suites, so broker occupancy
+    tests here must supply the pre-Serve052 empty-intent boundary explicitly.
+    """
+    with mock.patch.object(reserved_capacity_broker.zero_cost_actuation,
+                           'pending_pool_debits',
+                           return_value=()):
+        yield
 
 
 def _pool_key(*names: str) -> str:
