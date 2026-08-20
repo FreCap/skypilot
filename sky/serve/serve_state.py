@@ -2848,16 +2848,31 @@ def reserved_fill_reclaim_launch_authority_holds(
                     service_name).with_for_update(read=True)).mappings().all()
             matching_edge = next((edge for edge in edge_rows
                                   if edge['pool_key'] == fence.pool_key), None)
+            current_service_generation = (None if claim_set is None else
+                                          claim_set['generation'])
             if (version_row is None or claim_set is None or
                     claim_set['claim_set_state']
                     != RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2 or
                     claim_set['service_version'] != fence.service_version or
-                    claim_set['generation'] != fence.service_generation or
-                    claim_set['generation'] > protocol['claim_generation'] or
+                    type(current_service_generation) is not int or
+                    current_service_generation < fence.service_generation or
+                    current_service_generation > protocol['claim_generation'] or
                     len(edge_rows) != claim_set['edge_count'] or
                     matching_edge is None or
-                    any(edge['service_generation'] != fence.service_generation
+                    any(edge['service_generation'] != current_service_generation
                         for edge in edge_rows)):
+                return False
+            if (current_service_generation > fence.service_generation and
+                    not zero_cost_actuation.
+                    committed_intent_matches_replica_in_connection(
+                        connection,
+                        service_name=service_name,
+                        service_hash=service_hash,
+                        replica_info=launch_snapshot.durable_replica_info)):
+                # A committed intent is the immutable handoff from its broker
+                # generation.  A newer, still-compatible claim set may retain
+                # that launch, but an uncommitted or ambiguous legacy row must
+                # continue to fail closed.
                 return False
             _, projected_admission = (
                 reserved_capacity.require_reclaim_worker_projection(

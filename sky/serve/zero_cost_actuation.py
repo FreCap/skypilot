@@ -621,6 +621,54 @@ def _replica_matches_intent(replica_info: Any,
         return False
 
 
+def committed_intent_matches_replica_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    service_name: str,
+    service_hash: str,
+    replica_info: Any,
+) -> bool:
+    """Return whether an exact committed intent still owns one replica.
+
+    A committed intent is the durable handoff from a broker generation to a
+    replica.  It remains immutable after commit, so this read deliberately
+    avoids taking another row lock while the caller holds the launch-authority
+    lock order.
+    """
+    _require_postgres(connection)
+    try:
+        intent_key = replica_info.reserved_fill_intent_idempotency_key
+        replica_id = replica_info.replica_id
+        raw_record_id = replica_info.replica_record_id
+        replica_record_id = uuid.UUID(raw_record_id)
+        if (type(service_name) is not str or not service_name or
+                type(service_hash) is not str or not service_hash or
+                type(intent_key) is not str or len(intent_key) != 64 or
+                any(character not in '0123456789abcdef'
+                    for character in intent_key) or
+                type(replica_id) is not int or replica_id < 1 or
+                type(raw_record_id) is not str or
+                str(replica_record_id) != raw_record_id):
+            return False
+        row = connection.execute(
+            sqlalchemy.select(_INTENTS).where(
+                _INTENTS.c.intent_idempotency_key == intent_key,
+                _INTENTS.c.service_name == service_name,
+                _INTENTS.c.service_hash == service_hash,
+                _INTENTS.c.state == IntentState.COMMITTED.value,
+                _INTENTS.c.replica_id == replica_id,
+                _INTENTS.c.replica_record_id == replica_record_id,
+            )).mappings().one_or_none()
+        if row is None:
+            return False
+        intent = _intent_from_row(row)
+        planned_capacity = row['planned_capacity']
+        return (type(planned_capacity) is int and planned_capacity > 0 and
+                _replica_matches_intent(replica_info, intent, planned_capacity))
+    except (AttributeError, TypeError, ValueError, ZeroCostActuationError):
+        return False
+
+
 def commit_lease_in_connection(
     connection: sqlalchemy.engine.Connection,
     lease: IntentLease,
