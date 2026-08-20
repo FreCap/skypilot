@@ -10128,18 +10128,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                               _BoundOrdinaryLaunchUnresolvedError) and (
                                   provider_present_cleanup_context is None):
                     raise launch_thread.exception
-                # Handles a controller crash after the local worker completed
-                # but before its caller observed projection, and is a no-op
-                # after the normal exact reducer cleared the pointer.
-                fresh_info = serve_state.get_replica_info_from_id(
-                    self._service_name, replica_id)
-                if fresh_info is None:
-                    raise _BoundOrdinaryLaunchUnresolvedError(
-                        f'Bound teardown lost replica row {replica_id}.')
-                settled_cleanup = (
-                    self._settle_bound_ordinary_launch_for_teardown(fresh_info))
-                if settled_cleanup is not None:
-                    provider_present_cleanup_context = settled_cleanup
+                if provider_present_cleanup_context is None:
+                    # Handles a controller crash after the local worker
+                    # completed but before its caller observed projection, and
+                    # is a no-op after the normal exact reducer cleared the
+                    # pointer.  An exact provider-present cleanup context is
+                    # already the terminal launch-side authority and must not
+                    # re-enter ordinary cancellation.
+                    fresh_info = serve_state.get_replica_info_from_id(
+                        self._service_name, replica_id)
+                    if fresh_info is None:
+                        raise _BoundOrdinaryLaunchUnresolvedError(
+                            f'Bound teardown lost replica row {replica_id}.')
+                    settled_cleanup = (
+                        self._settle_bound_ordinary_launch_for_teardown(
+                            fresh_info))
+                    if settled_cleanup is not None:
+                        provider_present_cleanup_context = settled_cleanup
             legacy_runtime.launch_thread_pool.pop(replica_id)
             legacy_runtime.replica_to_request_id.pop(replica_id)
             legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
@@ -10170,11 +10175,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                           self._service_name, replica_id,
                           bound_teardown_info.replica_record_id)):
                     projected_provider_absence_info = bound_teardown_info
-                settled_cleanup = (
-                    self._settle_bound_ordinary_launch_for_teardown(
-                        bound_teardown_info))
-                if settled_cleanup is not None:
-                    provider_present_cleanup_context = settled_cleanup
+                else:
+                    settled_cleanup = (
+                        self._settle_bound_ordinary_launch_for_teardown(
+                            bound_teardown_info))
+                    if settled_cleanup is not None:
+                        provider_present_cleanup_context = settled_cleanup
 
         if replica_id in legacy_runtime.down_thread_pool:
             logger.warning(f'Terminate thread for replica {replica_id} '

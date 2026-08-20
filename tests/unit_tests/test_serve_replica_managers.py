@@ -1667,8 +1667,7 @@ class TestBoundOrdinaryLaunchManagerIntegration:
                  return_value=context), \
              mock.patch.object(
                  manager,
-                 '_settle_bound_ordinary_launch_for_teardown',
-                 return_value=context), \
+                 '_settle_bound_ordinary_launch_for_teardown') as settle, \
              mock.patch.object(manager, '_persist_replica'), \
              mock.patch.object(manager,
                                '_route_lease_registry',
@@ -1692,6 +1691,71 @@ class TestBoundOrdinaryLaunchManagerIntegration:
 
         assert context.replica_id not in runtime.launch_thread_pool
         assert context.replica_id not in runtime.replica_to_request_id
+        settle.assert_not_called()
+        reconcile.assert_called_once_with(info, context)
+
+    def test_provider_present_cleanup_restart_skips_ordinary_settlement(self):
+        manager = _make_manager()
+        manager._ordinary_launch_binding_authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=2,
+            generic=True)
+        context = _bound_non_pool_context(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+        info = _fake_replica_info(
+            context.replica_id,
+            replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.replica_record_id = str(context.replica_record_id)
+        info.reserved_fill = True
+        info.is_zero_cost = True
+        status = info.status_property
+        status.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
+        status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+        status.is_scale_down = True
+        status.drain_cap_seconds = 0
+        registry = mock.Mock()
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=info), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_info_with_resource_action_identity',
+                 return_value=(info, None)), \
+             mock.patch.object(
+                 manager,
+                 '_bound_non_pool_provider_present_cleanup_context',
+                 return_value=context), \
+             mock.patch.object(
+                 manager,
+                 '_settle_bound_ordinary_launch_for_teardown') as settle, \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'bound_non_pool_projected_provider_absence_is_authorized') \
+                     as projected_absence, \
+             mock.patch.object(manager, '_persist_replica'), \
+             mock.patch.object(manager,
+                               '_route_lease_registry',
+                               return_value=registry), \
+             mock.patch.object(
+                 replica_managers.reserved_capacity,
+                 'parse_protocol_v2_cleanup_fence',
+                 return_value=mock.sentinel.cleanup_fence), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'cluster_with_name_exists',
+                 return_value=False), \
+             mock.patch.object(
+                 manager,
+                 '_schedule_non_pool_provider_reconciliation') as reconcile:
+            manager._terminate_replica(context.replica_id,
+                                       sync_down_logs=False,
+                                       replica_drain_delay_seconds=0,
+                                       is_scale_down=True,
+                                       in_flight_drain_cap_seconds=0)
+
+        settle.assert_not_called()
+        projected_absence.assert_not_called()
         reconcile.assert_called_once_with(info, context)
 
     def test_provider_present_projection_persists_only_immediate_cleanup(self):
@@ -1794,8 +1858,7 @@ class TestBoundOrdinaryLaunchManagerIntegration:
                  return_value=None), \
              mock.patch.object(
                  manager,
-                 '_settle_bound_ordinary_launch_for_teardown',
-                 return_value=None), \
+                 '_settle_bound_ordinary_launch_for_teardown') as settle, \
              mock.patch.object(
                  replica_managers.request_postgres,
                  'bound_non_pool_projected_provider_absence_is_authorized',
@@ -1813,6 +1876,7 @@ class TestBoundOrdinaryLaunchManagerIntegration:
 
         manager._handle_sky_down_finish.assert_called_once_with(info,
                                                                 format_exc=None)
+        settle.assert_not_called()
         cluster_exists.assert_not_called()
         uncertain.assert_not_called()
 
