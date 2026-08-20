@@ -740,6 +740,26 @@ class ZeroCostActuationRepository:
                 'Zero-cost actuation intents require PostgreSQL.')
         return engine
 
+    def committed_replica_id_high_water(self, service_name: str) -> int:
+        """Return the largest replica ID durably owned by an intent.
+
+        Committed intents intentionally outlive their replica rows.  The
+        service's process-local replica allocator must therefore include this
+        ledger when it recovers after a restart; otherwise a cleaned replica's
+        ID can be reused and the intent uniqueness constraint rejects the new
+        atomic handoff.
+        """
+        if not isinstance(service_name, str) or not service_name:
+            raise ValueError('Service name must be a non-empty string.')
+        with self.engine.connect() as connection:
+            high_water = connection.execute(
+                sqlalchemy.select(sqlalchemy.func.max(
+                    _INTENTS.c.replica_id)).where(
+                        _INTENTS.c.service_name == service_name,
+                        _INTENTS.c.state ==
+                        IntentState.COMMITTED.value)).scalar_one()
+        return 0 if high_water is None else int(high_water)
+
     @staticmethod
     def _validate_service(
         service: Mapping[str, Any],

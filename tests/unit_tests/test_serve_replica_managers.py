@@ -3739,6 +3739,23 @@ class TestReplicaIdSeededOnRecovery:
             mgr._recover_replica_operations()
         assert mgr._next_replica_id == 1
 
+    def test_durable_intent_history_seeds_past_cleaned_replica_rows(self):
+        mgr = _make_manager(next_replica_id=1)
+        mgr._reserved_fill_actuation_mode = (
+            replica_managers.zero_cost_actuation.ActuationMode.DURABLE_INTENT)
+        mgr._zero_cost_actuation_repository = mock.Mock()
+        high_water = (
+            mgr._zero_cost_actuation_repository.committed_replica_id_high_water)
+        high_water.return_value = 9
+
+        with mock.patch(
+                'sky.serve.replica_managers.serve_state.get_replica_infos',
+                return_value=[_fake_replica_info(5)]):
+            mgr._recover_replica_operations()
+
+        assert mgr._next_replica_id == 10
+        high_water.assert_called_once_with('svc')
+
 
 class TestScaleUpDoesNotClobberLiveReplica:
     """Defensive guard: `scale_up` must never allocate an id that still has a
