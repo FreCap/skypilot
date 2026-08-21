@@ -45,6 +45,7 @@ from sky.serve import ordinary_launch_handoff
 from sky.serve import paid_capacity
 from sky.serve import placement_policy
 from sky.serve import replica_managers
+from sky.serve import reserved_fill_planner
 from sky.serve import route_projection
 from sky.serve import serve_utils
 from sky.serve import service_spec
@@ -11774,6 +11775,131 @@ class TestLogicalCapacityPlanning:
         defer.assert_called_once_with(1,
                                       logical_retirement=(1, 4, 4),
                                       replica_info=backends[0],
+                                      replica_url=None)
+
+    def test_logical_batch_selects_victims_against_retirement_floor(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        backends = [
+            self._ready_backend(replica_id, 1) for replica_id in range(1, 46)
+        ]
+        for backend in backends:
+            backend.resources_override = {'accelerators': {'H200': 1}}
+        snapshot = replica_managers.LogicalReconcileSnapshot(
+            version=1,
+            generation=4,
+            observed_slots_by_replica_id={
+                replica_id: 1 for replica_id in range(1, 46)
+            },
+            in_flight_by_replica_id={
+                replica_id: 0 for replica_id in range(1, 46)
+            },
+            unknown_replica_ids=frozenset(),
+            received_at=replica_managers.time.monotonic())
+        action = (1, 4, 0, (), (('H200', 1),))
+        floor = (1, 4, 45, (('H200', 45),), (('H200', 1),))
+        mgr._logical_reconcile_state = (replica_managers._LogicalReconcileState(
+            target=action, snapshot=snapshot, retirement_floor=floor))
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=backends), \
+             mock.patch.object(mgr,
+                               '_defer_scale_down_until_idle') as defer:
+            mgr.scale_down_logically_batch(list(range(1, 46)), 0, 1, 4, (),
+                                           (('H200', 1),))
+
+        defer.assert_not_called()
+        assert all(backend.status_property.is_scale_down is not True
+                   for backend in backends)
+
+    def test_sequenced_missing_retirement_floor_never_defaults_to_demand(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        victim = self._ready_backend(1, 1)
+        victim.resources_override = {'accelerators': {'H200': 1}}
+        snapshot = replica_managers.LogicalReconcileSnapshot(
+            version=1,
+            generation=4,
+            observed_slots_by_replica_id={1: 1},
+            in_flight_by_replica_id={1: 0},
+            unknown_replica_ids=frozenset(),
+            received_at=replica_managers.time.monotonic())
+        identity = reserved_fill_planner.ReservedFillAllocationIdentity(
+            allocation_generation=1,
+            allocation_input_sha256='a' * 64,
+            allocation_claim_generation=1,
+            service_version=1,
+            ordinary_zero_cost_admission_sequence_high_water=0,
+            reconciliation_gate_generation=1,
+            reclaim_fleet_bundle_sha256='b' * 64,
+            reclaim_policy_revision='test-policy',
+            reclaim_provider_inventory_sha256='c' * 64)
+        shelter = reserved_fill_planner.SequencedRetirementShelter(
+            service_version=1,
+            target_capacity=1,
+            target_capacity_by_accelerator=(('H200', 1),),
+            accelerator_shapes=(('H200', 1),),
+            allocation_identity=identity)
+        action = (1, 4, 0, (), (('H200', 1),))
+
+        assert mgr.publish_logical_reconcile_state(action, snapshot, None,
+                                                   shelter)
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos') as scan, \
+             mock.patch.object(mgr,
+                               '_defer_scale_down_until_idle') as defer:
+            mgr.scale_down_logically_batch([1], 0, 1, 4, (), (('H200', 1),))
+
+        scan.assert_not_called()
+        defer.assert_not_called()
+        assert victim.status_property.is_scale_down is not True
+
+    def test_unmaterialized_feed_does_not_pin_paid_replica_at_max(self):
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        paid = self._ready_backend(1, 1)
+        paid.is_zero_cost = False
+        paid.reserved_fill = False
+        paid.resources_override = {'accelerators': {'H200': 1}}
+        snapshot = replica_managers.LogicalReconcileSnapshot(
+            version=1,
+            generation=4,
+            observed_slots_by_replica_id={1: 1},
+            in_flight_by_replica_id={1: 0},
+            unknown_replica_ids=frozenset(),
+            received_at=replica_managers.time.monotonic())
+        shelter = reserved_fill_planner.SequencedRetirementShelter(
+            service_version=1,
+            target_capacity=0,
+            target_capacity_by_accelerator=(),
+            accelerator_shapes=(('H200', 1),),
+            allocation_identity=(
+                reserved_fill_planner.ReservedFillAllocationIdentity(
+                    allocation_generation=1,
+                    allocation_input_sha256='a' * 64,
+                    allocation_claim_generation=1,
+                    service_version=1,
+                    ordinary_zero_cost_admission_sequence_high_water=0,
+                    reconciliation_gate_generation=1,
+                    reclaim_fleet_bundle_sha256='b' * 64,
+                    reclaim_policy_revision='test-policy',
+                    reclaim_provider_inventory_sha256='c' * 64)))
+        action = (1, 4, 0, (), (('H200', 1),))
+        floor = (1, 4, 0, (), (('H200', 1),))
+
+        assert mgr.publish_logical_reconcile_state(action, snapshot, floor,
+                                                   shelter)
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[paid]), \
+             mock.patch.object(mgr,
+                               '_defer_scale_down_until_idle') as defer:
+            mgr.scale_down_logically_batch([1], 0, 1, 4, (), (('H200', 1),))
+
+        defer.assert_called_once_with(1,
+                                      logical_retirement=(1, 4, 0),
+                                      replica_info=paid,
                                       replica_url=None)
 
     def test_newer_snapshot_rechecks_scale_down_victim_idle(self):

@@ -785,6 +785,24 @@ class AuthenticatedAllocationMap:
             ],
         }
 
+    @property
+    def identity(self) -> 'ReservedFillAllocationIdentity':
+        """Return the closed identity required at destructive commit."""
+        return ReservedFillAllocationIdentity(
+            allocation_generation=self.allocation_generation,
+            allocation_input_sha256=self.allocation_input_sha256,
+            allocation_claim_generation=self.allocation_claim_generation,
+            service_version=self.service_version,
+            ordinary_zero_cost_admission_sequence_high_water=(
+                self.ordinary_zero_cost_admission_sequence_high_water),
+            reconciliation_gate_generation=(
+                self.reconciliation_gate_generation),
+            reclaim_fleet_bundle_sha256=self.reclaim_fleet_bundle_sha256,
+            reclaim_policy_revision=self.reclaim_policy_revision,
+            reclaim_provider_inventory_sha256=(
+                self.reclaim_provider_inventory_sha256),
+        )
+
 
 class FillCapacityUnit(str, enum.Enum):
     """Unit used by service-global maximum and planned capacity."""
@@ -797,6 +815,353 @@ class FillCapacityUnit(str, enum.Enum):
         if self is FillCapacityUnit.PHYSICAL:
             return 1
         return accelerator_count
+
+
+@dataclasses.dataclass(frozen=True)
+class ReservedFillAllocationIdentity:
+    """The immutable allocation columns required at destructive commit."""
+
+    allocation_generation: int
+    allocation_input_sha256: str
+    allocation_claim_generation: int
+    service_version: int
+    ordinary_zero_cost_admission_sequence_high_water: int
+    reconciliation_gate_generation: int
+    reclaim_fleet_bundle_sha256: str
+    reclaim_policy_revision: str
+    reclaim_provider_inventory_sha256: str
+
+    def __post_init__(self) -> None:
+        _require_int(self.allocation_generation,
+                     'Allocation identity generation',
+                     minimum=1)
+        _require_sha256(self.allocation_input_sha256,
+                        'Allocation identity input hash')
+        _require_int(self.allocation_claim_generation,
+                     'Allocation identity claim generation',
+                     minimum=1)
+        _require_int(self.service_version,
+                     'Allocation identity service version',
+                     minimum=1)
+        _require_int(self.ordinary_zero_cost_admission_sequence_high_water,
+                     'Allocation identity ordinary admission high-water')
+        _require_int(self.reconciliation_gate_generation,
+                     'Allocation identity gate generation',
+                     minimum=1)
+        _require_sha256(self.reclaim_fleet_bundle_sha256,
+                        'Allocation identity reclaim fleet bundle hash')
+        _require_nonempty_string(self.reclaim_policy_revision,
+                                 'Allocation identity reclaim policy revision')
+        _require_sha256(self.reclaim_provider_inventory_sha256,
+                        'Allocation identity reclaim provider inventory hash')
+
+
+@dataclasses.dataclass(frozen=True)
+class MaterializedFillHolding:
+    """Provider-free facts for one materialized reserved-fill backend."""
+
+    replica_id: int
+    service_version: int
+    capacity: int
+    pool_key: str | None
+    physical_cluster_uid: str | None
+    service_generation: int | None
+    accelerator: str | None
+    accelerator_count: int | None
+
+    def __post_init__(self) -> None:
+        _require_int(self.replica_id, 'Holding replica ID')
+        _require_int(self.service_version, 'Holding service version', minimum=1)
+        _require_int(self.capacity, 'Holding capacity', minimum=1)
+        if self.pool_key is not None:
+            _require_nonempty_string(self.pool_key, 'Holding pool key')
+        if self.physical_cluster_uid is not None:
+            _require_nonempty_string(self.physical_cluster_uid,
+                                     'Holding physical cluster UID')
+        if self.service_generation is not None:
+            _require_int(self.service_generation,
+                         'Holding service generation',
+                         minimum=1)
+        if self.accelerator is not None:
+            object.__setattr__(
+                self, 'accelerator',
+                _require_nonempty_string(self.accelerator,
+                                         'Holding accelerator').casefold())
+        if self.accelerator_count is not None:
+            _require_int(self.accelerator_count,
+                         'Holding accelerator count',
+                         minimum=1)
+
+
+@dataclasses.dataclass(frozen=True)
+class SequencedRetirementShelter:
+    """Frozen PostgreSQL-derived reserved capacity protected from teardown.
+
+    ``allocation_identity is None`` means the sequenced selector is active but
+    its current map is unavailable.  That state deliberately shelters every
+    already-materialized fill backend while authorizing neither a new fill nor
+    a destructive commit.
+    """
+
+    service_version: int
+    target_capacity: int
+    target_capacity_by_accelerator: tuple[tuple[str, int], ...]
+    accelerator_shapes: tuple[tuple[str, int], ...]
+    allocation_identity: ReservedFillAllocationIdentity | None
+
+    def __post_init__(self) -> None:
+        _require_int(self.service_version, 'Shelter service version', minimum=1)
+        _require_int(self.target_capacity, 'Shelter target capacity')
+        if type(self.target_capacity_by_accelerator) is not tuple:
+            raise ValueError('Shelter exact target must be an immutable tuple.')
+        if type(self.accelerator_shapes) is not tuple:
+            raise ValueError('Shelter shapes must be an immutable tuple.')
+        target: dict[str, int] = {}
+        shapes: dict[str, int] = {}
+        for raw_card, value in self.target_capacity_by_accelerator:
+            card = _require_nonempty_string(
+                raw_card, 'Shelter target accelerator').casefold()
+            if card in target:
+                raise ValueError('Shelter target repeats an accelerator.')
+            target[card] = _require_int(value, 'Shelter card target', minimum=1)
+        for raw_card, value in self.accelerator_shapes:
+            card = _require_nonempty_string(
+                raw_card, 'Shelter shape accelerator').casefold()
+            if card in shapes:
+                raise ValueError('Shelter shapes repeat an accelerator.')
+            shapes[card] = _require_int(value,
+                                        'Shelter accelerator width',
+                                        minimum=1)
+        if (sum(target.values()) != self.target_capacity or
+                set(target) - set(shapes)):
+            raise ValueError('Shelter exact target does not match its capacity '
+                             'and shapes.')
+        object.__setattr__(self, 'target_capacity_by_accelerator',
+                           tuple(target.items()))
+        object.__setattr__(self, 'accelerator_shapes', tuple(shapes.items()))
+
+    @property
+    def authority_current(self) -> bool:
+        return self.allocation_identity is not None
+
+
+@dataclasses.dataclass(frozen=True)
+class RetirementCapacityFloor:
+    """Demand plus the non-overlapping part of a reserved-fill shelter."""
+
+    capacity: int
+    capacity_by_accelerator: tuple[tuple[str, int], ...] = ()
+    accelerator_shapes: tuple[tuple[str, int], ...] = ()
+
+
+def _holding_exact_shape(
+    holding: MaterializedFillHolding,) -> tuple[str, int] | None:
+    if (holding.accelerator is None or holding.accelerator_count is None or
+            holding.accelerator_count <= 0):
+        return None
+    return holding.accelerator.casefold(), holding.accelerator_count
+
+
+def derive_sequenced_retirement_shelter(  # pylint: disable=too-many-locals
+    *,
+    allocation: AuthenticatedAllocationMap | None,
+    holdings: tuple[MaterializedFillHolding, ...],
+    service_version: int,
+    max_capacity: int,
+    capacity_unit: FillCapacityUnit,
+) -> SequencedRetirementShelter:
+    """Derive teardown shelter without adapting into legacy mutable feeds."""
+    _require_int(service_version, 'Shelter service version', minimum=1)
+    _require_int(max_capacity, 'Shelter maximum capacity')
+    if type(holdings) is not tuple or any(
+            not isinstance(holding, MaterializedFillHolding)
+            for holding in holdings):
+        raise ValueError('Shelter holdings must be an immutable typed tuple.')
+    if not isinstance(capacity_unit, FillCapacityUnit):
+        raise ValueError('Shelter capacity unit must be FillCapacityUnit.')
+
+    ordered_holdings = tuple(sorted(holdings, key=lambda item: item.replica_id))
+    if allocation is None:
+        # Unavailable is not an authenticated grant of zero.  Preserve every
+        # materialized row, including an old-version/recovery row, until a
+        # current map makes an explicit destructive decision possible.
+        selected: list[MaterializedFillHolding] = []
+        remaining_capacity = max_capacity
+        for holding in ordered_holdings:
+            if holding.capacity > remaining_capacity:
+                continue
+            selected.append(holding)
+            remaining_capacity -= holding.capacity
+        capacity = sum(holding.capacity for holding in selected)
+        exact: dict[str, int] = {}
+        unavailable_shapes: dict[str, int] = {}
+        exact_complete = True
+        for holding in selected:
+            shape = _holding_exact_shape(holding)
+            if shape is None:
+                exact_complete = False
+                break
+            card, width = shape
+            previous = unavailable_shapes.setdefault(card, width)
+            if previous != width:
+                exact_complete = False
+                break
+            exact[card] = exact.get(card, 0) + holding.capacity
+        if not exact_complete:
+            exact = {}
+            unavailable_shapes = {}
+        return SequencedRetirementShelter(
+            service_version=service_version,
+            target_capacity=capacity,
+            target_capacity_by_accelerator=tuple(exact.items()),
+            accelerator_shapes=tuple(unavailable_shapes.items()),
+            allocation_identity=None,
+        )
+
+    allocation.validate_authentication()
+    if allocation.service_version != service_version:
+        raise ValueError('Shelter allocation service version is stale.')
+
+    snapshots = {
+        snapshot.pool_key: snapshot for snapshot in allocation.pool_snapshots
+    }
+    shapes: dict[str, int] = {}
+    display_cards: dict[str, str] = {}
+    card_order_by_pool: dict[str, tuple[str, ...]] = {}
+    for snapshot in allocation.pool_snapshots:
+        card_order: list[str] = []
+        for location in snapshot.locations:
+            card = location.accelerator.casefold()
+            if card not in card_order:
+                card_order.append(card)
+            display_cards.setdefault(card, location.accelerator)
+            width = location.accelerator_count
+            prior_width = shapes.setdefault(card, width)
+            if prior_width != width:
+                raise ValueError('Shelter allocation has inconsistent service '
+                                 'accelerator shapes.')
+        card_order_by_pool[snapshot.pool_key] = tuple(card_order)
+
+    holdings_by_pool_card: dict[tuple[str, str],
+                                list[MaterializedFillHolding]] = {}
+    for holding in ordered_holdings:
+        if holding.service_version > service_version:
+            raise ValueError('A materialized holding has a future service '
+                             'version.')
+        if holding.pool_key is None:
+            raise ValueError('A materialized holding lacks exact pool '
+                             'attribution.')
+        matched_snapshot = snapshots.get(holding.pool_key)
+        if matched_snapshot is None:
+            # The current authenticated claim set removed this pool.  Its old
+            # holding is no longer part of the current grant shelter.
+            continue
+        holding_card = holding.accelerator
+        if (holding_card is None or holding_card
+                not in card_order_by_pool[matched_snapshot.pool_key] or
+                holding.accelerator_count != shapes.get(holding_card) or
+                holding.physical_cluster_uid
+                != matched_snapshot.physical_cluster_uid or
+                holding.service_generation is None or holding.service_generation
+                > matched_snapshot.service_generation):
+            raise ValueError('A materialized holding does not match the '
+                             'authenticated allocation topology.')
+        holdings_by_pool_card.setdefault(
+            (matched_snapshot.pool_key, holding_card), []).append(holding)
+
+    physical_targets: list[tuple[str, int]] = []
+    for snapshot in allocation.pool_snapshots:
+        cards = card_order_by_pool[snapshot.pool_key]
+        remaining_slots = min(snapshot.grant, snapshot.edge_cap)
+        selected_by_card: dict[str, int] = {}
+        for card in cards:
+            candidates = holdings_by_pool_card.get((snapshot.pool_key, card),
+                                                   [])
+            admitted = min(remaining_slots, len(candidates))
+            if admitted > 0:
+                selected_by_card[card] = admitted
+                remaining_slots -= admitted
+        # FEED authorizes new work; it is not materialized capacity and cannot
+        # become a teardown floor. Otherwise a paid replica at max capacity
+        # could neither retire nor make headroom for its free replacement.
+        # Unused grant entitlement likewise carries no retirement shelter.
+        physical_targets.extend(selected_by_card.items())
+
+    remaining_capacity = max_capacity
+    target_by_card: dict[str, int] = {}
+    for card, physical_target in physical_targets:
+        unit_capacity = capacity_unit.intent_cost(shapes[card])
+        admitted_slots = min(physical_target,
+                             remaining_capacity // unit_capacity)
+        if admitted_slots <= 0:
+            continue
+        admitted_capacity = admitted_slots * unit_capacity
+        target_by_card[card] = (target_by_card.get(card, 0) + admitted_capacity)
+        remaining_capacity -= admitted_capacity
+
+    target_capacity = sum(target_by_card.values())
+    return SequencedRetirementShelter(
+        service_version=service_version,
+        target_capacity=target_capacity,
+        target_capacity_by_accelerator=tuple(target_by_card.items()),
+        accelerator_shapes=tuple(
+            (display_cards[card], width) for card, width in shapes.items()),
+        allocation_identity=allocation.identity,
+    )
+
+
+def compose_retirement_capacity_floor(
+    *,
+    demand_capacity: int,
+    demand_capacity_by_accelerator: tuple[tuple[str, int], ...],
+    accelerator_shapes: tuple[tuple[str, int], ...],
+    shelter: SequencedRetirementShelter,
+    max_capacity: int,
+) -> RetirementCapacityFloor | None:
+    """Compose demand and fill per exact card, preserving demand first."""
+    _require_int(demand_capacity, 'Demand retirement capacity')
+    _require_int(max_capacity, 'Retirement maximum capacity')
+    if (type(demand_capacity_by_accelerator) is not tuple or
+            type(accelerator_shapes) is not tuple):
+        raise ValueError('Demand retirement state must be immutable tuples.')
+    demand_by_card = {
+        str(card).casefold(): value
+        for card, value in demand_capacity_by_accelerator
+    }
+    shapes = {str(card).casefold(): value for card, value in accelerator_shapes}
+    shelter_by_card = dict(shelter.target_capacity_by_accelerator)
+    shelter_shapes = dict(shelter.accelerator_shapes)
+    exact = (sum(demand_by_card.values()) == demand_capacity and
+             sum(shelter_by_card.values()) == shelter.target_capacity and
+             set(demand_by_card) <= set(shapes) and
+             set(shelter_by_card) <= set(shapes) and
+             all(shapes[card] == width
+                 for card, width in shelter_shapes.items()
+                 if card in shapes))
+    if not exact:
+        return None
+    if shelter.target_capacity == 0:
+        return RetirementCapacityFloor(
+            capacity=demand_capacity,
+            capacity_by_accelerator=demand_capacity_by_accelerator,
+            accelerator_shapes=accelerator_shapes,
+        )
+
+    target = dict(demand_by_card)
+    remaining = max(0, max_capacity - demand_capacity)
+    for card in shapes:
+        additional = max(0, shelter_by_card.get(card, 0) - target.get(card, 0))
+        admitted = min(remaining, additional)
+        if admitted > 0:
+            target[card] = target.get(card, 0) + admitted
+            remaining -= admitted
+    return RetirementCapacityFloor(
+        capacity=sum(target.values()),
+        capacity_by_accelerator=tuple((card, target.get(card, 0))
+                                      for card in shapes
+                                      if target.get(card, 0) > 0),
+        accelerator_shapes=tuple(shapes.items()),
+    )
 
 
 @dataclasses.dataclass(frozen=True)

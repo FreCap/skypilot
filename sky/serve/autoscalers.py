@@ -18,6 +18,7 @@ from sky.jobs import state as managed_job_state
 from sky.serve import autoscaler_compatibility
 from sky.serve import autoscaler_decisions
 from sky.serve import constants
+from sky.serve import replica_info as replica_info_lib
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
@@ -662,12 +663,12 @@ class Autoscaler:
 
     @contextlib.contextmanager
     def sequenced_reserved_fill_planning(self) -> typing.Iterator[None]:
-        """Suppress legacy v2 launch emission for one typed planning tick.
+        """Bypass the legacy fill overlay for one typed planning tick.
 
-        The legacy overlay still computes its ordinary decisions, scale-down
-        shelter, and status target.  Only speculative protocol-v2 launch
-        emission and its feed/rotation mutation are disabled; a validated
-        durable manager receipt is the sole commit point in sequenced mode.
+        The sequenced path derives its immutable retirement shelter directly
+        from PostgreSQL allocation authority.  It must never project that map
+        into the legacy process-local feed or let the legacy overlay launch,
+        shelter, or mutate fairness state.
         """
         state = self._sequenced_reserved_fill_planning_state
         previously_enabled = bool(getattr(state, 'enabled', False))
@@ -718,7 +719,7 @@ class Autoscaler:
         old_capacity = 0
         latest_capacity = 0
         for info in replica_infos:
-            if info.is_terminal:
+            if not self._reserved_fill_row_is_materialized(info):
                 continue
             capacity = self._fill_capacity_units(info)
             if info.version == self.latest_version:
@@ -1830,6 +1831,64 @@ class Autoscaler:
         del info
         return 1
 
+    @staticmethod
+    def _is_reversible_reserved_fill_retirement(
+            info: 'replica_managers.ReplicaInfo') -> bool:
+        """Whether a fill backend is off-route but not teardown-committed."""
+        return (
+            info.reserved_fill is True and info.is_zero_cost is True and
+            replica_info_lib.is_restart_recoverable_logical_retirement(info))
+
+    def _reserved_fill_row_is_materialized(
+            self, info: 'replica_managers.ReplicaInfo') -> bool:
+        return (not info.is_terminal or
+                self._is_reversible_reserved_fill_retirement(info))
+
+    def sequenced_reserved_fill_holdings(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> tuple[reserved_fill_planner.MaterializedFillHolding, ...]:
+        """Return immutable provider-free facts for typed shelter planning."""
+        holdings: list[reserved_fill_planner.MaterializedFillHolding] = []
+        for info in replica_infos:
+            if (info.reserved_fill is not True or
+                    info.is_zero_cost is not True or
+                    not self._reserved_fill_row_is_materialized(info)):
+                continue
+            pool_key = getattr(info, 'reserved_fill_pool_key', None)
+            location = info.get_spot_location()
+            accelerators = None if location is None else location.accelerators
+            if not isinstance(accelerators, dict) or len(accelerators) != 1:
+                accelerators = (info.resources_override or
+                                {}).get('accelerators')
+            card: str | None = None
+            accelerator_count: int | None = None
+            if isinstance(accelerators, dict) and len(accelerators) == 1:
+                raw_card, raw_count = next(iter(accelerators.items()))
+                if isinstance(raw_card, str) and raw_card:
+                    try:
+                        count = int(raw_count)
+                    except (TypeError, ValueError):
+                        count = 0
+                    if count > 0:
+                        card = raw_card
+                        accelerator_count = count
+            holdings.append(
+                reserved_fill_planner.MaterializedFillHolding(
+                    replica_id=info.replica_id,
+                    service_version=info.version,
+                    capacity=self._fill_capacity_units(info),
+                    pool_key=(pool_key if isinstance(pool_key, str) and pool_key
+                              else None),
+                    physical_cluster_uid=(getattr(
+                        info, 'reserved_fill_physical_cluster_uid', None)),
+                    service_generation=getattr(
+                        info, 'reserved_fill_service_generation', None),
+                    accelerator=card,
+                    accelerator_count=accelerator_count,
+                ))
+        return tuple(holdings)
+
     def _reserved_fill_committed_capacity(
             self, info: 'replica_managers.ReplicaInfo') -> int:
         """Capacity an ordinary absolute target can already rely on."""
@@ -2560,6 +2619,12 @@ class Autoscaler:
         """
         if not self.reserved_capacity_fill:
             return decisions
+        if self._sequenced_reserved_fill_planning_enabled():
+            # A typed PostgreSQL shelter is composed by the controller and
+            # enforced by ReplicaManager.  Mutating or consulting the legacy
+            # feed here would recreate the restart race this boundary removes.
+            self._fill_target = 0
+            return decisions
         (pool_states, pool_order_revision) = (
             self._pool_fill_states_snapshot_with_order_revision())
         if pool_states:
@@ -2568,8 +2633,7 @@ class Autoscaler:
                 decisions,
                 pool_states,
                 pool_order_revision,
-                emit_legacy_launches=(
-                    not self._sequenced_reserved_fill_planning_enabled()))
+                emit_legacy_launches=True)
         # Zero-cost accounting is version-asymmetric by design; the
         # four roles use different version scopes:
         # - LAUNCH TARGET: latest-version zero-cost rows only. Old-version
@@ -5814,7 +5878,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self,
     ) -> (tuple[int, int, int] | tuple[int, int, int, tuple[tuple[
             str, int], ...], tuple[tuple[str, int], ...]] | None):
-        """Version, report generation, and target from the last full tick."""
+        """Version, report generation, and demand actuation target."""
         with self._logical_state_lock:
             return self._last_logical_target_state
 

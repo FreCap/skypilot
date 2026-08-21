@@ -1082,6 +1082,77 @@ def copy_system_recovery_fields(source: Any,
     _validate_system_recovery_fields(destination)
 
 
+def is_recoverable_uncommitted_logical_retirement(info: Any) -> bool:
+    """Whether an exact logical retirement is durable but reversible."""
+    status = info.status_property
+    retirement_version = status.logical_retirement_version
+    controller_epoch = status.logical_retirement_controller_epoch
+    selection_generation = status.logical_retirement_generation
+    selection_target = status.logical_retirement_target_capacity
+    confirmed_generation = status.logical_retirement_confirmed_generation
+    bounded_deadline = status.logical_retirement_bounded_deadline
+    generation_valid = (type(selection_generation) is int and
+                        selection_generation >= 0)
+    confirmation_valid = (
+        confirmed_generation is None or
+        (type(confirmed_generation) is int and generation_valid and
+         confirmed_generation >= typing.cast(int, selection_generation)))
+    strict_idle_wait = (status.wait_for_idle_before_termination is True and
+                        confirmation_valid)
+    bounded_precommit = (status.wait_for_idle_before_termination is False and
+                         bounded_deadline is True and
+                         type(confirmed_generation) is int and
+                         generation_valid and
+                         confirmed_generation >= typing.cast(
+                             int, selection_generation) and
+                         type(info.version) is int and
+                         type(retirement_version) is int and
+                         info.version <= retirement_version)
+    return bool(
+        status.sky_launch_status == common_utils.ProcessStatus.SUCCEEDED and
+        status.sky_down_status == common_utils.ProcessStatus.SCHEDULED and
+        status.is_scale_down is True and status.preempted is False and
+        status.purged is False and (strict_idle_wait or bounded_precommit) and
+        status.logical_retirement_committed is False and
+        type(info.version) is int and type(retirement_version) is int and
+        info.version <= retirement_version and
+        isinstance(controller_epoch, str) and bool(controller_epoch) and
+        generation_valid and type(selection_target) is int and
+        selection_target >= 0 and type(bounded_deadline) is bool)
+
+
+def is_uncommitted_logical_retirement_admission(info: Any) -> bool:
+    """Whether exact readback proves down admission did not commit."""
+    status = info.status_property
+    retirement_version = status.logical_retirement_version
+    controller_epoch = status.logical_retirement_controller_epoch
+    selection_generation = status.logical_retirement_generation
+    selection_target = status.logical_retirement_target_capacity
+    confirmed_generation = status.logical_retirement_confirmed_generation
+    return bool(
+        status.sky_launch_status == common_utils.ProcessStatus.SUCCEEDED and
+        status.sky_down_status == common_utils.ProcessStatus.SCHEDULED and
+        status.is_scale_down is True and status.preempted is False and
+        status.purged is False and
+        status.wait_for_idle_before_termination is False and
+        status.logical_retirement_committed is False and
+        type(info.version) is int and type(retirement_version) is int and
+        info.version <= retirement_version and
+        isinstance(controller_epoch, str) and bool(controller_epoch) and
+        type(selection_generation) is int and selection_generation >= 0 and
+        type(selection_target) is int and selection_target >= 0 and
+        type(confirmed_generation) is int and
+        selection_generation <= confirmed_generation and
+        type(status.logical_retirement_bounded_deadline) is bool)
+
+
+def is_restart_recoverable_logical_retirement(info: Any) -> bool:
+    """Whether controller restart may safely re-fence or reactivate a row."""
+    return bool(
+        is_recoverable_uncommitted_logical_retirement(info) or
+        is_uncommitted_logical_retirement_admission(info))
+
+
 class ReplicaInfo:
     """Replica info for each replica."""
 

@@ -210,6 +210,28 @@ class ReservedFillAllocationRepository:
         query = sqlalchemy.select(authority_table).where(
             authority_table.c.id == 1).with_for_update(read=read)
         authority = connection.execute(query).mappings().one_or_none()
+        return ReservedFillAllocationRepository._protocol_pair_from_authority(
+            connection, authority)
+
+    @staticmethod
+    def _read_prelocked_protocol(
+        connection: sqlalchemy.engine.Connection,
+    ) -> tuple[RowMapping, RowMapping] | None:
+        """Re-read protocol state after the caller took its first mutex."""
+        authority_table = (
+            pool_capacity_observation_schema.protocol_state_sequence_table)
+        authority = connection.execute(
+            sqlalchemy.select(authority_table).where(
+                authority_table.c.id == 1)).mappings().one_or_none()
+        return ReservedFillAllocationRepository._protocol_pair_from_authority(
+            connection, authority)
+
+    @staticmethod
+    def _protocol_pair_from_authority(
+        connection: sqlalchemy.engine.Connection,
+        authority: RowMapping | None,
+    ) -> tuple[RowMapping, RowMapping] | None:
+        """Validate a locked protocol row and its durable projection."""
         if authority is None:
             raise ReservedFillAllocationCorruptionError(
                 'Reserved-fill protocol singleton is absent.')
@@ -264,6 +286,33 @@ class ReservedFillAllocationRepository:
                               table.c.current_version).where(
                                   table.c.name == service_name).with_for_update(
                                       read=read)).mappings().one_or_none()
+        return ReservedFillAllocationRepository._validate_service_row(
+            row, expected_service_hash, expected_controller_owner)
+
+    @staticmethod
+    def _read_prelocked_service(
+        connection: sqlalchemy.engine.Connection,
+        service_name: str,
+        expected_service_hash: str,
+        expected_controller_owner: tuple[int | None, str | None],
+    ) -> RowMapping | None:
+        """Re-read service identity without inverting an existing lock order."""
+        table = serve_state_schema.services_table
+        row = connection.execute(
+            sqlalchemy.select(
+                table.c.name, table.c.hash, table.c.controller_pid,
+                table.c.controller_ip, table.c.resource_scope,
+                table.c.current_version).where(
+                    table.c.name == service_name)).mappings().one_or_none()
+        return ReservedFillAllocationRepository._validate_service_row(
+            row, expected_service_hash, expected_controller_owner)
+
+    @staticmethod
+    def _validate_service_row(
+        row: RowMapping | None,
+        expected_service_hash: str,
+        expected_controller_owner: tuple[int | None, str | None],
+    ) -> RowMapping | None:
         if (row is None or row['hash'] != expected_service_hash or
                 row['resource_scope'] != expected_service_hash or
             (row['controller_pid'], row['controller_ip'])
@@ -757,6 +806,138 @@ class ReservedFillAllocationRepository:
                     'Locked allocation publication lost its generation CAS.')
             return allocation
 
+    def read_current_in_connection(  # pylint: disable=too-many-locals
+        self,
+        connection: sqlalchemy.engine.Connection,
+        service_name: str,
+        expected_service_hash: str,
+        expected_controller_owner: tuple[int | None, str | None],
+        *,
+        protocol_and_service_prelocked: bool = False,
+    ) -> reserved_fill_planner.AuthenticatedAllocationMap | None:
+        """Revalidate current authority inside the caller's transaction.
+
+        A destructive caller that already holds the protocol singleton and
+        service row sets ``protocol_and_service_prelocked``.  Validation then
+        re-reads those rows without reacquiring the lock-order prefix before
+        locking the remaining round, claim, edge, and projection evidence.
+        """
+        if not isinstance(connection, sqlalchemy.engine.Connection):
+            raise ValueError('Allocation validation requires a SQLAlchemy '
+                             'Connection.')
+        if connection.dialect.name != 'postgresql':
+            raise ValueError('Allocation validation requires PostgreSQL.')
+        if not connection.in_transaction():
+            raise ValueError('Allocation validation requires an active '
+                             'caller transaction.')
+        if type(protocol_and_service_prelocked) is not bool:
+            raise ValueError('Prelocked mode must be a boolean.')
+        name = _require_nonempty_text(service_name, 'Service name')
+        service_hash = _require_nonempty_text(expected_service_hash,
+                                              'Expected service hash')
+        owner = _validate_controller_owner(expected_controller_owner)
+        if protocol_and_service_prelocked:
+            protocol_pair = self._read_prelocked_protocol(connection)
+        else:
+            protocol_pair = self._lock_protocol(connection, read=True)
+        if protocol_pair is None:
+            return None
+        protocol_authority, protocol = protocol_pair
+        if protocol_and_service_prelocked:
+            service_row = self._read_prelocked_service(connection, name,
+                                                       service_hash, owner)
+        else:
+            service_row = self._lock_service(connection,
+                                             name,
+                                             service_hash,
+                                             owner,
+                                             read=True)
+        if service_row is None:
+            return None
+        # The allocation row is read without a row lock first so its
+        # authenticated pool set can drive canonical sorted round locking.
+        # The service ownership lock fences every supported allocation and
+        # claim-set writer; re-reading after the claim lock additionally
+        # makes that dependency explicit and fail closed.
+        allocation_columns = self._read_allocation_columns(connection, name)
+        if allocation_columns is None:
+            return None
+        allocation = self._decode_current_allocation(allocation_columns)
+        if allocation is None:
+            return None
+        locked_rounds = self._lock_rounds(connection,
+                                          allocation.pool_snapshots,
+                                          read=True)
+        if locked_rounds is None:
+            return None
+        claim_state = self._lock_claim_set(connection,
+                                           name,
+                                           int(protocol['claim_generation']),
+                                           read=True)
+        if claim_state is None:
+            return None
+        set_row, edges = claim_state
+        if (service_row['current_version'] != set_row['service_version'] or
+                not self._lock_projection_source(
+                    connection, name, set_row['service_version'], edges)):
+            return None
+        current_columns = self._read_allocation_columns(connection, name)
+        if current_columns is None:
+            raise ReservedFillAllocationCorruptionError(
+                'Claim set lost its allocation projection.')
+        current = self._decode_current_allocation(current_columns)
+        if current is None:
+            return None
+        current_sequence = protocol_authority[
+            'ordinary_zero_cost_admission_sequence']
+        if (type(current_sequence) is not int or current_sequence
+                < current.ordinary_zero_cost_admission_sequence_high_water):
+            raise ReservedFillAllocationCorruptionError(
+                'Ordinary admission sequence regressed behind the '
+                'authenticated allocation high-water.')
+        if (current_sequence
+                != current.ordinary_zero_cost_admission_sequence_high_water):
+            # Any ordinary admission after publication consumes shared
+            # unpartitioned capacity.  The map is stale, not corrupt, and
+            # must be rebuilt from new pool evidence before it is spent.
+            return None
+        allocation_column_names = ('allocation_generation',
+                                   'allocation_input_sha256',
+                                   'allocation_claim_generation',
+                                   'allocation_map', 'allocation_published_at',
+                                   'allocation_gate_generation')
+        if (current != allocation or
+                any(current_columns[column] != allocation_columns[column]
+                    for column in allocation_column_names)):
+            return None
+        if (allocation.allocation_claim_generation != set_row['generation'] or
+                allocation.service_version != set_row['service_version'] or
+                current_columns['allocation_gate_generation']
+                != protocol_authority['reconciliation_gate_generation'] or
+                allocation.reconciliation_gate_generation
+                != protocol_authority['reconciliation_gate_generation'] or
+                allocation.reclaim_fleet_bundle_sha256
+                != protocol_authority['reclaim_fleet_bundle_sha256'] or
+                allocation.reclaim_policy_revision
+                != protocol_authority['reclaim_policy_revision'] or
+                allocation.reclaim_provider_inventory_sha256
+                != protocol_authority['reclaim_provider_inventory_sha256'] or
+                not self._validate_snapshot_topology(allocation.pool_snapshots,
+                                                     int(set_row['generation']),
+                                                     edges)):
+            return None
+        now = _database_now(connection)
+        published_at = float(current_columns['allocation_published_at'])
+        if (published_at > now or
+                any(snapshot.valid_until < now
+                    for snapshot in allocation.pool_snapshots)):
+            return None
+        for snapshot in allocation.pool_snapshots:
+            if not self._validate_round(connection, name, snapshot,
+                                        locked_rounds[snapshot.pool_key], now):
+                return None
+        return allocation
+
     def read_current(  # pylint: disable=too-many-locals
         self,
         service_name: str,
@@ -764,106 +945,10 @@ class ReservedFillAllocationRepository:
         expected_controller_owner: tuple[int | None, str | None],
     ) -> reserved_fill_planner.AuthenticatedAllocationMap | None:
         """Read and revalidate the current complete planner authority."""
-        name = _require_nonempty_text(service_name, 'Service name')
-        service_hash = _require_nonempty_text(expected_service_hash,
-                                              'Expected service hash')
-        owner = _validate_controller_owner(expected_controller_owner)
         with self._engine.begin() as connection:
-            protocol_pair = self._lock_protocol(connection, read=True)
-            if protocol_pair is None:
-                return None
-            protocol_authority, protocol = protocol_pair
-            service_row = self._lock_service(connection,
-                                             name,
-                                             service_hash,
-                                             owner,
-                                             read=True)
-            if service_row is None:
-                return None
-            # The allocation row is read without a row lock first so its
-            # authenticated pool set can drive canonical sorted round locking.
-            # The service ownership lock fences every supported allocation and
-            # claim-set writer; re-reading after the claim lock additionally
-            # makes that dependency explicit and fail closed.
-            allocation_columns = self._read_allocation_columns(connection, name)
-            if allocation_columns is None:
-                return None
-            allocation = self._decode_current_allocation(allocation_columns)
-            if allocation is None:
-                return None
-            locked_rounds = self._lock_rounds(connection,
-                                              allocation.pool_snapshots,
-                                              read=True)
-            if locked_rounds is None:
-                return None
-            claim_state = self._lock_claim_set(
-                connection, name, int(protocol['claim_generation']), read=True)
-            if claim_state is None:
-                return None
-            set_row, edges = claim_state
-            if (service_row['current_version'] != set_row['service_version'] or
-                    not self._lock_projection_source(
-                        connection, name, set_row['service_version'], edges)):
-                return None
-            current_columns = self._read_allocation_columns(connection, name)
-            if current_columns is None:
-                raise ReservedFillAllocationCorruptionError(
-                    'Claim set lost its allocation projection.')
-            current = self._decode_current_allocation(current_columns)
-            if current is None:
-                return None
-            current_sequence = protocol_authority[
-                'ordinary_zero_cost_admission_sequence']
-            if (type(current_sequence) is not int or current_sequence
-                    < current.ordinary_zero_cost_admission_sequence_high_water):
-                raise ReservedFillAllocationCorruptionError(
-                    'Ordinary admission sequence regressed behind the '
-                    'authenticated allocation high-water.')
-            if (current_sequence !=
-                    current.ordinary_zero_cost_admission_sequence_high_water):
-                # Any ordinary admission after publication consumes shared
-                # unpartitioned capacity.  The map is stale, not corrupt, and
-                # must be rebuilt from new pool evidence before it is spent.
-                return None
-            allocation_column_names = ('allocation_generation',
-                                       'allocation_input_sha256',
-                                       'allocation_claim_generation',
-                                       'allocation_map',
-                                       'allocation_published_at',
-                                       'allocation_gate_generation')
-            if (current != allocation or
-                    any(current_columns[column] != allocation_columns[column]
-                        for column in allocation_column_names)):
-                return None
-            if (allocation.allocation_claim_generation != set_row['generation']
-                    or
-                    allocation.service_version != set_row['service_version'] or
-                    current_columns['allocation_gate_generation']
-                    != protocol_authority['reconciliation_gate_generation'] or
-                    allocation.reconciliation_gate_generation
-                    != protocol_authority['reconciliation_gate_generation'] or
-                    allocation.reclaim_fleet_bundle_sha256
-                    != protocol_authority['reclaim_fleet_bundle_sha256'] or
-                    allocation.reclaim_policy_revision
-                    != protocol_authority['reclaim_policy_revision'] or
-                    allocation.reclaim_provider_inventory_sha256
-                    != protocol_authority['reclaim_provider_inventory_sha256']
-                    or not self._validate_snapshot_topology(
-                        allocation.pool_snapshots, int(set_row['generation']),
-                        edges)):
-                return None
-            now = _database_now(connection)
-            published_at = float(current_columns['allocation_published_at'])
-            if (published_at > now or
-                    any(snapshot.valid_until < now
-                        for snapshot in allocation.pool_snapshots)):
-                return None
-            for snapshot in allocation.pool_snapshots:
-                if not self._validate_round(connection, name, snapshot,
-                                            locked_rounds[snapshot.pool_key],
-                                            now):
-                    return None
-            return allocation
+            return self.read_current_in_connection(connection, service_name,
+                                                   expected_service_hash,
+                                                   expected_controller_owner)
 
     def current_generation(
         self,

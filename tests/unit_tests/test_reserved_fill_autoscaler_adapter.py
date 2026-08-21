@@ -1,5 +1,6 @@
-"""Tests for the sequenced reserved-fill autoscaler adapter."""
+"""Tests for the sequenced reserved-fill planning boundary."""
 # pylint: disable=protected-access,unexpected-keyword-arg
+import dataclasses
 import time
 import types
 from unittest import mock
@@ -141,7 +142,20 @@ def _replica(
         status=status,
         is_terminal=status in serve_state.ReplicaStatus.terminal_statuses(),
         is_ready=status is serve_state.ReplicaStatus.READY,
-        status_property=types.SimpleNamespace(is_scale_down=False),
+        status_property=types.SimpleNamespace(
+            sky_launch_status=autoscalers.common_utils.ProcessStatus.SUCCEEDED,
+            sky_down_status=None,
+            is_scale_down=False,
+            preempted=False,
+            purged=False,
+            wait_for_idle_before_termination=False,
+            logical_retirement_committed=False,
+            logical_retirement_version=None,
+            logical_retirement_controller_epoch=None,
+            logical_retirement_generation=None,
+            logical_retirement_target_capacity=None,
+            logical_retirement_confirmed_generation=None,
+            logical_retirement_bounded_deadline=False),
         resources_override={'accelerators': {
             card: width
         }},
@@ -175,7 +189,7 @@ def _pool_payload(snapshot: reserved_fill_planner.PoolFillSnapshot,
     }
 
 
-def test_sequenced_scope_retains_ordinary_shelter_without_spending_feed():
+def test_sequenced_scope_bypasses_legacy_fill_state():
     autoscaler = autoscalers.Autoscaler('svc', _spec())
     autoscaler.max_replicas = 3
     snapshot = _snapshot('east-context', 'uid-east', 'H200', 2)
@@ -210,11 +224,11 @@ def test_sequenced_scope_retains_ordinary_shelter_without_spending_feed():
             decisions = autoscaler._apply_reserved_capacity_fill(
                 [fill], [ordinary_up, ordinary_down])
 
-    # The ordinary launch survives and reserved shelter suppresses the victim,
-    # but no dictionary-sentinel fill launch or speculative state mutation is
-    # allowed in the typed scope.
-    assert decisions == [ordinary_up]
-    assert autoscaler.fill_target == 2
+    # The typed path owns shelter and launch admission outside this deprecated
+    # overlay.  Ordinary decisions pass through without spending or mutating
+    # the process-local feed.
+    assert decisions == [ordinary_up, ordinary_down]
+    assert autoscaler.fill_target == 0
     assert autoscaler._fill_pool_states[
         snapshot.pool_key].free_slots == before_free
     assert autoscaler.reserved_fill_rotation_anchor() == snapshot.pool_key
@@ -226,6 +240,199 @@ def test_sequenced_scope_retains_ordinary_shelter_without_spending_feed():
         isinstance(decision.target, dict) and
         decision.target.get(constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY)
         for decision in legacy)
+
+
+def test_authenticated_allocation_derives_frozen_first_restart_shelter():
+    autoscaler = autoscalers.Autoscaler('svc', _spec())
+    autoscaler.max_replicas = 45
+    snapshot = _snapshot('east-context', 'uid-east', 'H200', 45)
+    allocation = _allocation(snapshot)
+    location = snapshot.locations[0].to_location()
+    replicas = []
+    for replica_id in range(1, 46):
+        info = _replica(replica_id,
+                        location=location,
+                        reserved_fill=True,
+                        is_zero_cost=True)
+        info.reserved_fill_pool_key = snapshot.pool_key
+        info.reserved_fill_service_generation = 1
+        info.reserved_fill_physical_cluster_uid = 'uid-east'
+        replicas.append(info)
+    shelter = reserved_fill_planner.derive_sequenced_retirement_shelter(
+        allocation=allocation,
+        holdings=autoscaler.sequenced_reserved_fill_holdings(replicas),
+        service_version=1,
+        max_capacity=45,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+
+    assert shelter.target_capacity == 45
+    assert shelter.target_capacity_by_accelerator == (('h200', 45),)
+    assert shelter.allocation_identity == allocation.identity
+
+
+def test_reversible_retirements_are_frozen_materialized_holdings():
+    autoscaler = autoscalers.Autoscaler('svc', _spec())
+    autoscaler.max_replicas = 45
+    snapshot = _snapshot('east-context', 'uid-east', 'H200', 45)
+    allocation = _allocation(snapshot)
+    location = snapshot.locations[0].to_location()
+    replicas = []
+    for replica_id in range(1, 46):
+        info = _replica(replica_id,
+                        location=location,
+                        reserved_fill=True,
+                        is_zero_cost=True,
+                        status=serve_state.ReplicaStatus.SHUTTING_DOWN)
+        info.reserved_fill_pool_key = snapshot.pool_key
+        info.reserved_fill_service_generation = 1
+        info.reserved_fill_physical_cluster_uid = 'uid-east'
+        status = info.status_property
+        status.sky_down_status = autoscalers.common_utils.ProcessStatus.SCHEDULED
+        status.is_scale_down = True
+        status.wait_for_idle_before_termination = True
+        status.logical_retirement_version = 1
+        status.logical_retirement_controller_epoch = 'old-controller'
+        status.logical_retirement_generation = 9
+        status.logical_retirement_target_capacity = 0
+        replicas.append(info)
+
+    shelter = reserved_fill_planner.derive_sequenced_retirement_shelter(
+        allocation=allocation,
+        holdings=autoscaler.sequenced_reserved_fill_holdings(replicas),
+        service_version=1,
+        max_capacity=45,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+
+    assert shelter.target_capacity == 45
+    assert autoscaler.reserved_fill_planned_capacity(replicas) == 45
+
+
+def test_missing_sequenced_authority_is_distinct_from_grant_zero():
+    autoscaler = autoscalers.Autoscaler('svc', _spec())
+    location = _location('east-context', 'H200', 1).to_location()
+    fill = _replica(1, location=location, reserved_fill=True, is_zero_cost=True)
+    zero_snapshot = _snapshot('east-context', 'uid-east', 'H200', 0)
+    fill.reserved_fill_pool_key = zero_snapshot.pool_key
+    fill.reserved_fill_service_generation = 1
+    fill.reserved_fill_physical_cluster_uid = 'uid-east'
+    shelter = reserved_fill_planner.derive_sequenced_retirement_shelter(
+        allocation=None,
+        holdings=autoscaler.sequenced_reserved_fill_holdings([fill]),
+        service_version=1,
+        max_capacity=20,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+    grant_zero = _allocation(zero_snapshot)
+    explicit_zero = reserved_fill_planner.derive_sequenced_retirement_shelter(
+        allocation=grant_zero,
+        holdings=autoscaler.sequenced_reserved_fill_holdings([fill]),
+        service_version=1,
+        max_capacity=20,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+
+    assert not shelter.authority_current
+    assert shelter.target_capacity == 1
+    assert explicit_zero.authority_current
+    assert explicit_zero.target_capacity == 0
+
+
+def test_unused_grant_or_feed_is_not_a_retirement_floor():
+    autoscaler = autoscalers.Autoscaler('svc', _spec())
+    snapshot = dataclasses.replace(_snapshot('east-context', 'uid-east', 'H200',
+                                             2),
+                                   edge_cap=10,
+                                   grant=10)
+    allocation = _allocation(snapshot)
+    location = snapshot.locations[0].to_location()
+    replicas = []
+    for replica_id in range(1, 4):
+        info = _replica(replica_id,
+                        location=location,
+                        reserved_fill=True,
+                        is_zero_cost=True)
+        info.reserved_fill_pool_key = snapshot.pool_key
+        info.reserved_fill_service_generation = 1
+        info.reserved_fill_physical_cluster_uid = 'uid-east'
+        replicas.append(info)
+
+    shelter = reserved_fill_planner.derive_sequenced_retirement_shelter(
+        allocation=allocation,
+        holdings=autoscaler.sequenced_reserved_fill_holdings(replicas),
+        service_version=1,
+        max_capacity=20,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+
+    assert shelter.authority_current
+    assert shelter.target_capacity == 3
+    assert shelter.target_capacity_by_accelerator == (('h200', 3),)
+
+
+def test_paid_at_max_can_make_headroom_for_free_fill():
+    allocation = _allocation(_snapshot('east-context', 'uid-east', 'H200', 1))
+    shelter = reserved_fill_planner.derive_sequenced_retirement_shelter(
+        allocation=allocation,
+        holdings=(),
+        service_version=1,
+        max_capacity=1,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.LOGICAL)
+    floor = reserved_fill_planner.compose_retirement_capacity_floor(
+        demand_capacity=0,
+        demand_capacity_by_accelerator=(),
+        accelerator_shapes=(('H200', 1),),
+        shelter=shelter,
+        max_capacity=1)
+
+    assert shelter.authority_current
+    assert shelter.target_capacity == 0
+    assert floor is not None
+    assert floor.capacity == 0
+    assert reserved_fill_planner.compose_retirement_capacity_floor(
+        demand_capacity=1,
+        demand_capacity_by_accelerator=(),
+        accelerator_shapes=(('H200', 1),),
+        shelter=shelter,
+        max_capacity=1) is None
+
+
+def test_logical_retirement_floor_composes_incompatible_cards_and_clips():
+    snapshot = _snapshot('east-context', 'uid-east', 'H200', 10)
+    allocation = _allocation(snapshot)
+    holdings = tuple(
+        reserved_fill_planner.MaterializedFillHolding(
+            replica_id=replica_id,
+            service_version=1,
+            capacity=1,
+            pool_key=snapshot.pool_key,
+            physical_cluster_uid=snapshot.physical_cluster_uid,
+            service_generation=snapshot.service_generation,
+            accelerator='H200',
+            accelerator_count=1) for replica_id in range(1, 11))
+    shelter = reserved_fill_planner.derive_sequenced_retirement_shelter(
+        allocation=allocation,
+        holdings=holdings,
+        service_version=1,
+        max_capacity=55,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.LOGICAL)
+
+    floor = reserved_fill_planner.compose_retirement_capacity_floor(
+        demand_capacity=50,
+        demand_capacity_by_accelerator=(('L4', 50),),
+        accelerator_shapes=(('L4', 1), ('H200', 1)),
+        shelter=shelter,
+        max_capacity=55)
+
+    assert floor is not None
+    assert floor.capacity == 55
+    assert floor.capacity_by_accelerator == (('l4', 50), ('h200', 5))
+
+    overlap = reserved_fill_planner.compose_retirement_capacity_floor(
+        demand_capacity=7,
+        demand_capacity_by_accelerator=(('H200', 7),),
+        accelerator_shapes=(('H200', 1),),
+        shelter=shelter,
+        max_capacity=55)
+    assert overlap is not None
+    assert overlap.capacity == 10
+    assert overlap.capacity_by_accelerator == (('h200', 10),)
 
 
 def test_physical_debits_duplicate_ambiguous_card_and_use_map_local_caps():
