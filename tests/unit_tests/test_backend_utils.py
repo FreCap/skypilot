@@ -425,6 +425,36 @@ def _builtin_kubernetes_writer_kwargs(monkeypatch, tmp_path, test_name):
     }, output_path)
 
 
+def _projected_h200_worker_v4():
+    return {
+        'projection_version': 4,
+        'candidate_id': 'kubernetes-0000',
+        'kubernetes_context': 'test-context',
+        'namespace': 'inference',
+        'service_account_name': 'worker-sa',
+        'priority_class_name': 'preemptible-inference-low',
+        'priority_value': -1000,
+        'preemption_policy': 'Never',
+        'pod_identity_role_arn': 'arn:aws:iam::123456789012:role/skyserve-worker-test',
+        'accelerator_name': 'H200',
+        'accelerator_count': 1,
+        'accelerator_scheduling': {
+            'label_key': 'nvidia.com/gpu.product',
+            'label_values': ['NVIDIA-H200'],
+            'resource_key': 'nvidia.com/gpu',
+        },
+        'cache': {
+            'kind': 'none',
+        },
+        'scheduler_name': 'default-scheduler',
+        'kueue_admission': None,
+        'provision_timeout': -1,
+        'scratch': {
+            'kind': 'none',
+        },
+    }
+
+
 def test_builtin_kubernetes_writer_preserves_fill_template_facade(
         monkeypatch, tmp_path):
     writer_kwargs, output_path = _builtin_kubernetes_writer_kwargs(
@@ -484,34 +514,9 @@ def test_projected_serve_worker_suppresses_all_static_credential_mounts(
     monkeypatch.setenv('CUSTOM_GPU_RESOURCE_KEY', 'mutable.example/gpu')
     writer_kwargs['to_provision'] = Resources(
         cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
-    writer_kwargs['worker_placement_projections'] = [{
-        'projection_version': 4,
-        'candidate_id': 'kubernetes-0000',
-        'kubernetes_context': 'test-context',
-        'namespace': 'inference',
-        'service_account_name': 'worker-sa',
-        'priority_class_name': 'preemptible-inference-low',
-        'priority_value': -1000,
-        'preemption_policy': 'Never',
-        'pod_identity_role_arn':
-            ('arn:aws:iam::123456789012:role/skyserve-worker-test'),
-        'accelerator_name': 'H200',
-        'accelerator_count': 1,
-        'accelerator_scheduling': {
-            'label_key': 'nvidia.com/gpu.product',
-            'label_values': ['NVIDIA-H200'],
-            'resource_key': 'nvidia.com/gpu',
-        },
-        'cache': {
-            'kind': 'none',
-        },
-        'scheduler_name': 'default-scheduler',
-        'kueue_admission': None,
-        'provision_timeout': -1,
-        'scratch': {
-            'kind': 'none',
-        },
-    }]
+    writer_kwargs['worker_placement_projections'] = [
+        _projected_h200_worker_v4()
+    ]
     original_fill_template = common_utils.fill_template
     rendered_variables = {}
 
@@ -629,6 +634,83 @@ def test_projected_serve_worker_suppresses_all_static_credential_mounts(
     assert '.aws' not in serialized_mounts
     assert '.kube' not in serialized_mounts
     assert 'logging-agent' not in serialized_mounts
+
+
+def test_projected_worker_persists_authenticated_bootstrap_through_finalizer(
+        monkeypatch, tmp_path):
+    writer_kwargs, _ = _builtin_kubernetes_writer_kwargs(
+        monkeypatch, tmp_path, 'projected-worker-authenticated-bootstrap')
+    writer_kwargs['to_provision'] = Resources(
+        cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
+    writer_kwargs['worker_placement_projections'] = [
+        _projected_h200_worker_v4()
+    ]
+    writer_kwargs['dryrun'] = False
+
+    private_key_path = tmp_path / 'test-key'
+    public_key_path = tmp_path / 'test-key.pub'
+    private_key_path.write_text('test-private-key', encoding='utf-8')
+    public_key = 'ssh-rsa AAAATEST projected-worker@test'
+    public_key_path.write_text(public_key, encoding='utf-8')
+    monkeypatch.setattr(backend_utils.auth_utils, 'get_or_generate_keys',
+                        lambda: (str(private_key_path), str(public_key_path)))
+    monkeypatch.setattr(kubernetes_utils,
+                        'check_port_forward_mode_dependencies', lambda: None)
+    monkeypatch.setattr(kubernetes_utils, 'get_ssh_proxy_command',
+                        lambda *_args, **_kwargs: 'test-proxy-command')
+    monkeypatch.setattr(backend_utils.global_user_state, 'get_cluster_yaml_str',
+                        lambda _path: None)
+    persisted = {}
+    monkeypatch.setattr(
+        backend_utils.global_user_state, 'set_cluster_yaml',
+        lambda cluster_name, content: persisted.update({
+            'cluster_name': cluster_name,
+            'content': content,
+        }))
+    monkeypatch.setattr(backend_utils, '_optimize_file_mounts',
+                        lambda _path: None)
+    monkeypatch.setattr(backend_utils.usage_lib.messages.usage,
+                        'update_ray_yaml', lambda _path: None)
+
+    backend_utils.write_cluster_config(**writer_kwargs)
+
+    rendered = yaml_utils.safe_load(persisted['content'])
+    node_config = rendered['available_node_types']['ray_head_default'][
+        'node_config']
+    pod_spec = node_config['spec']
+    runtime_script = next(container for container in pod_spec['containers']
+                          if container['name'] == 'ray-node')['args'][0]
+    expected_bootstrap_sha256 = rendered['provider'][
+        'serve_worker_expected_runtime_bootstrap_sha256']
+    assert persisted['cluster_name'] == 'display'
+    assert 'skypilot:ssh_public_key_content' not in runtime_script
+    assert public_key in runtime_script
+    assert expected_bootstrap_sha256 == (
+        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
+
+    finalized = kubernetes_pod_spec.finalize_pod_spec(
+        node_config,
+        role='head',
+        pod_name='projected-worker-head',
+        cluster_name_on_cloud='projected-worker',
+        node_count=2,
+        nvidia_runtime_exists=False,
+        needs_gpus=True,
+        needs_gpus_nvidia=True,
+        gpu_resource_key='nvidia.com/gpu',
+        needs_tpu=False,
+        resolved_base_affinity=pod_spec.get('affinity'),
+        docker_config=None,
+        docker_pvc_name=None,
+        context='test-context',
+        namespace='inference',
+    )
+    contract = (
+        kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
+            finalized['spec'],
+            rewrite=False,
+            expected_bootstrap_sha256=expected_bootstrap_sha256))
+    assert contract.matches
 
 
 def test_generic_kubernetes_runtime_has_no_projected_readiness_contract(

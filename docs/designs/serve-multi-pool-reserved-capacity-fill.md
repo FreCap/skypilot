@@ -3233,12 +3233,18 @@ installs exactly one downward-API `SKYPILOT_POD_UID`, `restartPolicy: Never`,
 and startup/readiness exec probes on the sole `ray-node` container. Before any
 workspace or resource Pod-config merge, the renderer hashes the canonical
 template's exact `ray-node` `command`, `args`, and `lifecycle` into one
-server-owned SHA256 expectation. Final rendering rejects any merged change to
-that producer and persists only the digest through the provisioner boundary.
-The create response, adoption read, finalized Pod, admitted read, and final
-fresh read must all reproduce the same digest; an injected `postStart`, changed
-pre-stop lifecycle, alternate command, or replacement script therefore cannot
-forge the readiness marker. Both probes require the contents of
+transient server-owned SHA256 expectation and rejects any merged change to that
+producer. Kubernetes SSH authentication is the one later trusted rendering
+step: it materializes the server key in the canonical bootstrap placeholder.
+Immediately after that step, while the complete projection remains available,
+the renderer requires every projected node type to share one exact
+authenticated producer, reasserts the projection, and persists that final
+digest through the provisioner boundary. No untrusted merge occurs between
+authentication and this final freeze. The finalized Pod, create response,
+adoption read, admitted read, and final fresh read must all reproduce the final
+digest; an injected `postStart`, changed pre-stop lifecycle, alternate command,
+or replacement script therefore cannot forge the readiness marker. Both probes
+require the contents of
 `/tmp/skypilot-serve-worker-runtime-ready` to equal the current Pod UID. Under
 fail-fast shell execution, the container clears every ready, setup-completion,
 setup-failure, Ray-completion, and host-network-port marker that could be
@@ -4072,7 +4078,7 @@ either case.
 | 2a.4 | Remove redundant admission-policy authority from reserved fill | Platform PR #8649 is superseded and must not change the shared KubeRay/HPTO policy for fleet activation. Policy-bundle schema v5 removes ValidatingAdmissionPolicy and binding reads while retaining the stronger exact Kueue controller/webhook and synchronous/fresh Pod lifecycle proof. Activation requires only the SkyPilot fix-forward deployment and a fresh full-fleet preflight; no Terraform or platform Helm change is part of this gate. |
 | 2a.5 | Preserve Simone's flat PHX Kueue contract and attest its complete inventory | Platform PR #8822 is merged and deployed as platform revision 29: zero explicit Cohort objects, no new priority class, existing `be-lt=11`, list-only audit access, PostgreSQL projection updated to `be-lt`, and only SkyPilot queues held. The matching SkyPilot schema-v6 correction is merged in PR #1650 and deployed in release `1.1.1422`. This phase is source-complete and deployed, but final activation/backfill proof remains open. |
 | 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 63 is committed, elected, and controller-applied at lifecycle epoch 82 on known-good image `v3.682.2-boltz-2`; it is the clean demand-gated activation successor. Version 62 remains rejected historical projection evidence. |
-| 2b.1 | UID-bound base-runtime readiness for canonical projected Kubernetes workers | Merged in PR #1618 at `6ad2407d813d04aed79de2fea62723987ee56670` and present in the revision-472 image. The focused render, source-composition, template-owned bootstrap-digest, typed Kubernetes-model, mutation, bounded-wait, UID-replacement, SSH-listener-failure, and final fresh-read tests pass, but the exact live runtime-readiness path is not yet production-exercised or proven. Generic Kubernetes and projection v1/v2/v3 remain unchanged. |
+| 2b.1 | UID-bound base-runtime readiness for canonical projected Kubernetes workers | Merged in PR #1618 at `6ad2407d813d04aed79de2fea62723987ee56670`. The first live projected-worker exercise on Helm revision 495 / release 1.1.1426 failed closed before Pod creation: the pre-merge producer digest still described the SSH-key placeholder, while the later trusted authentication pass had materialized the real key in `ray-node.args`. Fix-forward PR #1655 retains the pre-merge digest check, then freezes and reasserts the exact authenticated producer before restore, hashing, and persistence. Its non-dry-run real-template/authentication/finalizer regression and the focused readiness suites pass; deployment and exact-UID Ready proof remain open. Generic Kubernetes and projection v1/v2/v3 remain unchanged. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. Historical cleanup #1506 is closed/superseded and reserves no head. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
 | 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed dark in revision 431 / release 1.1.1338: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Activation remains gated by 2a.3, 2a.4, and a successful full-fleet re-attestation. |
