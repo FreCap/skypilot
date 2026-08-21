@@ -1445,11 +1445,14 @@ def remove_service_completely(
     claim row must go too, or a torn-down fill-enabled service keeps
     absorbing broker entitlement until its claim TTL expires.
 
-    The service row is conditionally deleted first inside the transaction.
+    The exact service row is conditionally locked first inside the transaction.
     If its durable hash (and, for a live controller, PID/IP owner) no longer
-    matches, no child table is touched. Once that delete succeeds, a same-name
-    successor cannot insert until this transaction commits, so deleting the
-    child rows cannot cross an A-to-B reuse boundary.
+    matches, no child table is touched. The replica rows are then deleted
+    before the service row because deleting the service cascades its durable
+    actuation intents, whose committed rows are protected by a restrictive
+    replica foreign key. The locked service row prevents a same-name successor
+    from inserting until this transaction commits, so deleting the child rows
+    cannot cross an A-to-B reuse boundary.
 
     Returns:
         True when the expected incarnation was removed; False when ownership
@@ -1485,10 +1488,10 @@ def remove_service_completely(
             session.rollback()
             return False
         resource_scope = service_row[0]
-        session.execute(sqlalchemy.delete(services_table).where(*predicates))
         session.execute(
             sqlalchemy.delete(replicas_table).where(
                 replicas_table.c.service_name == service_name))
+        session.execute(sqlalchemy.delete(services_table).where(*predicates))
         session.execute(
             sqlalchemy.delete(version_specs_table).where(
                 version_specs_table.c.service_name == service_name))

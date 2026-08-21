@@ -1590,6 +1590,59 @@ def test_outer_commit_publishes_sequences_and_hydrates_exact_request(
         receipt.request_id, _CREATOR_ID, 'different-workspace')
 
 
+def test_remove_service_completely_removes_intent_linked_replica_graph(
+        atomic_database, monkeypatch) -> None:
+    _, info, authority = _failed_teardown_reserved_fill_ambiguity(
+        atomic_database)
+    _install_failed_teardown_provider_observation(
+        monkeypatch, atomic_database, info,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
+    service._settle_bound_ordinary_launches_for_teardown(authority, [info])
+
+    assert serve_state.remove_service_completely(
+        _SERVICE,
+        _SERVICE_HASH,
+        expected_controller_owner=_OWNER,
+        expected_lifecycle_epoch=4)
+
+    with atomic_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table)).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.replicas_table)).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                zero_cost_actuation_schema.
+                serve_zero_cost_actuation_intents_table)).scalar_one() == 0
+
+
+def test_remove_service_completely_rejects_unsettled_intent_graph(
+        atomic_database) -> None:
+    spec = _atomic_spec(atomic_database)
+    reserved_fill_admission._transaction(spec, 7, require_existing=False)
+
+    with pytest.raises(sqlalchemy.exc.InternalError,
+                       match='bound ordinary-launch replica cannot be deleted'):
+        serve_state.remove_service_completely(_SERVICE,
+                                              _SERVICE_HASH,
+                                              expected_controller_owner=_OWNER,
+                                              expected_lifecycle_epoch=4)
+
+    with atomic_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table)).scalar_one() == 1
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.replicas_table)).scalar_one() == 1
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                zero_cost_actuation_schema.
+                serve_zero_cost_actuation_intents_table)).scalar_one() == 1
+
+
 def test_serve056_accepts_live_intent_and_replica_image_id_encodings(
         atomic_database) -> None:
     image = 'docker:registry.example/boltz@sha256:' + 'e' * 64

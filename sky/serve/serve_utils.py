@@ -95,6 +95,9 @@ controller_transport.logger = logger
 _LEGACY_HA_CONFIG_BLOCK_BEGIN = '# SKY_SERVE_CONFIG_SNAPSHOT_BEGIN'
 _LEGACY_HA_CONFIG_BLOCK_END = '# SKY_SERVE_CONFIG_SNAPSHOT_END'
 _VERSIONED_HA_CONFIG_MARKER = constants.VERSIONED_HA_CONFIG_RECOVERY_MARKER
+_HA_RECOVERY_PYTHON_EXECUTABLE_RE = re.compile(r'python(?:3(?:[.][0-9]+)?)?\Z')
+_HA_RECOVERY_SKY_PYTHON_CMD_TOKENS = tuple(
+    shlex.split(skylet_constants.SKY_PYTHON_CMD))
 # This grammar is owned by ``write_config_snapshot_receipt()``. Keep it
 # deliberately exact: recovery and GC must never treat an arbitrary dotfile
 # that merely shares the prefix as one of our receipts.
@@ -266,6 +269,63 @@ def sanitize_ha_recovery_config_bytes(config_bytes: bytes) -> bytes:
     return yaml_utils.dump_yaml_str(config).encode('utf-8')
 
 
+def _find_ha_recovery_controller_launch_index(lines: list[str]) -> int:
+    """Locate the generated Python command that starts a Serve controller."""
+    candidates: list[int] = []
+    line_index = 0
+    while line_index < len(lines):
+        launch_index = line_index
+        logical_parts: list[str] = []
+        unterminated_continuation = False
+        while line_index < len(lines):
+            physical_line = lines[line_index].rstrip()
+            continued = physical_line.endswith('\\')
+            logical_parts.append(
+                physical_line[:-1] if continued else physical_line)
+            line_index += 1
+            if not continued:
+                break
+            if line_index == len(lines):
+                unterminated_continuation = True
+        if unterminated_continuation:
+            continue
+        try:
+            tokens = shlex.split(' '.join(logical_parts), comments=True)
+        except ValueError:
+            # A malformed or non-generated shell block cannot authorize a
+            # controller launch. The exact-one check below fails closed if it
+            # was the only apparent launch.
+            continue
+        if not tokens:
+            continue
+        module_pair_count = sum(
+            token == '-m' and index +
+            1 < len(tokens) and tokens[index + 1] == 'sky.serve.service'
+            for index, token in enumerate(tokens))
+        if module_pair_count != 1:
+            continue
+        direct_python = (_HA_RECOVERY_PYTHON_EXECUTABLE_RE.fullmatch(
+            os.path.basename(tokens[0])) is not None)
+        direct_args = tokens[1:]
+        if direct_args[:1] == ['-u']:
+            direct_args = direct_args[1:]
+        direct_invocation = direct_python and direct_args[:2] == [
+            '-m', 'sky.serve.service'
+        ]
+        generated_prefix_size = len(_HA_RECOVERY_SKY_PYTHON_CMD_TOKENS)
+        generated_invocation = (
+            tuple(tokens[:generated_prefix_size])
+            == _HA_RECOVERY_SKY_PYTHON_CMD_TOKENS and
+            tokens[generated_prefix_size:generated_prefix_size + 3]
+            == ['-u', '-m', 'sky.serve.service'])
+        if direct_invocation or generated_invocation:
+            candidates.append(launch_index)
+    if len(candidates) != 1:
+        raise ValueError('Cannot locate exactly one generated SkyServe '
+                         'controller launch in the HA recovery script.')
+    return candidates[0]
+
+
 def strip_legacy_ha_recovery_config_payload(script: str,
                                             remote_path: str) -> str:
     """Remove historical config bytes and retain the controller launch.
@@ -321,14 +381,7 @@ def strip_legacy_ha_recovery_config_payload(script: str,
             continue
         rewritten.append(line)
     if not wrote_export:
-        launch_index = next(
-            (index for index, line in enumerate(rewritten)
-             if 'python' in line and
-             'sky.serve.service' in '\n'.join(rewritten[index:index + 6])),
-            None)
-        if launch_index is None:
-            raise ValueError('Cannot locate the SkyServe controller launch in '
-                             'the HA recovery script.')
+        launch_index = _find_ha_recovery_controller_launch_index(rewritten)
         rewritten.insert(launch_index, config_export)
     export_index = rewritten.index(config_export)
     rewritten.insert(export_index, _VERSIONED_HA_CONFIG_MARKER)
@@ -338,6 +391,64 @@ def strip_legacy_ha_recovery_config_payload(script: str,
             f'{_VERSIONED_HA_CONFIG_MARKER}\n{config_export}' not in scrubbed):
         raise ValueError('Legacy Serve HA config payload was not removed.')
     return scrubbed
+
+
+def bind_ha_recovery_config_snapshot_receipt(script: str, *, config_path: str,
+                                             config_bytes: bytes) -> str:
+    """Bind one HA launch to its exact restored controller config bytes.
+
+    Recovery scripts outlive API/controller pods.  Scripts retained before
+    guarded child snapshots were introduced have no receipt exports, while a
+    script retained for an older version can carry receipts for different
+    bytes.  PostgreSQL recovery already selects and restores the exact elected
+    version before launch; issue its invocation-local receipt at that boundary
+    instead of trusting either form of retained environment.
+    """
+    config_export = (f'export {skypilot_config.ENV_VAR_SKYPILOT_CONFIG}='
+                     f'{shlex.quote(config_path)}')
+
+    def _find_config_marker(candidate_lines: list[str]) -> int | None:
+        for index, line in enumerate(candidate_lines[:-1]):
+            if (line == _VERSIONED_HA_CONFIG_MARKER and
+                    candidate_lines[index + 1] == config_export):
+                return index
+        return None
+
+    lines = script.splitlines()
+    marker_index = _find_config_marker(lines)
+    if marker_index is None:
+        raise ValueError('HA recovery script is not bound to the restored '
+                         'controller config path.')
+    launch_index = _find_ha_recovery_controller_launch_index(lines)
+    if marker_index >= launch_index:
+        raise ValueError('Versioned controller config binding must precede '
+                         'the SkyServe controller launch.')
+
+    receipt = skypilot_config.internal_config_snapshot_environment(
+        skypilot_config.INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE, config_path,
+        config_bytes)
+    receipt_prefixes = tuple(f'export {name}=' for name in receipt)
+    # Retained scripts can contain the receipt issued when the service was
+    # first created.  It is not authority for this recovery invocation, so
+    # remove the generated assignments and emit exactly one canonical set.
+    lines = [
+        line for index, line in enumerate(lines)
+        if index >= launch_index or not line.startswith(receipt_prefixes)
+    ]
+    marker_index = _find_config_marker(lines)
+    if marker_index is None:
+        raise ValueError('HA recovery script lost its restored controller '
+                         'config binding while replacing its receipt.')
+    launch_index = _find_ha_recovery_controller_launch_index(lines)
+    if marker_index >= launch_index:
+        raise ValueError('Versioned controller config binding must precede '
+                         'the SkyServe controller launch.')
+    receipt_exports = [
+        f'export {name}={shlex.quote(value)}'
+        for name, value in receipt.items()
+    ]
+    lines[launch_index:launch_index] = receipt_exports
+    return '\n'.join(lines).rstrip() + '\n'
 
 
 def bind_ha_recovery_owner_fence(
@@ -367,12 +478,7 @@ def bind_ha_recovery_owner_fence(
     lines = script.splitlines()
     if any(line.startswith(export_prefix) for line in lines):
         raise ValueError('HA recovery script already contains an owner fence.')
-    launch_index = next(
-        (index for index, line in enumerate(lines) if 'python' in line and
-         'sky.serve.service' in '\n'.join(lines[index:index + 6])), None)
-    if launch_index is None:
-        raise ValueError('Cannot locate the SkyServe controller launch in the '
-                         'HA recovery script.')
+    launch_index = _find_ha_recovery_controller_launch_index(lines)
     encoded = json.dumps(payload, separators=(',', ':'), sort_keys=True)
     lines.insert(launch_index, export_prefix + shlex.quote(encoded))
     return '\n'.join(lines).rstrip() + '\n'
@@ -1230,7 +1336,7 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                         recovery_version,
                         recovery_snapshot.get('resource_scope'),
                         snapshot_id=config_snapshot[2]))
-                    restore_controller_config_snapshot(
+                    restored_config_bytes = restore_controller_config_snapshot(
                         config_snapshot,
                         live_config_path,
                         staged_config_path,
@@ -1240,6 +1346,10 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                     # version is already restored above.
                     script = strip_legacy_ha_recovery_config_payload(
                         script, live_config_path)
+                    script = bind_ha_recovery_config_snapshot_receipt(
+                        script,
+                        config_path=live_config_path,
+                        config_bytes=restored_config_bytes)
                 except Exception as e:  # pylint: disable=broad-except
                     if live_config_path is not None:
                         try:

@@ -1,9 +1,12 @@
 # pylint: disable=missing-module-docstring,protected-access,import-outside-toplevel,missing-class-docstring,unused-argument,redefined-outer-name,reimported,confusing-with-statement
 import contextlib
+import contextvars
 import hashlib
 import os
 import pathlib
 import shlex
+import subprocess
+import sys
 import tempfile
 import threading
 import types
@@ -19,6 +22,7 @@ from sqlalchemy import orm
 from sky import clouds
 from sky import exceptions
 from sky import global_user_state
+from sky import skypilot_config
 from sky.resources import Resources
 from sky.serve import constants
 from sky.serve import controller_transport
@@ -31,6 +35,7 @@ from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import requests as api_requests
+from sky.skylet import constants as skylet_constants
 
 # String path for mock.patch — can't use the constant directly because
 # mock.patch needs the dotted path to the attribute being patched.
@@ -430,6 +435,138 @@ def test_version_controller_config_allows_implicit_default_workspace():
     assert parsed.get_nested(('active_workspace',), None) == 'default'
 
 
+@pytest.mark.parametrize('launch', [
+    'python \\\n -u -m sky.serve.service --service-name svc',
+    '/usr/bin/python3.11 -u -m sky.serve.service --service-name svc',
+    (f'{skylet_constants.SKY_PYTHON_CMD} \\\n'
+     ' -u -m sky.serve.service \\\n --service-name svc'),
+])
+def test_ha_recovery_controller_launch_locator_accepts_generated_grammar(
+        launch):
+    lines = ['# unrelated setup', *launch.splitlines()]
+
+    launch_index = (
+        serve_utils._find_ha_recovery_controller_launch_index(lines))
+
+    assert launch_index == 1
+
+
+def test_ha_recovery_controller_launch_locator_fails_closed_on_duplicates():
+    lines = [
+        'python -u -m sky.serve.service --service-name first',
+        '/usr/bin/python3 -m sky.serve.service --service-name second',
+    ]
+
+    with pytest.raises(ValueError, match='exactly one generated'):
+        serve_utils._find_ha_recovery_controller_launch_index(lines)
+
+
+@pytest.mark.parametrize('invalid_launch', [
+    'python -c "print(1)" -m sky.serve.service',
+    'python -u -m sky.serve.service \\',
+    ('python -m sky.serve.service ; '
+     'python -m sky.serve.service'),
+])
+def test_ha_recovery_controller_launch_locator_rejects_nonlaunch_grammar(
+        invalid_launch):
+    with pytest.raises(ValueError, match='exactly one generated'):
+        serve_utils._find_ha_recovery_controller_launch_index(
+            invalid_launch.splitlines())
+
+
+@pytest.mark.parametrize('retained_receipt', ['missing', 'stale'])
+def test_ha_recovery_config_snapshot_receipt_is_jit_bound(retained_receipt):
+    config_path = '/tmp/python-config.yaml'
+    config_bytes = b'active_workspace: research\n'
+    script = serve_utils.strip_legacy_ha_recovery_config_payload(
+        '# misleading python -m sky.serve.service comment\n'
+        "export NOTE='misleading python -m sky.serve.service export'\n"
+        'python \\\n -u -m sky.serve.service --service-name svc\n', config_path)
+    if retained_receipt == 'stale':
+        stale_receipt = (skypilot_config.internal_config_snapshot_environment(
+            skypilot_config.INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE,
+            '/tmp/old.yaml', b'active_workspace: stale\n'))
+        script = '\n'.join(
+            f'export {name}={shlex.quote(value)}'
+            for name, value in stale_receipt.items()) + '\n' + script
+
+    bound = serve_utils.bind_ha_recovery_config_snapshot_receipt(
+        script, config_path=config_path, config_bytes=config_bytes)
+    bound = serve_utils.bind_ha_recovery_owner_fence(
+        bound,
+        service_hash='incarnation-a',
+        lifecycle_epoch=8,
+        controller_pid=None,
+        controller_ip=None,
+        status=serve_state.ServiceStatus.CONTROLLER_FAILED,
+        recovery_version=7)
+
+    expected = skypilot_config.internal_config_snapshot_environment(
+        skypilot_config.INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE, config_path,
+        config_bytes)
+    lines = bound.splitlines()
+    launch_index = lines.index('python \\')
+    marker_index = lines.index(serve_utils._VERSIONED_HA_CONFIG_MARKER)
+    assert lines[marker_index + 1] == (f'export SKYPILOT_CONFIG={config_path}')
+    expected_exports = [
+        f'export {name}={shlex.quote(value)}'
+        for name, value in expected.items()
+    ]
+    owner_prefix = f'export {constants.HA_RECOVERY_OWNER_FENCE_ENV_VAR}='
+    assert lines[launch_index - 1].startswith(owner_prefix)
+    assert lines[launch_index - len(expected_exports) - 1:launch_index -
+                 1] == expected_exports
+    assert all(
+        sum(line.startswith(f'export {name}=')
+            for line in lines) == 1
+        for name in expected)
+    assert lines[0].startswith('# misleading python')
+    assert lines[1].startswith('export NOTE=')
+
+
+def test_bound_ha_recovery_script_admits_fresh_guarded_child(tmp_path):
+    config_path = tmp_path / 'python-config.yaml'
+    config_bytes = b'active_workspace: default\n'
+    config_path.write_bytes(config_bytes)
+    child_code = (
+        'from sky import skypilot_config as config; '
+        'assert config._guarded_ha_scoped_child_snapshot() == "serve"; '
+        'assert config.get_active_workspace() == "default"; '
+        'print("guarded-child-import-ok")')
+    python_wrapper = tmp_path / 'python'
+    python_wrapper.write_text(
+        '#!/bin/sh\n'
+        f'exec {shlex.quote(sys.executable)} -c '
+        f'{shlex.quote(child_code)}\n',
+        encoding='utf-8')
+    python_wrapper.chmod(0o700)
+    script = (f'export {skylet_constants.ENV_VAR_IS_SKYPILOT_SERVER}=1\n'
+              f'export {skypilot_config.ENV_VAR_SERVER_CONFIG_MODE}='
+              f'{skypilot_config.SERVER_CONFIG_MODE_POSTGRES}\n'
+              f'export {skylet_constants.IS_SKYPILOT_SERVE_CONTROLLER}=true\n'
+              '# misleading python -m sky.serve.service comment\n'
+              "export NOTE='misleading python -m sky.serve.service export'\n"
+              f'{shlex.quote(str(python_wrapper))} -u '
+              '-m sky.serve.service --service-name harmless-test\n')
+    script = serve_utils.strip_legacy_ha_recovery_config_payload(
+        script, str(config_path))
+    script = serve_utils.bind_ha_recovery_config_snapshot_receipt(
+        script, config_path=str(config_path), config_bytes=config_bytes)
+
+    child_env = dict(os.environ)
+    child_env['PYTHONPATH'] = os.getcwd()
+    completed = subprocess.run(['/bin/bash', '-c', script],
+                               cwd=os.getcwd(),
+                               env=child_env,
+                               check=False,
+                               capture_output=True,
+                               text=True,
+                               timeout=30)
+
+    assert completed.returncode == 0, completed.stderr
+    assert 'guarded-child-import-ok' in completed.stdout
+
+
 def test_ha_recovery_owner_fence_is_inserted_immediately_before_launch():
     script = ('export EXISTING=value\n'
               'python \\\n'
@@ -560,7 +697,7 @@ def test_recovery_scrubs_raw_live_configs_but_preserves_stages(
 
 def test_full_pod_ha_restores_versioned_db_config_before_runner(tmp_path):
     service_dir = tmp_path / 'service-dir'
-    live_path = tmp_path / 'config.yaml'
+    live_path = tmp_path / 'python-config.yaml'
     staged_path = tmp_path / 'config.yaml.v7.staged'
     live_path.write_text('active_workspace: stale\n', encoding='utf-8')
     durable = (b'active_workspace: research\n'
@@ -568,9 +705,19 @@ def test_full_pod_ha_restores_versioned_db_config_before_runner(tmp_path):
                b'kubernetes: {allowed_contexts: [east, phx]}\n')
     durable_digest = hashlib.sha256(durable).hexdigest()
     recovery_script = serve_utils.strip_legacy_ha_recovery_config_payload(
+        '# misleading python -m sky.serve.service comment\n'
+        "export NOTE='misleading python -m sky.serve.service export'\n"
         'export SKYPILOT_CONFIG=/old/config.yaml\n'
         '/usr/bin/python -u -m sky.serve.service --service-name svc\n',
         '/old/config.yaml')
+    receipt_names = (
+        skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_KIND,
+        skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_PATH,
+        skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_DIGEST,
+        skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_IDENTITY,
+    )
+    assert all(
+        f'export {name}=' not in recovery_script for name in receipt_names)
     record = {
         'name': 'svc',
         'hash': 'incarnation-a',
@@ -592,13 +739,64 @@ def test_full_pod_ha_restores_versioned_db_config_before_runner(tmp_path):
         'ha_recovery_script': recovery_script,
     }
     runner = mock.Mock()
+    child_reached_guarded_config = False
 
     def _run(script, require_outputs):
+        nonlocal child_reached_guarded_config
         assert require_outputs is True
         assert live_path.read_bytes() == durable
         assert live_path.stat().st_mode & 0o777 == 0o600
         assert f'export SKYPILOT_CONFIG={live_path}' in script
         assert 'base64 -d' not in script
+        lines = script.splitlines()
+        launch_index = lines.index(
+            '/usr/bin/python -u -m sky.serve.service --service-name svc')
+        marker_index = lines.index(serve_utils._VERSIONED_HA_CONFIG_MARKER)
+        assert lines[marker_index +
+                     1] == (f'export SKYPILOT_CONFIG={live_path}')
+        launch_environment = {}
+        for line in lines[:launch_index]:
+            if not line.startswith('export '):
+                continue
+            tokens = shlex.split(line)
+            if len(tokens) != 2 or '=' not in tokens[1]:
+                continue
+            name, value = tokens[1].split('=', 1)
+            launch_environment[name] = value
+        expected_receipt = (
+            skypilot_config.internal_config_snapshot_environment(
+                skypilot_config.INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE,
+                str(live_path), durable))
+        assert all(launch_environment[name] == value
+                   for name, value in expected_receipt.items())
+        assert all(
+            sum(line.startswith(f'export {name}=')
+                for line in lines) == 1
+            for name in receipt_names)
+        assert lines[launch_index - 1].startswith(
+            f'export {constants.HA_RECOVERY_OWNER_FENCE_ENV_VAR}=')
+
+        # This is the import-time boundary that kept a recovered
+        # SHUTTING_DOWN controller from reaching its existing teardown/ACK
+        # path.  Validate both receipt scope and the restored bytes using the
+        # exact environment passed to the child.
+        guarded_environment = {
+            **launch_environment,
+            skypilot_config.ENV_VAR_SERVER_CONFIG_MODE:
+                skypilot_config.SERVER_CONFIG_MODE_POSTGRES,
+            skylet_constants.ENV_VAR_IS_SKYPILOT_SERVER: '1',
+            skylet_constants.IS_SKYPILOT_SERVE_CONTROLLER: 'true',
+        }
+        with mock.patch.dict(os.environ, guarded_environment, clear=True):
+            snapshot_kind = (
+                skypilot_config._guarded_ha_scoped_child_snapshot())
+            assert snapshot_kind == (
+                skypilot_config.INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE)
+            contextvars.Context().run(
+                skypilot_config._reload_config_from_guarded_child_snapshot,
+                launch_environment[skypilot_config.ENV_VAR_SKYPILOT_CONFIG],
+                snapshot_kind)
+        child_reached_guarded_config = True
         fence_prefix = (f'export {constants.HA_RECOVERY_OWNER_FENCE_ENV_VAR}=')
         fence_line = next(line for line in script.splitlines()
                           if line.startswith(fence_prefix))
@@ -656,6 +854,7 @@ def test_full_pod_ha_restores_versioned_db_config_before_runner(tmp_path):
         serve_utils.ha_recovery_for_consolidation_mode(pool=True)
 
     runner.run.assert_called_once()
+    assert child_reached_guarded_config
     authorize.assert_called_once_with('svc',
                                       expected_service_hash='incarnation-a')
     legacy.assert_not_called()

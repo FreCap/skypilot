@@ -4,113 +4,67 @@ Last updated: 2026-08-21
 
 Status: the atomic reserved-capacity allocator and PostgreSQL recovery
 boundary are deployed, but end-to-end 100% physical backfill is **not yet
-production-converged**. Production release `1.1.1421` still uses the
-launch-liveness-sensitive reclaim-provider proof path. Independent PostgreSQL
-proof renewal and the complete flat Kueue attestation are merged in SkyPilot
-PR #1650 but are not yet deployed. Platform PR #8822 is separately
-merged and deployed as platform revision 29: PHX retains the flat implicit
-`shared-pool`, has zero explicit Cohort objects and no new priority class, only
-the SkyPilot queues remain held, the exact audit role has the two read-only
-Kueue LIST permissions, and the PostgreSQL worker projection points to the
-existing `be-lt` WorkloadPriorityClass at value 11. That is platform deployment
-evidence, not SkyPilot activation or end-to-end convergence evidence; the held
-queues intentionally prevent activation while the source correction is being
-qualified. Historical-state cleanup, request
-telemetry, and the independent removal of EFS also remain active.
+production-converged**. SkyPilot PR #1650 is merged and deployed in release
+`1.1.1422`: independent PostgreSQL provider-proof renewal now attests the
+complete existing flat PHX Kueue contract. Together with deployed Platform PR
+#8822, PHX retains the implicit `shared-pool`, zero explicit Cohort objects,
+the existing `be-lt=11` WorkloadPriorityClass, and only the held SkyPilot
+queues. SkyPilot creates no Cohort, ClusterQueue, WorkloadPriorityClass, or
+second scheduler.
 
-A bounded failed-service teardown correction is source-qualified in the
-current SkyPilot change; production deployment and purge proof remain open. It
-lets normal service
-finalization and failed-service purge adjudicate only terminal, execution-
-quiesced protocol-v2 `RESERVED_FILL` ambiguity through the existing exact
-provider reconciliation graph. The live purge remains blocked at 56/111 while
-that source is absent from production; no manual replica/association deletion
-is authorized.
+SkyPilot PR #1651 is merged and deployed in release `1.1.1423` as Helm
+revision 489. Its bounded failed-service teardown advanced the normal
+`boltz-l4-fleet` purge through physical effect cleanup. Current readback shows
+zero service-owned provider Workloads or Pods in East and PHX, zero fleet
+external-load-balancer objects, and zero matching central SkyPilot cluster
+rows. The service remains `SHUTTING_DOWN`; these zero-effect facts are teardown
+evidence, not service recreation, activation, or end-to-end fill proof.
 
-At the 2026-08-21 10:45 UTC observation, `boltz-l4-fleet` version 64 was
-`READY` at 80/80:
-13 East A100, 37 East A100-80GB, and 30 PHX H200 replicas. Every READY row was
-reserved-fill, zero-cost Kubernetes capacity; no READY row was Spot or carried
-a paid-capacity claim, and the service had zero durable paid claims. Fresh
-protocol-v2 broker rounds reported `last_observed_free=0`, `feed=0`, and
-holdings of 13, 37, and 30 for the three exact-card pools. The revision-479
-controller rollout recovered the same service and endpoint from PostgreSQL.
-Earlier forced-controller and lost-ack tests had already qualified durable
-intent hydration and no-duplicate recovery. After PR #1638's narrow occupancy
-fence deployed, 100 samples spanning 79 demand generations remained
-fresh/complete with two reporters and zero unknown occupancy.
+The purge is now stopped at one deterministic PostgreSQL delete-order defect,
+not at provider reconciliation. Seventy-one replica rows remain: 66
+`FAILED_CLEANUP` and five `SHUTTING_DOWN`. Every row carries a
+reserved-fill intent scalar, has no ordinary association pointer, and has no
+central cluster record. The live non-deferrable foreign-key graph cascades a
+service delete into its intents while those replica rows still reference the
+intents with `ON DELETE RESTRICT`. `remove_service_completely()` currently
+deletes the service before the replicas, so the transaction must fail before
+its later replica delete. The current change deletes the locked replica rows
+first and the service second. Its exact live-shape PostgreSQL regressions are
+source-qualified, but the change is **not yet merged or deployed**. Manual row
+deletion remains unauthorized.
 
-The current PHX picture must be read as capacity plus durable lifecycle state,
-not as a count of immediately schedulable GPUs. All 66/66 PHX nodes are Ready,
-with 512 H200 GPUs allocatable and 496 requested, leaving 16 physically free.
-One 64-GPU research MA Workload still needs 48 GPUs. The service has 24
-PostgreSQL-backed PENDING replica rows, all linked by
-`reserved_fill_intent_idempotency_key` to committed intents: ten PHX launch
-requests are RUNNING with healthy executor heartbeats and backing Pending Kueue
-Pods (IDs in the 56320--56332 range), while fourteen requests (six PHX and
-eight East) are durably PENDING and unclaimed. None is phantom capacity and
-none may be manually deleted. The screenshot is therefore accurate about the
-raw physical gap, but it is not by itself proof that all 16 GPUs are currently
-admissible to inference.
+The independent `foldeverything-r10-z256-v2` teardown reached zero replica,
+cluster, claim, and intent rows but retained its service/version/route/recovery
+and load-balancer state. That run exposed a separate missing JIT recovery
+snapshot receipt. The current change reissues that receipt from the exact
+PostgreSQL-restored bytes, locates the generated controller command through one
+strict shell grammar, and passes a fresh-child guarded-import test. It is
+source-qualified and adversarially approved, but **not yet merged or
+deployed**. These are two distinct blockers: the intent foreign-key
+delete order blocks final deletion of `boltz-l4-fleet`, while the missing JIT
+receipt blocks finalization of the zero-replica test service.
 
-An earlier PHX observation exposed Kueue v0.19's
-unreclaimable-preemptor reservation: a priority-31 64-GPU MA gang had 504/512
-GPUs assigned. A temporary LocalQueue `Hold` experiment allowed fill admission
-but was unsafe because fill used WorkloadPriorityClass `be-ls` (12) and
-preempted a research `be-lt` (11) RayJob. The permanent correction does not
-redesign research scheduling. It preserves Simone's exact #8407/#8517 flat
-implicit `shared-pool`, all seven existing ClusterQueues, their nominal quotas,
-and their preemption policies. Fill uses the existing lowest Kueue tranche,
-WorkloadPriorityClass `be-lt` at 11; SkyPilot creates no Cohort,
-ClusterQueue, or WorkloadPriorityClass. Pod scheduling independently uses the
-server-owned
-`rescluster-k8s-prod-east1-preemptible-inference-low` PriorityClass at -1000
-with `preemptionPolicy: Never`. A Pod PriorityClass named `be-lt` may coexist;
-its presence is not part of the worker contract. Retained Workloads may still
-show `be-ls`/12 during transition; their existence is not provider-proof,
-capacity, or replica authority.
-
-In the prior launch-liveness incident, after the eight fill rows 56282--56289
-were atomically committed, only
-56287 reached `READY`. All seven siblings failed with
-`ReservedFillLaunchFenceError`: the installed policy could not prove the exact
-reclaim launch inventory within its five-second deadline. Failures appeared at
-the Kubernetes create/read-and-attest guard, post-provision runtime setup
-guard, materialized-effect guard, and materialized-authority checkpoint. The
-Serve054 rows, intents, requests, and associations were structurally valid;
-this was not a missing grant, demand-scale-down, Spot scarcity, or PostgreSQL
-admission failure. Direct PHX measurements placed one complete AWS plus
-Kubernetes proof at 2.54--3.32 seconds, with the oldest domain fact already
-1.75--2.39 seconds old when the call returned. A receipt accepted for only five
-seconds and requiring two seconds of terminal reserve consequently leaves
-roughly 0.6--1.25 seconds for competing launch handlers and repeated provider
-checkpoints. Provider proof work on the launch path is therefore the current
-SkyPilot liveness blocker.
-
-Release `1.1.1410` includes the complete committed-handoff correction through
-PR #1630, capability-rotation fencing from PR #1635, batch pruning of
-superseded terminal replicas from PR #1636, and stable occupancy across
-capacity-only route updates from PR #1638. The allocator's safety ordering is
-satisfied: compatible reserved capacity is committed first and paid residual
-remains zero when that reserved supply covers demand. The provider-proof
-liveness correction below is still required before the corresponding
-provider-launch and full-utilization claims are complete.
-
-The broader initiative is not complete. The retained version-64 inventory
-still contains 958 terminal failed rows and 1,013 rows whose reserved-fill
-intent identity exists only in retained JSON rather than the normalized scalar
-column. PR #1636 cannot prune current-version terminal history until a version
-transition or controlled service recreation supersedes it. PR #1637 merged the
-controller-independent request-count UI, but its mixed-version authorization
-repair remains undeployed. The fresh-service-lifecycle plus bounded-emptyDir
-replacement for EFS is an independent workstream; the existing PostgreSQL
-authority is retained and local uploaded bytes are outside that test profile.
-These do not reopen the PostgreSQL allocation contract. Both the independently
-renewed provider receipt and the separate Kueue admission contract must pass
-their production horizons before the
-end-to-end 100% physical-backfill claim.
+The broader initiative remains incomplete. The next deployed image must carry
+both successor fixes, both services must complete normal evidence-backed purge,
+and `boltz-l4-fleet` must then be recreated on canonical PostgreSQL authority
+without EFS as a correctness dependency. The held PHX queues must remain held
+through this teardown/recreation preflight. Fresh service birth, release of
+the queues, automatic reserved backfill, paid-residual suppression, request
+telemetry, restart takeover, and the immediate/+10/+30/full-horizon production
+proofs all remain open.
 
 ## Qualification history
+
+Helm revision 489 / release `1.1.1423` deployed merged PR #1651 at
+`e883af27b986aee2bb5ae715dec99f308298356a` on the complete control-plane
+writer cohort. It includes PR #1650's release-`1.1.1422` flat-PHX attester and
+independent receipt renewal. The subsequent normal `boltz-l4-fleet` purge
+proved all matching provider Pods/Workloads, external-load-balancer objects,
+and central cluster rows absent, then retained exactly 71 database replica
+rows at the deterministic intent foreign-key delete-order boundary described
+above. This qualifies the deployed bounded teardown through physical absence;
+it does not qualify final database deletion, recreation, no-EFS operation, or
+reserved-capacity convergence.
 
 Helm revision 475 / release `1.1.1404` ran image digest
 `sha256:8047b32d5703eb280b621c5f7f404daadb2bb98738327e32d0f44355cbfe603e`
@@ -340,68 +294,60 @@ The completed system has these invariants:
 Already implemented, merged, and deployed are the PostgreSQL-backed generic
 non-pool binding, atomic replica/association/request/queue/pin/intent admission,
 durable demand/route/actuation authorities, sequenced pool observations,
-paid-residual accounting, takeover fences, and the provider-proof
-single-flight receipt. PR #1610 owns atomic admission, #1611 the durable-owner
-execution boundary, #1612 passive preflight, and #1613 nonce-stable receipt
-renewal across launch waves. The current source change moves provider renewal
-out of those launch waves and expands the immutable PHX inventory proof to the
-complete implicit-cohort/seven-ClusterQueue topology; the existing receipt row
-remains the sole durable authority rather than introducing another table or
-allocator. That change is implemented but not yet merged, deployed, or
-production-proven. Production readback, not source state, establishes the live
-authority facts above.
+paid-residual accounting, takeover fences, and the provider-proof receipt.
+PR #1610 owns atomic admission, #1611 the durable-owner execution boundary,
+#1612 passive preflight, and #1613 nonce-stable receipt reuse. PR #1650 moved
+provider renewal out of launch waves and made the immutable PHX proof match the
+existing implicit-flat/seven-ClusterQueue topology; it is deployed in release
+`1.1.1422`. PR #1651 added the bounded normal teardown path and is deployed in
+release `1.1.1423` / Helm revision 489. The current change source-qualifies the
+two defects exposed by production after that deployment--replica-before-service
+deletion and the JIT recovery snapshot receipt. They are not yet merged,
+deployed, or production-proven. Production readback, not source state,
+establishes the live authority facts above.
 
 Remaining work, in exact order:
 
-1. Open and merge the source-qualified independent provider-proof renewal and
-   schema-6 full flat Kueue inventory attestation, already rebased onto current
-   `improvements`.
-   Separate the fast PostgreSQL launch-read deadline, the provider refresh
-   timeout, and the bounded receipt maximum age. The proactive refresh margin
-   must exceed refresh interval plus measured worst proof latency plus jitter.
-   A cold or restarted observer must withhold claims and grants until one fresh
-   receipt exists; it must not create a wave of terminal failed intents.
-2. Direct-Helm deploy the qualified immutable image with `--reuse-values`, then
-   prove lifecycle and revocation. A supervised controller replacement resumes
-   renewal from PostgreSQL without process-local authority. Gate or policy
-   rotation fences the old owner and terminally rejects its old reference.
-   Identical positive renewal retains the nonce; changed positive evidence
-   rotates it; a successfully observed nonconformance invalidates it
-   immediately; an indeterminate refresh leaves the prior fact usable only
-   until its bounded expiry.
-3. Complete and deploy the permanent PHX Kueue contract only after rendered
-   manifests and scheduler simulations prove research-over-fill reclaim,
-   no fill-over-research preemption, no lower-research-over-higher-research
-   preemption, and no head-of-line reservation of otherwise free capacity.
-4. Restart the controller child and prove the observer takes over, the current
-   claim/grant path remains fresh, and the service recovers exclusively from
-   PostgreSQL. If historical cleanup makes it preferable, normally stop and
-   recreate the service; do not manually delete replica rows.
-5. Preserve and converge the current 24 committed-intent replicas through the
-   normal recovery/launch graph: ten PHX RUNNING requests with backing Pending
-   Pods and fourteen durable unclaimed requests are valid work, not historical
-   phantoms. Renewal may wake reconciliation, but it must not synthesize Pod
-   authority, bypass request claiming, or delete any of these rows.
-6. Fill every currently schedulable compatible GPU and prove a fresh current
-   allocation is admitted from PostgreSQL before the load-balancer demand read,
-   both paid scale decisions, and the final retirement commit. Publish an
-   allocation successor, advance
-   the ordinary-admission high-water, and expire a pool round between planning
-   and commit; each must reject teardown and preserve routing.
-7. Prove automatic backfill across every compatible free pool and a typed paid
-   residual for every uncovered slot. The production performance gate is
-   80--90 H200 workloads submitted within a few minutes with concurrent
-   initialization and cross-pool independence. Also prove no new paid launch
-   when reserved supply covers demand, paid drain/termination, exact request UI
-   totals, and no phantom historical capacity immediately, at +10, at +30, and
-   through the full 180-second stale/quiescence horizon, including child and
-   Pod takeover.
-8. Verify dashboard processing, queued, in-flight, and completed request totals
-   remain fresh during the restart and provider-stall gates.
-9. Merge the stacked cleanup that deletes the volatile legacy fill-shelter
-   bridge, compatibility decoders, and transition-only tests after the exact
-   horizon gates pass. No EFS/RWX addition or migration is part of this plan:
-   PostgreSQL is the sole correctness and request-observation store.
+1. Merge the source-qualified replica-before-service delete-order correction.
+   Its PostgreSQL tests reproduce the live non-deferrable intent foreign-key
+   graph and prove settled replicas are removed before service deletion
+   cascades into their intents, while an unsettled graph remains intact. It
+   weakens neither foreign key and adds no manual purge path.
+2. Merge the source-qualified JIT recovery snapshot-receipt correction exposed
+   by `foldeverything-r10-z256-v2`. Its strict command grammar and fresh-child
+   test prove exact restored bytes reach guarded startup without accepting a
+   misleading or duplicate launch command.
+3. Direct-Helm deploy both successor fixes in one immutable image with
+   `--reuse-values`. Keep the SkyPilot PHX queues held. Read back one uniform
+   API/controller/executor digest and preserve the already-qualified flat Kueue
+   topology; do not add a Cohort, priority class, scheduler, EFS authority,
+   Terraform/Terragrunt change, or platform runtime pin.
+4. Retry normal teardown for `boltz-l4-fleet` and
+   `foldeverything-r10-z256-v2`. Require zero retained service, version,
+   replica, association, intent, request-retention, recovery, route,
+   load-balancer, central-cluster, and provider-effect state. Do not manually
+   delete rows or reinterpret an absent cluster record as execution quiescence.
+5. Complete the no-EFS control-plane configuration and recreate
+   `boltz-l4-fleet` through the normal service API. Prove canonical birth on
+   PostgreSQL authority with `min_replicas: 0`, zero fill floor, immutable
+   server-owned projections, no task-owned Kubernetes overrides, and no
+   committed legacy/direct interval.
+6. Release only the SkyPilot queues after preflight passes, activate the single
+   durable-intent path, and prove automatic backfill across every compatible
+   free pool. The performance gate remains 80--90 H200 workloads submitted
+   within a few minutes with concurrent initialization and cross-pool
+   independence.
+7. Prove each fresh reserved grant is committed before paid residual is
+   calculated. No new paid/Spot launch may occur while compatible reserved
+   capacity covers demand; uncovered demand must receive one typed paid
+   residual and existing paid capacity must drain and terminate normally.
+8. Verify dashboard processing, queued, in-flight, rejected, completed, and
+   freshness fields remain available during controller restart and provider
+   stalls. Prove controller and Pod takeover recover solely from PostgreSQL.
+9. Repeat capacity, paid-spill, historical-state, telemetry, and takeover
+   checks immediately, at +10, at +30, and through the full stale/quiescence
+   horizon. Only then merge stacked deletion-only cleanup for compatibility
+   decoders and transition artifacts.
 
 Historical recovery record: PR #1614 reconstructed the exact frozen
 committed-intent profile for nine provider-present associations, and draft
@@ -415,7 +361,7 @@ required; and no `boltz-platform` SkyPilot runtime pin is added. Deployment is
 fix-forward through the SkyPilot Helm release, while #8652 is used only for the
 service configuration update it owns.
 
-Completion means the code and both PRs are merged, the exact images are live,
+Completion means both successor fixes are merged, the exact image is live,
 the final authorities are durably active, `boltz-l4-fleet` automatically
 materializes 100% of fresh compatible free capacity, paid residual and drain
 behavior are correct, dashboard request totals are fresh and non-null, restart
@@ -426,13 +372,13 @@ four are true.
 
 ### Controller-independent dashboard read boundary
 
-Status: PR #1637 is merged at `75debe4e3`, but is not deployed or
-production-proven. Post-merge mixed-version review found that its shared public
-and durable payload names could let a new controller discard the owner scope
-from an old API-server row. Deployment is gated on the surgical fix-forward:
-scope-less public wire bodies, retained legacy durable bodies with a required
-nullable owner, and distinct authorized handler identities that fence older
-workers.
+Status: PR #1637 is merged at `75debe4e3`, and its mixed-version scope repair
+PR #1641 is merged at `77b653d42`; both are present in the deployed
+release-`1.1.1423` source. End-to-end production proof remains open: the clean
+recreated service must show fresh, non-null request activity through controller
+restart and provider-stall horizons. The deployed contract uses scope-less
+public wire bodies, retained legacy durable bodies with a required nullable
+owner, and distinct authorized handler identities that fence older workers.
 
 The services list and one-service detail identity load from the existing
 PostgreSQL-backed `GET /serve/replica-summaries` projection. Persisted replica,
@@ -597,9 +543,10 @@ stored an equivalent version 64 after API acceptance but failed before
 election. Its initial post-merge combined run `32281262288` validated and
 dry-ran successfully, then failed closed in the separate test target because
 `boltz-l4-fleet-test` did not exist; that historical run made no production
-service change. The workflow subsequently completed: revision 472 now runs the
-uniform successor cohort and version 64 is elected and admitting provider-free
-capacity as recorded at the top of this design. The existing prod-only
+service change. The workflow subsequently completed: revision 472 ran the
+uniform successor cohort and elected version 64, which later admitted
+provider-free capacity before the teardown recorded at the top of this design.
+The existing prod-only
 `ml-model-deploy.yml` dispatch with `models=boltz-2`,
 `mode=prod`, and `provider=skypilot` targets only `boltz-l4-fleet` and remains
 the canonical application path. Version 64 has the same three worker
@@ -1450,13 +1397,18 @@ Failed-purge owner rotation propagates the newly claimed authority and reloads
 the persisted marker before cleanup.
 
 This correction changes no schema, migration, provider, Kueue, Helm,
-Terraform/Terragrunt, EFS, KubeRay, or platform-pin contract. It is locally
-source-qualified, not deployed or production-proven. Deployment qualification
-requires one direct Helm fix-forward followed by retrying the live purge and
-proving: every retained exact row reaches projected `ABSENT` or remains typed
-`UNKNOWN`/`REPLACED`; pins and pool/card debits release only after projection;
-no ambiguous request uses generic cancel or generic down; the service can be
-deleted and recreated through its normal lifecycle; and those properties hold
+Terraform/Terragrunt, EFS, KubeRay, or platform-pin contract. It merged as PR
+#1651 and is deployed in release `1.1.1423` / Helm revision 489. Production
+proved that it removed all matching `boltz-l4-fleet` provider Workloads/Pods,
+external-load-balancer objects, and central cluster rows. Final PostgreSQL
+deletion then exposed a narrower deterministic ordering defect: 71 replica
+rows still reference zero-cost intents when service deletion cascades into
+those intents. The current change source-qualifies the successor
+replica-before-service delete-order fix; it is not yet merged or deployed.
+After that fix-forward, qualification
+must prove: all 71 rows and the service graph delete through normal lifecycle;
+pins and pool/card debits release only after exact evidence; no ambiguous
+request uses generic cancel or generic down; and the zero census holds
 immediately, at +10 and +30 minutes, and through the complete stale-authority,
 execution-quiescence, and provider-reprobe horizon.
 
@@ -1476,12 +1428,12 @@ Serve056 head because its compiled additive-revision set ended at Serve055.
 Revision 475 / release `1.1.1404`, immutable digest
 `sha256:8047b32d5703eb280b621c5f7f404daadb2bb98738327e32d0f44355cbfe603e`,
 deployed PR #1632's one-line application-authority correction and restored
-service-controller adoption. It does not contain #1630's fresh provider proof,
-scalar-`NULL` cleanup, or cohort-rotation contracts. `boltz-l4-fleet` is already
-`DURABLE_INTENT` epoch 1 on generic capability cohort 1. Schema 056 is
-forward-only, so the prescribed response remains an urgent direct-Helm
-fix-forward to the immutable #1630 successor, not a schema/application
-rollback. No manual state rewrite is authorized on either precursor revision.
+service-controller adoption. It did not contain #1630's fresh provider proof,
+scalar-`NULL` cleanup, or cohort-rotation contracts. That precursor was later
+superseded: corrective PR #1630 merged and deployed in release `1.1.1410`, and
+Helm revision 489 inherits its committed-handoff contract. Schema 056 remains
+forward-only; no schema/application rollback or manual state rewrite is
+authorized.
 
 Serve056 closes the remaining mutable-authority gap between atomic admission
 and the first provider effect. It adds one nullable, initial-insert-only scalar
@@ -4109,16 +4061,16 @@ either case.
 | 2a.2 | Isolated audit-role Kubernetes authentication and exact east identity-free inventory | Merged and deployed through revision 429 / release 1.1.1336. East passes. PHX now explicitly enables `AssignQueueLabelsForPods=true`; a clean current platform plan is empty. The successful full two-context preflight remains gated by 2a.4. |
 | 2a.3 | Global activation scope with per-service duplicate-pool validation | Revision 431 preflight exposed that the deployment policy incorrectly treated two services sharing one broker pool/card as a duplicate claim. The fix groups activation claims by service, retains same-service duplicate rejection, and permits the documented cross-service sharing before one fleet-wide provider attestation. |
 | 2a.4 | Remove redundant admission-policy authority from reserved fill | Platform PR #8649 is superseded and must not change the shared KubeRay/HPTO policy for fleet activation. Policy-bundle schema v5 removes ValidatingAdmissionPolicy and binding reads while retaining the stronger exact Kueue controller/webhook and synchronous/fresh Pod lifecycle proof. Activation requires only the SkyPilot fix-forward deployment and a fresh full-fleet preflight; no Terraform or platform Helm change is part of this gate. |
-| 2a.5 | Preserve Simone's flat PHX Kueue contract and attest its complete inventory | Platform PR #8822 is merged and deployed as platform revision 29: zero explicit Cohort objects, no new priority class, existing `be-lt=11`, list-only audit access, PostgreSQL projection updated to `be-lt`, and only SkyPilot queues held. The matching SkyPilot schema-v6 correction is merged in PR #1650 but not deployed. This phase is not activated or production-proven. |
+| 2a.5 | Preserve Simone's flat PHX Kueue contract and attest its complete inventory | Platform PR #8822 is merged and deployed as platform revision 29: zero explicit Cohort objects, no new priority class, existing `be-lt=11`, list-only audit access, PostgreSQL projection updated to `be-lt`, and only SkyPilot queues held. The matching SkyPilot schema-v6 correction is merged in PR #1650 and deployed in release `1.1.1422`. This phase is source-complete and deployed, but final activation/backfill proof remains open. |
 | 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 63 is committed, elected, and controller-applied at lifecycle epoch 82 on known-good image `v3.682.2-boltz-2`; it is the clean demand-gated activation successor. Version 62 remains rejected historical projection evidence. |
 | 2b.1 | UID-bound base-runtime readiness for canonical projected Kubernetes workers | Merged in PR #1618 at `6ad2407d813d04aed79de2fea62723987ee56670` and present in the revision-472 image. The focused render, source-composition, template-owned bootstrap-digest, typed Kubernetes-model, mutation, bounded-wait, UID-replacement, SSH-listener-failure, and final fresh-read tests pass, but the exact live runtime-readiness path is not yet production-exercised or proven. Generic Kubernetes and projection v1/v2/v3 remain unchanged. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. Historical cleanup #1506 is closed/superseded and reserves no head. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
 | 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed dark in revision 431 / release 1.1.1338: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Activation remains gated by 2a.3, 2a.4, and a successful full-fleet re-attestation. |
 | 2f | Promoted capacity-authority controller takeover | The fix-forward implementation is merged in PR #1562: the existing owner-transfer transaction preserves both one-way epochs, rebinds demand and zero-cost capability together, invalidates pre-row predecessor intents, and leaves route/report admission cold until fresh replacement evidence. No schema, chart, provider, or platform change is required. Deployment and child/Pod takeover qualification remain activation prerequisites. |
-| 2g | Production full reserved backfill | **Active and incomplete.** Platform PR #8652 is merged and version 64 is elected. Helm revision 475 / release `1.1.1404` restored controller adoption after revision 474 installed Serve056 without recognizing that additive head. The service is already `DURABLE_INTENT` epoch 1 on cohort 1 and retains zero paid/Spot replica rows. Completion is blocked on the urgent corrective #1630 fix-forward, cohort-2 rotation, exact free-capacity reconciliation, cold-restart/successor/no-paid proofs, and the full production horizon. |
+| 2g | Production full reserved backfill | **Active and incomplete.** Platform PR #8652 is merged. The former version-64 service is now `SHUTTING_DOWN` under Helm revision 489 / release `1.1.1423`; its provider Workloads/Pods, load-balancer objects, and central cluster rows are zero, while 71 database replica rows remain at the deterministic intent foreign-key delete-order blocker. Final deletion, canonical no-EFS recreation, activation, exact free-capacity reconciliation, cold-restart/no-paid/telemetry proofs, and the full production horizon remain open. |
 | 2h | Atomic reserved-fill replica/request admission | Merged in PR #1626 and deployed on Helm revision 473 / release `1.1.1401`. One atomic-admission module owns the root PostgreSQL transaction and savepoint; the manager only prepares immutable server-local input before it and starts the returned request reducer after commit. Serve055 adds the owner audit tuple, user FK, and retained-row one-shot transition. The deployed pending-first/global-pending/cleanup-unproven accounting correctly avoided duplicate replacement capacity. The remaining postcommit mutable-authority rejection is owned by phase 2i, not by another admission path or infrastructure change. |
-| 2i | Serve056 committed reserved-fill provider handoff and cohort rotation | PR #1629 merged at `1642ca2e3` with the scalar schema but without the final fresh-proof, scalar-`NULL` cleanup, or cohort-rotation contracts. Automation deployed it as revision 474 / `1.1.1403`; application authority then rejected the new head until PR #1632 restored adoption in revision 475 / `1.1.1404`. Corrective PR #1630 is rebased on that precursor, adds the missing contracts, and removes the superseded mutable authority path. It deliberately does not edit the already-applied Serve056 trigger for a status-update optimization: the installed trigger is correctness-safe, and changing an applied migration would not alter production. Draft cleanup PR #1633 replaces automatically closed draft #1631 and removes only the scalar-`NULL` bridge after its exact production gate. Required gates are real-PostgreSQL tests, adversarial approval, complete CI, merge, direct Helm fix-forward, schema/cohort readback, and the full production horizon. No EFS, KubeRay, Terraform/Terragrunt, platform runtime pin, or alternate provider path is added. |
+| 2i | Serve056 committed reserved-fill provider handoff and cohort rotation | PR #1629 merged at `1642ca2e3` as the scalar-schema precursor; PR #1632 restored adoption and corrective PR #1630 supplied the complete committed-handoff contract. That source is deployed through release `1.1.1410` and inherited by revision 489. Draft cleanup PR #1633 remains gated on the final zero-legacy census and production horizon. No EFS, KubeRay, Terraform/Terragrunt, platform runtime pin, or alternate provider path is added. |
 | 3a | Stacked Serve055 owner-transition cleanup after the production horizon | The required `fix/serve-atomic-fill-admission-cleanup` branch adds Serve057 `NOT NULL` owner columns and removes only the application one-shot `NULL` attestation branch, the schema-derived temporary global user-deletion guard, and transition-only observability/tests. It retains or atomically simplifies the permanent database owner-immutability trigger. Its draft PR must be cross-linked and remains blocked on a complete capable cohort, zero `NULL` tuples, no old writers, backups, and the complete stale/HA production horizon. |
 | 3b | Stacked Serve056 scalar-`NULL` cleanup bridge removal | Draft PR #1633 is stacked on and cross-linked from #1630, replacing automatically closed draft #1631. It removes only the cleanup-only JSON resolver and its transition tests after zero scalar-`NULL` protocol-v2 replicas, zero unsettled scalar-`NULL` provider-effect associations, and zero scalar-`NULL` cleanup-unproven markers persist through the complete stale/quiescence/provider-reprobe horizon. It cannot merge earlier. Closed PRs #1506/#1510 are not revived. |
 
@@ -5457,10 +5409,9 @@ legacy activation.
 
 ## Open gates
 
-- [ ] Merge and direct-Helm deploy the single pre-demand PostgreSQL fill
-  admission. Reproduce route/report unavailability with positive authenticated
-  feed, prove exact intent convergence with no second admission site, and pass
-  the no-paid/no-provider/no-retirement immediate/+10/+30/full-horizon gates.
+- [x] Merge and direct-Helm deploy the single pre-demand PostgreSQL fill
+  admission. Its final end-to-end no-paid/no-provider/no-retirement horizon is
+  tracked by the clean-service convergence gate below.
 
 - [x] Deploy Serve053 recognition and empty durable-intent recovery as exact
   Helm release `1.1.1377`; prove the controller advances route generations and
@@ -5468,11 +5419,12 @@ legacy activation.
 - [x] Merge and source-qualify PR #1604's Serve054 PostgreSQL provider-proof
   receipt at `5d473147dfbaecead6b1501f923f47abf58adfe5`; three fresh exact-head
   CI passes prove the deterministic owner/parked-loser contract.
-- [ ] Deploy PR #1604's merged source by direct Helm fix-forward and complete
-  live readback plus cross-Pod production qualification. The shared five-second
-  operation/freshness horizon has no failure cache or fallback.
-- [ ] Merge, direct-Helm deploy, and production-qualify the successor renewable
-  receipt source. Source implementation uses the existing Serve054 table,
+- [x] Deploy PR #1604's merged source by direct Helm fix-forward. Its
+  launch-wave liveness limitation was superseded by the independently renewed
+  receipt in PR #1650.
+- [x] Merge and direct-Helm deploy the successor renewable receipt source in
+  PR #1650 / release `1.1.1422`. Source implementation uses the existing
+  Serve054 table,
   a supervised three-second observer, five-second provider refreshes,
   30-second database-clock freshness, and two-second consumer reads. A fresh
   cached read must not wake the poller; a publication observed during the call
@@ -5482,13 +5434,14 @@ legacy activation.
   controller-owned finite disposable lane with irreversible ambiguity
   fail-stop; renewal wakes must not advance the fixed-rate withdrawal horizon;
   and ResourceFlavor specs, node labels, and live Node selectors must match the
-  complete reviewed contract.
-- [ ] Merge and deploy the implemented atomic PostgreSQL
+  complete reviewed contract. Final clean-service production qualification
+  remains open.
+- [x] Merge and deploy the implemented atomic PostgreSQL
   replica/association/request receipt. Its feature change already removes
   protocol-v2 direct/non-atomic admission and rejects reserved fill at the HTTP
   surface; no system-identity or RWX/EFS correctness fallback remains.
-- [ ] Merge and direct-Helm deploy the canonical-v4 projected-worker
-  runtime-readiness fix-forward, then prove exact-UID Ready in east and PHX and
+- [x] Merge and direct-Helm deploy the canonical-v4 projected-worker
+  runtime-readiness fix-forward. Still prove exact-UID Ready in east and PHX and
   prove a failed base bootstrap never publishes provider success. This gate has
   no schema, EFS/RWX, KubeRay, Terraform, Terragrunt, or platform-pin change.
 - [x] Open cross-linked draft projection cleanup PR #1619. Keep it draft until
@@ -5500,14 +5453,16 @@ legacy activation.
   cohort, zero nullable owner tuples, no old writers, backups, and the full
   stale/HA production horizon, make service owner columns `NOT NULL` and remove
   the one-shot attestation transition.
-- [ ] Merge and direct-Helm deploy the reclaim-safe failed-service teardown
-  correction, then retry the live 56/111 purge under the lifecycle/name lock.
-  Prove `PRESENT` uses exact fenced down plus forced fresh `ABSENT`, a missing
-  cluster record uses exact reconciliation without generic down, direct
-  `ABSENT` projects and releases its pin/debit, and `UNKNOWN`, `REPLACED`,
-  protocol-v1, ordinary, and stale-authority cases remain quarantined. Verify
-  deletion/recreation and repeat the census immediately, at +10 and +30
-  minutes, and through the complete stale/quiescence/provider-reprobe horizon.
+- [x] Merge and direct-Helm deploy reclaim-safe failed-service teardown PR
+  #1651 in release `1.1.1423` / Helm revision 489. Production proved zero
+  matching provider Workloads/Pods, load-balancer objects, and central cluster
+  rows before exposing the final database delete-order blocker.
+- [ ] Merge and deploy the source-qualified replica-before-service intent-FK
+  correction and the independent JIT recovery snapshot-receipt correction.
+  Retry both
+  normal purges and require zero retained service graphs immediately, at +10
+  and +30 minutes, and through the complete stale/quiescence/provider-reprobe
+  horizon.
 - [ ] Prove a large grant assigns every compatible free GPU within the bounded
   convergence target, with zero paid spill and no new ambiguous capacity debit.
 
@@ -5554,13 +5509,14 @@ legacy activation.
   no new priority class, existing `be-lt=11`, list-only audit permissions, and
   a PostgreSQL projection naming `be-lt`; only the SkyPilot queues remain held.
   This is platform-shape evidence, not SkyPilot activation evidence.
-- [ ] Deploy the schema-v6 SkyPilot attester merged in PR #1650: retain schema-v5's
-  removal of admission-policy/binding reads, add the exact implicit-flat-cohort/
-  seven-ClusterQueue PHX topology, governed membership closure from two
-  complete cluster-wide LISTs, policy revision `1.1.1422`, and independent
-  renewable provider receipts, then obtain one fresh successful two-context
-  preflight. No runtime pin, KubeRay path, second scheduler, or EFS authority
-  is part of this gate.
+- [x] Deploy the schema-v6 SkyPilot attester merged in PR #1650 as release
+  `1.1.1422`: retain schema-v5's removal of admission-policy/binding reads, add
+  the exact implicit-flat-cohort/seven-ClusterQueue PHX topology, governed
+  membership closure from two complete cluster-wide LISTs, and independent
+  renewable provider receipts.
+- [ ] Obtain one fresh successful two-context preflight for the clean recreated
+  service. No runtime pin, KubeRay path, second scheduler, or EFS authority is
+  part of this gate.
 - [x] Commit and elect version 62 whose non-null immutable east and PHX worker
   projections exactly match the corrected server configuration. It proves the
   projection generator but is not an activation candidate because its
@@ -5644,19 +5600,17 @@ legacy activation.
 - [x] Merge Platform PR #8652 after CI and review. It is a service-spec change
   only: no Terraform/Terragrunt or platform runtime pin is part of this path.
 - [x] Apply #8652's production full-backfill service update from the clean
-  demand-gated activation version. Version 64 is elected with the known-good
-  model image and immutable worker projections; test remains demand-gated.
-  Full convergence and the no-paid/restart horizon remain separate open gates.
-- [ ] Finish corrective Serve056 PR #1630 and cross-linked draft cleanup PR
-  #1633: pass focused and real-PostgreSQL 055→056,
-  old-writer, scalar-`NULL` provider-present, both cohort crash-window, fresh
-  proof, and physical-retarget tests; obtain adversarial approval and complete
-  CI; and cross-link the draft scalar-`NULL` bridge-removal PR. Then merge and
-  deploy one immutable image by direct Helm fix-forward with `--reuse-values`.
-  Read back schema 056 and one uniform API/controller/executor digest, wait the
-  full 70-second cohort horizon, drain cohort-1 work through settlement-only
-  authority, and rotate the service binding epoch to cohort 2. Do not deploy
-  EFS, KubeRay, Terraform/Terragrunt, or a platform runtime pin.
+  demand-gated activation version. Version 64 was elected with the known-good
+  model image and immutable worker projections before the current normal
+  teardown. Clean recreation, full convergence, and the no-paid/restart
+  horizon remain separate open gates.
+- [x] Merge and deploy corrective Serve056 PR #1630's complete committed
+  provider handoff; release `1.1.1410` and every successor through revision 489
+  contain it.
+- [ ] Keep cross-linked draft cleanup PR #1633 blocked until the clean recreated
+  service passes the zero-scalar-`NULL`, stale/quiescence, no-paid, and provider
+  proof horizons. Do not deploy EFS, KubeRay, Terraform/Terragrunt, or a
+  platform runtime pin.
 - [ ] With zero authenticated demand, prove every fresh, authenticated,
   policy-compatible reclaimable zero-cost slot granted to this service is
   covered by a durable intent or a correctly attributed admitted,
