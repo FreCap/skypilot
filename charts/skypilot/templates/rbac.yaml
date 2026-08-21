@@ -7,6 +7,8 @@
 {{- end }}
 {{- if or .Values.rbac.create $bindExistingServiceAccount }}
 {{- $fullName := include "skypilot.fullname" . -}}
+{{- $haConfig := .Values.apiService.highAvailability | default (dict) -}}
+{{- $haEnabled := get $haConfig "enabled" | default false -}}
 {{- if .Values.rbac.create }}
 ---
 apiVersion: v1
@@ -92,7 +94,8 @@ roleRef:
   kind: Role
   name: {{ $fullName }}-api-role
   apiGroup: rbac.authorization.k8s.io
-{{- /* Workspace configuration is always synchronized with the ConfigMap in
+{{- if not $haEnabled }}
+{{- /* Workspace configuration is synchronized with the ConfigMap in
        the API release namespace, even when in-cluster workloads use another
        namespace. Keep this permission separate from namespaceRules so split-
        namespace installations cannot silently lose config synchronization. */}}
@@ -121,6 +124,7 @@ roleRef:
   kind: Role
   name: {{ $fullName }}-config-role
   apiGroup: rbac.authorization.k8s.io
+{{- end }}
 {{- /* External SkyServe LBs always stay beside the API pod. Keep their exact
        permissions in a dedicated Role even when workloads share the release
        namespace: unlike namespaceRules, this survives --reuse-values upgrades

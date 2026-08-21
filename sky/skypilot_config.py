@@ -52,11 +52,15 @@ from collections.abc import Callable
 from collections.abc import Iterator
 from collections.abc import Mapping
 import contextlib
+import contextvars
 import copy
+import dataclasses
+import hashlib
 import json
 import os
 import pathlib
 import re
+import secrets
 import tempfile
 import threading
 import typing
@@ -76,6 +80,7 @@ from sky.skylet import constants
 from sky.utils import common_utils
 from sky.utils import config_utils
 from sky.utils import context
+from sky.utils import controller_constants
 from sky.utils import schemas
 from sky.utils import ux_utils
 from sky.utils import yaml_utils
@@ -112,18 +117,42 @@ logger = sky_logging.init_logger(__name__)
 # is only used by jobs controller tasks to ensure recoveries of the same job
 # use the same config file.
 ENV_VAR_SKYPILOT_CONFIG = f'{constants.SKYPILOT_ENV_VAR_PREFIX}CONFIG'
+ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_KIND = (
+    f'{constants.SKYPILOT_ENV_VAR_PREFIX}SERVER_CONFIG_SNAPSHOT_KIND')
+ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_PATH = (
+    f'{constants.SKYPILOT_ENV_VAR_PREFIX}SERVER_CONFIG_SNAPSHOT_PATH')
+ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_DIGEST = (
+    f'{constants.SKYPILOT_ENV_VAR_PREFIX}SERVER_CONFIG_SNAPSHOT_DIGEST')
+ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_IDENTITY = (
+    f'{constants.SKYPILOT_ENV_VAR_PREFIX}SERVER_CONFIG_SNAPSHOT_IDENTITY')
 
 # Environment variables for setting non-default server and user
 # config files.
 ENV_VAR_GLOBAL_CONFIG = f'{constants.SKYPILOT_ENV_VAR_PREFIX}GLOBAL_CONFIG'
 # Environment variables for setting non-default project config files.
 ENV_VAR_PROJECT_CONFIG = f'{constants.SKYPILOT_ENV_VAR_PREFIX}PROJECT_CONFIG'
+# Server-owned selector for the guarded-HA configuration authority.  This is
+# intentionally not a generic user-facing backend switch: ``postgres`` is the
+# only supported value and is emitted by the guarded-HA Helm topology.
+ENV_VAR_SERVER_CONFIG_MODE = (
+    f'{constants.SKYPILOT_ENV_VAR_PREFIX}SERVER_CONFIG_MODE')
+SERVER_CONFIG_MODE_POSTGRES = 'postgres'
+INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE = 'serve'
+INTERNAL_CONFIG_SNAPSHOT_KIND_MANAGED_JOB = 'managed-job'
+_INTERNAL_CONFIG_SNAPSHOT_KINDS = frozenset({
+    INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE,
+    INTERNAL_CONFIG_SNAPSHOT_KIND_MANAGED_JOB,
+})
 
 # Path to the client config files.
 _GLOBAL_CONFIG_PATH = '~/.sky/config.yaml'
 _PROJECT_CONFIG_PATH = '.sky.yaml'
 
 API_SERVER_CONFIG_KEY = 'api_server_config'
+WORKSPACE_PERMISSION_GENERATION_KEY = 'workspace_permission_generation'
+
+_POSTGRES_SERVER_CONFIG_ADVISORY_LOCK_KEY = (
+    'skypilot.guarded_ha.central_config.v1')
 
 Base = declarative.declarative_base()
 
@@ -131,8 +160,40 @@ config_yaml_table = sqlalchemy.Table(
     'config_yaml',
     Base.metadata,
     sqlalchemy.Column('key', sqlalchemy.Text, primary_key=True),
-    sqlalchemy.Column('value', sqlalchemy.Text),
+    sqlalchemy.Column('value', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('revision', sqlalchemy.BigInteger, nullable=False),
+    sqlalchemy.Column('digest', sqlalchemy.String(64), nullable=False),
 )
+
+
+@dataclasses.dataclass(frozen=True)
+class ServerConfigIdentity:
+    """Exact optimistic-concurrency identity for one central config row."""
+
+    revision: int
+    digest: str
+
+
+@dataclasses.dataclass(frozen=True)
+class ServerConfigRecord:
+    """One validated central config generation and its durable identity."""
+
+    config: config_utils.Config
+    identity: ServerConfigIdentity
+    value: str
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkspacePermissionGeneration:
+    """Receipt fencing cached workspace-policy decisions."""
+
+    generation: int
+    config_identity: ServerConfigIdentity
+    row_identity: ServerConfigIdentity
+
+
+class StaleServerConfigError(RuntimeError):
+    """Raised when a guarded-HA writer presents an obsolete config CAS."""
 
 
 class ConfigContext:
@@ -141,13 +202,15 @@ class ConfigContext:
     def __init__(self,
                  config: config_utils.Config | None = None,
                  config_path: str | None = None,
-                 config_overridden: bool = False):
+                 config_overridden: bool = False,
+                 server_config_identity: ServerConfigIdentity | None = None):
         # A default of config_utils.Config() would be evaluated once at
         # function definition, silently sharing one mutable Config between
         # every context created without an explicit config.
         self.config = config if config is not None else config_utils.Config()
         self.config_path = config_path
         self.config_overridden = config_overridden
+        self.server_config_identity = server_config_identity
 
 
 # The global loaded config.
@@ -155,13 +218,36 @@ _active_workspace_context = threading.local()
 _global_config_context = ConfigContext()
 
 SKYPILOT_CONFIG_LOCK_PATH = '~/.sky/locks/.skypilot_config.lock'
+_CENTRAL_CONFIG_RELOAD_LOCK_PATH = (
+    '/var/run/skypilot/.central_config_reload.lock')
+
+
+def _postgres_server_config_is_authoritative() -> bool:
+    """Returns whether guarded HA requires PostgreSQL-only server config."""
+    mode = os.environ.get(ENV_VAR_SERVER_CONFIG_MODE)
+    if mode is None:
+        return False
+    if mode != SERVER_CONFIG_MODE_POSTGRES:
+        raise RuntimeError(f'{ENV_VAR_SERVER_CONFIG_MODE} must be exactly '
+                           f'{SERVER_CONFIG_MODE_POSTGRES!r} when set.')
+    return True
 
 
 def get_skypilot_config_lock_path() -> str:
     """Get the path for the SkyPilot config lock file."""
+    # This generic lock still fences the shared legacy Serve config snapshot
+    # promote/restore/scrub protocol.  It cannot become pod-local until that
+    # snapshot path is removed in D6.
     lock_path = os.path.expanduser(SKYPILOT_CONFIG_LOCK_PATH)
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     return lock_path
+
+
+def get_central_config_reload_lock_path() -> str:
+    """Return the pod-local lock for one process's central-config reload."""
+    os.makedirs(os.path.dirname(_CENTRAL_CONFIG_RELOAD_LOCK_PATH),
+                exist_ok=True)
+    return _CENTRAL_CONFIG_RELOAD_LOCK_PATH
 
 
 def _get_config_context() -> ConfigContext:
@@ -183,6 +269,7 @@ def _get_config_context() -> ConfigContext:
             config=copy.deepcopy(global_context.config),
             config_path=global_context.config_path,
             config_overridden=global_context.config_overridden,
+            server_config_identity=global_context.server_config_identity,
         )
     return ctx.config_context
 
@@ -231,10 +318,12 @@ def _set_config_overridden(config_overridden: bool) -> None:
     _get_config_context().config_overridden = config_overridden
 
 
-def _replace_config_context(config: config_utils.Config,
-                            config_path: str | list[str | None] | None,
-                            *,
-                            config_overridden: bool | None = None) -> None:
+def _replace_config_context(
+        config: config_utils.Config,
+        config_path: str | list[str | None] | None,
+        *,
+        config_overridden: bool | None = None,
+        server_config_identity: (ServerConfigIdentity | None) = None) -> None:
     """Publish a complete config generation to the applicable context.
 
     Config reloads can run either process-wide or inside an API request's
@@ -257,12 +346,22 @@ def _replace_config_context(config: config_utils.Config,
         config_overridden = current_config_context.config_overridden
     replacement = ConfigContext(config=config,
                                 config_path=serialized_path,
-                                config_overridden=config_overridden)
+                                config_overridden=config_overridden,
+                                server_config_identity=(server_config_identity))
 
     if current_sky_context is None:
         _global_config_context = replacement
     else:
         current_sky_context.config_context = replacement
+
+
+def get_loaded_server_config_identity() -> ServerConfigIdentity:
+    """Return the exact central-config generation loaded in this context."""
+    identity = _get_config_context().server_config_identity
+    if identity is None:
+        raise RuntimeError('No PostgreSQL server-config identity is loaded in '
+                           'this process context.')
+    return identity
 
 
 def get_user_config_path() -> str:
@@ -398,35 +497,208 @@ def _resolve_server_config_path() -> str | None:
 
 def get_server_config() -> config_utils.Config:
     """Returns the server config."""
+    if _postgres_server_config_is_authoritative():
+        db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
+        if db_url is None:
+            raise RuntimeError(
+                'Guarded HA PostgreSQL server-config authority requires '
+                f'{constants.ENV_VAR_DB_CONNECTION_URI}.')
+        return _overlay_db_config(config_utils.Config(), db_url)
     return _get_config_from_path(_resolve_server_config_path())
+
+
+def _config_value_digest(value: str) -> str:
+    return hashlib.sha256(value.encode('utf-8')).hexdigest()
+
+
+def internal_config_snapshot_digest(config_bytes: bytes) -> str:
+    """Return the immutable content identity for an internal child snapshot."""
+    return hashlib.sha256(config_bytes).hexdigest()
+
+
+def internal_config_snapshot_identity(kind: str, path: str, digest: str) -> str:
+    """Bind one server-issued child snapshot to kind, path, and bytes."""
+    if kind not in _INTERNAL_CONFIG_SNAPSHOT_KINDS:
+        raise ValueError(f'Unsupported internal config snapshot kind {kind!r}.')
+    if not path:
+        raise ValueError('Internal config snapshot path must be non-empty.')
+    if re.fullmatch(r'[0-9a-f]{64}', digest) is None:
+        raise ValueError('Invalid internal config snapshot digest.')
+    identity_bytes = b'\x00'.join(
+        (kind.encode('utf-8'), path.encode('utf-8'), digest.encode('ascii')))
+    return hashlib.sha256(identity_bytes).hexdigest()
+
+
+def internal_config_snapshot_environment(kind: str, path: str,
+                                         config_bytes: bytes) -> dict[str, str]:
+    """Build the exact environment receipt for a server-issued snapshot."""
+    digest = internal_config_snapshot_digest(config_bytes)
+    return {
+        ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_KIND: kind,
+        ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_PATH: path,
+        ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_DIGEST: digest,
+        ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_IDENTITY:
+            internal_config_snapshot_identity(kind, path, digest),
+    }
+
+
+def _validate_identity_fields(*, key: str, revision: Any,
+                              digest: Any) -> ServerConfigIdentity:
+    if (not isinstance(revision, int) or isinstance(revision, bool) or
+            revision < 1 or not isinstance(digest, str) or
+            re.fullmatch(r'[0-9a-f]{64}', digest) is None):
+        raise ValueError(f'Invalid PostgreSQL config row identity for {key!r}.')
+    return ServerConfigIdentity(revision=revision, digest=digest)
+
+
+def _validate_config_row_identity(*, key: str, value: Any, revision: Any,
+                                  digest: Any) -> ServerConfigIdentity:
+    identity = _validate_identity_fields(key=key,
+                                         revision=revision,
+                                         digest=digest)
+    if not isinstance(value, str) or _config_value_digest(value) != digest:
+        raise ValueError(f'Invalid PostgreSQL config row identity for {key!r}.')
+    return identity
+
+
+def _parse_server_config_record(row: Any) -> ServerConfigRecord:
+    value = row.value
+    identity = _validate_config_row_identity(
+        key=API_SERVER_CONFIG_KEY,
+        value=value,
+        revision=row.revision,
+        digest=row.digest,
+    )
+    try:
+        config_dict = yaml_utils.read_yaml_str(value,
+                                               reject_duplicate_keys=True)
+        db_config = config_utils.Config.from_dict(config_dict)
+    except (TypeError, ValueError, yaml.YAMLError):
+        raise ValueError(
+            'Invalid database server config YAML syntax.') from None
+    db_config.pop_nested(('db',), None)
+    _validate_config(db_config, '<database server config>')
+    return ServerConfigRecord(config=db_config, identity=identity, value=value)
+
+
+def _get_server_config_record_in_session(
+        session: orm.Session,
+        *,
+        for_update: bool = False) -> ServerConfigRecord | None:
+    statement = sqlalchemy.select(config_yaml_table).where(
+        config_yaml_table.c.key == API_SERVER_CONFIG_KEY)
+    if for_update:
+        statement = statement.with_for_update()
+    row = session.execute(statement).one_or_none()
+    if row is None:
+        return None
+    return _parse_server_config_record(row)
+
+
+def _get_server_config_record_from_db() -> ServerConfigRecord | None:
+    with orm.Session(_db_manager.get_engine()) as session:
+        return _get_server_config_record_in_session(session)
+
+
+def _get_config_yaml_from_db(key: str) -> config_utils.Config | None:
+    """Read and validate one server configuration row."""
+    if key != API_SERVER_CONFIG_KEY:
+        raise ValueError(f'Unsupported server config key: {key!r}.')
+    record = _get_server_config_record_from_db()
+    return None if record is None else record.config
+
+
+def _permission_generation_value(generation: int,
+                                 config_identity: ServerConfigIdentity) -> str:
+    return json.dumps(
+        {
+            'config_digest': config_identity.digest,
+            'config_revision': config_identity.revision,
+            'generation': generation,
+        },
+        separators=(',', ':'),
+        sort_keys=True)
+
+
+def _parse_workspace_permission_generation(
+        row: Any) -> WorkspacePermissionGeneration:
+    row_identity = _validate_config_row_identity(
+        key=WORKSPACE_PERMISSION_GENERATION_KEY,
+        value=row.value,
+        revision=row.revision,
+        digest=row.digest,
+    )
+    try:
+        value = json.loads(row.value)
+    except (json.JSONDecodeError, TypeError) as e:
+        raise ValueError('Invalid workspace permission generation receipt.') \
+            from e
+    if (not isinstance(value, dict) or
+            set(value) != {'config_digest', 'config_revision', 'generation'}):
+        raise ValueError('Invalid workspace permission generation receipt.')
+    generation = value['generation']
+    config_revision = value['config_revision']
+    config_digest = value['config_digest']
+    if (not isinstance(generation, int) or isinstance(generation, bool) or
+            generation < 0):
+        raise ValueError('Invalid workspace permission generation receipt.')
+    config_identity = _validate_identity_fields(
+        key='workspace permission config binding',
+        revision=config_revision,
+        digest=config_digest,
+    )
+    return WorkspacePermissionGeneration(generation=generation,
+                                         config_identity=config_identity,
+                                         row_identity=row_identity)
+
+
+def _get_workspace_permission_generation_in_session(
+        session: orm.Session,
+        *,
+        for_update: bool = False) -> WorkspacePermissionGeneration:
+    statement = sqlalchemy.select(config_yaml_table).where(
+        config_yaml_table.c.key == WORKSPACE_PERMISSION_GENERATION_KEY)
+    if for_update:
+        statement = statement.with_for_update()
+    row = session.execute(statement).one_or_none()
+    if row is None:
+        raise RuntimeError('Guarded HA requires the PostgreSQL workspace '
+                           'permission generation receipt.')
+    return _parse_workspace_permission_generation(row)
+
+
+def get_workspace_permission_generation() -> WorkspacePermissionGeneration:
+    """Read the current guarded-HA workspace authorization generation."""
+    if not _postgres_server_config_is_authoritative():
+        raise RuntimeError('Workspace permission generations are guarded-HA '
+                           'PostgreSQL state.')
+    with orm.Session(_db_manager.get_engine()) as session:
+        return _get_workspace_permission_generation_in_session(session)
 
 
 def _overlay_db_config(server_config: config_utils.Config,
                        db_url: str) -> config_utils.Config:
     """Overlay the DB-stored api_server_config onto ``server_config``."""
+    logger.debug('retrieving config from database')
+    del db_url  # Connection resolved via the env var by the engine.
+    db_config = _get_config_yaml_from_db(API_SERVER_CONFIG_KEY)
+    if _postgres_server_config_is_authoritative():
+        if db_config is None:
+            # The migration job is the only writer allowed to seed the row.
+            # Runtime roles must never fall back to a shared or projected file
+            # after guarded HA is activated, including an accidentally
+            # configured ``auto`` migration mode.
+            if migration_utils.configured_migration_mode() in ('bootstrap',
+                                                               'upgrade'):
+                return server_config
+            raise RuntimeError(
+                'Guarded HA requires the PostgreSQL api_server_config row. '
+                'Run the database migration job before starting runtime roles.')
+        return db_config
+
     if len(server_config.keys()) > 1:
         raise ValueError(
             'If db config is specified, no other config is allowed')
-    logger.debug('retrieving config from database')
-    del db_url  # Connection resolved via the env var by the engine.
-
-    def _get_config_yaml_from_db(key: str) -> config_utils.Config | None:
-        with orm.Session(_db_manager.get_engine()) as session:
-            row = session.query(config_yaml_table).filter_by(key=key).first()
-        if row:
-            try:
-                config_dict = yaml_utils.read_yaml_str(
-                    row.value, reject_duplicate_keys=True)
-                db_config = config_utils.Config.from_dict(config_dict)
-            except (TypeError, ValueError, yaml.YAMLError):
-                raise ValueError(
-                    'Invalid database server config YAML syntax.') from None
-            db_config.pop_nested(('db',), None)
-            _validate_config(db_config, '<database server config>')
-            return db_config
-        return None
-
-    db_config = _get_config_yaml_from_db(API_SERVER_CONFIG_KEY)
     if db_config:
         server_config = overlay_skypilot_config(server_config, db_config)
     return server_config
@@ -444,9 +716,19 @@ def get_effective_server_config() -> config_utils.Config:
     the server and every controller in the pod: this resolves the same config
     the API server itself uses, ignoring the per-service snapshot.
     """
+    db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
+    postgres_authority = _postgres_server_config_is_authoritative()
+    if postgres_authority and db_url is None:
+        raise RuntimeError('Guarded HA PostgreSQL server-config authority '
+                           f'requires {constants.ENV_VAR_DB_CONNECTION_URI}.')
+    if postgres_authority:
+        # Use the same direct PostgreSQL path as diagnostic callers of
+        # get_server_config().  Neither entrypoint resolves a projected or
+        # shared file in guarded HA.
+        return get_server_config()
+
     server_config_path = _resolve_server_config_path()
     server_config = _get_config_from_path(server_config_path)
-    db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
     if db_url:
         server_config = _overlay_db_config(server_config, db_url)
     return server_config
@@ -844,12 +1126,75 @@ def overlay_skypilot_config(
 
 def safe_reload_config() -> None:
     """Reloads the config, safe to be called concurrently."""
-    with filelock.FileLock(get_skypilot_config_lock_path()):
+    central_guarded_role = (_postgres_server_config_is_authoritative() and
+                            os.environ.get(constants.ENV_VAR_IS_SKYPILOT_SERVER)
+                            is not None and
+                            _guarded_ha_scoped_child_snapshot() is None)
+    lock_path = (get_central_config_reload_lock_path()
+                 if central_guarded_role else get_skypilot_config_lock_path())
+    with filelock.FileLock(lock_path):
         reload_config()
+
+
+def _guarded_ha_scoped_child_snapshot() -> str | None:
+    """Validate and classify a server-owned child snapshot receipt."""
+    internal_config_path = os.environ.get(ENV_VAR_SKYPILOT_CONFIG)
+    if internal_config_path is None:
+        return None
+    kind: str | None = None
+    if os.environ.get(constants.IS_SKYPILOT_SERVE_CONTROLLER) == 'true':
+        kind = INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE
+    managed_job_identity = (
+        controller_constants.MANAGED_JOB_ID_ENV_VAR,
+        controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ID_ENV_VAR,
+        controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ATTEMPT_ENV_VAR,
+    )
+    if all(os.environ.get(name) is not None for name in managed_job_identity):
+        if kind is not None:
+            raise RuntimeError('A guarded child cannot be both Serve and '
+                               'Managed Jobs.')
+        kind = INTERNAL_CONFIG_SNAPSHOT_KIND_MANAGED_JOB
+    if kind is None:
+        return None
+
+    receipt_kind = os.environ.get(ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_KIND)
+    receipt_path = os.environ.get(ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_PATH)
+    receipt_digest = os.environ.get(ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_DIGEST)
+    receipt_identity = os.environ.get(ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_IDENTITY)
+    if None in (receipt_kind, receipt_path, receipt_digest, receipt_identity):
+        raise RuntimeError(
+            'Guarded child config requires an exact server-issued '
+            'snapshot receipt.')
+    assert receipt_kind is not None
+    assert receipt_path is not None
+    assert receipt_digest is not None
+    assert receipt_identity is not None
+    if receipt_kind != kind or receipt_path != internal_config_path:
+        raise RuntimeError('Guarded child config snapshot scope does not match '
+                           'its server-issued receipt.')
+    expected_identity = internal_config_snapshot_identity(
+        receipt_kind, receipt_path, receipt_digest)
+    if not secrets.compare_digest(receipt_identity, expected_identity):
+        raise RuntimeError('Guarded child config snapshot identity is invalid.')
+    return kind
 
 
 def reload_config() -> None:
     internal_config_path = os.environ.get(ENV_VAR_SKYPILOT_CONFIG)
+    is_server = (os.environ.get(constants.ENV_VAR_IS_SKYPILOT_SERVER)
+                 is not None)
+    if is_server and _postgres_server_config_is_authoritative():
+        # Central API/controller/executor/image-worker roles always resolve the
+        # PostgreSQL authority, even if an inherited SKYPILOT_CONFIG happens to
+        # be present.  Only server-issued Serve/Managed-Jobs child snapshots
+        # retain their explicitly scoped immutable-file semantics until D6.
+        snapshot_kind = _guarded_ha_scoped_child_snapshot()
+        if internal_config_path is not None and snapshot_kind is not None:
+            _reload_config_from_guarded_child_snapshot(internal_config_path,
+                                                       snapshot_kind)
+        else:
+            _reload_config_as_server()
+        return
     if internal_config_path is not None:
         # {ENV_VAR_SKYPILOT_CONFIG} is used internally.
         # When this environment variable is set, the config loading
@@ -859,7 +1204,7 @@ def reload_config() -> None:
         _reload_config_from_internal_file(internal_config_path)
         return
 
-    if os.environ.get(constants.ENV_VAR_IS_SKYPILOT_SERVER) is not None:
+    if is_server:
         _reload_config_as_server()
     else:
         _reload_config_as_client()
@@ -919,6 +1264,30 @@ def install_internal_config_snapshot(config: config_utils.Config,
     expanded_path = os.path.expanduser(config_path)
     if not os.path.exists(expanded_path):
         raise FileNotFoundError(expanded_path)
+    if (_postgres_server_config_is_authoritative() and
+            os.environ.get(constants.ENV_VAR_IS_SKYPILOT_SERVER) is not None):
+        snapshot_kind: str | None = None
+        if os.environ.get(constants.IS_SKYPILOT_SERVE_CONTROLLER) == 'true':
+            snapshot_kind = INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE
+        managed_job_identity = (
+            controller_constants.MANAGED_JOB_ID_ENV_VAR,
+            controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ID_ENV_VAR,
+            controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ATTEMPT_ENV_VAR,
+        )
+        if all(
+                os.environ.get(name) is not None
+                for name in managed_job_identity):
+            if snapshot_kind is not None:
+                raise RuntimeError('A guarded child cannot be both Serve and '
+                                   'Managed Jobs.')
+            snapshot_kind = INTERNAL_CONFIG_SNAPSHOT_KIND_MANAGED_JOB
+        if snapshot_kind is not None:
+            with open(expanded_path, 'rb') as snapshot_file:
+                snapshot_bytes = snapshot_file.read()
+            os.environ.update(
+                internal_config_snapshot_environment(snapshot_kind,
+                                                     expanded_path,
+                                                     snapshot_bytes))
     os.environ[ENV_VAR_SKYPILOT_CONFIG] = expanded_path
     _replace_config_context(copy.deepcopy(config),
                             expanded_path,
@@ -964,6 +1333,33 @@ def _reload_config_from_internal_file(internal_config_path: str) -> None:
     _replace_config_context(loaded_config, config_path)
 
 
+def _reload_config_from_guarded_child_snapshot(internal_config_path: str,
+                                               snapshot_kind: str) -> None:
+    """Read one attested child snapshot once and reject path/content drift."""
+    del snapshot_kind  # Kind is bound into the receipt validated by the caller.
+    config_path = os.path.expanduser(internal_config_path)
+    receipt_digest = os.environ.get(ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_DIGEST)
+    if receipt_digest is None:
+        raise RuntimeError('Guarded child config snapshot digest is missing.')
+    try:
+        with open(config_path, 'rb') as snapshot_file:
+            config_bytes = snapshot_file.read()
+    except OSError as e:
+        raise RuntimeError(
+            'Guarded child config snapshot is unavailable.') from e
+    actual_digest = internal_config_snapshot_digest(config_bytes)
+    if not secrets.compare_digest(actual_digest, receipt_digest):
+        raise RuntimeError(
+            'Guarded child config snapshot content does not match '
+            'its server-issued digest.')
+    loaded_config = parse_and_validate_config_bytes(
+        config_bytes,
+        config_path,
+        apply_db_env=False,
+    )
+    _replace_config_context(loaded_config, config_path)
+
+
 def _create_table(engine: sqlalchemy.engine.Engine):
     """Initialize the config database with migrations."""
     migration_utils.safe_alembic_upgrade(
@@ -980,12 +1376,134 @@ _db_manager = db_utils.DatabaseManager(db_name='config',
 initialize_and_get_db = _db_manager.get_engine
 
 
+def _lock_postgres_server_config_transaction(session: orm.Session) -> None:
+    """Acquire the one transaction-scoped guarded-HA config writer lock."""
+    bind = session.get_bind()
+    if bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise RuntimeError(
+            'Guarded HA server-config authority requires PostgreSQL.')
+    session.execute(
+        sqlalchemy.text('SELECT pg_advisory_xact_lock('
+                        'hashtextextended(CAST(:lock_key AS text), 0))'),
+        {'lock_key': _POSTGRES_SERVER_CONFIG_ADVISORY_LOCK_KEY})
+
+
+def initialize_postgres_server_config_authority(
+    transaction_hook: Callable[[orm.Session, ServerConfigRecord], Any] |
+    None = None,
+) -> None:
+    """Seed or verify guarded HA's sole structured config authority.
+
+    The chart disallows inline configuration when an external database is
+    configured, so a fresh installation starts with an empty row and is then
+    configured through the server API.  An existing row always wins, so an
+    ordinary Helm upgrade cannot overwrite a live configuration.  Only an
+    explicitly owned migration process may seed; verify/runtime processes are
+    read-only and fail closed if the migration did not commit the row.
+    """
+    if not _postgres_server_config_is_authoritative():
+        return
+    if os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI) is None:
+        raise RuntimeError('Guarded HA PostgreSQL server-config authority '
+                           f'requires {constants.ENV_VAR_DB_CONNECTION_URI}.')
+
+    engine = _db_manager.get_engine()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise RuntimeError(
+            'Guarded HA server-config authority requires PostgreSQL.')
+
+    migration_mode = migration_utils.configured_migration_mode()
+    if migration_mode in ('bootstrap', 'upgrade'):
+        config_str = yaml_utils.dump_yaml_str({})
+        config_digest = _config_value_digest(config_str)
+        insert_stmt = postgresql.insert(config_yaml_table).values(
+            key=API_SERVER_CONFIG_KEY,
+            value=config_str,
+            revision=1,
+            digest=config_digest,
+        )
+        insert_stmt = insert_stmt.on_conflict_do_nothing(
+            index_elements=[config_yaml_table.c.key])
+        with orm.Session(engine) as session, session.begin():
+            _lock_postgres_server_config_transaction(session)
+            session.execute(insert_stmt)
+            config_record = _get_server_config_record_in_session(
+                session, for_update=True)
+            if config_record is None:
+                raise RuntimeError(
+                    'Failed to initialize PostgreSQL server config.')
+            generation_value = _permission_generation_value(
+                0, config_record.identity)
+            generation_insert = postgresql.insert(config_yaml_table).values(
+                key=WORKSPACE_PERMISSION_GENERATION_KEY,
+                value=generation_value,
+                revision=1,
+                digest=_config_value_digest(generation_value),
+            )
+            generation_insert = generation_insert.on_conflict_do_nothing(
+                index_elements=[config_yaml_table.c.key])
+            session.execute(generation_insert)
+            if transaction_hook is not None:
+                transaction_hook(session, config_record)
+
+    # Validate the retained winner, including the pre-existing-row and
+    # verify-only cases.  Validation performs no DML.
+    record = _get_server_config_record_from_db()
+    if record is None:
+        if migration_mode in ('bootstrap', 'upgrade'):
+            raise RuntimeError('Failed to initialize PostgreSQL server config.')
+        raise RuntimeError(
+            'Guarded HA requires the PostgreSQL api_server_config row. Run '
+            'the database migration job before starting runtime roles.')
+    generation = get_workspace_permission_generation()
+    if generation.config_identity.revision > record.identity.revision:
+        raise RuntimeError('Workspace permission receipt refers to a future '
+                           'PostgreSQL server config revision.')
+    if (generation.config_identity.revision == record.identity.revision and
+            generation.config_identity.digest != record.identity.digest):
+        raise RuntimeError('Workspace permission receipt does not match the '
+                           'PostgreSQL server config digest.')
+
+
 def _reload_config_as_server() -> None:
-    server_config_path = _resolve_server_config_path()
-    server_config = _get_config_from_path(server_config_path)
-    # Get the db url from the env var. _get_config_from_path should have moved
-    # the db url specified in config file to the env var.
     db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
+    postgres_authority = _postgres_server_config_is_authoritative()
+    server_config_identity: ServerConfigIdentity | None = None
+    server_config_path: str | None
+    if postgres_authority:
+        if db_url is None:
+            raise RuntimeError('Guarded HA PostgreSQL server-config authority '
+                               'requires '
+                               f'{constants.ENV_VAR_DB_CONNECTION_URI}.')
+        server_config_path = '<database server config>'
+        # A fresh bootstrap has no config table yet.  The migration entrypoint
+        # creates it and immediately seeds the authoritative empty row.  Every
+        # other role/mode reads PostgreSQL without first touching a file.
+        migration_mode = migration_utils.configured_migration_mode()
+        if migration_mode == 'bootstrap':
+            server_config = config_utils.Config()
+        else:
+            record = _get_server_config_record_from_db()
+            if record is None:
+                if migration_mode == 'upgrade':
+                    # The explicit migration owner seeds a legitimately absent
+                    # schema-001 row after module imports complete. Runtime and
+                    # verify modes must never take this path.
+                    server_config = config_utils.Config()
+                else:
+                    raise RuntimeError(
+                        'Guarded HA requires the PostgreSQL api_server_config '
+                        'row. Run the database migration job before starting '
+                        'runtime roles.')
+            else:
+                server_config = record.config
+                server_config_identity = record.identity
+    else:
+        server_config_path = _resolve_server_config_path()
+        server_config = _get_config_from_path(server_config_path)
+        # Get the db url from the env var. _get_config_from_path should have
+        # moved a db url specified in the config file to the environment.
+        db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
 
     # A fresh-schema migration job must initialize global user state before
     # any companion schema creates objects in the shared PostgreSQL schema.
@@ -993,14 +1511,19 @@ def _reload_config_as_server() -> None:
     # call global_user_state.initialize_and_get_db(), so defer the config
     # overlay only for explicit bootstrap mode.  The migration entrypoint
     # initializes this config schema immediately after global user state.
-    if (db_url and migration_utils.configured_migration_mode() != 'bootstrap'):
+    if (not postgres_authority and db_url and
+            migration_utils.configured_migration_mode() != 'bootstrap'):
         server_config = _overlay_db_config(server_config, db_url)
     if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
         safe_server_config = _redact_container_image_config_for_logging(
             server_config)
         logger.debug(f'server config: \n'
                      f'{yaml_utils.dump_yaml_str(safe_server_config)}')
-    _replace_config_context(server_config, server_config_path)
+    _replace_config_context(
+        server_config,
+        server_config_path,
+        server_config_identity=server_config_identity,
+    )
 
 
 def _reload_config_as_client() -> None:
@@ -1277,11 +1800,10 @@ def _config_requires_managed_kueue(config: config_utils.Config) -> bool:
         for workspace_config in workspaces.values())
 
 
-# Hooks invoked at the end of `update_api_server_config_no_lock`, after the
-# new config has been persisted and reloaded in-process. Plugins use this to
-# invalidate caches that were derived from the config (e.g. a request that
-# memoized the result of `get_nested(...)` for a TTL). Registered at server
-# startup during single-threaded plugin loading, so no lock is needed.
+# Hooks invoked after a canonical config writer has committed and reloaded the
+# new config in-process. Plugins use this to invalidate caches derived from the
+# config (e.g. a request that memoized `get_nested(...)` for a TTL). Registered
+# at server startup during single-threaded plugin loading, so no lock is needed.
 _CONFIG_UPDATE_HOOKS: list[Callable[[], None]] = []
 
 
@@ -1525,21 +2047,174 @@ def apply_cli_config(cli_config: list[str] | None) -> dict[str, Any]:
     return parsed_config
 
 
+def _require_api_server_config_writer() -> None:
+    # Pytest exercises repository contracts without booting the server.
+    if ('PYTEST_CURRENT_TEST' not in os.environ and
+            os.environ.get(constants.ENV_VAR_IS_SKYPILOT_SERVER) is None):
+        raise ValueError('This function can only be called by the API Server.')
+
+
+def _get_postgres_server_config_writer_engine() -> sqlalchemy.engine.Engine:
+    """Return the validated guarded-HA config writer engine."""
+    _require_api_server_config_writer()
+    if not _postgres_server_config_is_authoritative():
+        raise RuntimeError('PostgreSQL config mutation requires guarded HA.')
+    if os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI) is None:
+        raise RuntimeError(
+            'Guarded HA PostgreSQL server-config authority requires '
+            f'{constants.ENV_VAR_DB_CONNECTION_URI}.')
+    engine = _db_manager.get_engine()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise RuntimeError(
+            'Guarded HA server-config authority requires PostgreSQL.')
+    return engine
+
+
+@contextlib.contextmanager
+def locked_postgres_server_config_transaction(
+    expected_identity: ServerConfigIdentity,
+) -> Iterator[tuple[orm.Session, ServerConfigRecord]]:
+    """Yield the one caller-owned, locked, exact-CAS config transaction.
+
+    Repositories joining a config mutation must use the yielded Session and
+    must not commit it or open an independent transaction.  Returning from the
+    context commits; any exception rolls every participant back together.
+    """
+    engine = _get_postgres_server_config_writer_engine()
+    with orm.Session(engine) as session, session.begin():
+        _lock_postgres_server_config_transaction(session)
+        current = _get_server_config_record_in_session(session, for_update=True)
+        if current is None:
+            raise RuntimeError(
+                'Guarded HA requires the PostgreSQL api_server_config row.')
+        if current.identity != expected_identity:
+            raise StaleServerConfigError(
+                'PostgreSQL server config changed while this update was '
+                'being validated. Please retry the update.')
+        yield session, current
+
+
+def _run_config_update_hooks() -> None:
+    for hook in list(_CONFIG_UPDATE_HOOKS):
+        try:
+            hook()
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(f'Config-update hook {hook!r} raised: {e}',
+                           exc_info=True)
+
+
+def _reload_central_config_after_commit() -> None:
+    """Reload the process-global PostgreSQL config under a pod-local lock."""
+
+    def _reload_globally() -> None:
+        with filelock.FileLock(get_central_config_reload_lock_path()):
+            _reload_config_as_server()
+
+    # A config endpoint normally runs inside a request Context.  Reloading in
+    # an empty context publishes the generation to future requests and every
+    # long-lived process-global reader instead of updating only that request's
+    # private snapshot.
+    contextvars.Context().run(_reload_globally)
+    _run_config_update_hooks()
+
+
+def advance_workspace_permission_generation_in_session(
+        session: orm.Session, config_identity: ServerConfigIdentity) -> int:
+    """Advance the workspace cache receipt in the caller's config txn."""
+    receipt = _get_workspace_permission_generation_in_session(session,
+                                                              for_update=True)
+    generation = receipt.generation + 1
+    value = _permission_generation_value(generation, config_identity)
+    digest = _config_value_digest(value)
+    result = session.execute(
+        sqlalchemy.update(config_yaml_table).where(
+            config_yaml_table.c.key == WORKSPACE_PERMISSION_GENERATION_KEY,
+            config_yaml_table.c.revision == receipt.row_identity.revision,
+            config_yaml_table.c.digest == receipt.row_identity.digest,
+        ).values(
+            value=value,
+            revision=receipt.row_identity.revision + 1,
+            digest=digest,
+        ))
+    if result.rowcount != 1:
+        raise StaleServerConfigError(
+            'Workspace permission generation changed during its locked '
+            'transaction.')
+    return generation
+
+
+def mutate_postgres_server_config(
+    modifier: Callable[[dict[str, Any]], None],
+    *,
+    expected_identity: ServerConfigIdentity,
+    transaction_hook: Callable[
+        [orm.Session, ServerConfigRecord, ServerConfigRecord], Any] |
+    None = None,
+) -> tuple[ServerConfigRecord, Any]:
+    """Commit one guarded-HA config RMW under distributed lock and CAS.
+
+    ``transaction_hook`` runs after the config CAS but before commit on the
+    exact same SQLAlchemy Session.  It must neither commit nor open a second
+    transaction.  A failure rolls back the config CAS and every hook write.
+    """
+    hook_result: Any = None
+    next_record: ServerConfigRecord | None = None
+    with locked_postgres_server_config_transaction(expected_identity) as (
+            session, current):
+        next_dict = copy.deepcopy(dict(current.config))
+        modifier(next_dict)
+        next_config = config_utils.Config.from_dict(next_dict)
+        new_db_url = next_config.pop_nested(('db',), None)
+        existing_db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
+        if new_db_url and new_db_url != existing_db_url:
+            raise ValueError('Cannot change db url while server is running')
+        _validate_config(next_config, '<PostgreSQL server config update>')
+        next_value = yaml_utils.dump_yaml_str(dict(next_config))
+        next_identity = ServerConfigIdentity(
+            revision=current.identity.revision + 1,
+            digest=_config_value_digest(next_value),
+        )
+        update_result = session.execute(
+            sqlalchemy.update(config_yaml_table).where(
+                config_yaml_table.c.key == API_SERVER_CONFIG_KEY,
+                config_yaml_table.c.revision == current.identity.revision,
+                config_yaml_table.c.digest == current.identity.digest,
+            ).values(
+                value=next_value,
+                revision=next_identity.revision,
+                digest=next_identity.digest,
+            ))
+        if update_result.rowcount != 1:
+            raise StaleServerConfigError(
+                'PostgreSQL server config CAS lost despite the writer lock.')
+        next_record = ServerConfigRecord(config=next_config,
+                                         identity=next_identity,
+                                         value=next_value)
+        if transaction_hook is not None:
+            hook_result = transaction_hook(session, current, next_record)
+
+    assert next_record is not None
+    _reload_central_config_after_commit()
+    return next_record, hook_result
+
+
 def update_api_server_config_no_lock(config: config_utils.Config) -> None:
-    """Dumps the new config to a file and syncs to ConfigMap if in Kubernetes.
+    """Persists and reloads one API-server configuration update.
+
+    Guarded HA writes PostgreSQL directly and never resolves or mirrors a
+    configuration file. Other installations retain the file/ConfigMap path.
 
     Args:
         config: The config to save and sync.
     """
 
-    def is_running_pytest() -> bool:
-        return 'PYTEST_CURRENT_TEST' in os.environ
+    _require_api_server_config_writer()
 
-    # Only allow this function to be called by the API Server in production.
-    if not is_running_pytest() and os.environ.get(
-            constants.ENV_VAR_IS_SKYPILOT_SERVER) is None:
-        raise ValueError('This function can only be called by the API Server.')
-
+    if _postgres_server_config_is_authoritative():
+        raise RuntimeError(
+            'Guarded HA config writers must use '
+            'mutate_postgres_server_config() with an exact revision/digest '
+            'CAS; the legacy no-lock writer is disabled.')
     global_config_path = _resolve_server_config_path()
     if global_config_path is None:
         # Fallback to ~/.sky/config.yaml, and make sure it exists.
@@ -1549,6 +2224,7 @@ def update_api_server_config_no_lock(config: config_utils.Config) -> None:
     db_updated = False
     if os.environ.get(constants.ENV_VAR_IS_SKYPILOT_SERVER) is not None:
         existing_db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
+        config = copy.deepcopy(config)
         new_db_url = config.pop_nested(('db',), None)
         if new_db_url and new_db_url != existing_db_url:
             raise ValueError('Cannot change db url while server is running')
@@ -1557,6 +2233,7 @@ def update_api_server_config_no_lock(config: config_utils.Config) -> None:
             def _set_config_yaml_to_db(key: str, config: config_utils.Config):
                 engine = _db_manager.get_engine()
                 config_str = yaml_utils.dump_yaml_str(dict(config))
+                config_digest = _config_value_digest(config_str)
                 with orm.Session(engine) as session:
                     if (engine.dialect.name ==
                             db_utils.SQLAlchemyDialect.SQLITE.value):
@@ -1567,10 +2244,19 @@ def update_api_server_config_no_lock(config: config_utils.Config) -> None:
                     else:
                         raise ValueError('Unsupported database dialect')
                     insert_stmnt = insert_func(config_yaml_table).values(
-                        key=key, value=config_str)
+                        key=key,
+                        value=config_str,
+                        revision=1,
+                        digest=config_digest,
+                    )
                     do_update_stmt = insert_stmnt.on_conflict_do_update(
                         index_elements=[config_yaml_table.c.key],
-                        set_={config_yaml_table.c.value: config_str})
+                        set_={
+                            config_yaml_table.c.value: config_str,
+                            config_yaml_table.c.revision:
+                                config_yaml_table.c.revision + 1,
+                            config_yaml_table.c.digest: config_digest,
+                        })
                     session.execute(do_update_stmt)
                     session.commit()
 
@@ -1591,9 +2277,4 @@ def update_api_server_config_no_lock(config: config_utils.Config) -> None:
                 config, global_config_path)
 
     reload_config()
-    for hook in list(_CONFIG_UPDATE_HOOKS):
-        try:
-            hook()
-        except Exception as e:  # pylint: disable=broad-except
-            logger.warning(f'Config-update hook {hook!r} raised: {e}',
-                           exc_info=True)
+    _run_config_update_hooks()

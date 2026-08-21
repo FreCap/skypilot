@@ -98,6 +98,10 @@ _CONTROLLER_RUNTIME_ENV_VARS = frozenset({
     jobs_constants.CONTROLLER_CAPABILITY_FD_ENV_VAR,
     jobs_constants.CONTROLLER_ORIGIN_CAPABILITY_ENV_VAR,
     jobs_constants.CONTROLLER_ORIGIN_CAPABILITY_AUTHORITY_PATH_ENV_VAR,
+    skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_KIND,
+    skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_PATH,
+    skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_DIGEST,
+    skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_IDENTITY,
 })
 
 
@@ -2530,7 +2534,11 @@ class ControllerManager:
         logger.info(f'From controller {self._controller_uuid}')
         logger.info(f'  pid={self._pid}')
 
+        guarded_config_authority = (
+            skypilot_config._postgres_server_config_is_authoritative())  # pylint: disable=protected-access
         job_rank = None
+        env_vars: dict[str, str | None] = {}
+        persisted_env_loaded = False
         env_content = file_content_utils.get_job_env_content(job_id)
         if env_content:
             try:
@@ -2548,10 +2556,6 @@ class ControllerManager:
                         logger.debug('Set environment variable: %s=%s', key,
                                      value)
 
-                # Cleanup needs the same user config/auth context as launch.
-                file_content_utils.restore_job_config_file(job_id)
-                skypilot_config.reload_config()
-
                 if ('SKYPILOT_JOB_ID_TO_RANK' in env_vars and
                         env_vars['SKYPILOT_JOB_ID_TO_RANK']):
                     try:
@@ -2567,17 +2571,46 @@ class ControllerManager:
                 else:
                     logger.debug('SKYPILOT_JOB_ID_TO_RANK not found in '
                                  'environment variables')
+                persisted_env_loaded = True
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(
                     'Failed to load environment variables for job '
                     '%s: %s', job_id, e)
+                if guarded_config_authority:
+                    raise
 
-        # Install the server-owned field last so persisted user/legacy env
-        # content cannot replace the exact job bound to this coroutine.
-        # Nested SDK requests combine it with the immutable outer and slot
-        # environment inherited by the manager process.
+        # Install the server-owned field after persisted user/legacy env so it
+        # cannot replace the exact job bound to this coroutine.  It must be
+        # visible before config reload so guarded child classification sees
+        # the complete immutable job/slot/attempt identity.
         ctx.override_envs(
             {jobs_constants.CONTROLLER_JOB_ID_ENV_VAR: str(job_id)})
+
+        try:
+            # Cleanup needs the same user config/auth context as launch.  A
+            # guarded controller never trusts a receipt copied through the
+            # persisted environment: restore the exact snapshot first, then
+            # mint a fresh receipt in this server-owned execution context.
+            if guarded_config_authority or persisted_env_loaded:
+                restored_snapshot = (
+                    file_content_utils.restore_job_config_file(job_id))
+                if (guarded_config_authority and restored_snapshot is not None):
+                    config_path, config_bytes = restored_snapshot
+                    ctx.override_envs(
+                        skypilot_config.internal_config_snapshot_environment(
+                            skypilot_config.
+                            INTERNAL_CONFIG_SNAPSHOT_KIND_MANAGED_JOB,
+                            config_path,
+                            config_bytes,
+                        ))
+                skypilot_config.reload_config()
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error('Failed to restore config snapshot for job %s: %s',
+                         job_id, e)
+            if guarded_config_authority:
+                raise RuntimeError(
+                    f'Failed to install guarded config snapshot for job '
+                    f'{job_id}.') from e
 
         # Bind usage state after the per-job environment is installed.
         usage_lib.install_fresh_messages_for_current_context()

@@ -4037,6 +4037,85 @@ class TestTerminalCleanupAdoption:
         assert ctx.override_envs.call_args_list[-1] == call({origin_key: '37'})
         assert call({origin_key: '999'}) not in ctx.override_envs.call_args_list
 
+    def test_guarded_context_reissues_exact_restored_config_receipt(self):
+        manager = _make_controller_manager()
+        ctx = MagicMock()
+        config_path = '/server-owned/job-37-config.yaml'
+        config_bytes = b'active_workspace: research\n'
+        receipt_names = (
+            controller_lib.skypilot_config.
+            ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_KIND,
+            controller_lib.skypilot_config.
+            ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_PATH,
+            controller_lib.skypilot_config.
+            ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_DIGEST,
+            controller_lib.skypilot_config.
+            ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_IDENTITY,
+        )
+        env_content = '\n'.join([
+            'USER_VALUE=kept',
+            *(f'{name}=persisted-forgery' for name in receipt_names),
+        ])
+        expected_receipt = (
+            controller_lib.skypilot_config.internal_config_snapshot_environment(
+                controller_lib.skypilot_config.
+                INTERNAL_CONFIG_SNAPSHOT_KIND_MANAGED_JOB,
+                config_path,
+                config_bytes,
+            ))
+
+        with patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch('sky.jobs.controller.skypilot_config.'
+                      '_postgres_server_config_is_authoritative',
+                      return_value=True), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'get_job_env_content', return_value=env_content), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'restore_job_config_file',
+                      return_value=(config_path, config_bytes)) as restore, \
+                patch('sky.jobs.controller.skypilot_config.reload_config') \
+                    as reload_config, \
+                patch('sky.jobs.controller.usage_lib.'
+                      'install_fresh_messages_for_current_context'):
+            manager._initialize_job_context(37, '/tmp/controller.log', None)
+
+        origin = {controller_lib.jobs_constants.CONTROLLER_JOB_ID_ENV_VAR: '37'}
+        assert call(origin) in ctx.override_envs.call_args_list
+        assert call(expected_receipt) in ctx.override_envs.call_args_list
+        assert (ctx.override_envs.call_args_list.index(call(origin))
+                < ctx.override_envs.call_args_list.index(
+                    call(expected_receipt)))
+        for name in receipt_names:
+            assert call({name: 'persisted-forgery'
+                        }) not in (ctx.override_envs.call_args_list)
+        restore.assert_called_once_with(37)
+        reload_config.assert_called_once_with()
+
+    def test_guarded_context_fails_closed_when_snapshot_restore_fails(self):
+        manager = _make_controller_manager()
+        ctx = MagicMock()
+
+        with patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch('sky.jobs.controller.skypilot_config.'
+                      '_postgres_server_config_is_authoritative',
+                      return_value=True), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'get_job_env_content',
+                      return_value='SKYPILOT_CONFIG=/missing/config.yaml\n'), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'restore_job_config_file',
+                      side_effect=FileNotFoundError('/missing/config.yaml')), \
+                patch('sky.jobs.controller.skypilot_config.reload_config') \
+                    as reload_config, \
+                patch('sky.jobs.controller.usage_lib.'
+                      'install_fresh_messages_for_current_context') as usage:
+            with pytest.raises(RuntimeError,
+                               match='guarded config snapshot for job 37'):
+                manager._initialize_job_context(37, '/tmp/controller.log', None)
+
+        reload_config.assert_not_called()
+        usage.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_monitor_dispatches_cleanup_only_without_starting_workload(
             self):

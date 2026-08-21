@@ -519,6 +519,243 @@ def test_pure_config_parse_does_not_mutate_database_environment(monkeypatch):
     assert parsed.get_nested(('db',), None) is None
 
 
+def test_postgres_server_config_authority_ignores_bootstrap_overlay(
+        monkeypatch) -> None:
+    bootstrap = config_utils.Config.from_dict({
+        'aws': {
+            'labels': {
+                'bootstrap-only': 'must-not-survive',
+            },
+        },
+    })
+    authoritative = config_utils.Config.from_dict({
+        'aws': {
+            'labels': {
+                'postgres': 'winner',
+            },
+        },
+    })
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SERVER_CONFIG_MODE,
+                       skypilot_config.SERVER_CONFIG_MODE_POSTGRES)
+    monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'verify')
+    monkeypatch.setattr(skypilot_config, '_get_config_yaml_from_db',
+                        lambda _key: authoritative)
+
+    result = skypilot_config._overlay_db_config(
+        bootstrap,  # pylint: disable=protected-access
+        'postgresql://unused')
+
+    assert result == authoritative
+    assert result.get_nested(('aws', 'labels', 'bootstrap-only'), None) is None
+
+
+@pytest.mark.parametrize('migration_mode', ['verify', 'auto'])
+def test_postgres_server_config_authority_fails_closed_without_row(
+        monkeypatch, migration_mode: str) -> None:
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SERVER_CONFIG_MODE,
+                       skypilot_config.SERVER_CONFIG_MODE_POSTGRES)
+    monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE,
+                       migration_mode)
+    monkeypatch.setattr(skypilot_config, '_get_config_yaml_from_db',
+                        lambda _key: None)
+
+    with pytest.raises(RuntimeError, match='api_server_config row'):
+        skypilot_config._overlay_db_config(  # pylint: disable=protected-access
+            config_utils.Config(), 'postgresql://unused')
+
+
+def test_postgres_server_config_migration_can_seed_missing_row(
+        monkeypatch) -> None:
+    bootstrap = config_utils.Config.from_dict({'active_workspace': 'default'})
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SERVER_CONFIG_MODE,
+                       skypilot_config.SERVER_CONFIG_MODE_POSTGRES)
+    monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'upgrade')
+    monkeypatch.setattr(skypilot_config, '_get_config_yaml_from_db',
+                        lambda _key: None)
+
+    assert skypilot_config._overlay_db_config(  # pylint: disable=protected-access
+        bootstrap, 'postgresql://unused') is bootstrap
+
+
+def test_postgres_server_config_uses_pod_local_reload_lock(
+        monkeypatch, tmp_path) -> None:
+    shared_lock_path = tmp_path / 'shared' / 'config.lock'
+    central_lock_path = tmp_path / 'role-runtime' / 'config.lock'
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SERVER_CONFIG_MODE,
+                       skypilot_config.SERVER_CONFIG_MODE_POSTGRES)
+    monkeypatch.setattr(skypilot_config, 'SKYPILOT_CONFIG_LOCK_PATH',
+                        str(shared_lock_path))
+    monkeypatch.setattr(skypilot_config, '_CENTRAL_CONFIG_RELOAD_LOCK_PATH',
+                        str(central_lock_path))
+
+    # The generic helper remains the shared legacy Serve-snapshot lock until
+    # D6. Only central in-process reload gets a distinct pod-local lock.
+    assert skypilot_config.get_skypilot_config_lock_path() == str(
+        shared_lock_path)
+    assert skypilot_config.get_central_config_reload_lock_path() == str(
+        central_lock_path)
+    assert shared_lock_path.parent.is_dir()
+    assert central_lock_path.parent.is_dir()
+
+
+def test_effective_postgres_server_config_never_reads_bootstrap_file(
+        monkeypatch) -> None:
+    authoritative = config_utils.Config.from_dict(
+        {'active_workspace': 'postgres'})
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SERVER_CONFIG_MODE,
+                       skypilot_config.SERVER_CONFIG_MODE_POSTGRES)
+    monkeypatch.setenv(constants.ENV_VAR_DB_CONNECTION_URI,
+                       'postgresql://unused')
+    monkeypatch.setattr(
+        skypilot_config, '_resolve_server_config_path',
+        lambda: pytest.fail('PostgreSQL authority read a bootstrap file'))
+    monkeypatch.setattr(skypilot_config, '_overlay_db_config',
+                        lambda _config, _db_url: authoritative)
+
+    assert skypilot_config.get_server_config() == authoritative
+    assert skypilot_config.get_effective_server_config() == authoritative
+
+
+def test_postgres_server_config_update_has_no_file_or_configmap_side_effect(
+        monkeypatch) -> None:
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SERVER_CONFIG_MODE,
+                       skypilot_config.SERVER_CONFIG_MODE_POSTGRES)
+    monkeypatch.setenv(constants.ENV_VAR_DB_CONNECTION_URI,
+                       'postgresql://unused')
+    monkeypatch.setenv(constants.ENV_VAR_IS_SKYPILOT_SERVER, 'true')
+    monkeypatch.setattr(
+        skypilot_config, '_resolve_server_config_path',
+        lambda: pytest.fail('PostgreSQL update resolved a config file'))
+    monkeypatch.setattr(
+        skypilot_config.yaml_utils, 'dump_yaml', lambda *_args, **_kwargs:
+        pytest.fail('PostgreSQL update wrote a config file'))
+    monkeypatch.setattr(
+        skypilot_config.config_map_utils, 'patch_configmap_with_config', lambda
+        *_args, **_kwargs: pytest.fail('PostgreSQL update patched a ConfigMap'))
+    get_engine = mock.Mock()
+    monkeypatch.setattr(
+        skypilot_config._db_manager,  # pylint: disable=protected-access
+        'get_engine',
+        get_engine)
+
+    with pytest.raises(RuntimeError, match='exact revision/digest CAS'):
+        skypilot_config.update_api_server_config_no_lock(
+            config_utils.Config.from_dict({'active_workspace': 'postgres'}))
+
+    get_engine.assert_not_called()
+
+
+def test_initialize_postgres_server_config_preserves_existing_row(
+        monkeypatch) -> None:
+    engine = mock.MagicMock()
+    engine.dialect.name = 'postgresql'
+    retained = config_utils.Config.from_dict({'active_workspace': 'retained'})
+    retained_value = yaml_utils.dump_yaml_str(dict(retained))
+    retained_identity = skypilot_config.ServerConfigIdentity(
+        revision=7, digest=skypilot_config._config_value_digest(retained_value))  # pylint: disable=protected-access
+    retained_record = skypilot_config.ServerConfigRecord(
+        config=retained,
+        identity=retained_identity,
+        value=retained_value,
+    )
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SERVER_CONFIG_MODE,
+                       skypilot_config.SERVER_CONFIG_MODE_POSTGRES)
+    monkeypatch.setenv(constants.ENV_VAR_DB_CONNECTION_URI,
+                       'postgresql://unused')
+    monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'upgrade')
+    monkeypatch.setattr(
+        skypilot_config._db_manager,  # pylint: disable=protected-access
+        'get_engine',
+        lambda: engine)
+    session_context = mock.MagicMock()
+    session = session_context.__enter__.return_value
+    monkeypatch.setattr(skypilot_config.orm, 'Session',
+                        lambda _engine: session_context)
+    monkeypatch.setattr(skypilot_config,
+                        '_lock_postgres_server_config_transaction',
+                        lambda _session: None)
+    monkeypatch.setattr(skypilot_config,
+                        '_get_server_config_record_in_session',
+                        lambda _session, for_update=False: retained_record)
+    get_record = mock.Mock(return_value=retained_record)
+    monkeypatch.setattr(skypilot_config, '_get_server_config_record_from_db',
+                        get_record)
+    monkeypatch.setattr(
+        skypilot_config, 'get_workspace_permission_generation',
+        lambda: skypilot_config.WorkspacePermissionGeneration(
+            generation=0,
+            config_identity=retained_identity,
+            row_identity=skypilot_config.ServerConfigIdentity(revision=1,
+                                                              digest='a' * 64)))
+
+    skypilot_config.initialize_postgres_server_config_authority()
+
+    get_record.assert_called_once_with()
+    assert session.execute.call_count == 2
+    statement = session.execute.call_args_list[0].args[0]
+    assert 'ON CONFLICT (key) DO NOTHING' in str(statement)
+    assert statement.compile().params['value'] == '{}\n'
+
+
+def test_verify_postgres_server_config_authority_is_read_only(
+        monkeypatch) -> None:
+    engine = mock.MagicMock()
+    engine.dialect.name = 'postgresql'
+    retained = config_utils.Config.from_dict({'active_workspace': 'retained'})
+    retained_value = yaml_utils.dump_yaml_str(dict(retained))
+    retained_identity = skypilot_config.ServerConfigIdentity(
+        revision=3, digest=skypilot_config._config_value_digest(retained_value))  # pylint: disable=protected-access
+    retained_record = skypilot_config.ServerConfigRecord(
+        config=retained,
+        identity=retained_identity,
+        value=retained_value,
+    )
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SERVER_CONFIG_MODE,
+                       skypilot_config.SERVER_CONFIG_MODE_POSTGRES)
+    monkeypatch.setenv(constants.ENV_VAR_DB_CONNECTION_URI,
+                       'postgresql://unused')
+    monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'verify')
+    monkeypatch.setattr(
+        skypilot_config._db_manager,  # pylint: disable=protected-access
+        'get_engine',
+        lambda: engine)
+    monkeypatch.setattr(skypilot_config, '_get_server_config_record_from_db',
+                        lambda: retained_record)
+    monkeypatch.setattr(
+        skypilot_config, 'get_workspace_permission_generation',
+        lambda: skypilot_config.WorkspacePermissionGeneration(
+            generation=4,
+            config_identity=retained_identity,
+            row_identity=skypilot_config.ServerConfigIdentity(revision=5,
+                                                              digest='b' * 64)))
+
+    skypilot_config.initialize_postgres_server_config_authority()
+
+    engine.begin.assert_not_called()
+
+
+def test_verify_postgres_server_config_authority_fails_without_row(
+        monkeypatch) -> None:
+    engine = mock.MagicMock()
+    engine.dialect.name = 'postgresql'
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SERVER_CONFIG_MODE,
+                       skypilot_config.SERVER_CONFIG_MODE_POSTGRES)
+    monkeypatch.setenv(constants.ENV_VAR_DB_CONNECTION_URI,
+                       'postgresql://unused')
+    monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'verify')
+    monkeypatch.setattr(
+        skypilot_config._db_manager,  # pylint: disable=protected-access
+        'get_engine',
+        lambda: engine)
+    monkeypatch.setattr(skypilot_config, '_get_server_config_record_from_db',
+                        lambda: None)
+
+    with pytest.raises(RuntimeError, match='api_server_config row'):
+        skypilot_config.initialize_postgres_server_config_authority()
+
+    engine.begin.assert_not_called()
+
+
 def test_invalid_override_config(monkeypatch, tmp_path) -> None:
     """Test that an invalid override config is rejected."""
     with pytest.raises(sky.exceptions.InvalidSkyPilotConfigError) as e:
@@ -698,11 +935,15 @@ def test_get_override_skypilot_config_from_client_get_latest_config(tmp_path):
         kubernetes:
             ports: ingress
         """))
-    with mock.patch('os.environ.get', return_value=old_path):
+    with mock.patch.dict(
+            os.environ,
+        {skypilot_config.ENV_VAR_SKYPILOT_CONFIG: str(old_path)}):
         skypilot_config.reload_config()
         result_old = payloads.get_override_skypilot_config_from_client()
         assert result_old['kubernetes']['ports'] == 'loadbalancer'
-    with mock.patch('os.environ.get', return_value=new_path):
+    with mock.patch.dict(
+            os.environ,
+        {skypilot_config.ENV_VAR_SKYPILOT_CONFIG: str(new_path)}):
         skypilot_config.reload_config()
         result_new = payloads.get_override_skypilot_config_from_client()
         assert result_new['kubernetes']['ports'] == 'ingress'

@@ -3,6 +3,108 @@ suite: image_workers_test
 templates:
   - templates/image-workers.yaml
 tests:
+  - it: should use PostgreSQL as the guarded-HA config authority
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      imageCopyWorker.enabled: true
+      imageCopyWorker.serviceAccount.create: false
+      imageCopyWorker.serviceAccount.name: copy-worker
+    asserts:
+      - hasDocuments:
+          count: 1
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVER_CONFIG_MODE
+            value: postgres
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_GLOBAL_CONFIG
+      - notExists:
+          path: spec.template.spec.containers[0].volumeMounts
+      - notExists:
+          path: spec.template.spec.volumes
+
+  - it: should omit config projection from every guarded-HA image worker
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      imageCopyWorker.enabled: true
+      imageCopyWorker.serviceAccount.create: false
+      imageCopyWorker.serviceAccount.name: copy-worker
+      imageLifecycleWorker.enabled: true
+      imageLifecycleWorker.serviceAccount.create: false
+      imageLifecycleWorker.serviceAccount.name: lifecycle-worker
+      imageCanaryWorker.enabled: true
+      imageCanaryWorker.serviceAccount.create: false
+      imageCanaryWorker.serviceAccount.name: canary-worker
+    asserts:
+      - hasDocuments:
+          count: 3
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_GLOBAL_CONFIG
+        documentIndex: 0
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_GLOBAL_CONFIG
+        documentIndex: 1
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_GLOBAL_CONFIG
+        documentIndex: 2
+      - notExists:
+          path: spec.template.spec.containers[0].volumeMounts
+        documentIndex: 0
+      - notExists:
+          path: spec.template.spec.containers[0].volumeMounts
+        documentIndex: 1
+      - notExists:
+          path: spec.template.spec.containers[0].volumeMounts
+        documentIndex: 2
+      - notExists:
+          path: spec.template.spec.volumes
+        documentIndex: 0
+      - notExists:
+          path: spec.template.spec.volumes
+        documentIndex: 1
+      - notExists:
+          path: spec.template.spec.volumes
+        documentIndex: 2
+
+  - it: should retain config projection for a non-HA image worker
+    set:
+      apiService.highAvailability.enabled: false
+      apiService.dbConnectionSecretName: external-db
+      imageCopyWorker.enabled: true
+      imageCopyWorker.serviceAccount.create: false
+      imageCopyWorker.serviceAccount.name: copy-worker
+    asserts:
+      - hasDocuments:
+          count: 1
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_GLOBAL_CONFIG
+            value: /var/skypilot/config/config.yaml
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: skypilot-config
+            mountPath: /var/skypilot/config
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-config
+            configMap:
+              name: RELEASE-NAME-config
+
   - it: should keep source credential RBAC names distinct at the DNS limit
     set:
       fullnameOverride: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

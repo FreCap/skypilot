@@ -39,7 +39,7 @@
 {{- $lbDataPlaneSecret := get $lbDataPlaneAuth "existingSecret" | default "" -}}
 {{- $lbDataPlaneKey := get $lbDataPlaneAuth "key" | default "" -}}
 {{- $lbDataPlaneAuthEnabled := and $externalLBEnabled (not (empty $lbDataPlaneSecret)) (not (empty $lbDataPlaneKey)) -}}
-{{- $executorReservedEnvNames := list "KUBECONFIG" "POD_IP" "PROMETHEUS_MULTIPROC_DIR" "SKY_API_SERVER_METRICS_ENABLED" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH" "SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS" "SKYPILOT_API_SERVER_ENDPOINT" "SKYPILOT_API_SERVER_INSTANCE_ID" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_EXECUTION_DRAIN_SECONDS" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_POD_UID" "SKYPILOT_RELEASE_NAME" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_EXTERNAL_LB_SERVICE_ANNOTATIONS_JSON" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_STATE_DB_MIGRATION_MODE" -}}
+{{- $executorReservedEnvNames := list "KUBECONFIG" "POD_IP" "PROMETHEUS_MULTIPROC_DIR" "SKY_API_SERVER_METRICS_ENABLED" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH" "SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS" "SKYPILOT_API_SERVER_ENDPOINT" "SKYPILOT_API_SERVER_INSTANCE_ID" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_EXECUTION_DRAIN_SECONDS" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_POD_UID" "SKYPILOT_RELEASE_NAME" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVER_CONFIG_MODE" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_EXTERNAL_LB_SERVICE_ANNOTATIONS_JSON" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_STATE_DB_MIGRATION_MODE" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $executorReservedEnvNames = concat $executorReservedEnvNames (list "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY") -}}
 {{- end -}}
@@ -62,7 +62,7 @@
 {{- $executorReservedEnvNames = append $executorReservedEnvNames "VAST_API_KEY" -}}
 {{- end -}}
 
-{{- $executorReservedVolumeNames := list "skypilot-config" "skypilot-role-runtime" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
+{{- $executorReservedVolumeNames := list "skypilot-role-runtime" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $executorReservedVolumeNames = concat $executorReservedVolumeNames (list "aws-config" "aws-config-files") -}}
 {{- end -}}
@@ -97,7 +97,7 @@
 {{- $executorReservedVolumeNames = append $executorReservedVolumeNames "vast-config" -}}
 {{- end -}}
 
-{{- $executorReservedMountPaths := list "/etc/skypilot/serve-auth/controller-admin" "/etc/skypilot/serve-auth/lb-data-plane" "/etc/skypilot/serve-auth/lb-sync" "/root/.sky" "/root/.sky/.server.yaml" "/root/.ssh" "/root/sky_logs" "/var/run/skypilot" "/var/skypilot/config" "/var/skypilot/ssh_keys" "/var/skypilot/ssh_node_pool" -}}
+{{- $executorReservedMountPaths := list "/etc/skypilot/serve-auth/controller-admin" "/etc/skypilot/serve-auth/lb-data-plane" "/etc/skypilot/serve-auth/lb-sync" "/root/.sky" "/root/.sky/.server.yaml" "/root/.ssh" "/root/sky_logs" "/var/run/skypilot" "/var/skypilot/ssh_keys" "/var/skypilot/ssh_node_pool" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $executorReservedMountPaths = append $executorReservedMountPaths "/root/.aws" -}}
 {{- end -}}
@@ -229,6 +229,8 @@ spec:
           value: {{ printf "http://%s-api-service.%s.svc" $fullName .Release.Namespace | quote }}
         - name: SKYPILOT_API_SERVER_ROLE
           value: executor
+        - name: SKYPILOT_SERVER_CONFIG_MODE
+          value: postgres
         {{- if .Values.apiService.metrics.enabled }}
         - name: SKY_API_SERVER_METRICS_ENABLED
           value: "true"
@@ -337,21 +339,6 @@ spec:
           {{ .Values.apiService.preDeployHook | nindent 10 }}
           {{- end }}
           mkdir -p /root/.sky
-          if [ -L /root/.sky/config.yaml ]; then
-            rm -f /root/.sky/config.yaml
-          fi
-          if [ ! -s /root/.sky/config.yaml ]; then
-            config_tmp="/root/.sky/.config.yaml.${SKYPILOT_POD_UID}.tmp"
-            cp /var/skypilot/config/config.yaml "$config_tmp"
-            if [ ! -e /root/.sky/config.yaml ]; then
-              mv -n "$config_tmp" /root/.sky/config.yaml
-            fi
-            if [ ! -s /root/.sky/config.yaml ]; then
-              mv -f "$config_tmp" /root/.sky/config.yaml
-            else
-              rm -f "$config_tmp"
-            fi
-          fi
           {{- if .Values.apiService.sshNodePools }}
           ln -sf /var/skypilot/ssh_node_pool/ssh_node_pools.yaml /root/.sky/ssh_node_pools.yaml
           mkdir -p /root/.kube
@@ -436,8 +423,6 @@ spec:
         - name: state-volume
           mountPath: /root/sky_logs
           subPath: sky_logs
-        - name: skypilot-config
-          mountPath: /var/skypilot/config
         {{- if or .Values.auth.externalProxy.enabled (eq (include "skypilot.ingressOAuthEnabled" .) "true") }}
         - name: skypilot-server-config
           mountPath: /root/.sky/.server.yaml
@@ -697,9 +682,6 @@ spec:
       - name: state-volume
         persistentVolumeClaim:
           claimName: {{ $stateClaimName }}
-      - name: skypilot-config
-        configMap:
-          name: {{ $fullName }}-config
       {{- if or .Values.auth.externalProxy.enabled (eq (include "skypilot.ingressOAuthEnabled" .) "true") }}
       - name: skypilot-server-config
         configMap:

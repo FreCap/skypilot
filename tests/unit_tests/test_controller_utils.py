@@ -1166,6 +1166,37 @@ def test_skypilot_config_env_set_when_local_config_present(
     os.unlink(result['local_user_config_path'])
 
 
+@pytest.mark.parametrize(('controller_type', 'snapshot_kind'), [
+    ('jobs', skypilot_config.INTERNAL_CONFIG_SNAPSHOT_KIND_MANAGED_JOB),
+    ('serve', skypilot_config.INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE),
+])
+def test_guarded_controller_config_env_has_exact_snapshot_receipt(
+        controller_type: str, snapshot_kind: str, monkeypatch):
+    monkeypatch.setattr(
+        'sky.utils.controller_utils._get_cloud_dependencies_installation_commands',
+        lambda controller: [])
+    monkeypatch.setattr(skypilot_config,
+                        '_postgres_server_config_is_authoritative',
+                        lambda: True)
+    controller = controller_utils.Controllers.from_type(controller_type)
+    remote_path = '/remote/path/config.yaml'
+
+    result = controller_utils.shared_controller_vars_to_fill(
+        controller, remote_path, {'active_workspace': 'research'})
+
+    local_path = result['local_user_config_path']
+    assert local_path is not None
+    try:
+        with open(local_path, 'rb') as config_file:
+            expected = skypilot_config.internal_config_snapshot_environment(
+                snapshot_kind, remote_path, config_file.read())
+        envs = result['controller_envs']
+        assert envs[skypilot_config.ENV_VAR_SKYPILOT_CONFIG] == remote_path
+        assert all(envs[name] == value for name, value in expected.items())
+    finally:
+        os.unlink(local_path)
+
+
 @pytest.mark.parametrize('controller_type', ['jobs', 'serve'])
 def test_skypilot_config_env_NOT_set_when_local_config_empty(
         controller_type: str, monkeypatch):

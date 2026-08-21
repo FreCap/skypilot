@@ -107,6 +107,27 @@ tests:
           content:
             name: SKYPILOT_API_SERVER_ROLE
             value: controller
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_GLOBAL_CONFIG
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: skypilot-config
+            mountPath: /var/skypilot/config
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-config
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVER_CONFIG_MODE
+            value: postgres
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].args[2]
+          pattern: "config_tmp|/root/.sky/config.yaml"
       - contains:
           path: spec.template.spec.containers[0].env
           content:

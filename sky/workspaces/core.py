@@ -1,6 +1,7 @@
 """Workspace management core."""
 
 from collections.abc import Callable
+import copy
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,6 +33,7 @@ logger = sky_logging.init_logger(__name__)
 # Lock for workspace configuration updates to prevent race conditions
 _WORKSPACE_CONFIG_LOCK_TIMEOUT_SECONDS = 60
 _INHERITED_ALLOWED_CONTEXTS_UNSET = object()
+_WorkspacePolicyUpdates = dict[str, list[str] | None]
 
 
 @dataclass
@@ -131,7 +133,8 @@ def get_accessible_workspace_names_for_user(user_id: str,
 
 
 def _update_workspaces_config(
-    workspace_modifier_fn: Callable[[dict[str, Any]], None],
+    workspace_modifier_fn: Callable[[dict[str, Any]],
+                                    _WorkspacePolicyUpdates | None],
     expected_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Update the workspaces configuration in the config file.
@@ -149,6 +152,39 @@ def _update_workspaces_config(
     Returns:
         The updated workspaces configuration.
     """
+    if skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+        expected_identity = skypilot_config.get_loaded_server_config_identity()
+        policy_updates: _WorkspacePolicyUpdates = {}
+
+        def config_modifier(current_config: dict[str, Any]) -> None:
+            if (expected_config is not None and
+                    current_config != expected_config):
+                raise RuntimeError(
+                    'SkyPilot configuration changed while the workspace '
+                    'update was being validated. Please retry the update.')
+            current_workspaces = copy.deepcopy(
+                current_config.get('workspaces', {}))
+            updates = workspace_modifier_fn(current_workspaces) or {}
+            policy_updates.update(updates)
+            current_config['workspaces'] = current_workspaces
+
+        def transaction_hook(session, _current_record, next_record):
+            if not policy_updates:
+                return None
+            return permission.permission_service.replace_workspace_policies_in_session(
+                session, policy_updates, next_record.identity)
+
+        next_record, generation = (
+            skypilot_config.mutate_postgres_server_config(
+                config_modifier,
+                expected_identity=expected_identity,
+                transaction_hook=transaction_hook,
+            ))
+        if generation is not None:
+            permission.permission_service.reload_workspace_policy_after_commit(
+                generation)
+        return copy.deepcopy(next_record.config.get('workspaces', {}))
+
     lock_path = skypilot_config.get_skypilot_config_lock_path()
     try:
         with filelock.FileLock(lock_path,
@@ -164,7 +200,18 @@ def _update_workspaces_config(
             current_workspaces = current_config.get('workspaces', {}).copy()
 
             # Apply the modification inside the lock
-            workspace_modifier_fn(current_workspaces)
+            policy_updates = workspace_modifier_fn(current_workspaces) or {}
+
+            permission_service = permission.permission_service
+            for workspace_name, users in policy_updates.items():
+                if users is None:
+                    permission_service.remove_workspace_policy(workspace_name)
+                elif workspace_name in current_config.get('workspaces', {}):
+                    permission_service.update_workspace_policy(
+                        workspace_name, users)
+                else:
+                    permission_service.add_workspace_policy(
+                        workspace_name, users)
 
             # Update the config with the modified workspaces
             current_config['workspaces'] = current_workspaces
@@ -619,12 +666,12 @@ def update_workspace(workspace_name: str, config: dict[str,
         config,
         inherited_allowed_contexts=(inherited_allowed_contexts))
 
-    def update_workspace_fn(workspaces: dict[str, Any]) -> None:
+    def update_workspace_fn(
+            workspaces: dict[str, Any]) -> _WorkspacePolicyUpdates:
         """Function to update workspace inside the lock."""
         workspaces[workspace_name] = config
         users = workspaces_utils.get_workspace_users(config)
-        permission_service = permission.permission_service
-        permission_service.update_workspace_policy(workspace_name, users)
+        return {workspace_name: users}
 
     # Use the internal helper function to save
     result = _update_workspaces_config(update_workspace_fn,
@@ -665,7 +712,8 @@ def create_workspace(workspace_name: str, config: dict[str,
 
     _validate_workspace_config(workspace_name, config)
 
-    def create_workspace_fn(workspaces: dict[str, Any]) -> None:
+    def create_workspace_fn(
+            workspaces: dict[str, Any]) -> _WorkspacePolicyUpdates:
         """Function to create workspace inside the lock."""
         if workspace_name in workspaces:
             raise ValueError(f'Workspace {workspace_name!r} already exists. '
@@ -673,8 +721,7 @@ def create_workspace(workspace_name: str, config: dict[str,
         workspaces[workspace_name] = config
         # Add policy for the workspace and allowed users
         users = workspaces_utils.get_workspace_users(config)
-        permission_service = permission.permission_service
-        permission_service.add_workspace_policy(workspace_name, users)
+        return {workspace_name: users}
 
     # Use the internal helper function to save
     result = _update_workspaces_config(create_workspace_fn)
@@ -720,13 +767,13 @@ def delete_workspace(workspace_name: str) -> dict[str, Any]:
     resource_checker.check_no_active_resources_for_workspaces([(workspace_name,
                                                                 'delete')])
 
-    def delete_workspace_fn(workspaces: dict[str, Any]) -> None:
+    def delete_workspace_fn(
+            workspaces: dict[str, Any]) -> _WorkspacePolicyUpdates:
         """Function to delete workspace inside the lock."""
         if workspace_name not in workspaces:
             raise ValueError(f'Workspace {workspace_name!r} does not exist.')
         del workspaces[workspace_name]
-        permission_service = permission.permission_service
-        permission_service.remove_workspace_policy(workspace_name)
+        return {workspace_name: None}
 
     # Use the internal helper function to save
     return _update_workspaces_config(delete_workspace_fn)
@@ -866,12 +913,16 @@ def update_config(config: dict[str, Any]) -> dict[str, Any]:
     resource_checker.check_no_active_resources_for_workspaces(
         workspaces_to_check)
 
-    # Use file locking to prevent race conditions
-    lock_path = skypilot_config.get_skypilot_config_lock_path()
-    try:
-        with filelock.FileLock(lock_path,
-                               _WORKSPACE_CONFIG_LOCK_TIMEOUT_SECONDS):
-            latest_config = skypilot_config.to_dict()
+    policy_updates: _WorkspacePolicyUpdates = {}
+    for operation, workspaces in workspaces_to_check_policy.items():
+        for workspace_name, users in workspaces.items():
+            policy_updates[workspace_name] = (None if operation == 'delete' else
+                                              users)
+
+    if skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+        expected_identity = skypilot_config.get_loaded_server_config_identity()
+
+        def config_modifier(latest_config: dict[str, Any]) -> None:
             latest_workspaces = latest_config.get('workspaces', {})
             _, latest_inherited_allowed_contexts = (
                 _extract_k8s_allowed_contexts(latest_config))
@@ -882,28 +933,61 @@ def update_config(config: dict[str, Any]) -> dict[str, Any]:
                     'SkyPilot workspace configuration changed while the full '
                     'configuration update was being validated. Please retry '
                     'the update.')
-            # Convert to config_utils.Config and save
-            config_obj = config_utils.Config.from_dict(config)
-            skypilot_config.update_api_server_config_no_lock(config_obj)
-            permission_service = permission.permission_service
-            for operation, workspaces in workspaces_to_check_policy.items():
-                for workspace_name, users in workspaces.items():
-                    if operation == 'add':
-                        permission_service.add_workspace_policy(
-                            workspace_name, users)
-                    elif operation == 'update':
-                        permission_service.update_workspace_policy(
-                            workspace_name, users)
-                    elif operation == 'delete':
-                        permission_service.remove_workspace_policy(
-                            workspace_name)
-    except filelock.Timeout as e:
-        raise RuntimeError(
-            f'Failed to update configuration due to a timeout '
-            f'when trying to acquire the lock at {lock_path}. This may '
-            'indicate another SkyPilot process is currently updating the '
-            'configuration. Please try again or manually remove the lock '
-            f'file if you believe it is stale.') from e
+            latest_config.clear()
+            latest_config.update(copy.deepcopy(config))
+
+        def transaction_hook(session, _current_record, next_record):
+            if not policy_updates:
+                return None
+            return permission.permission_service.replace_workspace_policies_in_session(
+                session, policy_updates, next_record.identity)
+
+        _, generation = skypilot_config.mutate_postgres_server_config(
+            config_modifier,
+            expected_identity=expected_identity,
+            transaction_hook=transaction_hook,
+        )
+        if generation is not None:
+            permission.permission_service.reload_workspace_policy_after_commit(
+                generation)
+    else:
+        # Preserve the standalone/non-HA file + policy compatibility path.
+        lock_path = skypilot_config.get_skypilot_config_lock_path()
+        try:
+            with filelock.FileLock(lock_path,
+                                   _WORKSPACE_CONFIG_LOCK_TIMEOUT_SECONDS):
+                latest_config = skypilot_config.to_dict()
+                latest_workspaces = latest_config.get('workspaces', {})
+                _, latest_inherited_allowed_contexts = (
+                    _extract_k8s_allowed_contexts(latest_config))
+                if (latest_workspaces != current_workspaces or
+                        latest_inherited_allowed_contexts
+                        != inherited_allowed_contexts):
+                    raise RuntimeError(
+                        'SkyPilot workspace configuration changed while the '
+                        'full configuration update was being validated. '
+                        'Please retry the update.')
+                config_obj = config_utils.Config.from_dict(config)
+                skypilot_config.update_api_server_config_no_lock(config_obj)
+                permission_service = permission.permission_service
+                for operation, workspaces in workspaces_to_check_policy.items():
+                    for workspace_name, users in workspaces.items():
+                        if operation == 'add':
+                            permission_service.add_workspace_policy(
+                                workspace_name, users)
+                        elif operation == 'update':
+                            permission_service.update_workspace_policy(
+                                workspace_name, users)
+                        elif operation == 'delete':
+                            permission_service.remove_workspace_policy(
+                                workspace_name)
+        except filelock.Timeout as e:
+            raise RuntimeError(
+                f'Failed to update configuration due to a timeout '
+                f'when trying to acquire the lock at {lock_path}. This may '
+                'indicate another SkyPilot process is currently updating the '
+                'configuration. Please try again or manually remove the lock '
+                f'file if you believe it is stale.') from e
 
     # Validate the configuration by running sky check
     try:
@@ -1009,9 +1093,9 @@ def batch_add_users_to_workspaces(workspace_names: list[str],
         return {'succeeded': [], 'failed': failed}
 
     succeeded: list[str] = []
-    permission_service = permission.permission_service
 
-    def modifier(workspaces: dict[str, Any]) -> None:
+    def modifier(workspaces: dict[str, Any]) -> _WorkspacePolicyUpdates:
+        policy_updates: _WorkspacePolicyUpdates = {}
         for workspace_name in workspace_names:
             try:
                 if workspace_name not in workspaces:
@@ -1054,14 +1138,10 @@ def batch_add_users_to_workspaces(workspace_names: list[str],
                 # so we skip it here.
                 _validate_workspace_config(workspace_name, new_config)
                 workspaces[workspace_name] = new_config
-                # Update casbin policy inside the file lock so the config
-                # file and the policy table can't drift out of sync if the
-                # process crashes between the two updates. update_workspace
-                # follows the same pattern. resolved_current is the post-add
-                # user_id set we just computed, so reuse it instead of
-                # re-resolving (which would hit get_all_users() again).
-                permission_service.update_workspace_policy(
-                    workspace_name, list(resolved_current))
+                # Reuse the post-add user set instead of re-resolving it. The
+                # guarded path commits this exact replacement with config and
+                # the cache-generation receipt in one PostgreSQL transaction.
+                policy_updates[workspace_name] = list(resolved_current)
                 succeeded.append(workspace_name)
             except ValueError as e:
                 failed.append({
@@ -1075,6 +1155,7 @@ def batch_add_users_to_workspaces(workspace_names: list[str],
                     'workspace_name': workspace_name,
                     'error': str(e),
                 })
+        return policy_updates
 
     _update_workspaces_config(modifier)
 
@@ -1202,9 +1283,8 @@ def batch_remove_users_from_workspaces(workspace_names: list[str],
     if not validated_changes:
         return {'succeeded': succeeded, 'failed': failed}
 
-    permission_service = permission.permission_service
-
-    def modifier(workspaces: dict[str, Any]) -> None:
+    def modifier(workspaces: dict[str, Any]) -> _WorkspacePolicyUpdates:
+        policy_updates: _WorkspacePolicyUpdates = {}
         for workspace_name, (new_ws_config,
                              new_resolved) in validated_changes.items():
             try:
@@ -1217,13 +1297,9 @@ def batch_remove_users_from_workspaces(workspace_names: list[str],
                     })
                     continue
                 workspaces[workspace_name] = new_ws_config
-                # Update casbin policy inside the file lock so the config
-                # file and the policy table can't drift out of sync if the
-                # process crashes between the two updates. Use the
-                # pre-resolved user_id list (computed during validation)
-                # so we don't re-call get_workspace_users -> get_all_users.
-                permission_service.update_workspace_policy(
-                    workspace_name, new_resolved)
+                # Use the pre-resolved user IDs. The guarded path applies this
+                # exact replacement inside the central config transaction.
+                policy_updates[workspace_name] = new_resolved
                 succeeded.append(workspace_name)
             except Exception as e:  # pylint: disable=broad-except
                 logger.exception(
@@ -1232,6 +1308,7 @@ def batch_remove_users_from_workspaces(workspace_names: list[str],
                     'workspace_name': workspace_name,
                     'error': str(e),
                 })
+        return policy_updates
 
     _update_workspaces_config(modifier)
 
