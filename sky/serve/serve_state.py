@@ -47,6 +47,7 @@ from sky.serve import reserved_fill_reclaim_proofs
 from sky.serve import resource_action_m4_state_schema
 from sky.serve import route_projection_schema
 from sky.serve import serve_state_schema
+from sky.serve import zero_cost_actuation_schema
 from sky.serve.lb_cutover_state import lb_cutover_kubernetes_guard as _lb_guard
 from sky.serve.serve_statuses import ReplicaStatus
 from sky.serve.serve_statuses import ServiceStatus
@@ -3029,6 +3030,157 @@ def service_replica_launch_fence_holds(
         launch_context, binding_excluded_launch_context) is not None
 
 
+def reserved_fill_committed_launch_authority_holds(
+    launch_context: dict[str, Any],
+    launch_snapshot: ServiceReplicaLaunchFenceSnapshot | None,
+) -> bool:
+    """Validate the immutable postcommit fill handoff before provider I/O.
+
+    Mutable allocation maps, claim sets, observations, reconciliation gates,
+    deployment-policy callbacks, and context-wide inventory proofs authorize
+    only precommit admission.  After Serve056 atomically links a replica to a
+    COMMITTED intent, this function reads only that frozen graph plus the
+    current service/version owner.  The surrounding bound-request guard owns
+    the exact association/request execution generation and holds the service
+    authority lock across the concrete provider mutation.
+    """
+    if (launch_snapshot is None or
+            launch_snapshot.durable_replica_info is None):
+        return False
+    durable_replica = launch_snapshot.durable_replica_info
+    if (durable_replica.reserved_fill is not True or
+            durable_replica.is_zero_cost is not True or
+            durable_replica.is_spot is not False or
+            durable_replica.paid_capacity_pool_key is not None):
+        return False
+    try:
+        fence = reserved_capacity.parse_protocol_v2_launch_fence(launch_context)
+        if fence is None or not fence.policy_bound:
+            return False
+        reserved_capacity.validate_protocol_v2_launch_fence_against_replica(
+            fence, durable_replica)
+        service_name = launch_context[
+            constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY]
+        service_hash = launch_context[
+            constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY]
+        if (not isinstance(service_name, str) or not service_name or
+                not isinstance(service_hash, str) or not service_hash):
+            return False
+        engine = _db_manager.get_engine()
+        if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            return False
+        with engine.begin() as connection:
+            lifecycle_epoch = connection.execute(
+                sqlalchemy.select(service_lifecycle_fences_table.c.epoch).where(
+                    service_lifecycle_fences_table.c.name ==
+                    service_name)).scalar_one_or_none()
+            service_row = connection.execute(
+                sqlalchemy.select(services_table).where(
+                    services_table.c.name ==
+                    service_name)).mappings().one_or_none()
+            if service_row is None:
+                return False
+            try:
+                service_status = ServiceStatus(str(service_row['status']))
+            except ValueError:
+                return False
+            if (service_status
+                    in ServiceStatus.replica_launch_blocking_statuses() or
+                    lifecycle_epoch != service_row['lifecycle_epoch'] or
+                    service_row['hash'] != service_hash or
+                    service_row['resource_scope'] != service_hash or
+                    service_row['current_version'] != fence.service_version or
+                    service_row['reserved_fill_actuation_mode']
+                    != zero_cost_actuation.ActuationMode.DURABLE_INTENT.value or
+                    service_row['reserved_fill_actuation_capable'] is not True
+                    or service_row[
+                        'reserved_fill_actuation_controller_incarnation']
+                    != service_row['controller_incarnation'] or
+                    service_row['reserved_fill_actuation_protocol_version']
+                    != zero_cost_actuation.PROTOCOL_VERSION or
+                    service_row['ordinary_launch_binding_mode'] != 'bound' or
+                    service_row['ordinary_launch_binding_capable'] is not True
+                    or service_row['non_pool_launch_binding_capable']
+                    is not True or
+                    service_row['non_pool_launch_controller_incarnation']
+                    != service_row['controller_incarnation'] or
+                    service_row['non_pool_launch_binding_protocol_version']
+                    != 2):
+                return False
+            intent = (
+                zero_cost_actuation.committed_intent_for_replica_in_connection(
+                    connection,
+                    service_name=service_name,
+                    service_hash=service_hash,
+                    replica_info=durable_replica))
+            intent_owner = connection.execute(
+                sqlalchemy.select(
+                    zero_cost_actuation_schema.
+                    serve_zero_cost_actuation_intents_table.c.
+                    service_lifecycle_epoch,
+                    zero_cost_actuation_schema.
+                    serve_zero_cost_actuation_intents_table.c.actuation_epoch,
+                ).where(
+                    zero_cost_actuation_schema.
+                    serve_zero_cost_actuation_intents_table.c.service_name ==
+                    service_name,
+                    zero_cost_actuation_schema.
+                    serve_zero_cost_actuation_intents_table.c.
+                    intent_idempotency_key == getattr(
+                        durable_replica, 'reserved_fill_intent_idempotency_key',
+                        None),
+                    zero_cost_actuation_schema.
+                    serve_zero_cost_actuation_intents_table.c.state ==
+                    zero_cost_actuation.IntentState.COMMITTED.value,
+                )).mappings().one_or_none()
+            if (intent is None or intent_owner is None or
+                    intent_owner['service_lifecycle_epoch']
+                    != service_row['lifecycle_epoch'] or
+                    intent_owner['actuation_epoch']
+                    != service_row['reserved_fill_actuation_epoch'] or
+                    intent.service_version != fence.service_version or
+                    intent.pool_key != fence.pool_key or
+                    intent.service_generation != fence.service_generation or
+                    intent.physical_cluster_uid != fence.physical_cluster_uid or
+                    intent.allowed_locations[0].region
+                    != fence.kubernetes_context or
+                    intent.accelerator.casefold()
+                    != fence.accelerator.casefold() or
+                    intent.accelerator_count != fence.accelerator_count or
+                    intent.reconciliation_gate_generation
+                    != fence.reconciliation_gate_generation or
+                    intent.reclaim_fleet_bundle_sha256
+                    != fence.reclaim_fleet_bundle_sha256 or
+                    intent.reclaim_policy_revision
+                    != fence.reclaim_policy_revision or
+                    intent.reclaim_provider_inventory_sha256
+                    != fence.reclaim_provider_inventory_sha256 or
+                    intent.worker_projection_sha256
+                    != fence.worker_projection_sha256):
+                return False
+            version_row = connection.execute(
+                sqlalchemy.select(
+                    version_specs_table.c.worker_placement_projections).where(
+                        version_specs_table.c.service_name == service_name,
+                        version_specs_table.c.version == fence.service_version,
+                        version_specs_table.c.yaml_content.isnot(None),
+                        version_specs_table.c.quarantined_at.is_(None),
+                        version_specs_table.c.retired_at.is_(None),
+                    )).mappings().one_or_none()
+            if version_row is None:
+                return False
+            _, projected_admission = (
+                reserved_capacity.require_reclaim_worker_projection(
+                    fence, version_row['worker_placement_projections']))
+            if (projected_admission.worker_projection_sha256
+                    != intent.worker_projection_sha256):
+                return False
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError,
+            zero_cost_actuation.ZeroCostActuationError):
+        return False
+    return True
+
+
 def reserved_fill_reclaim_launch_authority_holds(
     scope: reserved_fill_reclaim_attestation.ReclaimLaunchScope | None,
     authorization: (reserved_fill_reclaim_attestation.ReclaimLaunchAuthorization
@@ -3592,6 +3744,7 @@ _ACTION_OWNED_REPLICA_COLUMNS = frozenset({
     'resource_action_spec_identity_sha256',
     'ordinary_launch_association_id',
     'non_pool_launch_authorization',
+    'reserved_fill_intent_idempotency_key',
 })
 _PAID_CAPACITY_UNRESOLVED_STATUSES = (
     ReplicaStatus.PENDING.value,
@@ -11517,6 +11670,15 @@ def _reserved_fill_replica_row_values(
             replica_state.get('reserved_fill') is not True or
             replica_state.get('reserved_fill_pool_key') != pool_key):
         return None
+    if expected_protocol_version == RESERVED_FILL_PROTOCOL_V2:
+        intent_key = replica_state.get('reserved_fill_intent_idempotency_key')
+        if (not isinstance(intent_key, str) or
+                re.fullmatch(r'[0-9a-f]{64}', intent_key) is None):
+            return None
+        # This scalar, rather than the JSON copy above, is the normalized
+        # Serve056 authority edge.  The database trigger exact-matches both
+        # projections to the already-COMMITTED intent on initial INSERT.
+        row_values['reserved_fill_intent_idempotency_key'] = intent_key
     return row_values
 
 
@@ -11898,9 +12060,6 @@ def _stage_postgres_replica_if_round_epoch(
         expected_protocol_version=expected_protocol_version)
     if row_values is None:
         return None
-    insert_stmt = _upsert_insert_func(engine)(replicas_table).values(
-        **row_values)
-    session.execute(insert_stmt)
     if actuation_lease is not None:
         try:
             assert replica_record_id is not None
@@ -11914,6 +12073,14 @@ def _stage_postgres_replica_if_round_epoch(
         except (TypeError, ValueError,
                 zero_cost_actuation.ZeroCostActuationError):
             return None
+    # Serve056's handoff order is intentional: the exact ACTUATING intent is
+    # first transitioned to COMMITTED, then the scalar-linked replica is
+    # inserted.  Both statements remain in this caller-owned transaction, so
+    # an insert or later request-binding failure rolls the intent transition
+    # back as well.  The database trigger refuses the inverse partial graph.
+    insert_stmt = _upsert_insert_func(engine)(replicas_table).values(
+        **row_values)
+    session.execute(insert_stmt)
 
     return StagedReservedFillReplica(replica_id=replica_id,
                                      caller_info=replica_info,

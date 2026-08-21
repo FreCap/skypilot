@@ -363,13 +363,13 @@ def test_backend_v2_provider_guard_owns_one_complete_short_epoch():
             events.append('owner-exit')
 
     @contextlib.contextmanager
-    def fleet_guard(snapshot):
+    def committed_guard(snapshot):
         assert snapshot is mock.sentinel.snapshot
-        events.append('fleet-enter')
+        events.append('committed-enter')
         try:
             yield
         finally:
-            events.append('fleet-exit')
+            events.append('committed-exit')
 
     with mock.patch.object(
             cloud_vm_ray_backend.reserved_capacity,
@@ -385,14 +385,14 @@ def test_backend_v2_provider_guard_owns_one_complete_short_epoch():
                            '_service_replica_launch_provider_owner_guard',
                            side_effect=owner_guard), \
          mock.patch.object(provisioner,
-                           '_reserved_fill_reclaim_provider_guard',
-                           side_effect=fleet_guard):
+                           '_reserved_fill_committed_provider_guard',
+                           side_effect=committed_guard):
         with provisioner._service_replica_launch_provider_guard():
             events.append('provider-effect')
 
     assert events == [
-        'association-enter', 'phase-enter', 'owner-enter', 'fleet-enter',
-        'provider-effect', 'fleet-exit', 'owner-exit', 'phase-exit',
+        'association-enter', 'phase-enter', 'owner-enter', 'committed-enter',
+        'provider-effect', 'committed-exit', 'owner-exit', 'phase-exit',
         'association-exit'
     ]
 

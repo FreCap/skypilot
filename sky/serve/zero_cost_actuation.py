@@ -727,24 +727,53 @@ def committed_intent_for_replica_in_connection(
     """Return the exact committed intent that still owns one replica.
 
     A committed intent is the durable handoff from a broker generation to a
-    replica.  It remains immutable after commit, so this read deliberately
-    avoids taking another row lock while the caller holds the launch-authority
-    lock order.
+    replica.  The normalized replica scalar is the authority edge; the JSON
+    key is only a checked projection.  Serve056 makes both the scalar and the
+    COMMITTED intent update-immutable, so this read deliberately avoids taking
+    another row lock while the caller holds the launch-authority lock order.
     """
     _require_postgres(connection)
     try:
-        intent_key = replica_info.reserved_fill_intent_idempotency_key
+        # A new server may briefly observe a migration-ceiling deployment
+        # during a rolling rollout.  Fail closed before compiling a SELECT
+        # that names the Serve056 column; do not turn expected cleanup-only
+        # compatibility into a PostgreSQL undefined-column error.
+        revision = connection.execute(
+            sqlalchemy.text(
+                'SELECT version_num FROM alembic_version_serve_state_db')
+        ).scalar_one_or_none()
+        if revision is None or int(revision) < 56:
+            return None
         replica_id = replica_info.replica_id
         raw_record_id = replica_info.replica_record_id
         replica_record_id = uuid.UUID(raw_record_id)
         if (type(service_name) is not str or not service_name or
                 type(service_hash) is not str or not service_hash or
-                type(intent_key) is not str or len(intent_key) != 64 or
-                any(character not in '0123456789abcdef'
-                    for character in intent_key) or
                 type(replica_id) is not int or replica_id < 1 or
                 type(raw_record_id) is not str or
                 str(replica_record_id) != raw_record_id):
+            return None
+        replica_row = connection.execute(
+            sqlalchemy.select(
+                _REPLICAS.c.reserved_fill_intent_idempotency_key,
+                _REPLICAS.c.replica_state_version,
+                _REPLICAS.c.replica_state,
+            ).where(
+                _REPLICAS.c.service_name == service_name,
+                _REPLICAS.c.replica_id == replica_id)).mappings().one_or_none()
+        if replica_row is None:
+            return None
+        intent_key = replica_row['reserved_fill_intent_idempotency_key']
+        replica_state = replica_row['replica_state']
+        if (type(intent_key) is not str or len(intent_key) != 64 or any(
+                character not in '0123456789abcdef' for character in intent_key)
+                or replica_row['replica_state_version'] != 1 or
+                not isinstance(replica_state, Mapping) or
+                replica_state.get('replica_record_id') != raw_record_id or
+                replica_state.get('reserved_fill_intent_idempotency_key')
+                != intent_key or
+                getattr(replica_info, 'reserved_fill_intent_idempotency_key',
+                        None) != intent_key):
             return None
         row = connection.execute(
             sqlalchemy.select(_INTENTS).where(
@@ -885,10 +914,12 @@ def commit_lease_in_connection(
 ) -> None:
     """Transfer one pending debit to its replica in the caller transaction.
 
-    The caller has already inserted the replica row but has not committed.
-    Any mismatch raises, rolling that insert back with this transition.  This
-    is deliberately not exposed as a second transaction: there must be no
-    crash window in which both the intent and replica consume capacity.
+    The caller has validated the mutable planner chain but has not inserted
+    the replica row.  This transitions the exact intent first; Serve056 then
+    permits only the matching scalar-linked replica INSERT.  Both operations
+    occur in the caller's transaction, so any later failure restores the
+    ACTUATING intent and leaves no replica.  This ordering gives the database
+    trigger a committed authority to validate without creating a crash window.
     """
     if (not isinstance(replica_id, int) or isinstance(replica_id, bool) or
             replica_id < 1 or not isinstance(replica_record_id, uuid.UUID)):
@@ -896,27 +927,23 @@ def commit_lease_in_connection(
     now, intent_row = _lock_materialization_authority(connection,
                                                       lease,
                                                       service_name=service_name)
+    try:
+        info_record_id = uuid.UUID(replica_info.replica_record_id)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ZeroCostActuationConflict(
+            'Actuation commit received a malformed replica identity.') from (
+                error)
     if (intent_row['state'] != IntentState.ACTUATING.value or
             intent_row['lease_owner'] != lease.owner or
             intent_row['lease_generation'] != lease.generation or
             intent_row['lease_expires_at'] != lease.expires_at or
             intent_row['valid_until'] <= now or
+            getattr(replica_info, 'replica_id', None) != replica_id or
+            info_record_id != replica_record_id or
             not _replica_matches_intent(replica_info, lease.intent,
                                         int(intent_row['planned_capacity']))):
         raise ZeroCostActuationConflict(
             'Actuation lease or replica handoff changed before commit.')
-    replica = connection.execute(
-        sqlalchemy.select(
-            _REPLICAS.c.replica_id, _REPLICAS.c.replica_state_version,
-            _REPLICAS.c.replica_state).where(
-                _REPLICAS.c.service_name == service_name, _REPLICAS.c.replica_id
-                == replica_id).with_for_update()).mappings().one_or_none()
-    replica_state = None if replica is None else replica['replica_state']
-    if (replica is None or replica['replica_state_version'] != 1 or
-            not isinstance(replica_state, Mapping) or
-            replica_state.get('replica_record_id') != str(replica_record_id)):
-        raise ZeroCostActuationConflict(
-            'Actuation commit does not own the inserted replica record.')
     result = connection.execute(
         sqlalchemy.update(_INTENTS).where(
             _INTENTS.c.intent_idempotency_key == lease.intent.idempotency_key,

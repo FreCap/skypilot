@@ -71,7 +71,6 @@ from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.slurm import utils as slurm_utils
 from sky.serve import constants as serve_constants
 from sky.serve import reserved_capacity
-from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import serve_state
 from sky.serve import system_oom_recovery as serve_system_oom_recovery
 from sky.serve import system_oom_recovery_observability
@@ -942,171 +941,64 @@ class RetryingVmProvisioner:
                 'Bound SkyServe preflight has no current association '
                 'authority.')
 
-    def _reserved_fill_reclaim_authorization(
-        self,
-        launch_snapshot: serve_state.ServiceReplicaLaunchFenceSnapshot | None,
-    ) -> tuple[bool, reserved_fill_reclaim_attestation.ReclaimLaunchScope |
-               None, reserved_fill_reclaim_attestation.
-               ReclaimLaunchAuthorization | None]:
-        """Bind the durable row, then mint a fresh deployment-policy ticket."""
-        try:
-            fence = reserved_capacity.parse_protocol_v2_launch_fence(
-                self._extra_launch_context)
-        except ValueError as error:
-            raise reserved_capacity.ReservedFillLaunchFenceError(
-                'Reserved-fill provider policy fence is malformed.') from error
-        durable_replica = (None if launch_snapshot is None else
-                           launch_snapshot.durable_replica_info)
-        durable_reserved_fill = bool(durable_replica is not None and
-                                     durable_replica.reserved_fill is True)
-        if fence is None:
-            return durable_reserved_fill, None, None
-        if not durable_reserved_fill:
-            raise reserved_capacity.ReservedFillLaunchFenceError(
-                'Reserved-fill provider policy fence has no exact durable '
-                'replica row.')
-        assert durable_replica is not None
-        try:
-            reserved_capacity.validate_protocol_v2_launch_fence_against_replica(
-                fence, durable_replica)
-        except ValueError as error:
-            raise reserved_capacity.ReservedFillLaunchFenceError(
-                'Reserved-fill provider policy fence changed from its '
-                'durable replica row.') from error
-        service_name = self._extra_launch_context.get(
-            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
-        if not isinstance(service_name, str) or not service_name:
-            raise reserved_capacity.ReservedFillLaunchFenceError(
-                'Reserved-fill provider policy fence has no service name.')
-        if not fence.policy_bound:
-            return True, None, None
-        try:
-            projections = self._extra_launch_context.get(
-                serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY)
-            _, projected_admission = (
-                reserved_capacity.require_reclaim_worker_projection(
-                    fence, projections))
-            scope = reserved_fill_reclaim_attestation.ReclaimLaunchScope(
-                service_name=service_name,
-                service_version=fence.service_version,
-                pool_key=fence.pool_key,
-                service_generation=fence.service_generation,
-                physical_cluster_uid=fence.physical_cluster_uid,
-                kubernetes_context=fence.kubernetes_context,
-                accelerator=fence.accelerator,
-                accelerator_count=fence.accelerator_count,
-                projected_admission=projected_admission)
-            identity = reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
-                fleet_bundle_sha256=typing.cast(
-                    str, fence.reclaim_fleet_bundle_sha256),
-                policy_revision=typing.cast(str, fence.reclaim_policy_revision),
-                provider_inventory_sha256=typing.cast(
-                    str, fence.reclaim_provider_inventory_sha256))
-            gate_generation = typing.cast(int,
-                                          fence.reconciliation_gate_generation)
-            policy = reserved_fill_reclaim_attestation.require_unique_policy()
-            (reserved_fill_reclaim_attestation.require_exact_policy_identity)(
-                policy, identity)
-            policy_deadline = (reserved_fill_reclaim_attestation.
-                               new_policy_operation_deadline())
-            authorization = policy.authorize_launch(
-                scope,
-                expected_identity=identity,
-                expected_gate_generation=gate_generation,
-                deadline_monotonic=policy_deadline)
-            (reserved_fill_reclaim_attestation.
-             require_policy_operation_completed)(policy_deadline)
-            (reserved_fill_reclaim_attestation.
-             require_exact_launch_authorization)(
-                 authorization,
-                 expected_identity=identity,
-                 expected_gate_generation=gate_generation,
-                 expected_scope=scope,
-                 minimum_remaining_seconds=(
-                     reserved_fill_reclaim_attestation.
-                     LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS))
-        except Exception as error:  # pylint: disable=broad-except
-            raise reserved_capacity.ReservedFillLaunchFenceError(
-                'Deployment reclaim policy refused the reserved-fill '
-                'provider effect.') from error
-        return True, scope, authorization
-
     @contextlib.contextmanager
-    def _reserved_fill_reclaim_provider_guard(
+    def _reserved_fill_committed_provider_guard(
         self,
         launch_snapshot: serve_state.ServiceReplicaLaunchFenceSnapshot | None,
     ) -> typing.Iterator[None]:
-        """Hold fleet gate authority across one terminal provider effect."""
+        """Use one committed intent as the post-admission provider grant."""
         durable_replica = (None if launch_snapshot is None else
                            launch_snapshot.durable_replica_info)
         durable_reserved_fill = bool(durable_replica is not None and
                                      durable_replica.reserved_fill is True)
         if not durable_reserved_fill:
-            # Preserve strict durable-fence validation for malformed contexts,
-            # but ordinary launches never acquire the reserved-fill fleet gate.
-            (authorized_reserved_fill, _,
-             _) = self._reserved_fill_reclaim_authorization(launch_snapshot)
-            if authorized_reserved_fill:
+            try:
+                fence = reserved_capacity.parse_protocol_v2_launch_fence(
+                    self._extra_launch_context)
+            except ValueError as error:
                 raise reserved_capacity.ReservedFillLaunchFenceError(
-                    'Reserved-fill durable authority changed before the '
-                    'provider operation.')
+                    'Reserved-fill committed fence is malformed.') from error
+            if fence is not None:
+                raise reserved_capacity.ReservedFillLaunchFenceError(
+                    'Reserved-fill committed fence has no exact durable '
+                    'replica row.')
             yield
             return
         provider_started = False
         try:
-            with serve_state.reserved_fill_reclaim_gate_authority_guard(
-                    shared=True) as gate_guard:
-                if not (serve_state.
-                        reserved_fill_reclaim_gate_authority_guard_is_valid(
-                            gate_guard)):
-                    raise reserved_capacity.ReservedFillLaunchFenceError(
-                        'Reserved-fill reclaim guard lost its database '
-                        'session before the provider operation.')
-                # Mint the five-second ticket only after the shared gate has
-                # been acquired. Gate acquisition is intentionally unbounded;
-                # doing this first prevents its wait from consuming proof
-                # freshness before the terminal validation below.
-                (authorized_reserved_fill, scope, authorization
-                ) = self._reserved_fill_reclaim_authorization(launch_snapshot)
-                if not authorized_reserved_fill:
-                    raise reserved_capacity.ReservedFillLaunchFenceError(
-                        'Reserved-fill durable authority changed before the '
-                        'provider operation.')
-                if not (serve_state.
-                        reserved_fill_reclaim_gate_authority_guard_is_valid(
-                            gate_guard)):
-                    raise reserved_capacity.ReservedFillLaunchFenceError(
-                        'Reserved-fill reclaim guard became indeterminate '
-                        'while proving provider authority.')
-                if not serve_state.reserved_fill_reclaim_launch_authority_holds(
-                        scope, authorization, self._extra_launch_context,
-                        launch_snapshot):
-                    raise reserved_capacity.ReservedFillLaunchFenceError(
-                        'Reserved-fill reclaim authority changed before the '
-                        'provider operation.')
+            fence = reserved_capacity.parse_protocol_v2_launch_fence(
+                self._extra_launch_context)
+            if fence is None:
+                raise reserved_capacity.ReservedFillLaunchFenceError(
+                    'Reserved-fill durable row has no protocol-v2 fence.')
+            if not serve_state.reserved_fill_committed_launch_authority_holds(
+                    self._extra_launch_context, launch_snapshot):
+                raise reserved_capacity.ReservedFillLaunchFenceError(
+                    'Reserved-fill committed intent no longer authorizes the '
+                    'provider operation.')
+            # The committed intent freezes the expected physical UID; the
+            # provider fence proves and pins the current Kubernetes target.
+            # The first create needs no Pod UID.  Its returned/adopted UID is
+            # attested by the in-tree provisioner, and later guarded epochs
+            # re-enter this same physical target before reattesting that UID.
+            with kubernetes_adaptor.physical_cluster_uid_fence(
+                    fence.kubernetes_context, fence.physical_cluster_uid):
                 provider_started = True
                 yield
-                if not (serve_state.
-                        reserved_fill_reclaim_gate_authority_guard_is_valid(
-                            gate_guard)):
-                    raise reserved_capacity.ReservedFillLaunchFenceError(
-                        'Reserved-fill reclaim guard became indeterminate '
-                        'during the provider operation.')
         except reserved_capacity.ReservedFillLaunchFenceError:
             raise
         except Exception as error:
             if provider_started:
                 raise
             raise reserved_capacity.ReservedFillLaunchFenceError(
-                'Unable to hold reserved-fill reclaim authority across the '
-                'provider operation.') from error
+                'Unable to prove the committed reserved-fill handoff before '
+                'the provider operation.') from error
 
     @contextlib.contextmanager
     def _service_replica_launch_provider_guard(self) -> typing.Iterator[None]:
         """Hold one bounded effect epoch across concrete provider I/O."""
-        # Canonical order: existing service (or already-held association)
-        # authority, the shared fleet gate, then a fresh five-second policy
-        # ticket immediately before terminal validation and provider mutation.
+        # Canonical order: exact request/association authority, current
+        # service owner, then the scalar-linked immutable COMMITTED intent.
         try:
             reserved_fill_fence = (
                 reserved_capacity.parse_protocol_v2_launch_fence(
@@ -1130,7 +1022,7 @@ class RetryingVmProvisioner:
         with effect_authority, phase:
             with self._service_replica_launch_provider_owner_guard(
             ) as launch_snapshot:
-                with self._reserved_fill_reclaim_provider_guard(
+                with self._reserved_fill_committed_provider_guard(
                         launch_snapshot):
                     yield
 

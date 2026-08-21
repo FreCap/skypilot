@@ -1758,7 +1758,7 @@ def test_reserved_fill_retry_preflight_is_passive_but_bulk_has_active_guard(
             durable_replica_info=mock.sentinel.durable_replica)
 
     @contextlib.contextmanager
-    def reclaim_guard(_snapshot):
+    def committed_guard(_snapshot):
         assert active
         yield
 
@@ -1767,8 +1767,8 @@ def test_reserved_fill_retry_preflight_is_passive_but_bulk_has_active_guard(
     monkeypatch.setattr(ordinary_launch_binding,
                         'require_active_provider_effect_authorization',
                         require_active)
-    monkeypatch.setattr(provisioner, '_reserved_fill_reclaim_provider_guard',
-                        reclaim_guard)
+    monkeypatch.setattr(provisioner, '_reserved_fill_committed_provider_guard',
+                        committed_guard)
     monkeypatch.setattr(provider_phase, 'provider_phase',
                         lambda _mode: contextlib.nullcontext())
 

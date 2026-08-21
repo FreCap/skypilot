@@ -539,8 +539,8 @@ def test_handoff_wins_takeover_and_committed_replica_survives(
     with engine.connect() as connection:
         intent = connection.execute(sqlalchemy.select(intents)).mappings().one()
         replica = connection.execute(
-            sqlalchemy.select(
-                serve_state_schema.replicas_table)).mappings().one()
+            sqlalchemy.select(serve_state_schema.replicas_table.c.replica_id)
+        ).mappings().one()
     assert intent['state'] == 'COMMITTED'
     assert intent['replica_id'] == 1
     assert intent['replica_record_id'] == record_id

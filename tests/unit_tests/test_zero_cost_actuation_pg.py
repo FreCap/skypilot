@@ -112,8 +112,10 @@ def _plan(
 def actuation_database(empty_postgres, monkeypatch):
     config = migration_utils.get_alembic_config(empty_postgres,
                                                 migration_utils.SERVE_DB_NAME)
-    # Exercise the 052 repository against the current Serve schema.  The
-    # shared services metadata includes columns introduced after 052.
+    # Exercise the pre-Serve056 cleanup-only behavior against the latest
+    # schema that does not yet have the scalar handoff column.  Older schema
+    # revisions cannot represent the current service-owner contract used by
+    # these repository tests.
     alembic_command.upgrade(config, '055')
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         empty_postgres)
@@ -125,6 +127,7 @@ def actuation_database(empty_postgres, monkeypatch):
                 workspace='workspace-a',
                 status='READY',
                 hash=_SERVICE_HASH,
+                resource_scope=_SERVICE_HASH,
                 current_version=19,
                 active_versions='[19]',
                 pool=0,
@@ -166,18 +169,19 @@ def _grant_plan(
         expected_controller_owner_epoch=controller['controller_owner_epoch'])
 
 
-def test_serve052_lineage_and_postgresql_only() -> None:
+def test_serve056_lineage_and_postgresql_only() -> None:
     sqlite = sqlalchemy.create_engine('sqlite://')
     config = migration_utils.get_alembic_config(sqlite,
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
     revision = scripts.get_revision('052')
-    assert scripts.get_heads() == ['055']
+    assert scripts.get_heads() == ['056']
+    assert scripts.get_revision('056').down_revision == '055'
     assert revision.down_revision == '051'
-    assert migration_utils.SERVE_VERSION == '055'
+    assert migration_utils.SERVE_VERSION == '056'
     assert migration_utils.serve_target_version(sqlite) == '037'
     with pytest.raises(RuntimeError, match='PostgreSQL-only'):
-        alembic_command.upgrade(config, '052')
+        alembic_command.upgrade(config, '056')
 
 
 def test_grant_is_idempotent_and_allocates_no_replica(
@@ -837,6 +841,23 @@ def _replica_for_intent(intent: reserved_fill_planner.FillIntent,
     return info
 
 
+def _commit_and_insert_replica(
+    connection: sqlalchemy.engine.Connection,
+    lease: zero_cost_actuation.IntentLease,
+    info: replica_managers.ReplicaInfo,
+) -> None:
+    record_id = uuid.UUID(info.replica_record_id)
+    zero_cost_actuation.commit_lease_in_connection(connection,
+                                                   lease,
+                                                   service_name='svc',
+                                                   replica_id=info.replica_id,
+                                                   replica_record_id=record_id,
+                                                   replica_info=info)
+    connection.execute(
+        sqlalchemy.insert(serve_state_schema.replicas_table).values(
+            **serve_state._replica_row_values('svc', info.replica_id, info)))
+
+
 def test_replica_and_intent_commit_in_one_transaction(
         actuation_database) -> None:
     repository = zero_cost_actuation.ZeroCostActuationRepository(
@@ -852,16 +873,7 @@ def test_replica_and_intent_commit_in_one_transaction(
     record_id = uuid.UUID(info.replica_record_id)
 
     with actuation_database.begin() as connection:
-        connection.execute(
-            sqlalchemy.insert(serve_state_schema.replicas_table).values(
-                **serve_state._replica_row_values('svc', 1, info)))
-        zero_cost_actuation.commit_lease_in_connection(
-            connection,
-            lease,
-            service_name='svc',
-            replica_id=1,
-            replica_record_id=record_id,
-            replica_info=info)
+        _commit_and_insert_replica(connection, lease, info)
 
     replay = _grant_plan(repository, plan, max_capacity=1)
 
@@ -876,7 +888,8 @@ def test_replica_and_intent_commit_in_one_transaction(
     assert row['replica_record_id'] == record_id
 
 
-def test_committed_intent_exactly_owns_replica(actuation_database) -> None:
+def test_pre_serve056_json_only_replica_is_cleanup_only(
+        actuation_database) -> None:
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
     plan = _plan(free_slots=1)
@@ -887,26 +900,16 @@ def test_committed_intent_exactly_owns_replica(actuation_database) -> None:
                                   lease_seconds=30)
     assert lease is not None
     info = _replica_for_intent(lease.intent, 1)
-    record_id = uuid.UUID(info.replica_record_id)
     with actuation_database.begin() as connection:
-        connection.execute(
-            sqlalchemy.insert(serve_state_schema.replicas_table).values(
-                **serve_state._replica_row_values('svc', 1, info)))
-        zero_cost_actuation.commit_lease_in_connection(
-            connection,
-            lease,
-            service_name='svc',
-            replica_id=1,
-            replica_record_id=record_id,
-            replica_info=info)
+        _commit_and_insert_replica(connection, lease, info)
 
     with actuation_database.connect() as connection:
         assert zero_cost_actuation.committed_intent_for_replica_in_connection(
             connection,
             service_name='svc',
             service_hash=_SERVICE_HASH,
-            replica_info=info) == lease.intent
-        assert zero_cost_actuation.committed_intent_matches_replica_in_connection(
+            replica_info=info) is None
+        assert not zero_cost_actuation.committed_intent_matches_replica_in_connection(
             connection,
             service_name='svc',
             service_hash=_SERVICE_HASH,
@@ -936,19 +939,9 @@ def test_committed_replica_id_high_water_survives_replica_cleanup(
                                   lease_seconds=30)
     assert lease is not None
     info = _replica_for_intent(lease.intent, 9)
-    record_id = uuid.UUID(info.replica_record_id)
 
     with actuation_database.begin() as connection:
-        connection.execute(
-            sqlalchemy.insert(serve_state_schema.replicas_table).values(
-                **serve_state._replica_row_values('svc', 9, info)))
-        zero_cost_actuation.commit_lease_in_connection(
-            connection,
-            lease,
-            service_name='svc',
-            replica_id=9,
-            replica_record_id=record_id,
-            replica_info=info)
+        _commit_and_insert_replica(connection, lease, info)
         connection.execute(
             sqlalchemy.delete(serve_state_schema.replicas_table).where(
                 serve_state_schema.replicas_table.c.service_name == 'svc',
@@ -973,9 +966,6 @@ def test_intent_mismatch_rolls_back_replica_insert(actuation_database) -> None:
 
     with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict):
         with actuation_database.begin() as connection:
-            connection.execute(
-                sqlalchemy.insert(serve_state_schema.replicas_table).values(
-                    **serve_state._replica_row_values('svc', 1, info)))
             zero_cost_actuation.commit_lease_in_connection(
                 connection,
                 lease,
