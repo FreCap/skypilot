@@ -32,14 +32,17 @@ from test_reserved_fill_allocation_pg import pg_server  # noqa: F401
 from sky import global_user_state
 from sky import global_user_state_schema
 from sky.client import sdk
+from sky.events import api_models as event_api_models
 from sky.serve import constants as serve_constants
 from sky.serve import controller_transport
 from sky.serve import ordinary_launch_binding
 from sky.serve import pool_capacity_observation
+from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
 from sky.serve import reserved_fill_reclaim_attestation
+from sky.serve import reserved_fill_reclaim_proofs
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import zero_cost_actuation
@@ -48,6 +51,7 @@ from sky.server import constants as server_constants
 from sky.server.requests import executor
 from sky.server.requests import payloads
 from sky.server.requests import postgres as request_postgres
+from sky.server.requests import requests as api_requests
 from sky.server.requests import reserved_fill_admission
 from sky.skylet import constants as skylet_constants
 from sky.utils import locks
@@ -172,8 +176,9 @@ def _authority():
             ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
 
 
-def _atomic_specs(engine, count=1, *, image_id=None):
-    authority = _authority()
+def _atomic_specs(engine, count=1, *, image_id=None, authority=None):
+    if authority is None:
+        authority = _authority()
     serve_state.attest_service_owner_user_id(authority, _CREATOR_ID,
                                              _CREATOR_NAME)
     _, snapshot = _commit_evidence(engine)
@@ -231,7 +236,7 @@ def _atomic_specs(engine, count=1, *, image_id=None):
             ordinary_launch_binding.REPLICA_RECORD_ID_KEY:
                 info.replica_record_id,
             ordinary_launch_binding.LIFECYCLE_EPOCH_KEY: 4,
-            ordinary_launch_binding.BINDING_EPOCH_KEY: _BINDING_EPOCH,
+            ordinary_launch_binding.BINDING_EPOCH_KEY: authority.binding_epoch,
             ordinary_launch_binding.CONTROLLER_INCARNATION_KEY:
                 str(_CONTROLLER_INCARNATION),
             ordinary_launch_binding.CONTROLLER_OWNER_EPOCH_KEY: _CONTROLLER_OWNER_EPOCH,
@@ -324,6 +329,52 @@ def _committed_launch_context(spec):
                 intent.reclaim_provider_inventory_sha256),
             worker_projection_sha256=intent.worker_projection_sha256))
     return context
+
+
+def _committed_launch_authorization(engine, spec):
+    intent = spec.actuation_lease.intent
+    launch_context = _committed_launch_context(spec)
+    fence = reserved_capacity.parse_protocol_v2_launch_fence(launch_context)
+    assert fence is not None
+    with engine.connect() as connection:
+        projections = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.version_specs_table.c.
+                worker_placement_projections).where(
+                    serve_state_schema.version_specs_table.c.service_name ==
+                    _SERVICE, serve_state_schema.version_specs_table.c.version
+                    == intent.service_version)).scalar_one()
+    _, projected_admission = reserved_capacity.require_reclaim_worker_projection(
+        fence, projections)
+    scope = reserved_fill_reclaim_attestation.ReclaimLaunchScope(
+        service_name=_SERVICE,
+        service_version=intent.service_version,
+        pool_key=intent.pool_key,
+        service_generation=intent.service_generation,
+        physical_cluster_uid=intent.physical_cluster_uid,
+        kubernetes_context=intent.allowed_locations[0].region,
+        accelerator=intent.accelerator,
+        accelerator_count=intent.accelerator_count,
+        projected_admission=projected_admission)
+    identity = reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
+        fleet_bundle_sha256=intent.reclaim_fleet_bundle_sha256,
+        policy_revision=intent.reclaim_policy_revision,
+        provider_inventory_sha256=intent.reclaim_provider_inventory_sha256)
+    completed = time.monotonic()
+    reference = reserved_fill_reclaim_attestation.ReclaimProviderProofReference(
+        receipt_nonce='a' * 64,
+        proof_sha256='b' * 64,
+        identity=identity,
+        gate_generation=intent.reconciliation_gate_generation,
+        kubernetes_context=scope.kubernetes_context,
+        completed_monotonic=completed)
+    authorization = reserved_fill_reclaim_attestation.ReclaimLaunchAuthorization(
+        identity=identity,
+        gate_generation=intent.reconciliation_gate_generation,
+        scope=scope,
+        provider_proof_reference=reference,
+        completed_monotonic=completed)
+    return scope, authorization
 
 
 def _owner_tuple(engine):
@@ -1269,17 +1320,255 @@ def test_provider_cleanup_uses_committed_intent_gate_after_gate_advances(
             connection, service, replica, context.profile)
 
 
+def _reconstruct_serve055_replica_handoff_boundary(engine) -> None:
+    """Remove only Serve056 DDL from an isolated PostgreSQL test database.
+
+    The fixture's current writer is needed to produce a fully canonical
+    intent/replica/association/request graph.  Removing the additive Serve056
+    boundary afterward leaves the exact deployed Serve055 representation: the
+    immutable intent key exists only in ReplicaInfo JSON.  No application
+    writes occur until the real 055 -> 056 migration is replayed.
+    """
+    statements = (
+        'DROP TRIGGER IF EXISTS '
+        'skyserve056_fill_replica_handoff_consistency ON replicas',
+        'DROP TRIGGER IF EXISTS '
+        'skyserve056_committed_fill_intent_consistency ON '
+        'serve_zero_cost_actuation_intents',
+        'DROP TRIGGER IF EXISTS skyserve056_committed_fill_intent_guard ON '
+        'serve_zero_cost_actuation_intents',
+        'DROP TRIGGER IF EXISTS '
+        'skyserve047_replica_non_pool_authorization_guard ON replicas',
+        'DROP FUNCTION IF EXISTS '
+        'skyserve056_check_fill_replica_handoff()',
+        'DROP FUNCTION IF EXISTS '
+        'skyserve056_check_committed_fill_intent()',
+        'DROP FUNCTION IF EXISTS skyserve056_guard_committed_fill_intent()',
+        'DROP FUNCTION IF EXISTS '
+        'skyserve047_guard_replica_non_pool_authorization()',
+        'ALTER TABLE replicas DROP CONSTRAINT IF EXISTS '
+        'serve056_replica_intent_fk',
+        'ALTER TABLE replicas DROP CONSTRAINT IF EXISTS '
+        'serve056_replica_intent_uq',
+        'ALTER TABLE replicas DROP CONSTRAINT IF EXISTS '
+        'serve056_replica_intent_key_ck',
+        'ALTER TABLE serve_zero_cost_actuation_intents DROP CONSTRAINT IF '
+        'EXISTS serve056_intent_service_key_uq',
+        'ALTER TABLE replicas DROP COLUMN '
+        'reserved_fill_intent_idempotency_key',
+        "UPDATE alembic_version_serve_state_db SET version_num = '055'",
+    )
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.exec_driver_sql(statement)
+    assert migration_utils.get_current_alembic_revision(
+        engine, migration_utils.SERVE_DB_NAME) == '055'
+    assert 'reserved_fill_intent_idempotency_key' not in {
+        column['name']
+        for column in sqlalchemy.inspect(engine).get_columns('replicas')
+    }
+
+
+def test_serve056_retained_provider_present_cleanup_reaches_manager_down_shape(
+        atomic_database, monkeypatch) -> None:
+    """A real Serve055 JSON-only launch remains exactly cleanup-authorized."""
+    current_cohort = ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    previous_cohort = current_cohort - 1
+    assert previous_cohort > 0
+    with atomic_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == _SERVICE).values(
+                    ordinary_launch_binding_epoch=(
+                        serve_state_schema.services_table.c.
+                        ordinary_launch_binding_epoch + 1),
+                    non_pool_launch_capability_cohort_epoch=previous_cohort))
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                _SERVICE)).mappings().one()
+    previous_authority = ordinary_launch_binding._authority_from_service(
+        service,
+        controller_pid=service['controller_pid'],
+        controller_ip=service['controller_ip'],
+        controller_incarnation=service['controller_incarnation'],
+        controller_owner_epoch=service['controller_owner_epoch'],
+        capable=True)
+    # Produce the retained graph exactly as the previous binary cohort did.
+    # The provider-effect phase below is a durable historical fact; no current
+    # provider admission or provider-effect start is exercised by this test.
+    with monkeypatch.context() as previous_binary:
+        previous_binary.setattr(ordinary_launch_binding,
+                                'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                                previous_cohort)
+        spec = _atomic_spec(atomic_database, authority=previous_authority)
+        staged, receipt = reserved_fill_admission._transaction(
+            spec, 7, require_existing=False)
+    with atomic_database.connect() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                _SERVICE)).mappings().one()
+    authority = ordinary_launch_binding._authority_from_service(
+        service,
+        controller_pid=service['controller_pid'],
+        controller_ip=service['controller_ip'],
+        controller_incarnation=service['controller_incarnation'],
+        controller_owner_epoch=service['controller_owner_epoch'],
+        capable=True)
+    assert not authority.generic_launches_required
+    assert authority.retained_non_pool_settlement_allowed
+    with atomic_database.connect() as connection:
+        request_row = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                receipt.request_id)).mappings().one()
+        request = request_postgres.request_from_mapping(request_row)
+    context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
+        request.request_body.extra_launch_context)
+    assert context.profile.kind is (
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+    assert context.capability_cohort_epoch == previous_cohort
+
+    with atomic_database.begin() as connection:
+        association = ordinary_launch_binding.ordinary_launch_associations_table
+        connection.execute(
+            sqlalchemy.update(association).where(
+                association.c.association_id == context.association_id).values(
+                    effect_phase=(
+                        ordinary_launch_binding.EffectPhase.PROVIDER_IO.value),
+                    effect_phase_changed_at=sqlalchemy.func.clock_timestamp(),
+                    owner_revision=association.c.owner_revision + 1,
+                    updated_at=sqlalchemy.func.clock_timestamp()))
+        assert ordinary_launch_binding.mark_ambiguous_in_connection(
+            connection, context, 'retained-serve055-provider-result-uncertain')
+        connection.execute(
+            sqlalchemy.delete(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id == context.request_id))
+        now = sqlalchemy.func.clock_timestamp()
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                context.request_id).values(
+                    status=api_requests.RequestStatus.CANCELLED.value,
+                    terminal_cause=event_api_models.EventCause.
+                    EXECUTION_LEASE_EXPIRED.value,
+                    execution_generation=1,
+                    execution_quiescence_required=True,
+                    execution_quiesced_generation=1,
+                    execution_quiesced_at=now,
+                    finished_at=now,
+                    updated_at=now))
+
+    info = staged.persisted_info
+    provider_payload = {
+        'association_id': str(context.association_id),
+        'cluster_name': info.cluster_name,
+        'kubernetes_context': info.reserved_fill_kubernetes_context,
+        'physical_cluster_uid': info.reserved_fill_physical_cluster_uid,
+        'probe_contract': 'kubernetes-physical-replica-presence-v1',
+        'profile_kind': context.profile.kind.value,
+        'replica_record_id': info.replica_record_id,
+        'result': ordinary_launch_binding.ProviderEvidence.PRESENT.value,
+    }
+    current_launch_authority = dataclasses.replace(
+        authority, non_pool_capability_cohort_epoch=current_cohort)
+    assert current_launch_authority.generic_launches_required
+    assert (current_launch_authority.non_pool_capability_cohort_epoch ==
+            current_cohort)
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='no longer owns this association'):
+        request_postgres.record_bound_non_pool_provider_evidence(
+            context, current_launch_authority,
+            ordinary_launch_binding.ProviderEvidence.PRESENT, provider_payload)
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        context, authority, ordinary_launch_binding.ProviderEvidence.PRESENT,
+        provider_payload)
+    with atomic_database.connect() as connection:
+        retained = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == context.association_id)).mappings().one()
+    assert retained['reconciliation_outcome'] == (
+        ordinary_launch_binding.ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.
+        value)
+    assert retained['provider_evidence'] == (
+        ordinary_launch_binding.ProviderEvidence.PRESENT.value)
+    assert retained['provider_evidence_observed_at'] >= (
+        retained['execution_quiesced_at'])
+
+    _reconstruct_serve055_replica_handoff_boundary(atomic_database)
+    config = migration_utils.get_alembic_config(atomic_database,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '056')
+
+    with atomic_database.connect() as connection:
+        migrated_service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                _SERVICE)).mappings().one()
+        migrated = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == _SERVICE,
+                serve_state_schema.replicas_table.c.replica_id ==
+                info.replica_id)).mappings().one()
+    assert migrated['reserved_fill_intent_idempotency_key'] is None
+    assert (migrated['replica_state']['reserved_fill_intent_idempotency_key'] ==
+            spec.actuation_lease.intent.idempotency_key)
+    authority = ordinary_launch_binding._authority_from_service(
+        migrated_service,
+        controller_pid=migrated_service['controller_pid'],
+        controller_ip=migrated_service['controller_ip'],
+        controller_incarnation=migrated_service['controller_incarnation'],
+        controller_owner_epoch=migrated_service['controller_owner_epoch'],
+        capable=True)
+    assert not authority.generic_launches_required
+    assert authority.retained_non_pool_settlement_allowed
+    assert authority.non_pool_capability_cohort_epoch == previous_cohort
+
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = _SERVICE
+    manager._ordinary_launch_binding_authority = authority
+
+    def _project_manager_cleanup(connection, projection):
+        return manager._project_bound_ordinary_launch(None, connection,
+                                                      projection)
+
+    assert request_postgres.authorize_bound_non_pool_provider_present_cleanup(
+        context, authority, project_replica_result=_project_manager_cleanup)
+    with atomic_database.connect() as connection:
+        persisted_row = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.replica_state).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    _SERVICE, serve_state_schema.replicas_table.c.replica_id ==
+                    info.replica_id)).scalar_one()
+    persisted = replica_managers.ReplicaInfo.from_storage_dict(persisted_row)
+    assert ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+        persisted, require_scheduled=True)
+    assert manager._provider_present_cleanup_marker_shape(persisted)
+    assert manager._bound_non_pool_provider_present_cleanup_context(
+        persisted) == context
+
+
 def test_postcommit_launch_authority_ignores_mutable_successor_state(
-        atomic_database) -> None:
+        atomic_database, monkeypatch) -> None:
     spec = _atomic_spec(atomic_database)
     staged, _ = reserved_fill_admission._transaction(spec,
                                                      7,
                                                      require_existing=False)
     launch_context = _committed_launch_context(spec)
+    scope, authorization = _committed_launch_authorization(
+        atomic_database, spec)
     snapshot = serve_state.ServiceReplicaLaunchFenceSnapshot(
         staged.persisted_info)
+    monkeypatch.setattr(reserved_fill_reclaim_proofs,
+                        'provider_proof_reference_holds_in_connection',
+                        lambda *_args, **_kwargs: True)
     assert serve_state.reserved_fill_committed_launch_authority_holds(
-        launch_context, snapshot)
+        scope, authorization, launch_context, snapshot)
 
     # Publish a newer observation and policy/gate generation, then withdraw
     # the current claim/allocation projection entirely. These are precommit
@@ -1340,21 +1629,51 @@ def test_postcommit_launch_authority_ignores_mutable_successor_state(
                   service_name == _SERVICE))
 
     assert serve_state.reserved_fill_committed_launch_authority_holds(
-        launch_context, snapshot)
+        scope, authorization, launch_context, snapshot)
 
 
-@pytest.mark.parametrize('revocation', ('lifecycle', 'version', 'capability'))
-def test_postcommit_launch_authority_still_honors_service_owner_revocation(
-        atomic_database, revocation) -> None:
+def test_postcommit_launch_authority_requires_fresh_provider_proof(
+        atomic_database, monkeypatch) -> None:
     spec = _atomic_spec(atomic_database)
     staged, _ = reserved_fill_admission._transaction(spec,
                                                      7,
                                                      require_existing=False)
     launch_context = _committed_launch_context(spec)
+    scope, authorization = _committed_launch_authorization(
+        atomic_database, spec)
     snapshot = serve_state.ServiceReplicaLaunchFenceSnapshot(
         staged.persisted_info)
+    proof = mock.Mock(return_value=False)
+    monkeypatch.setattr(reserved_fill_reclaim_proofs,
+                        'provider_proof_reference_holds_in_connection', proof)
+
+    assert not serve_state.reserved_fill_committed_launch_authority_holds(
+        scope, authorization, launch_context, snapshot)
+    proof.assert_called_once()
+    assert proof.call_args.args[1] == authorization.provider_proof_reference
+    assert proof.call_args.kwargs == {
+        'expected_physical_cluster_uid':
+            spec.actuation_lease.intent.physical_cluster_uid
+    }
+
+
+@pytest.mark.parametrize('revocation', ('lifecycle', 'version', 'capability'))
+def test_postcommit_launch_authority_still_honors_service_owner_revocation(
+        atomic_database, monkeypatch, revocation) -> None:
+    spec = _atomic_spec(atomic_database)
+    staged, _ = reserved_fill_admission._transaction(spec,
+                                                     7,
+                                                     require_existing=False)
+    launch_context = _committed_launch_context(spec)
+    scope, authorization = _committed_launch_authorization(
+        atomic_database, spec)
+    snapshot = serve_state.ServiceReplicaLaunchFenceSnapshot(
+        staged.persisted_info)
+    monkeypatch.setattr(reserved_fill_reclaim_proofs,
+                        'provider_proof_reference_holds_in_connection',
+                        lambda *_args, **_kwargs: True)
     assert serve_state.reserved_fill_committed_launch_authority_holds(
-        launch_context, snapshot)
+        scope, authorization, launch_context, snapshot)
 
     if revocation == 'lifecycle':
         table = serve_state_schema.service_lifecycle_fences_table
@@ -1376,7 +1695,7 @@ def test_postcommit_launch_authority_still_honors_service_owner_revocation(
             sqlalchemy.update(table).where(where).values(**values))
 
     assert not serve_state.reserved_fill_committed_launch_authority_holds(
-        launch_context, snapshot)
+        scope, authorization, launch_context, snapshot)
 
 
 def test_workspace_authority_requires_durable_intent(atomic_database) -> None:

@@ -4419,7 +4419,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                           ordinary_launch_binding.BoundNonPoolLaunchContext):
             return
         authority = self._ordinary_launch_binding_authority
-        if authority is None or not authority.generic_launches_required:
+        if (authority is None or
+                not authority.retained_non_pool_settlement_allowed):
             return
         replica_id = info.replica_id
         existing = self._non_pool_reconciliation_threads.get(replica_id)
@@ -4493,7 +4494,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             self, replica_infos: list[ReplicaInfo]) -> None:
         """Adopt active requests and reconcile effects from durable state."""
         authority = self._ordinary_launch_binding_authority
-        if authority is None or not authority.generic_launches_required:
+        if (authority is None or
+                not authority.retained_non_pool_settlement_allowed):
             return
         runtime = self._legacy_mutation_runtime_state()
         for info in replica_infos:
@@ -4571,7 +4573,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             self, info: ReplicaInfo) -> bool:
         """Re-enqueue one settled pre-effect row with its exact paid claim."""
         authority = self._ordinary_launch_binding_authority
-        if authority is not None and authority.generic_launches_required:
+        if (authority is not None and
+                authority.retained_non_pool_settlement_allowed):
             retirement = (ordinary_launch_binding.
                           retire_pre_admission_non_pool_launch_intent(
                               authority, info.replica_id,
@@ -4625,7 +4628,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         if (authority is None or authority.capable is not True or
                 authority.binding_mode
                 != ordinary_launch_binding.BindingMode.BOUND or
-                not authority.generic_launches_required):
+                not authority.retained_non_pool_settlement_allowed):
             return None
         if target is None:
             target = request_postgres.lookup_bound_ordinary_launch_cancel_target(
@@ -5876,6 +5879,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         generic_binding_active = bool(
             not self._is_pool and binding_authority is not None and
             binding_authority.generic_launches_required)
+        generic_settlement_active = bool(
+            not self._is_pool and binding_authority is not None and
+            binding_authority.retained_non_pool_settlement_allowed)
         interrupted_fill_replicas = ([] if generic_binding_active else [
             info for info in to_up_replicas if info.reserved_fill is True
         ])
@@ -5960,7 +5966,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         bound_recovery_errors: list[tuple[int, Exception]] = []
         for replica_info in to_up_replicas:
             generic_reduction = None
-            if generic_binding_active:
+            if generic_settlement_active:
                 try:
                     generic_reduction = (
                         request_postgres.inspect_bound_ordinary_launch(
@@ -6163,8 +6169,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 not self._is_pool and authority is not None and
                 authority.capable is True and authority.binding_mode
                 == ordinary_launch_binding.BindingMode.BOUND and
-                (authority.generic_launches_required or ordinary_launch_binding.
-                 replica_has_narrow_ordinary_profile(replica_info)))
+                (authority.retained_non_pool_settlement_allowed or
+                 ordinary_launch_binding.replica_has_narrow_ordinary_profile(
+                     replica_info)))
             try:
                 prior_planned_capacity = replica_info.planned_capacity
                 if (isinstance(prior_planned_capacity, bool) or

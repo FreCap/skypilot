@@ -71,6 +71,7 @@ from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.slurm import utils as slurm_utils
 from sky.serve import constants as serve_constants
 from sky.serve import reserved_capacity
+from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import serve_state
 from sky.serve import system_oom_recovery as serve_system_oom_recovery
 from sky.serve import system_oom_recovery_observability
@@ -946,7 +947,7 @@ class RetryingVmProvisioner:
         self,
         launch_snapshot: serve_state.ServiceReplicaLaunchFenceSnapshot | None,
     ) -> typing.Iterator[None]:
-        """Use one committed intent as the post-admission provider grant."""
+        """Use a committed intent plus fresh facts for one provider effect."""
         durable_replica = (None if launch_snapshot is None else
                            launch_snapshot.durable_replica_info)
         durable_reserved_fill = bool(durable_replica is not None and
@@ -971,16 +972,73 @@ class RetryingVmProvisioner:
             if fence is None:
                 raise reserved_capacity.ReservedFillLaunchFenceError(
                     'Reserved-fill durable row has no protocol-v2 fence.')
+            try:
+                projections = self._extra_launch_context.get(
+                    serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY)
+                _, projected_admission = (
+                    reserved_capacity.require_reclaim_worker_projection(
+                        fence, projections))
+                service_name = self._extra_launch_context.get(
+                    serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+                if not isinstance(service_name, str) or not service_name:
+                    raise ValueError('service name is missing')
+                scope = reserved_fill_reclaim_attestation.ReclaimLaunchScope(
+                    service_name=service_name,
+                    service_version=fence.service_version,
+                    pool_key=fence.pool_key,
+                    service_generation=fence.service_generation,
+                    physical_cluster_uid=fence.physical_cluster_uid,
+                    kubernetes_context=fence.kubernetes_context,
+                    accelerator=fence.accelerator,
+                    accelerator_count=fence.accelerator_count,
+                    projected_admission=projected_admission)
+                identity = (
+                    reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
+                        fleet_bundle_sha256=typing.cast(
+                            str, fence.reclaim_fleet_bundle_sha256),
+                        policy_revision=typing.cast(
+                            str, fence.reclaim_policy_revision),
+                        provider_inventory_sha256=typing.cast(
+                            str, fence.reclaim_provider_inventory_sha256)))
+                gate_generation = typing.cast(
+                    int, fence.reconciliation_gate_generation)
+                policy = (
+                    reserved_fill_reclaim_attestation.require_unique_policy())
+                (reserved_fill_reclaim_attestation.require_exact_policy_identity
+                )(policy, identity)
+                deadline = (reserved_fill_reclaim_attestation.
+                            new_policy_operation_deadline())
+                authorization = policy.authorize_launch(
+                    scope,
+                    expected_identity=identity,
+                    expected_gate_generation=gate_generation,
+                    deadline_monotonic=deadline)
+                (reserved_fill_reclaim_attestation.
+                 require_policy_operation_completed)(deadline)
+                (reserved_fill_reclaim_attestation.
+                 require_exact_launch_authorization)(
+                     authorization,
+                     expected_identity=identity,
+                     expected_gate_generation=gate_generation,
+                     expected_scope=scope,
+                     minimum_remaining_seconds=(
+                         reserved_fill_reclaim_attestation.
+                         LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS))
+            except Exception as error:  # pylint: disable=broad-except
+                raise reserved_capacity.ReservedFillLaunchFenceError(
+                    'Deployment reclaim policy refused the committed '
+                    'reserved-fill provider effect.') from error
             if not serve_state.reserved_fill_committed_launch_authority_holds(
-                    self._extra_launch_context, launch_snapshot):
+                    scope, authorization, self._extra_launch_context,
+                    launch_snapshot):
                 raise reserved_capacity.ReservedFillLaunchFenceError(
                     'Reserved-fill committed intent no longer authorizes the '
                     'provider operation.')
-            # The committed intent freezes the expected physical UID; the
-            # provider fence proves and pins the current Kubernetes target.
-            # The first create needs no Pod UID.  Its returned/adopted UID is
-            # attested by the in-tree provisioner, and later guarded epochs
-            # re-enter this same physical target before reattesting that UID.
+            # The fresh policy proof attests the exact live admission and
+            # no-paid contract.  The physical fence then pins that attested
+            # context to the committed intent's immutable cluster UID.  The
+            # first create needs no Pod UID; the in-tree provisioner captures
+            # it and later epochs reattest that same object independently.
             with kubernetes_adaptor.physical_cluster_uid_fence(
                     fence.kubernetes_context, fence.physical_cluster_uid):
                 provider_started = True

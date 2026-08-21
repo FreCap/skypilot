@@ -797,19 +797,98 @@ def committed_intent_for_replica_in_connection(
         return None
 
 
-def committed_intent_matches_replica_in_connection(
+def cleanup_only_committed_intent_for_replica_in_connection(
     connection: sqlalchemy.engine.Connection,
     *,
     service_name: str,
     service_hash: str,
     replica_info: Any,
-) -> bool:
-    """Return whether an exact committed intent still owns one replica."""
-    return committed_intent_for_replica_in_connection(
-        connection,
-        service_name=service_name,
-        service_hash=service_hash,
-        replica_info=replica_info) is not None
+) -> reserved_fill_planner.FillIntent | None:
+    """Resolve an exact committed intent solely for fenced cleanup.
+
+    Serve056 intentionally leaves retained protocol-v2 replicas with a NULL
+    normalized intent link, so they can never regain provider-launch
+    authority.  Provider-present reconciliation must nevertheless be able to
+    tear down an already-created object.  This resolver accepts that one
+    historical shape only after rereading the stored JSON projection and
+    exact immutable COMMITTED intent.  Callers must additionally validate the
+    persisted association/profile and terminal provider evidence, and must
+    already hold the exact replica row through the canonical effect-row lock
+    order.
+
+    A non-NULL scalar always takes the canonical resolver and can never fall
+    back to JSON authority.
+    """
+    _require_postgres(connection)
+    try:
+        revision = connection.execute(
+            sqlalchemy.text(
+                'SELECT version_num FROM alembic_version_serve_state_db')
+        ).scalar_one_or_none()
+        if revision is None or int(revision) < 56:
+            return None
+        replica_id = replica_info.replica_id
+        raw_record_id = replica_info.replica_record_id
+        replica_record_id = uuid.UUID(raw_record_id)
+        if (type(service_name) is not str or not service_name or
+                type(service_hash) is not str or not service_hash or
+                type(replica_id) is not int or replica_id < 1 or
+                type(raw_record_id) is not str or
+                str(replica_record_id) != raw_record_id):
+            return None
+        replica_row = connection.execute(
+            sqlalchemy.select(
+                _REPLICAS.c.reserved_fill_intent_idempotency_key,
+                _REPLICAS.c.replica_state_version,
+                _REPLICAS.c.replica_state,
+                _REPLICAS.c.is_spot,
+                _REPLICAS.c.paid_capacity_pool_key,
+            ).where(
+                _REPLICAS.c.service_name == service_name,
+                _REPLICAS.c.replica_id == replica_id)).mappings().one_or_none()
+        if replica_row is None:
+            return None
+        scalar_key = replica_row['reserved_fill_intent_idempotency_key']
+        if scalar_key is not None:
+            return committed_intent_for_replica_in_connection(
+                connection,
+                service_name=service_name,
+                service_hash=service_hash,
+                replica_info=replica_info)
+        replica_state = replica_row['replica_state']
+        intent_key = getattr(replica_info,
+                             'reserved_fill_intent_idempotency_key', None)
+        if (type(intent_key) is not str or len(intent_key) != 64 or any(
+                character not in '0123456789abcdef' for character in intent_key)
+                or replica_row['replica_state_version'] != 1 or
+                not isinstance(replica_state, Mapping) or
+                replica_state.get('replica_record_id') != raw_record_id or
+                replica_state.get('reserved_fill_intent_idempotency_key')
+                != intent_key or replica_row['is_spot'] is not False or
+                replica_row['paid_capacity_pool_key'] is not None or
+                getattr(replica_info, 'is_spot', None) is not False or getattr(
+                    replica_info, 'paid_capacity_pool_key', None) is not None):
+            return None
+        row = connection.execute(
+            sqlalchemy.select(_INTENTS).where(
+                _INTENTS.c.intent_idempotency_key == intent_key,
+                _INTENTS.c.service_name == service_name,
+                _INTENTS.c.service_hash == service_hash,
+                _INTENTS.c.state == IntentState.COMMITTED.value,
+                _INTENTS.c.replica_id == replica_id,
+                _INTENTS.c.replica_record_id == replica_record_id,
+            )).mappings().one_or_none()
+        if row is None:
+            return None
+        intent = _intent_from_row(row)
+        planned_capacity = row['planned_capacity']
+        if (type(planned_capacity) is not int or
+                planned_capacity <= 0 or not _replica_matches_intent(
+                    replica_info, intent, planned_capacity)):
+            return None
+        return intent
+    except (AttributeError, TypeError, ValueError, ZeroCostActuationError):
+        return None
 
 
 def _lock_materialization_authority(

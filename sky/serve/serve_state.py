@@ -3031,20 +3031,24 @@ def service_replica_launch_fence_holds(
 
 
 def reserved_fill_committed_launch_authority_holds(
+    scope: reserved_fill_reclaim_attestation.ReclaimLaunchScope | None,
+    authorization: (reserved_fill_reclaim_attestation.ReclaimLaunchAuthorization
+                    | None),
     launch_context: dict[str, Any],
     launch_snapshot: ServiceReplicaLaunchFenceSnapshot | None,
 ) -> bool:
-    """Validate the immutable postcommit fill handoff before provider I/O.
+    """Validate the immutable handoff and fresh facts before provider I/O.
 
     Mutable allocation maps, claim sets, observations, reconciliation gates,
-    deployment-policy callbacks, and context-wide inventory proofs authorize
-    only precommit admission.  After Serve056 atomically links a replica to a
-    COMMITTED intent, this function reads only that frozen graph plus the
-    current service/version owner.  The surrounding bound-request guard owns
-    the exact association/request execution generation and holds the service
-    authority lock across the concrete provider mutation.
+    and their current generations authorize only precommit admission.  After
+    Serve056 atomically links a replica to a COMMITTED intent, that frozen
+    graph defines the exact scope.  A newly minted deployment-policy ticket
+    must still attest the live context-wide provider/admission/no-paid facts
+    for that frozen scope.  The surrounding bound-request guard owns the exact
+    association/request execution generation and holds service authority
+    across the concrete provider mutation.
     """
-    if (launch_snapshot is None or
+    if (scope is None or authorization is None or launch_snapshot is None or
             launch_snapshot.durable_replica_info is None):
         return False
     durable_replica = launch_snapshot.durable_replica_info
@@ -3105,7 +3109,16 @@ def reserved_fill_committed_launch_authority_holds(
                     service_row['non_pool_launch_controller_incarnation']
                     != service_row['controller_incarnation'] or
                     service_row['non_pool_launch_binding_protocol_version']
-                    != 2):
+                    != ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION
+                    or
+                    service_row['non_pool_launch_capability_profile_set_digest']
+                    != ordinary_launch_binding.
+                    supported_non_pool_profile_set_digest() or
+                    service_row['non_pool_launch_capability_cohort_epoch']
+                    != ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+                    or service_row['non_pool_launch_receipt_protocol_version']
+                    != ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION
+               ):
                 return False
             intent = (
                 zero_cost_actuation.committed_intent_for_replica_in_connection(
@@ -3175,190 +3188,41 @@ def reserved_fill_committed_launch_authority_holds(
             if (projected_admission.worker_projection_sha256
                     != intent.worker_projection_sha256):
                 return False
-    except (AttributeError, IndexError, KeyError, TypeError, ValueError,
-            zero_cost_actuation.ZeroCostActuationError):
-        return False
-    return True
-
-
-def reserved_fill_reclaim_launch_authority_holds(
-    scope: reserved_fill_reclaim_attestation.ReclaimLaunchScope | None,
-    authorization: (reserved_fill_reclaim_attestation.ReclaimLaunchAuthorization
-                    | None),
-    launch_context: dict[str, Any],
-    launch_snapshot: ServiceReplicaLaunchFenceSnapshot | None,
-) -> bool:
-    """Revalidate durable row, immutable gate and policy ticket before effect."""
-    if (launch_snapshot is None or
-            launch_snapshot.durable_replica_info is None or
-            launch_snapshot.durable_replica_info.reserved_fill is not True):
-        return False
-    try:
-        fence = reserved_capacity.parse_protocol_v2_launch_fence(launch_context)
-        if fence is not None:
-            reserved_capacity.validate_protocol_v2_launch_fence_against_replica(
-                fence, launch_snapshot.durable_replica_info)
-    except (AttributeError, KeyError, TypeError, ValueError):
-        return False
-    try:
-        engine = _db_manager.get_engine()
-        if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
-            return False
-        with engine.begin() as connection:
-            # Lock the one global selector before any service or claim row.
-            # The provider guard holds the fleet advisory lock across this
-            # read and the effect; this row lock gives the read one exact SQL
-            # snapshot and preserves the global->service lock order.
-            authority_table = (
-                pool_capacity_observation_schema.protocol_state_sequence_table)
-            authority = connection.execute(
-                sqlalchemy.select(authority_table).where(
-                    authority_table.c.id == 1).with_for_update(
-                        read=True)).mappings().one_or_none()
-            if authority is None:
-                return False
-            gate_state = authority['reconciliation_gate_state']
-            if gate_state == pool_capacity_observation_schema.LEGACY_ACTIVE:
-                return (authorization is None and scope is None and
-                        (fence is None or not fence.policy_bound))
-            if (gate_state != pool_capacity_observation_schema.SEQUENCED_ACTIVE
-                    or authority['protocol_version']
-                    != RESERVED_FILL_PROTOCOL_V2 or fence is None or
-                    not fence.policy_bound or scope is None or
-                    authorization is None):
-                # A queued pre-policy request cannot cross the one-way gate.
-                return False
-            gate_generation = authority['reconciliation_gate_generation']
-            if type(gate_generation) is not int or gate_generation <= 0:
-                return False
-            identity = reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
-                fleet_bundle_sha256=authority['reclaim_fleet_bundle_sha256'],
-                policy_revision=authority['reclaim_policy_revision'],
-                provider_inventory_sha256=authority[
-                    'reclaim_provider_inventory_sha256'])
-            protocol = connection.execute(
-                sqlalchemy.select(
-                    reserved_fill_protocol_state_table.c.claim_generation).
-                where(reserved_fill_protocol_state_table.c.id ==
-                      1).with_for_update(read=True)).mappings().one_or_none()
-            if (protocol is None or
-                    type(protocol['claim_generation']) is not int or
-                    protocol['claim_generation'] < 0):
-                return False
-
-            service_name = launch_context[
-                constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY]
-            service_hash = launch_context[
-                constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY]
-            service_row = connection.execute(
-                sqlalchemy.select(
-                    services_table.c.hash, services_table.c.current_version,
-                    services_table.c.resource_scope).where(
-                        services_table.c.name == service_name).with_for_update(
-                            read=True)).mappings().one_or_none()
-            if (service_row is None or service_row['hash'] != service_hash or
-                    service_row['resource_scope'] != service_hash or
-                    service_row['current_version'] != fence.service_version):
-                return False
-            version_row = connection.execute(
-                sqlalchemy.select(
-                    version_specs_table.c.worker_placement_projections).where(
-                        version_specs_table.c.service_name == service_name,
-                        version_specs_table.c.version == fence.service_version,
-                        version_specs_table.c.yaml_content.isnot(None),
-                        version_specs_table.c.quarantined_at.is_(None),
-                        version_specs_table.c.retired_at.is_(None),
-                    ).with_for_update(read=True)).mappings().one_or_none()
-            claim_set = connection.execute(
-                sqlalchemy.select(reserved_fill_service_claim_sets_table).where(
-                    reserved_fill_service_claim_sets_table.c.service_name ==
-                    service_name).with_for_update(
-                        read=True)).mappings().one_or_none()
-            edge_rows = connection.execute(
-                sqlalchemy.select(reserved_fill_pool_claims_table).where(
-                    reserved_fill_pool_claims_table.c.service_name ==
-                    service_name).with_for_update(read=True)).mappings().all()
-            matching_edge = next((edge for edge in edge_rows
-                                  if edge['pool_key'] == fence.pool_key), None)
-            current_service_generation = (None if claim_set is None else
-                                          claim_set['generation'])
-            if (version_row is None or claim_set is None or
-                    claim_set['claim_set_state']
-                    != RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2 or
-                    claim_set['service_version'] != fence.service_version or
-                    type(current_service_generation) is not int or
-                    current_service_generation < fence.service_generation or
-                    current_service_generation > protocol['claim_generation'] or
-                    not edge_rows or
-                    len(edge_rows) != claim_set['edge_count'] or
-                    any(edge['service_generation'] != current_service_generation
-                        for edge in edge_rows)):
-                return False
-            successor_generation = (current_service_generation
-                                    > fence.service_generation)
-            if successor_generation:
-                committed_intent_holds = (
-                    zero_cost_actuation.
-                    committed_intent_matches_replica_in_connection(
-                        connection,
-                        service_name=service_name,
-                        service_hash=service_hash,
-                        replica_info=launch_snapshot.durable_replica_info))
-                if not committed_intent_holds:
-                    # A committed intent is the immutable handoff from its
-                    # broker generation. A successor claim set may replace or
-                    # remove the original pool edge; it cannot re-authorize
-                    # that historical launch. An uncommitted or ambiguous row
-                    # continues to fail closed.
-                    return False
-            _, projected_admission = (
-                reserved_capacity.require_reclaim_worker_projection(
-                    fence, version_row['worker_placement_projections']))
-            if not successor_generation:
-                # Before a successor publication, the matching current edge
-                # is still the launch authority and must restate every frozen
-                # placement field exactly.
-                if matching_edge is None:
-                    return False
-                digest_map = _decode_reserved_fill_projection_digest_map(
-                    matching_edge['worker_projection_sha256_by_accelerator'],
-                    matching_edge['accelerator_names'])
-                if (matching_edge['access_context'] != fence.kubernetes_context
-                        or matching_edge['physical_cluster_uid']
-                        != fence.physical_cluster_uid or
-                        matching_edge['gpus_per_replica']
-                        != fence.accelerator_count or
-                        digest_map.get(fence.accelerator.casefold())
-                        != projected_admission.worker_projection_sha256):
-                    return False
             expected_scope = (
                 reserved_fill_reclaim_attestation.ReclaimLaunchScope(
                     service_name=service_name,
-                    service_version=fence.service_version,
-                    pool_key=fence.pool_key,
-                    service_generation=fence.service_generation,
-                    physical_cluster_uid=fence.physical_cluster_uid,
-                    kubernetes_context=fence.kubernetes_context,
-                    accelerator=fence.accelerator,
-                    accelerator_count=fence.accelerator_count,
+                    service_version=intent.service_version,
+                    pool_key=intent.pool_key,
+                    service_generation=intent.service_generation,
+                    physical_cluster_uid=intent.physical_cluster_uid,
+                    kubernetes_context=intent.allowed_locations[0].region,
+                    accelerator=intent.accelerator,
+                    accelerator_count=intent.accelerator_count,
                     projected_admission=projected_admission))
             if scope != expected_scope:
                 return False
+            identity = reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
+                fleet_bundle_sha256=intent.reclaim_fleet_bundle_sha256,
+                policy_revision=intent.reclaim_policy_revision,
+                provider_inventory_sha256=(
+                    intent.reclaim_provider_inventory_sha256))
             (reserved_fill_reclaim_attestation.
              require_exact_launch_authorization)(
                  authorization,
                  expected_identity=identity,
-                 expected_gate_generation=gate_generation,
-                 expected_scope=scope)
+                 expected_gate_generation=(
+                     intent.reconciliation_gate_generation),
+                 expected_scope=expected_scope)
             if not (reserved_fill_reclaim_proofs.
                     provider_proof_reference_holds_in_connection)(
                         connection,
                         authorization.provider_proof_reference,
                         expected_physical_cluster_uid=(
-                            scope.physical_cluster_uid)):
+                            intent.physical_cluster_uid)):
                 return False
-    except (reserved_fill_reclaim_attestation.ReclaimAttestationError, KeyError,
-            TypeError, ValueError):
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError,
+            reserved_fill_reclaim_attestation.ReclaimAttestationError,
+            zero_cost_actuation.ZeroCostActuationError):
         return False
     return True
 

@@ -153,6 +153,21 @@ def test_generic_capability_requires_the_complete_exact_tuple() -> None:
             binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
 
     assert authority.generic_launches_required
+    assert authority.retained_non_pool_settlement_allowed
+    previous_cohort = dataclasses.replace(
+        authority,
+        non_pool_capability_cohort_epoch=(
+            binding.NON_POOL_CAPABILITY_COHORT_EPOCH - 1))
+    assert not previous_cohort.generic_launches_required
+    assert previous_cohort.retained_non_pool_settlement_allowed
+    assert not dataclasses.replace(
+        previous_cohort,
+        non_pool_capability_cohort_epoch=(
+            binding.NON_POOL_CAPABILITY_COHORT_EPOCH -
+            2)).retained_non_pool_settlement_allowed
+    assert not dataclasses.replace(previous_cohort,
+                                   binding_mode=binding.BindingMode.LEGACY
+                                  ).retained_non_pool_settlement_allowed
     assert not dataclasses.replace(
         authority,
         non_pool_profile_set_digest='0' * 64).generic_launches_required
