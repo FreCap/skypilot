@@ -239,21 +239,24 @@ cleanup worker, not a new execution topology or a broader meaning for
    settled association plus removable row; controller restart re-enters the
    same path without inventing a request result.
 
-The digest check has two deliberately closed modes during this recovery. The
-permanent `EXECUTABLE_EXACT` mode requires the locked durable body to hash to
-the association input digest and requires its tenant/name tuple to equal the
-immutable service owner. The cleanup-only `LEGACY_HTTP_NORMALIZED` mode
-reconstructs the pre-normalization submission on a deep copy by restoring only
-the immutable service-owner ID/name and `client_api_version = None`; that copy
-must hash exactly to the association digest. Both modes independently require
-the locked request/body tenant and cluster tuple to equal the association.
-Neither mode mutates durable state. Production census on 2026-08-20 found nine
-unsettled `RESERVED_FILL` associations: all nine matched the exact legacy
-reconstruction and zero were unexplained. The transitional verifier grants
-only entry into this provider-present teardown. It is removed by the stacked
-cleanup after those rows settle and one full stale/quiescence horizon remains
-at zero; launch/adoption/cancellation and all paid authority remain on the
-single current path throughout.
+The digest check has one contract. The locked durable body must hash to the
+association input digest, its tenant/name tuple must equal the immutable
+service owner, and the locked request/body tenant and cluster tuple must equal
+the association. The temporary `LEGACY_HTTP_NORMALIZED` verifier existed only
+to settle the nine enumerated pre-atomic rows and is removed after all nine
+reach exact provider `ABSENT`, release their pins and debits, and one complete
+stale/quiescence horizon remains at zero legacy rows. The transition never
+authorized launch, adoption, cancellation, paid capacity, or result
+projection; those operations remain on the single current path.
+
+The removal gate was captured on 2026-08-21. Production censuses at
+02:18:15 UTC and 02:21:53 UTC (218 seconds apart) each found zero unsettled
+`RESERVED_FILL` associations, zero associated request-retention pins, and zero
+`boltz-l4-fleet` paid-capacity claims. All two API, two controller, and two
+executor Pods were Ready with zero restarts on image digest
+`sha256:a61cc5ecf391ed5dfc9861d3ecebbbc55f5c7bf9c3ba0089ec3691bbe0618e3a`.
+The obsolete verifier therefore has no remaining provider-present cleanup
+population.
 
 The settled crash boundary is authorized from history, not from the now-cleared
 replica pointer. Before removing that row, restart recovery re-locks the exact

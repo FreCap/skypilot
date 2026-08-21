@@ -3904,7 +3904,7 @@ def _provider_present_cleanup_input_digest_matches(
     request: requests_lib.Request,
     context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
 ) -> bool:
-    """Match current atomic or one exact historical HTTP digest contract."""
+    """Match the exact atomic executable digest and service owner."""
     body = request.request_body
     env_vars = getattr(body, 'env_vars', None)
     tenant_scope = association.get('tenant_scope')
@@ -3933,28 +3933,9 @@ def _provider_present_cleanup_input_digest_matches(
     if (not isinstance(owner_user_id, str) or not owner_user_id or
             not isinstance(owner_user_name, str) or not owner_user_name):
         return False
-    if executable_exact:
-        # Atomic fill stamps the immutable service-owner tuple before hashing.
-        return bool(
-            tenant_scope == owner_user_id and
-            env_vars.get(skylet_constants.USER_ENV_VAR) == owner_user_name)
-
-    # Before atomic fill admission, the authenticated HTTP request builder
-    # normalized the service-owner environment and client API version after
-    # the submitted body had been hashed.  Reconstruct only that exact legacy
-    # representation from the immutable, already locked service owner tuple.
-    # Any other body mutation remains ineligible for provider teardown.
-    try:
-        submitted_body = body.model_copy(deep=True)
-        submitted_env = dict(submitted_body.env_vars)
-        submitted_env[skylet_constants.USER_ID_ENV_VAR] = owner_user_id
-        submitted_env[skylet_constants.USER_ENV_VAR] = owner_user_name
-        submitted_body.env_vars = submitted_env
-        submitted_body.client_api_version = None
-        return (ordinary_launch_binding.canonical_launch_digest(submitted_body)
-                == context.input_digest)
-    except (AttributeError, TypeError, ValueError):
-        return False
+    # Atomic fill stamps the immutable service-owner tuple before hashing.
+    return bool(executable_exact and tenant_scope == owner_user_id and
+                env_vars.get(skylet_constants.USER_ENV_VAR) == owner_user_name)
 
 
 def authorize_bound_non_pool_provider_present_cleanup(

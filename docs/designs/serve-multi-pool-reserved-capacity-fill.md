@@ -1174,27 +1174,24 @@ request-row and body cluster names to equal the association cluster. The bound
 context omits those fields, so a digest match never replaces the relational
 checks.
 
-There are temporarily two closed digest modes for this cleanup transaction:
+Provider-present cleanup now has one digest mode. The locked durable-body
+digest must equal `input_digest`, and the body owner ID/name and association
+tenant must equal the immutable locked service-owner tuple. Every body,
+context, tenant, cluster, profile, or authority change fails closed. The
+temporary `LEGACY_HTTP_NORMALIZED` verifier was scoped only to the nine
+enumerated pre-atomic rows and is removed after those rows reach exact provider
+`ABSENT`, release their pins and debits, and the zero-legacy census remains
+zero at T0 and T+180 seconds. No schema mode was added for that verifier.
 
-- `EXECUTABLE_EXACT` is the permanent atomic mode. The locked durable-body
-  digest equals `input_digest`, and the body owner ID/name and association
-  tenant equal the immutable locked service-owner tuple.
-- `LEGACY_HTTP_NORMALIZED` is a cleanup-only transition for pre-atomic HTTP
-  admissions. On a deep copy, the validator replaces only `USER_ID`,
-  `USER_NAME`, and `client_api_version` with the locked service-owner ID/name
-  and `None`, respectively. The reconstructed digest must equal
-  `input_digest`; the durable request is never rewritten. Every other body,
-  context, tenant, cluster, profile, or authority change fails closed.
-
-The legacy mode grants only entry into exact provider-present fenced teardown;
-it cannot authorize launch, adoption, cancellation, paid capacity, or result
-projection. The 2026-08-20 production census found exactly nine unsettled
-`RESERVED_FILL` associations, all nine matched this reconstruction, and zero
-had an unexplained mismatch. Once they settle and one complete
-stale/quiescence horizon observes zero unsettled legacy rows, the stacked
-cleanup removes this branch and its transition-only tests. No schema mode is
-added for a verifier whose entire population is already enumerated and whose
-steady state is direct-digest-only.
+The removal gate was captured on 2026-08-21. Production censuses at
+02:18:15 UTC and 02:21:53 UTC (218 seconds apart) each found zero unsettled
+`RESERVED_FILL` associations, zero associated request-retention pins, and zero
+`boltz-l4-fleet` paid-capacity claims. All two API, two controller, and two
+executor Pods were Ready with zero restarts on image digest
+`sha256:a61cc5ecf391ed5dfc9861d3ecebbbc55f5c7bf9c3ba0089ec3691bbe0618e3a`.
+The obsolete verifier therefore has no remaining provider-present cleanup
+population, and cleanup PR #1615 is eligible to merge independently of the
+broader fill-convergence qualification.
 
 Atomically admitted `RESERVED_FILL` requires the server-local prepared body and
 durable executable body to have the same digest at admission, lost-ack
