@@ -817,6 +817,22 @@ class FillCapacityUnit(str, enum.Enum):
         return accelerator_count
 
 
+def exact_accelerator_shape(
+    accelerators: Mapping[str, int | float] | None,) -> tuple[str, int]:
+    """Return one canonical whole-GPU shape or reject it as ambiguous."""
+    if not isinstance(accelerators, Mapping) or len(accelerators) != 1:
+        raise ValueError('A materialized replica requires one exact '
+                         'accelerator shape.')
+    raw_card, raw_count = next(iter(accelerators.items()))
+    if (not isinstance(raw_card, str) or not raw_card or
+            isinstance(raw_count, bool) or
+            not isinstance(raw_count, (int, float)) or raw_count < 1 or
+            not float(raw_count).is_integer()):
+        raise ValueError('A materialized replica accelerator shape is '
+                         'malformed.')
+    return raw_card.casefold(), int(raw_count)
+
+
 @dataclasses.dataclass(frozen=True)
 class ReservedFillAllocationIdentity:
     """The immutable allocation columns required at destructive commit."""
