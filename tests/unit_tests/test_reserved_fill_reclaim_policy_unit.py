@@ -554,6 +554,27 @@ class _Policy(reclaim.ReservedFillReclaimPolicy):
             deadline_monotonic=deadline_monotonic)
 
 
+def _install_launch_policy(monkeypatch, *, callback=None, identity=None):
+    calls = []
+
+    def _authorize(scope, *, expected_identity, expected_gate_generation,
+                   deadline_monotonic):
+        calls.append((scope, expected_identity, expected_gate_generation,
+                      deadline_monotonic))
+        if callback is not None:
+            return callback(scope,
+                            expected_identity=expected_identity,
+                            expected_gate_generation=expected_gate_generation,
+                            deadline_monotonic=deadline_monotonic)
+        return _launch_authorization(scope,
+                                     identity=expected_identity,
+                                     gate_generation=expected_gate_generation)
+
+    policy = _Policy(authorize_launch=_authorize, identity=identity)
+    monkeypatch.setattr(reclaim, 'require_unique_policy', lambda: policy)
+    return calls
+
+
 def test_observation_policy_identity_mismatch_precedes_provider_read(
         monkeypatch):
     repository = types.SimpleNamespace(read_reconciliation_gate=mock.Mock(
@@ -717,7 +738,7 @@ def test_policy_bound_terminal_fence_requires_admitted_allocation_provenance(
             fence, durable)
 
 
-def test_committed_provider_guard_uses_only_frozen_handoff_and_physical_uid(
+def test_committed_provider_guard_uses_frozen_handoff_fresh_proof_and_uid(
         monkeypatch):
     context = _launch_context()
     provisioner = _provisioner(context)
@@ -737,9 +758,14 @@ def test_committed_provider_guard_uses_only_frozen_handoff_and_physical_uid(
         yield
         events.append('physical-exit')
 
-    def _committed_authority(launch_context, launch_snapshot):
+    def _committed_authority(scope, authorization, launch_context,
+                             launch_snapshot):
         assert launch_context is context
         assert launch_snapshot == _launch_snapshot(context)
+        assert scope == _scope(context)
+        assert authorization.scope == scope
+        assert authorization.identity == _identity()
+        assert authorization.gate_generation == _GATE_GENERATION
         events.append('committed-authority')
         return True
 
@@ -751,9 +777,7 @@ def test_committed_provider_guard_uses_only_frozen_handoff_and_physical_uid(
                         _committed_authority)
     monkeypatch.setattr(backend.kubernetes_adaptor,
                         'physical_cluster_uid_fence', _physical_guard)
-    monkeypatch.setattr(
-        reclaim, 'require_unique_policy',
-        mock.Mock(side_effect=AssertionError('postcommit policy callback')))
+    policy_calls = _install_launch_policy(monkeypatch)
     monkeypatch.setattr(
         serve_state, 'reserved_fill_reclaim_gate_authority_guard',
         mock.Mock(side_effect=AssertionError('postcommit global gate')))
@@ -769,6 +793,12 @@ def test_committed_provider_guard_uses_only_frozen_handoff_and_physical_uid(
         'physical-exit',
         'service-exit',
     ]
+    assert len(policy_calls) == 1
+    scope, identity, generation, deadline = policy_calls[0]
+    assert scope == _scope(context)
+    assert identity == _identity()
+    assert generation == _GATE_GENERATION
+    assert deadline > time.monotonic()
 
 
 def test_mutable_successor_state_cannot_revoke_committed_provider_epochs(
@@ -793,11 +823,10 @@ def test_mutable_successor_state_cannot_revoke_committed_provider_epochs(
 
     monkeypatch.setattr(backend.kubernetes_adaptor,
                         'physical_cluster_uid_fence', _physical_guard)
+    policy_calls = _install_launch_policy(monkeypatch)
     # These are the old mutable successor authorities. A post-create
-    # with-guard/pass seam must never consult any of them.
-    monkeypatch.setattr(
-        reclaim, 'require_unique_policy',
-        mock.Mock(side_effect=AssertionError('successor policy consulted')))
+    # with-guard/pass seam must never consult any of them.  Fresh external
+    # facts are still attested against the original frozen scope.
     monkeypatch.setattr(
         serve_state, 'reserved_fill_reclaim_gate_authority_guard',
         mock.Mock(side_effect=AssertionError('successor gate consulted')))
@@ -813,6 +842,10 @@ def test_mutable_successor_state_cannot_revoke_committed_provider_epochs(
         pass
 
     assert authority.call_count == 2
+    assert all(
+        call.args[0] == _scope(context) for call in authority.call_args_list)
+    assert [call[0] for call in policy_calls] == [_scope(context)] * 2
+    assert [call[2] for call in policy_calls] == [_GATE_GENERATION] * 2
     assert physical_entries == [('phx-context', 'physical-uid')] * 2
 
 
@@ -828,6 +861,7 @@ def test_physical_uid_retarget_fails_before_provider_effect(monkeypatch):
     monkeypatch.setattr(serve_state,
                         'reserved_fill_committed_launch_authority_holds',
                         lambda *_args: True)
+    _install_launch_policy(monkeypatch)
 
     @contextlib.contextmanager
     def _retargeted_physical_guard(_context, _uid):
@@ -860,6 +894,7 @@ def test_lost_committed_service_authority_fails_before_physical_effect(
     monkeypatch.setattr(serve_state,
                         'reserved_fill_committed_launch_authority_holds',
                         lambda *_args: False)
+    _install_launch_policy(monkeypatch)
     monkeypatch.setattr(backend.kubernetes_adaptor,
                         'physical_cluster_uid_fence', physical_guard)
 
@@ -904,6 +939,7 @@ def test_provider_exception_classification_is_preserved(monkeypatch):
     monkeypatch.setattr(serve_state,
                         'reserved_fill_committed_launch_authority_holds',
                         lambda *_args: True)
+    _install_launch_policy(monkeypatch)
     monkeypatch.setattr(backend.kubernetes_adaptor,
                         'physical_cluster_uid_fence',
                         lambda *_args: contextlib.nullcontext())
@@ -915,6 +951,64 @@ def test_provider_exception_classification_is_preserved(monkeypatch):
             raise provider_error
 
     assert exc_info.value is provider_error
+
+
+def test_committed_provider_guard_rejects_current_plugin_identity_rotation(
+        monkeypatch):
+    context = _launch_context()
+    provisioner = _provisioner(context)
+    snapshot = _launch_snapshot(context)
+    provider_ran = False
+    monkeypatch.setattr(provisioner,
+                        '_service_replica_launch_provider_owner_guard',
+                        lambda: contextlib.nullcontext(snapshot))
+    monkeypatch.setattr(
+        reclaim, 'require_unique_policy',
+        lambda: _Policy(authorize_launch=lambda *_args, **_kwargs: pytest.fail(
+            'identity mismatch must precede external proof'),
+                        identity=_identity(fleet_digest=_OTHER_FLEET_DIGEST)))
+
+    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
+                       match='Deployment reclaim policy refused'):
+        with provisioner._service_replica_launch_provider_guard():
+            provider_ran = True
+
+    assert not provider_ran
+
+
+def test_committed_provider_guard_rejects_expired_fresh_proof_before_effect(
+        monkeypatch):
+    context = _launch_context()
+    provisioner = _provisioner(context)
+    snapshot = _launch_snapshot(context)
+    provider_ran = False
+    committed = mock.Mock(return_value=True)
+    monkeypatch.setattr(provisioner,
+                        '_service_replica_launch_provider_owner_guard',
+                        lambda: contextlib.nullcontext(snapshot))
+    monkeypatch.setattr(serve_state,
+                        'reserved_fill_committed_launch_authority_holds',
+                        committed)
+
+    def _expired(scope, *, expected_identity, expected_gate_generation,
+                 deadline_monotonic):
+        del deadline_monotonic
+        return _launch_authorization(
+            scope,
+            identity=expected_identity,
+            gate_generation=expected_gate_generation,
+            completed_monotonic=(time.monotonic() -
+                                 reclaim.AUTHORIZATION_MAX_AGE_SECONDS))
+
+    _install_launch_policy(monkeypatch, callback=_expired)
+
+    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
+                       match='Deployment reclaim policy refused'):
+        with provisioner._service_replica_launch_provider_guard():
+            provider_ran = True
+
+    assert not provider_ran
+    committed.assert_not_called()
 
 
 def _claim_edge() -> dict[str, object]:

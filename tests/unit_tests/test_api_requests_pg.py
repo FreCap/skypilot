@@ -1887,7 +1887,7 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
                         'resolve_non_pool_launch_profile_in_connection',
                         lambda *_args, **_kwargs: profile)
     monkeypatch.setattr(
-        ordinary_launch_binding, '_reserved_fill_payload',
+        ordinary_launch_binding, '_reserved_fill_cleanup_payload',
         lambda *_args, **_kwargs: {'physical_cluster_uid': 'physical-uid-a'})
     built = non_pool_admission.build(
         _gc_unbound_non_pool_launch_body(),
@@ -3835,6 +3835,46 @@ def test_binding_fleet_requires_every_recent_participant_and_local_handler(
                          handlers=(),
                          ready=False)
     assert not request_postgres.ordinary_launch_binding_fleet_capable()
+
+
+def test_non_pool_cohort_promotion_barrier_blocks_heartbeat_phantoms(
+        request_database):
+    engine, _ = request_database
+    instance_id = uuid.uuid4()
+
+    with engine.begin() as barrier_connection:
+        assert isinstance(
+            request_postgres.
+            _non_pool_launch_binding_participants_quiesced_in_transaction(
+                barrier_connection), bool)
+        with pytest.raises(sqlalchemy.exc.DBAPIError, match='lock timeout'):
+            with engine.begin() as heartbeat_connection:
+                heartbeat_connection.execute(
+                    sqlalchemy.text("SET LOCAL lock_timeout = '100ms'"))
+                heartbeat_connection.execute(
+                    sqlalchemy.insert(request_postgres.SERVER_INSTANCES).values(
+                        instance_id=instance_id,
+                        role='controller',
+                        version='cohort-racer',
+                        started_at=sqlalchemy.func.clock_timestamp(),
+                        heartbeat_at=sqlalchemy.func.clock_timestamp(),
+                        ready=False,
+                        health_detail={},
+                        supported_handlers=[],
+                        supported_payload_versions={}))
+
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(request_postgres.SERVER_INSTANCES).values(
+                instance_id=instance_id,
+                role='controller',
+                version='cohort-racer',
+                started_at=sqlalchemy.func.clock_timestamp(),
+                heartbeat_at=sqlalchemy.func.clock_timestamp(),
+                ready=False,
+                health_detail={},
+                supported_handlers=[],
+                supported_payload_versions={}))
 
 
 def test_ordered_capacity_fleet_requires_exact_recent_api015_cohort(

@@ -903,6 +903,10 @@ def test_pre_serve056_json_only_replica_is_cleanup_only(
     with actuation_database.begin() as connection:
         _commit_and_insert_replica(connection, lease, info)
 
+    config = migration_utils.get_alembic_config(actuation_database,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '056')
+
     with actuation_database.connect() as connection:
         assert zero_cost_actuation.committed_intent_for_replica_in_connection(
             connection,
@@ -914,6 +918,14 @@ def test_pre_serve056_json_only_replica_is_cleanup_only(
             service_name='svc',
             service_hash=_SERVICE_HASH,
             replica_info=info)
+        cleanup_intent = (
+            zero_cost_actuation.
+            cleanup_only_committed_intent_for_replica_in_connection(
+                connection,
+                service_name='svc',
+                service_hash=_SERVICE_HASH,
+                replica_info=info))
+        assert cleanup_intent == lease.intent
         info.reserved_fill_physical_cluster_uid = 'other-uid'
         assert zero_cost_actuation.committed_intent_for_replica_in_connection(
             connection,
@@ -925,6 +937,12 @@ def test_pre_serve056_json_only_replica_is_cleanup_only(
             service_name='svc',
             service_hash=_SERVICE_HASH,
             replica_info=info)
+        assert (zero_cost_actuation.
+                cleanup_only_committed_intent_for_replica_in_connection(
+                    connection,
+                    service_name='svc',
+                    service_hash=_SERVICE_HASH,
+                    replica_info=info) is None)
 
 
 def test_committed_replica_id_high_water_survives_replica_cleanup(

@@ -85,7 +85,8 @@ DIGEST_VERSION = 'serve-bound-launch.v1'
 NON_POOL_BINDING_PROTOCOL_VERSION = 2
 NON_POOL_PROFILE_VERSION = 1
 NON_POOL_RECEIPT_PROTOCOL_VERSION = 1
-NON_POOL_CAPABILITY_COHORT_EPOCH = 1
+NON_POOL_CAPABILITY_COHORT_EPOCH = (
+    serve_constants.NON_POOL_CAPABILITY_COHORT_EPOCH)
 TOMBSTONE_RETENTION_DAYS = 60
 MAX_GC_BATCH_SIZE = 500
 _SHA256_RE = re.compile(r'[0-9a-f]{64}')
@@ -1173,13 +1174,39 @@ class ControllerBindingAuthority:
     @property
     def generic_launches_required(self) -> bool:
         """Whether every non-pool launch must use protocol v2."""
-        return bool(self.non_pool_capable is True and
+        return bool(self.capable is True and
+                    self.binding_mode == BindingMode.BOUND and
+                    self.non_pool_capable is True and
                     self.non_pool_binding_protocol_version
                     == NON_POOL_BINDING_PROTOCOL_VERSION and
                     self.non_pool_profile_set_digest
                     == supported_non_pool_profile_set_digest() and
                     self.non_pool_capability_cohort_epoch
                     == NON_POOL_CAPABILITY_COHORT_EPOCH and
+                    self.non_pool_receipt_protocol_version
+                    == NON_POOL_RECEIPT_PROTOCOL_VERSION)
+
+    @property
+    def retained_non_pool_settlement_allowed(self) -> bool:
+        """Whether this owner may settle current/adjacent-cohort actions.
+
+        A provider-semantic cohort rotation closes new admission immediately
+        on the new binary, but the durable service tuple stays on the previous
+        cohort until its requests and replicas are drained.  Permit that one
+        adjacent cohort to adopt, reconcile, or retire existing actions.  This
+        property must never guard request admission or provider-effect start.
+        """
+        cohort = self.non_pool_capability_cohort_epoch
+        return bool(self.capable is True and
+                    self.binding_mode == BindingMode.BOUND and
+                    self.non_pool_capable is True and
+                    self.non_pool_binding_protocol_version
+                    == NON_POOL_BINDING_PROTOCOL_VERSION and
+                    self.non_pool_profile_set_digest
+                    == supported_non_pool_profile_set_digest() and
+                    type(cohort) is int and
+                    cohort in (NON_POOL_CAPABILITY_COHORT_EPOCH,
+                               NON_POOL_CAPABILITY_COHORT_EPOCH - 1) and
                     self.non_pool_receipt_protocol_version
                     == NON_POOL_RECEIPT_PROTOCOL_VERSION)
 
@@ -2460,6 +2487,61 @@ def _reserved_fill_payload(
     }
 
 
+def _reserved_fill_cleanup_payload(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    info: Any,
+) -> dict[str, Any]:
+    """Reconstruct immutable fill evidence for provider-present teardown.
+
+    This is the sole compatibility consumer for a retained Serve055 JSON-only
+    intent edge.  It cannot authorize launch, workspace access, materialization,
+    or a lease.  New scalar-linked rows take the canonical resolver.
+    """
+    intent = (zero_cost_actuation.
+              cleanup_only_committed_intent_for_replica_in_connection(
+                  connection,
+                  service_name=service['name'],
+                  service_hash=service['hash'],
+                  replica_info=info))
+    if intent is None:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup lost its exact committed intent '
+            'evidence.')
+    observations = (
+        pool_capacity_observation_schema.demand_capacity_observations_v2_table)
+    observation = connection.execute(
+        sqlalchemy.select(observations).where(
+            observations.c.pool_key == intent.pool_key,
+            observations.c.observation_generation ==
+            intent.observation_generation,
+            observations.c.observation_sequence == intent.observation_sequence,
+            observations.c.observation_status ==
+            pool_capacity_observation_schema.SUCCESS)).mappings().one_or_none()
+    if observation is None:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup lost its committed observation '
+            'evidence.')
+    sequence = _freeze_reserved_fill_sequence_gate(info,
+                                                   _zero_cost_sequence_payload(
+                                                       connection, info),
+                                                   committed_intent=intent)
+    return {
+        'allocation_input_sha256': intent.allocation_input_sha256,
+        'claim_generation': intent.allocation_claim_generation,
+        'intent_idempotency_key': intent.idempotency_key,
+        'observation_payload_sha256': observation['payload_sha256'],
+        'physical_cluster_uid': intent.physical_cluster_uid,
+        'pool_key': intent.pool_key,
+        'reclaim_fleet_bundle_sha256': intent.reclaim_fleet_bundle_sha256,
+        'reclaim_policy_revision': intent.reclaim_policy_revision,
+        'reclaim_provider_inventory_sha256':
+            intent.reclaim_provider_inventory_sha256,
+        'sequence': sequence,
+        'worker_projection_sha256': intent.worker_projection_sha256,
+    }
+
+
 def _freeze_reserved_fill_sequence_gate(
     info: Any,
     sequence: Mapping[str, Any],
@@ -2822,10 +2904,10 @@ def retire_pre_admission_non_pool_launch_intent(
         raise TypeError('authority must be ControllerBindingAuthority.')
     replica_id = _positive_int(replica_id, 'replica_id')
     record_id = _canonical_uuid(replica_record_id, 'replica_record_id')
-    if (authority.binding_mode != BindingMode.BOUND or
-            not authority.generic_launches_required):
+    if not authority.retained_non_pool_settlement_allowed:
         raise OrdinaryLaunchBindingConflict(
-            'Pre-admission retirement requires exact generic authority.')
+            'Pre-admission retirement requires exact retained generic '
+            'settlement authority.')
 
     engine = serve_state.get_database_engine()
     if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
@@ -3115,6 +3197,7 @@ def _validate_generic_capability(
                    capability_profile_set_digest, capability_cohort_epoch,
                    receipt_protocol_version) or capability_profile_set_digest
             != supported_non_pool_profile_set_digest() or
+            capability_cohort_epoch != NON_POOL_CAPABILITY_COHORT_EPOCH or
             receipt_protocol_version != NON_POOL_RECEIPT_PROTOCOL_VERSION):
         raise OrdinaryLaunchBindingConflict(
             'Service is not owned by the exact generic launch cohort.')
@@ -3187,10 +3270,7 @@ def _validate_reserved_fill_cleanup_profile_in_connection(
         raise OrdinaryLaunchBindingConflict(
             'Provider-present cleanup lost its durable reserved zero-cost '
             'profile.')
-    payload = _reserved_fill_payload(connection,
-                                     service,
-                                     info,
-                                     freeze_reconciliation_gate=True)
+    payload = _reserved_fill_cleanup_payload(connection, service, info)
     actual = NonPoolLaunchProfile.create(
         NonPoolLaunchProfileKind.RESERVED_FILL,
         authorization_reference=(
@@ -3653,7 +3733,7 @@ def list_provider_reconciliation_contexts(
     """
     if not isinstance(authority, ControllerBindingAuthority):
         raise TypeError('authority must be a ControllerBindingAuthority.')
-    if not authority.generic_launches_required:
+    if not authority.retained_non_pool_settlement_allowed:
         return []
     engine = serve_state.get_database_engine()
     if not _serve042_supported(engine):
@@ -3685,6 +3765,12 @@ def list_provider_reconciliation_contexts(
                 ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value,
                 associations.c.binding_protocol_version ==
                 NON_POOL_BINDING_PROTOCOL_VERSION,
+                associations.c.capability_cohort_epoch ==
+                authority.non_pool_capability_cohort_epoch,
+                associations.c.capability_profile_set_digest ==
+                authority.non_pool_profile_set_digest,
+                associations.c.receipt_protocol_version ==
+                authority.non_pool_receipt_protocol_version,
                 associations.c.profile_kind.is_not(None)).order_by(
                     associations.c.replica_id)).mappings().all()
     contexts = []
@@ -5071,18 +5157,83 @@ def promote_non_pool_launch_service_in_connection(
 
     if service['non_pool_launch_binding_capable'] is True:
         capability = _non_pool_capability_from_service(service)
-        if (service['controller_incarnation'] != controller_incarnation or
-                service['controller_owner_epoch'] != controller_owner_epoch or
-                service['ordinary_launch_binding_epoch']
-                != expected_binding_epoch + 1 or
-                capability != (True, NON_POOL_BINDING_PROTOCOL_VERSION,
+        expected_capability = (True, NON_POOL_BINDING_PROTOCOL_VERSION,
                                supported_non_pool_profile_set_digest(),
                                NON_POOL_CAPABILITY_COHORT_EPOCH,
-                               NON_POOL_RECEIPT_PROTOCOL_VERSION)):
+                               NON_POOL_RECEIPT_PROTOCOL_VERSION)
+        if (service['controller_incarnation'] != controller_incarnation or
+                service['controller_owner_epoch'] != controller_owner_epoch):
             raise OrdinaryLaunchBindingConflict(
-                'Already-generic service belongs to a different capability '
-                'cohort or binding epoch.')
-        return int(service['ordinary_launch_binding_epoch'])
+                'Already-generic service belongs to different controller '
+                'authority.')
+        if capability == expected_capability:
+            if (service['ordinary_launch_binding_epoch']
+                    != expected_binding_epoch + 1):
+                raise OrdinaryLaunchBindingConflict(
+                    'Already-generic service belongs to a different binding '
+                    'epoch.')
+            return int(service['ordinary_launch_binding_epoch'])
+
+        # A provider-effect semantic change rotates the complete advertised
+        # cohort.  Keep the old tuple durable until all new participants have
+        # survived the heartbeat/quiescence horizon and every old association
+        # has settled.  The adjacent binding-epoch CAS fences prepared old
+        # requests from the first new admission.
+        previous_capability = (True, NON_POOL_BINDING_PROTOCOL_VERSION,
+                               supported_non_pool_profile_set_digest(),
+                               NON_POOL_CAPABILITY_COHORT_EPOCH - 1,
+                               NON_POOL_RECEIPT_PROTOCOL_VERSION)
+        if (capability != previous_capability or
+                service['ordinary_launch_binding_mode']
+                != BindingMode.BOUND.value or
+                service['ordinary_launch_binding_epoch']
+                != expected_binding_epoch):
+            raise OrdinaryLaunchBindingConflict(
+                'Generic launch capability rotation is not exact and '
+                'adjacent.')
+        if (not _transition_barrier_passes(
+                connection, participant_barrier_passed,
+                'generic participant capability rotation barrier') or
+                not _transition_barrier_passes(
+                    connection, legacy_requests_drained,
+                    'prior-cohort request drain barrier')):
+            raise OrdinaryLaunchBindingUnavailable(
+                'Generic capability rotation requires the exact new fleet '
+                'cohort and complete prior-cohort drain.')
+        pending = [
+            int(replica['replica_id'])
+            for replica in replicas
+            if replica['status'] in ('PENDING', 'PROVISIONING')
+        ]
+        unsettled = [
+            str(association['association_id'])
+            for association in associations
+            if association['resolution'] in tuple(
+                value.value for value in UNSETTLED_RESOLUTIONS)
+        ]
+        if service['pool'] != 0 or pending or unsettled:
+            raise OrdinaryLaunchBindingConflict(
+                'Generic capability rotation requires no pending replicas or '
+                'unsettled prior-cohort associations.')
+        result = connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == service_name,
+                serve_state_schema.services_table.c.controller_incarnation ==
+                controller_incarnation,
+                serve_state_schema.services_table.c.controller_owner_epoch ==
+                controller_owner_epoch, serve_state_schema.services_table.c.
+                ordinary_launch_binding_epoch == expected_binding_epoch,
+                serve_state_schema.services_table.c.
+                non_pool_launch_binding_capable.is_(True), serve_state_schema.
+                services_table.c.non_pool_launch_capability_cohort_epoch ==
+                NON_POOL_CAPABILITY_COHORT_EPOCH - 1).values(
+                    ordinary_launch_binding_epoch=expected_binding_epoch + 1,
+                    non_pool_launch_capability_cohort_epoch=
+                    NON_POOL_CAPABILITY_COHORT_EPOCH))
+        if result.rowcount != 1:
+            raise OrdinaryLaunchBindingConflict(
+                'Generic capability rotation lost its exact service CAS.')
+        return expected_binding_epoch + 1
 
     _non_pool_capability_from_service(service)
     if (service['ordinary_launch_binding_mode'] != BindingMode.BOUND.value or
@@ -5543,7 +5694,15 @@ def record_non_pool_provider_evidence(
         == association['owner_controller_incarnation'] and
         authority.controller_owner_epoch
         == association['owner_controller_epoch'] and
-        authority.generic_launches_required)
+        authority.retained_non_pool_settlement_allowed and
+        association['binding_protocol_version']
+        == authority.non_pool_binding_protocol_version and
+        association['capability_cohort_epoch']
+        == authority.non_pool_capability_cohort_epoch and
+        association['capability_profile_set_digest']
+        == authority.non_pool_profile_set_digest and
+        association['receipt_protocol_version']
+        == authority.non_pool_receipt_protocol_version)
     if not expected_authority:
         raise OrdinaryLaunchBindingConflict(
             'Provider evidence writer no longer owns this association.')

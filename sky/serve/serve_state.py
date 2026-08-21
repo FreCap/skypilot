@@ -3031,20 +3031,24 @@ def service_replica_launch_fence_holds(
 
 
 def reserved_fill_committed_launch_authority_holds(
+    scope: reserved_fill_reclaim_attestation.ReclaimLaunchScope | None,
+    authorization: (reserved_fill_reclaim_attestation.ReclaimLaunchAuthorization
+                    | None),
     launch_context: dict[str, Any],
     launch_snapshot: ServiceReplicaLaunchFenceSnapshot | None,
 ) -> bool:
-    """Validate the immutable postcommit fill handoff before provider I/O.
+    """Validate the immutable handoff and fresh facts before provider I/O.
 
     Mutable allocation maps, claim sets, observations, reconciliation gates,
-    deployment-policy callbacks, and context-wide inventory proofs authorize
-    only precommit admission.  After Serve056 atomically links a replica to a
-    COMMITTED intent, this function reads only that frozen graph plus the
-    current service/version owner.  The surrounding bound-request guard owns
-    the exact association/request execution generation and holds the service
-    authority lock across the concrete provider mutation.
+    and their current generations authorize only precommit admission.  After
+    Serve056 atomically links a replica to a COMMITTED intent, that frozen
+    graph defines the exact scope.  A newly minted deployment-policy ticket
+    must still attest the live context-wide provider/admission/no-paid facts
+    for that frozen scope.  The surrounding bound-request guard owns the exact
+    association/request execution generation and holds service authority
+    across the concrete provider mutation.
     """
-    if (launch_snapshot is None or
+    if (scope is None or authorization is None or launch_snapshot is None or
             launch_snapshot.durable_replica_info is None):
         return False
     durable_replica = launch_snapshot.durable_replica_info
@@ -3105,7 +3109,16 @@ def reserved_fill_committed_launch_authority_holds(
                     service_row['non_pool_launch_controller_incarnation']
                     != service_row['controller_incarnation'] or
                     service_row['non_pool_launch_binding_protocol_version']
-                    != 2):
+                    != ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION
+                    or
+                    service_row['non_pool_launch_capability_profile_set_digest']
+                    != ordinary_launch_binding.
+                    supported_non_pool_profile_set_digest() or
+                    service_row['non_pool_launch_capability_cohort_epoch']
+                    != ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+                    or service_row['non_pool_launch_receipt_protocol_version']
+                    != ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION
+               ):
                 return False
             intent = (
                 zero_cost_actuation.committed_intent_for_replica_in_connection(
@@ -3175,7 +3188,40 @@ def reserved_fill_committed_launch_authority_holds(
             if (projected_admission.worker_projection_sha256
                     != intent.worker_projection_sha256):
                 return False
+            expected_scope = (
+                reserved_fill_reclaim_attestation.ReclaimLaunchScope(
+                    service_name=service_name,
+                    service_version=intent.service_version,
+                    pool_key=intent.pool_key,
+                    service_generation=intent.service_generation,
+                    physical_cluster_uid=intent.physical_cluster_uid,
+                    kubernetes_context=intent.allowed_locations[0].region,
+                    accelerator=intent.accelerator,
+                    accelerator_count=intent.accelerator_count,
+                    projected_admission=projected_admission))
+            if scope != expected_scope:
+                return False
+            identity = reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
+                fleet_bundle_sha256=intent.reclaim_fleet_bundle_sha256,
+                policy_revision=intent.reclaim_policy_revision,
+                provider_inventory_sha256=(
+                    intent.reclaim_provider_inventory_sha256))
+            (reserved_fill_reclaim_attestation.
+             require_exact_launch_authorization)(
+                 authorization,
+                 expected_identity=identity,
+                 expected_gate_generation=(
+                     intent.reconciliation_gate_generation),
+                 expected_scope=expected_scope)
+            if not (reserved_fill_reclaim_proofs.
+                    provider_proof_reference_holds_in_connection)(
+                        connection,
+                        authorization.provider_proof_reference,
+                        expected_physical_cluster_uid=(
+                            intent.physical_cluster_uid)):
+                return False
     except (AttributeError, IndexError, KeyError, TypeError, ValueError,
+            reserved_fill_reclaim_attestation.ReclaimAttestationError,
             zero_cost_actuation.ZeroCostActuationError):
         return False
     return True

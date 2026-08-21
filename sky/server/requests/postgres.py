@@ -3380,7 +3380,7 @@ def _controller_authority_matches_reduction(
     association: Mapping[str, Any],
     authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
 ) -> bool:
-    return bool(
+    base_matches = bool(
         isinstance(authority,
                    ordinary_launch_binding.ControllerBindingAuthority) and
         authority.capable is True and
@@ -3395,6 +3395,19 @@ def _controller_authority_matches_reduction(
         == association['owner_controller_incarnation'] and
         authority.controller_owner_epoch
         == association['owner_controller_epoch'])
+    if not base_matches:
+        return False
+    if association.get('binding_protocol_version') is None:
+        return True
+    return bool(authority.retained_non_pool_settlement_allowed and
+                association['binding_protocol_version']
+                == authority.non_pool_binding_protocol_version and
+                association['capability_cohort_epoch']
+                == authority.non_pool_capability_cohort_epoch and
+                association['capability_profile_set_digest']
+                == authority.non_pool_profile_set_digest and
+                association['receipt_protocol_version']
+                == authority.non_pool_receipt_protocol_version)
 
 
 def _paid_capacity_claim_is_exact(
@@ -4481,6 +4494,17 @@ def _ordinary_launch_binding_participants_quiesced_in_transaction(
             ORDINARY_LAUNCH_BINDING_PARTICIPANT_QUIESCENCE_SECONDS))
 
 
+def _non_pool_launch_binding_participants_quiesced_in_transaction(
+    connection: sqlalchemy.engine.Connection,) -> bool:
+    """Close capability-heartbeat phantoms before cohort rotation."""
+    connection.execute(
+        sqlalchemy.text('LOCK TABLE api_server_instances IN SHARE MODE'))
+    return non_pool_launch_binding_fleet_capable(
+        connection=connection,
+        quiescence_seconds=(
+            ORDINARY_LAUNCH_BINDING_PARTICIPANT_QUIESCENCE_SECONDS))
+
+
 def promote_ordinary_launch_binding_service(
     authority: ordinary_launch_binding_lib.ControllerBindingAuthority,) -> int:
     """Explicitly promote one service under fleet and legacy-drain barriers."""
@@ -4527,8 +4551,10 @@ def promote_non_pool_launch_binding_service(
                 expected_binding_epoch=authority.binding_epoch,
                 participant_barrier_passed=lambda conn:
                 (_transition_authority_is_current(
-                    conn, authority, ordinary_launch_binding.BindingMode.BOUND)
-                 and non_pool_launch_binding_fleet_capable(connection=conn)),
+                    conn, authority, ordinary_launch_binding.BindingMode.BOUND
+                ) and
+                 _non_pool_launch_binding_participants_quiesced_in_transaction(
+                     conn)),
                 legacy_requests_drained=lambda conn:
                 (_bound_ordinary_launch_requests_clear_in_transaction(
                     conn, authority.service_name) and

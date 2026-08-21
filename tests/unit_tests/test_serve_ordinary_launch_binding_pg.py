@@ -757,6 +757,147 @@ def _admit_generic_paid(
         launch_body.extra_launch_context)
 
 
+def test_serve056_previous_cohort_settles_but_cannot_start_provider_effect(
+        binding_database, monkeypatch) -> None:
+    current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    assert current_cohort > 1
+    with monkeypatch.context() as old_code:
+        old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                         current_cohort - 1)
+        identity, context = _admit_generic_paid(binding_database)
+
+    authority = dataclasses.replace(
+        _generic_controller_authority(),
+        non_pool_capability_cohort_epoch=current_cohort - 1)
+    assert not authority.generic_launches_required
+    assert authority.retained_non_pool_settlement_allowed
+    with binding_database.begin() as connection:
+        association = binding.lock_reduction_authority_in_connection(
+            connection, context)
+    assert association['association_id'] == identity.association_id
+
+    claim = _Claim(identity.request_id, 1, str(uuid.uuid4()), str(uuid.uuid4()))
+    entered = False
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='exact generic launch cohort'):
+        with binding.provider_effect_guard(context,
+                                           claim,
+                                           claim_validator=lambda _connection,
+                                           _association_id, _claim: True):
+            entered = True
+    assert not entered
+    with binding_database.connect() as connection:
+        phase = connection.execute(
+            sqlalchemy.select(
+                binding.ordinary_launch_associations_table.c.effect_phase).
+            where(binding.ordinary_launch_associations_table.c.association_id ==
+                  identity.association_id)).scalar_one()
+    assert phase == binding.EffectPhase.NOT_STARTED.value
+
+
+def test_serve056_previous_cohort_retires_pre_admission_replica(
+        binding_database, monkeypatch) -> None:
+    current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    with monkeypatch.context() as old_code:
+        old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                         current_cohort - 1)
+        with binding_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status='READY'))
+            assert binding.promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                expected_binding_epoch=5,
+                participant_barrier_passed=lambda _connection: True,
+                legacy_requests_drained=lambda _connection: True) == 6
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status='PROVISIONING',
+                        paid_capacity_pool_key='pool-a',
+                        replica_state=_stored_replica_state(
+                            {'paid_capacity_pool_key': 'pool-a'})))
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_pools_table).values(
+                        pool_key='pool-a',
+                        current_limit=1,
+                        successes_since_resize=0,
+                        updated_at=time.time()))
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_claims_table).values(
+                        service_name='svc',
+                        service_hash='svc-hash',
+                        replica_id=3,
+                        pool_key='pool-a',
+                        priority=1,
+                        claimed_at=time.time()))
+
+    authority = dataclasses.replace(
+        _generic_controller_authority(),
+        non_pool_capability_cohort_epoch=current_cohort - 1)
+    retirement = binding.retire_pre_admission_non_pool_launch_intent(
+        authority, 3, _RECORD_ID)
+    assert retirement.disposition is (
+        binding.PreAdmissionRetirementDisposition.RETIRED)
+    assert retirement.profile_kind is (
+        binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    with binding_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.replicas_table)).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table)).scalar_one(
+                ) == 0
+
+
+def test_serve056_previous_cohort_reconciles_ambiguous_provider_action(
+        binding_database, monkeypatch) -> None:
+    current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    with monkeypatch.context() as old_code:
+        old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                         current_cohort - 1)
+        identity, context = _admit_generic_paid(binding_database)
+        claim = _Claim(identity.request_id, 1, str(uuid.uuid4()),
+                       str(uuid.uuid4()))
+        with binding.provider_effect_guard(context,
+                                           claim,
+                                           claim_validator=lambda _connection,
+                                           _association_id, _claim: True):
+            pass
+
+    authority = dataclasses.replace(
+        _generic_controller_authority(),
+        non_pool_capability_cohort_epoch=current_cohort - 1)
+    with binding_database.begin() as connection:
+        assert binding.mark_ambiguous_in_connection(
+            connection, context, 'old-cohort-provider-result-uncertain')
+    assert binding.list_provider_reconciliation_contexts(authority) == [context]
+
+    terminal = binding.TerminalEvidence(status=binding.TerminalStatus.CANCELLED,
+                                        cause='execution_lease_expired',
+                                        execution_generation=1,
+                                        quiescence_required=True,
+                                        quiesced_generation=1,
+                                        quiesced_at=datetime.datetime.now(
+                                            datetime.timezone.utc))
+    with binding_database.begin() as connection:
+        assert binding.record_non_pool_provider_evidence(
+            connection, context, authority, binding.ProviderEvidence.UNKNOWN, {
+                'cluster_name': 'svc-3',
+                'probe_contract': 'test-provider-v1',
+                'result': 'UNKNOWN',
+            }, lambda _connection, _context: terminal)
+
+
 def test_serve047_provider_evidence_is_owner_fenced_and_monotonic(
         binding_database) -> None:
     identity, context = _admit_generic_paid(binding_database)
@@ -946,7 +1087,8 @@ def test_serve047_generic_capability_transition_is_adjacent_and_reversible(
     assert service['non_pool_launch_binding_protocol_version'] == 2
     assert service['non_pool_launch_capability_profile_set_digest'] == (
         binding.supported_non_pool_profile_set_digest())
-    assert service['non_pool_launch_capability_cohort_epoch'] == 1
+    assert service['non_pool_launch_capability_cohort_epoch'] == (
+        binding.NON_POOL_CAPABILITY_COHORT_EPOCH)
     assert service['non_pool_launch_receipt_protocol_version'] == 1
 
     with binding_database.begin() as connection:
@@ -972,6 +1114,137 @@ def test_serve047_generic_capability_transition_is_adjacent_and_reversible(
     assert service['non_pool_launch_receipt_protocol_version'] is None
 
 
+def test_serve056_rotates_generic_cohort_only_after_new_fleet_and_drain(
+        binding_database, monkeypatch) -> None:
+    current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    assert current_cohort > 1
+    with monkeypatch.context() as old_code:
+        old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                         current_cohort - 1)
+        with binding_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status='READY'))
+            assert binding.promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                expected_binding_epoch=5,
+                participant_barrier_passed=lambda _connection: True,
+                legacy_requests_drained=lambda _connection: True) == 6
+
+    with pytest.raises(binding.OrdinaryLaunchBindingUnavailable,
+                       match='exact new fleet cohort'):
+        with binding_database.begin() as connection:
+            binding.promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                expected_binding_epoch=6,
+                participant_barrier_passed=lambda _connection: False,
+                legacy_requests_drained=lambda _connection: True)
+
+    with binding_database.begin() as connection:
+        rotated_epoch = binding.promote_non_pool_launch_service_in_connection(
+            connection,
+            service_name='svc',
+            controller_incarnation=_CONTROLLER_ID,
+            controller_owner_epoch=6,
+            expected_binding_epoch=6,
+            participant_barrier_passed=lambda _connection: True,
+            legacy_requests_drained=lambda _connection: True)
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc')).mappings().one()
+
+    assert rotated_epoch == 7
+    assert service['ordinary_launch_binding_epoch'] == 7
+    assert service['non_pool_launch_capability_cohort_epoch'] == current_cohort
+
+
+def test_serve056_cohort_rotation_rejects_provisioning_replica(
+        binding_database, monkeypatch) -> None:
+    current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    assert current_cohort > 1
+    with monkeypatch.context() as old_code:
+        old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                         current_cohort - 1)
+        with binding_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status='READY'))
+            assert binding.promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                expected_binding_epoch=5,
+                participant_barrier_passed=lambda _connection: True,
+                legacy_requests_drained=lambda _connection: True) == 6
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status='PROVISIONING'))
+
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='no pending replicas'):
+        with binding_database.begin() as connection:
+            assert connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    binding.ordinary_launch_associations_table)).scalar_one(
+                    ) == 0
+            binding.promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                expected_binding_epoch=6,
+                participant_barrier_passed=lambda _connection: True,
+                legacy_requests_drained=lambda _connection: True)
+
+
+def test_serve056_cohort_rotation_rejects_unsettled_association(
+        binding_database, monkeypatch) -> None:
+    current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    assert current_cohort > 1
+    with monkeypatch.context() as old_code:
+        old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                         current_cohort - 1)
+        identity, _ = _admit_generic_paid(binding_database)
+
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='unsettled prior-cohort associations'):
+        with binding_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status='READY'))
+            association = connection.execute(
+                sqlalchemy.select(
+                    binding.ordinary_launch_associations_table.c.resolution).
+                where(binding.ordinary_launch_associations_table.c.
+                      association_id == identity.association_id)).scalar_one()
+            assert association in tuple(
+                value.value for value in binding.UNSETTLED_RESOLUTIONS)
+            binding.promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                expected_binding_epoch=6,
+                participant_barrier_passed=lambda _connection: True,
+                legacy_requests_drained=lambda _connection: True)
+
+
 def test_serve047_rejects_capability_change_without_binding_epoch_cas(
         binding_database) -> None:
     with pytest.raises(sqlalchemy.exc.DBAPIError,
@@ -985,7 +1258,8 @@ def test_serve047_rejects_capability_change_without_binding_epoch_cas(
                         non_pool_launch_binding_protocol_version=2,
                         non_pool_launch_capability_profile_set_digest=(
                             binding.supported_non_pool_profile_set_digest()),
-                        non_pool_launch_capability_cohort_epoch=1,
+                        non_pool_launch_capability_cohort_epoch=(
+                            binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
                         non_pool_launch_receipt_protocol_version=1))
 
 

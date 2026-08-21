@@ -1077,3 +1077,7 @@ POOL_DUMMY_RUN_COMMAND = 'echo "setup done"'
 # Error message prefix for max number of services reached.
 # This is used as a marker to detect the error in controller logs.
 MAX_NUMBER_OF_SERVICES_REACHED_ERROR = 'Max number of services reached'
+# Serve056 rotates the executor-side provider-effect semantics.  Every live
+# API/controller/executor participant and every service capability tuple must
+# agree on this value before a new protocol-v2 launch is admitted.
+NON_POOL_CAPABILITY_COHORT_EPOCH = 2

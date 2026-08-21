@@ -28,7 +28,8 @@ def _context(
         launch_generation=1,
         input_digest='a' * 64,
         profile=profile,
-        capability_cohort_epoch=1,
+        capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
         capability_profile_set_digest=(
             ordinary_launch_binding.supported_non_pool_profile_set_digest()),
         receipt_protocol_version=1)

@@ -172,6 +172,38 @@ def test_non_pool_provider_reconciliation_is_scheduled_without_inline_io():
     worker.start.assert_called_once_with()
 
 
+def test_previous_cohort_reconciliation_is_cleanup_only():
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    authority = dataclasses.replace(
+        _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                           binding_epoch=2,
+                           generic=True),
+        non_pool_capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH - 1))
+    context = dataclasses.replace(
+        _bound_non_pool_context(),
+        capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH - 1))
+    manager._ordinary_launch_binding_authority = authority
+    info = types.SimpleNamespace(replica_id=3)
+    worker = mock.Mock()
+
+    assert not authority.generic_launches_required
+    assert authority.retained_non_pool_settlement_allowed
+    with mock.patch.object(replica_managers.thread_utils,
+                           'SafeThread',
+                           return_value=worker) as thread_constructor, \
+         mock.patch.object(manager, '_launch_replica') as launch:
+        manager._schedule_non_pool_provider_reconciliation(info, context)
+
+    thread_constructor.assert_called_once()
+    assert thread_constructor.call_args.kwargs['args'][:3] == (context, info,
+                                                               authority)
+    worker.start.assert_called_once_with()
+    launch.assert_not_called()
+
+
 def test_unowned_ambiguous_non_pool_launch_schedules_provider_reconciliation(
         monkeypatch):
     manager = replica_managers.SkyPilotReplicaManager.__new__(
@@ -180,9 +212,10 @@ def test_unowned_ambiguous_non_pool_launch_schedules_provider_reconciliation(
                                    binding_epoch=2,
                                    generic=True)
     context = _bound_non_pool_context()
-    info = types.SimpleNamespace(replica_id=context.replica_id,
-                                 replica_record_id=str(
-                                     context.replica_record_id))
+    info = types.SimpleNamespace(
+        replica_id=context.replica_id,
+        status=(replica_managers.serve_state.ReplicaStatus.READY),
+        replica_record_id=str(context.replica_record_id))
     runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
     manager._ordinary_launch_binding_authority = authority
     manager._non_pool_reconciliation_threads = {}
@@ -2264,8 +2297,13 @@ class TestBoundOrdinaryLaunchManagerIntegration:
 
     def test_generic_pre_effect_result_retires_intent_for_fresh_planning(self):
         manager = _make_manager()
-        authority = _binding_authority(
-            ordinary_launch_binding.BindingMode.BOUND, generic=True)
+        authority = dataclasses.replace(
+            _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                               generic=True),
+            non_pool_capability_cohort_epoch=(
+                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH - 1))
+        assert not authority.generic_launches_required
+        assert authority.retained_non_pool_settlement_allowed
         manager._ordinary_launch_binding_authority = authority
         info = _fake_replica_info(
             1, replica_managers.serve_state.ReplicaStatus.PENDING)
@@ -4695,7 +4733,7 @@ class TestLaunchClusterRetry:
         assert (wait.call_args.kwargs['api_auth_token_provider']
                 is replica_managers._required_controller_admin_auth_tokens)
 
-    def test_reserved_fill_profile_requires_exact_physical_fence(
+    def test_reserved_fill_profile_rejects_post_admission_worker_submission(
             self, tmp_path):
         task = mock.MagicMock()
         task.resources = {mock.MagicMock()}
@@ -4703,7 +4741,7 @@ class TestLaunchClusterRetry:
                                '_build_replica_launch_task',
                                return_value=task), \
              pytest.raises(replica_managers._BoundOrdinaryLaunchUnresolvedError,
-                           match='present together'):
+                           match='admitted before worker creation'):
             replica_managers.launch_cluster(
                 replica_id=1,
                 yaml_content='dummy: yaml',
