@@ -3129,36 +3129,48 @@ def reserved_fill_reclaim_launch_authority_holds(
                     type(current_service_generation) is not int or
                     current_service_generation < fence.service_generation or
                     current_service_generation > protocol['claim_generation'] or
+                    not edge_rows or
                     len(edge_rows) != claim_set['edge_count'] or
-                    matching_edge is None or
                     any(edge['service_generation'] != current_service_generation
                         for edge in edge_rows)):
                 return False
-            if (current_service_generation > fence.service_generation and
-                    not zero_cost_actuation.
+            successor_generation = (current_service_generation
+                                    > fence.service_generation)
+            if successor_generation:
+                committed_intent_holds = (
+                    zero_cost_actuation.
                     committed_intent_matches_replica_in_connection(
                         connection,
                         service_name=service_name,
                         service_hash=service_hash,
-                        replica_info=launch_snapshot.durable_replica_info)):
-                # A committed intent is the immutable handoff from its broker
-                # generation.  A newer, still-compatible claim set may retain
-                # that launch, but an uncommitted or ambiguous legacy row must
-                # continue to fail closed.
-                return False
+                        replica_info=launch_snapshot.durable_replica_info))
+                if not committed_intent_holds:
+                    # A committed intent is the immutable handoff from its
+                    # broker generation. A successor claim set may replace or
+                    # remove the original pool edge; it cannot re-authorize
+                    # that historical launch. An uncommitted or ambiguous row
+                    # continues to fail closed.
+                    return False
             _, projected_admission = (
                 reserved_capacity.require_reclaim_worker_projection(
                     fence, version_row['worker_placement_projections']))
-            digest_map = _decode_reserved_fill_projection_digest_map(
-                matching_edge['worker_projection_sha256_by_accelerator'],
-                matching_edge['accelerator_names'])
-            if (matching_edge['access_context'] != fence.kubernetes_context or
-                    matching_edge['physical_cluster_uid']
-                    != fence.physical_cluster_uid or
-                    matching_edge['gpus_per_replica'] != fence.accelerator_count
-                    or digest_map.get(fence.accelerator.casefold())
-                    != projected_admission.worker_projection_sha256):
-                return False
+            if not successor_generation:
+                # Before a successor publication, the matching current edge
+                # is still the launch authority and must restate every frozen
+                # placement field exactly.
+                if matching_edge is None:
+                    return False
+                digest_map = _decode_reserved_fill_projection_digest_map(
+                    matching_edge['worker_projection_sha256_by_accelerator'],
+                    matching_edge['accelerator_names'])
+                if (matching_edge['access_context'] != fence.kubernetes_context
+                        or matching_edge['physical_cluster_uid']
+                        != fence.physical_cluster_uid or
+                        matching_edge['gpus_per_replica']
+                        != fence.accelerator_count or
+                        digest_map.get(fence.accelerator.casefold())
+                        != projected_admission.worker_projection_sha256):
+                    return False
             expected_scope = (
                 reserved_fill_reclaim_attestation.ReclaimLaunchScope(
                     service_name=service_name,
