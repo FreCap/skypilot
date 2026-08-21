@@ -8710,6 +8710,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                 first.service_version != self.latest_version):
             return (reserved_fill_planner.DeferredFillReason.SUPERSEDED_POLICY,
                     'the manager service version no longer matches the plan')
+        binding_authority = self._ordinary_launch_binding_authority
+        if (binding_authority is not None and
+                not binding_authority.generic_launches_required):
+            return (
+                reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                'the current generic launch capability cohort is unavailable')
         service_hash = self._service_hash
         controller_owner = self._controller_owner
         if (not isinstance(service_hash, str) or not service_hash or
@@ -8953,7 +8959,12 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _zero_cost_actuation_authority_current(
             self, intent: reserved_fill_planner.FillIntent) -> bool:
         """Cheap in-process fence before a leased intent touches a provider."""
-        if (self._reserved_fill_actuation_mode
+        binding_authority = self._ordinary_launch_binding_authority
+        # An adjacent capability cohort may settle old actions only. Keep a
+        # pre-row intent retryable until rotation installs launch authority.
+        if (binding_authority is None or
+                not binding_authority.generic_launches_required or
+                self._reserved_fill_actuation_mode
                 is not zero_cost_actuation.ActuationMode.DURABLE_INTENT or
                 self._update_recovery_required or
                 self._ownership_lost.is_set() or self._is_pool or

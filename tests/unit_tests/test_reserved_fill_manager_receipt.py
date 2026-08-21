@@ -145,7 +145,17 @@ def _manager(*,
             controller_owner_epoch=_CONTROLLER_OWNER_EPOCH,
             capable=True,
             binding_mode=ordinary_launch_binding.BindingMode.BOUND,
-            binding_epoch=1))
+            binding_epoch=2,
+            non_pool_capable=True,
+            non_pool_binding_protocol_version=(
+                ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+            non_pool_profile_set_digest=(
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            ),
+            non_pool_capability_cohort_epoch=(
+                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+            non_pool_receipt_protocol_version=(
+                ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)))
     return manager
 
 
@@ -258,6 +268,82 @@ def test_durable_accept_without_controller_authority_fails_closed() -> None:
     assert receipt.deferred[0].detail == (
         'durable controller authority is unavailable')
     repository.grant_plan.assert_not_called()
+
+
+def test_durable_accept_previous_capability_cohort_fails_before_grant() -> None:
+    manager = _manager(maximum=7)
+    manager._reserved_fill_actuation_mode = (  # pylint: disable=protected-access
+        zero_cost_actuation.ActuationMode.DURABLE_INTENT)
+    manager._ordinary_launch_binding_authority = dataclasses.replace(  # pylint: disable=protected-access
+        manager._ordinary_launch_binding_authority,
+        non_pool_capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH - 1))
+    plan = _plan((_snapshot('east-context', 'uid-east', 1),))
+    repository = mock.Mock()
+    manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
+
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_service_controller_owner') as owner_read, \
+         mock.patch.object(replica_managers.provider_phase,
+                           'try_provider_phase') as provider_admission:
+        receipt = manager.accept_reserved_fill(plan)
+
+    assert not receipt.accepted
+    assert receipt.authority_current is False
+    assert len(receipt.deferred) == 1
+    assert receipt.deferred[0].reason is (
+        reserved_fill_planner.DeferredFillReason.LOST_OWNER)
+    assert receipt.deferred[0].detail == (
+        'the current generic launch capability cohort is unavailable')
+    repository.grant_plan.assert_not_called()
+    owner_read.assert_not_called()
+    provider_admission.assert_not_called()
+
+
+def test_previous_cohort_intent_retries_before_provider_or_materialization(
+) -> None:
+    manager = _manager()
+    manager._reserved_fill_actuation_mode = (  # pylint: disable=protected-access
+        zero_cost_actuation.ActuationMode.DURABLE_INTENT)
+    manager._ordinary_launch_binding_authority = dataclasses.replace(  # pylint: disable=protected-access
+        manager._ordinary_launch_binding_authority,
+        non_pool_capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH - 1))
+    manager._zero_cost_actuation_executor_id = (  # pylint: disable=protected-access
+        mock.sentinel.executor_id)
+    intent = _plan((_snapshot('east-context', 'uid-east', 1),)).intents[0]
+    lease = SimpleNamespace(intent=intent)
+    repository = mock.Mock()
+    repository.lease_next.return_value = lease
+    manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
+
+    with mock.patch.object(replica_managers.provider_phase,
+                           'try_provider_phase') as provider_admission, \
+         mock.patch.object(
+             manager, '_start_reserved_fill_physical_preflights') as preflight, \
+         mock.patch.object(manager, '_scale_up_one_locked') as materialize:
+        manager._actuate_zero_cost_pool(intent.pool_key)
+
+    repository.release_retryable.assert_called_once_with(
+        lease, 'controller_authority_unavailable')
+    repository.terminate.assert_not_called()
+    provider_admission.assert_not_called()
+    preflight.assert_not_called()
+    materialize.assert_not_called()
+
+
+def test_current_cohort_intent_has_pre_provider_actuation_authority() -> None:
+    manager = _manager()
+    manager._reserved_fill_actuation_mode = (  # pylint: disable=protected-access
+        zero_cost_actuation.ActuationMode.DURABLE_INTENT)
+    manager._update_recovery_required = False  # pylint: disable=protected-access
+    manager._ownership_lost = threading.Event()  # pylint: disable=protected-access
+    intent = _plan((_snapshot('east-context', 'uid-east', 1),)).intents[0]
+
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_service_controller_owner',
+                           return_value=_owner_record()):
+        assert manager._zero_cost_actuation_authority_current(intent)  # pylint: disable=protected-access
 
 
 def test_durable_pool_executor_does_not_serialize_independent_pools() -> None:
