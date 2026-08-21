@@ -88,6 +88,13 @@ tests:
       - equal:
           path: metadata.labels["skypilot.co/helm-revision"]
           value: "0"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVER_CONFIG_MODE
+            value: postgres
+      - notExists:
+          path: spec.template.spec.containers[0].volumeMounts
 
   - it: should reject chart-managed database secrets in HA mode
     set:

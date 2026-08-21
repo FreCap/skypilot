@@ -118,6 +118,12 @@ ENV_VAR_SKYPILOT_CONFIG = f'{constants.SKYPILOT_ENV_VAR_PREFIX}CONFIG'
 ENV_VAR_GLOBAL_CONFIG = f'{constants.SKYPILOT_ENV_VAR_PREFIX}GLOBAL_CONFIG'
 # Environment variables for setting non-default project config files.
 ENV_VAR_PROJECT_CONFIG = f'{constants.SKYPILOT_ENV_VAR_PREFIX}PROJECT_CONFIG'
+# Server-owned selector for the guarded-HA configuration authority.  This is
+# intentionally not a generic user-facing backend switch: ``postgres`` is the
+# only supported value and is emitted by the guarded-HA Helm topology.
+ENV_VAR_SERVER_CONFIG_MODE = (
+    f'{constants.SKYPILOT_ENV_VAR_PREFIX}SERVER_CONFIG_MODE')
+SERVER_CONFIG_MODE_POSTGRES = 'postgres'
 
 # Path to the client config files.
 _GLOBAL_CONFIG_PATH = '~/.sky/config.yaml'
@@ -155,11 +161,28 @@ _active_workspace_context = threading.local()
 _global_config_context = ConfigContext()
 
 SKYPILOT_CONFIG_LOCK_PATH = '~/.sky/locks/.skypilot_config.lock'
+_POSTGRES_SERVER_CONFIG_LOCK_PATH = ('/var/run/skypilot/.skypilot_config.lock')
+
+
+def _postgres_server_config_is_authoritative() -> bool:
+    """Returns whether guarded HA requires PostgreSQL-only server config."""
+    mode = os.environ.get(ENV_VAR_SERVER_CONFIG_MODE)
+    if mode is None:
+        return False
+    if mode != SERVER_CONFIG_MODE_POSTGRES:
+        raise RuntimeError(f'{ENV_VAR_SERVER_CONFIG_MODE} must be exactly '
+                           f'{SERVER_CONFIG_MODE_POSTGRES!r} when set.')
+    return True
 
 
 def get_skypilot_config_lock_path() -> str:
     """Get the path for the SkyPilot config lock file."""
-    lock_path = os.path.expanduser(SKYPILOT_CONFIG_LOCK_PATH)
+    # PostgreSQL serializes durable configuration updates in guarded HA.  This
+    # lock protects only one process's in-memory reload, so keeping it on the
+    # shared state filesystem would retain a needless EFS correctness edge.
+    lock_path = (_POSTGRES_SERVER_CONFIG_LOCK_PATH
+                 if _postgres_server_config_is_authoritative() else
+                 os.path.expanduser(SKYPILOT_CONFIG_LOCK_PATH))
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     return lock_path
 
@@ -398,35 +421,57 @@ def _resolve_server_config_path() -> str | None:
 
 def get_server_config() -> config_utils.Config:
     """Returns the server config."""
+    if _postgres_server_config_is_authoritative():
+        db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
+        if db_url is None:
+            raise RuntimeError(
+                'Guarded HA PostgreSQL server-config authority requires '
+                f'{constants.ENV_VAR_DB_CONNECTION_URI}.')
+        return _overlay_db_config(config_utils.Config(), db_url)
     return _get_config_from_path(_resolve_server_config_path())
+
+
+def _get_config_yaml_from_db(key: str) -> config_utils.Config | None:
+    """Read and validate one server configuration row."""
+    with orm.Session(_db_manager.get_engine()) as session:
+        row = session.query(config_yaml_table).filter_by(key=key).first()
+    if row is None:
+        return None
+    try:
+        config_dict = yaml_utils.read_yaml_str(row.value,
+                                               reject_duplicate_keys=True)
+        db_config = config_utils.Config.from_dict(config_dict)
+    except (TypeError, ValueError, yaml.YAMLError):
+        raise ValueError(
+            'Invalid database server config YAML syntax.') from None
+    db_config.pop_nested(('db',), None)
+    _validate_config(db_config, '<database server config>')
+    return db_config
 
 
 def _overlay_db_config(server_config: config_utils.Config,
                        db_url: str) -> config_utils.Config:
     """Overlay the DB-stored api_server_config onto ``server_config``."""
+    logger.debug('retrieving config from database')
+    del db_url  # Connection resolved via the env var by the engine.
+    db_config = _get_config_yaml_from_db(API_SERVER_CONFIG_KEY)
+    if _postgres_server_config_is_authoritative():
+        if db_config is None:
+            # The migration job is the only writer allowed to seed the row.
+            # Runtime roles must never fall back to a shared or projected file
+            # after guarded HA is activated, including an accidentally
+            # configured ``auto`` migration mode.
+            if migration_utils.configured_migration_mode() in ('bootstrap',
+                                                               'upgrade'):
+                return server_config
+            raise RuntimeError(
+                'Guarded HA requires the PostgreSQL api_server_config row. '
+                'Run the database migration job before starting runtime roles.')
+        return db_config
+
     if len(server_config.keys()) > 1:
         raise ValueError(
             'If db config is specified, no other config is allowed')
-    logger.debug('retrieving config from database')
-    del db_url  # Connection resolved via the env var by the engine.
-
-    def _get_config_yaml_from_db(key: str) -> config_utils.Config | None:
-        with orm.Session(_db_manager.get_engine()) as session:
-            row = session.query(config_yaml_table).filter_by(key=key).first()
-        if row:
-            try:
-                config_dict = yaml_utils.read_yaml_str(
-                    row.value, reject_duplicate_keys=True)
-                db_config = config_utils.Config.from_dict(config_dict)
-            except (TypeError, ValueError, yaml.YAMLError):
-                raise ValueError(
-                    'Invalid database server config YAML syntax.') from None
-            db_config.pop_nested(('db',), None)
-            _validate_config(db_config, '<database server config>')
-            return db_config
-        return None
-
-    db_config = _get_config_yaml_from_db(API_SERVER_CONFIG_KEY)
     if db_config:
         server_config = overlay_skypilot_config(server_config, db_config)
     return server_config
@@ -444,9 +489,19 @@ def get_effective_server_config() -> config_utils.Config:
     the server and every controller in the pod: this resolves the same config
     the API server itself uses, ignoring the per-service snapshot.
     """
+    db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
+    postgres_authority = _postgres_server_config_is_authoritative()
+    if postgres_authority and db_url is None:
+        raise RuntimeError('Guarded HA PostgreSQL server-config authority '
+                           f'requires {constants.ENV_VAR_DB_CONNECTION_URI}.')
+    if postgres_authority:
+        # Use the same direct PostgreSQL path as diagnostic callers of
+        # get_server_config().  Neither entrypoint resolves a projected or
+        # shared file in guarded HA.
+        return get_server_config()
+
     server_config_path = _resolve_server_config_path()
     server_config = _get_config_from_path(server_config_path)
-    db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
     if db_url:
         server_config = _overlay_db_config(server_config, db_url)
     return server_config
@@ -980,12 +1035,70 @@ _db_manager = db_utils.DatabaseManager(db_name='config',
 initialize_and_get_db = _db_manager.get_engine
 
 
+def initialize_postgres_server_config_authority() -> None:
+    """Seed or verify guarded HA's sole structured config authority.
+
+    The chart disallows inline configuration when an external database is
+    configured, so a fresh installation starts with an empty row and is then
+    configured through the server API.  An existing row always wins, so an
+    ordinary Helm upgrade cannot overwrite a live configuration.  Only an
+    explicitly owned migration process may seed; verify/runtime processes are
+    read-only and fail closed if the migration did not commit the row.
+    """
+    if not _postgres_server_config_is_authoritative():
+        return
+    if os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI) is None:
+        raise RuntimeError('Guarded HA PostgreSQL server-config authority '
+                           f'requires {constants.ENV_VAR_DB_CONNECTION_URI}.')
+
+    engine = _db_manager.get_engine()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise RuntimeError(
+            'Guarded HA server-config authority requires PostgreSQL.')
+
+    migration_mode = migration_utils.configured_migration_mode()
+    if migration_mode in ('bootstrap', 'upgrade'):
+        config_str = yaml_utils.dump_yaml_str({})
+        insert_stmt = postgresql.insert(config_yaml_table).values(
+            key=API_SERVER_CONFIG_KEY, value=config_str)
+        insert_stmt = insert_stmt.on_conflict_do_nothing(
+            index_elements=[config_yaml_table.c.key])
+        with engine.begin() as connection:
+            connection.execute(insert_stmt)
+
+    # Validate the retained winner, including the pre-existing-row and
+    # verify-only cases.  Validation performs no DML.
+    if _get_config_yaml_from_db(API_SERVER_CONFIG_KEY) is None:
+        if migration_mode in ('bootstrap', 'upgrade'):
+            raise RuntimeError('Failed to initialize PostgreSQL server config.')
+        raise RuntimeError(
+            'Guarded HA requires the PostgreSQL api_server_config row. Run '
+            'the database migration job before starting runtime roles.')
+
+
 def _reload_config_as_server() -> None:
-    server_config_path = _resolve_server_config_path()
-    server_config = _get_config_from_path(server_config_path)
-    # Get the db url from the env var. _get_config_from_path should have moved
-    # the db url specified in config file to the env var.
     db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
+    postgres_authority = _postgres_server_config_is_authoritative()
+    server_config_path: str | None
+    if postgres_authority:
+        if db_url is None:
+            raise RuntimeError('Guarded HA PostgreSQL server-config authority '
+                               'requires '
+                               f'{constants.ENV_VAR_DB_CONNECTION_URI}.')
+        server_config_path = '<database server config>'
+        # A fresh bootstrap has no config table yet.  The migration entrypoint
+        # creates it and immediately seeds the authoritative empty row.  Every
+        # other role/mode reads PostgreSQL without first touching a file.
+        if migration_utils.configured_migration_mode() == 'bootstrap':
+            server_config = config_utils.Config()
+        else:
+            server_config = _overlay_db_config(config_utils.Config(), db_url)
+    else:
+        server_config_path = _resolve_server_config_path()
+        server_config = _get_config_from_path(server_config_path)
+        # Get the db url from the env var. _get_config_from_path should have
+        # moved a db url specified in the config file to the environment.
+        db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
 
     # A fresh-schema migration job must initialize global user state before
     # any companion schema creates objects in the shared PostgreSQL schema.
@@ -993,7 +1106,8 @@ def _reload_config_as_server() -> None:
     # call global_user_state.initialize_and_get_db(), so defer the config
     # overlay only for explicit bootstrap mode.  The migration entrypoint
     # initializes this config schema immediately after global user state.
-    if (db_url and migration_utils.configured_migration_mode() != 'bootstrap'):
+    if (not postgres_authority and db_url and
+            migration_utils.configured_migration_mode() != 'bootstrap'):
         server_config = _overlay_db_config(server_config, db_url)
     if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
         safe_server_config = _redact_container_image_config_for_logging(
@@ -1526,7 +1640,10 @@ def apply_cli_config(cli_config: list[str] | None) -> dict[str, Any]:
 
 
 def update_api_server_config_no_lock(config: config_utils.Config) -> None:
-    """Dumps the new config to a file and syncs to ConfigMap if in Kubernetes.
+    """Persists and reloads one API-server configuration update.
+
+    Guarded HA writes PostgreSQL directly and never resolves or mirrors a
+    configuration file. Other installations retain the file/ConfigMap path.
 
     Args:
         config: The config to save and sync.
@@ -1540,15 +1657,22 @@ def update_api_server_config_no_lock(config: config_utils.Config) -> None:
             constants.ENV_VAR_IS_SKYPILOT_SERVER) is None:
         raise ValueError('This function can only be called by the API Server.')
 
-    global_config_path = _resolve_server_config_path()
-    if global_config_path is None:
-        # Fallback to ~/.sky/config.yaml, and make sure it exists.
-        global_config_path = os.path.expanduser(get_user_config_path())
-        pathlib.Path(global_config_path).touch(exist_ok=True)
+    postgres_authority = _postgres_server_config_is_authoritative()
+    global_config_path: str | None = None
+    if not postgres_authority:
+        global_config_path = _resolve_server_config_path()
+        if global_config_path is None:
+            # Fallback to ~/.sky/config.yaml, and make sure it exists.
+            global_config_path = os.path.expanduser(get_user_config_path())
+            pathlib.Path(global_config_path).touch(exist_ok=True)
 
     db_updated = False
     if os.environ.get(constants.ENV_VAR_IS_SKYPILOT_SERVER) is not None:
         existing_db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
+        if postgres_authority and existing_db_url is None:
+            raise RuntimeError(
+                'Guarded HA PostgreSQL server-config authority requires '
+                f'{constants.ENV_VAR_DB_CONNECTION_URI}.')
         new_db_url = config.pop_nested(('db',), None)
         if new_db_url and new_db_url != existing_db_url:
             raise ValueError('Cannot change db url while server is running')
@@ -1579,6 +1703,10 @@ def update_api_server_config_no_lock(config: config_utils.Config) -> None:
             db_updated = True
 
     if not db_updated:
+        if postgres_authority:
+            raise RuntimeError(
+                'Guarded HA failed to persist PostgreSQL server config.')
+        assert global_config_path is not None
         # save to the local file (PVC in Kubernetes, local file otherwise)
         yaml_utils.dump_yaml(global_config_path, dict(config))
 

@@ -17,7 +17,11 @@
 {{- end -}}
 {{- end -}}
 {{- $fullName := include "skypilot.fullname" . -}}
-{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs) "reservedEnvNames" (list "IS_SKYPILOT_SERVER" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKYPILOT_DB_CONNECTION_URI") "volumeLists" (list .Values.databaseConnection.extraVolumes) "mountLists" (list .Values.databaseConnection.extraVolumeMounts)) }}
+{{- $migrationReservedEnvNames := list "IS_SKYPILOT_SERVER" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_STATE_DB_MIGRATION_MODE" "SKYPILOT_DB_CONNECTION_URI" -}}
+{{- if $haEnabled -}}
+{{- $migrationReservedEnvNames = append $migrationReservedEnvNames "SKYPILOT_SERVER_CONFIG_MODE" -}}
+{{- end -}}
+{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs) "reservedEnvNames" $migrationReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes) "mountLists" (list .Values.databaseConnection.extraVolumeMounts)) }}
 {{- $migrationSuffix := printf "-db-migration-%d" .Release.Revision -}}
 {{- $migrationBaseLength := sub 63 (len $migrationSuffix) | int -}}
 {{- $migrationName := printf "%s%s" ($fullName | trunc $migrationBaseLength | trimSuffix "-") $migrationSuffix -}}
@@ -89,6 +93,10 @@ spec:
           value: {{ $requestStore.backend | quote }}
         - name: SKYPILOT_STATE_DB_MIGRATION_MODE
           value: {{ ternary "bootstrap" "upgrade" .Values.databaseMigration.bootstrapFreshSchema }}
+        {{- if $haEnabled }}
+        - name: SKYPILOT_SERVER_CONFIG_MODE
+          value: postgres
+        {{- end }}
         {{- if .Values.apiService.dbConnectionSecretName }}
         - name: SKYPILOT_DB_CONNECTION_URI
           valueFrom:

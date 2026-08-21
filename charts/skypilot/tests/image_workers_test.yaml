@@ -3,6 +3,22 @@ suite: image_workers_test
 templates:
   - templates/image-workers.yaml
 tests:
+  - it: should use PostgreSQL as the guarded-HA config authority
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      imageCopyWorker.enabled: true
+      imageCopyWorker.serviceAccount.create: false
+      imageCopyWorker.serviceAccount.name: copy-worker
+    asserts:
+      - hasDocuments:
+          count: 1
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVER_CONFIG_MODE
+            value: postgres
+
   - it: should keep source credential RBAC names distinct at the DNS limit
     set:
       fullnameOverride: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

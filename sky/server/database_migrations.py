@@ -23,6 +23,7 @@ def initialize_central_databases() -> None:
     # objects in it.
     global_engine = global_user_state.initialize_and_get_db()
     skypilot_config.initialize_and_get_db()
+    skypilot_config.initialize_postgres_server_config_authority()
     serve_state.get_database_engine()
     state_storage.initialize_and_get_db()
     if os.environ.get('SKYPILOT_API_REQUEST_BACKEND') == 'postgres':
