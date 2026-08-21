@@ -171,13 +171,19 @@ and constraints are contract, not implementation suggestions:
 
 - one storage-authority row with protocol (`LEGACY_EFS` or `S3_V1`), monotonic
   generation, database-incarnation UUID, and the committed cutover receipt;
-- upload sessions keyed by a server-generated UUID, with storage generation,
-  tenant, logical object kind, client content SHA-256,
-  expected chunk count, the immutable per-session limits, lease
-  owner/epoch/expiry, current attempt epoch, and state. A server-derived session
-  key is unique on generation, tenant, object kind, and logical ID; concurrent
-  first chunks converge on that row and a conflicting chunk count or limit set
-  is rejected;
+- logical upload heads unique on
+  `(storage_generation, tenant_id, object_kind, logical_blob_id)`, containing a
+  monotonic session epoch and current session ID. The head is the only mutable
+  rendezvous pointer; advancing it requires a locked compare-and-swap from the
+  exact terminal predecessor;
+- upload sessions keyed by a server-generated UUID and unique on
+  `(upload_head_id, session_epoch)`, with expected chunk count, immutable
+  per-session limits, lease owner/epoch/expiry, current attempt epoch, state,
+  and optional predecessor session. Concurrent first chunks converge on the
+  current row. An active conflicting chunk count or limit set is rejected. A
+  terminal pre-publication session remains immutable audit evidence but may be
+  superseded by one freshly fenced session epoch; concurrent successor creation
+  converges through the upload-head compare-and-swap;
 - upload attempts unique on `(upload_session_id, attempt_epoch)`, with a fresh
   object UUID/key, S3 multipart upload ID, and terminal outcome. A rejected or
   conflicted immutable attempt is retained and a successor attempt never reuses
@@ -209,6 +215,14 @@ The object state is deliberate: the existing upload API finishes before the
 later request, Managed Job, or Serve admission has an owner row. A successfully
 published but never referenced object is retained garbage in version 1, not an
 owner and not live work.
+
+`ABORTED` is terminal only for that immutable session epoch, not for the
+logical digest forever. If no logical alias was published, a later first chunk
+may lock the upload head and atomically insert one successor session with a
+higher epoch and new immutable chunk plan/limits. If the predecessor is still
+active, a conflicting plan is rejected; if an alias is already published, the
+alias wins and no successor is created. Old sessions and attempts are never
+rewritten or reused.
 
 The later domain admission transaction locks the alias, validates tenant,
 generation, object kind, publication state, exact digest, and size, inserts the
@@ -366,10 +380,13 @@ reference.
 
 1. The read-only existence check resolves only a tenant-scoped published alias;
    it does not allocate state. The first chunk request creates/locks the upload
-   session and its first server-generated attempt/object identity in
-   PostgreSQL. Concurrent first chunks converge through the unique logical key.
-   A session retry returns that same active attempt. One lease epoch owns
-   multipart creation or finalization at a time.
+   head, current session, and first server-generated attempt/object identity in
+   PostgreSQL. Concurrent first chunks converge through the unique logical
+   head. A retry returns the same active attempt when its immutable plan
+   matches. A conflicting plan is rejected while that session is active; after
+   a terminal pre-publication abort, one compare-and-swapped successor session
+   epoch may adopt the new plan. A published alias always returns the existing
+   object. One lease epoch owns multipart creation or finalization at a time.
 2. Each parallel chunk request may land on any API replica. It validates chunk
    number/count and HTTP bounds, spools at most that chunk to a reserved local
    path while computing its checksum and size, uploads the corresponding S3
@@ -726,7 +743,8 @@ The dependency graph and minimum clean stack are:
    source PR because it removes one real EFS correctness edge without inventing
    the object protocol. It depends only on D0.
 3. **D2 -- inert PostgreSQL storage foundation.** Add the protocol/generation,
-   incarnation/restore receipt, upload-session/part, object/alias/reference,
+   incarnation/restore receipt, upload-head/session/part,
+   object/alias/reference,
    log-stream/segment/gap, and migration-receipt schema plus the repository that
    accepts caller-owned transactions on the existing mandatory central
    migration head. The migration creates no authority row and changes no
@@ -805,6 +823,9 @@ lines. The common log path is the largest portion.
   `412`, duplicate/conflicting parts, wrong tenant/owner, wrong version, wrong
   KMS key, digest mismatch, truncation, local ENOSPC, and pod deletion are
   covered.
+- An active upload rejects a conflicting chunk plan; an aborted unpublished
+  session can be superseded by exactly one higher session epoch; immutable old
+  audit rows remain unchanged; and a published alias prevents all successors.
 - An uploaded object is durably `PUBLISHED_UNREFERENCED` before domain
   admission; request, Job, and Serve tests prove that owner plus reference
   commit atomically through a caller-owned PostgreSQL transaction.
