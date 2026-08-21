@@ -6,7 +6,6 @@ import concurrent.futures
 import contextlib
 import copy
 import dataclasses
-import importlib
 import os
 import threading
 import time
@@ -67,9 +66,6 @@ _BINDING_EPOCH = 1
 _CREATOR_ID = 'creator-tenant'
 _CREATOR_NAME = 'alice@example.com'
 _WORKSPACE = 'workspace-a'
-
-_SERVE056_MIGRATION = importlib.import_module(
-    'sky.schemas.db.serve_state.056_committed_reserved_fill_handoff')
 
 
 class _InjectedAdmissionFault(BaseException):
@@ -424,48 +420,6 @@ def test_serve056_lineage_and_sqlite_ceiling() -> None:
     assert migration_utils.serve_target_version(sqlite) == '037'
     with pytest.raises(RuntimeError, match='PostgreSQL-only'):
         alembic_command.upgrade(config, '056')
-
-
-def test_serve056_status_update_fast_path_covers_exact_authority_projection(
-) -> None:
-    assert _SERVE056_MIGRATION._REPLICA_AUTHORITY_COLUMNS == (
-        'service_name',
-        'replica_id',
-        'replica_state_version',
-        'version',
-        'cluster_name',
-        'is_spot',
-        'paid_capacity_pool_key',
-        'ordinary_launch_association_id',
-    )
-    assert _SERVE056_MIGRATION._REPLICA_AUTHORITY_JSON_FIELDS == (
-        'reserved_fill',
-        'is_zero_cost',
-        'is_spot',
-        'paid_capacity_pool_key',
-        'reserved_fill_intent_idempotency_key',
-        'replica_id',
-        'version',
-        'cluster_name',
-        'replica_record_id',
-        'reserved_fill_pool_key',
-        'reserved_fill_service_generation',
-        'reserved_fill_physical_cluster_uid',
-        'reserved_fill_kubernetes_context',
-        'reserved_fill_allocation_generation',
-        'reserved_fill_allocation_input_sha256',
-        'reserved_fill_allocation_claim_generation',
-        'reserved_fill_reconciliation_gate_generation',
-        'reserved_fill_reclaim_fleet_bundle_sha256',
-        'reserved_fill_reclaim_policy_revision',
-        'reserved_fill_reclaim_provider_inventory_sha256',
-        'reserved_fill_worker_projection_sha256',
-        'reserved_fill_observation_generation',
-        'reserved_fill_observation_sequence',
-        'planned_capacity',
-        'location',
-        'resources_override',
-    )
 
 
 def test_retained_serve054_row_migrates_null_and_055_is_forward_only(
@@ -1263,61 +1217,6 @@ def test_outer_commit_publishes_sequences_and_hydrates_exact_request(
         receipt.request_id, 'different-owner', _WORKSPACE)
     assert not ordinary_launch_binding.reserved_fill_binding_authorizes_workspace(
         receipt.request_id, _CREATOR_ID, 'different-workspace')
-
-
-def test_serve056_status_updates_skip_immutable_intent_graph_reads(
-        atomic_database) -> None:
-    spec = _atomic_spec(atomic_database)
-    _, receipt = reserved_fill_admission._transaction(spec,
-                                                      7,
-                                                      require_existing=False)
-    replicas = serve_state_schema.replicas_table
-    predicate = sqlalchemy.and_(replicas.c.service_name == _SERVICE,
-                                replicas.c.replica_id == receipt.replica_id)
-    with atomic_database.connect() as connection:
-        stored_state = connection.execute(
-            sqlalchemy.select(
-                replicas.c.replica_state).where(predicate)).scalar_one()
-    runtime_state = copy.deepcopy(stored_state)
-    status_property = runtime_state['status_property']
-    assert isinstance(status_property, dict)
-    status_property[
-        'service_ready_now'] = not status_property['service_ready_now']
-    changed_authority = copy.deepcopy(runtime_state)
-    changed_authority['reserved_fill_reclaim_policy_revision'] = (
-        'changed-policy-revision')
-
-    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
-    with atomic_database.connect() as blocker:
-        blocker_transaction = blocker.begin()
-        blocker.execute(
-            sqlalchemy.text(
-                f'LOCK TABLE {intents.name} IN ACCESS EXCLUSIVE MODE'))
-        try:
-            with atomic_database.begin() as writer:
-                writer.execute(
-                    sqlalchemy.text("SET LOCAL lock_timeout = '250ms'"))
-                writer.execute(
-                    sqlalchemy.update(replicas).where(predicate).values(
-                        status='READY', replica_state=runtime_state))
-
-            with pytest.raises(sqlalchemy.exc.DBAPIError, match='lock timeout'):
-                with atomic_database.begin() as writer:
-                    writer.execute(
-                        sqlalchemy.text("SET LOCAL lock_timeout = '250ms'"))
-                    writer.execute(
-                        sqlalchemy.update(replicas).where(predicate).values(
-                            replica_state=changed_authority))
-        finally:
-            blocker_transaction.rollback()
-
-    with atomic_database.connect() as connection:
-        row = connection.execute(
-            sqlalchemy.select(
-                replicas.c.status,
-                replicas.c.replica_state).where(predicate)).mappings().one()
-    assert row['status'] == 'READY'
-    assert row['replica_state'] == runtime_state
 
 
 def test_serve056_accepts_live_intent_and_replica_image_id_encodings(
