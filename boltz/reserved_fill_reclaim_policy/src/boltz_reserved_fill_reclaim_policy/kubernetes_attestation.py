@@ -980,7 +980,7 @@ def _list_kueue_objects(custom: Any, *, plural: str, deadline_monotonic: float,
                 'group': _KUEUE_GROUP,
                 'version': version,
                 'plural': plural,
-                '_limit': _KUEUE_LIST_PAGE_LIMIT,
+                'limit': _KUEUE_LIST_PAGE_LIMIT,
                 '_request_timeout': kubernetes_adaptor.API_TIMEOUT,
             }
             if continuation is not None:
