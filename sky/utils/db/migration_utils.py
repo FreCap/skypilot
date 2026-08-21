@@ -112,7 +112,7 @@ def _require_exact_serve_migration_ceiling(
 
 
 SKYPILOT_CONFIG_DB_NAME = 'sky_config_db'
-SKYPILOT_CONFIG_VERSION = '001'  # initial alembic for config_yaml table
+SKYPILOT_CONFIG_VERSION = '002'  # revision/digest-fenced config authority
 SKYPILOT_CONFIG_LOCK_PATH = f'~/.sky/locks/.{SKYPILOT_CONFIG_DB_NAME}.lock'
 
 KV_CACHE_DB_NAME = 'kv_cache_db'

@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/helm-unittest/helm-unittest/main/schema/helm-testsuite.json
+suite: api_configmap_test
+templates:
+  - templates/api-configmap.yaml
+tests:
+  - it: should retain the config ConfigMap for non-HA compatibility
+    set:
+      apiService.highAvailability.enabled: false
+      apiService.config: |-
+        active_workspace: default
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-config
+      - equal:
+          path: data["config.yaml"]
+          value: "active_workspace: default"
+
+  - it: should omit the config ConfigMap in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0

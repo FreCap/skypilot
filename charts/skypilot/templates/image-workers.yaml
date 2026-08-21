@@ -54,6 +54,20 @@
 {{- if $haEnabled -}}
 {{- $workerReservedEnvNames = append $workerReservedEnvNames "SKYPILOT_SERVER_CONFIG_MODE" -}}
 {{- end -}}
+{{- $copyReservedVolumeNames := list "qualification-manifests" -}}
+{{- $copyReservedMountPaths := list "/var/skypilot/image-qualification" -}}
+{{- $lifecycleReservedVolumeNames := list -}}
+{{- $lifecycleReservedMountPaths := list -}}
+{{- $canaryReservedVolumeNames := list "kubeconfig" -}}
+{{- $canaryReservedMountPaths := list "/var/skypilot/kubeconfig" -}}
+{{- if not $haEnabled -}}
+{{- $copyReservedVolumeNames = append $copyReservedVolumeNames "skypilot-config" -}}
+{{- $copyReservedMountPaths = append $copyReservedMountPaths "/var/skypilot/config" -}}
+{{- $lifecycleReservedVolumeNames = append $lifecycleReservedVolumeNames "skypilot-config" -}}
+{{- $lifecycleReservedMountPaths = append $lifecycleReservedMountPaths "/var/skypilot/config" -}}
+{{- $canaryReservedVolumeNames = append $canaryReservedVolumeNames "skypilot-config" -}}
+{{- $canaryReservedMountPaths = append $canaryReservedMountPaths "/var/skypilot/config" -}}
+{{- end -}}
 
 {{- if and .Values.imageCopyWorker.enabled .Values.imageCopyWorker.serviceAccount.create }}
 apiVersion: v1
@@ -107,7 +121,7 @@ subjects:
 {{- end }}
 {{- end }}
 {{- if .Values.imageCopyWorker.enabled }}
-{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.imageCopyWorker.extraEnvs) "reservedEnvNames" $workerReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes) "reservedVolumeNames" (list "skypilot-config" "qualification-manifests") "mountLists" (list .Values.databaseConnection.extraVolumeMounts) "reservedMountPaths" (list "/var/skypilot/config" "/var/skypilot/image-qualification")) }}
+{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.imageCopyWorker.extraEnvs) "reservedEnvNames" $workerReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes) "reservedVolumeNames" $copyReservedVolumeNames "mountLists" (list .Values.databaseConnection.extraVolumeMounts) "reservedMountPaths" $copyReservedMountPaths) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -167,8 +181,10 @@ spec:
         {{- end }}
         - name: IS_SKYPILOT_SERVER
           value: "true"
+        {{- if not $haEnabled }}
         - name: SKYPILOT_GLOBAL_CONFIG
           value: /var/skypilot/config/config.yaml
+        {{- end }}
         {{- if $haEnabled }}
         - name: SKYPILOT_SERVER_CONFIG_MODE
           value: postgres
@@ -236,10 +252,13 @@ spec:
           failureThreshold: 3
         resources:
           {{- toYaml .Values.imageCopyWorker.resources | nindent 10 }}
+        {{- if or (not $haEnabled) .Values.imageCopyWorker.qualificationManifestConfigMapName .Values.databaseConnection.extraVolumeMounts }}
         volumeMounts:
+        {{- if not $haEnabled }}
         - name: skypilot-config
           mountPath: /var/skypilot/config
           readOnly: true
+        {{- end }}
         {{- if .Values.imageCopyWorker.qualificationManifestConfigMapName }}
         - name: qualification-manifests
           mountPath: /var/skypilot/image-qualification
@@ -248,10 +267,14 @@ spec:
         {{- with .Values.databaseConnection.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+        {{- end }}
+      {{- if or (not $haEnabled) .Values.imageCopyWorker.qualificationManifestConfigMapName .Values.databaseConnection.extraVolumes }}
       volumes:
+      {{- if not $haEnabled }}
       - name: skypilot-config
         configMap:
           name: {{ $fullName }}-config
+      {{- end }}
       {{- if .Values.imageCopyWorker.qualificationManifestConfigMapName }}
       - name: qualification-manifests
         configMap:
@@ -259,6 +282,7 @@ spec:
       {{- end }}
       {{- with .Values.databaseConnection.extraVolumes }}
       {{- toYaml . | nindent 6 }}
+      {{- end }}
       {{- end }}
       {{- with .Values.imageCopyWorker.nodeSelector }}
       nodeSelector:
@@ -292,7 +316,7 @@ automountServiceAccountToken: true
 ---
 {{- end }}
 {{- if .Values.imageLifecycleWorker.enabled }}
-{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.imageLifecycleWorker.extraEnvs) "reservedEnvNames" $workerReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes) "reservedVolumeNames" (list "skypilot-config") "mountLists" (list .Values.databaseConnection.extraVolumeMounts) "reservedMountPaths" (list "/var/skypilot/config")) }}
+{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.imageLifecycleWorker.extraEnvs) "reservedEnvNames" $workerReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes) "reservedVolumeNames" $lifecycleReservedVolumeNames "mountLists" (list .Values.databaseConnection.extraVolumeMounts) "reservedMountPaths" $lifecycleReservedMountPaths) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -355,8 +379,10 @@ spec:
         {{- end }}
         - name: IS_SKYPILOT_SERVER
           value: "true"
+        {{- if not $haEnabled }}
         - name: SKYPILOT_GLOBAL_CONFIG
           value: /var/skypilot/config/config.yaml
+        {{- end }}
         {{- if $haEnabled }}
         - name: SKYPILOT_SERVER_CONFIG_MODE
           value: postgres
@@ -420,19 +446,27 @@ spec:
           failureThreshold: 3
         resources:
           {{- toYaml .Values.imageLifecycleWorker.resources | nindent 10 }}
+        {{- if or (not $haEnabled) .Values.databaseConnection.extraVolumeMounts }}
         volumeMounts:
+        {{- if not $haEnabled }}
         - name: skypilot-config
           mountPath: /var/skypilot/config
           readOnly: true
+        {{- end }}
         {{- with .Values.databaseConnection.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+        {{- end }}
+      {{- if or (not $haEnabled) .Values.databaseConnection.extraVolumes }}
       volumes:
+      {{- if not $haEnabled }}
       - name: skypilot-config
         configMap:
           name: {{ $fullName }}-config
+      {{- end }}
       {{- with .Values.databaseConnection.extraVolumes }}
       {{- toYaml . | nindent 6 }}
+      {{- end }}
       {{- end }}
       {{- with .Values.imageLifecycleWorker.nodeSelector }}
       nodeSelector:
@@ -465,7 +499,7 @@ metadata:
 automountServiceAccountToken: true
 {{- end }}
 {{- if .Values.imageCanaryWorker.enabled }}
-{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.imageCanaryWorker.extraEnvs) "reservedEnvNames" $workerReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes) "reservedVolumeNames" (list "skypilot-config" "kubeconfig") "mountLists" (list .Values.databaseConnection.extraVolumeMounts) "reservedMountPaths" (list "/var/skypilot/config" "/var/skypilot/kubeconfig")) }}
+{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.imageCanaryWorker.extraEnvs) "reservedEnvNames" $workerReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes) "reservedVolumeNames" $canaryReservedVolumeNames "mountLists" (list .Values.databaseConnection.extraVolumeMounts) "reservedMountPaths" $canaryReservedMountPaths) }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -526,8 +560,10 @@ spec:
         {{- end }}
         - name: IS_SKYPILOT_SERVER
           value: "true"
+        {{- if not $haEnabled }}
         - name: SKYPILOT_GLOBAL_CONFIG
           value: /var/skypilot/config/config.yaml
+        {{- end }}
         {{- if $haEnabled }}
         - name: SKYPILOT_SERVER_CONFIG_MODE
           value: postgres
@@ -593,10 +629,13 @@ spec:
           failureThreshold: 3
         resources:
           {{- toYaml .Values.imageCanaryWorker.resources | nindent 10 }}
+        {{- if or (not $haEnabled) .Values.imageCanaryWorker.kubeconfigSecretName .Values.databaseConnection.extraVolumeMounts }}
         volumeMounts:
+        {{- if not $haEnabled }}
         - name: skypilot-config
           mountPath: /var/skypilot/config
           readOnly: true
+        {{- end }}
         {{- if .Values.imageCanaryWorker.kubeconfigSecretName }}
         - name: kubeconfig
           mountPath: /var/skypilot/kubeconfig
@@ -605,10 +644,14 @@ spec:
         {{- with .Values.databaseConnection.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+        {{- end }}
+      {{- if or (not $haEnabled) .Values.imageCanaryWorker.kubeconfigSecretName .Values.databaseConnection.extraVolumes }}
       volumes:
+      {{- if not $haEnabled }}
       - name: skypilot-config
         configMap:
           name: {{ $fullName }}-config
+      {{- end }}
       {{- if .Values.imageCanaryWorker.kubeconfigSecretName }}
       - name: kubeconfig
         secret:
@@ -616,6 +659,7 @@ spec:
       {{- end }}
       {{- with .Values.databaseConnection.extraVolumes }}
       {{- toYaml . | nindent 6 }}
+      {{- end }}
       {{- end }}
       {{- with .Values.imageCanaryWorker.nodeSelector }}
       nodeSelector:

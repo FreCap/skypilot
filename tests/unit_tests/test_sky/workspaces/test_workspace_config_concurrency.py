@@ -44,6 +44,9 @@ class TestWorkspaceConfigConcurrency(unittest.TestCase):
             'sky.skypilot_config.get_user_config_path',
             return_value=self.temp_config_file)
         self.config_path_patcher.start()
+        self.global_config_path_patcher = mock.patch(
+            'sky.skypilot_config._GLOBAL_CONFIG_PATH', self.temp_config_file)
+        self.global_config_path_patcher.start()
 
         # Mock skypilot_config.to_dict to read from our temp file
         def mock_to_dict():
@@ -58,6 +61,7 @@ class TestWorkspaceConfigConcurrency(unittest.TestCase):
     def tearDown(self):
         """Clean up test environment."""
         self.config_path_patcher.stop()
+        self.global_config_path_patcher.stop()
         self.to_dict_patcher.stop()
         # Clean up temp files
         if os.path.exists(self.temp_config_file):

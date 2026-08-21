@@ -1,5 +1,6 @@
 """Permission service for SkyPilot API Server."""
 from collections.abc import Generator
+from collections.abc import Mapping
 import contextlib
 import hashlib
 import logging
@@ -11,11 +12,13 @@ from typing import Optional
 import casbin
 from casbin import util as casbin_util
 import filelock
+import sqlalchemy
 import sqlalchemy_adapter
 
 from sky import global_user_state
 from sky import models
 from sky import sky_logging
+from sky import skypilot_config
 from sky.skylet import constants
 from sky.users import rbac
 from sky.utils import common
@@ -48,6 +51,8 @@ class PermissionService:
     def __init__(self):
         self.enforcer: casbin.SyncedEnforcer | None = None
         self._lock = threading.Lock()
+        self._workspace_generation_lock = threading.Lock()
+        self._observed_workspace_permission_generation: int | None = None
         # Viewer role's endpoint allowlist, materialised at boot.
         self._viewer_allowlist: list[tuple] = []
 
@@ -93,6 +98,12 @@ class PermissionService:
             # casbin). It MUST be populated in every process that handles
             # requests.
             self._build_viewer_allowlist_no_lock()
+            if skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+                # Workspace rules deliberately do not participate in the
+                # legacy file-locked initializer above. Reconcile their exact
+                # set under the central PostgreSQL config transaction, then
+                # load and attest that committed generation in this process.
+                self._synchronize_guarded_workspace_policies()
 
     def _ensure_enforcer(self) -> casbin.SyncedEnforcer:
         """Ensure enforcer is initialized and return it."""
@@ -198,7 +209,8 @@ class PermissionService:
                             user_type=models.UserType.BASIC.value))
             enforcer = self._ensure_enforcer()
             enforcer.add_grouping_policy(user_hash, rbac.RoleName.ADMIN.value)
-            enforcer.save_policy()
+            if not skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+                enforcer.save_policy()
             logger.info(f'Basic auth user {username} initialized')
 
     def _maybe_initialize_policies(self) -> None:
@@ -235,14 +247,18 @@ class PermissionService:
                     expected_policies.append(
                         (role, item['path'], item['method']))
 
-        # Add workspace policy
+        # Guarded-HA workspace policies have their own PostgreSQL transaction
+        # below. They must never enter this file-locked/global-save path, since
+        # save_policy() can replace unrelated rows from a stale in-memory view.
+        guarded_ha = skypilot_config._postgres_server_config_is_authoritative()  # pylint: disable=protected-access
         workspace_policy_permissions = rbac.get_workspace_policy_permissions()
         logger.debug(f'Workspace policy permissions from config: '
                      f'{workspace_policy_permissions}')
 
-        for workspace_name, users in workspace_policy_permissions.items():
-            for user in users:
-                expected_policies.append((user, workspace_name, '*'))
+        if not guarded_ha:
+            for workspace_name, users in workspace_policy_permissions.items():
+                for user in users:
+                    expected_policies.append((user, workspace_name, '*'))
         # Check if all expected policies already exist and find missing ones
         missing_policies = [
             p for p in expected_policies if p not in existing_policies
@@ -250,7 +266,9 @@ class PermissionService:
         # Find policies to remove
         expected_policies_set = set(expected_policies)
         redundant_policies = [
-            p for p in existing_policies if p not in expected_policies_set
+            p for p in existing_policies
+            if p not in expected_policies_set and not (guarded_ha and len(
+                p) >= 3 and p[2] == '*' and not str(p[1]).startswith('/'))
         ]
         if missing_policies:
             # Add missing policies
@@ -323,7 +341,7 @@ class PermissionService:
             enforcer.add_grouping_policy(system_user_id, system_user_role)
             system_permission_cache_invalidations.append(system_user_id)
             policy_updated = True
-        if policy_updated:
+        if policy_updated and not guarded_ha:
             enforcer.save_policy()
         for system_user_id in system_permission_cache_invalidations:
             self.invalidate_user_permission_cache(system_user_id)
@@ -360,7 +378,8 @@ class PermissionService:
                 logger.debug(f'User {user_id} has no roles')
                 return
             enforcer.remove_grouping_policy(user_id, current_roles[0])
-            enforcer.save_policy()
+            if not skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+                enforcer.save_policy()
             self.invalidate_user_permission_cache(user_id)
 
     def update_role(self, user_id: str, new_role: str) -> None:
@@ -381,7 +400,8 @@ class PermissionService:
 
             # Update user role
             enforcer.add_grouping_policy(user_id, new_role)
-            enforcer.save_policy()
+            if not skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+                enforcer.save_policy()
             # Always invalidate: even a first role assignment can grant
             # workspace access that was previously denied and cached.
             self.invalidate_user_permission_cache(user_id)
@@ -422,11 +442,20 @@ class PermissionService:
         """
         if os.getenv(constants.ENV_VAR_IS_SKYPILOT_SERVER) is None:
             return workspace_names
+        self._ensure_workspace_permission_generation_current()
+        enforcer = self._ensure_enforcer()
         if roles is None:
-            roles = self.get_user_roles(user_id)
+            if skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+                # Role mutations remain on the legacy D6 path and do not
+                # advance the workspace generation yet. Preserve their prior
+                # read freshness with one generation-bracketed policy load.
+                self._ensure_workspace_permission_generation_current(
+                    force_reload=True)
+                roles = enforcer.get_roles_for_user(user_id)
+            else:
+                roles = self.get_user_roles(user_id)
         if rbac.RoleName.ADMIN.value in roles:
             return workspace_names
-        enforcer = self._ensure_enforcer()
         # Scan policy rules directly for workspace access.
         # NOTE: this only matches direct (user_id, workspace, '*') and wildcard
         # ('*', workspace, '*') policies.  It does NOT traverse casbin role
@@ -497,10 +526,191 @@ class PermissionService:
         with _policy_lock():
             self._load_policy_no_lock()
 
-    def _workspace_perm_cache_key(self, workspace_name: str,
-                                  user_id: str) -> str:
+    def _ensure_workspace_permission_generation_current(
+            self, *, force_reload: bool = False) -> int | None:
+        """Reload Casbin before using a newer guarded-HA policy generation."""
+        if not skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+            return None
+        receipt = skypilot_config.get_workspace_permission_generation()
+        self._ensure_config_covers_workspace_receipt(receipt)
+        observed = self._observed_workspace_permission_generation
+        if observed == receipt.generation and not force_reload:
+            return receipt.generation
+        with self._workspace_generation_lock:
+            # Another request in this process may have completed the reload.
+            receipt = skypilot_config.get_workspace_permission_generation()
+            self._ensure_config_covers_workspace_receipt(receipt)
+            observed = self._observed_workspace_permission_generation
+            if observed == receipt.generation and not force_reload:
+                return receipt.generation
+            if observed is not None and receipt.generation < observed:
+                raise RuntimeError(
+                    'Workspace permission generation regressed; refusing a '
+                    'potentially stale authorization decision.')
+
+            # Bracket the adapter's policy read with generation reads.  If a
+            # writer commits between them, retry until the policy snapshot and
+            # receipt are from one stable committed generation.
+            while True:
+                before = receipt.generation
+                self._load_policy_no_lock()
+                after_receipt = (
+                    skypilot_config.get_workspace_permission_generation())
+                self._ensure_config_covers_workspace_receipt(after_receipt)
+                if after_receipt.generation == before:
+                    self._observed_workspace_permission_generation = before
+                    return before
+                if after_receipt.generation < before:
+                    raise RuntimeError(
+                        'Workspace permission generation regressed during '
+                        'policy reload.')
+                receipt = after_receipt
+
+    def _ensure_config_covers_workspace_receipt(
+        self,
+        receipt: skypilot_config.WorkspacePermissionGeneration,
+    ) -> None:
+        """Fail closed unless this context covers the receipt's config CAS."""
+        loaded = skypilot_config.get_loaded_server_config_identity()
+        if loaded.revision < receipt.config_identity.revision:
+            skypilot_config.safe_reload_config()
+            loaded = skypilot_config.get_loaded_server_config_identity()
+        if loaded.revision < receipt.config_identity.revision:
+            raise RuntimeError('Loaded server config predates the workspace '
+                               'permission generation; refusing a stale '
+                               'authorization decision.')
+        if (loaded.revision == receipt.config_identity.revision and
+                loaded.digest != receipt.config_identity.digest):
+            raise RuntimeError('Workspace permission generation is bound to a '
+                               'different server-config digest.')
+
+    @staticmethod
+    def _workspace_policy_predicate(casbin_rule):
+        """Return the exact SQL predicate for workspace Casbin rules."""
+        return sqlalchemy.and_(
+            casbin_rule.c.ptype == 'p',
+            casbin_rule.c.v2 == '*',
+            casbin_rule.c.v1.not_like('/%'),
+        )
+
+    def _synchronize_guarded_workspace_policies(self) -> None:
+        """Normalize the full workspace-rule set under the config lock."""
+        generation: int | None = None
+        while True:
+            expected_identity = (
+                skypilot_config.get_loaded_server_config_identity())
+            policies = rbac.get_workspace_policy_permissions()
+            try:
+                with skypilot_config.locked_postgres_server_config_transaction(
+                        expected_identity) as (session, current):
+                    # The exact CAS guarantees ``policies`` came from this row.
+                    generation = self.replace_all_workspace_policies_in_session(
+                        session, policies, current.identity)
+                break
+            except skypilot_config.StaleServerConfigError:
+                skypilot_config.safe_reload_config()
+        assert generation is not None
+        self.reload_workspace_policy_after_commit(generation)
+
+    def replace_all_workspace_policies_in_session(
+            self, session, policies: Mapping[str, list[str]],
+            config_identity: skypilot_config.ServerConfigIdentity) -> int:
+        """Replace every workspace rule, if needed, in the caller's txn."""
+        if not skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+            raise RuntimeError(
+                'Transactional workspace policies require guarded HA.')
+        bind = session.get_bind()
+        if bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            raise RuntimeError(
+                'Transactional workspace policies require PostgreSQL.')
+        casbin_rule = sqlalchemy_adapter.CasbinRule.__table__
+        predicate = self._workspace_policy_predicate(casbin_rule)
+        existing = {(str(row.v0), str(row.v1), str(row.v2))
+                    for row in session.execute(
+                        sqlalchemy.select(casbin_rule.c.v0, casbin_rule.c.v1,
+                                          casbin_rule.c.v2).where(predicate))}
+        desired = {(user, workspace_name, '*')
+                   for workspace_name, users in policies.items()
+                   for user in set(users)}
+        if existing == desired:
+            return (
+                skypilot_config._get_workspace_permission_generation_in_session(
+                    session)  # pylint: disable=protected-access
+                .generation)
+        session.execute(sqlalchemy.delete(casbin_rule).where(predicate))
+        for user, workspace_name, action in sorted(desired):
+            session.execute(
+                sqlalchemy.insert(casbin_rule).values(ptype='p',
+                                                      v0=user,
+                                                      v1=workspace_name,
+                                                      v2=action))
+        return skypilot_config.advance_workspace_permission_generation_in_session(
+            session, config_identity)
+
+    def replace_workspace_policies_in_session(
+            self, session, policies: Mapping[str, list[str] | None],
+            config_identity: skypilot_config.ServerConfigIdentity) -> int:
+        """Replace exact workspace rules in the caller's guarded-HA txn."""
+        if not skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+            raise RuntimeError(
+                'Transactional workspace policies require guarded HA.')
+        bind = session.get_bind()
+        if bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            raise RuntimeError(
+                'Transactional workspace policies require PostgreSQL.')
+        casbin_rule = sqlalchemy_adapter.CasbinRule.__table__
+        for workspace_name, users in sorted(policies.items()):
+            session.execute(
+                sqlalchemy.delete(casbin_rule).where(
+                    casbin_rule.c.ptype == 'p',
+                    casbin_rule.c.v1 == workspace_name,
+                    casbin_rule.c.v2 == '*',
+                ))
+            if users is None:
+                continue
+            for user in sorted(set(users)):
+                session.execute(
+                    sqlalchemy.insert(casbin_rule).values(
+                        ptype='p',
+                        v0=user,
+                        v1=workspace_name,
+                        v2='*',
+                    ))
+        return skypilot_config.advance_workspace_permission_generation_in_session(
+            session, config_identity)
+
+    def reload_workspace_policy_after_commit(self,
+                                             expected_generation: int) -> None:
+        """Publish one committed workspace policy to this process."""
+        retry = False
+        with self._workspace_generation_lock:
+            receipt = skypilot_config.get_workspace_permission_generation()
+            if receipt.generation < expected_generation:
+                raise RuntimeError(
+                    'Committed workspace permission generation is not '
+                    'visible after config commit.')
+            self._load_policy_no_lock()
+            confirmed = skypilot_config.get_workspace_permission_generation()
+            if confirmed.generation != receipt.generation:
+                # A later writer committed during reload.  The ordinary reader
+                # path will loop and load that newer exact generation now.
+                self._observed_workspace_permission_generation = None
+                retry = True
+            else:
+                self._observed_workspace_permission_generation = (
+                    confirmed.generation)
+        if retry:
+            self._ensure_workspace_permission_generation_current()
+
+    def _workspace_perm_cache_key(self,
+                                  workspace_name: str,
+                                  user_id: str,
+                                  generation: int | None = None) -> str:
         """Build a KV cache key for a workspace permission entry."""
+        generation_component = ('' if generation is None else
+                                f'{generation}{_WORKSPACE_PERM_CACHE_KEY_SEP}')
         return (f'{_WORKSPACE_PERM_CACHE_PREFIX}'
+                f'{generation_component}'
                 f'{workspace_name}'
                 f'{_WORKSPACE_PERM_CACHE_KEY_SEP}'
                 f'{user_id}')
@@ -538,14 +748,34 @@ class PermissionService:
             return True
 
         # Check DB-backed KV cache (covers both admin and non-admin results).
-        cache_key = self._workspace_perm_cache_key(workspace_name, user_id)
+        generation = self._ensure_workspace_permission_generation_current()
+        cache_key = self._workspace_perm_cache_key(workspace_name, user_id,
+                                                   generation)
         cached = kv_cache.get_cache_entry(cache_key)
         if cached is not None:
             return cached == '1'
 
         # Cache miss — compute the permission.
         # Admin users have access to all workspaces.
-        role = self.get_user_roles(user_id)
+        enforcer = self._ensure_enforcer()
+        if skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+            # Non-workspace role mutations remain on the legacy D6 path and do
+            # not advance the workspace receipt. Force one bracketed load on a
+            # cache miss so those role changes remain visible without allowing
+            # a workspace-policy generation to cross the load.
+            refreshed_generation = (
+                self._ensure_workspace_permission_generation_current(
+                    force_reload=True))
+            if refreshed_generation != generation:
+                generation = refreshed_generation
+                cache_key = self._workspace_perm_cache_key(
+                    workspace_name, user_id, generation)
+                cached = kv_cache.get_cache_entry(cache_key)
+                if cached is not None:
+                    return cached == '1'
+            role = enforcer.get_roles_for_user(user_id)
+        else:
+            role = self.get_user_roles(user_id)
         if rbac.RoleName.ADMIN.value in role:
             result = True
         else:
@@ -554,7 +784,6 @@ class PermissionService:
             # r.act == p.act
             # This means if there's a policy ('*', workspace_name, '*'), it
             # will match any user
-            enforcer = self._ensure_enforcer()
             result = enforcer.enforce(user_id, workspace_name, '*')
 
         logger.debug(f'Workspace permission check: user={user_id}, '
@@ -615,6 +844,9 @@ class PermissionService:
                    For public workspaces, this should be ['*'].
                    For private workspaces, this should be specific user IDs.
         """
+        if skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+            raise RuntimeError('Guarded-HA workspace policy writes must join '
+                               'the central config transaction.')
         with _policy_lock():
             enforcer = self._ensure_enforcer()
             for user in users:
@@ -636,6 +868,9 @@ class PermissionService:
                    For public workspaces, this should be ['*'].
                    For private workspaces, this should be specific user IDs.
         """
+        if skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+            raise RuntimeError('Guarded-HA workspace policy writes must join '
+                               'the central config transaction.')
         with _policy_lock():
             self._load_policy_no_lock()
             enforcer = self._ensure_enforcer()
@@ -654,6 +889,9 @@ class PermissionService:
 
     def remove_workspace_policy(self, workspace_name: str) -> None:
         """Remove workspace policy."""
+        if skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+            raise RuntimeError('Guarded-HA workspace policy writes must join '
+                               'the central config transaction.')
         with _policy_lock():
             enforcer = self._ensure_enforcer()
             enforcer.remove_filtered_policy(1, workspace_name)
@@ -666,7 +904,13 @@ class PermissionService:
 
 @contextlib.contextmanager
 def _policy_lock() -> Generator[None, None, None]:
-    """Context manager for policy update lock."""
+    """Legacy/non-workspace policy lock retained until D6.
+
+    Guarded-HA workspace add/update/delete and batch mutation bypass this file
+    lock by joining the PostgreSQL central-config transaction. Remaining D6
+    callers are permission initialization, basic-auth/user-role mutation, and
+    explicit policy reloads.
+    """
     try:
         with filelock.FileLock(POLICY_UPDATE_LOCK_PATH,
                                POLICY_UPDATE_LOCK_TIMEOUT_SECONDS):

@@ -1,10 +1,10 @@
 # Stateless HA control-plane storage
 
-Status: Proposed canonical design, source contract complete. Application
-support, infrastructure, migration tooling, and the production cutover are not
-implemented. This document does not authorize a deployment or deletion. It may
-merge after independent review of its exact diff; implementation and
-production mutation remain separately gated.
+Status: Canonical design. D1 PostgreSQL config authority is source-complete in
+the accompanying change and has not been production-activated. D2--D10,
+infrastructure, data migration, EFS removal, and the production cutover remain
+unimplemented. This document does not itself authorize a deployment or
+deletion; production mutation remains separately gated.
 
 Last updated: 2026-08-21
 
@@ -112,8 +112,8 @@ reference blocks cutover.
 
 ## Source readiness and gaps
 
-This source audit is against `improvements` at 008316be2 (two commits after
-1.1.1409). Later implementation PRs must refresh it after rebasing.
+This D1 source audit is against `improvements` at 75debe4e3. Later
+implementation PRs must refresh it after rebasing.
 
 Literal EFS removal is not source-ready. The current seams and missing work are:
 
@@ -123,10 +123,18 @@ Literal EFS removal is not source-ready. The current seams and missing work are:
 | Upload blobs | Current clients compute a content SHA-256 and send parallel `/upload_v2` chunk requests; request/job rows retain the logical blob ID | `LocalFilesystemBlobStorage` is the only backend; chunks rely on a shared staging directory, existence/GC use paths and mtimes, the server does not verify that bytes match the claimed blob ID, resolve returns a permanent path, and expired `/upload` clients write an uncorrelated mutable per-user tree | PostgreSQL upload sessions, direct conditional S3 multipart publication, verified logical aliases, owner references, scoped materialization, and removal of `/upload` at the S3_V1 boundary |
 | Managed Jobs | DAG, environment, config, and original YAML are stored in PostgreSQL | Legacy disk fallbacks, blob bytes, controller/task logs | Validate retained rows, remove guarded-HA fallbacks, use S3/log provider |
 | Serve | Version YAML, submitted YAML, placement, controller snapshots, and recovery scripts are in PostgreSQL | Up/update staging, controller files, replica launch artifacts, and logs | Transactional admission payload, local reconstruction, S3 logs |
-| Server config | Canonical server config and Casbin policy are in PostgreSQL and database-backed Helm installs reject inline config | Startup still seeds and synchronizes ~/.sky/config.yaml through shared storage; workspace mutation uses an EFS policy lock and independently commits config and authorization | Seed an empty PostgreSQL row once, read PostgreSQL directly, atomically commit workspace config/policy/cache invalidation, and use only optional pod-local projections |
+| Server config | D1 source seeds only in explicit migration mode, validates revision/digest-fenced PostgreSQL rows, resolves central roles directly from PostgreSQL, and atomically commits workspace config, exact Casbin deltas, and permission generation | D1 is not production-activated; non-workspace policy operations and legacy Serve/Managed Jobs child snapshots retain their scoped filesystem locks until D6 | Qualify and deploy D1, then replace the remaining explicitly deferred snapshot and non-workspace policy paths in D6 |
 | Generated SSH | Generated per-user keypairs and cluster YAML are in PostgreSQL | /root/.ssh is shared; SSH-node-pool uploads use local key paths | Local regeneration; externally supplied keys only from projected Secrets |
 | Caches and scratch | Derivable from durable state | Catalogs, locks, wheels, generated YAML, debug files, and request stages use shared roots | Bounded emptyDir only |
-| Helm | Role split and PostgreSQL guards exist | Every HA role mounts one RWX claim and HA hard-fails without it; API/controller/executor/image-worker renders also retain an unused `skypilot-config` file dependency | D1 removes every guarded-HA config ConfigMap/env/mount/volume; D7 produces the PVC-free render with bounded ephemeral storage |
+| Helm | D1 source removes every guarded-HA `skypilot-config` object/reference, config volume/mount, synchronization RBAC rule, and image-worker `SKYPILOT_GLOBAL_CONFIG` environment variable | Every HA role still mounts the general RWX state claim and HA still hard-fails without it | Qualify and deploy D1; D7 produces the PVC-free render with bounded ephemeral storage after D3--D6 remove the remaining runtime consumers |
+
+D1 source qualification exercises the real PostgreSQL migration, retained-row
+precedence, read-only verification, malformed-state rejection, mixed-version
+write rejection, concurrent CAS writers, transaction rollback and post-commit
+recovery, workspace authorization fencing, and actual central/child reload
+dispatch. The complete Helm unit suite also renders guarded-HA negative and
+explicit non-HA compatibility cases. Production deployment and runtime proof
+remain open gates.
 
 The existing BlobStorage abstraction is path-oriented and has no S3
 implementation. The existing LogProvider abstraction reads local files but
@@ -1028,6 +1036,9 @@ The dependency graph and minimum clean stack are:
    `update_api_server_config_no_lock` bypass. This is the first bounded source
    PR because it removes one real EFS correctness edge without inventing the
    object protocol. It depends only on D0.
+   **Source status:** implemented and locally qualified in the accompanying
+   change; independent exact-head review, merge, deployment, and production
+   verification remain required.
 3. **D2 -- inert PostgreSQL storage foundation.** Add the protocol/generation,
    exact provider-target tuple, incarnation and `FENCED`/`RECOVERED` restore
    receipt, upload-head/session/attempt/part and cleanup-receipt,

@@ -18,6 +18,26 @@ tests:
           value: test-release-api-sa
         documentIndex: 0
 
+  - it: should omit ConfigMap synchronization RBAC in guarded HA
+    release:
+      name: test-release
+      namespace: test-namespace
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+    asserts:
+      - hasDocuments:
+          count: 7
+      - equal:
+          path: metadata.name
+          value: test-release-api-role-binding
+        documentIndex: 4
+      - equal:
+          path: metadata.name
+          value: test-release-serve-lb-role
+        documentIndex: 5
+
   - it: should bind chart-managed policies to an external service account
     release:
       name: test-release

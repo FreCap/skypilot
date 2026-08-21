@@ -62,7 +62,7 @@
 {{- $executorReservedEnvNames = append $executorReservedEnvNames "VAST_API_KEY" -}}
 {{- end -}}
 
-{{- $executorReservedVolumeNames := list "skypilot-config" "skypilot-role-runtime" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
+{{- $executorReservedVolumeNames := list "skypilot-role-runtime" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $executorReservedVolumeNames = concat $executorReservedVolumeNames (list "aws-config" "aws-config-files") -}}
 {{- end -}}
@@ -97,7 +97,7 @@
 {{- $executorReservedVolumeNames = append $executorReservedVolumeNames "vast-config" -}}
 {{- end -}}
 
-{{- $executorReservedMountPaths := list "/etc/skypilot/serve-auth/controller-admin" "/etc/skypilot/serve-auth/lb-data-plane" "/etc/skypilot/serve-auth/lb-sync" "/root/.sky" "/root/.sky/.server.yaml" "/root/.ssh" "/root/sky_logs" "/var/run/skypilot" "/var/skypilot/config" "/var/skypilot/ssh_keys" "/var/skypilot/ssh_node_pool" -}}
+{{- $executorReservedMountPaths := list "/etc/skypilot/serve-auth/controller-admin" "/etc/skypilot/serve-auth/lb-data-plane" "/etc/skypilot/serve-auth/lb-sync" "/root/.sky" "/root/.sky/.server.yaml" "/root/.ssh" "/root/sky_logs" "/var/run/skypilot" "/var/skypilot/ssh_keys" "/var/skypilot/ssh_node_pool" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $executorReservedMountPaths = append $executorReservedMountPaths "/root/.aws" -}}
 {{- end -}}
@@ -423,8 +423,6 @@ spec:
         - name: state-volume
           mountPath: /root/sky_logs
           subPath: sky_logs
-        - name: skypilot-config
-          mountPath: /var/skypilot/config
         {{- if or .Values.auth.externalProxy.enabled (eq (include "skypilot.ingressOAuthEnabled" .) "true") }}
         - name: skypilot-server-config
           mountPath: /root/.sky/.server.yaml
@@ -684,9 +682,6 @@ spec:
       - name: state-volume
         persistentVolumeClaim:
           claimName: {{ $stateClaimName }}
-      - name: skypilot-config
-        configMap:
-          name: {{ $fullName }}-config
       {{- if or .Values.auth.externalProxy.enabled (eq (include "skypilot.ingressOAuthEnabled" .) "true") }}
       - name: skypilot-server-config
         configMap:
