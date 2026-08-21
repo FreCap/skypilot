@@ -1269,6 +1269,24 @@ def _enforce_worker_projection_on_kubernetes_yaml(
                 pod_spec, expected_runtime_bootstrap_sha256)
 
 
+def _finalize_authenticated_worker_projection_on_kubernetes_yaml(
+        cluster_yaml: dict[str, Any], projection: dict[str, Any]) -> bool:
+    """Freeze the exact v4 bootstrap after trusted SSH-key rendering."""
+    projection_version = (
+        kubernetes_identity.worker_projection_protocol_version(projection))
+    if not k8s_pod_spec.serve_worker_projection_protocol_has_runtime_readiness(
+            projection_version):
+        return False
+    authenticated_bootstrap_sha256 = (
+        _projected_worker_runtime_bootstrap_sha256_for_cluster_yaml(
+            cluster_yaml))
+    _enforce_worker_projection_on_kubernetes_yaml(
+        cluster_yaml,
+        projection,
+        expected_runtime_bootstrap_sha256=authenticated_bootstrap_sha256)
+    return True
+
+
 def _restore_projected_worker_kubernetes_fields(
     new_yaml: str,
     restored_yaml: str,
@@ -1999,6 +2017,15 @@ def write_cluster_config(
             logger.debug('Full exception:', exc_info=e)
         return config_dict
     _add_auth_to_cluster_config(cloud, tmp_yaml_path)
+    if isinstance(cloud, clouds.Kubernetes) and worker_projection is not None:
+        # Authentication materializes the server's SSH key inside the
+        # canonical ray-node bootstrap. The pre-auth projection above has
+        # already rejected untrusted Pod-config changes; now freeze and
+        # reassert the exact producer that the provisioner will receive.
+        authenticated_yaml_obj = yaml_utils.read_yaml(tmp_yaml_path)
+        if _finalize_authenticated_worker_projection_on_kubernetes_yaml(
+                authenticated_yaml_obj, worker_projection):
+            yaml_utils.dump_yaml(tmp_yaml_path, authenticated_yaml_obj)
 
     # Restore the old yaml content for backward compatibility.
     old_yaml_content = global_user_state.get_cluster_yaml_str(yaml_path)
