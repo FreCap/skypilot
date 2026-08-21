@@ -4,11 +4,10 @@ Last updated: 2026-08-21
 
 Status: the atomic reserved-capacity allocator and PostgreSQL recovery
 boundary are deployed, but end-to-end 100% physical backfill is **not yet
-production-converged**. Production release `1.1.1414` still uses the
+production-converged**. Production release `1.1.1421` still uses the
 launch-liveness-sensitive reclaim-provider proof path. Independent PostgreSQL
-proof renewal and the complete flat Kueue attestation are implemented
-and locally source-qualified in the current SkyPilot change; they are neither
-merged nor deployed at this status update. Platform PR #8822 is separately
+proof renewal and the complete flat Kueue attestation are merged in SkyPilot
+PR #1650 but are not yet deployed. Platform PR #8822 is separately
 merged and deployed as platform revision 29: PHX retains the flat implicit
 `shared-pool`, has zero explicit Cohort objects and no new priority class, only
 the SkyPilot queues remain held, the exact audit role has the two read-only
@@ -18,6 +17,15 @@ evidence, not SkyPilot activation or end-to-end convergence evidence; the held
 queues intentionally prevent activation while the source correction is being
 qualified. Historical-state cleanup, request
 telemetry, and the independent removal of EFS also remain active.
+
+A bounded failed-service teardown correction is source-qualified in the
+current SkyPilot change; production deployment and purge proof remain open. It
+lets normal service
+finalization and failed-service purge adjudicate only terminal, execution-
+quiesced protocol-v2 `RESERVED_FILL` ambiguity through the existing exact
+provider reconciliation graph. The live purge remains blocked at 56/111 while
+that source is absent from production; no manual replica/association deletion
+is authorized.
 
 At the 2026-08-21 10:45 UTC observation, `boltz-l4-fleet` version 64 was
 `READY` at 80/80:
@@ -1401,6 +1409,56 @@ admission-time sequence and gate generation. The live sequencer must remain a
 monotonic successor of those frozen values, but today's gate is never
 substituted into yesterday's profile digest. This keeps cleanup exact without
 requiring an obsolete grant to become current again.
+
+### Reclaim-safe failed-service bulk teardown
+
+Normal finalization and failed-service purge use one shared preparation and
+cleanup dispatch for retained bound launches. An already `AMBIGUOUS`, terminal,
+execution-quiesced protocol-v2 `RESERVED_FILL` association never re-enters the
+generic request-cancel or name-only teardown paths. Protocol v1, ordinary
+profiles, malformed identity, or missing exact authority remain quarantined.
+
+The closed provider outcomes are:
+
+- `ABSENT`: record the exact physical-UID/context/replica observation after
+  executor quiescence, atomically project the association, clear its replica
+  pointer, and release its request-retention pin. A restart consumes that
+  PostgreSQL history only when the SkyPilot cluster record is also absent; it
+  authorizes replica-row removal and no new provider operation.
+- `PRESENT`: atomically persist the existing immediate-cleanup marker while
+  retaining the association and pin, then use the existing exact
+  `terminate_bound_non_pool_provider_present_cluster` path. Successful fenced
+  down is not completion until a forced fresh `ABSENT` observation projects
+  the association. If the SkyPilot cluster record disappeared before cleanup,
+  the same exact reconciliation path performs a fresh provider read instead of
+  falling through to generic teardown.
+- `UNKNOWN` or `REPLACED`: retain the association, pin, replica row, and
+  capacity debit. Neither result is absence or cleanup authority.
+
+Provider reads occur after the readiness/authority transaction releases all
+PostgreSQL row locks. The service lifecycle/name lock remains held across bulk
+preparation and cleanup. While bound cleanup still owns either an unresolved
+`PRESENT` association or an already-projected `ABSENT` replica row, normal
+finalization retains the current lifecycle epoch rather than advancing it;
+otherwise the immutable admission epoch would conflict with the service row
+before exact cleanup can consume the row. After acquiring that lock and
+immediately before scheduling destructive down, the cleanup owner revalidates
+the exact
+association/controller incarnation and owner epoch in PostgreSQL. A takeover,
+even with reused parent PID/IP, therefore fails before provider deletion.
+Failed-purge owner rotation propagates the newly claimed authority and reloads
+the persisted marker before cleanup.
+
+This correction changes no schema, migration, provider, Kueue, Helm,
+Terraform/Terragrunt, EFS, KubeRay, or platform-pin contract. It is locally
+source-qualified, not deployed or production-proven. Deployment qualification
+requires one direct Helm fix-forward followed by retrying the live purge and
+proving: every retained exact row reaches projected `ABSENT` or remains typed
+`UNKNOWN`/`REPLACED`; pins and pool/card debits release only after projection;
+no ambiguous request uses generic cancel or generic down; the service can be
+deleted and recreated through its normal lifecycle; and those properties hold
+immediately, at +10 and +30 minutes, and through the complete stale-authority,
+execution-quiescence, and provider-reprobe horizon.
 
 ### Atomic reserved-fill replica and request admission
 
@@ -4051,7 +4109,7 @@ either case.
 | 2a.2 | Isolated audit-role Kubernetes authentication and exact east identity-free inventory | Merged and deployed through revision 429 / release 1.1.1336. East passes. PHX now explicitly enables `AssignQueueLabelsForPods=true`; a clean current platform plan is empty. The successful full two-context preflight remains gated by 2a.4. |
 | 2a.3 | Global activation scope with per-service duplicate-pool validation | Revision 431 preflight exposed that the deployment policy incorrectly treated two services sharing one broker pool/card as a duplicate claim. The fix groups activation claims by service, retains same-service duplicate rejection, and permits the documented cross-service sharing before one fleet-wide provider attestation. |
 | 2a.4 | Remove redundant admission-policy authority from reserved fill | Platform PR #8649 is superseded and must not change the shared KubeRay/HPTO policy for fleet activation. Policy-bundle schema v5 removes ValidatingAdmissionPolicy and binding reads while retaining the stronger exact Kueue controller/webhook and synchronous/fresh Pod lifecycle proof. Activation requires only the SkyPilot fix-forward deployment and a fresh full-fleet preflight; no Terraform or platform Helm change is part of this gate. |
-| 2a.5 | Preserve Simone's flat PHX Kueue contract and attest its complete inventory | Platform PR #8822 is merged and deployed as platform revision 29: zero explicit Cohort objects, no new priority class, existing `be-lt=11`, list-only audit access, PostgreSQL projection updated to `be-lt`, and only SkyPilot queues held. The matching SkyPilot schema-v6 correction is locally source-qualified but not merged or deployed. This phase is not activated or production-proven. |
+| 2a.5 | Preserve Simone's flat PHX Kueue contract and attest its complete inventory | Platform PR #8822 is merged and deployed as platform revision 29: zero explicit Cohort objects, no new priority class, existing `be-lt=11`, list-only audit access, PostgreSQL projection updated to `be-lt`, and only SkyPilot queues held. The matching SkyPilot schema-v6 correction is merged in PR #1650 but not deployed. This phase is not activated or production-proven. |
 | 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 63 is committed, elected, and controller-applied at lifecycle epoch 82 on known-good image `v3.682.2-boltz-2`; it is the clean demand-gated activation successor. Version 62 remains rejected historical projection evidence. |
 | 2b.1 | UID-bound base-runtime readiness for canonical projected Kubernetes workers | Merged in PR #1618 at `6ad2407d813d04aed79de2fea62723987ee56670` and present in the revision-472 image. The focused render, source-composition, template-owned bootstrap-digest, typed Kubernetes-model, mutation, bounded-wait, UID-replacement, SSH-listener-failure, and final fresh-read tests pass, but the exact live runtime-readiness path is not yet production-exercised or proven. Generic Kubernetes and projection v1/v2/v3 remain unchanged. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. Historical cleanup #1506 is closed/superseded and reserves no head. |
@@ -5442,9 +5500,14 @@ legacy activation.
   cohort, zero nullable owner tuples, no old writers, backups, and the full
   stale/HA production horizon, make service owner columns `NOT NULL` and remove
   the one-shot attestation transition.
-- [ ] Adjudicate every exact PRESENT/quiesced launch through the existing
-  generation/UID-fenced cleanup graph; UNKNOWN or replaced identities remain
-  quarantined rather than inferred absent.
+- [ ] Merge and direct-Helm deploy the reclaim-safe failed-service teardown
+  correction, then retry the live 56/111 purge under the lifecycle/name lock.
+  Prove `PRESENT` uses exact fenced down plus forced fresh `ABSENT`, a missing
+  cluster record uses exact reconciliation without generic down, direct
+  `ABSENT` projects and releases its pin/debit, and `UNKNOWN`, `REPLACED`,
+  protocol-v1, ordinary, and stale-authority cases remain quarantined. Verify
+  deletion/recreation and repeat the census immediately, at +10 and +30
+  minutes, and through the complete stale/quiescence/provider-reprobe horizon.
 - [ ] Prove a large grant assigns every compatible free GPU within the bounded
   convergence target, with zero paid spill and no new ambiguous capacity debit.
 
@@ -5491,7 +5554,7 @@ legacy activation.
   no new priority class, existing `be-lt=11`, list-only audit permissions, and
   a PostgreSQL projection naming `be-lt`; only the SkyPilot queues remain held.
   This is platform-shape evidence, not SkyPilot activation evidence.
-- [ ] Merge and deploy the schema-v6 SkyPilot attester: retain schema-v5's
+- [ ] Deploy the schema-v6 SkyPilot attester merged in PR #1650: retain schema-v5's
   removal of admission-policy/binding reads, add the exact implicit-flat-cohort/
   seven-ClusterQueue PHX topology, governed membership closure from two
   complete cluster-wide LISTs, policy revision `1.1.1422`, and independent

@@ -6,6 +6,7 @@ import concurrent.futures
 import contextlib
 import copy
 import dataclasses
+import functools
 import os
 import threading
 import time
@@ -45,6 +46,7 @@ from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import reserved_fill_reclaim_proofs
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
+from sky.serve import service
 from sky.serve import zero_cost_actuation
 from sky.serve import zero_cost_actuation_schema
 from sky.server import constants as server_constants
@@ -54,6 +56,7 @@ from sky.server.requests import postgres as request_postgres
 from sky.server.requests import requests as api_requests
 from sky.server.requests import reserved_fill_admission
 from sky.skylet import constants as skylet_constants
+from sky.utils import common_utils
 from sky.utils import locks
 from sky.utils.db import migration_utils
 
@@ -384,6 +387,373 @@ def _owner_tuple(engine):
                 serve_state_schema.services_table.c.owner_user_id,
                 serve_state_schema.services_table.c.owner_user_name).
             where(serve_state_schema.services_table.c.name == _SERVICE)).one()
+
+
+def _failed_teardown_reserved_fill_ambiguity(engine):
+    """Create one exact terminal+quiesced ambiguous fill association."""
+    spec = _atomic_spec(engine)
+    staged, receipt = reserved_fill_admission._transaction(
+        spec, 7, require_existing=False)
+    with engine.connect() as connection:
+        request_row = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                receipt.request_id)).mappings().one()
+    request = request_postgres.request_from_mapping(request_row)
+    context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
+        request.request_body.extra_launch_context)
+    with engine.begin() as connection:
+        associations = (
+            ordinary_launch_binding.ordinary_launch_associations_table)
+        connection.execute(
+            sqlalchemy.update(associations).where(
+                associations.c.association_id == context.association_id).values(
+                    effect_phase=ordinary_launch_binding.EffectPhase.
+                    PROVIDER_IO.value,
+                    effect_phase_changed_at=sqlalchemy.func.clock_timestamp(),
+                    owner_revision=associations.c.owner_revision + 1,
+                    updated_at=sqlalchemy.func.clock_timestamp()))
+        assert ordinary_launch_binding.mark_ambiguous_in_connection(
+            connection, context, 'provider-result-uncertain')
+        connection.execute(
+            sqlalchemy.delete(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id == context.request_id))
+        now = sqlalchemy.func.clock_timestamp()
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                context.request_id).values(
+                    status=api_requests.RequestStatus.CANCELLED.value,
+                    terminal_cause=event_api_models.EventCause.
+                    EXECUTION_LEASE_EXPIRED.value,
+                    execution_generation=1,
+                    execution_quiescence_required=True,
+                    execution_quiesced_generation=1,
+                    execution_quiesced_at=now,
+                    finished_at=now,
+                    updated_at=now))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == _SERVICE).values(
+                    status=serve_state.ServiceStatus.CONTROLLER_FAILED.value))
+    teardown = ordinary_launch_binding.begin_service_teardown_if_owner(
+        _SERVICE, _SERVICE_HASH, _OWNER)
+    assert teardown.disposition is (
+        ordinary_launch_binding.ServiceTeardownDisposition.MARKED_BOUND)
+    assert teardown.authority is not None
+    info = serve_state.get_replica_info_from_id(
+        _SERVICE, staged.persisted_info.replica_id)
+    assert info is not None
+    return context, info, teardown.authority
+
+
+def _install_failed_teardown_provider_observation(monkeypatch, engine, info,
+                                                  evidence):
+    """Install one real-lock probe and closed provider classification."""
+    provider_reads = []
+
+    def _get_physical_uid(kubernetes_context, *, force_refresh):
+        assert kubernetes_context == info.reserved_fill_kubernetes_context
+        assert force_refresh
+        # This NOWAIT lock is the regression witness that provider observation
+        # runs after the request/state transactions release their row locks.
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.select(
+                    serve_state_schema.services_table.c.name).where(
+                        serve_state_schema.services_table.c.name ==
+                        _SERVICE).with_for_update(nowait=True)).scalar_one()
+        provider_reads.append('physical-cluster-uid')
+        if evidence == ordinary_launch_binding.ProviderEvidence.REPLACED:
+            return 'replacement-physical-cluster-uid'
+        return info.reserved_fill_physical_cluster_uid
+
+    def _probe_presence(_fence, cluster_name, *, use_cache):
+        assert cluster_name == info.cluster_name
+        assert not use_cache
+        provider_reads.append('replica-presence')
+        return {
+            ordinary_launch_binding.ProviderEvidence.PRESENT:
+                reserved_capacity.PhysicalReplicaPresence.PRESENT,
+            ordinary_launch_binding.ProviderEvidence.ABSENT:
+                reserved_capacity.PhysicalReplicaPresence.ABSENT,
+            ordinary_launch_binding.ProviderEvidence.UNKNOWN:
+                reserved_capacity.PhysicalReplicaPresence.UNPROVEN,
+        }[evidence]
+
+    monkeypatch.setattr(reserved_capacity,
+                        'get_kubernetes_physical_cluster_uid',
+                        _get_physical_uid)
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        _probe_presence)
+    return provider_reads
+
+
+def test_failed_teardown_present_ambiguity_authorizes_cleanup_marker(
+        atomic_database, monkeypatch) -> None:
+    context, info, authority = _failed_teardown_reserved_fill_ambiguity(
+        atomic_database)
+    provider_reads = _install_failed_teardown_provider_observation(
+        monkeypatch, atomic_database, info,
+        ordinary_launch_binding.ProviderEvidence.PRESENT)
+    monkeypatch.setattr(
+        service.request_postgres, 'request_bound_ordinary_launch_cancel',
+        lambda *_args, **_kwargs: pytest.fail(
+            'an ambiguous reserved-fill request must not be cancelled'))
+
+    cleanup_contexts = (service._settle_bound_ordinary_launches_for_teardown(
+        authority, [info]))
+
+    assert provider_reads == ['physical-cluster-uid', 'replica-presence']
+    assert cleanup_contexts == {
+        (info.replica_id, info.replica_record_id): context
+    }
+    with atomic_database.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == context.association_id)).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == _SERVICE,
+                serve_state_schema.replicas_table.c.replica_id ==
+                info.replica_id)).mappings().one()
+        pin_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.REQUEST_RETENTION_PINS).where(
+                    request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+                    context.request_id)).scalar_one()
+    persisted = replica_managers.ReplicaInfo.from_storage_dict(
+        replica['replica_state'])
+    assert association['resolution'] == (
+        ordinary_launch_binding.Resolution.AMBIGUOUS.value)
+    assert association['provider_evidence'] == (
+        ordinary_launch_binding.ProviderEvidence.PRESENT.value)
+    assert association['cancel_reason'] is None
+    assert replica['ordinary_launch_association_id'] == context.association_id
+    assert ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+        persisted, require_scheduled=True)
+    assert pin_count == 1
+
+    # The cleanup owner must use the existing exact PRESENT path, not generic
+    # cancellation or a name-only down. That path performs the fenced down and
+    # then forces a new provider observation before releasing the association
+    # and retention pin.
+    cleanup_reads = _install_failed_teardown_provider_observation(
+        monkeypatch, atomic_database, persisted,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
+    terminated = []
+
+    def _terminate(*args, **kwargs):
+        terminated.append((args, kwargs))
+
+    monkeypatch.setattr(replica_managers, 'terminate_cluster', _terminate)
+    replica_managers.terminate_bound_non_pool_provider_present_cluster(
+        context, persisted, authority,
+        functools.partial(service._project_bound_ordinary_launch_for_teardown,
+                          authority), persisted.cluster_name, 'cleanup.log')
+
+    assert len(terminated) == 1
+    assert terminated[0][0][:2] == (persisted.cluster_name, 'cleanup.log')
+    assert cleanup_reads == ['physical-cluster-uid', 'replica-presence']
+    with atomic_database.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == context.association_id)).mappings().one()
+        replica_pointer = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.
+                ordinary_launch_association_id).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    _SERVICE, serve_state_schema.replicas_table.c.replica_id ==
+                    info.replica_id)).scalar_one()
+        pin_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.REQUEST_RETENTION_PINS).where(
+                    request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+                    context.request_id)).scalar_one()
+    assert association['resolution'] == (
+        ordinary_launch_binding.Resolution.PROJECTED.value)
+    assert association['provider_evidence'] == (
+        ordinary_launch_binding.ProviderEvidence.ABSENT.value)
+    assert replica_pointer is None
+    assert pin_count == 0
+
+
+def test_failed_teardown_present_marker_without_cluster_record_reconciles(
+        atomic_database, monkeypatch) -> None:
+    context, info, authority = _failed_teardown_reserved_fill_ambiguity(
+        atomic_database)
+    _install_failed_teardown_provider_observation(
+        monkeypatch, atomic_database, info,
+        ordinary_launch_binding.ProviderEvidence.PRESENT)
+    cleanup_contexts = (service._settle_bound_ordinary_launches_for_teardown(
+        authority, [info]))
+    persisted = serve_state.get_replica_info_from_id(_SERVICE, info.replica_id)
+    assert persisted is not None
+    cleanup_reads = _install_failed_teardown_provider_observation(
+        monkeypatch, atomic_database, persisted,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
+    monkeypatch.setattr(
+        replica_managers, 'terminate_cluster', lambda *_args, **_kwargs: pytest.
+        fail('a missing cluster record must not use generic teardown'))
+
+    preparation = service._prepare_provider_present_cleanup(
+        _SERVICE, authority, [persisted], set(), cleanup_contexts)
+
+    assert not preparation.contexts
+    assert preparation.projected_absence_keys == frozenset({
+        (persisted.replica_id, persisted.replica_record_id)
+    })
+    assert not preparation.failures
+    assert cleanup_reads == ['physical-cluster-uid', 'replica-presence']
+    with atomic_database.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == context.association_id)).mappings().one()
+        replica_pointer = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.
+                ordinary_launch_association_id).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    _SERVICE, serve_state_schema.replicas_table.c.replica_id ==
+                    info.replica_id)).scalar_one()
+        pin_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.REQUEST_RETENTION_PINS).where(
+                    request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+                    context.request_id)).scalar_one()
+    assert association['resolution'] == (
+        ordinary_launch_binding.Resolution.PROJECTED.value)
+    assert association['provider_evidence'] == (
+        ordinary_launch_binding.ProviderEvidence.ABSENT.value)
+    assert replica_pointer is None
+    assert pin_count == 0
+
+
+def test_failed_teardown_present_marker_rejects_stale_authority(
+        atomic_database, monkeypatch) -> None:
+    context, info, authority = _failed_teardown_reserved_fill_ambiguity(
+        atomic_database)
+    _install_failed_teardown_provider_observation(
+        monkeypatch, atomic_database, info,
+        ordinary_launch_binding.ProviderEvidence.PRESENT)
+    cleanup_contexts = (service._settle_bound_ordinary_launches_for_teardown(
+        authority, [info]))
+    persisted = serve_state.get_replica_info_from_id(_SERVICE, info.replica_id)
+    assert persisted is not None
+    stale_authority = dataclasses.replace(
+        authority, controller_owner_epoch=authority.controller_owner_epoch - 1)
+
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='lost its exact bound association authority'):
+        service._provider_present_cleanup_context(persisted, stale_authority,
+                                                  cleanup_contexts)
+
+    assert request_postgres.bound_non_pool_provider_present_cleanup_is_authorized(
+        context, authority)
+
+
+def test_failed_teardown_absent_ambiguity_projects_exact_result(
+        atomic_database, monkeypatch) -> None:
+    context, info, authority = _failed_teardown_reserved_fill_ambiguity(
+        atomic_database)
+    provider_reads = _install_failed_teardown_provider_observation(
+        monkeypatch, atomic_database, info,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
+    monkeypatch.setattr(
+        service.request_postgres, 'request_bound_ordinary_launch_cancel',
+        lambda *_args, **_kwargs: pytest.fail(
+            'an ambiguous reserved-fill request must not be cancelled'))
+
+    service._settle_bound_ordinary_launches_for_teardown(authority, [info])
+
+    assert provider_reads == ['physical-cluster-uid', 'replica-presence']
+    with atomic_database.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == context.association_id)).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == _SERVICE,
+                serve_state_schema.replicas_table.c.replica_id ==
+                info.replica_id)).mappings().one()
+        pin_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.REQUEST_RETENTION_PINS).where(
+                    request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+                    context.request_id)).scalar_one()
+    persisted = replica_managers.ReplicaInfo.from_storage_dict(
+        replica['replica_state'])
+    assert association['resolution'] == (
+        ordinary_launch_binding.Resolution.PROJECTED.value)
+    assert association['provider_evidence'] == (
+        ordinary_launch_binding.ProviderEvidence.ABSENT.value)
+    assert association['cancel_reason'] is None
+    assert replica['ordinary_launch_association_id'] is None
+    assert persisted.status_property.sky_launch_status == (
+        common_utils.ProcessStatus.FAILED)
+    assert pin_count == 0
+
+
+@pytest.mark.parametrize(
+    'evidence',
+    (ordinary_launch_binding.ProviderEvidence.UNKNOWN,
+     ordinary_launch_binding.ProviderEvidence.REPLACED),
+)
+def test_failed_teardown_uncertain_provider_ambiguity_stays_fail_closed(
+        atomic_database, monkeypatch, evidence) -> None:
+    context, info, authority = _failed_teardown_reserved_fill_ambiguity(
+        atomic_database)
+    provider_reads = _install_failed_teardown_provider_observation(
+        monkeypatch, atomic_database, info, evidence)
+    monkeypatch.setattr(
+        service.request_postgres, 'request_bound_ordinary_launch_cancel',
+        lambda *_args, **_kwargs: pytest.fail(
+            'an ambiguous reserved-fill request must not be cancelled'))
+
+    with pytest.raises(
+            ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+            match=f'returned {evidence.value}.*refusing provider cleanup'):
+        service._settle_bound_ordinary_launches_for_teardown(authority, [info])
+
+    expected_reads = ['physical-cluster-uid']
+    if evidence == ordinary_launch_binding.ProviderEvidence.UNKNOWN:
+        expected_reads.append('replica-presence')
+    assert provider_reads == expected_reads
+    with atomic_database.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == context.association_id)).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == _SERVICE,
+                serve_state_schema.replicas_table.c.replica_id ==
+                info.replica_id)).mappings().one()
+        pin_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.REQUEST_RETENTION_PINS).where(
+                    request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+                    context.request_id)).scalar_one()
+    persisted = replica_managers.ReplicaInfo.from_storage_dict(
+        replica['replica_state'])
+    assert association['resolution'] == (
+        ordinary_launch_binding.Resolution.AMBIGUOUS.value)
+    assert association['provider_evidence'] == evidence.value
+    assert association['cancel_reason'] is None
+    assert replica['ordinary_launch_association_id'] == context.association_id
+    assert not ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+        persisted)
+    assert pin_count == 1
 
 
 def _use_real_broker(monkeypatch, engine):

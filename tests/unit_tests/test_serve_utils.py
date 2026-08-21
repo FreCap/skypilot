@@ -26,6 +26,7 @@ from sky.serve import demand_state
 from sky.serve import maintenance
 from sky.serve import ordinary_launch_binding
 from sky.serve import reserved_capacity
+from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.server.requests import postgres as request_postgres
@@ -4852,6 +4853,11 @@ class TestTerminateFailedServices:
             if terminate_side_effect is not None:
                 terminate_side_effect(cluster_name)
 
+        self.exact_terminations = []
+
+        def _terminate_exact(*args, **kwargs):
+            self.exact_terminations.append((args, kwargs))
+
         self.cluster_snapshot_calls = []
 
         def _cluster_snapshot(cluster_names):
@@ -4884,7 +4890,8 @@ class TestTerminateFailedServices:
              mock.patch(
                  'sky.serve.service.'
                  '_settle_bound_ordinary_launches_for_teardown',
-                 side_effect=bound_settle_side_effect) as settle_bound, \
+                 side_effect=bound_settle_side_effect,
+                 return_value={}) as settle_bound, \
              mock.patch(
                  'sky.serve.serve_utils.global_user_state.'
                  'get_cluster_status_fields',
@@ -4897,6 +4904,10 @@ class TestTerminateFailedServices:
                   if teardown_identities is None else teardown_identities)), \
              mock.patch('sky.serve.replica_managers.terminate_cluster',
                         side_effect=_terminate), \
+             mock.patch(
+                 'sky.serve.replica_managers.'
+                 'terminate_bound_non_pool_provider_present_cluster',
+                 side_effect=_terminate_exact), \
              mock.patch('sky.serve.serve_utils.get_service_lifecycle_lock',
                         return_value=lifecycle_lock), \
              mock.patch('sky.serve.serve_utils.lifecycle_lock_is_valid',
@@ -4962,6 +4973,7 @@ class TestTerminateFailedServices:
 
         def _settle(*_args):
             events.append('exact-settle')
+            return {}
 
         def _quiesce(*_args, **_kwargs):
             events.append('generic-quiesce')
@@ -4975,8 +4987,142 @@ class TestTerminateFailedServices:
             quiesce_side_effect=_quiesce)
 
         assert message is None
-        assert events == ['exact-settle', 'generic-quiesce']
-        self.settle_bound.assert_called_once_with(authority, [info])
+        assert events == ['exact-settle', 'exact-settle', 'generic-quiesce']
+        assert self.settle_bound.call_args_list == [
+            mock.call(authority, [info]),
+            mock.call(authority, [info]),
+        ]
+        remove_service.assert_called_once()
+
+    def test_provider_present_marker_uses_exact_failed_purge_path(self):
+        authority = ordinary_launch_binding.ControllerBindingAuthority(
+            service_name='svc',
+            service_hash='incarnation-a',
+            service_workspace='default',
+            service_lifecycle_epoch=17,
+            controller_pid=123,
+            controller_ip='10.0.0.2',
+            controller_incarnation=uuid.UUID(
+                '00000000-0000-4000-8000-000000000123'),
+            controller_owner_epoch=7,
+            capable=True,
+            binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=2,
+            non_pool_capable=True,
+            non_pool_binding_protocol_version=(
+                ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+            non_pool_profile_set_digest=(
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            ),
+            non_pool_capability_cohort_epoch=(
+                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+            non_pool_receipt_protocol_version=(
+                ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
+        physical_uid = 'physical-cluster-a'
+        kubernetes_context = 'on-prem-a'
+        pool_key = reserved_capacity_broker.make_pool_key(
+            kubernetes_context,
+            'L4',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid=physical_uid)
+        status = types.SimpleNamespace(
+            sky_launch_status=(
+                serve_utils.common_utils.ProcessStatus.INTERRUPTED),
+            sky_down_status=serve_utils.common_utils.ProcessStatus.SCHEDULED,
+            service_ready_now=False,
+            is_scale_down=True,
+            preempted=False,
+            purged=False,
+            failed_spot_availability=False,
+            wait_for_idle_before_termination=False,
+            drain_cap_seconds=0,
+            drain_started_at=None,
+            logical_retirement_version=None,
+            logical_retirement_controller_epoch=None,
+            logical_retirement_generation=None,
+            logical_retirement_target_capacity=None,
+            logical_retirement_confirmed_generation=None,
+            logical_retirement_bounded_deadline=False,
+            logical_retirement_committed=False)
+        record_uuid = uuid.UUID('22222222-2222-4222-8222-222222222222')
+        record_id = str(record_uuid)
+        profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+            authorization_reference='reserved-fill:test',
+            authorization_generation=7,
+            authorization_payload={'pool_key': pool_key})
+        context = ordinary_launch_binding.BoundNonPoolLaunchContext(
+            association_id=uuid.UUID('11111111-1111-4111-8111-111111111111'),
+            request_id='request-1',
+            service_name='svc',
+            replica_id=3,
+            replica_record_id=record_uuid,
+            launch_generation=1,
+            input_digest='a' * 64,
+            profile=profile,
+            capability_cohort_epoch=(
+                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+            capability_profile_set_digest=(
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            ),
+            receipt_protocol_version=(
+                ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
+        info = types.SimpleNamespace(
+            replica_id=3,
+            replica_record_id=record_id,
+            cluster_name='svc-3',
+            reserved_fill=True,
+            reserved_fill_pool_key=pool_key,
+            reserved_fill_service_generation=7,
+            reserved_fill_physical_cluster_uid=physical_uid,
+            reserved_fill_kubernetes_context=kubernetes_context,
+            location={
+                'cloud': 'Kubernetes',
+                'region': kubernetes_context,
+                'accelerators': {
+                    'L4': 1,
+                },
+            },
+            resources_override={
+                'cloud': 'Kubernetes',
+                'region': kubernetes_context,
+                'accelerators': {
+                    'L4': 1,
+                },
+            },
+            is_zero_cost=True,
+            service_job_id=None,
+            paid_capacity_pool_key=None,
+            zero_cost_materialization_sequence=None,
+            status_property=status)
+        assert (
+            ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+                info, require_scheduled=True))
+
+        def _settle(_authority, _infos):
+            return {(info.replica_id, info.replica_record_id): context}
+
+        with mock.patch.object(
+                request_postgres,
+                'bound_non_pool_provider_present_cleanup_is_authorized',
+                return_value=True):
+            terminated, remove_service, _, message, _, _ = self._run(
+                [info],
+                exists=lambda _name: True,
+                bound_authority=authority,
+                bound_settle_side_effect=_settle)
+
+        assert message is None
+        assert not terminated
+        assert len(self.exact_terminations) == 1
+        args, kwargs = self.exact_terminations[0]
+        assert args[:3] == (context, info, authority)
+        assert callable(args[3])
+        assert args[4] == info.cluster_name
+        assert kwargs['cleanup_fence'] == (
+            reserved_capacity.ProtocolV2CleanupFence(
+                kubernetes_context=kubernetes_context,
+                physical_cluster_uid=physical_uid))
         remove_service.assert_called_once()
 
     def test_bound_settlement_failure_retains_all_cleanup_rows(self):
@@ -5558,6 +5704,7 @@ class TestTerminateFailedServices:
 
         def _settle(*_args):
             events.append('exact-settle')
+            return {}
 
         def _rotate(*_args, **_kwargs):
             events.append('rotate-authority')
@@ -5583,9 +5730,14 @@ class TestTerminateFailedServices:
              mock.patch(
                  'sky.serve.ordinary_launch_binding.'
                  'begin_service_teardown_if_owner',
-                 return_value=ordinary_launch_binding.ServiceTeardownResult(
-                     ordinary_launch_binding.ServiceTeardownDisposition.
-                     MARKED_BOUND, old_authority)), \
+                 side_effect=[
+                     ordinary_launch_binding.ServiceTeardownResult(
+                         ordinary_launch_binding.ServiceTeardownDisposition.
+                         MARKED_BOUND, old_authority),
+                     ordinary_launch_binding.ServiceTeardownResult(
+                         ordinary_launch_binding.ServiceTeardownDisposition.
+                         MARKED_BOUND, claimed_authority),
+                 ]), \
              mock.patch(
                  'sky.serve.service.'
                  '_settle_bound_ordinary_launches_for_teardown',
@@ -5619,8 +5771,13 @@ class TestTerminateFailedServices:
                 'svc', 'incarnation-a', False, lifecycle_lock)
 
         assert message is None
-        assert events == ['exact-settle', 'rotate-authority', 'claim-orphan']
-        settle.assert_called_once_with(old_authority, [])
+        assert events == [
+            'exact-settle', 'rotate-authority', 'claim-orphan', 'exact-settle'
+        ]
+        assert settle.call_args_list == [
+            mock.call(old_authority, []),
+            mock.call(claimed_authority, []),
+        ]
         rotate.assert_called_once_with(
             'svc',
             'incarnation-a', (101, '10.0.0.1'),

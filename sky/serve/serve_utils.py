@@ -4613,6 +4613,7 @@ def _terminate_failed_services_locked(
                 if claimed_authority is None:
                     raise RuntimeError(
                         'Bound orphan claim returned no controller authority.')
+                bound_authority = claimed_authority
                 owner = dict(owner)
                 owner['controller_pid'], owner['controller_ip'] = purge_owner
             except Exception as e:  # pylint: disable=broad-except
@@ -4680,6 +4681,45 @@ def _terminate_failed_services_locked(
             'acknowledgement')
 
     replica_infos = serve_state.get_replica_infos(service_name)
+    provider_present_cleanup_contexts: dict[tuple[int, str], Any] = {}
+    if bound_authority is not None:
+        try:
+            # A live parent may rotate the controller incarnation between the
+            # first teardown transition and its acknowledgement. Re-read the
+            # exact current authority under the same lifecycle/name lock, then
+            # revalidate every retained provider-present marker against it.
+            marked_for_teardown, current_authority = (
+                _begin_service_teardown_if_owner(
+                    service_name, expected_service_hash,
+                    (owner.get('controller_pid'), owner.get('controller_ip')),
+                    lifecycle_epoch))
+            if not marked_for_teardown or current_authority is None:
+                raise RuntimeError(
+                    'Bound teardown authority disappeared after controller '
+                    'acknowledgement.')
+            bound_authority = current_authority
+            # Local to break service -> serve_utils at module import time.
+            # pylint: disable=import-outside-toplevel,protected-access
+            from sky.serve import service as service_lib
+
+            provider_present_cleanup_contexts = (
+                service_lib._settle_bound_ordinary_launches_for_teardown(
+                    bound_authority, replica_infos))
+            # pylint: enable=import-outside-toplevel,protected-access
+            # Settlement may atomically persist the provider-present cleanup
+            # marker on a separately locked ReplicaInfo instance.  Refresh
+            # before matching that marker to the returned exact context.
+            replica_infos = serve_state.get_replica_infos(service_name)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(
+                f'Failed to refresh exact bound cleanup authority for '
+                f'service {service_name!r}; retaining purge state for retry: '
+                f'{common_utils.format_exception(e)}')
+            return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
+                    'could not be purged because its exact provider cleanup '
+                    'authority could not be refreshed; durable cleanup '
+                    'inventory was retained for retry.'
+                    f'{colorama.Style.RESET_ALL}')
     if not quiesce_service_replica_launch_requests(
             service_name,
             replica_infos,
@@ -4750,20 +4790,64 @@ def _terminate_failed_services_locked(
     if not _still_owns():
         return _purge_ownership_failure(
             service_name, 'ownership lost after cluster inventory snapshot')
+    # Local to break service -> serve_utils at module import time.
+    # pylint: disable=import-outside-toplevel,protected-access
+    from sky.serve import service as service_lib
+
+    try:
+        preparation = service_lib._prepare_provider_present_cleanup(
+            service_name, bound_authority, replica_infos,
+            existing_cluster_names, provider_present_cleanup_contexts)
+    except Exception as error:  # pylint: disable=broad-except
+        logger.error(
+            'Retaining failed service %r because its exact provider cleanup '
+            'inventory could not be prepared (%s).', service_name,
+            common_utils.format_exception(error))
+        return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
+                'could not be purged because its exact provider cleanup '
+                'inventory could not be prepared; durable cleanup inventory '
+                f'was retained for retry.{colorama.Style.RESET_ALL}')
+    # pylint: enable=import-outside-toplevel,protected-access
+    provider_present_cleanup_contexts = preparation.contexts
+    remaining_replica_clusters.extend(
+        info.cluster_name
+        for info in replica_infos
+        if (info.replica_id, info.replica_record_id) in preparation.failures)
+    skipped_cleanup_keys = (set(preparation.failures) |
+                            set(preparation.projected_absence_keys))
+    partition_infos = [
+        info for info in replica_infos
+        if (info.replica_id, info.replica_record_id) not in skipped_cleanup_keys
+    ]
     # This remains the failed-service purge submission owner.  The retired
     # action-authority proposal does not replace it.
     to_terminate, unresolved_cluster_names = (
-        _partition_replica_cleanup_targets(replica_infos,
+        _partition_replica_cleanup_targets(partition_infos,
                                            existing_cluster_names))
+    cleanup_targets: list[tuple[Any, Any, Any | None]] = []
+    for info, cleanup_fence in to_terminate:
+        try:
+            # pylint: disable=protected-access
+            cleanup_context = service_lib._provider_present_cleanup_context(
+                info, bound_authority, provider_present_cleanup_contexts)
+            # pylint: enable=protected-access
+        except Exception as error:  # pylint: disable=broad-except
+            logger.error(
+                'Retaining replica cluster %r because its provider-present '
+                'cleanup marker lost exact bound association authority (%s).',
+                info.cluster_name, common_utils.format_exception(error))
+            unresolved_cluster_names.append(info.cluster_name)
+            continue
+        cleanup_targets.append((info, cleanup_fence, cleanup_context))
     remaining_replica_clusters.extend(unresolved_cluster_names)
-    if to_terminate:
+    if cleanup_targets:
         try:
             teardown_identities = (
                 serve_state.get_replica_resource_action_identities(
                     service_name,
-                    [info.replica_id for info, _ in to_terminate]))
+                    [info.replica_id for info, _, _ in cleanup_targets]))
             if set(teardown_identities) != {
-                    info.replica_id for info, _ in to_terminate
+                    info.replica_id for info, _, _ in cleanup_targets
             }:
                 raise RuntimeError(
                     'Replica inventory changed while snapshotting teardown '
@@ -4793,11 +4877,12 @@ def _terminate_failed_services_locked(
                 return _still_owns()
 
         def _terminate_replica_cluster(
-            cleanup_target: tuple['replica_managers.ReplicaInfo', Any]
+            cleanup_target: tuple['replica_managers.ReplicaInfo', Any,
+                                  Any | None]
         ) -> str | None:
             # Reuse the normal replica down path (sdk.down with retries);
             # logs go to the replica's log file like a regular teardown.
-            info, cleanup_fence = cleanup_target
+            info, cleanup_fence, cleanup_context = cleanup_target
             log_file_name = generate_replica_log_file_name(
                 service_name, info.replica_id, resource_scope)
             try:
@@ -4810,9 +4895,11 @@ def _terminate_failed_services_locked(
                 }
                 if cleanup_fence is not None:
                     terminate_kwargs['cleanup_fence'] = cleanup_fence
-                replica_managers.terminate_cluster(info.cluster_name,
-                                                   log_file_name,
-                                                   **terminate_kwargs)
+                # pylint: disable=protected-access
+                service_lib._terminate_replica_cluster_for_service_cleanup(
+                    info, cleanup_context, bound_authority, info.cluster_name,
+                    log_file_name, **terminate_kwargs)
+                # pylint: enable=protected-access
                 return None
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to terminate replica cluster '
@@ -4822,7 +4909,7 @@ def _terminate_failed_services_locked(
                 return info.cluster_name
 
         termination_failures = subprocess_utils.run_in_parallel(
-            _terminate_replica_cluster, to_terminate)
+            _terminate_replica_cluster, cleanup_targets)
         remaining_replica_clusters.extend(
             name for name in termination_failures if name is not None)
 
@@ -4855,9 +4942,6 @@ def _terminate_failed_services_locked(
     # Version rows may already have been retired while this service was live;
     # consume the separate durable generation manifests only after every
     # replica is confirmed gone and before the final DB removal.
-    # Imported here to break the serve_utils <-> service dependency cycle.
-    # pylint: disable=import-outside-toplevel
-    from sky.serve import service as service_lib
     if not service_lib.cleanup_storage_intents(service_name, resource_scope,
                                                _still_owns):
         return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '

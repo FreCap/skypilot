@@ -932,6 +932,54 @@ class TestRunCleanupAndFinalizeDeletesLb:
         ack.assert_not_called()
         cleanup.assert_not_called()
 
+    @pytest.mark.parametrize('provider_present', [False, True])
+    def test_bound_cleanup_retains_lifecycle_epoch(self, provider_present):
+        binding = service.ordinary_launch_binding
+        authority = _binding_authority(binding.BindingMode.BOUND,
+                                       binding_epoch=2,
+                                       generic=True)
+        info = mock.Mock(replica_id=3,
+                         replica_record_id='record-3',
+                         cluster_name='svc-a-r3')
+        cleanup_contexts = ({
+            (3, 'record-3'): mock.sentinel.cleanup_context
+        } if provider_present else {})
+        teardown = binding.ServiceTeardownResult(
+            binding.ServiceTeardownDisposition.MARKED_BOUND, authority)
+        lifecycle_lock = mock.MagicMock()
+
+        with mock.patch.object(binding,
+                               'begin_service_teardown_if_owner',
+                               return_value=teardown), \
+             mock.patch.object(binding,
+                               'claim_controller_incarnation',
+                               return_value=authority), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos', return_value=[info]), \
+             mock.patch.object(
+                 service,
+                 '_settle_bound_ordinary_launches_for_teardown',
+                 return_value=cleanup_contexts), \
+             mock.patch.object(
+                 service.serve_utils,
+                 'quiesce_service_replica_launch_requests',
+                 return_value=True), \
+             mock.patch.object(
+                 serve_state,
+                 'acknowledge_service_controller_teardown_if_owner',
+                 return_value=True), \
+             mock.patch.object(service.serve_utils,
+                               'get_service_lifecycle_lock',
+                               return_value=lifecycle_lock) as get_lock, \
+             mock.patch.object(service,
+                               '_run_cleanup_and_finalize_locked') as locked:
+            service._run_cleanup_and_finalize('svc', self._spec(), '/tmp/svc',
+                                              1, 'incarnation-a', 123,
+                                              '10.0.0.1')
+
+        get_lock.assert_called_once_with('svc', advance_epoch=False)
+        assert locked.call_args.args[-2:] == (authority, cleanup_contexts)
+
     def test_failed_cleanup_lb_delete_error_is_swallowed(self):
         with mock.patch('sky.serve.service._cleanup',
                         return_value=True) as mock_cleanup, \
@@ -1641,6 +1689,148 @@ def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
         expected_lifecycle_epoch=31,
         expected_controller_owner=expected_owner,
         expected_replica_record_id=(present.replica_record_id))
+
+
+def test_cleanup_routes_provider_present_marker_through_exact_termination():
+
+    class SynchronousThread:
+
+        def __init__(self, target, args, kwargs):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs
+            self.format_exc = None
+            self.started = False
+
+        def is_alive(self):
+            return False
+
+        def start(self):
+            self.started = True
+            self._target(*self._args, **self._kwargs)
+
+        def join(self):
+            assert self.started
+
+    binding = service.ordinary_launch_binding
+    authority = _binding_authority(binding.BindingMode.BOUND,
+                                   binding_epoch=2,
+                                   generic=True)
+    record_id = uuid.UUID('22222222-2222-4222-8222-222222222222')
+    profile = binding.NonPoolLaunchProfile.create(
+        binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+        authorization_reference='reserved-fill:test',
+        authorization_generation=7,
+        authorization_payload={'pool_key': 'pool-a'})
+    context = binding.BoundNonPoolLaunchContext(
+        association_id=uuid.UUID('11111111-1111-4111-8111-111111111111'),
+        request_id='request-1',
+        service_name='svc',
+        replica_id=3,
+        replica_record_id=record_id,
+        launch_generation=1,
+        input_digest='a' * 64,
+        profile=profile,
+        capability_cohort_epoch=binding.NON_POOL_CAPABILITY_COHORT_EPOCH,
+        capability_profile_set_digest=(
+            binding.supported_non_pool_profile_set_digest()),
+        receipt_protocol_version=binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)
+    status = types.SimpleNamespace(
+        sky_launch_status=service.common_utils.ProcessStatus.INTERRUPTED,
+        sky_down_status=service.common_utils.ProcessStatus.SCHEDULED,
+        service_ready_now=False,
+        is_scale_down=True,
+        preempted=False,
+        purged=False,
+        failed_spot_availability=False,
+        wait_for_idle_before_termination=False,
+        drain_cap_seconds=0,
+        drain_started_at=None,
+        logical_retirement_version=None,
+        logical_retirement_controller_epoch=None,
+        logical_retirement_generation=None,
+        logical_retirement_target_capacity=None,
+        logical_retirement_confirmed_generation=None,
+        logical_retirement_bounded_deadline=False,
+        logical_retirement_committed=False)
+    info = mock.Mock(replica_id=3,
+                     replica_record_id=str(record_id),
+                     cluster_name='svc-a-r3',
+                     reserved_fill=True,
+                     is_zero_cost=True,
+                     service_job_id=None,
+                     paid_capacity_pool_key=None,
+                     zero_cost_materialization_sequence=None,
+                     status_property=status)
+    assert binding.replica_has_provider_present_cleanup_marker(
+        info, require_scheduled=True)
+    lifecycle_lock = mock.Mock(epoch=31)
+    cleanup_fence = service.reserved_capacity.ProtocolV2CleanupFence(
+        kubernetes_context='phx-context', physical_cluster_uid='phx-uid')
+    expected_owner = (4242, '10.4.7.7')
+
+    with mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=[info]), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name', return_value=None), \
+         mock.patch.object(serve_state,
+                           'service_owner_matches', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'get_service_lifecycle_epoch', return_value=31), \
+         mock.patch.object(service.serve_utils,
+                           'get_existing_replica_cluster_names',
+                           return_value={'svc-a-r3'}), \
+         mock.patch.object(service.reserved_capacity,
+                           'parse_protocol_v2_cleanup_fence',
+                           return_value=cleanup_fence), \
+         mock.patch.object(
+             serve_state,
+             'get_replica_resource_action_identities',
+             return_value={3: None}), \
+         mock.patch.object(serve_state,
+                           'add_or_update_replica', return_value=True), \
+         mock.patch.object(serve_state,
+                           'remove_replica', return_value=True) as remove, \
+         mock.patch.object(service.controller_utils,
+                           'can_terminate', return_value=True), \
+         mock.patch.object(service.thread_utils,
+                           'SafeThread', SynchronousThread), \
+         mock.patch.object(service.replica_managers,
+                           'terminate_cluster') as generic_terminate, \
+         mock.patch.object(
+             service.request_postgres,
+             'bound_non_pool_provider_present_cleanup_is_authorized',
+             return_value=True), \
+         mock.patch.object(
+             service.replica_managers,
+             'terminate_bound_non_pool_provider_present_cluster'
+         ) as exact_terminate, \
+         mock.patch.object(service.time, 'sleep'), \
+         mock.patch.object(service,
+                           'cleanup_storage_intents', return_value=True):
+        failed = service._cleanup('svc',
+                                  True,
+                                  'incarnation-a',
+                                  expected_owner[0],
+                                  expected_owner[1],
+                                  lifecycle_lock,
+                                  binding_authority=authority,
+                                  provider_present_cleanup_contexts={
+                                      (3, str(record_id)): context
+                                  })
+
+    assert not failed
+    generic_terminate.assert_not_called()
+    exact_terminate.assert_called_once()
+    assert exact_terminate.call_args.args[:3] == (context, info, authority)
+    assert callable(exact_terminate.call_args.args[3])
+    assert exact_terminate.call_args.args[4] == info.cluster_name
+    assert exact_terminate.call_args.kwargs['cleanup_fence'] == cleanup_fence
+    assert status.sky_launch_status == (
+        service.common_utils.ProcessStatus.INTERRUPTED)
+    remove.assert_called_once()
 
 
 def test_cleanup_retains_replica_when_teardown_identity_snapshot_changes():

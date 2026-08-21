@@ -42,6 +42,7 @@ from sky.serve import controller
 from sky.serve import kubernetes_identity
 from sky.serve import lb_k8s
 from sky.serve import maintenance
+from sky.serve import non_pool_launch_reconciliation
 from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
 from sky.serve import replica_managers
@@ -400,16 +401,168 @@ def cleanup_storage_intents(
     return all(results)
 
 
+def _provider_present_cleanup_context(
+    info: Any,
+    authority: ordinary_launch_binding.ControllerBindingAuthority | None,
+    cleanup_contexts: dict[tuple[int, str],
+                           ordinary_launch_binding.BoundNonPoolLaunchContext],
+) -> ordinary_launch_binding.BoundNonPoolLaunchContext | None:
+    """Match one durable cleanup marker to its exact bound authority."""
+    context = cleanup_contexts.get((info.replica_id, info.replica_record_id))
+    marker = (ordinary_launch_binding.
+              replica_has_provider_present_cleanup_marker(info))
+    if context is None and not marker:
+        return None
+    if (authority is None or authority.capable is not True or
+            authority.binding_mode != ordinary_launch_binding.BindingMode.BOUND
+            or not marker or not isinstance(
+                context, ordinary_launch_binding.BoundNonPoolLaunchContext) or
+            context.profile.kind
+            != ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL or
+            context.service_name != authority.service_name or
+            context.replica_id != info.replica_id or
+            str(context.replica_record_id) != info.replica_record_id or
+            not request_postgres.
+            bound_non_pool_provider_present_cleanup_is_authorized(
+                context, authority)):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup marker lost its exact bound '
+            'association authority.')
+    return context
+
+
+@dataclasses.dataclass(frozen=True)
+class _ProviderPresentCleanupPreparation:
+    """Exact pre-provider classification for bulk service cleanup."""
+
+    contexts: dict[tuple[int, str],
+                   ordinary_launch_binding.BoundNonPoolLaunchContext]
+    projected_absence_keys: frozenset[tuple[int, str]]
+    failures: dict[tuple[int, str], str]
+
+
+def _prepare_provider_present_cleanup(
+    service_name: str,
+    authority: ordinary_launch_binding.ControllerBindingAuthority | None,
+    replica_infos: list[Any],
+    existing_cluster_names: set[str],
+    cleanup_contexts: dict[tuple[int, str],
+                           ordinary_launch_binding.BoundNonPoolLaunchContext],
+) -> _ProviderPresentCleanupPreparation:
+    """Reconcile exact PRESENT markers whose cluster record disappeared.
+
+    The caller holds the service lifecycle/name lock.  Every provider read is
+    still outside PostgreSQL row-lock transactions: ``reconcile()`` closes its
+    readiness transaction before observing the provider and opens a separate
+    transaction to record/project the result.
+    """
+    contexts = dict(cleanup_contexts)
+    projected_absence_keys: set[tuple[int, str]] = set()
+    failures: dict[tuple[int, str], str] = {}
+    info_by_key = {
+        (info.replica_id, info.replica_record_id): info
+        for info in replica_infos
+    }
+    extra_keys = contexts.keys() - info_by_key.keys()
+    if extra_keys:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup lost its exact replica inventory: '
+            f'{sorted(extra_keys)!r}.')
+    projector = (None if authority is None else functools.partial(
+        _project_bound_ordinary_launch_for_teardown, authority))
+    for key, info in info_by_key.items():
+        context = contexts.get(key)
+        marker = (ordinary_launch_binding.
+                  replica_has_provider_present_cleanup_marker(info))
+        if context is None:
+            if not marker:
+                continue
+            if (request_postgres.
+                    bound_non_pool_projected_provider_absence_is_authorized(
+                        service_name, info.replica_id, info.replica_record_id)):
+                if info.cluster_name in existing_cluster_names:
+                    failures[key] = (
+                        'exact provider absence was projected but its fenced '
+                        'SkyPilot cluster record is still present')
+                else:
+                    projected_absence_keys.add(key)
+            else:
+                failures[key] = (
+                    'provider-present cleanup marker lost its exact bound '
+                    'association authority')
+            continue
+        try:
+            cleanup_context = _provider_present_cleanup_context(
+                info, authority, contexts)
+            assert cleanup_context is not None
+            if info.cluster_name in existing_cluster_names:
+                continue
+            assert authority is not None
+            assert projector is not None
+            observation = non_pool_launch_reconciliation.reconcile(
+                cleanup_context,
+                info,
+                authority,
+                projector,
+                force_provider_read=True)
+            if (observation.evidence
+                    != ordinary_launch_binding.ProviderEvidence.ABSENT):
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'A provider-present cleanup marker lost its SkyPilot '
+                    'cluster record, but fresh exact provider evidence is '
+                    f'{observation.evidence.value}.')
+            contexts.pop(key)
+            projected_absence_keys.add(key)
+        except Exception as error:  # pylint: disable=broad-except
+            failures[key] = common_utils.format_exception(error)
+            contexts.pop(key, None)
+    return _ProviderPresentCleanupPreparation(
+        contexts=contexts,
+        projected_absence_keys=frozenset(projected_absence_keys),
+        failures=failures)
+
+
+def _terminate_replica_cluster_for_service_cleanup(
+    info: replica_managers.ReplicaInfo,
+    cleanup_context: ordinary_launch_binding.BoundNonPoolLaunchContext | None,
+    authority: ordinary_launch_binding.ControllerBindingAuthority | None,
+    cluster_name: str,
+    log_file_name: str,
+    **terminate_kwargs: Any,
+) -> None:
+    """Dispatch generic or exact PRESENT cleanup through one bulk path."""
+    if cleanup_context is None:
+        replica_managers.terminate_cluster(cluster_name, log_file_name,
+                                           **terminate_kwargs)
+        return
+    if authority is None:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup has no exact controller authority.')
+    replica_managers.terminate_bound_non_pool_provider_present_cluster(
+        cleanup_context, info, authority,
+        functools.partial(_project_bound_ordinary_launch_for_teardown,
+                          authority), cluster_name, log_file_name,
+        **terminate_kwargs)
+
+
 # NOTE(dev): We don't need to acquire the `with_lock` in replica manager here
 # because we killed all the processes (controller & replica manager) before
 # calling this function.
-def _cleanup(service_name: str,
-             pool: bool,
-             service_hash: str,
-             controller_pid: int,
-             controller_ip: str | None,
-             lifecycle_lock: Any,
-             resource_scope: str | None = None) -> bool:
+def _cleanup(
+    service_name: str,
+    pool: bool,
+    service_hash: str,
+    controller_pid: int,
+    controller_ip: str | None,
+    lifecycle_lock: Any,
+    resource_scope: str | None = None,
+    *,
+    binding_authority: ordinary_launch_binding.ControllerBindingAuthority |
+    None = None,
+    provider_present_cleanup_contexts: dict[tuple[
+        int, str], ordinary_launch_binding.BoundNonPoolLaunchContext] |
+    None = None
+) -> bool:
     """Clean up all service related resources, i.e. replicas and storage."""
     expected_owner = (controller_pid, controller_ip)
     lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
@@ -503,9 +656,13 @@ def _cleanup(service_name: str,
         # Set replica status to `FAILED_CLEANUP` and preserve its durable row.
         # In particular, absence from SkyPilot's cluster table is not proof
         # that a protocol-v2 Kubernetes object is absent.
-        if info.status_property.sky_launch_status in (
-                None, replica_managers.common_utils.ProcessStatus.SCHEDULED,
-                replica_managers.common_utils.ProcessStatus.INTERRUPTED):
+        provider_present_cleanup = (
+            ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+                info))
+        if (not provider_present_cleanup and
+                info.status_property.sky_launch_status
+                in (None, replica_managers.common_utils.ProcessStatus.SCHEDULED,
+                    replica_managers.common_utils.ProcessStatus.INTERRUPTED)):
             # These launch states otherwise dominate ``sky_down_status`` in
             # status rendering (PENDING/SHUTTING_DOWN). The launch barrier has
             # already quiesced them, so publish the retained row accurately as
@@ -520,10 +677,25 @@ def _cleanup(service_name: str,
         logger.error(f'Replica {info.replica_id} failed to terminate{suffix}.')
 
     absent_legacy_infos: list[replica_managers.ReplicaInfo] = []
-    cleanup_entries: list[tuple[replica_managers.ReplicaInfo,
-                                reserved_capacity.ProtocolV2CleanupFence |
-                                None]] = []
+    cleanup_entries: list[
+        tuple[replica_managers.ReplicaInfo,
+              reserved_capacity.ProtocolV2CleanupFence | None,
+              ordinary_launch_binding.BoundNonPoolLaunchContext | None]] = []
+    provider_present_cleanup_contexts = (provider_present_cleanup_contexts or
+                                         {})
+    preparation = _prepare_provider_present_cleanup(
+        service_name, binding_authority, replica_infos, existing_cluster_names,
+        provider_present_cleanup_contexts)
+    provider_present_cleanup_contexts = preparation.contexts
     for info in replica_infos:
+        cleanup_key = (info.replica_id, info.replica_record_id)
+        preparation_failure = preparation.failures.get(cleanup_key)
+        if preparation_failure is not None:
+            _set_to_failed_cleanup(info, preparation_failure)
+            continue
+        if cleanup_key in preparation.projected_absence_keys:
+            absent_legacy_infos.append(info)
+            continue
         try:
             cleanup_fence = (
                 reserved_capacity.parse_protocol_v2_cleanup_fence(info))
@@ -532,7 +704,14 @@ def _cleanup(service_name: str,
                 info, 'durable Kubernetes cleanup identity is malformed or '
                 f'incomplete ({common_utils.format_exception(error)})')
             continue
-        if info.cluster_name not in existing_cluster_names:
+        try:
+            cleanup_context = _provider_present_cleanup_context(
+                info, binding_authority, provider_present_cleanup_contexts)
+        except ordinary_launch_binding.OrdinaryLaunchBindingConflict as error:
+            _set_to_failed_cleanup(info, common_utils.format_exception(error))
+            continue
+        if (info.cluster_name not in existing_cluster_names and
+                cleanup_context is None):
             if cleanup_fence is None:
                 absent_legacy_infos.append(info)
             else:
@@ -550,7 +729,7 @@ def _cleanup(service_name: str,
                         'fenced provider presence is '
                         f'{presence.value.lower()}')
             continue
-        cleanup_entries.append((info, cleanup_fence))
+        cleanup_entries.append((info, cleanup_fence, cleanup_context))
 
     if absent_legacy_infos:
         removed = serve_state.remove_replicas(
@@ -573,7 +752,9 @@ def _cleanup(service_name: str,
     teardown_identities: dict[int, serve_state.ReplicaResourceActionIdentity |
                               None] = {}
     if cleanup_entries:
-        cleanup_replica_ids = [info.replica_id for info, _ in cleanup_entries]
+        cleanup_replica_ids = [
+            info.replica_id for info, _, _ in cleanup_entries
+        ]
         try:
             # Snapshot every action-owned cluster-record UUID before starting
             # any worker.  Context/physical-UID fencing prevents a kubeconfig
@@ -591,7 +772,7 @@ def _cleanup(service_name: str,
             reason = ('durable replica teardown identities could not be '
                       'verified '
                       f'({common_utils.format_exception(error)})')
-            for info, _ in cleanup_entries:
+            for info, _, _ in cleanup_entries:
                 _set_to_failed_cleanup(info, reason)
             cleanup_entries = []
     # This remains the whole-service teardown owner.  Cleanup intent and exact
@@ -599,7 +780,7 @@ def _cleanup(service_name: str,
     # not replace this thread loop.
     info2thr: dict[replica_managers.ReplicaInfo,
                    thread_utils.SafeThread] = dict()
-    for info, cleanup_fence in cleanup_entries:
+    for info, cleanup_fence, cleanup_context in cleanup_entries:
         _assert_owner(f'before scheduling replica {info.replica_id} cleanup')
         # Use the durable exact cluster identity from the replica row. New
         # incarnation-scoped names truncate long service prefixes to stay
@@ -616,13 +797,16 @@ def _cleanup(service_name: str,
         }
         if cleanup_fence is not None:
             terminate_kwargs['cleanup_fence'] = cleanup_fence
-        t = thread_utils.SafeThread(target=replica_managers.terminate_cluster,
-                                    args=(info.cluster_name, log_file_name),
-                                    kwargs=terminate_kwargs)
+        t = thread_utils.SafeThread(
+            target=_terminate_replica_cluster_for_service_cleanup,
+            args=(info, cleanup_context, binding_authority, info.cluster_name,
+                  log_file_name),
+            kwargs=terminate_kwargs)
         info2thr[info] = t
         # Set replica status to `SHUTTING_DOWN`
-        info.status_property.sky_launch_status = (
-            replica_managers.common_utils.ProcessStatus.SUCCEEDED)
+        if cleanup_context is None:
+            info.status_property.sky_launch_status = (
+                replica_managers.common_utils.ProcessStatus.SUCCEEDED)
         info.status_property.sky_down_status = (
             replica_managers.common_utils.ProcessStatus.SCHEDULED)
         _persist_replica(info)
@@ -1430,8 +1614,60 @@ def _project_bound_ordinary_launch_for_teardown(
 ) -> bool:
     """Project an exact bound result without reviving teardown intent."""
     info = projection.locked_replica_info
-    if (info.status_property.sky_launch_status
-            != common_utils.ProcessStatus.INTERRUPTED):
+    provider_evidence = getattr(projection, 'provider_evidence', None)
+    provider_absent = (
+        provider_evidence == ordinary_launch_binding.ProviderEvidence.ABSENT)
+    provider_present_cleanup = (
+        provider_evidence == ordinary_launch_binding.ProviderEvidence.PRESENT)
+    if provider_absent:
+        context = projection.context
+        if (not isinstance(context,
+                           ordinary_launch_binding.BoundNonPoolLaunchContext) or
+                context.profile.kind != ordinary_launch_binding.
+                NonPoolLaunchProfileKind.RESERVED_FILL or
+                projection.pre_effect_terminal or
+                projection.service_job_id is not None or
+                projection.paid_capacity_pool_key is not None):
+            return False
+    if provider_present_cleanup:
+        context = projection.context
+        if (not isinstance(context,
+                           ordinary_launch_binding.BoundNonPoolLaunchContext) or
+                context.profile.kind != ordinary_launch_binding.
+                NonPoolLaunchProfileKind.RESERVED_FILL or
+                projection.pre_effect_terminal or
+                projection.service_job_id is not None or
+                projection.paid_capacity_pool_key is not None or
+                info.service_job_id is not None or
+                info.paid_capacity_pool_key is not None or
+                info.is_zero_cost is not True or
+                info.zero_cost_materialization_sequence is not None):
+            return False
+        status = info.status_property
+        status.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
+        status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+        status.service_ready_now = False
+        status.is_scale_down = True
+        status.preempted = False
+        status.purged = False
+        status.failed_spot_availability = False
+        status.drain_cap_seconds = 0
+        status.drain_started_at = None
+        status.wait_for_idle_before_termination = False
+        status.logical_retirement_version = None
+        status.logical_retirement_controller_epoch = None
+        status.logical_retirement_generation = None
+        status.logical_retirement_target_capacity = None
+        status.logical_retirement_confirmed_generation = None
+        status.logical_retirement_bounded_deadline = False
+        status.logical_retirement_committed = False
+    elif provider_absent:
+        if (info.status_property.sky_launch_status
+                != common_utils.ProcessStatus.INTERRUPTED):
+            info.status_property.sky_launch_status = (
+                common_utils.ProcessStatus.FAILED)
+    elif (info.status_property.sky_launch_status
+          != common_utils.ProcessStatus.INTERRUPTED):
         if projection.status.value == 'SUCCEEDED':
             info.status_property.sky_launch_status = (
                 common_utils.ProcessStatus.SUCCEEDED)
@@ -1452,48 +1688,125 @@ def _project_bound_ordinary_launch_for_teardown(
         projection.context.association_id,
         info,
         provider_launch_succeeded=(not projection.pre_effect_terminal and
+                                   not provider_absent and
+                                   not provider_present_cleanup and
                                    projection.status.value == 'SUCCEEDED'),
         paid_capacity_pool_key=projection.paid_capacity_pool_key,
         paid_capacity_outcome=paid_outcome)
 
 
+def _reconcile_bound_reserved_fill_ambiguity_for_teardown(
+    authority: ordinary_launch_binding.ControllerBindingAuthority,
+    info: Any,
+    context: Any,
+    projector: Callable[..., bool],
+) -> ordinary_launch_binding.BoundNonPoolLaunchContext | None:
+    """Resolve only the exact provider-backed reserved-fill ambiguity."""
+    if (not isinstance(context,
+                       ordinary_launch_binding.BoundNonPoolLaunchContext) or
+            context.profile.kind
+            != ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider reconciliation cannot authorize an ordinary or '
+            'protocol-v1 ambiguous launch.')
+    if request_postgres.bound_non_pool_provider_present_cleanup_is_authorized(
+            context, authority):
+        return context
+    observation = non_pool_launch_reconciliation.reconcile(
+        context, info, authority, projector)
+    if observation.evidence == ordinary_launch_binding.ProviderEvidence.ABSENT:
+        return None
+    if (observation.evidence == ordinary_launch_binding.ProviderEvidence.PRESENT
+            and request_postgres.
+            bound_non_pool_provider_present_cleanup_is_authorized(
+                context, authority)):
+        return context
+    raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+        'Teardown provider reconciliation returned '
+        f'{observation.evidence.value} for reserved-fill replica '
+        f'{info.replica_id}; refusing provider cleanup.')
+
+
 def _settle_bound_ordinary_launches_for_teardown(
     authority: ordinary_launch_binding.ControllerBindingAuthority | None,
     replica_infos: list[Any],
-) -> None:
+) -> dict[tuple[int, str], ordinary_launch_binding.BoundNonPoolLaunchContext]:
     """Cancel and project every exact association before generic cleanup."""
     if (authority is None or authority.capable is not True or
             authority.binding_mode
             != ordinary_launch_binding.BindingMode.BOUND):
-        return
+        return {}
     projector = functools.partial(_project_bound_ordinary_launch_for_teardown,
                                   authority)
-    targets: list[tuple[Any, Any]] = []
+    targets: list[tuple[Any, Any, bool]] = []
     for info in replica_infos:
         target = request_postgres.lookup_bound_ordinary_launch_cancel_target(
             authority.service_name, info.replica_id, info.replica_record_id)
         if target is None:
             continue
+        context = target.context
+        reconcile_reserved_fill = False
+        if (isinstance(context,
+                       ordinary_launch_binding.BoundNonPoolLaunchContext) and
+                context.profile.kind ==
+                ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
+            inspection = request_postgres.inspect_bound_ordinary_launch(
+                authority.service_name, info.replica_id, info.replica_record_id)
+            if inspection is None or inspection.context != context:
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'Teardown lost the exact reserved-fill association while '
+                    f'inspecting replica {info.replica_id}.')
+            reconcile_reserved_fill = (
+                _bound_ordinary_launch_disposition(inspection) == 'AMBIGUOUS')
         durable_reason = target.cancel_reason
         # First pass: make every exact cancellation reachable before waiting
         # for any one executor's quiescence. Provider authority is
         # service-scoped, so reducing replica N before cancelling N+1 could
         # otherwise let one stuck request delay cancellation for all peers.
-        request_postgres.request_bound_ordinary_launch_cancel(
-            target.context, authority, durable_reason or 'service-teardown')
-        targets.append((info, target))
+        # A terminal protocol-v2 reserved-fill ambiguity is no longer a
+        # cancellable request. Its exact physical identity is instead reduced
+        # through the provider-evidence state machine below. All provider I/O
+        # remains outside the inspection/reduction transactions.
+        if not reconcile_reserved_fill:
+            request_postgres.request_bound_ordinary_launch_cancel(
+                context, authority, durable_reason or 'service-teardown')
+        targets.append((info, target, reconcile_reserved_fill))
 
-    for info, target in targets:
+    provider_present_cleanup_contexts: dict[tuple[
+        int, str], ordinary_launch_binding.BoundNonPoolLaunchContext] = {}
+    for info, target, reconcile_reserved_fill in targets:
         context = target.context
+        if reconcile_reserved_fill:
+            cleanup_context = (
+                _reconcile_bound_reserved_fill_ambiguity_for_teardown(
+                    authority, info, context, projector))
+            if cleanup_context is not None:
+                provider_present_cleanup_contexts[(
+                    info.replica_id, info.replica_record_id)] = cleanup_context
+            continue
         reduction = request_postgres.reduce_bound_ordinary_launch(
             context, authority, project_replica_result=projector)
         attempts = 0
         while True:
             disposition = _bound_ordinary_launch_disposition(reduction)
             if disposition == 'AMBIGUOUS':
-                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                    'Teardown found a durably ambiguous ordinary launch for '
-                    f'replica {info.replica_id}; refusing provider cleanup.')
+                if (not isinstance(
+                        context,
+                        ordinary_launch_binding.BoundNonPoolLaunchContext) or
+                        context.profile.kind != ordinary_launch_binding.
+                        NonPoolLaunchProfileKind.RESERVED_FILL):
+                    raise (ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                        'Teardown found a durably ambiguous ordinary launch '
+                        f'for replica {info.replica_id}; refusing provider '
+                        'cleanup.'))
+                cleanup_context = (
+                    _reconcile_bound_reserved_fill_ambiguity_for_teardown(
+                        authority, info, context, projector))
+                if cleanup_context is not None:
+                    provider_present_cleanup_contexts[(
+                        info.replica_id,
+                        info.replica_record_id)] = cleanup_context
+                break
             if (getattr(reduction, 'projected', False) or disposition
                     in ('PROJECTED', 'PRE_EFFECT_TERMINAL', 'SETTLED')):
                 break
@@ -1512,6 +1825,7 @@ def _settle_bound_ordinary_launches_for_teardown(
             time.sleep(_BOUND_ORDINARY_LAUNCH_SETTLE_INTERVAL_SECONDS)
             reduction = request_postgres.reduce_bound_ordinary_launch(
                 context, authority, project_replica_result=projector)
+    return provider_present_cleanup_contexts
 
 
 def _run_cleanup_and_finalize(service_name: str,
@@ -1608,8 +1922,9 @@ def _run_cleanup_and_finalize(service_name: str,
     # killing the child alone does not prove launch quiescence. Every request is
     # backed by a replica row created before sdk.launch is submitted.
     try:
-        _settle_bound_ordinary_launches_for_teardown(teardown_binding_authority,
-                                                     replica_infos)
+        provider_present_cleanup_contexts = (
+            _settle_bound_ordinary_launches_for_teardown(
+                teardown_binding_authority, replica_infos))
     except Exception as e:  # pylint: disable=broad-except
         logger.warning(
             f'Refusing generic cleanup until exact bound ordinary launches '
@@ -1634,24 +1949,39 @@ def _run_cleanup_and_finalize(service_name: str,
         logger.warning(f'Lost ownership before acknowledging teardown of '
                        f'{service_name!r}.')
         return
-    lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
+    # Bound cleanup retains the association's immutable admission epoch until
+    # either PRESENT reaches fresh ABSENT or an already-projected ABSENT row is
+    # consumed. Advancing the service epoch here would invalidate both exact
+    # cleanup authorities before their replica rows can be removed. The held
+    # lifecycle/name lock plus exact revalidation inside ``_cleanup`` fence
+    # this retry instead.
+    lifecycle_lock = serve_utils.get_service_lifecycle_lock(
+        service_name, advance_epoch=teardown_binding_authority is None)
     with lifecycle_lock:
         _run_cleanup_and_finalize_locked(service_name, service_spec,
                                          service_dir, job_id, service_hash,
                                          controller_pid, controller_ip,
-                                         lifecycle_lock, resource_scope)
+                                         lifecycle_lock, resource_scope,
+                                         teardown_binding_authority,
+                                         provider_present_cleanup_contexts)
 
 
 def _run_cleanup_and_finalize_locked(
-        service_name: str,
-        service_spec: 'service_spec_lib.SkyServiceSpec',
-        service_dir: str,
-        job_id: int,
-        service_hash: str,
-        controller_pid: int,
-        controller_ip: str | None,
-        lifecycle_lock: Any,
-        resource_scope: str | None = None) -> None:
+    service_name: str,
+    service_spec: 'service_spec_lib.SkyServiceSpec',
+    service_dir: str,
+    job_id: int,
+    service_hash: str,
+    controller_pid: int,
+    controller_ip: str | None,
+    lifecycle_lock: Any,
+    resource_scope: str | None = None,
+    binding_authority: ordinary_launch_binding.ControllerBindingAuthority |
+    None = None,
+    provider_present_cleanup_contexts: dict[tuple[
+        int, str], ordinary_launch_binding.BoundNonPoolLaunchContext] |
+    None = None
+) -> None:
     """Owner-fenced cleanup while holding the service lifecycle lock."""
     expected_owner = (controller_pid, controller_ip)
     lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
@@ -1699,9 +2029,16 @@ def _run_cleanup_and_finalize_locked(
         if not _still_owns():
             raise ServiceOwnershipLostError(
                 'Ownership lost after load balancer quiesce.')
-        failed = _cleanup(service_name, service_spec.pool, service_hash,
-                          controller_pid, controller_ip, lifecycle_lock,
-                          resource_scope)
+        failed = _cleanup(service_name,
+                          service_spec.pool,
+                          service_hash,
+                          controller_pid,
+                          controller_ip,
+                          lifecycle_lock,
+                          resource_scope,
+                          binding_authority=binding_authority,
+                          provider_present_cleanup_contexts=(
+                              provider_present_cleanup_contexts))
     except ServiceOwnershipLostError as e:
         # Another owner or a lost PG advisory-lock session means this process
         # must stop immediately. Preserve DB state and the recovery script;

@@ -37,6 +37,7 @@ from sky.serve import pool_capacity_observation_schema
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
+from sky.serve import service
 from sky.serve import zero_cost_actuation
 from sky.serve.server import core as serve_core
 from sky.server import daemons
@@ -3002,6 +3003,70 @@ def test_expired_bound_claim_after_provider_io_is_ambiguous(
     assert replay.disposition is (
         request_postgres.OrdinaryLaunchReductionDisposition.AMBIGUOUS)
     assert replay.request.quiescent
+
+
+def test_failed_teardown_keeps_protocol_v1_ambiguity_fail_closed(
+        bound_request_database):
+    engine, backend = bound_request_database
+    identity, context, _, item = _claim_gc_bound_request(engine, backend)
+    assert backend.try_mark_running(item.request_id, 1234,
+                                    item.execution_generation, item.claim_token,
+                                    424242)
+    body = _legacy_serve_launch_request(identity.request_id).request_body
+    ordinary_launch_binding.install_bound_context(body, identity,
+                                                  context.launch_generation)
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+    with ordinary_launch_binding.provider_effect_guard(
+            body.extra_launch_context,
+            claim,
+            claim_validator=(
+                request_postgres.
+                validate_bound_ordinary_launch_claim_in_transaction)):
+        pass
+    request_postgres.request_bound_ordinary_launch_cancel(
+        context, _gc_binding_authority(), 'failed-service-teardown-test')
+    assert backend.acknowledge_execution_quiescence(claim)
+    reduction = request_postgres.reduce_bound_ordinary_launch(
+        context,
+        _gc_binding_authority(),
+        project_replica_result=_keep_replica_projection)
+    assert reduction.disposition is (
+        request_postgres.OrdinaryLaunchReductionDisposition.AMBIGUOUS)
+    teardown = ordinary_launch_binding.begin_service_teardown_if_owner(
+        'gc-service', 'gc-service-hash', (123, '10.0.0.2'))
+    assert teardown.authority is not None
+    info = serve_state.get_replica_info_from_id('gc-service', 3)
+    assert info is not None
+
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='ambiguous association cannot authorize'):
+        service._settle_bound_ordinary_launches_for_teardown(
+            teardown.authority, [info])
+
+    with engine.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == identity.association_id)).mappings().one()
+        replica_pointer = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.
+                ordinary_launch_association_id).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    'gc-service', serve_state_schema.replicas_table.c.replica_id
+                    == 3)).scalar_one()
+        pin_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(request_postgres.REQUEST_RETENTION_PINS).where(
+                request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+                identity.request_id)).scalar_one()
+    assert association['resolution'] == (
+        ordinary_launch_binding.Resolution.AMBIGUOUS.value)
+    assert replica_pointer == identity.association_id
+    assert pin_count == 1
 
 
 def test_malformed_success_result_is_durably_ambiguous(bound_request_database):
