@@ -32,6 +32,8 @@ from sky.serve import drain_observability
 from sky.serve import paid_retirement
 from sky.serve import placement_policy
 from sky.serve import replica_managers
+from sky.serve import reserved_capacity_broker
+from sky.serve import reserved_fill_planner
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import system_recovery_route_lease
@@ -4583,20 +4585,69 @@ class TestAutoscalerRuntimeSnapshot:
         publish.assert_not_called()
         notify.assert_called_once_with()
 
-    def test_promoted_reserved_fill_commit_forces_replan_before_paid_plan(self):
+    def test_promoted_reserved_fill_commits_before_demand_snapshot(self):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._controller_owner_fingerprint = 'owner'  # pylint: disable=protected-access
         scaler = self._durable_autoscaler()
         scaler.reserved_capacity_fill = True
-        scaler.max_replicas = 20
-        scaler.sequenced_reserved_fill_holdings.return_value = ()
-        scaler.sequenced_reserved_fill_planning.return_value = (
-            contextlib.nullcontext())
+        scaler.replica_unit = 'logical'
+        scaler.max_replicas = 64
+        scaler.reserved_fill_materialized_capacity.return_value = 44
+        scaler.reserved_fill_rotation_anchor.return_value = None
         ctrl._autoscaler = scaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._replica_manager.spot_placer = None
-        allocation = object()
-        shelter = mock.Mock(authority_current=True, service_version=1)
+        ctrl._replica_manager.pending_reserved_fill_debits.return_value = ()
+        location = reserved_fill_planner.LocationSnapshot(cloud='Kubernetes',
+                                                          region='phx',
+                                                          zone=None,
+                                                          accelerators=(('H200',
+                                                                         1),),
+                                                          use_spot=False)
+        pool_key = reserved_capacity_broker.make_pool_key(
+            'phx',
+            'H200',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='uid-phx')
+        pool = reserved_fill_planner.PoolFillSnapshot(
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            pool_key=pool_key,
+            physical_cluster_uid='uid-phx',
+            service_generation=1,
+            worker_projection_sha256_by_accelerator=(('h200', 'e' * 64),),
+            edge_cap=11,
+            broker_slot_width=1,
+            free_slots=11,
+            free_slots_by_accelerator=(('h200', 11),),
+            grant=11,
+            grant_epoch=1,
+            observation_generation=1,
+            observation_sequence=1,
+            ordinary_zero_cost_admission_sequence=1,
+            valid_until=time.time() + 60,
+            locations=(location,))
+        allocation = reserved_fill_planner.AuthenticatedAllocationMap.create(
+            allocation_generation=1,
+            allocation_claim_generation=1,
+            service_version=1,
+            ordinary_zero_cost_admission_sequence_high_water=1,
+            reconciliation_gate_generation=1,
+            reclaim_fleet_bundle_sha256='c' * 64,
+            reclaim_policy_revision='policy',
+            reclaim_provider_inventory_sha256='d' * 64,
+            pool_snapshots=(pool,))
+        receipt = mock.Mock(accepted=(object(),), deferred=())
+        receipt.accepted_rotation_anchor.return_value = None
+        call_order = []
+        accepted_plans = []
+
+        def _accept_plan(fill_plan):
+            call_order.append('accept')
+            accepted_plans.append(fill_plan)
+            return receipt
+
+        ctrl._replica_manager.accept_reserved_fill.side_effect = _accept_plan
 
         with mock.patch.object(
                 controller.capacity_admission,
@@ -4605,40 +4656,88 @@ class TestAutoscalerRuntimeSnapshot:
                               DURABLE_FEED, 1)), \
              mock.patch.object(controller.demand_state,
                                'get_autoscaling_snapshot',
-                               return_value=self._durable_snapshot()), \
+                               return_value=None) as read_demand, \
              mock.patch.object(controller.serve_state,
                                'get_replica_infos',
                                return_value=[]), \
+             mock.patch.object(ctrl,
+                               '_read_sequenced_reserved_fill_allocation',
+                               return_value=(True, allocation)), \
+             mock.patch.object(ctrl,
+                               '_publish_ordered_paid_authority') as publish, \
+             mock.patch.object(
+                 controller.provider_phase,
+                 'provider_phase') as provider_phase, \
+             mock.patch.object(
+                 ctrl,
+                 '_notify_scale_reconcile',
+                 side_effect=lambda: call_order.append('notify')) as notify:
+            ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
+
+        assert call_order == ['accept', 'notify']
+        assert len(accepted_plans) == 1
+        assert len(accepted_plans[0].intents) == 11
+        scaler.reserved_fill_materialized_capacity.assert_called_once_with([])
+        receipt.validate_for_plan.assert_called_once_with(accepted_plans[0])
+        read_demand.assert_not_called()
+        publish.assert_not_called()
+        provider_phase.assert_not_called()
+        ctrl._replica_manager.scale_up_batch.assert_not_called()
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()
+        ctrl._replica_manager.scale_down_logically_batch.assert_not_called()
+        ctrl._replica_manager.reconcile_fresh_zero_paid_retirements.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.publish_target_num_replicas.assert_not_called()
+        ctrl._replica_manager.invalidate_logical_reconcile_state.assert_called_once_with()  # pylint: disable=line-too-long
+        notify.assert_called_once_with()
+
+    def test_unknown_demand_after_empty_prefill_blocks_other_actuation(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        scaler = self._logical_durable_autoscaler(target=2, emit_scale_up=True)
+        scaler.reserved_capacity_fill = True
+        scaler.max_replicas = 20
+        ctrl._autoscaler = scaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        allocation = object()
+
+        with mock.patch.object(
+                controller.capacity_admission,
+                'get_service_source_mode',
+                return_value=(controller.capacity_admission.DemandSourceMode.
+                              DURABLE_FEED, 1)), \
+             mock.patch.object(controller.demand_state,
+                               'get_autoscaling_snapshot',
+                               return_value=None) as read_demand, \
+             mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]) as get_replicas, \
              mock.patch.object(
                  controller.serve_state,
-                 'get_service_runtime_snapshot',
-                 return_value={'active_versions': [1]}), \
-             mock.patch.object(
-                 autoscalers,
-                 'generate_controller_scaling_decisions',
-                 return_value=[]), \
-             mock.patch.object(
-                 controller.reserved_fill_planner,
-                 'derive_sequenced_retirement_shelter',
-                 return_value=shelter), \
+                 'get_service_runtime_snapshot') as get_runtime, \
              mock.patch.object(ctrl,
                                '_read_sequenced_reserved_fill_allocation',
                                return_value=(True, allocation)), \
              mock.patch.object(ctrl,
                                '_accept_sequenced_reserved_fill',
-                               return_value=True) as accept, \
+                               return_value=False) as accept, \
              mock.patch.object(ctrl,
-                               '_persist_cost_rebalance_state',
-                               return_value=True), \
-             mock.patch.object(ctrl,
-                               '_publish_ordered_paid_authority') as publish, \
-             mock.patch.object(ctrl, '_notify_scale_reconcile') as notify:
+                               '_publish_ordered_paid_authority') as publish:
             ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
 
-        accept.assert_called_once_with(allocation, scaler, 1, 0, [], [])
+        accept.assert_called_once_with(allocation, scaler, 1, 0, [])
+        read_demand.assert_called_once_with('svc', 'svc-hash')
+        get_replicas.assert_called_once_with('svc')
+        get_runtime.assert_not_called()
         publish.assert_not_called()
+        ctrl._replica_manager.publish_target_num_replicas.assert_not_called()
+        ctrl._replica_manager.publish_logical_reconcile_state.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.scale_up_batch.assert_not_called()
-        notify.assert_called_once_with()
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_down_logically_batch.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.reconcile_fresh_zero_paid_retirements.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.cancel_uncommitted_paid_retirements.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.invalidate_logical_reconcile_state.assert_called_once_with()  # pylint: disable=line-too-long
 
     def test_promoted_paid_launch_uses_post_zero_cost_plan_authority(self):
         ctrl = _make_controller()

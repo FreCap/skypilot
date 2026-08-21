@@ -5925,9 +5925,8 @@ class SkyServeController:
         decision_version: int,
         reconcile_generation: int,
         replica_infos: list[replica_managers.ReplicaInfo],
-        scaling_options: list[autoscalers.AutoscalerDecision],
     ) -> bool:
-        """Plan from durable authority and spend only the manager receipt."""
+        """Admit provider-free fill from PostgreSQL before demand planning."""
         if allocation is None or not allocation.pool_snapshots:
             return False
         service_hash = self._service_hash
@@ -5936,9 +5935,6 @@ class SkyServeController:
         capacity_unit = (reserved_fill_planner.FillCapacityUnit.LOGICAL
                          if decision_autoscaler.replica_unit == 'logical' else
                          reserved_fill_planner.FillCapacityUnit.PHYSICAL)
-        ordinary_debits = (
-            decision_autoscaler.reserved_fill_ordinary_demand_debits(
-                allocation, replica_infos, scaling_options))
         committed_debits = self._committed_reserved_fill_debits(
             allocation, replica_infos)
         try:
@@ -5962,10 +5958,10 @@ class SkyServeController:
             service_version=decision_version,
             controller_owner=self._controller_owner_fingerprint,
             max_replicas=decision_autoscaler.max_replicas,
-            planned_replicas=(decision_autoscaler.
-                              reserved_fill_planned_capacity(replica_infos)),
+            planned_replicas=(
+                decision_autoscaler.reserved_fill_materialized_capacity(
+                    replica_infos)),
             capacity_unit=capacity_unit,
-            ordinary_demand_debits=ordinary_debits,
             committed_fill_debits=all_committed_debits,
             rotation_anchor=(
                 decision_autoscaler.reserved_fill_rotation_anchor()))
@@ -6114,6 +6110,52 @@ class SkyServeController:
                 durable_demand_promoted = (
                     demand_source is not None and demand_source[0]
                     is capacity_admission.DemandSourceMode.DURABLE_FEED)
+                logical_reconcile_invalidated = False
+                if (durable_demand_promoted and
+                        decision_autoscaler.reserved_capacity_fill):
+                    # Sequenced fill spends an independently authenticated
+                    # PostgreSQL allocation.  Admit that free capacity before
+                    # consulting LB demand: route/report convergence must not
+                    # starve a current reserved grant.  This phase publishes
+                    # durable intents only.  It supplies no ordinary-demand
+                    # debit and installs no target, paid authority, or
+                    # retirement decision.
+                    (sequenced_fill, pre_demand_allocation) = (
+                        self._read_sequenced_reserved_fill_allocation())
+                    if sequenced_fill and pre_demand_allocation is not None:
+                        if not self._scale_actuation_is_current(
+                                actuation_generation, decision_autoscaler,
+                                decision_version):
+                            return
+                        # A successful admission returns before demand is
+                        # read.  Revoke any prior logical retirement pair
+                        # first so unknown demand can never retain destructive
+                        # authority across that early return.
+                        self._durable_demand_snapshot = None
+                        self._replica_manager.invalidate_logical_reconcile_state(
+                        )
+                        logical_reconcile_invalidated = True
+                        pre_demand_replica_infos = (
+                            serve_state.get_replica_infos(self._service_name))
+                        if not self._scale_actuation_is_current(
+                                actuation_generation, decision_autoscaler,
+                                decision_version):
+                            return
+                        reserved_fill_progress = (
+                            self._accept_sequenced_reserved_fill(
+                                pre_demand_allocation, decision_autoscaler,
+                                decision_version, reconcile_generation,
+                                pre_demand_replica_infos))
+                        if not self._scale_actuation_is_current(
+                                actuation_generation, decision_autoscaler,
+                                decision_version):
+                            return
+                        if reserved_fill_progress:
+                            # Replan from the accepted durable debits.  The
+                            # manager's PostgreSQL admission is idempotent, so
+                            # a lost wakeup or restart cannot duplicate them.
+                            self._notify_scale_reconcile()
+                            return
                 durable_snapshot = None
                 durable_logical_snapshot: (
                     replica_managers.LogicalReconcileSnapshot | None) = None
@@ -6128,16 +6170,18 @@ class SkyServeController:
                             'because its PostgreSQL snapshot is unavailable: '
                             f'{common_utils.format_exception(error)}')
                         self._durable_demand_snapshot = None
-                        self._replica_manager.invalidate_logical_reconcile_state(
-                        )
+                        if not logical_reconcile_invalidated:
+                            self._replica_manager.invalidate_logical_reconcile_state(
+                            )
                         return
                     if durable_snapshot is None:
                         # Stale or incomplete is unknown, never zero.  Do not
                         # reuse the last promoted snapshot for either free or
                         # paid capacity actuation.
                         self._durable_demand_snapshot = None
-                        self._replica_manager.invalidate_logical_reconcile_state(
-                        )
+                        if not logical_reconcile_invalidated:
+                            self._replica_manager.invalidate_logical_reconcile_state(
+                            )
                         return
                     request_information = dict(
                         durable_snapshot.request_information)
@@ -6399,24 +6443,6 @@ class SkyServeController:
                     # earlier generation as well as suppressing this tick's
                     # aggregate-only intent.
                     self._replica_manager.invalidate_logical_target()
-                if sequenced_reserved_fill:
-                    if not self._scale_actuation_is_current(
-                            actuation_generation, decision_autoscaler,
-                            decision_version):
-                        return
-                    reserved_fill_progress = self._accept_sequenced_reserved_fill(
-                        allocation, decision_autoscaler, decision_version,
-                        reconcile_generation, replica_infos, scaling_options)
-                    if not self._scale_actuation_is_current(
-                            actuation_generation, decision_autoscaler,
-                            decision_version):
-                        return
-                    if durable_demand_promoted and reserved_fill_progress:
-                        # The plan input was computed before these zero-cost
-                        # rows committed. Replan from their exact-card
-                        # attribution before publishing any paid residual.
-                        self._notify_scale_reconcile()
-                        return
                 if durable_demand_promoted:
                     ordinary_physical_overrides: list[dict[str, Any] | None] = [
                         option.target

@@ -94,8 +94,6 @@ def _plan(
     planned_replicas: int = 0,
     capacity_unit: reserved_fill_planner.FillCapacityUnit = (
         reserved_fill_planner.FillCapacityUnit.PHYSICAL),
-    ordinary_demand_debits: tuple[reserved_fill_planner.OrdinaryDemandDebit,
-                                  ...] = (),
     committed_fill_debits: tuple[reserved_fill_planner.CommittedFillDebit,
                                  ...] = (),
     rotation_anchor: str | None = None,
@@ -127,7 +125,6 @@ def _plan(
         max_replicas=max_replicas,
         planned_replicas=planned_replicas,
         capacity_unit=capacity_unit,
-        ordinary_demand_debits=ordinary_demand_debits,
         committed_fill_debits=committed_fill_debits,
         rotation_anchor=rotation_anchor,
     )
@@ -369,46 +366,6 @@ def test_logical_headroom_charges_exact_accelerator_width() -> None:
         reserved_fill_planner.FillCapacityUnit.LOGICAL)
 
 
-def test_ordinary_demand_debits_exact_pool_card_before_fill() -> None:
-    mixed = _snapshot('mixed-context',
-                      'uid-mixed', {
-                          'a100': 1,
-                          'h200': 2,
-                      },
-                      location_order=('A100', 'H200'))
-    debit = reserved_fill_planner.OrdinaryDemandDebit(pool_key=mixed.pool_key,
-                                                      accelerator='A100',
-                                                      replica_slots=1)
-
-    plan = _plan((mixed,), ordinary_demand_debits=(debit,))
-
-    assert [intent.accelerator for intent in plan.intents] == ['H200', 'H200']
-
-    east = _snapshot('east-context', 'uid-east', {'a100': 1})
-    west = _snapshot('west-context', 'uid-west', {'a100': 1})
-    ambiguous_debits = tuple(
-        reserved_fill_planner.OrdinaryDemandDebit(
-            pool_key=snapshot.pool_key, accelerator='a100', replica_slots=1)
-        for snapshot in (east, west))
-    assert not _plan(
-        (east, west), ordinary_demand_debits=ambiguous_debits).intents
-
-
-def test_ordinary_demand_debits_are_closed_and_allocation_scoped() -> None:
-    east = _snapshot('east-context', 'uid-east', {'a100': 2})
-    debit = reserved_fill_planner.OrdinaryDemandDebit(pool_key=east.pool_key,
-                                                      accelerator='a100',
-                                                      replica_slots=1)
-    with pytest.raises(ValueError, match='one entry per pool/card'):
-        _plan((east,), ordinary_demand_debits=(debit, debit))
-
-    foreign = _snapshot('west-context', 'uid-west', {'h100': 1})
-    foreign_debit = reserved_fill_planner.OrdinaryDemandDebit(
-        pool_key=foreign.pool_key, accelerator='h100', replica_slots=1)
-    with pytest.raises(ValueError, match='outside the authenticated'):
-        _plan((east,), ordinary_demand_debits=(foreign_debit,))
-
-
 def test_committed_fill_debit_prevents_same_allocation_replay() -> None:
     east = _snapshot('east-context', 'uid-east', {'a100': 3})
     allocation_map = reserved_fill_planner.AuthenticatedAllocationMap.create(
@@ -422,9 +379,6 @@ def test_committed_fill_debit_prevents_same_allocation_replay() -> None:
         reclaim_policy_revision=_RECLAIM_POLICY_REVISION,
         reclaim_provider_inventory_sha256=(_RECLAIM_PROVIDER_INVENTORY_SHA256),
         pool_snapshots=(east,))
-    ordinary = reserved_fill_planner.OrdinaryDemandDebit(pool_key=east.pool_key,
-                                                         accelerator='a100',
-                                                         replica_slots=1)
     committed = reserved_fill_planner.CommittedFillDebit(
         allocation_generation=allocation_map.allocation_generation,
         allocation_input_sha256=allocation_map.allocation_input_sha256,
@@ -432,11 +386,9 @@ def test_committed_fill_debit_prevents_same_allocation_replay() -> None:
             allocation_map.allocation_claim_generation),
         pool_key=east.pool_key,
         accelerator='A100',
-        replica_slots=1)
+        replica_slots=2)
 
-    plan = _plan((east,),
-                 ordinary_demand_debits=(ordinary,),
-                 committed_fill_debits=(committed,))
+    plan = _plan((east,), committed_fill_debits=(committed,))
 
     assert len(plan.intents) == 1
     assert plan.intents[0].accelerator == 'a100'

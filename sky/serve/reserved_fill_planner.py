@@ -1165,40 +1165,13 @@ def compose_retirement_capacity_floor(
 
 
 @dataclasses.dataclass(frozen=True)
-class OrdinaryDemandDebit:
-    """Physical replica slots already claimed by ordinary demand."""
-
-    pool_key: str
-    accelerator: str
-    replica_slots: int
-
-    def __post_init__(self) -> None:
-        pool_key = _require_nonempty_string(self.pool_key, 'Debit pool key')
-        accelerator = _require_nonempty_string(self.accelerator,
-                                               'Debit accelerator').casefold()
-        _require_int(self.replica_slots, 'Debit replica slots', minimum=1)
-        try:
-            identity = reserved_capacity_broker.parse_pool_identity(pool_key)
-        except (TypeError, ValueError) as error:
-            raise ValueError('Ordinary-demand debit has a malformed pool '
-                             'key.') from error
-        if identity.protocol_version != reserved_capacity_broker.PROTOCOL_V2:
-            raise ValueError('Ordinary-demand debit requires a protocol-v2 '
-                             'pool key.')
-        if accelerator not in identity.gpu_names:
-            raise ValueError('Ordinary-demand debit accelerator is outside '
-                             'its pool.')
-        object.__setattr__(self, 'accelerator', accelerator)
-
-
-@dataclasses.dataclass(frozen=True)
 class CommittedFillDebit:
     """Physical slots already admitted from one allocation publication.
 
-    Unlike :class:`OrdinaryDemandDebit`, this is replay protection for rows
-    created by a previous reconcile pass.  Carrying the complete allocation
-    identity prevents a row from an older publication from reducing a newer
-    feed that may describe different physical capacity.
+    This is replay protection for rows created by a previous reconcile pass.
+    Carrying the complete allocation identity prevents a row from an older
+    publication from reducing a newer feed that may describe different
+    physical capacity.
     """
 
     allocation_generation: int
@@ -1640,7 +1613,6 @@ class ReservedFillPlanner:
         max_replicas: int,
         planned_replicas: int,
         capacity_unit: FillCapacityUnit,
-        ordinary_demand_debits: tuple[OrdinaryDemandDebit, ...] = (),
         committed_fill_debits: tuple[CommittedFillDebit, ...] = (),
         rotation_anchor: str | None = None,
     ) -> FillPlan:
@@ -1660,11 +1632,6 @@ class ReservedFillPlanner:
         _require_int(planned_replicas, 'planned_replicas')
         if not isinstance(capacity_unit, FillCapacityUnit):
             raise ValueError('capacity_unit must be FillCapacityUnit.')
-        if type(ordinary_demand_debits) is not tuple or any(
-                not isinstance(debit, OrdinaryDemandDebit)
-                for debit in ordinary_demand_debits):
-            raise ValueError('Ordinary-demand debits must be an immutable '
-                             'tuple of OrdinaryDemandDebit values.')
         if type(committed_fill_debits) is not tuple or any(
                 not isinstance(debit, CommittedFillDebit)
                 for debit in committed_fill_debits):
@@ -1717,25 +1684,6 @@ class ReservedFillPlanner:
             remaining_by_pool[snapshot.pool_key] = min(snapshot.free_slots,
                                                        snapshot.grant,
                                                        snapshot.edge_cap)
-
-        debit_keys: set[tuple[str, str]] = set()
-        for debit in ordinary_demand_debits:
-            debit_key = (debit.pool_key, debit.accelerator)
-            if debit_key in debit_keys:
-                raise ValueError('Ordinary-demand debits must contain one '
-                                 'entry per pool/card.')
-            debit_keys.add(debit_key)
-            if debit.pool_key not in remaining_by_pool_card:
-                raise ValueError('Ordinary-demand debit references a pool '
-                                 'outside the authenticated allocation map.')
-            exact_slots = remaining_by_pool_card[debit.pool_key]
-            if debit.accelerator not in card_order_by_pool[debit.pool_key]:
-                raise ValueError('Ordinary-demand debit references a card '
-                                 'outside its authenticated pool locations.')
-            exact_slots[debit.accelerator] = max(
-                0, exact_slots[debit.accelerator] - debit.replica_slots)
-            remaining_by_pool[debit.pool_key] = max(
-                0, remaining_by_pool[debit.pool_key] - debit.replica_slots)
 
         committed_debit_keys: set[tuple[str, str]] = set()
         for debit in committed_fill_debits:
