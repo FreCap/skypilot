@@ -18,7 +18,10 @@ from test_pool_capacity_observation_pg import pg_server  # noqa: F401
 
 from sky import clouds
 from sky import global_user_state_schema
+from sky.client import sdk
+from sky.serve import constants as serve_constants
 from sky.serve import kubernetes_identity
+from sky.serve import ordinary_launch_binding
 from sky.serve import pool_capacity_observation
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker
@@ -30,6 +33,11 @@ from sky.serve import serve_state_schema
 from sky.serve import serve_utils
 from sky.serve import service_spec
 from sky.serve import zero_cost_actuation
+from sky.server import constants as server_constants
+from sky.server.requests import payloads
+from sky.server.requests import postgres as request_postgres
+from sky.server.requests import reserved_fill_admission
+from sky.skylet import constants as skylet_constants
 from sky.utils.db import migration_utils
 
 _SERVICE = 'svc'
@@ -46,6 +54,10 @@ _PEER_CONTROLLER_PORT = 8124
 _CONTROLLER_INCARNATION = uuid.UUID('11111111-1111-4111-8111-111111111111')
 _PEER_CONTROLLER_INCARNATION = uuid.UUID('22222222-2222-4222-8222-222222222222')
 _CONTROLLER_OWNER_EPOCH = 2
+_BINDING_EPOCH = 1
+_CREATOR_ID = 'reserved-fill-allocation-owner'
+_CREATOR_NAME = 'reserved-fill-allocation-owner@example.com'
+_WORKSPACE = 'workspace-a'
 
 
 def _worker_projection(card: str,
@@ -138,27 +150,42 @@ def _claim_policy_authority(
 
 
 @pytest.fixture
-def allocation_engine(observation_engine):  # noqa: F811
+def allocation_engine(observation_engine, monkeypatch):  # noqa: F811
     global_user_state_schema.user_table.create(observation_engine,
                                                checkfirst=True)
     config = migration_utils.get_alembic_config(observation_engine,
                                                 migration_utils.SERVE_DB_NAME)
     alembic_command.upgrade(config, migration_utils.SERVE_VERSION)
+    request_postgres._initialize_schema(observation_engine)
+    monkeypatch.setattr(request_postgres._DB_MANAGER, '_engine',
+                        observation_engine)
+    monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
+                        observation_engine)
+    monkeypatch.setattr(request_postgres,
+                        '_resolved_request_backend_capability', lambda:
+                        ('postgres', 'postgres', True))
     with observation_engine.begin() as connection:
+        connection.execute(global_user_state_schema.user_table.insert().values(
+            id=_CREATOR_ID, name=_CREATOR_NAME, created_at=int(time.time())))
         connection.execute(
             sqlalchemy.text("""
                 INSERT INTO services
                     (name, hash, resource_scope, controller_pid,
                      controller_ip, status, current_version,
-                     logical_replica_semantics)
+                     logical_replica_semantics, workspace,
+                     owner_user_id, owner_user_name)
                 VALUES (:name, :hash, :resource_scope, :controller_pid,
-                        :controller_ip, 'READY', 1, 0)
+                        :controller_ip, 'READY', 1, 0, :workspace,
+                        :owner_user_id, :owner_user_name)
             """), {
                 'name': _SERVICE,
                 'hash': _SERVICE_HASH,
                 'resource_scope': _SERVICE_HASH,
                 'controller_pid': _OWNER[0],
                 'controller_ip': _OWNER[1],
+                'workspace': _WORKSPACE,
+                'owner_user_id': _CREATOR_ID,
+                'owner_user_name': _CREATOR_NAME,
             })
         connection.execute(
             serve_state_schema.version_specs_table.insert().values(
@@ -167,6 +194,9 @@ def allocation_engine(observation_engine):  # noqa: F811
                 spec=pickle.dumps(_service_spec()),
                 yaml_content='service: v1\n',
                 worker_placement_projections=_WORKER_PROJECTIONS))
+        connection.execute(
+            serve_state_schema.service_lifecycle_fences_table.insert().values(
+                name=_SERVICE, epoch=1))
         connection.execute(
             sqlalchemy.text("""
                 UPDATE reserved_fill_protocol_state
@@ -462,15 +492,20 @@ def _insert_peer_service(
                 INSERT INTO services
                     (name, hash, resource_scope, controller_pid,
                      controller_ip, status, current_version,
-                     logical_replica_semantics)
+                     logical_replica_semantics, workspace,
+                     owner_user_id, owner_user_name)
                 VALUES (:name, :hash, :resource_scope, :controller_pid,
-                        :controller_ip, 'READY', 1, 0)
+                        :controller_ip, 'READY', 1, 0, :workspace,
+                        :owner_user_id, :owner_user_name)
             """), {
                 'name': _PEER_SERVICE,
                 'hash': _PEER_HASH,
                 'resource_scope': _PEER_HASH,
                 'controller_pid': _PEER_OWNER[0],
                 'controller_ip': _PEER_OWNER[1],
+                'workspace': _WORKSPACE,
+                'owner_user_id': _CREATOR_ID,
+                'owner_user_name': _CREATOR_NAME,
             })
         connection.execute(
             serve_state_schema.version_specs_table.insert().values(
@@ -479,6 +514,9 @@ def _insert_peer_service(
                 spec=pickle.dumps(_service_spec()),
                 yaml_content='service: v1\n',
                 worker_placement_projections=_WORKER_PROJECTIONS))
+        connection.execute(
+            serve_state_schema.service_lifecycle_fences_table.insert().values(
+                name=_PEER_SERVICE, epoch=1))
         if not with_claim:
             return
         connection.execute(
@@ -607,20 +645,35 @@ def _activate_durable_intent_service(
     with engine.begin() as connection:
         result = connection.execute(
             sqlalchemy.update(serve_state_schema.services_table).where(
-                serve_state_schema.services_table.c.name ==
-                service_name).values(
-                    pool=0,
-                    lifecycle_epoch=1,
-                    controller_port=controller_port,
-                    controller_incarnation=controller_incarnation,
-                    controller_owner_epoch=_CONTROLLER_OWNER_EPOCH,
-                    reserved_fill_actuation_mode=(
-                        zero_cost_actuation.ActuationMode.DURABLE_INTENT.value),
-                    reserved_fill_actuation_epoch=1,
-                    reserved_fill_actuation_capable=True,
-                    reserved_fill_actuation_controller_incarnation=(
-                        controller_incarnation),
-                    reserved_fill_actuation_protocol_version=1))
+                serve_state_schema.services_table.c.name == service_name).
+            values(
+                pool=0,
+                lifecycle_epoch=1,
+                controller_port=controller_port,
+                controller_incarnation=controller_incarnation,
+                controller_owner_epoch=_CONTROLLER_OWNER_EPOCH,
+                ordinary_launch_binding_capable=True,
+                ordinary_launch_binding_mode=(
+                    ordinary_launch_binding.BindingMode.BOUND.value),
+                ordinary_launch_binding_epoch=_BINDING_EPOCH,
+                non_pool_launch_binding_capable=True,
+                non_pool_launch_controller_incarnation=(controller_incarnation),
+                non_pool_launch_binding_protocol_version=(
+                    ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+                non_pool_launch_capability_profile_set_digest=(
+                    ordinary_launch_binding.
+                    supported_non_pool_profile_set_digest()),
+                non_pool_launch_capability_cohort_epoch=(
+                    ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+                non_pool_launch_receipt_protocol_version=(
+                    ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION),
+                reserved_fill_actuation_mode=(
+                    zero_cost_actuation.ActuationMode.DURABLE_INTENT.value),
+                reserved_fill_actuation_epoch=1,
+                reserved_fill_actuation_capable=True,
+                reserved_fill_actuation_controller_incarnation=(
+                    controller_incarnation),
+                reserved_fill_actuation_protocol_version=1))
     assert result.rowcount == 1
     return serve_utils.make_controller_owner_fingerprint(
         service_hash, controller_owner[0], controller_owner[1], controller_port)
@@ -687,27 +740,93 @@ def _stage_durable_fill(
     *,
     controller_owner: tuple[int, str] = _OWNER,
 ) -> bool:
-    """Commit one real durable lease through the transaction-owned stage."""
+    """Commit one lease through the complete production admission graph."""
+    if service_name == _SERVICE:
+        service_hash = _SERVICE_HASH
+    elif service_name == _PEER_SERVICE:
+        service_hash = _PEER_HASH
+    else:
+        raise ValueError(f'Unknown test service: {service_name!r}')
+    with engine.connect() as current_connection:
+        service = current_connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.services_table.c.workspace,
+                serve_state_schema.services_table.c.lifecycle_epoch,
+                serve_state_schema.services_table.c.controller_incarnation,
+                serve_state_schema.services_table.c.controller_owner_epoch).
+            where(serve_state_schema.services_table.c.name ==
+                  service_name)).mappings().one()
+    controller_incarnation = service['controller_incarnation']
+    controller_owner_epoch = service['controller_owner_epoch']
+    lifecycle_epoch = service['lifecycle_epoch']
+    assert service['workspace'] == _WORKSPACE
+    assert isinstance(controller_incarnation, uuid.UUID)
+    assert isinstance(controller_owner_epoch, int)
+    assert isinstance(lifecycle_epoch, int)
+    authority = ordinary_launch_binding.ControllerBindingAuthority(
+        service_name=service_name,
+        service_hash=service_hash,
+        service_workspace=_WORKSPACE,
+        service_lifecycle_epoch=lifecycle_epoch,
+        controller_pid=controller_owner[0],
+        controller_ip=controller_owner[1],
+        controller_incarnation=controller_incarnation,
+        controller_owner_epoch=controller_owner_epoch,
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        binding_epoch=_BINDING_EPOCH,
+        non_pool_capable=True,
+        non_pool_binding_protocol_version=(
+            ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+        non_pool_profile_set_digest=(
+            ordinary_launch_binding.supported_non_pool_profile_set_digest()),
+        non_pool_capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+        non_pool_receipt_protocol_version=(
+            ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
+    launch_context = {
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: service_name,
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: service_hash,
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: 1,
+        serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY:
+            controller_owner[0],
+        serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY:
+            controller_owner[1],
+        ordinary_launch_binding.REPLICA_ID_KEY: replica_id,
+        ordinary_launch_binding.REPLICA_RECORD_ID_KEY: info.replica_record_id,
+        ordinary_launch_binding.LIFECYCLE_EPOCH_KEY: lifecycle_epoch,
+        ordinary_launch_binding.BINDING_EPOCH_KEY: _BINDING_EPOCH,
+        ordinary_launch_binding.CONTROLLER_INCARNATION_KEY:
+            str(controller_incarnation),
+        ordinary_launch_binding.CONTROLLER_OWNER_EPOCH_KEY: controller_owner_epoch,
+    }
+    body = payloads.LaunchBody(
+        task=('name: allocation-fill\nresources:\n  accelerators: '
+              'A100-80GB:1\n'),
+        cluster_name=info.cluster_name,
+        is_launched_by_sky_serve_controller=True,
+        client_api_version=server_constants.API_VERSION,
+        extra_launch_context=launch_context,
+        env_vars={
+            skylet_constants.USER_ID_ENV_VAR: _CREATOR_ID,
+            skylet_constants.USER_ENV_VAR: _CREATOR_NAME,
+        },
+        override_skypilot_config={'active_workspace': _WORKSPACE})
+    prepared = sdk.PreparedLaunchRequest(sdk._canonical_launch_body_bytes(body))
+    spec = reserved_fill_admission.AdmissionSpec(
+        prepared_request=prepared,
+        submission_id=uuid.uuid5(
+            uuid.UUID('33333333-3333-4333-8333-333333333333'),
+            f'{service_name}:{replica_id}:{info.replica_record_id}'),
+        authority=authority,
+        replica_info=info,
+        actuation_lease=lease)
     with engine.connect() as connection:
         transaction = connection.begin()
-        staged = serve_state.stage_protocol_v2_reserved_fill_replica_in_transaction(
-            connection,
-            service_name,
-            replica_id,
-            info,
-            pool_key=lease.intent.pool_key,
-            expected_epoch=lease.intent.pool_epoch,
-            expected_service_hash=lease.intent.service_incarnation,
-            expected_controller_owner=controller_owner,
-            expected_service_generation=lease.intent.service_generation,
-            expected_physical_cluster_uid=lease.intent.physical_cluster_uid,
-            expected_ordinary_zero_cost_admission_sequence=(
-                lease.intent.ordinary_zero_cost_admission_sequence),
-            expected_lease_token=7,
-            expected_actuation_mode=(
-                zero_cost_actuation.ActuationMode.DURABLE_INTENT.value),
-            actuation_lease=lease)
-        if staged is None:
+        try:
+            staged, _ = reserved_fill_admission._stage_and_bind(
+                connection, spec, 7, require_existing=False)
+        except reserved_fill_admission._Rejected:
             transaction.rollback()
             return False
         transaction.commit()
@@ -1392,20 +1511,35 @@ def test_durable_intent_handoff_survives_successor_pool_epoch(
         _SERVICE_HASH, _OWNER[0], _OWNER[1], controller_port)
     with allocation_engine.begin() as connection:
         connection.execute(
-            sqlalchemy.update(serve_state_schema.services_table).where(
-                serve_state_schema.services_table.c.name == _SERVICE).values(
-                    pool=0,
-                    lifecycle_epoch=1,
-                    controller_port=controller_port,
-                    controller_incarnation=controller_incarnation,
-                    controller_owner_epoch=controller_owner_epoch,
-                    reserved_fill_actuation_mode=(
-                        zero_cost_actuation.ActuationMode.DURABLE_INTENT.value),
-                    reserved_fill_actuation_epoch=1,
-                    reserved_fill_actuation_capable=True,
-                    reserved_fill_actuation_controller_incarnation=(
-                        controller_incarnation),
-                    reserved_fill_actuation_protocol_version=1))
+            sqlalchemy.update(serve_state_schema.services_table).
+            where(serve_state_schema.services_table.c.name == _SERVICE).values(
+                pool=0,
+                lifecycle_epoch=1,
+                controller_port=controller_port,
+                controller_incarnation=controller_incarnation,
+                controller_owner_epoch=controller_owner_epoch,
+                ordinary_launch_binding_capable=True,
+                ordinary_launch_binding_mode=(
+                    ordinary_launch_binding.BindingMode.BOUND.value),
+                ordinary_launch_binding_epoch=_BINDING_EPOCH,
+                non_pool_launch_binding_capable=True,
+                non_pool_launch_controller_incarnation=(controller_incarnation),
+                non_pool_launch_binding_protocol_version=(
+                    ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+                non_pool_launch_capability_profile_set_digest=(
+                    ordinary_launch_binding.
+                    supported_non_pool_profile_set_digest()),
+                non_pool_launch_capability_cohort_epoch=(
+                    ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+                non_pool_launch_receipt_protocol_version=(
+                    ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION),
+                reserved_fill_actuation_mode=(
+                    zero_cost_actuation.ActuationMode.DURABLE_INTENT.value),
+                reserved_fill_actuation_epoch=1,
+                reserved_fill_actuation_capable=True,
+                reserved_fill_actuation_controller_incarnation=(
+                    controller_incarnation),
+                reserved_fill_actuation_protocol_version=1))
 
     plan = reserved_fill_planner.ReservedFillPlanner.plan(
         policy_revision=1,

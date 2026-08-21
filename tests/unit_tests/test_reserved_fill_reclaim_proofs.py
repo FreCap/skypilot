@@ -444,7 +444,7 @@ def test_serve054_is_forward_only(proof_engine):
     with pytest.raises(RuntimeError, match='forward-only'):
         alembic_command.downgrade(config, '053')
     assert migration_utils.get_current_alembic_revision(
-        proof_engine, migration_utils.SERVE_DB_NAME) == '055'
+        proof_engine, migration_utils.SERVE_DB_NAME) == '056'
     assert (proof_schema.serve_reserved_fill_reclaim_provider_proofs_table.name
             in sqlalchemy.inspect(proof_engine).get_table_names())
 
