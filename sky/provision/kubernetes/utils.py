@@ -2827,10 +2827,10 @@ def get_kubernetes_node_observation_uncached_bounded(
     return observation
 
 
-@annotations.lru_cache(scope='request', maxsize=10)
 @_retry_on_error(resource_type='node')
-def get_kubernetes_nodes(*, context: str | None = None) -> list[V1Node]:
-    """Gets the kubernetes nodes in the context.
+def get_kubernetes_nodes_uncached(*,
+                                  context: str | None = None) -> list[V1Node]:
+    """Gets a fresh Kubernetes node snapshot for the context.
 
     If context is None, gets the nodes in the current context.
 
@@ -2859,6 +2859,12 @@ def get_kubernetes_nodes(*, context: str | None = None) -> list[V1Node]:
     nodes = _filter_allowed_nodes(nodes, context)
 
     return nodes
+
+
+@annotations.lru_cache(scope='request', maxsize=10)
+def get_kubernetes_nodes(*, context: str | None = None) -> list[V1Node]:
+    """Gets a request-cached Kubernetes node snapshot for the context."""
+    return get_kubernetes_nodes_uncached(context=context)
 
 
 # These aliases preserve the historical Kubernetes utility import surface while

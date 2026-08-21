@@ -194,7 +194,13 @@ def _list_accelerators(
 
     accelerators_qtys: set[tuple[str, int]] = set()
     keys = lf.get_label_keys()
-    nodes = kubernetes_utils.get_kubernetes_nodes(context=context)
+    if realtime:
+        # Realtime observations also run in long-lived controller workers,
+        # outside API request boundaries.  Bypass the request-scoped node
+        # cache so cordon and readiness changes are visible every cycle.
+        nodes = kubernetes_utils.get_kubernetes_nodes_uncached(context=context)
+    else:
+        nodes = kubernetes_utils.get_kubernetes_nodes(context=context)
     kubernetes.raise_if_api_call_deadline_exceeded()
 
     # Check if any nodes have accelerators before fetching pods
