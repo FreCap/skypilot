@@ -603,6 +603,26 @@ def _content_sha256(response: object, identities: object) -> str:
         })).hexdigest()
 
 
+def _occupancy_context_sha256(response: Mapping[str, Any],
+                              identities: Mapping[str, Any]) -> str:
+    """Digest only route state that can invalidate occupancy evidence.
+
+    The full projection digest also covers volatile capacity hints.  Those
+    hints can change without changing a backend or its async-occupancy
+    contract, so using the full digest as the load balancer's occupancy fence
+    creates a fleet-wide unknown window on every capacity-only publication.
+    Persisted route identities are included here so a successor replica that
+    reuses the same URL still advances this narrower fence.
+    """
+    return hashlib.sha256(
+        _canonical_json({
+            'service_version': response.get('service_version'),
+            'routing_spec': response.get('routing_spec'),
+            'replica_info': response.get('replica_info'),
+            'identities': identities,
+        })).hexdigest()
+
+
 def _canonical_record_id(value: object) -> str:
     if not isinstance(value, str):
         raise RouteProjectionValidationError(
@@ -2456,10 +2476,12 @@ class RouteProjectionRepository:
                     raise RouteProjectionUnavailable(
                         'Route projection owner, version, or producer is '
                         'stale.')
-                response, _ = self.validate_snapshot_row(snapshot)
+                response, identities = self.validate_snapshot_row(snapshot)
                 response.update({
                     'route_projection_generation': int(head['generation']),
                     'route_projection_sha256': snapshot['content_sha256'],
+                    'route_occupancy_context_sha256': _occupancy_context_sha256(
+                        response, identities),
                     'route_source_epoch': int(owner['route_source_epoch']),
                 })
                 return RouteSyncDecision(mode=mode, response=response)

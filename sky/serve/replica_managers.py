@@ -12967,8 +12967,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         """
         if not self._superseded_prune_pending:
             return
-        self._superseded_prune_pending = False
         latest_version = self.latest_version
+        prunable_infos: list[ReplicaInfo] = []
         for info in serve_state.get_replica_infos(self._service_name):
             if info.version == latest_version:
                 continue
@@ -12977,11 +12977,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                 continue
             if (info.status not in self._PRUNABLE_SUPERSEDED_STATUSES):
                 continue
-            self._remove_replica(info.replica_id, info.replica_record_id)
-            logger.info(
-                f'Replica {info.replica_id} removed from the replica table '
-                f'for version outdated (version {info.version} superseded by '
-                f'{latest_version}).')
+            prunable_infos.append(info)
+        if not prunable_infos:
+            self._superseded_prune_pending = False
+            return
+        prunable_infos.sort(key=lambda info: info.replica_id)
+        self._remove_replicas(prunable_infos)
+        self._superseded_prune_pending = False
+        superseded_versions = sorted({info.version for info in prunable_infos})
+        logger.info(
+            f'Removed {len(prunable_infos)} superseded failed replicas from '
+            f'the replica table in one batch (versions '
+            f'{superseded_versions!r} superseded by {latest_version}).')
 
     @with_lock
     def _refresh_thread_pool(self) -> None:
