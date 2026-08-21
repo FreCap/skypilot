@@ -156,7 +156,7 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
     ]
     assert bundle.policy_revision == (
         f'boltz-reserved-fill-reclaim-policy/{POLICY_REVISION}')
-    assert POLICY_REVISION == '1.1.1422'
+    assert POLICY_REVISION == '1.1.1425'
     assert _quota(phx, 'skypilot-be', 'ml.p5e.48xlarge',
                   'cpu')['borrowing_limit'] == '12100'
     assert _quota(phx, 'skypilot-be', 'ml.p5e.48xlarge',
@@ -626,7 +626,7 @@ def test_unchanged_policy_authorizes_current_service_version_refresh(
     context = policy._bundle.fleet_context('phx_research_cluster_eks')
     identity = policy.policy_identity()
     assert identity.policy_revision == (
-        'boltz-reserved-fill-reclaim-policy/1.1.1422')
+        'boltz-reserved-fill-reclaim-policy/1.1.1425')
 
     authorizations = []
     for service_version in (63, 64):
@@ -1861,11 +1861,56 @@ def test_paginated_kueue_inventory_exposes_later_governed_member():
             cancellation=threading.Event()))
 
     assert len(calls) == 2
-    assert calls[0]['_limit'] == kubernetes_attestation._KUEUE_LIST_PAGE_LIMIT
+    assert calls[0]['limit'] == kubernetes_attestation._KUEUE_LIST_PAGE_LIMIT
     with pytest.raises(
             kubernetes_attestation.KubernetesAttestationNonconformanceError,
             match='late-foreign-member'):
         kubernetes_attestation.validate_snapshot(context, provider, snapshot)
+
+
+def test_kueue_inventory_uses_real_client_pagination_contract():
+    """Exercise the generated client's strict pagination keyword contract."""
+    client_lib = kubernetes_attestation.kubernetes_adaptor.kubernetes.client
+    configuration = client_lib.Configuration()
+    pages = [{
+        'items': [{
+            'metadata': {
+                'name': 'first-page',
+            },
+        }],
+        'metadata': {
+            'continue': 'next-page',
+        },
+    }, {
+        'items': [{
+            'metadata': {
+                'name': 'second-page',
+            },
+        }],
+        'metadata': {
+            'continue': '',
+        },
+    }]
+    with client_lib.ApiClient(configuration) as api_client:
+        custom_objects = client_lib.CustomObjectsApi(api_client)
+        with mock.patch.object(api_client, 'call_api',
+                               side_effect=pages) as call_api:
+            items = kubernetes_attestation._list_kueue_objects(
+                custom_objects,
+                plural='clusterqueues',
+                deadline_monotonic=time.monotonic() + 5,
+                cancellation=threading.Event())
+
+    assert [item['metadata']['name'] for item in items
+           ] == ['first-page', 'second-page']
+    assert len(call_api.call_args_list) == 2
+    assert dict(call_api.call_args_list[0].args[3]) == {
+        'limit': kubernetes_attestation._KUEUE_LIST_PAGE_LIMIT,
+    }
+    assert dict(call_api.call_args_list[1].args[3]) == {
+        'continue': 'next-page',
+        'limit': kubernetes_attestation._KUEUE_LIST_PAGE_LIMIT,
+    }
 
 
 @pytest.mark.parametrize('continuation', ['repeat', 17])
