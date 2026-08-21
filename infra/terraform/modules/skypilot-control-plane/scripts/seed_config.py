@@ -15,6 +15,7 @@ still restarts the API server after a new seed generation so an old process cann
 pre-seed full-config snapshot.
 """
 
+import hashlib
 import os
 import pathlib
 import sys
@@ -138,12 +139,16 @@ def seed(
         new_value = yaml.safe_dump(merged,
                                    default_flow_style=False,
                                    sort_keys=False)
+        new_digest = hashlib.sha256(new_value.encode("utf-8")).hexdigest()
         conn.execute(
-            text("insert into config_yaml (key, value) values (:k, :v) "
-                 "on conflict (key) do update set value = :v"),
+            text("insert into config_yaml (key, value, revision, digest) "
+                 "values (:k, :v, 1, :digest) "
+                 "on conflict (key) do update set value = :v, "
+                 "revision = config_yaml.revision + 1, digest = :digest"),
             {
                 "k": CONFIG_KEY,
-                "v": new_value
+                "v": new_value,
+                "digest": new_digest,
             },
         )
         print(

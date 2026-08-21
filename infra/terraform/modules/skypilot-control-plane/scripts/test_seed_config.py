@@ -1,6 +1,7 @@
 """Tests the control-plane config seed and Terraform wiring contracts."""
 
 import copy
+import hashlib
 import os
 import pathlib
 import re
@@ -174,6 +175,14 @@ class SeedTest(unittest.TestCase):
                     }
                 },
             },
+        )
+        statement, parameters = connection.execute.call_args_list[1].args
+        statement_text = str(statement)
+        self.assertIn('(key, value, revision, digest)', statement_text)
+        self.assertIn('revision = config_yaml.revision + 1', statement_text)
+        self.assertEqual(
+            parameters['digest'],
+            hashlib.sha256(parameters['v'].encode('utf-8')).hexdigest(),
         )
 
     def test_current_config_is_a_noop(self) -> None:

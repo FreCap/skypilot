@@ -175,7 +175,10 @@ skypilot_config.initialize_postgres_server_config_authority(
 global_user_state.initialize_and_get_db = lambda: engine
 permission._enforcer_instance = None
 service = permission.PermissionService()
-service._lazy_initialize()
+# A request subprocess reaches the generation gate before its process-local
+# enforcer exists.  This cold path recursively attests the generation while
+# initializing the enforcer and must not self-deadlock.
+service._ensure_workspace_permission_generation_current()
 """
     process_env = _guarded_subprocess_environment(engine, mode)
     if read_only:
@@ -189,6 +192,7 @@ service._lazy_initialize()
         capture_output=True,
         text=True,
         check=False,
+        timeout=30,
     )
 
 

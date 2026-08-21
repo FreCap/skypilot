@@ -94,7 +94,12 @@ class PermissionService:
     def __init__(self):
         self.enforcer: casbin.SyncedEnforcer | None = None
         self._lock = threading.Lock()
-        self._workspace_generation_lock = threading.Lock()
+        # A cold request child enters the generation gate before its enforcer
+        # exists.  Enforcer initialization attests the same generation again
+        # after publishing the instance-local enforcer, so this lock must be
+        # reentrant within that one thread.  It still serializes independent
+        # request threads in a long-lived process.
+        self._workspace_generation_lock = threading.RLock()
         self._observed_workspace_permission_generation: int | None = None
         # Viewer role's endpoint allowlist, materialised at boot.
         self._viewer_allowlist: list[tuple] = []
