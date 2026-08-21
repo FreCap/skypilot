@@ -2,16 +2,51 @@
 
 Last updated: 2026-08-21
 
-Status: production qualification is **active but incomplete**. Helm revision
-475 / release `1.1.1404` runs image digest
+Status: the reserved-capacity allocator and PostgreSQL recovery objective is
+**production-converged**; historical-state cleanup, request telemetry, and the
+independent removal of EFS remain active. Helm revision 479 / release
+`1.1.1410` runs immutable image digest
+`sha256:cc8ff796eb008c2d085f6e0933be7bf00d00c288794e493e57382fcf13ac4d35`
+on two API, two controller, and two executor Pods. All six Pods were Ready with
+zero restarts at the 2026-08-21 10:45 UTC observation.
+
+At that observation, `boltz-l4-fleet` version 64 was `READY` at 80/80:
+13 East A100, 37 East A100-80GB, and 30 PHX H200 replicas. Every READY row was
+reserved-fill, zero-cost Kubernetes capacity; no READY row was Spot or carried
+a paid-capacity claim, and the service had zero durable paid claims. Fresh
+protocol-v2 broker rounds reported `last_observed_free=0`, `feed=0`, and
+holdings of 13, 37, and 30 for the three exact-card pools. The revision-479
+controller rollout recovered the same service and endpoint from PostgreSQL.
+Earlier forced-controller and lost-ack tests had already qualified durable
+intent hydration and no-duplicate recovery.
+
+Release `1.1.1410` includes the complete committed-handoff correction through
+PR #1630, capability-rotation fencing from PR #1635, batch pruning of
+superseded terminal replicas from PR #1636, and stable occupancy across
+capacity-only route updates from PR #1638. The allocator's steady-state gates
+are therefore satisfied: compatible reserved capacity is committed first,
+provider launch follows that commit, and paid residual remains zero when the
+reserved supply covers demand.
+
+The broader initiative is not complete. The retained version-64 inventory
+still contains 958 terminal failed rows and 1,013 rows whose reserved-fill
+intent identity exists only in retained JSON rather than the normalized scalar
+column. PR #1636 cannot prune current-version terminal history until a version
+transition or controlled service recreation supersedes it. Request-count UI
+work and the PostgreSQL-plus-S3 replacement for EFS are separate remaining
+workstreams; neither is required for the already-converged allocation result.
+
+## Qualification history
+
+Helm revision 475 / release `1.1.1404` ran image digest
 `sha256:8047b32d5703eb280b621c5f7f404daadb2bb98738327e32d0f44355cbfe603e`
-on all two API, two controller, and two executor Pods. It includes the
+on all two API, two controller, and two executor Pods. It included the
 application-only PR #1632 correction that recognizes additive Serve revision
 056 as a valid descendant of placement-normalization authority 040. Controller
 generation 110 became ready at 08:28 UTC and the `boltz-l4-fleet` service child
 then adopted successfully, clearing revision 474's deterministic controller
-boot failure and controller-dependent 503s. Release `1.1.1404` does **not**
-contain corrective PR #1630's complete committed-handoff contract, so it is a
+boot failure and controller-dependent 503s. Release `1.1.1404` did **not**
+contain corrective PR #1630's complete committed-handoff contract, so it was a
 service-availability precursor rather than the final fix-forward image.
 
 Revision 473 / release `1.1.1401` included merged PR #1626 at
