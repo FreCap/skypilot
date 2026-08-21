@@ -692,7 +692,8 @@ def _generic_controller_authority() -> binding.ControllerBindingAuthority:
 
 def _admit_generic_paid(
     database,
-) -> tuple[binding.NonPoolBindingIdentity, binding.BoundNonPoolLaunchContext]:
+) -> tuple[binding.NonPoolBindingIdentity, binding.BoundNonPoolLaunchContext,
+           dict[str, object]]:
     with database.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.replicas_table).where(
@@ -753,8 +754,10 @@ def _admit_generic_paid(
         admission = binding.insert_or_get_locked(connection, identity)
     binding.install_bound_non_pool_context(launch_body, identity,
                                            admission.launch_generation)
-    return identity, binding.parse_bound_non_pool_launch_context(
-        launch_body.extra_launch_context)
+    return (identity,
+            binding.parse_bound_non_pool_launch_context(
+                launch_body.extra_launch_context),
+            dict(launch_body.extra_launch_context))
 
 
 def test_serve056_previous_cohort_settles_but_cannot_start_provider_effect(
@@ -764,7 +767,8 @@ def test_serve056_previous_cohort_settles_but_cannot_start_provider_effect(
     with monkeypatch.context() as old_code:
         old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
                          current_cohort - 1)
-        identity, context = _admit_generic_paid(binding_database)
+        identity, context, launch_context = _admit_generic_paid(
+            binding_database)
 
     authority = dataclasses.replace(
         _generic_controller_authority(),
@@ -780,10 +784,11 @@ def test_serve056_previous_cohort_settles_but_cannot_start_provider_effect(
     entered = False
     with pytest.raises(binding.OrdinaryLaunchBindingConflict,
                        match='exact generic launch cohort'):
-        with binding.provider_effect_guard(context,
-                                           claim,
-                                           claim_validator=lambda _connection,
-                                           _association_id, _claim: True):
+        with binding.non_pool_provider_effect_guard(
+                launch_context,
+                claim,
+                claim_validator=lambda _connection, _association_id, _claim:
+                True):
             entered = True
     assert not entered
     with binding_database.connect() as connection:
@@ -865,13 +870,15 @@ def test_serve056_previous_cohort_reconciles_ambiguous_provider_action(
     with monkeypatch.context() as old_code:
         old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
                          current_cohort - 1)
-        identity, context = _admit_generic_paid(binding_database)
+        identity, context, launch_context = _admit_generic_paid(
+            binding_database)
         claim = _Claim(identity.request_id, 1, str(uuid.uuid4()),
                        str(uuid.uuid4()))
-        with binding.provider_effect_guard(context,
-                                           claim,
-                                           claim_validator=lambda _connection,
-                                           _association_id, _claim: True):
+        with binding.non_pool_provider_effect_guard(
+                launch_context,
+                claim,
+                claim_validator=lambda _connection, _association_id, _claim:
+                True):
             pass
 
     authority = dataclasses.replace(
@@ -900,7 +907,7 @@ def test_serve056_previous_cohort_reconciles_ambiguous_provider_action(
 
 def test_serve047_provider_evidence_is_owner_fenced_and_monotonic(
         binding_database) -> None:
-    identity, context = _admit_generic_paid(binding_database)
+    identity, context, _ = _admit_generic_paid(binding_database)
     with binding_database.begin() as connection:
         assert binding.mark_ambiguous_in_connection(
             connection, context, 'provider-result-uncertain')
@@ -1218,7 +1225,7 @@ def test_serve056_cohort_rotation_rejects_unsettled_association(
     with monkeypatch.context() as old_code:
         old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
                          current_cohort - 1)
-        identity, _ = _admit_generic_paid(binding_database)
+        identity, _, _ = _admit_generic_paid(binding_database)
 
     with pytest.raises(binding.OrdinaryLaunchBindingConflict,
                        match='unsettled prior-cohort associations'):
