@@ -6,26 +6,28 @@ Status: production qualification is **active and incomplete**. The latest
 readback runs Helm revision 472 / release `v1.1.1399` at image digest
 `sha256:222de3cbedb1296e9327fc3f93ada5bebb8dbbe945ab95b97be1cefc70602393`
 on all two API, two controller, and two executor Pods, with elected service
-version 64. At claim generation 7482,
-point-in-time effective/represented capacity was H200 34/30, A100-80GB 12/12,
-and A100 9/9: 55 effective slots, 51 represented by 47 READY and four PENDING
-replicas. Four H200 intents/replicas 56079--56082 committed between 04:43 and
-04:46 UTC after revision 472, leaving a four-slot point-in-time gap. By 05:01
-UTC all four workloads were Kueue-admitted and their Pods became Ready, so
-scheduler admission is not the active blocker. Launches 56080 and 56082
-completed provider success and advanced to `STARTING`; launches 56079 and
-56081 instead timed out during post-create reclaim attestation, failed and
-quiesced, and now remain `AMBIGUOUS` / `POST_EFFECT_AMBIGUOUS` with provider
-state `PRESENT` while their replicas are `SHUTTING_DOWN`. The active blocker is
-therefore the missing durable committed-intent-to-replica provider handoff
-specified as Serve056 below. By 05:06 UTC replacements 56084--56087 had
-committed automatically; claim generation 7490 was fully represented at H200
-30/30, A100-80GB 12/12, and A100 9/9 (50 `READY`, one `STARTING`) with zero
-paid capacity. That proves automatic recovery but not a fix: effective H200
-capacity fell from 34 to 30 and the handoff remains intermittent. This is
-positive convergence evidence, not completion: cold restart,
-successor-allocation, the remaining four slots, and the full production
-horizon are not yet proven. Revision 472 includes the
+version 64. A fresh 05:57 UTC read at claim generation 7495 is fully
+represented: H200 30/30, A100-80GB 12/12, and A100 9/9, with 51 `READY`
+non-Spot replicas and zero paid claims. Each current protocol-v2 pool round
+has `grants == holdings`, `feeds == 0`, `last_observed_free == 0`, and
+`fence_pending == 0`. Eight A100-80GB slots that became free at generation
+7491 were admitted automatically and reached provider completion; the later
+cap contraction from 20 to 12 reflects those slots ceasing to be free rather
+than fill loss. Direct provider inventory also reports zero instances in the
+service's GCP project, so the previously observed 116 Spot L4 VMs have
+terminated and are no longer a live cost gate.
+
+This proves current automatic and cost convergence, but not the final
+correctness horizon. Four H200 intents/replicas 56079--56082 committed between
+04:43 and 04:46 UTC after revision 472. All four workloads were Kueue-admitted
+and their Pods became Ready, so scheduler admission is not the active blocker.
+Launches 56080 and 56082 completed provider success; launches 56079 and 56081
+instead timed out during post-create reclaim attestation, failed and quiesced,
+then were replaced automatically. That intermittent failure exposes the
+missing durable committed-intent-to-replica provider handoff specified as
+Serve056 below. Cold restart, successor-allocation, and the full production
+horizon remain unproven until that handoff and the admission-accounting
+follow-up are deployed. Revision 472 includes the
 merged PR
 #1624 retirement-shelter fix at
 `6a3605d7b11ab27eb3cb9006213055616ed781f8` and PR #1625's single pre-demand
@@ -197,7 +199,8 @@ authority facts above.
 
 Remaining work, in exact order:
 
-1. Qualify and merge the admission-accounting safety follow-up to #1625. Prove
+1. Qualify and merge PR #1626, the admission-accounting safety follow-up to
+   #1625. Prove
    pending-first/fresh-replica handoff ordering, unit-normalized global pending
    headroom, exact current-allocation replay debits, and all-version capacity
    retention until provider-down success.
@@ -210,21 +213,23 @@ Remaining work, in exact order:
    allocation, claim-edge, observation, ticket, or gate-generation rows. No
    JSON-only fallback, second replica UUID, EFS path, or provider path is
    introduced.
-3. Publish the immutable image and direct-Helm deploy it with `--reuse-values`;
+3. Make request demand/history and replica summaries controller-independent
+   and owner-filtered. Direct PostgreSQL reads must remain available while a
+   controller or provider call stalls; controller metadata is optional UI
+   enrichment, not a refresh dependency.
+4. Publish each reviewed immutable image and direct-Helm deploy it with
+   `--reuse-values`;
    do not update a `boltz-platform` runtime pin.
-4. Restart the controller child and prove the 44 surviving materialized Pods
-   are protected before its first autoscaler decision. Reactivate all 45
-   uncommitted retirement rows from durable evidence, replacing only the
-   independently disk-pressure-evicted Pod; do not manually delete a row or
-   begin provider teardown.
-5. Fill every currently schedulable compatible GPU and prove a fresh current
+5. Restart the controller child and then perform a normal service
+   stop/recreation. Prove the fresh service is born directly on the canonical
+   authority tuple and every surviving materialized Pod is protected before
+   the first autoscaler decision; do not manually delete replica rows.
+6. Fill every currently schedulable compatible GPU and prove a fresh current
    allocation is admitted from PostgreSQL before the load-balancer demand read,
    both paid scale decisions, and the final retirement commit. Publish an
    allocation successor, advance
    the ordinary-admission high-water, and expire a pool round between planning
    and commit; each must reject teardown and preserve routing.
-6. Canary-uncordon the three empty East nodes, then the loaded East node, and
-   verify bounded automatic fill without disturbing higher-priority work.
 7. Prove automatic backfill across every compatible free pool and a typed paid
    residual for every uncovered slot. The production performance gate is
    80--90 H200 workloads submitted within a few minutes with concurrent
@@ -235,9 +240,10 @@ Remaining work, in exact order:
    Pod takeover.
 8. Verify dashboard processing, queued, in-flight, and completed request totals
    remain fresh during the restart and provider-stall gates.
-9. Only after the full horizon remove EFS/RWX from the deployment and merge the
-   cleanup that deletes the volatile legacy fill-shelter bridge and its
-   transition-only tests.
+9. Merge the stacked cleanup that deletes the volatile legacy fill-shelter
+   bridge, compatibility decoders, and transition-only tests after the exact
+   horizon gates pass. No EFS/RWX addition or migration is part of this plan:
+   PostgreSQL is the sole correctness and request-observation store.
 
 Historical recovery record: PR #1614 reconstructed the exact frozen
 committed-intent profile for nine provider-present associations, and draft
