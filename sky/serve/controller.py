@@ -5924,7 +5924,6 @@ class SkyServeController:
         decision_autoscaler: autoscalers.Autoscaler,
         decision_version: int,
         reconcile_generation: int,
-        replica_infos: list[replica_managers.ReplicaInfo],
     ) -> bool:
         """Admit provider-free fill from PostgreSQL before demand planning."""
         if allocation is None or not allocation.pool_snapshots:
@@ -5935,21 +5934,30 @@ class SkyServeController:
         capacity_unit = (reserved_fill_planner.FillCapacityUnit.LOGICAL
                          if decision_autoscaler.replica_unit == 'logical' else
                          reserved_fill_planner.FillCapacityUnit.PHYSICAL)
-        committed_debits = self._committed_reserved_fill_debits(
-            allocation, replica_infos)
         try:
-            pending_debits = (
-                self._replica_manager.pending_reserved_fill_debits(allocation))
+            pending = self._replica_manager.pending_reserved_fill_snapshot(
+                allocation, capacity_unit)
+            # Pending -> COMMITTED plus replica insertion is one atomic,
+            # monotonic handoff. Reading pending first and a fresh replica
+            # ledger second can conservatively see both sides but can never
+            # miss both. Reversing this order can overspend a pool/card grant.
+            replica_infos = serve_state.get_replica_infos(self._service_name)
+            committed_debits = self._committed_reserved_fill_debits(
+                allocation, replica_infos)
+            all_committed_debits = (
+                self._coalesce_committed_reserved_fill_debits(
+                    committed_debits, pending.debits))
+            planned_capacity = (
+                decision_autoscaler.reserved_fill_materialized_capacity(
+                    replica_infos) + pending.capacity)
         except Exception as error:  # pylint: disable=broad-except
-            # Losing accepted grants from the planner debit would issue new
-            # intent keys and could reopen paid residual.  Wait for the next
-            # bounded reconciliation instead of guessing that none exist.
+            # Losing either side of the monotonic handoff could issue new
+            # intent keys. Wait for the next bounded reconciliation instead
+            # of guessing that no durable capacity exists.
             logger.warning(
-                'Reserved-fill pending-intent accounting failed closed: %s',
+                'Reserved-fill durable capacity accounting failed closed: %s',
                 common_utils.format_exception(error))
             return False
-        all_committed_debits = self._coalesce_committed_reserved_fill_debits(
-            committed_debits, pending_debits)
         plan = reserved_fill_planner.ReservedFillPlanner.plan(
             policy_revision=decision_version,
             reconcile_generation=max(1, reconcile_generation + 1),
@@ -5958,9 +5966,7 @@ class SkyServeController:
             service_version=decision_version,
             controller_owner=self._controller_owner_fingerprint,
             max_replicas=decision_autoscaler.max_replicas,
-            planned_replicas=(
-                decision_autoscaler.reserved_fill_materialized_capacity(
-                    replica_infos)),
+            planned_replicas=planned_capacity,
             capacity_unit=capacity_unit,
             committed_fill_debits=all_committed_debits,
             rotation_anchor=(
@@ -6135,17 +6141,10 @@ class SkyServeController:
                         self._replica_manager.invalidate_logical_reconcile_state(
                         )
                         logical_reconcile_invalidated = True
-                        pre_demand_replica_infos = (
-                            serve_state.get_replica_infos(self._service_name))
-                        if not self._scale_actuation_is_current(
-                                actuation_generation, decision_autoscaler,
-                                decision_version):
-                            return
                         reserved_fill_progress = (
                             self._accept_sequenced_reserved_fill(
                                 pre_demand_allocation, decision_autoscaler,
-                                decision_version, reconcile_generation,
-                                pre_demand_replica_infos))
+                                decision_version, reconcile_generation))
                         if not self._scale_actuation_is_current(
                                 actuation_generation, decision_autoscaler,
                                 decision_version):

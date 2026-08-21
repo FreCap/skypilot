@@ -18,7 +18,6 @@ from sky.jobs import state as managed_job_state
 from sky.serve import autoscaler_compatibility
 from sky.serve import autoscaler_decisions
 from sky.serve import constants
-from sky.serve import replica_info as replica_info_lib
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
@@ -717,7 +716,7 @@ class Autoscaler:
         admission transaction still enforces the service-wide maximum.
         """
         return sum(
-            self._fill_capacity_units(info)
+            self._service_ceiling_capacity_units(info)
             for info in replica_infos
             if self._reserved_fill_row_is_materialized(info))
 
@@ -1623,18 +1622,46 @@ class Autoscaler:
         del info
         return 1
 
-    @staticmethod
-    def _is_reversible_reserved_fill_retirement(
-            info: 'replica_managers.ReplicaInfo') -> bool:
-        """Whether a fill backend is off-route but not teardown-committed."""
-        return (
-            info.reserved_fill is True and info.is_zero_cost is True and
-            replica_info_lib.is_restart_recoverable_logical_retirement(info))
+    def _service_ceiling_capacity_units(
+            self, info: 'replica_managers.ReplicaInfo') -> int:
+        """Project any cleanup-unproven row into the current service unit."""
+        capacity_unit = (reserved_fill_planner.FillCapacityUnit.LOGICAL
+                         if self.replica_unit == 'logical' else
+                         reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+        if capacity_unit is reserved_fill_planner.FillCapacityUnit.PHYSICAL:
+            return 1
+        shapes: set[tuple[str, int]] = set()
+        resources_override = getattr(info, 'resources_override', None)
+        if resources_override is not None:
+            if not isinstance(resources_override, Mapping):
+                raise ValueError('Materialized replica resources override is '
+                                 'malformed.')
+            accelerators = resources_override.get('accelerators')
+            if accelerators is not None:
+                shapes.add(
+                    reserved_fill_planner.exact_accelerator_shape(accelerators))
+        try:
+            location = info.get_spot_location()
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError('Materialized replica location is malformed.') \
+                from error
+        if location is not None:
+            accelerators = getattr(location, 'accelerators', None)
+            if accelerators is not None:
+                shapes.add(
+                    reserved_fill_planner.exact_accelerator_shape(accelerators))
+        if len(shapes) != 1:
+            raise ValueError('Materialized replica has missing or conflicting '
+                             'accelerator shapes.')
+        _, accelerator_count = next(iter(shapes))
+        return capacity_unit.intent_cost(accelerator_count)
 
     def _reserved_fill_row_is_materialized(
             self, info: 'replica_managers.ReplicaInfo') -> bool:
-        return (not info.is_terminal or
-                self._is_reversible_reserved_fill_retirement(info))
+        """Whether the durable row may still own provider capacity."""
+        status = getattr(info, 'status_property', None)
+        return (status is None or getattr(status, 'sky_down_status', None)
+                != common_utils.ProcessStatus.SUCCEEDED)
 
     def sequenced_reserved_fill_holdings(
         self,

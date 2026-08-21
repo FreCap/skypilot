@@ -27,6 +27,7 @@ from sky.serve import service_spec
 from sky.serve import spot_placer
 from sky.serve import zero_cost_actuation
 from sky.serve import zero_cost_actuation_schema
+from sky.utils import common_utils
 from sky.utils.db import migration_utils
 
 pytestmark = pytest.mark.xdist_group(
@@ -111,7 +112,9 @@ def _plan(
 def actuation_database(empty_postgres, monkeypatch):
     config = migration_utils.get_alembic_config(empty_postgres,
                                                 migration_utils.SERVE_DB_NAME)
-    alembic_command.upgrade(config, '052')
+    # Exercise the 052 repository against the current Serve schema.  The
+    # shared services metadata includes columns introduced after 052.
+    alembic_command.upgrade(config, '055')
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         empty_postgres)
     incarnation = uuid.uuid4()
@@ -200,6 +203,78 @@ def test_grant_is_idempotent_and_allocates_no_replica(
     assert len(rows) == 2
     assert {row['state'] for row in rows} == {'GRANTED'}
     assert replica_count == 0
+
+
+def test_grant_locks_exclude_cleanup_proven_history(actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1)
+    _grant_plan(repository, plan, max_capacity=1)
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    replicas = serve_state_schema.replicas_table
+    with actuation_database.begin() as connection:
+        base = dict(
+            connection.execute(sqlalchemy.select(intents)).mappings().one())
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        terminal_rows = []
+        used_keys = {base['intent_idempotency_key']}
+        for ordinal in range(256):
+            key = f'{ordinal + 1:064x}'
+            while key in used_keys:
+                key = f'{int(key, 16) + 256:064x}'
+            used_keys.add(key)
+            row = dict(base)
+            row.update(intent_idempotency_key=key,
+                       state='TERMINAL',
+                       last_error='retained_history',
+                       updated_at=now,
+                       terminal_at=now)
+            terminal_rows.append(row)
+        connection.execute(sqlalchemy.insert(intents), terminal_rows)
+        for replica_id in range(1, 33):
+            cleaned = _replica_for_intent(plan.intents[0], replica_id)
+            cleaned.status_property.sky_down_status = (
+                common_utils.ProcessStatus.SUCCEEDED)
+            cleaned.status_property.is_scale_down = True
+            connection.execute(
+                sqlalchemy.insert(replicas).values(
+                    **serve_state._replica_row_values('svc', replica_id,
+                                                      cleaned)))
+
+    selected_terminal_key = terminal_rows[0]['intent_idempotency_key']
+    excluded_terminal_key = terminal_rows[-1]['intent_idempotency_key']
+    with actuation_database.connect() as locking_connection:
+        transaction = locking_connection.begin()
+        try:
+            rows = zero_cost_actuation._locked_grant_intent_rows(
+                locking_connection,
+                service_name='svc',
+                plan_keys=(selected_terminal_key,))
+            assert {row['intent_idempotency_key'] for row in rows
+                   } == {base['intent_idempotency_key'], selected_terminal_key}
+            locked_replica_capacity = getattr(zero_cost_actuation,
+                                              '_locked_replica_capacity')
+            # pylint: disable-next=missing-kwoa
+            assert locked_replica_capacity(locking_connection,
+                                           service_name='svc',
+                                           capacity_unit=reserved_fill_planner.
+                                           FillCapacityUnit.PHYSICAL) == 0
+            # Excluded history is not merely skipped in Python: it is not
+            # locked by the admission transaction.
+            with actuation_database.begin() as contender:
+                contender.execute(
+                    sqlalchemy.select(intents.c.intent_idempotency_key).where(
+                        intents.c.intent_idempotency_key ==
+                        excluded_terminal_key).with_for_update(
+                            nowait=True)).one()
+                contender.execute(
+                    sqlalchemy.select(replicas.c.replica_id).where(
+                        replicas.c.service_name == 'svc',
+                        replicas.c.replica_id == 32).with_for_update(
+                            nowait=True)).one()
+        finally:
+            transaction.rollback()
 
 
 def test_status_summary_keeps_intents_separate_from_replicas(
@@ -378,6 +453,212 @@ def test_pending_grants_enforce_headroom_and_debit_paid_residual(
                                              {'l4': 0}) == {
                                                  'l4': 1
                                              }
+
+
+def test_pending_fill_snapshot_is_global_unit_normalized_and_exact(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1,
+                 accelerator_count=8,
+                 capacity_unit=reserved_fill_planner.FillCapacityUnit.LOGICAL)
+    receipt = _grant_plan(repository, plan, max_capacity=8)
+    assert len(receipt.accepted) == 1
+    with actuation_database.begin() as connection:
+        row = dict(
+            connection.execute(
+                sqlalchemy.select(
+                    zero_cost_actuation_schema.
+                    serve_zero_cost_actuation_intents_table)).mappings().one())
+        row.update(
+            intent_idempotency_key='f' * 64,
+            service_hash='older-service-hash',
+            allocation_generation=plan.allocation_generation + 1,
+            allocation_input_sha256='f' * 64,
+            allocation_claim_generation=plan.allocation_claim_generation + 1,
+        )
+        connection.execute(
+            sqlalchemy.insert(
+                zero_cost_actuation_schema.
+                serve_zero_cost_actuation_intents_table).values(**row))
+
+    logical = repository.pending_fill_snapshot(
+        service_name='svc',
+        service_hash=_SERVICE_HASH,
+        allocation_generation=plan.allocation_generation,
+        allocation_input_sha256=plan.allocation_input_sha256,
+        allocation_claim_generation=plan.allocation_claim_generation,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.LOGICAL)
+    physical = repository.pending_fill_snapshot(
+        service_name='svc',
+        service_hash=_SERVICE_HASH,
+        allocation_generation=plan.allocation_generation,
+        allocation_input_sha256=plan.allocation_input_sha256,
+        allocation_claim_generation=plan.allocation_claim_generation,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+
+    # Both current and old-incarnation grants consume service-global headroom,
+    # but only the exact current allocation becomes a planner replay debit.
+    assert logical.capacity == 16
+    assert physical.capacity == 2
+    assert logical.debits == physical.debits
+    assert len(logical.debits) == 1
+    assert logical.debits[0].replica_slots == 1
+
+
+def test_grant_ceiling_counts_materialized_old_version(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1)
+    old = _replica_for_intent(plan.intents[0], 1)
+    old.version = plan.intents[0].service_version - 1
+    old.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
+    with actuation_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                **serve_state._replica_row_values('svc', 1, old)))
+
+    receipt = _grant_plan(repository, plan, max_capacity=1)
+
+    assert not receipt.accepted
+    assert len(receipt.deferred) == 1
+    assert receipt.deferred[0].reason is (
+        reserved_fill_planner.DeferredFillReason.MAX_REPLICAS_EXHAUSTED)
+
+
+def test_logical_grant_ceiling_projects_old_physical_row_from_exact_shape(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    physical_plan = _plan(
+        free_slots=1,
+        accelerator_count=8,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+    old = _replica_for_intent(physical_plan.intents[0], 1)
+    old.version = physical_plan.intents[0].service_version - 1
+    assert old.planned_capacity == 1
+    with actuation_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                **serve_state._replica_row_values('svc', 1, old)))
+
+    logical_plan = _plan(
+        free_slots=1,
+        accelerator_count=8,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.LOGICAL)
+    receipt = _grant_plan(repository, logical_plan, max_capacity=8)
+
+    assert not receipt.accepted
+    assert len(receipt.deferred) == 1
+    assert receipt.deferred[0].reason is (
+        reserved_fill_planner.DeferredFillReason.MAX_REPLICAS_EXHAUSTED)
+
+
+def test_logical_grant_ceiling_rejects_conflicting_persisted_shapes(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    physical_plan = _plan(
+        free_slots=1,
+        accelerator_count=8,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+    old = _replica_for_intent(physical_plan.intents[0], 1)
+    assert old.resources_override is not None
+    old.resources_override['accelerators'] = {'A100': 8}
+    with actuation_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                **serve_state._replica_row_values('svc', 1, old)))
+
+    logical_plan = _plan(
+        free_slots=1,
+        accelerator_count=8,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.LOGICAL)
+    with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict,
+                       match='conflicting accelerator shapes'):
+        _grant_plan(repository, logical_plan, max_capacity=16)
+
+
+@pytest.mark.parametrize(('storage_version', 'replica_info_version'), [(2, 18),
+                                                                       (1, 17)])
+def test_logical_capacity_rejects_noncanonical_replica_state_version(
+        storage_version, replica_info_version) -> None:
+    state = {
+        'replica_info_version': replica_info_version,
+        'resources_override': {
+            'accelerators': {
+                'H200': 8
+            }
+        },
+        'location': None,
+    }
+
+    with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict,
+                       match='replica state is malformed'):
+        zero_cost_actuation._replica_capacity_for_unit(
+            storage_version, state,
+            reserved_fill_planner.FillCapacityUnit.LOGICAL)
+
+
+def test_grant_ceiling_releases_cleanup_proven_old_version(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1)
+    cleaned = _replica_for_intent(plan.intents[0], 1)
+    cleaned.version = plan.intents[0].service_version - 1
+    cleaned.status_property.sky_launch_status = (
+        common_utils.ProcessStatus.SUCCEEDED)
+    cleaned.status_property.sky_down_status = (
+        common_utils.ProcessStatus.SUCCEEDED)
+    cleaned.status_property.is_scale_down = True
+    with actuation_database.begin() as connection:
+        values = serve_state._replica_row_values('svc', 1, cleaned)
+        assert values['sky_down_status'] == 'SUCCEEDED'
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.replicas_table).values(**values))
+
+    receipt = _grant_plan(repository, plan, max_capacity=1)
+
+    assert len(receipt.accepted) == 1
+    assert not receipt.deferred
+
+
+def test_grant_ceiling_counts_uncommitted_shutting_down_capacity(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1)
+    retiring = _replica_for_intent(plan.intents[0], 1)
+    retiring.status_property.sky_launch_status = (
+        common_utils.ProcessStatus.SUCCEEDED)
+    retiring.status_property.sky_down_status = (
+        common_utils.ProcessStatus.SCHEDULED)
+    retiring.status_property.is_scale_down = True
+    retiring.status_property.wait_for_idle_before_termination = True
+    retiring.status_property.logical_retirement_version = retiring.version
+    retiring.status_property.logical_retirement_controller_epoch = 'epoch'
+    retiring.status_property.logical_retirement_generation = 7
+    retiring.status_property.logical_retirement_target_capacity = 0
+    retiring.status_property.logical_retirement_confirmed_generation = 7
+    retiring.status_property.logical_retirement_bounded_deadline = False
+    retiring.status_property.logical_retirement_committed = False
+    with actuation_database.begin() as connection:
+        values = serve_state._replica_row_values('svc', 1, retiring)
+        assert values['status'] == 'SHUTTING_DOWN'
+        assert values['sky_down_status'] == 'SCHEDULED'
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.replicas_table).values(**values))
+
+    receipt = _grant_plan(repository, plan, max_capacity=1)
+
+    assert not receipt.accepted
+    assert len(receipt.deferred) == 1
+    assert receipt.deferred[0].reason is (
+        reserved_fill_planner.DeferredFillReason.MAX_REPLICAS_EXHAUSTED)
 
 
 @pytest.mark.parametrize(('utilization_gate', 'expected_intents'), [(False, 2),
@@ -582,9 +863,14 @@ def test_replica_and_intent_commit_in_one_transaction(
             replica_record_id=record_id,
             replica_info=info)
 
+    replay = _grant_plan(repository, plan, max_capacity=1)
+
     intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
     with actuation_database.connect() as connection:
         row = connection.execute(sqlalchemy.select(intents)).mappings().one()
+    assert replay.accepted == (reserved_fill_planner.AcceptedFillIntent(
+        plan.intents[0].idempotency_key, 1),)
+    assert not replay.deferred
     assert row['state'] == 'COMMITTED'
     assert row['replica_id'] == 1
     assert row['replica_record_id'] == record_id

@@ -440,13 +440,29 @@ def test_materialized_capacity_and_receipt_driven_rotation_use_configured_unit(
     autoscaler = _LogicalAccountingAutoscaler('svc',
                                               _spec(replica_unit='logical'))
     replicas = [
-        _replica(1, planned_capacity=8),
-        _replica(2, version=0, planned_capacity=4),
+        _replica(1, width=4, planned_capacity=4),
+        # A physical old-version row persists planned_capacity=1. The current
+        # logical service ceiling derives its eight slots from exact shape.
+        _replica(2, width=8, version=0, planned_capacity=1),
         _replica(3,
+                 width=100,
                  planned_capacity=100,
                  status=serve_state.ReplicaStatus.FAILED),
     ]
+    # FAILED is lifecycle state, not provider cleanup evidence. Capacity is
+    # released only after the normalized provider-down result succeeds.
+    assert autoscaler.reserved_fill_materialized_capacity(replicas) == 112
+    replicas[2].status_property.sky_down_status = (
+        autoscalers.common_utils.ProcessStatus.SUCCEEDED)
     assert autoscaler.reserved_fill_materialized_capacity(replicas) == 12
+
+    conflicting = _replica(4,
+                           width=8,
+                           planned_capacity=1,
+                           location=_location('east-context', 'A100',
+                                              8).to_location())
+    with pytest.raises(ValueError, match='conflicting accelerator shapes'):
+        autoscaler.reserved_fill_materialized_capacity([conflicting])
 
     snapshot = _snapshot('east-context', 'uid-east', 'H200', 1)
     autoscaler.collect_reserved_capacity_pools(

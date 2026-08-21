@@ -211,8 +211,6 @@ def replica_may_consume_physical_capacity(info: Any) -> bool:
     from the caller's snapshot.  Missing or malformed teardown state therefore
     fails closed.
     """
-    if not info.is_terminal:
-        return True
     status_property = getattr(info, 'status_property', None)
     return (status_property is None or
             getattr(status_property, 'sky_down_status',
@@ -3165,12 +3163,14 @@ class ReplicaManager:
         del plan
         raise NotImplementedError
 
-    def pending_reserved_fill_debits(
-        self, allocation: reserved_fill_planner.AuthenticatedAllocationMap
-    ) -> tuple[reserved_fill_planner.CommittedFillDebit, ...]:
-        """Return accepted-but-unmaterialized debits for one allocation."""
-        del allocation
-        return ()
+    def pending_reserved_fill_snapshot(
+        self,
+        allocation: reserved_fill_planner.AuthenticatedAllocationMap,
+        capacity_unit: reserved_fill_planner.FillCapacityUnit,
+    ) -> zero_cost_actuation.PendingFillSnapshot:
+        """Return service-wide headroom plus exact-map pending debits."""
+        del allocation, capacity_unit
+        raise NotImplementedError
 
     def install_durable_zero_cost_actuation(self) -> None:
         """Install a committed durable reserved-fill authority."""
@@ -8774,10 +8774,12 @@ class SkyPilotReplicaManager(ReplicaManager):
             raise ValueError('the current service maximum is malformed')
         return maximum
 
-    def pending_reserved_fill_debits(
-        self, allocation: reserved_fill_planner.AuthenticatedAllocationMap
-    ) -> tuple[reserved_fill_planner.CommittedFillDebit, ...]:
-        """Return exact durable grants still awaiting replica rows."""
+    def pending_reserved_fill_snapshot(
+        self,
+        allocation: reserved_fill_planner.AuthenticatedAllocationMap,
+        capacity_unit: reserved_fill_planner.FillCapacityUnit,
+    ) -> zero_cost_actuation.PendingFillSnapshot:
+        """Return one bounded planning read of every live durable grant."""
         allocation.__post_init__()
         mode = self._reserved_fill_actuation_mode
         if mode is not zero_cost_actuation.ActuationMode.DURABLE_INTENT:
@@ -8787,13 +8789,14 @@ class SkyPilotReplicaManager(ReplicaManager):
         if not isinstance(service_hash, str) or not service_hash:
             raise zero_cost_actuation.ZeroCostActuationConflict(
                 'Reserved-fill manager has no service incarnation.')
-        return self._zero_cost_actuation_repository.pending_debits(
+        return self._zero_cost_actuation_repository.pending_fill_snapshot(
             service_name=self._service_name,
             service_hash=service_hash,
             allocation_generation=allocation.allocation_generation,
             allocation_input_sha256=allocation.allocation_input_sha256,
             allocation_claim_generation=(
-                allocation.allocation_claim_generation))
+                allocation.allocation_claim_generation),
+            capacity_unit=capacity_unit)
 
     def install_durable_zero_cost_actuation(self) -> None:
         """Publish a committed one-way promotion to manager workers."""
