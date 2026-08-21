@@ -156,11 +156,11 @@ def _demand_report(now: float,
 def capacity_database(empty_postgres, monkeypatch):
     serve_config = migration_utils.get_alembic_config(
         empty_postgres, migration_utils.SERVE_DB_NAME)
-    # Capacity admission uses the current service metadata and, as of
-    # Serve052, atomically accounts for grant-before-row intents.  Keep the
-    # fixture at the current schema head while retaining the focused Serve050
-    # behavioral assertions below.
-    alembic_command.upgrade(serve_config, '052')
+    # Capacity admission uses the current service metadata and atomically
+    # accounts for grant-before-row intents. Keep the behavioral fixture at
+    # the current additive head; revision-specific migration tests build their
+    # historical schemas separately below.
+    alembic_command.upgrade(serve_config, migration_utils.SERVE_VERSION)
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         empty_postgres)
     incarnation = uuid.uuid4()

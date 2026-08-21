@@ -51,7 +51,6 @@ from sky.serve.lb_cutover_state import lb_cutover_kubernetes_guard as _lb_guard
 from sky.serve.serve_statuses import ReplicaStatus
 from sky.serve.serve_statuses import ServiceStatus
 from sky.server.requests import postgres_schema as request_postgres_schema
-from sky.skylet import constants as skylet_constants
 from sky.utils import common_utils
 from sky.utils import locks
 from sky.utils import yaml_utils
@@ -862,19 +861,25 @@ def add_service(
          controller_job_projection, controller_work_cache,
          worker_placement_projections))
     engine = _db_manager.get_engine()
-    if owner_user_id is None:
-        owner_user_id = os.environ.get(skylet_constants.USER_ID_ENV_VAR)
-    if owner_user_name is None:
-        owner_user_name = os.environ.get(skylet_constants.USER_ENV_VAR)
-    if not common_utils.is_valid_user_hash(owner_user_id):
-        raise ValueError('Service owner_user_id is invalid.')
     owner_columns_available = {'owner_user_id', 'owner_user_name'} <= {
         column['name']
         for column in sqlalchemy.inspect(engine).get_columns('services')
     }
-    if not isinstance(owner_user_name, str) or not owner_user_name:
-        raise ValueError('Service owner_user_name is invalid.')
-    if (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value and
+    # Serve055 ownership is a central lifecycle authority. Controller-local
+    # SQLite rows and explicit legacy PostgreSQL registrations predate that
+    # authority and must remain representable without inheriting ambient
+    # process identity.
+    is_central_lifecycle_birth = (
+        engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value and
+        lifecycle_epoch is not None)
+    owner_identity_present = (owner_user_id is not None or
+                              owner_user_name is not None)
+    if is_central_lifecycle_birth or owner_identity_present:
+        if not common_utils.is_valid_user_hash(owner_user_id):
+            raise ValueError('Service owner_user_id is invalid.')
+        if not isinstance(owner_user_name, str) or not owner_user_name:
+            raise ValueError('Service owner_user_name is invalid.')
+    if ((is_central_lifecycle_birth or owner_identity_present) and
             not owner_columns_available):
         raise RuntimeError('Serve055 owner authority is not installed.')
     projection_columns_available = _require_projection_columns_if_nonnull(
