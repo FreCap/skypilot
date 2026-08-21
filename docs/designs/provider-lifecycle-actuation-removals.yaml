@@ -3777,7 +3777,7 @@ artifacts:
   locators:
   - kind: file_digest
     path: sky/templates/kubernetes-ray.yml.j2
-    sha256: dcb8b332408ffadaf92882a2b510fb9acfb36e5196757932957fb7826d395891
+    sha256: 0a0475194589c7f50501da7a5b267e8d59f28a669f9470aef46a3502c66b5392
   - kind: runtime_metadata
     path: sky/utils/kubernetes_template_source.py
     name: _BUILTIN_KUBERNETES_MONOLITH_SIZE
