@@ -151,7 +151,8 @@ PostgreSQL owns:
   clusters;
 - log-stream identity, ordered segment metadata, terminal markers, and typed
   gap records;
-- migration inventory, item result, manifest digest, and cutover receipt; and
+- migration-operation provider intent, inventory, item result, manifest digest,
+  and cutover receipt; and
 - all existing request, queue, job, Serve, config, Casbin authorization,
   permission-cache generation, cluster, and generated-SSH structured state.
 
@@ -179,6 +180,16 @@ and constraints are contract, not implementation suggestions:
   of the qualified policy probe. Changing that tuple requires a new storage
   generation; a Helm value or environment variable can only advertise a
   capability that exactly matches it and can never select the target;
+- migration-operation intents keyed by an immutable operation ID, with a
+  compare-and-swapped per-installation intent head and immutable source
+  installation and EFS identity, source-manifest digest, source protocol/
+  generation/incarnation, candidate generation, complete provider-target tuple,
+  and qualified policy-probe receipt. Binding fields never change. Receipt-
+  backed operation state advances only
+  `PREPARED -> IMPORTING -> VERIFIED -> ACTIVATED`, or to terminal `ABANDONED`;
+  operation-scoped provider-call authorizations and receipts record terminal or
+  quiescence evidence, and only one nonterminal intent may own a source/
+  candidate pair;
 - logical upload heads unique on
   `(storage_generation, tenant_id, object_kind, logical_blob_id)`, containing a
   monotonic session epoch, current session ID, authority incarnation, and
@@ -196,7 +207,8 @@ and constraints are contract, not implementation suggestions:
   chunk count or limit set is rejected. A terminal pre-publication session
   remains immutable audit evidence but may be superseded by one freshly fenced
   session epoch; concurrent successor creation converges through the upload-head
-  compare-and-swap;
+  compare-and-swap. Every multipart-create, part, and finalizer provider-call
+  lease expiry is constrained to be no later than `idle_deadline_at`;
 - upload attempts unique on `(upload_session_id, attempt_epoch)`, with a fresh
   authority generation/incarnation and provider-target identity, object
   UUID/key, S3 multipart upload ID and creation receipt, multipart-cleanup
@@ -247,6 +259,15 @@ lease acquisition/renewal, or failed provider call does not refresh it. The
 idle timeout and resulting deadlines use the PostgreSQL clock and are fixed by
 the session's admitted limits; pod-local clocks and S3 timestamps are not
 authority.
+
+Provider-call lease acquisition and renewal lock the current session and use
+database time. They are rejected when database time is at or past
+`idle_deadline_at`; otherwise the committed expiry is
+`min(database_now + lease_duration, idle_deadline_at)`. Renewal cannot move the
+idle deadline or extend a lease beyond it. Durable progress may advance the
+deadline only through the receipt transaction above. Thus even a live or stuck
+owner cannot renew forever, and terminalization at or after the idle deadline
+waits only for a lease whose maximum expiry is that same deadline.
 
 The first-chunk allocation path owns the correctness transition. While locking
 the logical head and current session, it may compare-and-swap an unpublished
@@ -314,17 +335,52 @@ in their server-owned roots. They cannot list object prefixes, copy objects,
 delete completed objects or versions, change bucket configuration, or alter the
 KMS key.
 
-Before any provider call, allocation locks the storage-authority row and reads
-the exact target tuple committed for that generation. It derives a random key
-under that server root and copies the target identity, authority generation,
-and authority incarnation into the attempt or log-segment allocation. Any
-projected bucket, region, owner, root, KMS, or policy-capability hint must equal
-the PostgreSQL tuple byte-for-byte after canonicalization; absence or mismatch
-fails readiness and the call is not issued. IAM independently grants only that
-tuple. The hint and IAM grant prove capability but neither is a target selector.
-An object read continues to use its own committed exact identity, including
-after an authorized later generation; prefix discovery and "the currently
-configured bucket" are never read authority.
+Before any new runtime blob or log publication provider call, allocation locks
+the storage-authority row and reads the exact target tuple committed for that
+generation. It derives a random key under that server root and copies the
+target identity, authority generation, and authority incarnation into the
+attempt or log-segment allocation. Any projected bucket, region, owner, root,
+KMS, or policy-capability hint must equal the PostgreSQL tuple byte-for-byte
+after canonicalization; absence or mismatch fails readiness and the call is not
+issued. IAM independently grants only that tuple. The hint and IAM grant prove
+capability but neither is a target selector. Cleanup uses only its recorded
+attempt target as defined below. An object read continues to use its own
+committed exact identity, including after an authorized later generation;
+prefix discovery and "the currently configured bucket" are never read
+authority.
+
+The one migration importer uses a preparatory intent in the same PostgreSQL
+authority because it must publish immutable S3 bytes before runtime changes
+from `LEGACY_EFS`. After the final source inventory but before its first
+provider call, an explicit prepare-import transaction locks the current
+storage-authority row and migration-intent head. It verifies the installation,
+source EFS identity and manifest digest, source protocol/generation/
+incarnation, candidate generation, complete target tuple, and qualified policy-
+probe receipt, then compare-and-swaps the head to a new operation ID and commits
+the immutable `PREPARED` intent. A nonmatching source, existing nonterminal
+intent, reused operation ID, or failed CAS writes no intent and permits no S3
+call.
+
+Immediately before every importer S3 call, an allocation/authorization
+transaction locks and revalidates the exact `PREPARED` or `IMPORTING` intent,
+its current head ownership, unchanged source authority, candidate generation,
+target, and probe receipt, and records the operation-scoped call authorization.
+The first authorization advances `PREPARED` to `IMPORTING` in that same
+transaction. Every retry and reconciliation does the same; every response-
+receipt transaction re-locks and revalidates before recording an effect. Import
+allocations, call authorizations, and receipts stamp the operation ID and full
+target identity. A mismatch, another state, or `ABANDONED` intent fails closed;
+a late provider response can only leave unreferenced bytes under its operation-
+scoped random key. The operation may become `VERIFIED` only when every manifest
+item has its exact receipt and every call authorization has terminal or
+execution-quiescence evidence. The final activation transaction locks the
+authority, intent head, and `VERIFIED` intent, compare-and-swaps the exact
+recorded source to its candidate generation, requires the full target, probe,
+source protocol/generation/incarnation, installation, manifest, and operation
+binding to match, commits the imported catalog and `S3_V1` authority, and marks
+that same intent `ACTIVATED` atomically. This intent authorizes only the bounded
+import operation. It neither selects the runtime protocol nor permits runtime
+S3 writes or EFS/S3 dual-write.
 
 Every committed object record includes:
 
@@ -362,10 +418,11 @@ region, bucket, key, upload ID, expected owner, authority generation/
 incarnation, and creation receipt. Cleanup never substitutes the current
 process target. It is idempotent and never unfences the attempt. Because an
 in-flight `UploadPart` may finish after an abort, cleanup waits out every
-recorded provider-call lease, repeats exact abort as needed, and calls
-`ListParts` until the upload is absent or the part list is empty before
-recording `CONFIRMED_ABSENT`. Lost abort acknowledgement, retryable provider
-failure, or an unexpectedly nonempty part list leaves the receipt retryable.
+recorded provider-call lease, each already capped at its session idle deadline,
+repeats exact abort as needed, and calls `ListParts` until the upload is absent
+or the part list is empty before recording `CONFIRMED_ABSENT`. Lost abort
+acknowledgement, retryable provider failure, or an unexpectedly nonempty part
+list leaves the receipt retryable.
 The existing bounded maintenance loop retries that same repository operation;
 successor creation does not wait for provider cleanup because it uses a
 different upload ID and key. A prefix-scoped
@@ -469,11 +526,12 @@ reference.
    path while computing its checksum and size, uploads the corresponding S3
    part, and commits the part receipt under the attempt. A row/advisory lease on
    `(session, attempt, part)` permits only one provider call for a part at a
-   time, preventing a concurrent overwrite from disagreeing with its receipt.
-   Part numbers are
-   bounded by S3's 10,000-part limit and every non-final part satisfies S3's
-   minimum size. A duplicate part is accepted only if its durable checksum and
-   size match.
+   time and uses the database-clock acquisition/renewal cap above, preventing a
+   concurrent overwrite from disagreeing with its receipt or a live owner from
+   extending provider authority beyond the session idle deadline. Part numbers
+   are bounded by S3's 10,000-part limit and every non-final part satisfies
+   S3's minimum size. A duplicate part is accepted only if its durable checksum
+   and size match.
    A provider-call lease that expires or loses its owning process is never
    reassigned against the same multipart upload: the attempt becomes
    `REJECTED`, its exact upload receives a durable cleanup receipt, and a fresh
@@ -726,12 +784,15 @@ verification before serving requests or acquiring provider authority.
 The `S3_V1` commit records the complete immutable target tuple, policy-contract
 version and probe receipt, minimum storage capability, and qualified image,
 chart, values, and rendered-manifest digests in its receipt. Activation is
-refused unless the database head, importer manifest, quiescence evidence, exact
-S3/KMS policy probe, and intended deployment digests match. After that commit,
-an S3-capable process that cannot implement or reach the recorded target fails
-readiness; it cannot select EFS or another bucket. Native rollback to a
-pre-feature image is unsupported and fails the database-head gate. The stacked
-cleanup removes `LEGACY_EFS` code after the acceptance horizon.
+refused unless the database head, quiescence evidence, exact S3/KMS policy
+probe, and intended deployment digests match. EFS migration additionally
+requires the current `VERIFIED` migration intent and its importer manifest to
+match every immutable binding; the intent becomes `ACTIVATED` in the same
+transaction. After that commit, an S3-capable process that cannot implement or
+reach the recorded target fails readiness; it cannot select EFS or another
+bucket. Native rollback to a pre-feature image is unsupported and fails the
+database-head gate. The stacked cleanup removes `LEGACY_EFS` code after the
+acceptance horizon.
 
 A fresh guarded-HA database never bootstraps through EFS. The same activation
 command has a fresh-install mode that requires an empty product database, the
@@ -869,21 +930,38 @@ No production authority changes in these steps.
 2. Drain active request execution and prove no unquiesced provider handler,
    launch, update, or teardown remains.
 3. Fence the application and scale API, executor, and controller roles to zero.
-4. Capture a final exact EFS inventory and copy required opaque bytes to
-   immutable S3 versions.
-5. Verify every object twice by exact version, size, and digest. Commit imported
-   object rows, logical aliases, owner references, manifest digest, the complete
-   provider-target tuple and policy-probe receipt, qualified image/chart/values/
-   manifest identities, and one S3_V1 generation receipt in one PostgreSQL
-   transaction.
-6. After that commit, advance the stopped release's non-lowerable fence Secret
+4. Capture the final exact EFS inventory and source manifest without issuing an
+   S3 mutation.
+5. Before the first importer S3 call, commit the migration-operation intent by
+   the PostgreSQL compare-and-swap defined above. It binds the installation,
+   exact EFS source/manifest, source generation/incarnation, immutable operation
+   ID, candidate generation, complete provider target, and policy-probe receipt.
+6. Copy required opaque bytes to operation-scoped random keys. Every call and
+   receipt revalidates the exact intent. Verify every object twice by exact
+   version, size, and digest, persist its item receipt, and advance only that
+   operation to `VERIFIED` after the complete manifest succeeds and every
+   operation-scoped provider call has terminal or execution-quiescence evidence.
+7. In one PostgreSQL transaction, lock the current authority, intent head, and
+   exact `VERIFIED` intent; compare-and-swap its recorded source to the candidate
+   S3_V1 generation; require the installation, source EFS identity, manifest,
+   source protocol/generation/incarnation, candidate generation, target, probe,
+   and operation fields to match; commit imported object rows, logical aliases,
+   owner references, qualified image/chart/values/manifest identities, and the
+   generation receipt; and mark the intent `ACTIVATED`. Partial commit is
+   impossible.
+8. After that commit, advance the stopped release's non-lowerable fence Secret
    to the committed S3_V1 generation, then start only the PVC-free release. A
-   failure after step 5 remains a fix-forward outage; it cannot reopen EFS.
+   failure after step 7 remains a fix-forward outage; it cannot reopen EFS.
 
-Before the generation transaction commits, the qualified transition release
-may be restarted in `LEGACY_EFS` mode after reconciling the failed attempt. A
-pre-feature image is already rejected by the central schema head. After commit,
-EFS can no longer be selected as authority.
+Before the generation transaction commits, the same operation may resume from
+its durable receipts while all application writers remain fenced. Alternatively
+the operator may terminalize it as `ABANDONED` after provider quiescence; its
+immutable bytes remain unreferenced garbage, every later importer call fails
+closed, and a new operation requires a new intent-head CAS. Only then may the
+qualified transition release restart in `LEGACY_EFS` mode. The preparatory
+intent never changes runtime protocol selection. A pre-feature image is already
+rejected by the central schema head. After activation commits, EFS can no longer
+be selected as authority.
 
 ### Fix-forward activation
 
@@ -953,13 +1031,15 @@ The dependency graph and minimum clean stack are:
 3. **D2 -- inert PostgreSQL storage foundation.** Add the protocol/generation,
    exact provider-target tuple, incarnation and `FENCED`/`RECOVERED` restore
    receipt, upload-head/session/attempt/part and cleanup-receipt,
-   object/alias/reference, log-stream/writer/segment/gap, and migration-receipt
-   schema. Stamp every mutable writer/lease with authority generation and
-   incarnation; add database-clock durable-progress/deadline fields and the
-   indexed current-head/old-incarnation recovery queries. Add the repository
-   with the one on-access abandonment/restore-fence compare-and-swap and
-   caller-owned transaction support on the existing mandatory central migration
-   head. The migration creates no authority row and changes no runtime routing.
+   object/alias/reference, log-stream/writer/segment/gap, migration-intent head
+   and operation, and migration-receipt schema. Stamp every mutable writer/lease
+   with authority generation and incarnation; add database-clock durable-
+   progress/deadline fields, a constraint that provider-lease expiry cannot
+   exceed the idle deadline, and indexed current-head/old-incarnation recovery
+   queries. Add the repository with the one on-access abandonment/restore-fence
+   compare-and-swap, migration-intent CAS, and caller-owned transaction support
+   on the existing mandatory central migration head. The migration creates no
+   authority row or intent and changes no runtime routing.
    A separately invoked, idempotent `initialize-legacy` command records the
    exact retained installation, expected incarnation, EFS identity, and
    qualified transition digest before those processes start; it refuses a
@@ -971,8 +1051,9 @@ The dependency graph and minimum clean stack are:
    lifecycle/policy probes, logical aliasing, and the object
    `PUBLISHED_UNREFERENCED` state and upload-session `PUBLISHED` state. Implement
    database-clock idle fencing on first-chunk access, exact stale-epoch
-   rejection, and receipt-backed abort/ListParts cleanup through the existing
-   bounded maintenance loop; cleanup never gates a fresh-key successor.
+   rejection, database-clock provider-lease acquisition/renewal capped at the
+   idle deadline, and receipt-backed abort/ListParts cleanup through the
+   existing bounded maintenance loop; cleanup never gates a fresh-key successor.
    Integrate owner references into request, Managed Job, and Serve admission
    transactions. It depends on D2 and the static S3 boundary.
 5. **D4 -- scoped materialization.** Replace permanent blob paths in guarded HA
@@ -1001,24 +1082,26 @@ The dependency graph and minimum clean stack are:
    limits, readiness probes, and storage-negative render tests. It depends on
    D1 and all applicable D3--D6 runtime removals.
 9. **D8 -- importer, rehearsal, and activation command.** Inventory EFS and
-   PostgreSQL, import exact versions, construct owner references, bind the exact
-   S3 target/policy receipt while committing the one-way generation, support
-   receipt-backed fresh-database S3_V1 bootstrap, and emit the verification
-   bundle. Add the separate explicit restore operation: atomically rotate only
-   incarnation into a `FENCED` receipt; then, in bounded locked PostgreSQL
-   transactions, terminalize each active old-incarnation session and attempt,
-   advance every old-incarnation upload head to the new incarnation/fence, and
-   invalidate old log leases. Mark that same receipt `RECOVERED` before writer
-   readiness. Provider abort cleanup can continue afterward through the
-   existing maintenance path.
+   PostgreSQL, CAS-commit the immutable migration-operation intent before the
+   first importer S3 call, import exact versions while revalidating and stamping
+   that intent, construct owner references, and activate only by atomically
+   matching the exact verified intent while committing the one-way generation.
+   Support receipt-backed fresh-database S3_V1 bootstrap and emit the
+   verification bundle. Add the separate explicit restore operation:
+   atomically rotate only incarnation into a `FENCED` receipt; then, in bounded
+   locked PostgreSQL transactions, terminalize each active old-incarnation
+   session and attempt, advance every old-incarnation upload head to the new
+   incarnation/fence, and invalidate old log leases. Mark that same receipt
+   `RECOVERED` before writer readiness. Provider abort cleanup can continue
+   afterward through the existing maintenance path.
    Importer, cutover, Helm migration, and normal startup never rotate
    incarnation. It depends on D2--D7.
 10. **D9 -- production activation.** Apply the dedicated minimal S3/KMS/IAM
     slice with the completed-object delete deny and conditional-write policy,
     deploy the transition image in `LEGACY_EFS`, rehearse,
-    freeze/import/commit, and deploy the PVC-free `S3_V1` chart. Static S3
-    infrastructure can be prepared in parallel after D2, but activation depends
-    on D8.
+    freeze/prepare-intent/import/commit, and deploy the PVC-free `S3_V1` chart.
+    Static S3 infrastructure can be prepared in parallel after D2, but
+    activation depends on D8.
 11. **D10 -- stacked removal.** Delete `LEGACY_EFS`, importer/transition code,
     filesystem fallbacks, compatibility metrics/tests, and the exact SkyPilot
     EFS client path after acceptance. Author this draft alongside D2, the first
@@ -1050,7 +1133,8 @@ lines. The common log path is the largest portion.
   mixed-version rejection pass against real PostgreSQL. Schema constraints and
   repository tests cover the exact authority target, authority incarnation on
   every mutable writer, upload durable-progress/deadline fields, head/session/
-  attempt fences, and cleanup receipts.
+  attempt fences, provider-lease expiry constraint, cleanup receipts, and the
+  unique migration-intent head/operation state machine.
 - Parallel chunks deliberately routed across both API replicas produce one
   session, one logical alias, and one exact object without sticky routing.
 - Upload allocation, multipart creation/completion acknowledgement loss, `409`,
@@ -1068,6 +1152,11 @@ lines. The common log path is the largest portion.
   transition. Immutable old identity and protocol-state audit fields remain
   unchanged (only the cleanup receipt may advance), and a published alias
   prevents all successors.
+- A real-PostgreSQL renewal race starts a live provider-call owner immediately
+  before the idle deadline while another replica attempts first-chunk
+  abandonment. No acquisition or renewal commits at/after the deadline, no
+  expiry exceeds it, and terminalization waits at most for that capped lease;
+  exactly one successor wins and the old response cannot publish.
 - After idle, restore, or attempt fencing, every delayed old request and every
   late multipart-create, UploadPart, or complete response fails the current
   authority/head/session/attempt/lease comparison and cannot record a receipt,
@@ -1151,6 +1240,11 @@ lines. The common log path is the largest portion.
   policy contract cannot issue S3 calls. Allocation uses only the exact
   PostgreSQL target tuple and stamps it into the attempt or segment; reads use
   each object's committed identity rather than current process configuration.
+- Importer tests prove no provider call occurs without a committed intent; two
+  concurrent prepare operations produce one CAS winner; and every allocation,
+  retry, provider response, and receipt rejects a missing, displaced,
+  mismatched, or abandoned intent. The intent never changes runtime protocol
+  selection and grants no runtime S3 write path while `LEGACY_EFS` is active.
 - Guarded-HA Helm rendering contains no PVC, persistentVolumeClaim,
   /root/.sky, /root/.ssh, or /root/sky_logs persistent mount; this D7 gate is
   independent of the D1 config-ConfigMap negative render gate above.
@@ -1176,8 +1270,17 @@ lines. The common log path is the largest portion.
   no provider mutation.
 - Every imported object passes exact-version, size, digest, owner, and
   encryption verification.
-- One PostgreSQL transaction commits the complete reference set, exact provider
-  target/policy-probe receipt, and S3_V1 generation; partial commit is
+- Before the first production importer provider call, PostgreSQL contains one
+  CAS-committed immutable operation intent binding the exact installation,
+  source identity/manifest, source generation/incarnation, operation ID,
+  candidate generation, full provider target, and policy-probe receipt. Audit
+  evidence proves every provider request and receipt revalidated and stamped
+  that intent.
+- Activation with a displaced/abandoned intent or any changed source, target,
+  probe, manifest, operation, incarnation, or candidate generation fails closed
+  without changing runtime authority. One PostgreSQL transaction locks the
+  exact `VERIFIED` intent and commits the complete reference set, S3_V1
+  generation, target/probe receipt, and `ACTIVATED` state; partial commit is
   impossible.
 
 ### Production
@@ -1204,9 +1307,11 @@ lines. The common log path is the largest portion.
 
 ## Rollback boundary
 
-- Before the S3_V1 generation commits, abort, reconcile temporary immutable
-  uploads as retained garbage, and restart the qualified transition release in
-  `LEGACY_EFS` mode. Pre-feature images remain rejected by the schema head.
+- Before the S3_V1 generation commits, prove importer-provider quiescence,
+  terminalize any committed migration intent as `ABANDONED`, reconcile
+  temporary immutable uploads as retained garbage, and restart the qualified
+  transition release in `LEGACY_EFS` mode. An abandoned intent cannot be
+  reused; pre-feature images remain rejected by the schema head.
 - After the generation commits, do not restore an EFS revision or dual-write.
   Repair schema, object access, or application behavior with an S3_V1
   fix-forward release.
