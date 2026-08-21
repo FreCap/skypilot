@@ -6,16 +6,17 @@ Status: production qualification is **active and incomplete**. The latest
 readback runs Helm revision 472 / release `v1.1.1399` at image digest
 `sha256:222de3cbedb1296e9327fc3f93ada5bebb8dbbe945ab95b97be1cefc70602393`
 on all two API, two controller, and two executor Pods, with elected service
-version 64. A fresh 05:57 UTC read at claim generation 7495 is fully
+version 64. A fresh 05:57 UTC read at claim generation 7495 was fully
 represented: H200 30/30, A100-80GB 12/12, and A100 9/9, with 51 `READY`
-non-Spot replicas and zero paid claims. Each current protocol-v2 pool round
-has `grants == holdings`, `feeds == 0`, `last_observed_free == 0`, and
-`fence_pending == 0`. Eight A100-80GB slots that became free at generation
-7491 were admitted automatically and reached provider completion; the later
-cap contraction from 20 to 12 reflects those slots ceasing to be free rather
-than fill loss. Direct provider inventory also reports zero instances in the
-service's GCP project, so the previously observed 116 Spot L4 VMs have
-terminated and are no longer a live cost gate.
+non-Spot replicas, zero unassigned free slots, and zero paid claims. At 06:03
+UTC, eight more A100-80GB slots became observable as free. Generation 7497
+immediately carried eight new non-Spot `PENDING` replica rows, raising durable
+A100-80GB holdings from 12 to 20. The round still published `feeds == 0`
+because those eight slots were already debited by the in-flight assignments;
+it did not duplicate them or open paid capacity while the Pods were binding.
+Every current protocol-v2 round remained unfenced. Direct provider inventory
+also reports zero instances in the service's GCP project, so the previously
+observed 116 Spot L4 VMs have terminated and are no longer a live cost gate.
 
 This proves current automatic and cost convergence, but not the final
 correctness horizon. Four H200 intents/replicas 56079--56082 committed between
