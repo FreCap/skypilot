@@ -147,6 +147,120 @@ export function getReplicaPlacementBreakdown(replicas) {
   );
 }
 
+export function useServiceSummaryBootstrap({ serviceName }) {
+  const [serviceSummary, setServiceSummary] = useState(null);
+  const [summaryLoading, setSummaryLoading] = useState(Boolean(serviceName));
+  const [legacyFallback, setLegacyFallback] = useState(false);
+  const [resolvedServiceName, setResolvedServiceName] = useState(null);
+  const [resolvedRouteEpoch, setResolvedRouteEpoch] = useState(null);
+  const identityRef = useRef(null);
+  const renderedServiceNameRef = useRef(serviceName);
+  const routeEpochRef = useRef(0);
+  const requestVersionRef = useRef(0);
+  const activeRequestRef = useRef(null);
+  const directIdentityCapabilityRef = useRef(null);
+
+  if (renderedServiceNameRef.current !== serviceName) {
+    renderedServiceNameRef.current = serviceName;
+    routeEpochRef.current += 1;
+  }
+
+  const fetchSummary = useCallback(() => {
+    if (!serviceName) {
+      setSummaryLoading(false);
+      return Promise.resolve();
+    }
+    const active = activeRequestRef.current;
+    if (active?.serviceName === serviceName) return active.promise;
+
+    const requestVersion = requestVersionRef.current + 1;
+    requestVersionRef.current = requestVersion;
+    const routeEpoch = routeEpochRef.current;
+    setSummaryLoading(true);
+    const isCurrentRequest = () =>
+      requestVersionRef.current === requestVersion &&
+      identityRef.current === serviceName;
+    let requestPromise;
+    requestPromise = getServiceReplicaSummaries({
+      serviceNames: [serviceName],
+    })
+      .then((response) => {
+        if (!isCurrentRequest()) return;
+        const directIdentityIsAuthoritative =
+          response.legacyFallback !== true &&
+          ((response.available !== false &&
+            response.serviceMetadataIncluded === true) ||
+            (response.available === false && response.reason === 'not_found'));
+        directIdentityCapabilityRef.current = directIdentityIsAuthoritative;
+        const found = (response.summaries || []).find(
+          (summary) => summary.name === serviceName
+        );
+        setResolvedServiceName(serviceName);
+        setResolvedRouteEpoch(routeEpoch);
+        setLegacyFallback(!directIdentityIsAuthoritative);
+        setServiceSummary(found || null);
+      })
+      .catch((error) => {
+        if (!isCurrentRequest()) return;
+        const directIdentityWasProven =
+          directIdentityCapabilityRef.current === true;
+        if (!directIdentityWasProven) {
+          directIdentityCapabilityRef.current = false;
+        }
+        console.error('Failed to fetch persisted service summary:', error);
+        setResolvedServiceName(serviceName);
+        setResolvedRouteEpoch(routeEpoch);
+        // A same-route transport error cannot revoke a modern capability that
+        // already proved persisted identity. Preserve the authoritative
+        // snapshot and retry direct later; only an unproven route uses the
+        // controller-backed compatibility path.
+        setLegacyFallback(!directIdentityWasProven);
+        setServiceSummary((previous) =>
+          previous?.name === serviceName
+            ? { ...previous, refreshUnavailable: true }
+            : null
+        );
+      })
+      .finally(() => {
+        if (isCurrentRequest()) setSummaryLoading(false);
+        if (activeRequestRef.current?.promise === requestPromise) {
+          activeRequestRef.current = null;
+        }
+      });
+    activeRequestRef.current = { serviceName, promise: requestPromise };
+    return requestPromise;
+  }, [serviceName]);
+
+  useEffect(() => {
+    identityRef.current = serviceName || null;
+    directIdentityCapabilityRef.current = null;
+    requestVersionRef.current += 1;
+    activeRequestRef.current = null;
+    setServiceSummary(null);
+    setLegacyFallback(false);
+    setSummaryLoading(Boolean(serviceName));
+    if (!serviceName) return undefined;
+    void fetchSummary();
+    return () => {
+      requestVersionRef.current += 1;
+      activeRequestRef.current = null;
+    };
+  }, [fetchSummary, serviceName]);
+
+  const refreshSummary = useCallback(() => fetchSummary(), [fetchSummary]);
+  useVisibleRefreshInterval(Boolean(serviceName), 60 * 1000, refreshSummary);
+
+  const ownsResolvedRoute =
+    resolvedServiceName === serviceName &&
+    resolvedRouteEpoch === routeEpochRef.current;
+  return {
+    serviceSummary: ownsResolvedRoute ? serviceSummary : null,
+    summaryLoading: ownsResolvedRoute ? summaryLoading : Boolean(serviceName),
+    legacyFallback: ownsResolvedRoute && legacyFallback,
+    refreshSummary,
+  };
+}
+
 export function useServiceDetails({ serviceName, loadFull = true }) {
   const [serviceData, setServiceData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -390,6 +504,16 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
   );
 
   useEffect(() => {
+    if (!serviceName) {
+      requestVersionRef.current += 1;
+      refreshInFlightRef.current = null;
+      visibleServiceDataRef.current = null;
+      initialLoadServiceNameRef.current = null;
+      setServiceData(null);
+      setLoading(false);
+      setReplicasLoading(false);
+      return undefined;
+    }
     const requireFreshSummary =
       initialLoadServiceNameRef.current !== serviceName;
     initialLoadServiceNameRef.current = serviceName;
@@ -406,8 +530,16 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
   }, [fetchData, serviceName]);
 
   const refreshData = useCallback(
-    () => fetchData({ invalidate: true, source: 'manual', supersede: true }),
-    [fetchData]
+    () =>
+      fetchData({
+        invalidate: true,
+        source: 'manual',
+        // Summary-only status is optional controller enrichment on the detail
+        // page. Never accumulate a successor while one enrichment read is
+        // already hung; persisted identity/demand/history refresh separately.
+        supersede: loadFull,
+      }),
+    [fetchData, loadFull]
   );
 
   const refreshWhenVisible = useCallback(
@@ -415,10 +547,10 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
       void fetchData({
         invalidate: true,
         source: refreshSource === 'visibilitychange' ? 'visibility' : 'poll',
-        supersede: refreshSource === 'visibilitychange',
+        supersede: loadFull && refreshSource === 'visibilitychange',
       });
     },
-    [fetchData]
+    [fetchData, loadFull]
   );
 
   useVisibleRefreshInterval(
@@ -504,6 +636,7 @@ export function useServiceDemand({
                 ...previous,
                 requestTelemetryState: 'stale',
                 requestTelemetryReason: 'dashboard_refresh_failed',
+                requestStatsAgeSeconds: null,
                 refreshUnavailable: true,
               }
             : {
@@ -807,13 +940,14 @@ function dedupeReplicas(previous, incoming) {
   return Array.from(rows.values());
 }
 
-// Owns the v1c replica projections. The controller summary stays independent
-// because it remains the fresh authority for targets and the endpoint.
-// Durable demand and persisted replica counts/pages are hash-anchored and
-// never wait for it.
+// Owns bounded replica pages and optional controller enrichment. The detail
+// bootstrap is the sole persisted-summary owner and supplies its hash-anchored
+// snapshot here, avoiding a second request/state machine for the same direct
+// projection. Controller target/endpoint reads never gate durable pages.
 export function useServiceReplicaData({
   serviceName,
   serviceHash,
+  persistedReplicaSummary = null,
   metadataReady,
   enabled = true,
   onServiceHashMismatch,
@@ -822,18 +956,13 @@ export function useServiceReplicaData({
   const [liveService, setLiveService] = useState(null);
   const [liveSummaryLoading, setLiveSummaryLoading] = useState(false);
   const [liveSummaryUnavailable, setLiveSummaryUnavailable] = useState(false);
-  const [replicaSummary, setReplicaSummary] = useState(null);
-  const [replicaSummaryLoading, setReplicaSummaryLoading] = useState(false);
-  const [replicaSummaryUnavailable, setReplicaSummaryUnavailable] =
-    useState(false);
   const [currentPage, setCurrentPage] = useState(emptyReplicaPage);
   const [pastPage, setPastPage] = useState(emptyReplicaPage);
   const [legacyService, setLegacyService] = useState(null);
   const identityRef = useRef(null);
   const generationRef = useRef(0);
   const modeRef = useRef('direct');
-  const liveRequestRef = useRef(0);
-  const summaryRequestRef = useRef(0);
+  const liveRequestRef = useRef(null);
   const currentRequestRef = useRef(0);
   const pastRequestRef = useRef(0);
   const legacyRequestRef = useRef(0);
@@ -860,7 +989,6 @@ export function useServiceReplicaData({
     (identity, generation) => {
       if (!identityIsCurrent(identity, generation)) return;
       generationRef.current += 1;
-      setReplicaSummaryUnavailable(true);
       setCurrentPage((previous) => ({
         ...previous,
         loading: false,
@@ -888,7 +1016,6 @@ export function useServiceReplicaData({
       modeRef.current = 'legacy';
       const requestVersion = legacyRequestRef.current + 1;
       legacyRequestRef.current = requestVersion;
-      summaryRequestRef.current += 1;
       currentRequestRef.current += 1;
       pastRequestRef.current += 1;
       const args = [
@@ -898,7 +1025,6 @@ export function useServiceReplicaData({
         },
       ];
       if (force) dashboardCache.invalidate(getServices, args);
-      setReplicaSummaryLoading(true);
       setCurrentPage((previous) => ({
         ...previous,
         loading: true,
@@ -934,8 +1060,6 @@ export function useServiceReplicaData({
             REPLICA_HISTORICAL_FAILURE_STATUSES.has(replica.status)
           );
           setLegacyService(service);
-          setReplicaSummary(service);
-          setReplicaSummaryUnavailable(false);
           setCurrentPage({
             serviceHash: serviceHash || null,
             replicas: current,
@@ -967,7 +1091,6 @@ export function useServiceReplicaData({
             return;
           }
           console.error('Failed to fetch legacy service replicas:', error);
-          setReplicaSummaryUnavailable(true);
           setCurrentPage((previous) => ({
             ...previous,
             loading: false,
@@ -982,12 +1105,6 @@ export function useServiceReplicaData({
           }));
         })
         .finally(() => {
-          if (
-            identityIsCurrent(identity, generation) &&
-            legacyRequestRef.current === requestVersion
-          ) {
-            setReplicaSummaryLoading(false);
-          }
           if (fallbackRequestRef.current?.promise === promise) {
             fallbackRequestRef.current = null;
           }
@@ -999,10 +1116,10 @@ export function useServiceReplicaData({
   );
 
   const fetchLiveSummary = useCallback(
-    async ({ identity, generation, force = false }) => {
-      if (!identityIsCurrent(identity, generation)) return;
-      const requestVersion = liveRequestRef.current + 1;
-      liveRequestRef.current = requestVersion;
+    ({ identity, generation, force = false }) => {
+      if (!identityIsCurrent(identity, generation)) return Promise.resolve();
+      const active = liveRequestRef.current;
+      if (active?.identity === identity) return active.promise;
       const args = [
         {
           serviceNames: [serviceName],
@@ -1014,119 +1131,46 @@ export function useServiceReplicaData({
       if (force) dashboardCache.invalidate(getServices, args);
       setLiveSummaryLoading(true);
       setLiveSummaryUnavailable(false);
-      try {
-        const { services } = await dashboardCache.get(getServices, args);
-        if (
-          !identityIsCurrent(identity, generation) ||
-          liveRequestRef.current !== requestVersion
-        ) {
-          return;
-        }
-        const service = (services || []).find(
-          (candidate) => candidate.name === serviceName
-        );
-        if (
-          service?.serviceHash &&
-          serviceHash &&
-          service.serviceHash !== serviceHash
-        ) {
-          reportHashMismatch(identity, generation);
-          return;
-        }
-        if (!service) throw new Error('Service not found');
-        setLiveService(service);
-      } catch (error) {
-        if (
-          !identityIsCurrent(identity, generation) ||
-          liveRequestRef.current !== requestVersion
-        ) {
-          return;
-        }
-        console.error('Failed to fetch live service summary:', error);
-        setLiveSummaryUnavailable(true);
-      } finally {
-        if (
-          identityIsCurrent(identity, generation) &&
-          liveRequestRef.current === requestVersion
-        ) {
-          setLiveSummaryLoading(false);
-        }
-      }
-    },
-    [identityIsCurrent, reportHashMismatch, serviceHash, serviceName]
-  );
-
-  const fetchReplicaSummary = useCallback(
-    async ({ identity, generation }) => {
-      if (!identityIsCurrent(identity, generation) || !serviceHash) return;
-      const requestVersion = summaryRequestRef.current + 1;
-      summaryRequestRef.current = requestVersion;
-      setReplicaSummaryLoading(true);
-      setReplicaSummaryUnavailable(false);
-      try {
-        const response = await getServiceReplicaSummaries({
-          serviceNames: [serviceName],
-        });
-        if (
-          !identityIsCurrent(identity, generation) ||
-          summaryRequestRef.current !== requestVersion ||
-          modeRef.current === 'legacy'
-        ) {
-          return;
-        }
-        if (response.legacyFallback) {
-          await fetchLegacyFull({ identity, generation });
-          return;
-        }
-        if (!response.available) {
-          if (response.reason === 'not_found') {
+      // The previous controller observation is not current for this refresh.
+      // Persisted lifecycle/counts remain visible, while controller-only
+      // endpoint and target cells return to an explicit pending state.
+      setLiveService(null);
+      let promise;
+      promise = dashboardCache
+        .get(getServices, args)
+        .then(({ services }) => {
+          if (!identityIsCurrent(identity, generation)) return;
+          const service = (services || []).find(
+            (candidate) => candidate.name === serviceName
+          );
+          if (
+            service?.serviceHash &&
+            serviceHash &&
+            service.serviceHash !== serviceHash
+          ) {
             reportHashMismatch(identity, generation);
             return;
           }
-          throw new Error(
-            `Persisted replica summary unavailable: ${response.reason || 'unknown'}`
-          );
-        }
-        const summary = (response.summaries || []).find(
-          (candidate) => candidate.name === serviceName
-        );
-        if (!summary) {
-          throw new Error('Persisted replica summary was not found');
-        }
-        if (summary.serviceHash !== serviceHash) {
-          reportHashMismatch(identity, generation);
-          return;
-        }
-        setReplicaSummary(summary);
-      } catch (error) {
-        if (
-          !identityIsCurrent(identity, generation) ||
-          summaryRequestRef.current !== requestVersion
-        ) {
-          return;
-        }
-        if (error?.code === 'SERVICE_HASH_MISMATCH') {
-          reportHashMismatch(identity, generation);
-          return;
-        }
-        console.error('Failed to fetch persisted replica summary:', error);
-        setReplicaSummaryUnavailable(true);
-      } finally {
-        if (
-          identityIsCurrent(identity, generation) &&
-          summaryRequestRef.current === requestVersion
-        ) {
-          setReplicaSummaryLoading(false);
-        }
-      }
+          if (!service) throw new Error('Service not found');
+          setLiveService(service);
+        })
+        .catch((error) => {
+          if (!identityIsCurrent(identity, generation)) return;
+          console.error('Failed to fetch live service summary:', error);
+          setLiveSummaryUnavailable(true);
+        })
+        .finally(() => {
+          if (identityIsCurrent(identity, generation)) {
+            setLiveSummaryLoading(false);
+          }
+          if (liveRequestRef.current?.promise === promise) {
+            liveRequestRef.current = null;
+          }
+        });
+      liveRequestRef.current = { identity, promise };
+      return promise;
     },
-    [
-      fetchLegacyFull,
-      identityIsCurrent,
-      reportHashMismatch,
-      serviceHash,
-      serviceName,
-    ]
+    [identityIsCurrent, reportHashMismatch, serviceHash, serviceName]
   );
 
   const fetchReplicaPage = useCallback(
@@ -1259,16 +1303,17 @@ export function useServiceReplicaData({
           (kind === 'visibility' && active.kind === 'manual'));
       if (shouldReuse) return active.promise;
 
-      const requests = [
-        fetchLiveSummary({ identity, generation, force: forceLive }),
-      ];
+      // Controller enrichment is a strict independent singleflight. It never
+      // owns the persisted refresh promise, so a hung controller cannot keep
+      // the Refresh button disabled or accumulate successor requests.
+      void fetchLiveSummary({ identity, generation, force: forceLive });
+      const requests = [];
       if (modeRef.current === 'legacy' || !serviceHash) {
         requests.push(
           fetchLegacyFull({ identity, generation, force: forceLive })
         );
       } else {
         requests.push(
-          fetchReplicaSummary({ identity, generation }),
           fetchReplicaPage({
             identity,
             generation,
@@ -1294,14 +1339,7 @@ export function useServiceReplicaData({
       refreshRequestRef.current = { identity, kind, promise };
       return promise;
     },
-    [
-      enabled,
-      fetchLegacyFull,
-      fetchLiveSummary,
-      fetchReplicaPage,
-      fetchReplicaSummary,
-      serviceHash,
-    ]
+    [enabled, fetchLegacyFull, fetchLiveSummary, fetchReplicaPage, serviceHash]
   );
 
   useEffect(() => {
@@ -1315,17 +1353,15 @@ export function useServiceReplicaData({
     modeRef.current = serviceHash ? 'direct' : 'legacy';
     fallbackRequestRef.current = null;
     refreshRequestRef.current = null;
+    liveRequestRef.current = null;
     pastRequestedRef.current = false;
     setLiveService(null);
     setLiveSummaryUnavailable(false);
-    setReplicaSummary(null);
-    setReplicaSummaryUnavailable(false);
     setLegacyService(null);
     setCurrentPage(emptyReplicaPage());
     setPastPage(emptyReplicaPage());
     if (!enabled || !identity) {
       setLiveSummaryLoading(false);
-      setReplicaSummaryLoading(false);
       return undefined;
     }
     void startReplicaRefresh({ kind: 'initial', forceLive: false });
@@ -1333,6 +1369,7 @@ export function useServiceReplicaData({
       generationRef.current += 1;
       fallbackRequestRef.current = null;
       refreshRequestRef.current = null;
+      liveRequestRef.current = null;
     };
   }, [enabled, hasMetadata, serviceHash, serviceName, startReplicaRefresh]);
 
@@ -1425,9 +1462,10 @@ export function useServiceReplicaData({
     liveService,
     liveSummaryLoading,
     liveSummaryUnavailable,
-    replicaSummary,
-    replicaSummaryLoading,
-    replicaSummaryUnavailable,
+    replicaSummary: legacyService || persistedReplicaSummary,
+    replicaSummaryUnavailable: Boolean(
+      persistedReplicaSummary?.refreshUnavailable
+    ),
     currentPage,
     pastPage,
     legacyService,
@@ -1954,21 +1992,62 @@ function ServiceDetails() {
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const activeServiceNameRef = useRef(serviceName);
   const isMobile = useMobile();
-  const { serviceData, loading, refreshData } = useServiceDetails({
-    serviceName,
-    // Overview uses the bounded direct replica projections below. The full
-    // controller status path is reserved for capability/topology fallback.
+  const { serviceSummary, summaryLoading, legacyFallback, refreshSummary } =
+    useServiceSummaryBootstrap({ serviceName });
+  const {
+    serviceData: controllerServiceData,
+    loading: controllerLoading,
+    refreshData: refreshControllerDetails,
+  } = useServiceDetails({
+    // Current servers bootstrap identity from PostgreSQL and use the bounded
+    // replica hook's one controller singleflight for optional live fields.
+    // This separate path exists only for an old server that cannot provide a
+    // persisted identity at all.
+    serviceName: legacyFallback ? serviceName : null,
     loadFull: false,
   });
+  const serviceData = useMemo(() => {
+    const persisted = serviceSummary;
+    const controller =
+      legacyFallback && controllerServiceData?.name === serviceName
+        ? controllerServiceData
+        : null;
+    if (!persisted) return legacyFallback ? controller : null;
+    if (
+      controller?.serviceHash &&
+      controller.serviceHash !== persisted.serviceHash
+    ) {
+      return persisted;
+    }
+    return {
+      ...persisted,
+      ...(controller || {}),
+      name: persisted.name,
+      serviceHash: persisted.serviceHash,
+    };
+  }, [controllerServiceData, legacyFallback, serviceName, serviceSummary]);
+  const directIdentityReady = serviceSummary?.name === serviceName;
+  const loading = directIdentityReady
+    ? false
+    : legacyFallback
+      ? controllerLoading
+      : summaryLoading;
+  const refreshIdentity = useCallback(() => {
+    if (legacyFallback) void refreshControllerDetails();
+    return refreshSummary();
+  }, [legacyFallback, refreshControllerDetails, refreshSummary]);
   const replicaData = useServiceReplicaData({
     serviceName,
     serviceHash:
-      serviceData?.name === serviceName ? serviceData.serviceHash : null,
+      !legacyFallback && serviceData?.name === serviceName
+        ? serviceData.serviceHash
+        : null,
+    persistedReplicaSummary: legacyFallback ? null : serviceSummary,
     metadataReady:
       serviceData?.name === serviceName &&
       Object.prototype.hasOwnProperty.call(serviceData, 'serviceHash'),
     enabled: activeTab === 'overview',
-    onServiceHashMismatch: refreshData,
+    onServiceHashMismatch: refreshIdentity,
   });
   const demand = useServiceDemand({
     serviceName,
@@ -1978,7 +2057,7 @@ function ServiceDetails() {
       serviceData?.name === serviceName &&
       Object.prototype.hasOwnProperty.call(serviceData, 'serviceHash'),
     enabled: activeTab === 'overview',
-    onServiceHashMismatch: refreshData,
+    onServiceHashMismatch: refreshIdentity,
   });
   const pricingData = useServicePricing({
     serviceName,
@@ -1989,7 +2068,7 @@ function ServiceDetails() {
       Object.prototype.hasOwnProperty.call(serviceData, 'serviceHash'),
     currentPage: replicaData.currentPage,
     enabled: activeTab === 'overview' && !replicaData.legacyService,
-    onServiceHashMismatch: refreshData,
+    onServiceHashMismatch: refreshIdentity,
     onRefreshCurrentPage: replicaData.refreshCurrentPage,
   });
   const { replicaHistory, historyLoading, loadHistoryHours, refreshHistory } =
@@ -2001,7 +2080,7 @@ function ServiceDetails() {
         serviceData?.name === serviceName &&
         Object.prototype.hasOwnProperty.call(serviceData, 'serviceHash'),
       enabled: activeTab === 'overview',
-      onServiceHashMismatch: refreshData,
+      onServiceHashMismatch: refreshIdentity,
     });
 
   useEffect(() => {
@@ -2121,8 +2200,11 @@ function ServiceDetails() {
         : {};
     const enriched = {
       ...serviceData,
-      ...(persistedSummary || {}),
       ...(liveSummary || {}),
+      // PostgreSQL owns lifecycle and replica counts. Same-incarnation
+      // controller data may enrich fields absent from the direct projection
+      // (endpoint and live targets), but cannot overwrite persisted state.
+      ...(persistedSummary || {}),
       ...directOnlyFields,
       ...directDemandMetadata,
       ...directDemandMetrics,
@@ -2152,7 +2234,11 @@ function ServiceDetails() {
     }
     // A live controller summary settles metadata-dependent cells but cannot
     // erase an independently landed replica summary or page.
-    if (liveSummary || legacy) enriched.metadataOnly = false;
+    if (liveSummary || legacy) {
+      enriched.metadataOnly = false;
+    } else if (persistedSummary) {
+      enriched.metadataOnly = true;
+    }
     return enriched;
   }, [
     demand.demandData,
@@ -2162,12 +2248,16 @@ function ServiceDetails() {
     serviceData,
     serviceName,
   ]);
-  const isRouteLoading = !router.isReady || !ownsRouteState || isInitialLoad;
+  const isRouteLoading =
+    !router.isReady ||
+    !ownsRouteState ||
+    (!currentServiceData && (loading || isInitialLoad));
 
   const handleManualRefresh = async () => {
     setIsRefreshing(true);
-    await Promise.all([
-      refreshData(),
+    if (legacyFallback) void refreshControllerDetails();
+    await Promise.allSettled([
+      refreshSummary(),
       demand.refreshDemand(),
       refreshHistory(),
       replicaData.refreshReplicas(),
@@ -2263,7 +2353,7 @@ function ServiceDetails() {
           activeTab === 'versions' ? (
             <ServiceVersionHistory
               serviceName={serviceName}
-              onElectionComplete={refreshData}
+              onElectionComplete={refreshIdentity}
             />
           ) : activeTab === 'placement' ? (
             <ServicePlacement serviceName={serviceName} />
@@ -2496,6 +2586,68 @@ function formatRequestRate(value) {
   })} req/s`;
 }
 
+export function getTerminalPredictionObservationsLastHour(history) {
+  if (
+    history?.available !== true ||
+    history?.predictionTimeHistogramVersion !== 1 ||
+    !Array.isArray(history?.predictionTimeSamples) ||
+    !Array.isArray(history?.predictionTimeBucketUpperBoundsSeconds) ||
+    history.predictionTimeBucketUpperBoundsSeconds.length === 0 ||
+    history.predictionTimeBucketUpperBoundsSeconds.some(
+      (bound, index, bounds) =>
+        !Number.isFinite(bound) ||
+        bound <= 0 ||
+        (index > 0 && bound <= bounds[index - 1])
+    ) ||
+    !Number.isFinite(history?.windowEnd)
+  ) {
+    return null;
+  }
+  const bucketSeconds =
+    Number.isFinite(history.bucketSeconds) && history.bucketSeconds > 0
+      ? history.bucketSeconds
+      : 60;
+  const currentBucket =
+    Math.floor(history.windowEnd / bucketSeconds) * bucketSeconds;
+  const windowStart = currentBucket - (60 * 60 - bucketSeconds);
+  const bucketCount = history.predictionTimeBucketUpperBoundsSeconds.length + 1;
+  let total = 0;
+  for (const sample of history.predictionTimeSamples) {
+    if (
+      !Number.isFinite(sample?.timestamp) ||
+      sample.timestamp < windowStart ||
+      sample.timestamp > history.windowEnd
+    ) {
+      continue;
+    }
+    for (const outcome of ['succeeded', 'failed']) {
+      const counts = sample.outcomeCounts?.[outcome];
+      if (counts === undefined) continue;
+      if (
+        !Array.isArray(counts) ||
+        counts.length !== bucketCount ||
+        counts.some((count) => !Number.isInteger(count) || count < 0)
+      ) {
+        return null;
+      }
+      total += counts.reduce((sum, count) => sum + count, 0);
+    }
+  }
+  return total;
+}
+
+export function getLatestTerminalObservationReportAgeSeconds(history) {
+  if (
+    !Number.isFinite(history?.windowEnd) ||
+    !Number.isFinite(history?.predictionTimeLatestHourReportedAt) ||
+    history.predictionTimeLatestHourReportedAt < 0 ||
+    history.predictionTimeLatestHourReportedAt > history.windowEnd
+  ) {
+    return null;
+  }
+  return history.windowEnd - history.predictionTimeLatestHourReportedAt;
+}
+
 export function ServiceDetailCard({
   serviceData,
   requestHistory = null,
@@ -2556,6 +2708,14 @@ export function ServiceDetailCard({
   });
 
   const requestDetails = [];
+  const requestTelemetryIsStale = serviceData.requestTelemetryState === 'stale';
+  const lastReportedPrefix = requestTelemetryIsStale ? 'last reported ' : '';
+  const terminalPredictionObservationsLastHour =
+    getTerminalPredictionObservationsLastHour(requestHistory);
+  const latestTerminalObservationReportAgeSeconds =
+    terminalPredictionObservationsLastHour == null
+      ? null
+      : getLatestTerminalObservationReportAgeSeconds(requestHistory);
   const actuationCounts = serviceData.zeroCostActuationStateCounts;
   const actuationDetails = [];
   if (serviceData.zeroCostActuationMode) {
@@ -2583,14 +2743,18 @@ export function ServiceDetailCard({
     serviceData.observedReadyReplicas != null &&
     serviceData.observedReadyReplicasFresh === false;
   if (serviceData.requestRate != null) {
-    requestDetails.push(`${formatRequestRate(serviceData.requestRate)} recent`);
+    requestDetails.push(
+      requestTelemetryIsStale
+        ? `${lastReportedPrefix}${formatRequestRate(serviceData.requestRate)}`
+        : `${formatRequestRate(serviceData.requestRate)} recent`
+    );
   }
   if (
     serviceData.recentRequestCount != null &&
     serviceData.requestWindowSeconds != null
   ) {
     requestDetails.push(
-      `${serviceData.recentRequestCount.toLocaleString()} requests in ${serviceData.requestWindowSeconds}s`
+      `${lastReportedPrefix}${serviceData.recentRequestCount.toLocaleString()} requests in ${serviceData.requestWindowSeconds}s`
     );
   }
   if (
@@ -2601,18 +2765,34 @@ export function ServiceDetailCard({
       `${requestHistory.requestsLastHour.toLocaleString()} requests in last hour`
     );
   }
+  if (terminalPredictionObservationsLastHour != null) {
+    requestDetails.push(
+      `${terminalPredictionObservationsLastHour.toLocaleString()} terminal prediction observations recorded in last hour`
+    );
+    requestDetails.push(
+      latestTerminalObservationReportAgeSeconds == null
+        ? 'latest terminal-observation report time unavailable'
+        : `latest terminal-observation report ${Math.round(
+            latestTerminalObservationReportAgeSeconds
+          )}s ago`
+    );
+  }
   if (serviceData.requestQueueDepth != null) {
-    requestDetails.push(`${serviceData.requestQueueDepth} queued`);
+    requestDetails.push(
+      `${lastReportedPrefix}${serviceData.requestQueueDepth} queued`
+    );
   }
   if (serviceData.unknownInFlightReplicaCount > 0) {
     requestDetails.push(
-      `${serviceData.unknownInFlightReplicaCount} backend${
+      `${lastReportedPrefix}${serviceData.unknownInFlightReplicaCount} backend${
         serviceData.unknownInFlightReplicaCount === 1 ? '' : 's'
       } with unknown occupancy`
     );
   }
   if (serviceData.rejectedRequests != null) {
-    requestDetails.push(`${serviceData.rejectedRequests} rejected`);
+    requestDetails.push(
+      `${lastReportedPrefix}${serviceData.rejectedRequests} rejected`
+    );
   }
   if (serviceData.requestStatsAgeSeconds != null) {
     requestDetails.push(
@@ -2624,9 +2804,12 @@ export function ServiceDetailCard({
     serviceData.requestTelemetryState !== 'fresh'
   ) {
     const legacySuffix =
-      serviceData.recentRequestCount != null
-        ? '; showing controller snapshot'
-        : '';
+      serviceData.requestTelemetryReason === 'dashboard_refresh_failed'
+        ? '; showing last persisted snapshot'
+        : serviceData.requestTelemetryReason === 'unsupported' &&
+            serviceData.recentRequestCount != null
+          ? '; showing controller snapshot'
+          : '';
     requestDetails.push(
       `request telemetry ${serviceData.requestTelemetryState}${legacySuffix}`
     );
@@ -2809,11 +2992,19 @@ export function ServiceDetailCard({
               </div>
               <div className="text-base mt-1">
                 {serviceData.inFlightRequests != null
-                  ? `${serviceData.inFlightRequests.toLocaleString()} processing`
+                  ? `${serviceData.inFlightRequests.toLocaleString()} ${
+                      requestTelemetryIsStale ? 'last reported ' : ''
+                    }processing`
                   : serviceData.confirmedInFlightRequests != null
-                    ? `${serviceData.confirmedInFlightRequests.toLocaleString()} confirmed processing`
+                    ? `${serviceData.confirmedInFlightRequests.toLocaleString()} ${
+                        requestTelemetryIsStale
+                          ? 'last confirmed processing'
+                          : 'confirmed processing'
+                      }`
                     : serviceData.requestRate != null
-                      ? formatRequestRate(serviceData.requestRate)
+                      ? `${lastReportedPrefix}${formatRequestRate(
+                          serviceData.requestRate
+                        )}`
                       : metadataDeferred
                         ? deferredValue
                         : '-'}

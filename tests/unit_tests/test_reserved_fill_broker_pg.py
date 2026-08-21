@@ -4962,18 +4962,27 @@ class TestServeStatusHistoryPG:
                                               'pod-a:process-a',
                                               prediction_history(5, 2),
                                               timestamp + 2)
-        # A concurrently active reporter contributes distinct completions.
+        # A concurrently active reporter contributes distinct terminal
+        # observations.
         serve_history.record_prediction_times('svc', 'hash-a',
                                               'pod-b:process-b',
                                               prediction_history(7, 3),
                                               timestamp + 3)
+        # An equal cumulative retry advances report recency without claiming a
+        # new terminal observation.
+        serve_history.record_prediction_times('svc', 'hash-a',
+                                              'pod-b:process-b',
+                                              prediction_history(7, 3),
+                                              timestamp + 4)
 
         history = serve_history.get_status_history('svc',
-                                                   timestamp=timestamp + 4)
+                                                   timestamp=timestamp + 5)
         assert history['prediction_time_histogram_version'] == 1
         assert history['prediction_time_bucket_upper_bounds_seconds'] == list(
             constants.LB_PREDICTION_TIME_BUCKET_UPPER_BOUNDS_SECONDS)
         assert len(history['prediction_time_samples']) == 1
+        assert history[
+            'prediction_time_latest_hour_reported_at'] == timestamp + 4
         sample = history['prediction_time_samples'][0]
         assert sample['timestamp'] == float(bucket_start)
         assert sample['outcome_counts']['succeeded'][3] == 12
@@ -4984,7 +4993,7 @@ class TestServeStatusHistoryPG:
                 sqlalchemy.update(
                     serve_state.services_table).values(hash='hash-b'))
         current = serve_history.get_status_history('svc',
-                                                   timestamp=timestamp + 5)
+                                                   timestamp=timestamp + 6)
         assert current['service_hash'] == 'hash-b'
         assert not current['prediction_time_samples']
 

@@ -187,6 +187,46 @@ def test_default_history_sections_keep_all_queries_and_fields(monkeypatch):
     }.issubset(history)
 
 
+def test_prediction_latest_hour_report_excludes_older_selected_rows(
+        monkeypatch):
+    engine = mock.MagicMock()
+    monkeypatch.setattr(serve_history, '_postgres_engine', lambda: engine)
+    service_result = mock.MagicMock()
+    service_result.scalar_one_or_none.return_value = 'hash-a'
+    observed_at = datetime.datetime.fromtimestamp(7200, datetime.timezone.utc)
+    zero_counts = [0] * constants.LB_PREDICTION_TIME_BUCKET_COUNT
+    one_count = list(zero_counts)
+    one_count[0] = 1
+
+    def prediction_row(bucket_start, row_observed_at):
+        return {
+            'bucket_start': bucket_start,
+            'observed_at': row_observed_at,
+            'succeeded_counts': one_count,
+            'failed_counts': zero_counts,
+        }
+
+    prediction_result = mock.MagicMock()
+    prediction_result.mappings.return_value.all.return_value = [
+        # Outside the aligned latest 60 buckets, despite a newer receipt.
+        prediction_row(observed_at - datetime.timedelta(minutes=60),
+                       observed_at - datetime.timedelta(seconds=1)),
+        prediction_row(observed_at - datetime.timedelta(minutes=1),
+                       observed_at - datetime.timedelta(seconds=10)),
+    ]
+    session = mock.MagicMock()
+    session.__enter__.return_value = session
+    session.execute.side_effect = [service_result, prediction_result]
+    monkeypatch.setattr(serve_history.orm, 'Session', lambda unused: session)
+
+    history = serve_history.get_status_history('svc',
+                                               hours=24,
+                                               timestamp=7200,
+                                               sections={'prediction'})
+
+    assert history['prediction_time_latest_hour_reported_at'] == 7190
+
+
 def test_expected_service_hash_mismatch_is_distinct(monkeypatch):
     engine = mock.MagicMock()
     monkeypatch.setattr(serve_history, '_postgres_engine', lambda: engine)
@@ -223,6 +263,7 @@ def test_missing_central_service_is_unavailable(monkeypatch):
         'samples': [],
         'request_samples': [],
         'prediction_time_samples': [],
+        'prediction_time_latest_hour_reported_at': None,
         'autoscaler_samples': [],
         'prediction_time_histogram_version': 1,
         'prediction_time_bucket_upper_bounds_seconds': list(

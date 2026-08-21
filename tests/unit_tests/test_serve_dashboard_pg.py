@@ -1,6 +1,7 @@
 """Real-PostgreSQL execution tests for bounded Serve dashboard pricing."""
 
 # pylint: disable=protected-access,redefined-outer-name,unused-import
+import pickle
 import uuid
 
 import pytest
@@ -9,6 +10,15 @@ from test_serve_resource_action_state_pg import postgres_engine
 from sky.serve import serve_dashboard
 from sky.serve import serve_state
 from sky.serve import spot_placer
+
+
+class _PolicySpec:
+
+    def __init__(self, policy: str):
+        self._policy = policy
+
+    def autoscaling_policy_str(self) -> str:
+        return self._policy
 
 
 @pytest.fixture
@@ -228,3 +238,29 @@ def test_dashboard_reads_apply_owner_scope_before_selection_and_aggregation(
             'hash-null',
             owner_user_id='owner-a',
         )
+
+
+def test_replica_summary_policy_comes_from_elected_immutable_version(
+        dashboard_database):
+    with dashboard_database.begin() as connection:
+        connection.execute(serve_state.services_table.insert().values(
+            name='svc',
+            hash='hash-a',
+            pool=0,
+            status='READY',
+            current_version=1,
+            policy='Autoscaling from 1 to 20'))
+        connection.execute(serve_state.version_specs_table.insert(), [{
+            'service_name': 'svc',
+            'version': 1,
+            'spec': pickle.dumps(_PolicySpec('Autoscaling from 0 to 1000')),
+        }, {
+            'service_name': 'svc',
+            'version': 2,
+            'spec': pickle.dumps(_PolicySpec('Autoscaling from 5 to 5')),
+        }])
+
+    response = serve_dashboard.get_replica_summaries(['svc'])
+
+    assert response['summaries'][0]['service_policy'] == (
+        'Autoscaling from 0 to 1000')

@@ -255,6 +255,16 @@ export function normalizeReplicaHistory(history) {
   const predictionTimeHistogramVersion = Number(
     history.prediction_time_histogram_version
   );
+  const rawPredictionTimeLatestHourReportedAt = Number(
+    history.prediction_time_latest_hour_reported_at
+  );
+  const predictionTimeLatestHourReportedAt =
+    history.prediction_time_latest_hour_reported_at !== null &&
+    history.prediction_time_latest_hour_reported_at !== undefined &&
+    Number.isFinite(rawPredictionTimeLatestHourReportedAt) &&
+    rawPredictionTimeLatestHourReportedAt >= 0
+      ? rawPredictionTimeLatestHourReportedAt
+      : null;
   const predictionTimeBucketUpperBoundsSeconds = Array.isArray(
     history.prediction_time_bucket_upper_bounds_seconds
   )
@@ -396,6 +406,7 @@ export function normalizeReplicaHistory(history) {
       ? predictionTimeBucketUpperBoundsSeconds
       : [],
     predictionTimeSamples,
+    predictionTimeLatestHourReportedAt,
     autoscalerSamples,
     rejectionHistoryAvailable: history.rejection_history_available === true,
     requestWindowSeconds:
@@ -1020,16 +1031,14 @@ export function normalizeServiceReplicaSummary(summary) {
     name,
     serviceHash,
     persistedMetadataLoaded,
-    status: persistedMetadataLoaded ? summary.service_status : undefined,
-    uptime: persistedMetadataLoaded
-      ? finiteOrNull(summary.service_uptime)
-      : undefined,
-    policy: persistedMetadataLoaded
-      ? summary.service_policy || null
-      : undefined,
-    requestedResources: persistedMetadataLoaded
-      ? summary.requested_resources_str || null
-      : undefined,
+    ...(persistedMetadataLoaded
+      ? {
+          status: summary.service_status,
+          uptime: finiteOrNull(summary.service_uptime),
+          policy: summary.service_policy || null,
+          requestedResources: summary.requested_resources_str || null,
+        }
+      : {}),
     replicaUnit: usesLogicalReplicas ? 'logical' : 'physical',
     replicaStatusCounts: { ...replicaStatusCounts },
     replicaCapacityCounts: { ...replicaCapacityCounts },

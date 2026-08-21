@@ -450,6 +450,7 @@ describe('getServices', () => {
           },
         ],
         prediction_time_histogram_version: 1,
+        prediction_time_latest_hour_reported_at: 1751633190,
         prediction_time_bucket_upper_bounds_seconds: [0.1, 1, 10],
         prediction_time_samples: [
           {
@@ -556,6 +557,7 @@ describe('getServices', () => {
         { timestamp: 1751633160, requestCount: 9, rejectedCount: 2 },
       ],
       predictionTimeHistogramVersion: 1,
+      predictionTimeLatestHourReportedAt: 1751633190,
       predictionTimeBucketUpperBoundsSeconds: [0.1, 1, 10],
       predictionTimeSamples: [
         {
@@ -963,6 +965,28 @@ describe('direct replica projections', () => {
       physicalReplicasFailed: 2,
       currentOrUncertainCount: 2,
       pastAttemptCount: 2,
+    });
+  });
+
+  it('omits lifecycle fields when the direct metadata projection is absent', () => {
+    const summary = normalizeServiceReplicaSummary({
+      service_name: 'svc',
+      service_hash: 'hash-a',
+      replica_unit: 'physical',
+      replica_status_counts: { READY: 1 },
+      replica_capacity_counts: { READY: 1 },
+      current_or_uncertain_count: 1,
+      past_attempt_count: 0,
+    });
+
+    expect(summary).not.toHaveProperty('status');
+    expect(summary).not.toHaveProperty('uptime');
+    expect(summary).not.toHaveProperty('policy');
+    expect(summary).not.toHaveProperty('requestedResources');
+    expect(summary).toMatchObject({
+      persistedMetadataLoaded: false,
+      replicasReady: 1,
+      replicasTotal: 1,
     });
   });
 

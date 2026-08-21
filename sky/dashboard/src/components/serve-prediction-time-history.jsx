@@ -209,7 +209,7 @@ export function PredictionTimeHistoryCard({
     ),
     datasets: [
       {
-        label: 'Completed predictions',
+        label: 'Recorded terminal prediction observations',
         data: view.aggregateCounts,
         backgroundColor: 'rgba(2, 132, 199, 0.65)',
       },
@@ -226,7 +226,10 @@ export function PredictionTimeHistoryCard({
       y: {
         beginAtZero: true,
         ticks: { precision: 0 },
-        title: { display: true, text: 'Completed predictions' },
+        title: {
+          display: true,
+          text: 'Recorded terminal prediction observations',
+        },
       },
     },
     plugins: { legend: { display: false } },
@@ -267,7 +270,9 @@ export function PredictionTimeHistoryCard({
           </div>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4 text-sm">
             <div>
-              <div className="text-gray-500">Completed in range</div>
+              <div className="text-gray-500">
+                Recorded terminal observations in range
+              </div>
               <div className="font-semibold">{view.samples}</div>
             </div>
             {[
@@ -286,7 +291,8 @@ export function PredictionTimeHistoryCard({
           </div>
           {view.samples === 0 ? (
             <div className="py-8 text-sm text-gray-500 text-center">
-              No completed predictions in the selected range.
+              No terminal prediction observations were recorded in the selected
+              range.
             </div>
           ) : (
             <>

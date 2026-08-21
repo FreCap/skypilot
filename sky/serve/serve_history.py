@@ -1901,6 +1901,7 @@ def unavailable_status_history(reason: str,
     if 'prediction' in requested_sections:
         response.update({
             'prediction_time_samples': [],
+            'prediction_time_latest_hour_reported_at': None,
             'prediction_time_histogram_version':
                 constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
             'prediction_time_bucket_upper_bounds_seconds': list(
@@ -2101,6 +2102,11 @@ def get_status_history(
     current_bucket = observed_at.replace(second=0, microsecond=0)
     request_window_start = current_bucket - datetime.timedelta(
         seconds=constants.LB_REQUEST_HISTORY_WINDOW_SECONDS - BUCKET_SECONDS)
+    prediction_time_latest_hour_reported_at = max(
+        (row['observed_at']
+         for row in prediction_rows
+         if row['bucket_start'] >= request_window_start),
+        default=None)
     requests_last_hour = sum(
         sample['request_count']
         for sample in request_samples
@@ -2127,6 +2133,9 @@ def get_status_history(
     if 'prediction' in requested_sections:
         response.update({
             'prediction_time_samples': prediction_time_samples,
+            'prediction_time_latest_hour_reported_at':
+                prediction_time_latest_hour_reported_at.timestamp() if
+                prediction_time_latest_hour_reported_at is not None else None,
             'prediction_time_histogram_version':
                 constants.LB_PREDICTION_TIME_HISTOGRAM_VERSION,
             'prediction_time_bucket_upper_bounds_seconds': list(

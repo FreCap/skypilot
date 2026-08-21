@@ -335,6 +335,69 @@ production gate passes. Source-complete, deployed, activated, and
 production-proven are distinct states; this effort is not complete until all
 four are true.
 
+### Controller-independent dashboard read boundary
+
+Status: source implementation candidate on the controller-independent request
+UI branch; not yet merged, deployed, or production-proven.
+
+The services list and one-service detail identity load from the existing
+PostgreSQL-backed `GET /serve/replica-summaries` projection. Persisted replica,
+demand, history, and pricing reads therefore start as soon as that immutable
+service hash lands. The detail bootstrap is the single owner of that summary;
+the bounded replica hook consumes the landed snapshot and owns only replica
+pages plus optional controller enrichment. Controller status remains optional
+enrichment for endpoint and live autoscaler fields. It owns a separate
+single-flight boundary, so a hung controller request cannot hold the persisted
+refresh owner, suppress a manual/visibility refresh, or hide confirmed
+processing, queued, rejected, and freshness fields. A freshness boundary
+fences a stale enrichment response but does not accumulate a second controller
+request while the first is hung. If a rolling old-server or non-consolidated
+response revokes the direct capability, the sole fenced request must settle
+before exactly one compatibility successor starts. A modern direct `not_found`
+response is authoritative absence and never falls back to controller identity.
+
+A successful modern direct response is authoritative for the complete service
+identity set, including an empty set. Controller rows may enrich only an exact
+name/hash match; they cannot retain a controller-only row, resurrect a removed
+service, replace PostgreSQL lifecycle/count fields, or merge two service
+incarnations. A direct transport failure after capability was proved preserves
+the last authoritative identity and schedules a later direct retry; it does not
+silently restore controller identity authority. Policy display is derived only
+from the elected version's immutable `version_specs.spec`. The mutable legacy
+`services.policy` field is never a fallback because it may describe an older
+stored or previously elected version. A missing or unreadable elected
+projection renders policy unavailable.
+
+Request activity has three distinct honesty levels. In-flight is exact only
+when every currently relevant backend reporter is covered; otherwise the UI
+shows the confirmed lower bound and the number of backends whose occupancy is
+unknown. Queue depth, recent arrivals, rejects, and their observation age come
+from the controller-independent PostgreSQL demand projection. The prediction
+histogram is not an exact completed-logical-request ledger: it contains bounded
+per-load-balancer terminal prediction observations, an async terminal may be
+missed before polling, and retries or load-balancer failover may duplicate a
+logical request. The UI therefore labels the sum as terminal prediction
+observations, not completed requests. Its latest-hour report timestamp is the
+most recent report containing nonzero terminal observations; equal cumulative
+retries can advance it without a new completion. It describes report recency,
+not event time, unique-request completeness, reporter coverage, or proof that a
+displayed zero means no logical request completed. If a demand refresh fails,
+retained values are labeled `last reported`/`last confirmed`, their frozen
+server age is hidden, and the UI identifies the value as the last persisted
+snapshot. A controller enrichment refresh similarly returns endpoint/target
+cells to Loading and then Unavailable on failure instead of presenting the
+previous controller value as fresh alongside a newer PostgreSQL timestamp.
+
+All direct Serve dashboard reads use the existing canonical request-access
+resolver. The resulting owner predicate is pushed into the service identity or
+grouped summary SQL, rather than filtering returned rows in application code.
+Queued status and placement reads carry a server-derived execution scope; the
+route overwrites any caller-supplied value and execution rechecks the same
+owner predicate, closing same-name replacement races. Versions endpoints stay
+unchanged because they are already administrator-only. This slice adds no
+schema, EFS/RWX, KubeRay, Terraform, Terragrunt, service-version, or platform-pin
+dependency.
+
 The remaining production launch wave exposed two steady-state gates. First,
 many simultaneous terminal launch authorizations independently repeat the
 same live AWS and Kubernetes proof under separate five-second deadlines.
