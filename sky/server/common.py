@@ -38,6 +38,7 @@ from sky.client import service_account_auth
 from sky.data import data_utils
 from sky.server import constants as server_constants
 from sky.server import rest
+from sky.server import runtime_profile
 from sky.server import versions
 from sky.server.blob import blob_storage as bs
 from sky.skylet import constants
@@ -1080,6 +1081,17 @@ def process_mounts_in_task_on_api_server(
     from sky.utils import dag_utils  # pylint: disable=import-outside-toplevel
 
     versions.check_recipe_client_version(task)
+    if runtime_profile.guarded_ha_ephemeral_artifacts_enabled():
+        if file_mounts_blob_id is not None:
+            runtime_profile.reject_local_artifact_operation(
+                'request file-mount blob materialization')
+        task_configs = yaml_utils.read_yaml_all_str(task,
+                                                    reject_duplicate_keys=True)
+        runtime_profile.validate_serialized_task_artifact_inputs(
+            task_configs, product='API request')
+        # The fresh guarded profile deliberately has no client staging
+        # directory. Parse remote-only tasks directly from the admitted bytes.
+        return dag_utils.load_dag_from_yaml_str(task)
 
     user_hash = env_vars.get(constants.USER_ID_ENV_VAR, 'unknown')
 

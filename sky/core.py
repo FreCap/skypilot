@@ -26,6 +26,7 @@ from sky.clouds import cloud as sky_cloud
 from sky.jobs.server import core as managed_jobs_core
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.schemas.api import responses
+from sky.server import runtime_profile
 from sky.server.requests import request_names
 from sky.skylet import autostop_lib
 from sky.skylet import constants
@@ -92,6 +93,8 @@ def optimize(
             dag,
             request_name=request_names.AdminPolicyRequestName.OPTIMIZE,
             request_options=request_options) as dag:
+        runtime_profile.validate_final_task_artifact_inputs(
+            dag.tasks, product='SkyPilot optimize')
         dag.resolve_and_validate_volumes()
         # Use job group optimizer for job groups to properly handle
         # co-location constraints and show the combined optimizer table

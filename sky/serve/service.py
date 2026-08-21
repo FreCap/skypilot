@@ -49,6 +49,7 @@ from sky.serve import reserved_capacity
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
+from sky.server import runtime_profile
 from sky.skylet import constants as skylet_constants
 from sky.utils import auth_utils
 from sky.utils import common_utils
@@ -1997,6 +1998,11 @@ def _start(service_name: str,
                          if is_recovery else None)
     recovery_version = (recovery_snapshot[0]
                         if recovery_snapshot is not None else None)
+    if (runtime_profile.guarded_ha_ephemeral_artifacts_enabled() and
+            is_recovery and recovery_version is None):
+        raise RuntimeError(
+            f'Cannot recover guarded HA service {service_name!r}: '
+            'PostgreSQL has no committed applicable service version.')
     if (recovery_expected_version is not None and
             recovery_version != recovery_expected_version):
         raise RuntimeError(
@@ -2042,10 +2048,24 @@ def _start(service_name: str,
                 contextvars.Context().run(_publish_recovery_config)
                 serve_utils.scrub_obsolete_controller_config_files(
                     service_name, recovery_version, resource_scope)
+        elif runtime_profile.guarded_ha_ephemeral_artifacts_enabled():
+            raise RuntimeError(
+                f'Cannot recover guarded HA service {service_name!r} '
+                f'version {recovery_version}: PostgreSQL has no complete '
+                'controller configuration snapshot.')
 
     if is_recovery:
         assert service is not None
-        if recovery_version is not None:
+        if (runtime_profile.guarded_ha_ephemeral_artifacts_enabled() and
+                recovery_version is not None):
+            yaml_content = serve_state.get_yaml_content(service_name,
+                                                        recovery_version)
+            if yaml_content is None:
+                raise RuntimeError(
+                    f'Cannot recover guarded HA service {service_name!r} '
+                    f'version {recovery_version}: PostgreSQL has no committed '
+                    'task YAML.')
+        elif recovery_version is not None:
             yaml_content = serve_state.get_yaml_content(service_name,
                                                         recovery_version)
         else:

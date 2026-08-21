@@ -24,7 +24,7 @@ apiService:
   replicas: 1
   highAvailability:
     # Split public API serving from durable request execution. Requires
-    # PostgreSQL, ReadWriteMany storage, RollingUpdate, and executorService.
+    # PostgreSQL, storage.enabled=false, RollingUpdate, and executorService.
     # @schema type: [boolean]
     enabled: false
     # Seconds between publishing an unready pod-local drain marker and
@@ -58,9 +58,10 @@ apiService:
   #   delete the old one. This remains experimental unless guarded high
   #   availability is enabled.
   # Default to Recreate. When set to RollingUpdate, an external database must be configured via .apiService.dbConnectionSecretName or .apiService.dbConnectionString.
-  # For persistent storage with RollingUpdate, use storage.accessMode=ReadWriteMany with an RWX-capable storage class.
-  # If storage.enabled=false with RollingUpdate, file mounts and logs will be lost on pod restart; consider configuring
-  # 'jobs.bucket' in the SkyPilot config to persist file mounts to cloud storage.
+  # For non-HA persistent storage with RollingUpdate, use
+  # storage.accessMode=ReadWriteMany with an RWX-capable storage class.
+  # Guarded high availability requires storage.enabled=false and rejects local
+  # uploads, local task inputs, and raw-log downloads.
   upgradeStrategy: Recreate
   # Rolling update tuning, only applied when upgradeStrategy is RollingUpdate.
   # Defaults reproduce the previous hard-coded behavior: surge a new pod before
@@ -312,9 +313,11 @@ executorService:
     requests:
       cpu: "4"
       memory: "8Gi"
+      ephemeral-storage: "6Gi"
     limits:
       cpu: "4"
       memory: "8Gi"
+      ephemeral-storage: "8Gi"
   # @schema type: [array, null]; item: object
   extraEnvs: null
   # @schema type: [array, null]; item: object
@@ -351,9 +354,11 @@ controllerService:
     requests:
       cpu: "4"
       memory: "8Gi"
+      ephemeral-storage: "6Gi"
     limits:
       cpu: "4"
       memory: "8Gi"
+      ephemeral-storage: "8Gi"
   # @schema type: [array, null]; item: object
   extraEnvs: null
   # @schema type: [array, null]; item: object
@@ -750,20 +755,38 @@ storage:
   # Note: Transient cluster logs (sky-*) and api_server logs are NOT persisted to minimize storage usage.
   # Refer to https://docs.skypilot.co/en/latest/reference/architecture/state.html for more details.
   #
-  # IMPORTANT: When using RollingUpdate upgrade strategy:
+  # IMPORTANT: For non-HA RollingUpdate:
   # - ReadWriteOnce (RWO): NOT supported - the PVC cannot be mounted by both old and new pods during rolling update.
   # - ReadWriteMany (RWX): Supported - requires an RWX-capable storage class (e.g., NFS-backed storage like Google Filestore,
   #   AWS EFS, Azure Files, or an NFS provisioner). Both pods can mount the same PVC during the rolling update.
-  # - storage.enabled=false: Supported - but file mounts and logs will be lost on pod restart. Consider configuring
-  #   'jobs.bucket' in the SkyPilot config to use cloud storage for file mounts.
+  # Guarded PostgreSQL HA requires storage.enabled=false. Its local inputs and
+  # raw artifact-return surfaces are rejected rather than made restart-unsafe.
   enabled: true
+  # Bounded disk-backed local materialization used by role-split PostgreSQL HA
+  # when storage.enabled=false. These volumes are disposable and never become
+  # recovery authority. Guarded HA locks these values and injects a 6Gi/8Gi
+  # role ephemeral-storage request/limit; neither affects non-HA API renders.
+  # Changing that profile requires a chart change and live qualification.
+  # Kubernetes does not support an inode quota for emptyDir, so inode alerting
+  # remains an external node/pod observation rather than a chart knob that
+  # cannot enforce its value.
+  ephemeral:
+    # @schema type: string; minLength: 1; required: true
+    stateSizeLimit: 4Gi
+    # @schema type: string; minLength: 1; required: true
+    sshSizeLimit: 64Mi
+    # @schema type: string; minLength: 1; required: true
+    logsSizeLimit: 1Gi
+    # @schema type: string; minLength: 1; required: true
+    runtimeSizeLimit: 256Mi
+    # @schema type: string; minLength: 1; required: true
+    credentialSizeLimit: 64Mi
   # Mount a pre-existing PersistentVolumeClaim instead of creating the
   # release-owned <fullname>-state claim. This is useful when storage is
   # provisioned independently or when migrating an existing release to a new
   # volume without deleting the legacy claim. The referenced claim must exist
-  # in the release namespace before Helm rolls any pod. storage.accessMode
-  # remains the operator's declared capability and must be ReadWriteMany in HA
-  # mode; the chart cannot inspect the referenced claim at render time.
+  # in the release namespace before Helm rolls any pod. This compatibility
+  # option is not valid in guarded HA.
   # @schema type: string
   existingClaim: ""
   # Storage class name - leave empty to use cluster default

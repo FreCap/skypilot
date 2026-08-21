@@ -1780,6 +1780,57 @@ class TestServiceUpdateReconciler:
         update_recovery_script.assert_not_called()
         assert ctrl._committed_version == 1  # pylint: disable=protected-access
 
+    def test_guarded_fresh_update_refuses_predecessor_local_backfill(
+            self, tmp_path, monkeypatch):
+        ctrl = _make_update_controller()
+        ctrl._resource_scope = 'scope-a'  # pylint: disable=protected-access
+        ctrl._replica_manager.workspace = 'research'  # pylint: disable=protected-access
+        staged = tmp_path / 'config.staged'
+        staged.write_text('active_workspace: research\n'
+                          'workspaces: {research: {}}\n')
+        digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+        recovery_script = ('export SKYPILOT_CONFIG=/tmp/config.yaml\n'
+                           '/usr/bin/python -u -m sky.serve.service '
+                           '--service-name svc\n')
+        monkeypatch.setenv('SKYPILOT_API_REQUEST_BACKEND', 'postgres')
+        monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'controller')
+        monkeypatch.setenv('SKYPILOT_API_SERVER_STORAGE_ENABLED', 'false')
+
+        with mock.patch.object(
+                controller.serve_utils,
+                'generate_versioned_config_yaml_file_name',
+                return_value=str(tmp_path / 'config.yaml')), \
+             mock.patch.object(
+                 controller.serve_utils,
+                 'generate_staged_config_yaml_file_name',
+                 return_value=str(staged)), \
+             mock.patch.object(controller.serve_state,
+                               'get_ha_recovery_script',
+                               return_value=recovery_script), \
+             mock.patch.object(controller.serve_state,
+                               'get_yaml_content',
+                               return_value=None), \
+             mock.patch.object(controller.serve_state,
+                               'get_version_controller_config',
+                               return_value=None), \
+             mock.patch.object(
+                 controller.serve_utils,
+                 'generate_remote_config_yaml_file_name',
+                 side_effect=AssertionError(
+                     'predecessor config path derived')) as legacy_path, \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_recovery_version_spec',
+                 side_effect=AssertionError(
+                     'legacy recovery row queried')) as legacy_row, \
+             pytest.raises(RuntimeError,
+                           match='committed PostgreSQL controller config'):
+            ctrl._prepare_controller_config_update(  # pylint: disable=protected-access
+                2, digest, 'c' * 64)
+
+        legacy_path.assert_not_called()
+        legacy_row.assert_not_called()
+
     def test_delayed_lower_version_skips_legacy_activation(self, tmp_path):
         ctrl = _make_update_controller()
         ctrl._resource_scope = 'scope-a'  # pylint: disable=protected-access

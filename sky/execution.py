@@ -39,6 +39,7 @@ from sky.serve import provider_phase
 from sky.serve import reserved_capacity
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.server import runtime_profile
 from sky.server.requests import request_names
 from sky.skylet import autostop_lib
 from sky.usage import usage_lib
@@ -549,6 +550,8 @@ def _execute(
                 down=down,
                 dryrun=dryrun,
             )) as dag:
+        runtime_profile.validate_final_task_artifact_inputs(
+            dag.tasks, product='SkyPilot launch/exec')
         dag.resolve_and_validate_volumes()
         if (not _is_launched_by_jobs_controller and
                 not _is_launched_by_sky_serve_controller):

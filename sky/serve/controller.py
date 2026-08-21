@@ -69,6 +69,7 @@ from sky.serve import spot_placer
 from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state
 from sky.serve import zero_cost_actuation
+from sky.server import runtime_profile
 from sky.server.requests import process as request_process
 from sky.skylet import constants
 from sky.utils import common_utils
@@ -3998,6 +3999,11 @@ class SkyServeController:
             self._service_name, self._applied_version) is not None)
         if (source_is_staged and committed_yaml is None and
                 not protocol_active):
+            if runtime_profile.guarded_ha_ephemeral_artifacts_enabled():
+                raise RuntimeError(
+                    'Guarded HA requires a committed PostgreSQL controller '
+                    'config protocol; refusing predecessor-local legacy '
+                    'backfill.')
             current_config_path = os.environ.get(
                 skypilot_config.ENV_VAR_SKYPILOT_CONFIG,
                 serve_utils.generate_remote_config_yaml_file_name(

@@ -794,6 +794,56 @@ def test_full_pod_ha_refuses_protocol_row_without_selected_config(tmp_path):
         tmp_path / 'recovery_pool_.log').read_text(encoding='utf-8')
 
 
+def test_guarded_full_pod_ha_never_uses_legacy_recovery_script(
+        tmp_path, monkeypatch):
+    record = {
+        'name': 'svc',
+        'hash': 'incarnation-a',
+        'lifecycle_epoch': 8,
+        'workspace': 'research',
+        'resource_scope': 'scope-a',
+        'controller_pid': None,
+        'controller_ip': None,
+        'status': serve_state.ServiceStatus.CONTROLLER_FAILED,
+        'yaml_content': 'service: {}',
+    }
+    monkeypatch.setenv('SKYPILOT_API_REQUEST_BACKEND', 'postgres')
+    monkeypatch.setenv('SKYPILOT_API_SERVER_ROLE', 'controller')
+    monkeypatch.setenv('SKYPILOT_API_SERVER_STORAGE_ENABLED', 'false')
+    with mock.patch.object(serve_state,
+                           'get_glob_service_names',
+                           return_value=['svc']), \
+         mock.patch.object(serve_state,
+                           'get_service_liveness_snapshots',
+                           return_value=[record]), \
+         mock.patch.object(
+             serve_state,
+             'get_ha_recovery_script',
+             side_effect=AssertionError('legacy script lookup')) as legacy, \
+         mock.patch.object(
+             serve_utils,
+             '_snapshot_in_flight_start_service_incarnations',
+             return_value=set()), \
+         mock.patch.object(
+             serve_utils,
+             'generate_remote_service_dir_name',
+             side_effect=AssertionError('predecessor directory derived')) \
+             as service_dir, \
+         mock.patch.object(serve_utils.command_runner,
+                           'LocalProcessCommandRunner') as runner_cls, \
+         mock.patch.object(
+             serve_utils.skylet_constants,
+             'HA_PERSISTENT_RECOVERY_LOG_PATH',
+             str(tmp_path / 'recovery_{}.log')):
+        serve_utils.ha_recovery_for_consolidation_mode(pool=True)
+
+    legacy.assert_not_called()
+    service_dir.assert_not_called()
+    runner_cls.return_value.run.assert_not_called()
+    assert 'no PostgreSQL recovery-protocol marker' in (
+        tmp_path / 'recovery_pool_.log').read_text(encoding='utf-8')
+
+
 def test_full_pod_ha_skips_owner_changed_after_liveness_sweep(tmp_path):
     record = {
         'name': 'svc',

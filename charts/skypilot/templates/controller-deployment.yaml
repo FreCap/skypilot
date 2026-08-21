@@ -2,6 +2,13 @@
 {{- $fullName := include "skypilot.fullname" . -}}
 {{- $requestStore := include "skypilot.effectiveRequestStore" . | fromJson -}}
 {{- $stateClaimName := include "skypilot.storageClaimName" . -}}
+{{- $guardedHA := and (eq $requestStore.backend "postgres") (not .Values.storage.enabled) -}}
+{{- $ephemeralStorage := .Values.storage.ephemeral | default (dict) -}}
+{{- $stateSizeLimit := get $ephemeralStorage "stateSizeLimit" -}}
+{{- $sshSizeLimit := get $ephemeralStorage "sshSizeLimit" -}}
+{{- $logsSizeLimit := get $ephemeralStorage "logsSizeLimit" -}}
+{{- $runtimeSizeLimit := get $ephemeralStorage "runtimeSizeLimit" -}}
+{{- $credentialSizeLimit := get $ephemeralStorage "credentialSizeLimit" -}}
 {{- $haConfig := .Values.apiService.highAvailability | default (dict) -}}
 {{- $readinessDrainSeconds := dig "readinessDrainSeconds" 20 $haConfig -}}
 {{- $executionDrainSeconds := dig "executionDrainSeconds" 30 $haConfig -}}
@@ -43,7 +50,7 @@
 {{- $lbDataPlaneSecret := get $lbDataPlaneAuth "existingSecret" | default "" -}}
 {{- $lbDataPlaneKey := get $lbDataPlaneAuth "key" | default "" -}}
 {{- $lbDataPlaneAuthEnabled := and $externalLBEnabled (not (empty $lbDataPlaneSecret)) (not (empty $lbDataPlaneKey)) -}}
-{{- $controllerReservedEnvNames := list "IS_SKYPILOT_SERVER" "KUBECONFIG" "POD_IP" "PROMETHEUS_MULTIPROC_DIR" "SKY_API_SERVER_METRICS_ENABLED" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH" "SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS" "SKYPILOT_API_SERVER_ENDPOINT" "SKYPILOT_API_SERVER_INSTANCE_ID" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_EXECUTION_DRAIN_SECONDS" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_POD_UID" "SKYPILOT_RELEASE_NAME" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVER_CONFIG_MODE" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_EXTERNAL_LB_SERVICE_ANNOTATIONS_JSON" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_PRIORITY_CLASS_NAME" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_STATE_DB_MIGRATION_MODE" -}}
+{{- $controllerReservedEnvNames := list "IS_SKYPILOT_SERVER" "KUBECONFIG" "POD_IP" "PROMETHEUS_MULTIPROC_DIR" "SKY_API_SERVER_METRICS_ENABLED" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH" "SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS" "SKYPILOT_API_SERVER_ENDPOINT" "SKYPILOT_API_SERVER_INSTANCE_ID" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_EXECUTION_DRAIN_SECONDS" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_POD_UID" "SKYPILOT_RELEASE_NAME" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVER_CONFIG_MODE" "SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_EXTERNAL_LB_SERVICE_ANNOTATIONS_JSON" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_PRIORITY_CLASS_NAME" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_STATE_DB_MIGRATION_MODE" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $controllerReservedEnvNames = concat $controllerReservedEnvNames (list "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY") -}}
 {{- end -}}
@@ -66,7 +73,7 @@
 {{- $controllerReservedEnvNames = append $controllerReservedEnvNames "VAST_API_KEY" -}}
 {{- end -}}
 
-{{- $controllerReservedVolumeNames := list "skypilot-role-runtime" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
+{{- $controllerReservedVolumeNames := list "kube-volume" "logs-volume" "skypilot-role-runtime" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "ssh-volume" "state-volume" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $controllerReservedVolumeNames = concat $controllerReservedVolumeNames (list "aws-config" "aws-config-files") -}}
 {{- end -}}
@@ -140,7 +147,10 @@
 {{- if .Values.vastCredentials.enabled -}}
 {{- $controllerReservedMountPaths = append $controllerReservedMountPaths "/root/.config/vastai" -}}
 {{- end -}}
-{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.apiService.extraEnvs $controllerExtraEnvs) "reservedEnvNames" $controllerReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes .Values.apiService.extraVolumes $controllerExtraVolumes) "reservedVolumeNames" $controllerReservedVolumeNames "mountLists" (list .Values.databaseConnection.extraVolumeMounts .Values.apiService.extraVolumeMounts $controllerExtraVolumeMounts) "reservedMountPaths" $controllerReservedMountPaths) }}
+{{- if $guardedHA }}
+{{ include "skypilot.requireRoleEphemeralStorage" (dict "role" "controllerService" "resources" $controllerResources "ephemeralStorage" $ephemeralStorage) }}
+{{- end }}
+{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.apiService.extraEnvs $controllerExtraEnvs) "reservedEnvNames" $controllerReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes .Values.apiService.extraVolumes $controllerExtraVolumes) "reservedVolumeNames" $controllerReservedVolumeNames "mountLists" (list .Values.databaseConnection.extraVolumeMounts .Values.apiService.extraVolumeMounts $controllerExtraVolumeMounts) "reservedMountPaths" $controllerReservedMountPaths "guardedEphemeralProfile" $guardedHA) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -268,7 +278,9 @@ spec:
         - name: SKYPILOT_ROLLING_UPDATE_ENABLED
           value: "true"
         - name: SKYPILOT_API_SERVER_STORAGE_ENABLED
-          value: "true"
+          value: {{ ternary "true" "false" .Values.storage.enabled | quote }}
+        - name: SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD
+          value: {{ ternary "true" "false" .Values.serve.controllerHold | quote }}
         - name: SKYPILOT_EXECUTION_DRAIN_SECONDS
           value: {{ $executionDrainSeconds | quote }}
         {{- if .Values.apiService.dbConnectionSecretName }}
@@ -424,6 +436,14 @@ spec:
         volumeMounts:
         - name: skypilot-role-runtime
           mountPath: /var/run/skypilot
+        {{- if $guardedHA }}
+        - name: state-volume
+          mountPath: /root/.sky
+        - name: ssh-volume
+          mountPath: /root/.ssh
+        - name: logs-volume
+          mountPath: /root/sky_logs
+        {{- else }}
         - name: state-volume
           mountPath: /root/.sky
           subPath: .sky
@@ -433,6 +453,7 @@ spec:
         - name: state-volume
           mountPath: /root/sky_logs
           subPath: sky_logs
+        {{- end }}
         {{- if or .Values.auth.externalProxy.enabled (eq (include "skypilot.ingressOAuthEnabled" .) "true") }}
         - name: skypilot-server-config
           mountPath: /root/.sky/.server.yaml
@@ -478,9 +499,14 @@ spec:
           mountPath: {{ ternary "/var/skypilot/kubeconfig" "/root/.kube" (not (empty .Values.apiService.sshNodePools)) }}
         {{- end }}
         {{- if .Values.apiService.sshNodePools }}
+        {{- if $guardedHA }}
+        - name: kube-volume
+          mountPath: /root/.kube
+        {{- else }}
         - name: state-volume
           mountPath: /root/.kube
           subPath: .kube
+        {{- end }}
         {{- end }}
         {{- if .Values.runpodCredentials.enabled }}
         - name: runpod-config
@@ -688,10 +714,28 @@ spec:
       {{- end }}
       volumes:
       - name: skypilot-role-runtime
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: {{ $runtimeSizeLimit | quote }}
+      {{- if $guardedHA }}
+      - name: state-volume
+        emptyDir:
+          sizeLimit: {{ $stateSizeLimit | quote }}
+      - name: ssh-volume
+        emptyDir:
+          sizeLimit: {{ $sshSizeLimit | quote }}
+      - name: logs-volume
+        emptyDir:
+          sizeLimit: {{ $logsSizeLimit | quote }}
+      {{- if .Values.apiService.sshNodePools }}
+      - name: kube-volume
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
+      {{- end }}
+      {{- else }}
       - name: state-volume
         persistentVolumeClaim:
           claimName: {{ $stateClaimName }}
+      {{- end }}
       {{- if or .Values.auth.externalProxy.enabled (eq (include "skypilot.ingressOAuthEnabled" .) "true") }}
       - name: skypilot-server-config
         configMap:
@@ -719,7 +763,8 @@ spec:
         secret:
           secretName: {{ .Values.awsCredentials.awsSecretName }}
         {{- else }}
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
         {{- end }}
       {{- end }}
       {{- if .Values.gcpCredentials.enabled }}
@@ -727,34 +772,41 @@ spec:
         secret:
           secretName: {{ .Values.gcpCredentials.gcpSecretName }}
       - name: gcp-config
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
       {{- end }}
       {{- if .Values.coreweaveCredentials.enabled }}
       - name: coreweave-credentials
         secret:
           secretName: {{ .Values.coreweaveCredentials.coreweaveSecretName }}
       - name: coreweave-config
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
       {{- end }}
       {{- if .Values.runpodCredentials.enabled }}
       - name: runpod-config
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
       {{- end }}
       {{- if .Values.digitaloceanCredentials.enabled }}
       - name: digitalocean-config
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
       {{- end }}
       {{- if .Values.lambdaCredentials.enabled }}
       - name: lambda-config
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
       {{- end }}
       {{- if .Values.vastCredentials.enabled }}
       - name: vast-config
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
       {{- end }}
       {{- if .Values.r2Credentials.enabled }}
       - name: r2-config
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
       {{- end }}
       {{- if .Values.nebiusCredentials.enabled }}
       - name: nebius-credentials

@@ -6,6 +6,22 @@
 {{- $stateClaimName := include "skypilot.storageClaimName" . -}}
 {{- $haConfig := .Values.apiService.highAvailability | default (dict) -}}
 {{- $haEnabled := get $haConfig "enabled" | default false -}}
+{{- $guardedHA := and $haEnabled (eq $requestStore.backend "postgres") (not .Values.storage.enabled) -}}
+{{- $ephemeralStorage := .Values.storage.ephemeral | default (dict) -}}
+{{- $stateSizeLimit := get $ephemeralStorage "stateSizeLimit" -}}
+{{- $sshSizeLimit := get $ephemeralStorage "sshSizeLimit" -}}
+{{- $logsSizeLimit := get $ephemeralStorage "logsSizeLimit" -}}
+{{- $runtimeSizeLimit := get $ephemeralStorage "runtimeSizeLimit" -}}
+{{- $credentialSizeLimit := get $ephemeralStorage "credentialSizeLimit" -}}
+{{- $apiResources := deepCopy (.Values.apiService.resources | default (dict)) -}}
+{{- if $guardedHA -}}
+{{- $apiResourceRequests := default (dict) (get $apiResources "requests") -}}
+{{- $apiResourceLimits := default (dict) (get $apiResources "limits") -}}
+{{- $_ := set $apiResourceRequests "ephemeral-storage" "6Gi" -}}
+{{- $_ := set $apiResourceLimits "ephemeral-storage" "8Gi" -}}
+{{- $_ := set $apiResources "requests" $apiResourceRequests -}}
+{{- $_ := set $apiResources "limits" $apiResourceLimits -}}
+{{- end -}}
 {{- $rollingUpdate := .Values.apiService.rollingUpdate | default (dict) -}}
 {{- $rollingUpdateMaxSurge := dig "maxSurge" 1 $rollingUpdate -}}
 {{- $rollingUpdateMaxUnavailable := dig "maxUnavailable" 0 $rollingUpdate -}}
@@ -83,6 +99,9 @@
 {{- end -}}
 
 {{- $apiReservedVolumeNames := list "sky-ephemeral" "skypilot-role-runtime" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
+{{- if $guardedHA -}}
+{{- $apiReservedVolumeNames = concat $apiReservedVolumeNames (list "kube-volume" "logs-volume" "ssh-volume") -}}
+{{- end -}}
 {{- if not $haEnabled -}}
 {{- $apiReservedVolumeNames = append $apiReservedVolumeNames "skypilot-config" -}}
 {{- end -}}
@@ -193,12 +212,15 @@
 {{- if ne (toString $rollingUpdateMaxSurge) "1" -}}
 {{- fail "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxSurge=1" -}}
 {{- end -}}
-{{- if not .Values.storage.enabled -}}
-{{- fail "apiService.highAvailability.enabled=true requires storage.enabled=true" -}}
+{{- if .Values.storage.enabled -}}
+{{- fail "apiService.highAvailability.enabled=true requires storage.enabled=false for PostgreSQL guarded HA" -}}
 {{- end -}}
-{{- if ne .Values.storage.accessMode "ReadWriteMany" -}}
-{{- fail "apiService.highAvailability.enabled=true requires storage.accessMode=ReadWriteMany" -}}
+{{- range $name, $value := dict "credentialSizeLimit" $credentialSizeLimit "logsSizeLimit" $logsSizeLimit "runtimeSizeLimit" $runtimeSizeLimit "sshSizeLimit" $sshSizeLimit "stateSizeLimit" $stateSizeLimit -}}
+{{- if empty $value -}}
+{{- fail (printf "storage.ephemeral.%s is required in guarded HA" $name) -}}
 {{- end -}}
+{{- end -}}
+{{ include "skypilot.requireRoleEphemeralStorage" (dict "role" "apiService" "resources" .Values.apiService.resources "ephemeralStorage" $ephemeralStorage "chartInjectsBudget" true) }}
 {{- $readinessProbe := .Values.apiService.readinessProbe | default (dict) -}}
 {{- if not (hasKey $readinessProbe "httpGet") -}}
 {{- fail "apiService.highAvailability.enabled=true requires an HTTP apiService.readinessProbe" -}}
@@ -237,7 +259,7 @@
 {{- if and (default false $requestStore.enforceBuiltinExecutionQuiescenceBackends) (ne $requestStore.backend "postgres") -}}
 {{- fail "requestStore.enforceBuiltinExecutionQuiescenceBackends=true requires requestStore.backend=postgres" -}}
 {{- end -}}
-{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.apiService.extraEnvs) "reservedEnvNames" $apiReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes .Values.apiService.extraVolumes) "reservedVolumeNames" $apiReservedVolumeNames "mountLists" (list .Values.databaseConnection.extraVolumeMounts .Values.apiService.extraVolumeMounts) "reservedMountPaths" $apiReservedMountPaths) }}
+{{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.apiService.extraEnvs) "reservedEnvNames" $apiReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes .Values.apiService.extraVolumes) "reservedVolumeNames" $apiReservedVolumeNames "mountLists" (list .Values.databaseConnection.extraVolumeMounts .Values.apiService.extraVolumeMounts) "reservedMountPaths" $apiReservedMountPaths "guardedEphemeralProfile" $guardedHA) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -332,7 +354,7 @@ spec:
         {{- end }}
         {{- end }}
         resources:
-          {{- toYaml .Values.apiService.resources | nindent 10 }}
+          {{- toYaml $apiResources | nindent 10 }}
         {{- if $haEnabled }}
         lifecycle:
           preStop:
@@ -451,10 +473,8 @@ spec:
         - name: SKYPILOT_ROLLING_UPDATE_ENABLED
           value: "true"
         {{- end }}
-        {{- if .Values.storage.enabled }}
         - name: SKYPILOT_API_SERVER_STORAGE_ENABLED
-          value: "true"
-        {{- end }}
+          value: {{ ternary "true" "false" .Values.storage.enabled | quote }}
         {{- if .Values.apiService.metrics.enabled }}
         - name: SKY_API_SERVER_METRICS_ENABLED
           value: "true"
@@ -713,7 +733,14 @@ spec:
         - name: skypilot-role-runtime
           mountPath: /var/run/skypilot
         {{- end }}
-        {{- if and .Values.storage.enabled (eq .Values.apiService.upgradeStrategy "RollingUpdate") (not $haEnabled) }}
+        {{- if $guardedHA }}
+        - name: state-volume
+          mountPath: /root/.sky
+        - name: ssh-volume
+          mountPath: /root/.ssh
+        - name: logs-volume
+          mountPath: /root/sky_logs
+        {{- else if and .Values.storage.enabled (eq .Values.apiService.upgradeStrategy "RollingUpdate") (not $haEnabled) }}
         # For RollingUpdate with storage enabled, use emptyDir for ~/.sky to avoid
         # running SQLite on NFS. Only persist the clients directory for file mounts.
         # An ephemeral volume is still required since we have to share ~/.sky between
@@ -728,7 +755,7 @@ spec:
           mountPath: /root/.sky
           subPath: .sky
         {{- end }}
-        {{- if .Values.storage.enabled }}
+        {{- if and .Values.storage.enabled (not $guardedHA) }}
         - name: state-volume
           mountPath: /root/.ssh # To preserve the SSH keys for the user when using the API server
           subPath: .ssh
@@ -800,9 +827,14 @@ spec:
         {{- end }}
         {{- end }}
         {{- if .Values.apiService.sshNodePools }}
+        {{- if $guardedHA }}
+        - name: kube-volume
+          mountPath: /root/.kube
+        {{- else }}
         - name: state-volume
           mountPath: /root/.kube
           subPath: .kube
+        {{- end }}
         {{- end }}
         {{- if .Values.runpodCredentials.enabled }}
         - name: runpod-config
@@ -906,7 +938,10 @@ spec:
             run_interruptibly sleep 60
           done
         volumeMounts:
-        {{- if and .Values.storage.enabled (eq .Values.apiService.upgradeStrategy "RollingUpdate") (not $haEnabled) }}
+        {{- if $guardedHA }}
+        - name: state-volume
+          mountPath: /root/.sky
+        {{- else if and .Values.storage.enabled (eq .Values.apiService.upgradeStrategy "RollingUpdate") (not $haEnabled) }}
         - name: sky-ephemeral
           mountPath: /root/.sky
         {{- else }}
@@ -1195,7 +1230,8 @@ spec:
       volumes:
       {{- if $haEnabled }}
       - name: skypilot-role-runtime
-        emptyDir: {}
+        emptyDir:
+          sizeLimit: {{ $runtimeSizeLimit | quote }}
       {{- end }}
       {{- if .Values.storage.enabled }}
       - name: state-volume
@@ -1210,7 +1246,25 @@ spec:
       {{- end }}
       {{- else }}
       - name: state-volume
+        {{- if $guardedHA }}
+        emptyDir:
+          sizeLimit: {{ $stateSizeLimit | quote }}
+        {{- else }}
         emptyDir: {}
+        {{- end }}
+      {{- if $guardedHA }}
+      - name: ssh-volume
+        emptyDir:
+          sizeLimit: {{ $sshSizeLimit | quote }}
+      - name: logs-volume
+        emptyDir:
+          sizeLimit: {{ $logsSizeLimit | quote }}
+      {{- if .Values.apiService.sshNodePools }}
+      - name: kube-volume
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
+      {{- end }}
+      {{- end }}
       {{- end }}
       {{- if .Values.awsCredentials.enabled }}
       {{- if .Values.awsCredentials.useCredentialsFile }}
@@ -1221,7 +1275,12 @@ spec:
       {{- else }}
       # Mount emptyDir that will be populated by initContainer
       - name: aws-config
+        {{- if $guardedHA }}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
+        {{- else }}
         emptyDir: {}
+        {{- end }}
       {{- end }}
       {{- end }}
       {{- if .Values.gcpCredentials.enabled }}
@@ -1229,30 +1288,60 @@ spec:
         secret:
           secretName: {{ .Values.gcpCredentials.gcpSecretName }}
       - name: gcp-config
+        {{- if $guardedHA }}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
+        {{- else }}
         emptyDir: {}
+        {{- end }}
       {{- end }}
       {{- if .Values.coreweaveCredentials.enabled }}
       - name: coreweave-credentials
         secret:
           secretName: {{ .Values.coreweaveCredentials.coreweaveSecretName }}
       - name: coreweave-config
+        {{- if $guardedHA }}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
+        {{- else }}
         emptyDir: {}
+        {{- end }}
       {{- end }}
       {{- if .Values.runpodCredentials.enabled }}
       - name: runpod-config
+        {{- if $guardedHA }}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
+        {{- else }}
         emptyDir: {}
+        {{- end }}
       {{- end }}
       {{- if .Values.digitaloceanCredentials.enabled }}
       - name: digitalocean-config
+        {{- if $guardedHA }}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
+        {{- else }}
         emptyDir: {}
+        {{- end }}
       {{- end }}
       {{- if .Values.lambdaCredentials.enabled }}
       - name: lambda-config
+        {{- if $guardedHA }}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
+        {{- else }}
         emptyDir: {}
+        {{- end }}
       {{- end }}
       {{- if .Values.vastCredentials.enabled }}
       - name: vast-config
+        {{- if $guardedHA }}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
+        {{- else }}
         emptyDir: {}
+        {{- end }}
       {{- end }}
       {{- if .Values.nebiusCredentials.enabled }}
       - name: nebius-credentials
@@ -1331,7 +1420,12 @@ spec:
       {{- end }}
       {{- if .Values.r2Credentials.enabled }}
       - name: r2-config
+        {{- if $guardedHA }}
+        emptyDir:
+          sizeLimit: {{ $credentialSizeLimit | quote }}
+        {{- else }}
         emptyDir: {}
+        {{- end }}
       {{- end }}
       {{- include "skypilot.apiPodScheduling" . }}
       {{- if $apiTopologySpreadTopologyKey }}

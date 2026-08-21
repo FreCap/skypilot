@@ -8,6 +8,7 @@ from sky import sky_logging
 from sky.jobs import utils as managed_jobs_utils
 from sky.jobs.server import core
 from sky.server import common as server_common
+from sky.server import runtime_profile
 from sky.server import stream_utils
 from sky.server.requests import executor
 from sky.server.requests import payloads
@@ -143,6 +144,7 @@ async def logs(
     jobs_logs_body: payloads.JobsLogsBody = fastapi.Depends(
         role_filter.force_viewer_jobs_logs_body),
 ) -> fastapi.responses.StreamingResponse:
+    runtime_profile.reject_local_artifact_operation('managed-job log streaming')
     stream_utils.ensure_request_log_storage_available()
     schedule_type = api_requests.ScheduleType.SHORT
     if _controller_refresh_need_long(jobs_logs_body.refresh):
@@ -200,6 +202,8 @@ async def download_logs(
     jobs_download_logs_body: payloads.JobsDownloadLogsBody = fastapi.Depends(
         role_filter.force_viewer_jobs_download_logs_body),
 ) -> None:
+    runtime_profile.reject_local_artifact_operation(
+        'managed-job log synchronization')
     user_hash = server_common.get_request_user_id(request,
                                                   jobs_download_logs_body)
     logs_dir_on_api_server = await asyncio.to_thread(
@@ -268,6 +272,8 @@ async def pool_tail_logs(
     request: fastapi.Request, log_body: payloads.JobsPoolLogsBody,
     background_tasks: fastapi.BackgroundTasks
 ) -> fastapi.responses.StreamingResponse:
+    runtime_profile.reject_local_artifact_operation(
+        'managed-job pool log streaming')
     stream_utils.ensure_request_log_storage_available()
     await executor.schedule_request_async(
         request_id=request.state.request_id,
@@ -297,6 +303,8 @@ async def pool_download_logs(
     request: fastapi.Request,
     download_logs_body: payloads.JobsPoolDownloadLogsBody,
 ) -> None:
+    runtime_profile.reject_local_artifact_operation(
+        'managed-job pool log synchronization')
     user_hash = server_common.get_request_user_id(request, download_logs_body)
     timestamp = sky_logging.get_run_timestamp()
     download_tmp = await asyncio.to_thread(

@@ -1503,6 +1503,38 @@
                 "enabled": {
                     "type": "boolean"
                 },
+                "ephemeral": {
+                    "type": "object",
+                    "required": [
+                        "stateSizeLimit",
+                        "sshSizeLimit",
+                        "logsSizeLimit",
+                        "runtimeSizeLimit",
+                        "credentialSizeLimit"
+                    ],
+                    "properties": {
+                        "credentialSizeLimit": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "logsSizeLimit": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "runtimeSizeLimit": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "sshSizeLimit": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "stateSizeLimit": {
+                            "type": "string",
+                            "minLength": 1
+                        }
+                    }
+                },
                 "existingClaim": {
                     "type": "string"
                 },

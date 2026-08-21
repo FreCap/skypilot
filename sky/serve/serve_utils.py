@@ -53,6 +53,7 @@ from sky.serve import serve_state
 from sky.serve import serve_status_formatter
 from sky.serve import spot_placer
 from sky.server import constants as server_constants
+from sky.server import runtime_profile
 from sky.server.requests import request_names
 from sky.skylet import constants as skylet_constants
 from sky.skylet import job_lib
@@ -1152,6 +1153,15 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                             'the recovery sweep. Skipping recovery.\n')
                     continue
                 recovery_snapshot = current_snapshot
+                if (runtime_profile.guarded_ha_ephemeral_artifacts_enabled() and
+                    (not current_snapshot.get('config_protocol_active') or
+                     current_snapshot.get('controller_config_snapshot')
+                     is None)):
+                    f.write(f'{capnoun} {service_name} has no complete '
+                            'PostgreSQL controller recovery snapshot; guarded '
+                            'HA will not use a predecessor-local or embedded '
+                            'configuration fallback. Skipping recovery.\n')
+                    continue
                 script = current_snapshot['ha_recovery_script']
                 recovery_version = current_snapshot.get('recovery_version')
                 if (isinstance(recovery_version, bool) or
@@ -1161,6 +1171,12 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                             'recovery version. Skipping recovery.\n')
                     continue
             else:
+                if (runtime_profile.guarded_ha_ephemeral_artifacts_enabled()):
+                    f.write(f'{capnoun} {service_name} has no PostgreSQL '
+                            'recovery-protocol marker; guarded HA will not '
+                            'read a legacy controller-local fallback. '
+                            'Skipping recovery.\n')
+                    continue
                 script = serve_state.get_ha_recovery_script(service_name)
             if script is None:
                 f.write(f'{capnoun} {service_name}\'s recovery script does '
@@ -2874,6 +2890,11 @@ def get_yaml_content(service_name: str,
     yaml_content = serve_state.get_yaml_content(service_name, version)
     if yaml_content is not None:
         return yaml_content
+    if runtime_profile.guarded_ha_ephemeral_artifacts_enabled():
+        raise RuntimeError(
+            f'Guarded HA service {service_name!r} version {version} has no '
+            'committed PostgreSQL task YAML; refusing predecessor-local '
+            'fallback.')
     # Backward compatibility for old service records that
     # does not dump the yaml content to version database.
     # TODO(tian): Remove this after 2 minor releases, i.e. 0.13.0.

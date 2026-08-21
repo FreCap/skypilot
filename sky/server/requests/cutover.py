@@ -22,6 +22,7 @@ import sqlalchemy
 from sqlalchemy.dialects import postgresql
 
 from sky import sky_logging
+from sky.server import runtime_profile
 
 if TYPE_CHECKING:
     from sky.server.requests import requests as requests_lib
@@ -82,6 +83,14 @@ def require_completed_cutover_backend(*, postgres_configured: bool,
                                       postgres_backend: bool,
                                       sqlite_backend: bool) -> None:
     """Refuse stale-source startup after the one-way cutover completes."""
+    if runtime_profile.guarded_ha_ephemeral_artifacts_enabled():
+        if not postgres_configured or not postgres_backend or sqlite_backend:
+            raise RuntimeError(
+                'Guarded HA runtime facts disagree with the resolved '
+                'PostgreSQL request backend.')
+        # Fresh-only guarded HA has no SQLite predecessor to fence. In
+        # particular, do not derive or stat the legacy pod-local gate path.
+        return
     path = gate_path()
     if not path.exists():
         return

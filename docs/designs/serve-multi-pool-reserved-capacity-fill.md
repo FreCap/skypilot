@@ -87,10 +87,12 @@ intent identity exists only in retained JSON rather than the normalized scalar
 column. PR #1636 cannot prune current-version terminal history until a version
 transition or controlled service recreation supersedes it. PR #1637 merged the
 controller-independent request-count UI, but its mixed-version authorization
-repair remains undeployed. The PostgreSQL-plus-S3 replacement for EFS is an
-independent major workstream. These do not reopen the PostgreSQL allocation
-contract. Both the independently renewed provider receipt and the separate
-Kueue admission contract must pass their production horizons before the
+repair remains undeployed. The fresh-service-lifecycle plus bounded-emptyDir
+replacement for EFS is an independent workstream; the existing PostgreSQL
+authority is retained and local uploaded bytes are outside that test profile.
+These do not reopen the PostgreSQL allocation contract. Both the independently
+renewed provider receipt and the separate Kueue admission contract must pass
+their production horizons before the
 end-to-end 100% physical-backfill claim.
 
 ## Qualification history

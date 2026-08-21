@@ -69,6 +69,7 @@ from sky.server import infra_dashboard
 from sky.server import metrics
 from sky.server import plugins
 from sky.server import public_capacity as public_capacity_api
+from sky.server import runtime_profile
 from sky.server import ssh_proxy
 from sky.server import state
 from sky.server import stream_utils
@@ -636,6 +637,23 @@ def handle_concurrent_worker_exhausted_error(
         })
 
 
+@app.exception_handler(runtime_profile.GuardedHALocalArtifactError)
+def handle_guarded_ha_local_artifact_error(
+    request: fastapi.Request, error: runtime_profile.GuardedHALocalArtifactError
+) -> fastapi.responses.JSONResponse:
+    """Return a stable typed response without touching a pod-local path."""
+    del request
+    return fastapi.responses.JSONResponse(
+        status_code=fastapi.status.HTTP_501_NOT_IMPLEMENTED,
+        content={
+            'detail': {
+                'code': runtime_profile.GUARDED_HA_LOCAL_ARTIFACT_ERROR_CODE,
+                'operation': error.operation,
+                'message': str(error),
+            }
+        })
+
+
 async def _read_html_template(template_name: str) -> str:
     template_path = pathlib.Path(__file__).parent / 'html' / template_name
     return await asyncio.to_thread(template_path.read_text, encoding='utf-8')
@@ -1008,6 +1026,8 @@ async def validate(validate_body: payloads.ValidateBody) -> None:
                 dag,
                 request_name=request_names.AdminPolicyRequestName.VALIDATE,
                 request_options=validate_body.get_request_options()) as dag:
+            runtime_profile.validate_final_task_artifact_inputs(
+                dag.tasks, product='SkyPilot validate')
             dag.resolve_and_validate_volumes()
             # Skip validating workdir and file_mounts, as those need to be
             # validated after the files are uploaded to the SkyPilot API server
@@ -1621,6 +1641,7 @@ async def logs(
     background_tasks: fastapi.BackgroundTasks
 ) -> fastapi.responses.StreamingResponse:
     """Tails the logs of a job."""
+    runtime_profile.reject_local_artifact_operation('cluster log streaming')
     stream_utils.ensure_request_log_storage_available()
     # TODO(zhwu): This should wait for the request on the cluster, e.g., async
     # launch, to finish, so that a user does not need to manually pull the
@@ -1668,6 +1689,8 @@ async def download_logs(
         request: fastapi.Request,
         cluster_jobs_body: payloads.ClusterJobsDownloadLogsBody) -> None:
     """Downloads the logs of a job."""
+    runtime_profile.reject_local_artifact_operation(
+        'cluster log synchronization')
     user_hash = common.get_request_user_id(request, cluster_jobs_body)
     logs_dir_on_api_server = await asyncio.to_thread(
         common.prepare_download_tmp_dir, user_hash)
@@ -1727,6 +1750,7 @@ def _resolve_download_paths(
 async def download(download_body: payloads.DownloadBody,
                    request: fastapi.Request) -> None:
     """Downloads a folder from the cluster to the local machine."""
+    runtime_profile.reject_local_artifact_operation('local artifact download')
     user_hash = common.get_request_user_id(request, download_body)
     logs_dir_on_api_server = common.api_server_user_logs_dir_prefix(user_hash)
     download_tmp = await asyncio.to_thread(common.prepare_download_tmp_dir,
@@ -1812,6 +1836,8 @@ def provision_logs(provision_logs_body: payloads.ProvisionLogsBody,
                    follow: bool = True,
                    tail: int = 0) -> fastapi.responses.StreamingResponse:
     """Streams the provision.log for the latest launch request of a cluster."""
+    runtime_profile.reject_local_artifact_operation(
+        'cluster provision-log streaming')
     log_path = None
     cluster_name = provision_logs_body.cluster_name
     worker = provision_logs_body.worker
@@ -1890,6 +1916,8 @@ async def hook_logs(
 
     If ``event`` is None, auto-selects whichever hook event has fired.
     """
+    runtime_profile.reject_local_artifact_operation(
+        'cluster hook-log streaming')
     kill_request_on_disconnect = False
     if executor.api_process_execution_enabled():
         executor.check_request_thread_executor_available()
@@ -2266,6 +2294,8 @@ async def stream(
             clients, console for CLI/API clients), 'plain' (force plain text),
             'html' (force HTML), or 'console' (force console)
     """
+    runtime_profile.reject_local_artifact_operation(
+        'raw API request-log streaming')
     # We need to save the user-supplied request ID for the response header.
     user_supplied_request_id = request_id
     if request_id is not None and log_path is not None:
@@ -2942,6 +2972,8 @@ async def create_debug_dump(
         create_debug_dump_body: payloads.CreateDebugDumpBody) -> None:
     """Starts a debug dump."""
 
+    runtime_profile.reject_local_artifact_operation('local debug-dump creation')
+
     await executor.schedule_request_async(
         request_id=request.state.request_id,
         request_name=request_names.RequestName.CREATE_DEBUG_DUMP,
@@ -2978,6 +3010,7 @@ async def download_debug_dump(
 
     The dump file is automatically deleted after the download completes.
     """
+    runtime_profile.reject_local_artifact_operation('local debug-dump download')
     dump_path = await asyncio.to_thread(_resolve_debug_dump_path, dump_filename)
 
     # Delete the dump file after download completes

@@ -44,6 +44,7 @@ from sky.schemas.api import responses
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve.server import impl
+from sky.server import runtime_profile
 from sky.server.requests import request_names
 from sky.skylet import constants as skylet_constants
 from sky.usage import usage_lib
@@ -676,6 +677,8 @@ def launch(
     # and get the mutated config.
     dag, mutated_user_config = admin_policy_utils.apply(
         dag, request_name=request_names.AdminPolicyRequestName.JOBS_LAUNCH)
+    runtime_profile.validate_final_task_artifact_inputs(dag.tasks,
+                                                        product='Managed Jobs')
     dag.resolve_and_validate_volumes()
     if not dag.is_chain() and not dag.is_job_group():
         with ux_utils.print_exception_no_traceback():

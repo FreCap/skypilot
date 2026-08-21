@@ -4,6 +4,7 @@ from typing import Any
 
 import fastapi
 
+from sky.server import runtime_profile
 from sky.server.requests import executor
 from sky.server.requests import payloads
 from sky.server.requests import request_names
@@ -27,11 +28,20 @@ def get_ssh_node_pools() -> dict[str, Any]:
 
 
 @router.post('')
-def update_ssh_node_pools(pools_config: dict[str, Any]) -> dict[str, str]:
+async def update_ssh_node_pools(request: fastapi.Request) -> dict[str, str]:
     """Update SSH Node Pool configurations."""
+    runtime_profile.reject_local_artifact_operation(
+        'SSH node-pool configuration update')
     try:
+        pools_config = await request.json()
+        if not isinstance(pools_config, dict):
+            raise fastapi.HTTPException(
+                status_code=400,
+                detail='SSH Node Pool configuration must be an object')
         core.update_pools(pools_config)
         return {'status': 'success'}
+    except fastapi.HTTPException:
+        raise
     except Exception as e:
         raise fastapi.HTTPException(status_code=400,
                                     detail=f'Failed to update SSH Node Pools:'
@@ -41,6 +51,8 @@ def update_ssh_node_pools(pools_config: dict[str, Any]) -> dict[str, str]:
 @router.delete('/{pool_name}')
 def delete_ssh_node_pool(pool_name: str) -> dict[str, str]:
     """Delete a SSH Node Pool configuration."""
+    runtime_profile.reject_local_artifact_operation(
+        'SSH node-pool configuration deletion')
     try:
         if core.delete_pool(pool_name):
             return {'status': 'success'}
@@ -59,6 +71,7 @@ def delete_ssh_node_pool(pool_name: str) -> dict[str, str]:
 @router.post('/keys')
 async def upload_ssh_key(request: fastapi.Request) -> dict[str, str]:
     """Upload SSH private key."""
+    runtime_profile.reject_local_artifact_operation('SSH private-key upload')
     try:
         form = await request.form()
         key_name = form.get('key_name')

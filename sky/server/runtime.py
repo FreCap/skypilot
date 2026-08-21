@@ -42,6 +42,7 @@ from sky.server import executor_termination_observer
 from sky.server import file_mount_uploads
 from sky.server import metrics
 from sky.server import plugins
+from sky.server import runtime_profile
 from sky.server.blob import blob_storage as bs
 from sky.server.events import store as operational_event_store
 from sky.server.requests import cutover as request_cutover
@@ -912,15 +913,17 @@ def _start_background_loop(
         background.create_task(
             _singleton_task('estimated-spend-rollup',
                             estimated_spend_lib.rollup_daemon))
-        background.create_task(
-            _singleton_task(
-                'unreferenced-file-mounts',
-                file_mount_uploads.cleanup_unreferenced_file_mounts))
-        background.create_task(
-            _singleton_task('upload-staging-cleanup',
-                            file_mount_uploads.cleanup_upload_ids))
-        background.create_task(
-            _singleton_task('download-staging-cleanup', _cleanup_download_tmp))
+        if not runtime_profile.guarded_ha_ephemeral_artifacts_enabled():
+            background.create_task(
+                _singleton_task(
+                    'unreferenced-file-mounts',
+                    file_mount_uploads.cleanup_unreferenced_file_mounts))
+            background.create_task(
+                _singleton_task('upload-staging-cleanup',
+                                file_mount_uploads.cleanup_upload_ids))
+            background.create_task(
+                _singleton_task('download-staging-cleanup',
+                                _cleanup_download_tmp))
     background.start()
     return background
 

@@ -52,6 +52,7 @@ from sky.server import config as server_config
 from sky.server import constants as server_constants
 from sky.server import metrics as metrics_lib
 from sky.server import plugins
+from sky.server import runtime_profile
 from sky.server import versions
 from sky.server import watchdog
 from sky.server.events import models as event_models
@@ -1910,6 +1911,9 @@ def _build_request(
     re-enqueued with the same dispatch semantics
     (see reenqueue_recovered_requests).
     """
+    if getattr(request_body, 'file_mounts_blob_id', None) is not None:
+        runtime_profile.reject_local_artifact_operation(
+            'request file-mount blob admission')
     role_filter.reject_non_admin_pod_config(auth_user, request_body)
     authenticated_managed_job_origin = versions.get_managed_job_origin()
     if (managed_job_origin is not None and

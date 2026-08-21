@@ -35,6 +35,7 @@ from sky.serve import serve_rpc_utils
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve.server import status as serve_status
+from sky.server import runtime_profile
 from sky.server.requests import request_names
 from sky.skylet import constants
 from sky.skylet import job_lib
@@ -61,6 +62,12 @@ logger = sky_logging.init_logger(__name__)
 
 _KUBERNETES_LABEL_VALUE_MAX_LENGTH = 63
 _STORAGE_NAME_MAX_LENGTH = 63
+
+
+def _validate_guarded_ha_task_inputs(dag: Any) -> None:
+    """Validate the final policy-mutated Serve DAG before local preparation."""
+    runtime_profile.validate_final_task_artifact_inputs(dag.tasks,
+                                                        product='SkyServe')
 
 
 def _prepare_scoped_ephemeral_storage(
@@ -525,7 +532,10 @@ def _up_impl_body(task: 'task_lib.Task',
     lifecycle_epoch = serve_utils.get_service_lifecycle_epoch(lifecycle_lock)
     controller_lifecycle_epoch = (lifecycle_epoch
                                   if consolidation_mode else None)
-    task.validate()
+    task.validate(
+        skip_file_mounts=(
+            runtime_profile.guarded_ha_ephemeral_artifacts_enabled()),
+        skip_workdir=(runtime_profile.guarded_ha_ephemeral_artifacts_enabled()))
     serve_utils.validate_service_task(task, pool=pool)
     assert task.service is not None
     assert task.service.pool == pool, 'Inconsistent pool flag.'
@@ -540,7 +550,9 @@ def _up_impl_body(task: 'task_lib.Task',
     # and get the mutated config.
     dag, mutated_user_config = admin_policy_utils.apply(
         dag, request_name=request_names.AdminPolicyRequestName.SERVE_UP)
+    _validate_guarded_ha_task_inputs(dag)
     task = dag.tasks[0]
+    task.validate()
     assert task.service is not None
     service_workspace = (skypilot_config.get_active_workspace() or
                          constants.SKYPILOT_DEFAULT_WORKSPACE)
@@ -1144,7 +1156,10 @@ def _update_impl_body(
                                    f'existing {noun} {service_name!r}')
         task.set_service(task.service.copy(min_replicas=workers))
 
-    task.validate()
+    task.validate(
+        skip_file_mounts=(
+            runtime_profile.guarded_ha_ephemeral_artifacts_enabled()),
+        skip_workdir=(runtime_profile.guarded_ha_ephemeral_artifacts_enabled()))
     serve_utils.validate_service_task(task, pool=pool)
 
     # Now apply the policy and handle task-specific logic
@@ -1153,7 +1168,9 @@ def _update_impl_body(
     # and get the mutated config.
     dag, mutated_user_config = admin_policy_utils.apply(
         task, request_name=request_names.AdminPolicyRequestName.SERVE_UPDATE)
+    _validate_guarded_ha_task_inputs(dag)
     task = dag.tasks[0]
+    task.validate()
     requested_config_workspace = mutated_user_config.get('active_workspace')
     if (requested_config_workspace is not None and
             requested_config_workspace != service_workspace):

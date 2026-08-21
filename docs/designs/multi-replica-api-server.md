@@ -14,8 +14,9 @@ plans and pull request descriptions must link here rather than restating it.
 
 Storage supersession: storage work is governed only by
 `docs/designs/stateless-ha-control-plane-storage.md`: PostgreSQL structured
-authority, private server-owned S3 for immutable bytes, bounded pod-local
-`emptyDir`, and no control-plane PVC or EFS steady state.
+authority, fail-closed rejection of local uploaded bytes, bounded pod-local
+`emptyDir`, and no control-plane PVC or EFS steady state. The test-only fresh
+cutover has superseded the former EFS-to-S3 migration design.
 
 ## Summary
 
@@ -122,9 +123,10 @@ replica-independent and keeps each migration milestone deployable.
   retries.
 - Migrating local controller databases that officially continue to support
   SQLite.
-- Defining or migrating the durable-byte backend. Guarded HA consumes the
-  committed provider contract; `stateless-ha-control-plane-storage.md` alone
-  defines its PostgreSQL/S3 migration and no-PVC steady state.
+- Defining the supported local-artifact boundary. Guarded HA consumes the
+  PostgreSQL plus bounded-emptyDir contract;
+  `stateless-ha-control-plane-storage.md` alone defines its fresh recreation,
+  rejected upload surface, and no-PVC steady state.
 
 ## Behavior Contract
 
@@ -141,10 +143,12 @@ replica-independent and keeps each migration milestone deployable.
 - A rolling upgrade with `maxUnavailable: 0` must retain at least one Ready API
   endpoint throughout the rollout.
 - Existing long-lived HTTP or WebSocket streams may reconnect using the same
-  request ID. Their underlying request and log state must remain available.
-- API readiness is false when PostgreSQL is unreachable, the request schema is
-  incompatible, or the active committed durable-byte provider fails its
-  generation and exact-object readiness contract.
+  request ID. Their PostgreSQL request state remains available; a raw local log
+  tail lost with its pod is reported as an explicit gap/unavailable result.
+- API readiness is false when PostgreSQL is unreachable or the request schema
+  is incompatible. Helm rejects an invalid PVC-free local-artifact profile
+  before deployment; local quota exhaustion fails the affected operation and
+  leaves PostgreSQL authority unchanged.
 - SIGTERM makes the pod fail readiness before it begins application shutdown.
   A pre-stop drain interval allows EndpointSlice and kube-proxy state to
   converge before Uvicorn exits.
@@ -382,15 +386,17 @@ operational table, is the 35-day evidence authority.
 
 ### Artifacts and logs
 
-- Every API, executor, and controller role consumes the one committed
-  durable-byte provider selected by the independent storage generation; role
-  correctness never depends on pod affinity or a path shared between pods.
-- Upload and log references are durable and replica-independent before their
-  originating role can release ownership. Provider-specific publication,
-  fencing, materialization, retention, and recovery are defined only in
-  `docs/designs/stateless-ha-control-plane-storage.md`.
-- Temporary assembly/materialization remains bounded and pod-local because it
-  is regenerated from the committed reference.
+- Every API, executor, and controller role consumes PostgreSQL durable state;
+  role correctness never depends on pod affinity or a path shared between
+  pods.
+- Guarded HA rejects API-uploaded local workdirs, local file mounts, and every
+  non-null file-mount blob ID before staging bytes. Remote object URIs and
+  server/workspace-owned volumes remain outside the control-plane filesystem.
+- Raw local log files are best-effort operational diagnostics. PostgreSQL
+  lifecycle/status remains replica-independent and Kubernetes/Datadog owns the
+  test installation's retained operational logs.
+- Temporary projection/materialization is bounded and pod-local because it is
+  regenerated from PostgreSQL or an external immutable workload source.
 - Stored Serve version YAML and submitted YAML in PostgreSQL are authoritative.
   Recovery reconstructs control files from durable rows. A persisted script
   must not be the only copy of a controller input file.
@@ -424,15 +430,10 @@ operational table, is the 35-day evidence authority.
   `before-hook-creation`. Release-managed, least-privilege RBAC permits the
   verifier to read only the exact role Deployments. Tests cover retry, failure,
   TTL cleanup, and uninstall residue. In guarded HA, every migration, seed, and
-  verifier Job that runs after storage-authority initialization must read and
-  validate the committed storage mode and generation before it mutates durable
-  state; Helm hook annotations are not an exemption. The only initialization
-  exceptions are D2's inert schema creation, which creates no authority row,
-  and the explicit receipt/CAS-backed `initialize-legacy` or D8 empty-database
-  S3 bootstrap operations that create the first authority row. Each exception
-  validates the release-projected external fence and its documented
-  installation preconditions; every subsequent Job validates the committed
-  PostgreSQL row.
+  verifier Job in the fresh guarded profile validates the exact database head,
+  PostgreSQL configuration generation, and PVC-free rendered release before it
+  mutates durable state. There is no storage-authority row, legacy initializer,
+  or object-provider bootstrap.
 - API and worker pods run in verify-only migration mode.
 - New schema revisions are additive during the expand phase.
 - A release may read both the old and new representation while mixed versions
@@ -460,7 +461,7 @@ operational table, is the 35-day evidence authority.
 | Controller Deployment | 2 or more | No | No | Leader only | Leader only |
 | Migration Job | 1 per Helm revision | No | No | No | No |
 | PostgreSQL | External production service | No | Durable authority | Durable authority | Durable authority |
-| Durable byte provider | Storage design | Upload and log reads | Upload and log writes | Controller files and logs | Controller files and logs |
+| Bounded emptyDir | One per pod | Disposable projections only | Disposable projections/logs | Disposable projections/logs | No durable authority |
 
 Splitting executors from controller supervisors is intentional. Active-active
 request throughput and active-standby controller ownership have different
@@ -469,8 +470,9 @@ also churn controller leadership.
 
 The compatibility entrypoint keeps `--role=all` while the fleet migrates. HA
 mode uses explicit `api`, `executor`, and `controller` roles and fails Helm
-rendering if PostgreSQL or the committed durable-byte provider required by the
-active storage generation is absent.
+rendering if PostgreSQL or the bounded PVC-free volume contract is absent. The
+qualified image independently provides fail-closed local-upload admission;
+Helm cannot infer application behavior from an image reference.
 
 ## PostgreSQL Request Schema
 
@@ -647,8 +649,9 @@ The reviewed bundle pins immutable chart and image identities, captures
 retained values and the rendered diff, and upgrades the existing release with
 `--reuse-values`. `boltz-platform` owns only minimum static infrastructure
 and identity/RBAC boundaries; it owns neither the SkyPilot Helm release nor an
-application-version pin. The one-way storage cutover lease, generation commit,
-and pre-commit/post-commit recovery boundary are defined only by
+application-version pin. The one-way retained-PostgreSQL, fresh-service-
+lifecycle/PVC-free cutover and its pre-detach/post-detach recovery boundary are
+defined only by
 `docs/designs/stateless-ha-control-plane-storage.md`. This role-split design
 adds no admission policy, second Helm release, or storage-specific rollout
 controller.
@@ -683,9 +686,9 @@ The chart enforces:
   split.
 - `apiService.replicas >= 2`.
 - Executor and controller replicas are at least two.
-- The active storage generation passes the independent guarded-HA contract in
-  `docs/designs/stateless-ha-control-plane-storage.md`. This file defines no
-  PVC, EFS, fallback, or cutover values.
+- `storage.enabled=false`, no `storage.existingClaim`, and bounded disk-backed
+  emptyDir plus matching ephemeral-storage requests/limits for every role.
+  Guarded HA rejects any PVC, EFS, fallback, or unbounded local volume.
 - Guarded HA pins RollingUpdate to zero unavailable replicas
   (`maxUnavailable: 0` or `0%`) and an absolute `maxSurge: 1`.
   Compatibility-mode RollingUpdate retains its existing configurable values,
@@ -820,8 +823,8 @@ RWX claim as a transitional storage dependency. The former executable EFS/RWX
 copy, backup, Terraform, Helm, cost, rollback, and capacity plan has been
 removed from this canonical design; it remains available in Git history only.
 `docs/designs/stateless-ha-control-plane-storage.md` exclusively owns removal of
-that live claim and the PostgreSQL plus S3 no-EFS cutover. No text in this file
-authorizes a new EFS/RWX change.
+that live claim and the retained-PostgreSQL plus fresh-service-lifecycle,
+emptyDir no-EFS cutover. No text in this file authorizes a new EFS/RWX change.
 
 ### M2: Split API and executor roles
 
@@ -1186,7 +1189,7 @@ running managed-job finalizers. Singleton maintenance loops start only with
 leader-owned resources or retain their narrower PostgreSQL session locks.
 
 The chart renders two controller replicas with a distinct label, role command,
-health port, resources, credentials, committed durable-byte provider, and
+health port, resources, credentials, bounded pod-local storage, and
 PostgreSQL configuration. HA validation requires at least two. M3 intentionally leaves
 the controller PodDisruptionBudget and topology-spread rollout policy for M4,
 but active and standby deletion are both failure-injected before M3 is
@@ -1436,13 +1439,13 @@ Deployment:
    the fix-forward contract below and never uses this historical exercise to
    authorize native rollback.
 6. Remove the conformance canary and superseded hook Jobs, while retaining the
-   healthy isolated release and its declared PostgreSQL and storage-generation
+   healthy isolated release and its declared PostgreSQL and bounded-emptyDir
    dependencies.
 
 ### M5: Compatibility cleanup gate
 
-- Confirm all production-target Helm values use explicit roles, PostgreSQL, and
-  a provider that passes the active storage-generation contract.
+- Confirm all production-target Helm values use explicit roles, PostgreSQL,
+  rejected local uploads, and the bounded PVC-free profile.
 - Confirm the rollback window no longer includes a release that reads the
   legacy request database or local queue.
 - Delete the compatibility code listed below in a dedicated final commit.
@@ -1534,13 +1537,15 @@ by HA mode.
 - Normal executors reject controller-class rows. Only a current controller
   leader may claim them, and a stale generation cannot reserve a new external
   mutation.
-- Role-split tests inject the committed durable-byte provider and prove that
-  API/executor/controller failover does not lose or duplicate its references;
-  provider-specific blob/log behavior is owned by the storage design.
+- Role-split tests start with empty role-local filesystems and prove that
+  API/executor/controller failover reconstructs supported state from
+  PostgreSQL. Guarded upload requests fail before body consumption and raw-log
+  loss is explicit rather than misrouted.
 - Migration tests cover empty bootstrap, additive upgrade, verify-only success,
   verify-only mismatch, and two concurrent migration attempts.
-- Storage migration, object-store, importer, admission-fence, and exact EFS
-  deletion tests are owned exclusively by
+- Retained-PostgreSQL fresh service recreation, local-artifact admission,
+  bounded emptyDir, and exact EFS detachment/deletion tests are owned
+  exclusively by
   `docs/designs/stateless-ha-control-plane-storage.md`; this role-split suite
   neither recreates nor qualifies the removed RWX plan.
 - Direct-Helm harness tests require immutable chart/image/operation digests,
@@ -1682,8 +1687,9 @@ No new telemetry pipeline is introduced. Existing Datadog collection receives:
 - Ready API, executor, and controller instance counts.
 - Controller leader identity, generation, and lock-session health.
 - Migration duration and result.
-- Active storage-generation readiness and reference failures, using the
-  storage design's provider-neutral metrics.
+- Local byte/inode pressure from Kubernetes/container telemetry and typed local-
+  upload rejection responses through the ordinary API request/error pipeline.
+  This storage change introduces no second telemetry service.
 
 Scraping is role- and pod-scoped. API, executor, and both controller targets
 must be present independently; the API Service is not a proxy for metrics
@@ -1706,8 +1712,8 @@ wall-clock timer, PR age, or Helm uptime never unlocks cleanup; provider-
 specific runbook step names are not part of this application contract.
 
 This clock gates only the role-split M5 compatibility cleanup described by
-this file. It does not gate the independently reviewed no-EFS cutover, retain-
-forever S3 object policy, or exact SkyPilot PVC/access-point removal.
+this file. It does not gate the independently reviewed fresh no-EFS cutover or
+exact SkyPilot PVC/access-point removal.
 
 The separately reviewed observation deployment installs a
 `rainier-ha-observer` CronJob inside the private cluster
@@ -1727,8 +1733,8 @@ sample/reset/checkpoint objects but cannot overwrite or delete them. The bucket
 policy independently denies missing or non-`*` conditional headers for both
 this prefix and the disjoint seed prefix; identity policy alone is not the
 append-only boundary.
-Each sample binds the attempt ID, committed storage mode and generation,
-accepted storage-readiness receipt, exact direct-Helm release-bundle
+Each sample binds the attempt ID, exact rendered PVC-free storage profile and
+accepted live-pod readiness evidence, exact direct-Helm release-bundle
 digest, immutable environment/placement evidence, any applicable capacity-cost
 approval receipt and hard end, predicate result and source query IDs, prior-
 sample digest, and observer build digest. Failed predicates and missing UTC-
@@ -1787,8 +1793,8 @@ An exporter on the same approved network verifies the append-only chain and
 materializes the canonical platform-repository artifact
 `deployment/evidence/rainier-ha-observation.json`. It contains every accepted
 minute or an equivalently lossless interval encoding, the continuous start and
-end, all resets and reasons, source query IDs, storage-generation/admission-
-policy and release identities, approval hard end, chain head and backing S3
+end, all resets and reasons, source query IDs, PVC-free-storage/admission-policy
+and release identities, approval hard end, chain head and backing S3
 object/version manifest, and the
 computed `eligible_at`. Cleanup CI independently validates the schema and hash
 chain, expands the minute sequence, rejects a gap or failed predicate, requires
@@ -1829,10 +1835,11 @@ slower; any failed, stale, or missing observation resets the clock:
   aggregate headroom for all three possible rollout surges remains satisfied
   after accounting for DaemonSets, external load balancers, the observer, and
   all other live workloads;
-- the committed storage mode and generation are Ready in all six role pods and
-  exact-version object probes have no stale or failed observation. Before the
-  separate storage cutover, EFS health is operational telemetry only; after
-  S3_V1, any PVC/EFS mount or I/O fails the storage gate;
+- the exact rendered PVC-free storage profile is running in all six Ready role
+  pods, every local volume remains within its byte/inode budget, and local-
+  upload rejection has no bypass. Before the separate fresh cutover, EFS health
+  is operational telemetry only; afterward, any PVC/EFS mount or I/O fails the
+  storage gate;
 - PostgreSQL CPU remains below 70% at p95, connections below 70% of the
   configured maximum, and connection/error counters show no HA-attributable
   increase; and
@@ -1859,9 +1866,9 @@ observation clock.
   an immutable compatible image/chart and the complete retained values. Native
   `helm rollback` to a stored pre-PostgreSQL or incompatible storage revision is
   unsupported.
-- After S3_V1, guarded production HA cannot return to `--role=all`.
+- After the fresh PVC-free cutover, guarded HA cannot return to `--role=all`.
   Recovery fixes the split API, executor, and controller topology forward with
-  an S3-capable image.
+  a PostgreSQL/emptyDir-capable image.
   The all-role entrypoint may remain only for explicit non-HA/local
   compatibility until its M5 removal gate.
 - Disabling `apiService.metrics.enabled` removes all role metrics ports and
@@ -1994,8 +2001,8 @@ behavior, not a migration guard.
   `sky/server/blob/blob_storage.py` for remote HA deployments
 - Startup logic that wipes uploaded task files or logs because one pod
   restarted
-- Chart branches that let guarded HA bypass the committed storage-generation
-  contract or select pod-local/RWO authority
+- Chart branches that let guarded HA mount a PVC/RWO/RWX path, leave emptyDir
+  unbounded, or accept local uploads
 
 `LocalFilesystemBlobStorage` may remain for a standalone local developer
 server only if it is explicitly selected and cannot be used by HA mode.
@@ -2068,8 +2075,8 @@ This migration is complete only when all of the following are true:
 - The final Helm release is deployed, all role Deployments are healthy, and no
   test workload or stale migration resource remains.
 - The isolated role-split release retains only its declared PostgreSQL and
-  active storage-generation dependencies. One-shot canaries, failed revisions,
-  and unrelated cluster-scoped residue are absent.
+  bounded PVC-free local-storage dependencies. One-shot canaries, failed
+  revisions, and unrelated cluster-scoped residue are absent.
 - The design reflects the code that actually shipped.
 - M5 removals are either merged after fleet evidence or tracked as explicit
   gated deletions with owners and objective removal conditions. Passing a test

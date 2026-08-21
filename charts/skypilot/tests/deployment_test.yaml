@@ -25,31 +25,31 @@ tests:
             persistentVolumeClaim:
               claimName: production-rwx-state
 
-  - it: should gate API startup on a separately mounted read-only authority claim
+  - it: should reject an operator-supplied PVC in guarded HA
     values:
       - fixtures/rwx-authority-fence-values.yaml
+    set:
+      storage.enabled: false
+      storage.existingClaim: ""
     asserts:
-      - equal:
-          path: spec.template.spec.initContainers[0].name
-          value: verify-rwx-authority-fence
-      - equal:
-          path: spec.template.spec.initContainers[0].volumeMounts
-          value:
-            - name: skypilot-rwx-authority-fence
-              mountPath: /var/run/skypilot/rwx-authority
-              readOnly: true
-      - contains:
-          path: spec.template.spec.volumes
-          content:
-            name: skypilot-rwx-authority-fence
-            persistentVolumeClaim:
-              claimName: skypilot-state-authority
-              readOnly: true
-      - notContains:
-          path: spec.template.spec.containers[0].volumeMounts
-          any: true
-          content:
-            name: skypilot-rwx-authority-fence
+      - failedTemplate:
+          errorMessage: 'extraVolumes persistentVolumeClaim "skypilot-rwx-authority-fence" is not supported in guarded HA'
+
+  - it: should reject a CSI shared filesystem in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: postgres-uri
+      requestStore.backend: postgres
+      storage.enabled: false
+      apiService.extraVolumes:
+        - name: external-shared
+          csi:
+            driver: efs.csi.aws.com
+    asserts:
+      - failedTemplate:
+          errorMessage: 'extraVolumes volume "external-shared" uses unsupported source "csi" in guarded HA'
 
   - it: should keep the authority fence in one-pod compatibility mode
     values:
@@ -367,8 +367,7 @@ tests:
       apiService.upgradeStrategy: RollingUpdate
       requestStore.backend: postgres
       apiService.dbConnectionSecretName: external-db
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
       executorService.replicas: 2
       # Simulate an upgrade whose reused values still contain the pre-HA
       # readiness endpoint. HA must force the role-specific readiness gate.
@@ -458,7 +457,8 @@ tests:
           path: spec.template.spec.volumes
           content:
             name: skypilot-role-runtime
-            emptyDir: {}
+            emptyDir:
+              sizeLimit: 256Mi
       - equal:
           path: spec.template.spec.topologySpreadConstraints[0].topologyKey
           value: kubernetes.io/hostname
@@ -467,7 +467,24 @@ tests:
           content:
             name: state-volume
             mountPath: /root/.sky
-            subPath: .sky
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: state-volume
+            emptyDir:
+              sizeLimit: 4Gi
+      - notMatchRegexRaw:
+          pattern: 'emptyDir: \{\}'
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: ssh-volume
+            mountPath: /root/.ssh
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: logs-volume
+            mountPath: /root/sky_logs
       - notContains:
           path: spec.template.spec.volumes
           content:
@@ -482,11 +499,112 @@ tests:
       apiService.dbConnectionSecretName: external-db
       apiService.topologySpreadTopologyKey: ""
       requestStore.backend: postgres
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
     asserts:
       - notExists:
           path: spec.template.spec.topologySpreadConstraints
+
+  - it: should reject an operator emptyDir in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: false
+      apiService.extraVolumes:
+        - name: operator-cache
+          emptyDir: {}
+    asserts:
+      - failedTemplate:
+          errorMessage: 'extraVolumes emptyDir "operator-cache" is not supported in guarded HA; use a chart-owned bounded volume or a read-only projected source'
+
+  - it: should reject a bounded memory-backed operator emptyDir in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: false
+      apiService.extraVolumes:
+        - name: operator-cache
+          emptyDir:
+            medium: Memory
+            sizeLimit: 100Gi
+    asserts:
+      - failedTemplate:
+          errorMessage: 'extraVolumes emptyDir "operator-cache" is not supported in guarded HA; use a chart-owned bounded volume or a read-only projected source'
+
+  - it: should accept a read-only projected Secret in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: false
+      apiService.extraVolumes:
+        - name: operator-config
+          secret:
+            secretName: operator-config
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: operator-config
+            secret:
+              secretName: operator-config
+
+  - it: should reject overriding a chart-owned guarded HA volume budget
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: false
+      storage.ephemeral.stateSizeLimit: 100Gi
+    asserts:
+      - failedTemplate:
+          errorMessage: storage.ephemeral.stateSizeLimit must use the guarded HA chart-owned value 4Gi
+
+  - it: should reject overriding a chart-owned guarded HA role budget
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: false
+      apiService.resources.requests.ephemeral-storage: 1Gi
+    asserts:
+      - failedTemplate:
+          errorMessage: apiService resources.requests.ephemeral-storage must use the guarded HA chart-owned value 6Gi
+
+  - it: should inject API ephemeral-storage budgets only in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: false
+      apiService.resources.requests.ephemeral-storage: null
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.ephemeral-storage
+          value: 6Gi
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits.ephemeral-storage
+          value: 8Gi
+
+  - it: should not inject API ephemeral-storage budgets outside guarded HA
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].resources.requests.ephemeral-storage
+      - notExists:
+          path: spec.template.spec.containers[0].resources.limits.ephemeral-storage
 
   - it: should reject unavailable API replicas during guarded HA rollouts
     set:
@@ -496,8 +614,7 @@ tests:
       apiService.rollingUpdate.maxUnavailable: 1
       requestStore.backend: postgres
       apiService.dbConnectionSecretName: external-db
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
     asserts:
       - failedTemplate:
           errorMessage: "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxUnavailable=0 or 0%"
@@ -510,8 +627,7 @@ tests:
       apiService.rollingUpdate.maxUnavailable: 0%
       requestStore.backend: postgres
       apiService.dbConnectionSecretName: external-db
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
     asserts:
       - equal:
           path: spec.strategy.rollingUpdate.maxUnavailable
@@ -525,8 +641,7 @@ tests:
       apiService.rollingUpdate.maxSurge: 2
       requestStore.backend: postgres
       apiService.dbConnectionSecretName: external-db
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
     asserts:
       - failedTemplate:
           errorMessage: "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxSurge=1"
@@ -539,8 +654,7 @@ tests:
       apiService.rollingUpdate.maxSurge: 0
       requestStore.backend: postgres
       apiService.dbConnectionSecretName: external-db
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
     asserts:
       - failedTemplate:
           errorMessage: "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxSurge=1"
@@ -553,8 +667,7 @@ tests:
       apiService.rollingUpdate.maxSurge: 25%
       requestStore.backend: postgres
       apiService.dbConnectionSecretName: external-db
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
     asserts:
       - failedTemplate:
           errorMessage: "apiService.highAvailability.enabled=true requires apiService.rollingUpdate.maxSurge=1"
@@ -566,8 +679,7 @@ tests:
       apiService.upgradeStrategy: RollingUpdate
       requestStore.backend: postgres
       apiService.dbConnectionString: postgresql://user:pass@host:5432/db
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
     asserts:
       - failedTemplate:
           errorMessage: "apiService.highAvailability.enabled=true requires a pre-existing apiService.dbConnectionSecretName for the blocking migration hook"
@@ -580,8 +692,7 @@ tests:
       apiService.upgradeStrategy: RollingUpdate
       requestStore.backend: postgres
       apiService.dbConnectionSecretName: external-db
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
     asserts:
       - failedTemplate:
           errorMessage: "apiService.highAvailability.readinessDrainSeconds must be at least the API readiness failure-detection window (16 seconds)"
@@ -594,8 +705,7 @@ tests:
       apiService.upgradeStrategy: RollingUpdate
       requestStore.backend: postgres
       apiService.dbConnectionSecretName: external-db
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
     asserts:
       - failedTemplate:
           errorMessage: "apiService.terminationGracePeriodSeconds must be at least readinessDrainSeconds+executionDrainSeconds+finalCommitSeconds (91 seconds) in HA mode"
@@ -607,8 +717,7 @@ tests:
       apiService.upgradeStrategy: RollingUpdate
       requestStore.backend: postgres
       apiService.dbConnectionSecretName: external-db
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
       executorService.terminationGracePeriodSeconds: 59
     asserts:
       - failedTemplate:
@@ -620,8 +729,7 @@ tests:
       apiService.replicas: 2
       apiService.upgradeStrategy: RollingUpdate
       apiService.dbConnectionSecretName: external-db
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
     asserts:
       - failedTemplate:
           errorMessage: "apiService.highAvailability.enabled=true requires requestStore.backend=postgres"
@@ -633,8 +741,7 @@ tests:
       apiService.upgradeStrategy: RollingUpdate
       requestStore.backend: postgres
       apiService.dbConnectionSecretName: external-db
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
     asserts:
       - failedTemplate:
           errorMessage: "apiService.highAvailability.enabled=true requires apiService.replicas>=2"
@@ -646,8 +753,7 @@ tests:
       apiService.upgradeStrategy: RollingUpdate
       requestStore.backend: postgres
       apiService.dbConnectionSecretName: external-db
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
       executorService.replicas: 1
     asserts:
       - failedTemplate:
@@ -660,14 +766,13 @@ tests:
       apiService.upgradeStrategy: RollingUpdate
       requestStore.backend: postgres
       apiService.dbConnectionSecretName: external-db
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
       controllerService.replicas: 1
     asserts:
       - failedTemplate:
           errorMessage: "apiService.highAvailability.enabled=true requires controllerService.replicas>=2"
 
-  - it: should reject HA without shared RWX storage
+  - it: should reject persistent storage in guarded HA
     set:
       apiService.highAvailability.enabled: true
       apiService.replicas: 2
@@ -675,11 +780,9 @@ tests:
       requestStore.backend: postgres
       apiService.dbConnectionSecretName: external-db
       storage.enabled: true
-      storage.accessMode: ReadWriteOnce
-      storage.existingClaim: production-rwx-state
     asserts:
       - failedTemplate:
-          errorMessage: "apiService.highAvailability.enabled=true requires storage.accessMode=ReadWriteMany"
+          errorMessage: "apiService.highAvailability.enabled=true requires storage.enabled=false for PostgreSQL guarded HA"
 
   - it: should reject the PostgreSQL request store without an external database
     set:

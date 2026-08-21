@@ -9,8 +9,7 @@ requestStore:
   cutoverGatePath: /root/.sky/api-request-cutover.json
   enforceBuiltinExecutionQuiescenceBackends: true
 storage:
-  enabled: true
-  accessMode: ReadWriteMany
+  enabled: false
 executorService:
   replicas: 2
 controllerService:

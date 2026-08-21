@@ -20,16 +20,14 @@ tests:
             name: SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH
             value: /root/.sky/api-request-cutover.json
 
-  - it: should mount a pre-existing state claim
+  - it: should render bounded local state in guarded HA
     set:
       apiService.highAvailability.enabled: true
       apiService.dbConnectionSecretName: external-db
       apiService.replicas: 2
       apiService.upgradeStrategy: RollingUpdate
       requestStore.backend: postgres
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
-      storage.existingClaim: production-rwx-state
+      storage.enabled: false
       executorService.replicas: 2
       controllerService.replicas: 2
     asserts:
@@ -37,34 +35,20 @@ tests:
           path: spec.template.spec.volumes
           content:
             name: state-volume
-            persistentVolumeClaim:
-              claimName: production-rwx-state
+            emptyDir:
+              sizeLimit: 4Gi
+      - notMatchRegexRaw:
+          pattern: 'emptyDir: \{\}'
 
-  - it: should gate controller startup on a separately mounted read-only authority claim
+  - it: should reject an operator-supplied PVC in guarded HA
     values:
       - fixtures/rwx-authority-fence-values.yaml
+    set:
+      storage.enabled: false
+      storage.existingClaim: ""
     asserts:
-      - equal:
-          path: spec.template.spec.initContainers[0].name
-          value: verify-rwx-authority-fence
-      - equal:
-          path: spec.template.spec.initContainers[0].volumeMounts
-          value:
-            - name: skypilot-rwx-authority-fence
-              mountPath: /var/run/skypilot/rwx-authority
-              readOnly: true
-      - contains:
-          path: spec.template.spec.volumes
-          content:
-            name: skypilot-rwx-authority-fence
-            persistentVolumeClaim:
-              claimName: skypilot-state-authority
-              readOnly: true
-      - notContains:
-          path: spec.template.spec.containers[0].volumeMounts
-          any: true
-          content:
-            name: skypilot-rwx-authority-fence
+      - failedTemplate:
+          errorMessage: 'extraVolumes persistentVolumeClaim "skypilot-rwx-authority-fence" is not supported in guarded HA'
 
   - it: should not render an controller deployment in compatibility mode
     asserts:
@@ -79,8 +63,8 @@ tests:
       apiService.dbConnectionSecretName: external-db
       requestStore.backend: postgres
       requestStore.enforceBuiltinExecutionQuiescenceBackends: true
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
+      serve.controllerHold: true
       controllerService.replicas: 2
       executorService.terminationGracePeriodSeconds: 75
     asserts:
@@ -202,13 +186,23 @@ tests:
           path: spec.template.spec.volumes
           content:
             name: skypilot-role-runtime
-            emptyDir: {}
+            emptyDir:
+              sizeLimit: 256Mi
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
           content:
             name: state-volume
             mountPath: /root/.sky
-            subPath: .sky
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_SERVER_STORAGE_ENABLED
+            value: "false"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD
+            value: "true"
       - notExists:
           path: spec.template.metadata.annotations["skypilot.co/scrape"]
       - notContains:
@@ -242,8 +236,7 @@ tests:
       apiService.metrics.enabled: true
       prometheus.useDedicatedScrapeConfig: true
       requestStore.backend: postgres
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
     asserts:
       - equal:
           path: spec.template.metadata.annotations["skypilot.co/scrape"]
@@ -272,6 +265,30 @@ tests:
       - matchRegex:
           path: spec.template.spec.containers[0].args[2]
           pattern: "export PROMETHEUS_MULTIPROC_DIR=/tmp/metrics\\s+rm -rf /tmp/metrics\\s+mkdir -p /tmp/metrics\\s+exec python[\\s\\S]+--metrics-port 9090"
+
+  - it: should reject an operator controller emptyDir in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: false
+      controllerService.extraVolumes:
+        - name: operator-cache
+          emptyDir: {}
+    asserts:
+      - failedTemplate:
+          errorMessage: 'extraVolumes emptyDir "operator-cache" is not supported in guarded HA; use a chart-owned bounded volume or a read-only projected source'
+
+  - it: should require a controller ephemeral-storage limit in guarded HA
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      storage.enabled: false
+      controllerService.resources.limits.ephemeral-storage: null
+    asserts:
+      - failedTemplate:
+          errorMessage: controllerService resources.limits.ephemeral-storage is required in guarded HA
 
   - it: should discard stale controller metric files after hooks before exec
     set:
@@ -320,8 +337,7 @@ tests:
       apiService.upgradeStrategy: RollingUpdate
       apiService.dbConnectionSecretName: external-db
       requestStore.backend: postgres
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
       databaseConnection.extraEnvs:
         - name: PGSSLMODE
           value: verify-full
@@ -367,8 +383,7 @@ tests:
       apiService.upgradeStrategy: RollingUpdate
       apiService.dbConnectionSecretName: external-db
       requestStore.backend: postgres
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
+      storage.enabled: false
       awsCredentials.enabled: true
       awsCredentials.useCredentialsFile: true
       awsCredentials.awsSecretName: aws-credentials

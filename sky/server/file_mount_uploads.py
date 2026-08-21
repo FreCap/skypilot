@@ -18,6 +18,7 @@ from sky import sky_logging
 from sky.jobs import state as managed_job_state
 from sky.schemas.api import responses
 from sky.server import common
+from sky.server import runtime_profile
 from sky.server.blob import blob_storage as bs
 from sky.server.requests import payloads
 from sky.server.requests import requests as requests_lib
@@ -264,6 +265,7 @@ async def upload_zip_file(request: fastapi.Request, user_hash: str,
         chunk_index: The chunk index, starting from 0.
         total_chunks: The total number of chunks.
     """
+    runtime_profile.reject_local_artifact_operation('file-mount upload')
     # Check upload_id to be a valid SkyPilot run_timestamp appended with 8 hex
     # characters, e.g. 'sky-2025-01-17-09-10-13-933602-35d31c22'.
     if not re.match(
@@ -295,6 +297,7 @@ async def upload_zip_file(request: fastapi.Request, user_hash: str,
 async def check_blob_exists(request: fastapi.Request, user_hash: str,
                             blob_id: str) -> dict[str, bool]:
     """Check if a file mount blob already exists."""
+    runtime_profile.reject_local_artifact_operation('file-mount blob lookup')
     if not re.match(r'^[0-9a-f]{64}$', blob_id):
         raise fastapi.HTTPException(status_code=400,
                                     detail=f'Invalid blob_id: {blob_id}')
@@ -333,6 +336,7 @@ async def upload_blob(request: fastapi.Request, user_hash: str, upload_id: str,
     into a staging directory, then atomically renames to a shared extraction
     directory (blobs/{upload_id}/) so all requests can reuse it.
     """
+    runtime_profile.reject_local_artifact_operation('file-mount blob upload')
     if not re.match(r'^[0-9a-f]{64}$', upload_id):
         raise fastapi.HTTPException(
             status_code=400, detail=f'Invalid upload_id for v2: {upload_id}')

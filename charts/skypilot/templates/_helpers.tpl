@@ -38,6 +38,7 @@ Fail before rendering a Pod whose configurable environment, volume, or mount
 inputs collide with each other or with chart-owned fields.
 */}}
 {{- define "skypilot.validatePodExtras" -}}
+{{- $guardedEphemeralProfile := default false .guardedEphemeralProfile -}}
 {{- $seenEnvs := dict -}}
 {{- range (default (list) .reservedEnvNames) -}}
 {{- $_ := set $seenEnvs . true -}}
@@ -72,6 +73,23 @@ inputs collide with each other or with chart-owned fields.
 {{- if hasKey $seenVolumes $name -}}
 {{- fail (printf "volume name %q is duplicated or reserved by the chart" $name) -}}
 {{- end -}}
+{{- if and $guardedEphemeralProfile (hasKey . "persistentVolumeClaim") -}}
+{{- fail (printf "extraVolumes persistentVolumeClaim %q is not supported in guarded HA" $name) -}}
+{{- end -}}
+{{- if and $guardedEphemeralProfile (hasKey . "emptyDir") -}}
+{{- fail (printf "extraVolumes emptyDir %q is not supported in guarded HA; use a chart-owned bounded volume or a read-only projected source" $name) -}}
+{{- end -}}
+{{- if $guardedEphemeralProfile -}}
+{{- $allowedVolumeKeys := list "name" "secret" "configMap" "projected" "downwardAPI" -}}
+{{- range $key, $_ := . -}}
+{{- if not (has $key $allowedVolumeKeys) -}}
+{{- fail (printf "extraVolumes volume %q uses unsupported source %q in guarded HA" $name $key) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (or (hasKey . "secret") (hasKey . "configMap") (hasKey . "projected") (hasKey . "downwardAPI")) -}}
+{{- fail (printf "extraVolumes volume %q must use a read-only projected Kubernetes source in guarded HA" $name) -}}
+{{- end -}}
+{{- end -}}
 {{- $_ := set $seenVolumes $name true -}}
 {{- end -}}
 {{- end -}}
@@ -99,6 +117,34 @@ inputs collide with each other or with chart-owned fields.
 {{- end -}}
 {{- $_ := set $seenMountNames $name true -}}
 {{- $_ := set $seenMountPaths $path true -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Require per-container node-ephemeral accounting for a guarded HA role. */}}
+{{- define "skypilot.requireRoleEphemeralStorage" -}}
+{{- $role := required "role is required" .role -}}
+{{- $chartInjectsBudget := default false .chartInjectsBudget -}}
+{{- $resources := default (dict) .resources -}}
+{{- $requests := default (dict) (get $resources "requests") -}}
+{{- $limits := default (dict) (get $resources "limits") -}}
+{{- if and (not $chartInjectsBudget) (empty (get $requests "ephemeral-storage")) -}}
+{{- fail (printf "%s resources.requests.ephemeral-storage is required in guarded HA" $role) -}}
+{{- end -}}
+{{- if and (not $chartInjectsBudget) (empty (get $limits "ephemeral-storage")) -}}
+{{- fail (printf "%s resources.limits.ephemeral-storage is required in guarded HA" $role) -}}
+{{- end -}}
+{{- if and (not (empty (get $requests "ephemeral-storage"))) (ne (toString (get $requests "ephemeral-storage")) "6Gi") -}}
+{{- fail (printf "%s resources.requests.ephemeral-storage must use the guarded HA chart-owned value 6Gi" $role) -}}
+{{- end -}}
+{{- if and (not (empty (get $limits "ephemeral-storage"))) (ne (toString (get $limits "ephemeral-storage")) "8Gi") -}}
+{{- fail (printf "%s resources.limits.ephemeral-storage must use the guarded HA chart-owned value 8Gi" $role) -}}
+{{- end -}}
+{{- $ephemeralStorage := default (dict) .ephemeralStorage -}}
+{{- $expectedLimits := dict "credentialSizeLimit" "64Mi" "logsSizeLimit" "1Gi" "runtimeSizeLimit" "256Mi" "sshSizeLimit" "64Mi" "stateSizeLimit" "4Gi" -}}
+{{- range $name, $expected := $expectedLimits -}}
+{{- if ne (toString (get $ephemeralStorage $name)) $expected -}}
+{{- fail (printf "storage.ephemeral.%s must use the guarded HA chart-owned value %s" $name $expected) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

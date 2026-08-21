@@ -16,6 +16,7 @@ from sky.serve import serve_utils
 from sky.serve import zero_cost_actuation
 from sky.serve.server import core
 from sky.server import common as server_common
+from sky.server import runtime_profile
 from sky.server import stream_utils
 from sky.server.requests import access as request_access
 from sky.server.requests import executor
@@ -611,6 +612,7 @@ async def tail_logs(
     request: fastapi.Request, log_body: payloads.ServeLogsBody,
     background_tasks: fastapi.BackgroundTasks
 ) -> fastapi.responses.StreamingResponse:
+    runtime_profile.reject_local_artifact_operation('SkyServe log streaming')
     stream_utils.ensure_request_log_storage_available()
     kill_request_on_disconnect = False
     if executor.api_process_execution_enabled():
@@ -654,6 +656,8 @@ async def download_logs(
     request: fastapi.Request,
     download_logs_body: payloads.ServeDownloadLogsBody,
 ) -> None:
+    runtime_profile.reject_local_artifact_operation(
+        'SkyServe log synchronization')
     user_hash = server_common.get_request_user_id(request, download_logs_body)
     timestamp = sky_logging.get_run_timestamp()
     download_tmp = await asyncio.to_thread(
