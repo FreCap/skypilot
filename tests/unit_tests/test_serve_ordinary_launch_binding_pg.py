@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import datetime
 import time
+from unittest import mock
 import uuid
 
 from alembic import command as alembic_command
@@ -25,6 +26,7 @@ from sky.serve import route_projection
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import serve_statuses
+from sky.serve import serve_utils
 from sky.serve import service_spec
 from sky.serve import system_recovery_state
 from sky.serve import zero_cost_actuation
@@ -1435,6 +1437,109 @@ def test_promotion_before_atomic_teardown_returns_bound_authority(
                 serve_state_schema.services_table.c.name ==
                 service_name)).scalar_one()
     assert status == 'SHUTTING_DOWN'
+
+
+def test_failed_purge_retains_epoch_before_ambiguous_settlement_and_hash_fence(
+        binding_database) -> None:
+    identity, context, _ = _admit_generic_paid(binding_database)
+    with binding_database.begin() as connection:
+        assert binding.mark_ambiguous_in_connection(
+            connection, context, 'provider-result-uncertain')
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).
+            where(serve_state_schema.services_table.c.name == 'svc').values(
+                status=serve_statuses.ServiceStatus.CONTROLLER_FAILED.value))
+
+    association_columns = (
+        binding.ordinary_launch_associations_table.c.resolution,
+        binding.ordinary_launch_associations_table.c.service_lifecycle_epoch,
+        binding.ordinary_launch_associations_table.c.service_binding_epoch,
+        binding.ordinary_launch_associations_table.c.
+        owner_controller_incarnation,
+        binding.ordinary_launch_associations_table.c.owner_controller_epoch,
+        binding.ordinary_launch_associations_table.c.owner_revision,
+    )
+
+    def _read_state():
+        with binding_database.connect() as connection:
+            service = connection.execute(
+                sqlalchemy.select(
+                    serve_state_schema.services_table.c.status,
+                    serve_state_schema.services_table.c.lifecycle_epoch,
+                    serve_state_schema.services_table.c.
+                    ordinary_launch_binding_epoch).
+                where(serve_state_schema.services_table.c.name == 'svc')).one()
+            fence_epoch = connection.execute(
+                sqlalchemy.select(
+                    serve_state_schema.service_lifecycle_fences_table.c.epoch).
+                where(serve_state_schema.service_lifecycle_fences_table.c.name
+                      == 'svc')).scalar_one()
+            association = connection.execute(
+                sqlalchemy.select(*association_columns).where(
+                    binding.ordinary_launch_associations_table.c.association_id
+                    == identity.association_id)).one()
+        return service, fence_epoch, association
+
+    before_service, before_fence, before_association = _read_state()
+    assert before_service == (
+        serve_statuses.ServiceStatus.CONTROLLER_FAILED.value, 4, 6)
+    assert before_fence == 4
+    assert before_association.resolution == binding.Resolution.AMBIGUOUS.value
+    assert serve_state.service_owner_matches('svc', 'svc-hash')
+    assert serve_state.service_lifecycle_epoch_matches('svc', 4)
+
+    class _RetainedLifecycleLock:
+        """Test lock that observes, but does not advance, the live epoch."""
+
+        def __init__(self, service_name):
+            self.service_name = service_name
+            self.epoch = None
+
+        def __enter__(self):
+            with binding_database.connect() as connection:
+                self.epoch = connection.execute(
+                    sqlalchemy.select(
+                        serve_state_schema.services_table.c.lifecycle_epoch).
+                    where(serve_state_schema.services_table.c.name ==
+                          'svc')).scalar_one()
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def session_is_valid(self):
+            return True
+
+    lock_calls = []
+
+    def _retained_lock(service_name, *, advance_epoch=True):
+        lock_calls.append((service_name, advance_epoch))
+        return _RetainedLifecycleLock(service_name)
+
+    with mock.patch.object(serve_utils,
+                           'get_service_lifecycle_lock',
+                           side_effect=_retained_lock), \
+         mock.patch(
+             'sky.serve.service._settle_bound_ordinary_launches_for_teardown',
+             side_effect=RuntimeError('stop after durable teardown')) as settle:
+        stale_result = serve_utils._terminate_failed_services(
+            'svc', 'same-name-successor-hash', None)
+        result = serve_utils._terminate_failed_services('svc', 'svc-hash', None)
+
+    # The retained name lock does not weaken incarnation fencing: a caller
+    # holding the old hash cannot publish teardown against a same-name row.
+    assert not stale_result.completed
+    assert 'ownership lost before cleanup' in stale_result.message
+    assert lock_calls == [('svc', False), ('svc', False)]
+    assert not result.completed
+    assert 'cancelled and settled' in result.message
+    settle.assert_called_once()
+
+    after_service, after_fence, after_association = _read_state()
+    assert after_service == (serve_statuses.ServiceStatus.SHUTTING_DOWN.value,
+                             4, 6)
+    assert after_fence == before_fence
+    assert after_association == before_association
 
 
 def test_controller_authority_refresh_allows_only_binding_advance_and_fences_legacy(

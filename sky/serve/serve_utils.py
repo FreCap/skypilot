@@ -4486,7 +4486,16 @@ def _terminate_failed_services(service_name: str,
             False,
             _purge_ownership_failure(service_name,
                                      'missing durable service hash'))
-    lifecycle_lock = get_service_lifecycle_lock(service_name)
+    # An unresolved bound association keeps its admission-time lifecycle
+    # epoch as immutable provenance.  Advancing the service epoch before the
+    # teardown transaction would therefore trip the deferred consistency
+    # guard before the reducer can publish SHUTTING_DOWN and settle the
+    # association.  Retain the current epoch while the same name-scoped
+    # advisory lock is held.  SHUTTING_DOWN is the explicit launch fence, and
+    # the existing hash/owner/epoch CASes plus the final conditional delete
+    # continue to fence same-name replacement.
+    lifecycle_lock = get_service_lifecycle_lock(service_name,
+                                                advance_epoch=False)
     # Kept in the outer helper's compatibility signature for existing callers;
     # cleanup behavior is now fully determined by durable DB state.
     del service_status
