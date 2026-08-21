@@ -3,10 +3,18 @@
 Last updated: 2026-08-21
 
 Status: production qualification is **active but incomplete**. Helm revision
-473 / release `1.1.1401` runs image digest
-`sha256:788572aae5e164bb451b56c3d0f5b5458abae807d57b3cb65703c57a62fcafdc`
-on all two API, two controller, and two executor Pods with zero restarts.
-Revision 473 includes merged PR #1626 at
+475 / release `1.1.1404` runs image digest
+`sha256:8047b32d5703eb280b621c5f7f404daadb2bb98738327e32d0f44355cbfe603e`
+on all two API, two controller, and two executor Pods. It includes the
+application-only PR #1632 correction that recognizes additive Serve revision
+056 as a valid descendant of placement-normalization authority 040. Controller
+generation 110 became ready at 08:28 UTC and the `boltz-l4-fleet` service child
+then adopted successfully, clearing revision 474's deterministic controller
+boot failure and controller-dependent 503s. Release `1.1.1404` does **not**
+contain corrective PR #1630's complete committed-handoff contract, so it is a
+service-availability precursor rather than the final fix-forward image.
+
+Revision 473 / release `1.1.1401` included merged PR #1626 at
 `218aaaefb63d655f5513430f974198ff0c8aa93f`; its durable global-capacity
 accounting is under horizon, while the independent postcommit provider handoff
 still fails under successor-state churn. At 05:57 UTC, revision 472 represented
@@ -1223,12 +1231,18 @@ Implementation PR: corrective PR #1630
 Operational correction (2026-08-21): the automated release path deployed the
 incomplete PR #1629 source as Helm revision 474 / release `1.1.1403`, immutable
 digest `sha256:8bd915cb851b108420687f580dc87ec9de2d900d42545a8a61cf70d18f9e042a`,
-before corrective PR #1630 merged. The API/controller/executor rollout is
-uniform and healthy, and `boltz-l4-fleet` is already `DURABLE_INTENT` epoch 1
-on generic capability cohort 1. Schema 056 is forward-only, so the prescribed
-response is an urgent direct-Helm fix-forward to the immutable #1630 successor,
-not a schema/application rollback. No further activation or manual state
-rewrite is authorized on the incomplete revision.
+before corrective PR #1630 merged. Although its six writer Pods were ready, a
+restarted service controller deterministically rejected the newly installed
+Serve056 head because its compiled additive-revision set ended at Serve055.
+Revision 475 / release `1.1.1404`, immutable digest
+`sha256:8047b32d5703eb280b621c5f7f404daadb2bb98738327e32d0f44355cbfe603e`,
+deployed PR #1632's one-line application-authority correction and restored
+service-controller adoption. It does not contain #1630's fresh provider proof,
+scalar-`NULL` cleanup, or cohort-rotation contracts. `boltz-l4-fleet` is already
+`DURABLE_INTENT` epoch 1 on generic capability cohort 1. Schema 056 is
+forward-only, so the prescribed response remains an urgent direct-Helm
+fix-forward to the immutable #1630 successor, not a schema/application
+rollback. No manual state rewrite is authorized on either precursor revision.
 
 Serve056 closes the remaining mutable-authority gap between atomic admission
 and the first provider effect. It adds one nullable, initial-insert-only scalar
@@ -3695,9 +3709,9 @@ either case.
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
 | 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed dark in revision 431 / release 1.1.1338: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Activation remains gated by 2a.3, 2a.4, and a successful full-fleet re-attestation. |
 | 2f | Promoted capacity-authority controller takeover | The fix-forward implementation is merged in PR #1562: the existing owner-transfer transaction preserves both one-way epochs, rebinds demand and zero-cost capability together, invalidates pre-row predecessor intents, and leaves route/report admission cold until fresh replacement evidence. No schema, chart, provider, or platform change is required. Deployment and child/Pod takeover qualification remain activation prerequisites. |
-| 2g | Production full reserved backfill | **Active and incomplete.** Platform PR #8652 is merged and version 64 is elected. Automated Helm revision 474 / release `1.1.1403` unexpectedly deployed incomplete PR #1629; the service remains 63/63 ready with zero paid/Spot replica rows at the first post-rollout census, but is already `DURABLE_INTENT` epoch 1 on cohort 1. Completion is blocked on the urgent corrective #1630 fix-forward, cohort-2 rotation, exact free-capacity reconciliation, cold-restart/successor/no-paid proofs, and the full production horizon. |
+| 2g | Production full reserved backfill | **Active and incomplete.** Platform PR #8652 is merged and version 64 is elected. Helm revision 475 / release `1.1.1404` restored controller adoption after revision 474 installed Serve056 without recognizing that additive head. The service is already `DURABLE_INTENT` epoch 1 on cohort 1 and retains zero paid/Spot replica rows. Completion is blocked on the urgent corrective #1630 fix-forward, cohort-2 rotation, exact free-capacity reconciliation, cold-restart/successor/no-paid proofs, and the full production horizon. |
 | 2h | Atomic reserved-fill replica/request admission | Merged in PR #1626 and deployed on Helm revision 473 / release `1.1.1401`. One atomic-admission module owns the root PostgreSQL transaction and savepoint; the manager only prepares immutable server-local input before it and starts the returned request reducer after commit. Serve055 adds the owner audit tuple, user FK, and retained-row one-shot transition. The deployed pending-first/global-pending/cleanup-unproven accounting correctly avoided duplicate replacement capacity. The remaining postcommit mutable-authority rejection is owned by phase 2i, not by another admission path or infrastructure change. |
-| 2i | Serve056 committed reserved-fill provider handoff and cohort rotation | PR #1629 merged at `1642ca2e3` with the scalar schema but without the final fresh-proof, scalar-`NULL` cleanup, or cohort-rotation contracts. Although it was deployment-ineligible, automation deployed it as revision 474 / `1.1.1403`; schema 056 is forward-only, so rollback is not the recovery path. Corrective PR #1630 adds the missing contracts and removes the superseded mutable authority path. It deliberately does not edit the already-applied Serve056 trigger for a status-update optimization: the installed trigger is correctness-safe, and changing an applied migration would not alter production. Draft cleanup PR #1631 removes only the scalar-`NULL` bridge after its exact production gate. Required gates are real-PostgreSQL tests, adversarial approval, complete CI, merge, direct Helm fix-forward, schema/cohort readback, and the full production horizon. No EFS, KubeRay, Terraform/Terragrunt, platform runtime pin, or alternate provider path is added. |
+| 2i | Serve056 committed reserved-fill provider handoff and cohort rotation | PR #1629 merged at `1642ca2e3` with the scalar schema but without the final fresh-proof, scalar-`NULL` cleanup, or cohort-rotation contracts. Automation deployed it as revision 474 / `1.1.1403`; application authority then rejected the new head until PR #1632 restored adoption in revision 475 / `1.1.1404`. Corrective PR #1630 is rebased on that precursor, adds the missing contracts, and removes the superseded mutable authority path. It deliberately does not edit the already-applied Serve056 trigger for a status-update optimization: the installed trigger is correctness-safe, and changing an applied migration would not alter production. Draft cleanup PR #1631 removes only the scalar-`NULL` bridge after its exact production gate. Required gates are real-PostgreSQL tests, adversarial approval, complete CI, merge, direct Helm fix-forward, schema/cohort readback, and the full production horizon. No EFS, KubeRay, Terraform/Terragrunt, platform runtime pin, or alternate provider path is added. |
 | 3a | Stacked Serve055 owner-transition cleanup after the production horizon | The required `fix/serve-atomic-fill-admission-cleanup` branch adds Serve057 `NOT NULL` owner columns and removes only the application one-shot `NULL` attestation branch, the schema-derived temporary global user-deletion guard, and transition-only observability/tests. It retains or atomically simplifies the permanent database owner-immutability trigger. Its draft PR must be cross-linked and remains blocked on a complete capable cohort, zero `NULL` tuples, no old writers, backups, and the complete stale/HA production horizon. |
 | 3b | Stacked Serve056 scalar-`NULL` cleanup bridge removal | Draft PR #1631 is stacked on and cross-linked from #1630. It removes only the cleanup-only JSON resolver and its transition tests after zero scalar-`NULL` protocol-v2 replicas, zero unsettled scalar-`NULL` provider-effect associations, and zero scalar-`NULL` cleanup-unproven markers persist through the complete stale/quiescence/provider-reprobe horizon. It cannot merge earlier. Closed PRs #1506/#1510 are not revived. |
 
