@@ -66,10 +66,22 @@ logger = sky_logging.init_logger(__name__)
 ReservedFillLaunchFenceError = exceptions.ReservedFillLaunchFenceError
 
 # Provider SDK calls are not guaranteed to honor Python thread cancellation.
-# Leave enough time after the provider deadline for the disposable invocation
+# The provider operation establishes its own five-second deadline inside the
+# handler, after disposable-process startup.  This separate parent boundary
+# covers handler startup, result transport, and family convergence without
+# extending that provider/DB operation budget.
+_RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS = 8.0
+# Leave enough time after the parent boundary for the disposable invocation
 # guardian to kill and reap the complete process family before another renewal
 # may begin.
 _RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS = 10.0
+
+if not (reserved_fill_reclaim_attestation.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS
+        < _RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS <
+        reserved_fill_reclaim_attestation.PROVIDER_PROOF_MAX_AGE_SECONDS):
+    raise RuntimeError('The reclaim-provider process lifetime must exceed the '
+                       'provider operation deadline and remain inside the '
+                       'provider-proof freshness horizon.')
 
 
 def raise_protocol_v2_materialized_launch_error(error: Exception, *,
@@ -2881,14 +2893,14 @@ def renew_reclaim_provider_proofs_once(
 def _renew_reclaim_provider_proofs_in_boundary(
         executor: request_process.DisposableExecutor) -> bool:
     """Run one refresh behind an authenticated process-family drain proof."""
-    deadline = (
-        time.monotonic() +
-        reserved_fill_reclaim_attestation.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS
-    )
-    future = executor.submit(renew_reclaim_provider_proofs_once, deadline)
+    # Establish the provider/DB deadline in the child.  DisposableExecutor
+    # submission is synchronous through guardian startup and admission, so a
+    # parent-created provider deadline would incorrectly charge that process
+    # overhead to the five-second provider operation contract.
+    future = executor.submit(renew_reclaim_provider_proofs_once)
     try:
-        return bool(future.result(timeout=max(0.0, deadline -
-                                              time.monotonic())))
+        return bool(
+            future.result(timeout=_RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS))
     except concurrent.futures.TimeoutError as timeout_error:
         # Do not start another proof while an uncooperative SDK call could
         # still publish. The guardian must first prove the complete invocation

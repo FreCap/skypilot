@@ -11,6 +11,12 @@ when none is available -- fill must never spill to paid capacity).
 import concurrent.futures
 import contextlib
 import dataclasses
+import functools
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import types
@@ -62,6 +68,39 @@ _K8S_KEY = {
     'image_id': None,
     'disk_tier': None,
 }
+
+_PROVIDER_STARTUP_REGRESSION_OPERATION_SECONDS = 0.2
+_PROVIDER_STARTUP_REGRESSION_TIMEOUT_SECONDS = 0.3
+
+
+def _provider_startup_regression_initializer(delay_seconds: float) -> None:
+    """Model handler initialization that is outside the provider budget."""
+    time.sleep(delay_seconds)
+
+
+def _provider_startup_regression_operation(
+        deadline_monotonic: float | None = None) -> bool:
+    """Succeed only when the operation receives its full in-child budget."""
+    if deadline_monotonic is None:
+        deadline_monotonic = (time.monotonic() +
+                              _PROVIDER_STARTUP_REGRESSION_TIMEOUT_SECONDS)
+    time.sleep(_PROVIDER_STARTUP_REGRESSION_OPERATION_SECONDS)
+    if time.monotonic() >= deadline_monotonic:
+        raise TimeoutError('Provider operation deadline was consumed by '
+                           'disposable-process startup.')
+    return True
+
+
+def _hanging_provider_operation_with_descendant(pid_path: str,
+                                                _deadline_monotonic: float |
+                                                None = None) -> bool:
+    """Leave a descendant for the real boundary cancellation to drain."""
+    child = subprocess.Popen(
+        [sys.executable, '-c', 'import time; time.sleep(60)'])
+    pathlib.Path(pid_path).write_text(f'{os.getpid()}\n{child.pid}\n',
+                                      encoding='utf-8')
+    while True:
+        time.sleep(1)
 
 
 def _spec(min_replicas=1, max_replicas=10, fill=True):
@@ -1137,6 +1176,42 @@ class TestReclaimProviderProofRenewer(unittest.TestCase):
             expected_gate_generation=19,
             deadline_monotonic=deadline)
 
+    def test_default_provider_deadline_starts_in_handler(self):
+        identity = mock.sentinel.identity
+        repository = mock.Mock()
+        repository.read_reconciliation_gate.return_value = types.SimpleNamespace(
+            sequenced_active=True,
+            reclaim_policy_identity=identity,
+            generation=19)
+        policy = mock.Mock()
+        policy.renew_provider_proofs.return_value = True
+        started = time.monotonic()
+        with mock.patch.object(
+                reserved_capacity.pool_capacity_observation,
+                'PoolCapacityObservationRepository',
+                return_value=repository), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_unique_policy',
+                 return_value=policy), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_exact_policy_identity'), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_policy_operation_completed') as require_completed:
+            self.assertTrue(
+                reserved_capacity.renew_reclaim_provider_proofs_once())
+        completed = time.monotonic()
+
+        deadline = policy.renew_provider_proofs.call_args.kwargs[
+            'deadline_monotonic']
+        provider_timeout = (reserved_capacity.reserved_fill_reclaim_attestation.
+                            PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
+        self.assertGreaterEqual(deadline, started + provider_timeout)
+        self.assertLessEqual(deadline, completed + provider_timeout)
+        require_completed.assert_called_once_with(deadline)
+
     def test_active_gate_rejects_untyped_publication_result(self):
         repository = mock.Mock()
         repository.read_reconciliation_gate.return_value = types.SimpleNamespace(
@@ -1162,25 +1237,84 @@ class TestReclaimProviderProofRenewer(unittest.TestCase):
                 reserved_capacity.renew_reclaim_provider_proofs_once(
                     time.monotonic() + 1)
 
-    def test_boundary_passes_one_absolute_provider_deadline(self):
+    def test_boundary_starts_provider_deadline_in_child(self):
         executor = mock.Mock()
         future = executor.submit.return_value
         future.result.return_value = True
-        started = time.monotonic()
 
         self.assertTrue(
             reserved_capacity._renew_reclaim_provider_proofs_in_boundary(
                 executor))
 
-        operation, deadline = executor.submit.call_args.args
-        self.assertIs(operation,
-                      reserved_capacity.renew_reclaim_provider_proofs_once)
-        self.assertGreater(deadline, started)
-        self.assertLessEqual(
-            deadline - started,
+        executor.submit.assert_called_once_with(
+            reserved_capacity.renew_reclaim_provider_proofs_once)
+        future.result.assert_called_once_with(
+            timeout=reserved_capacity.
+            _RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS)
+        self.assertGreater(
+            reserved_capacity._RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS,
             reserved_capacity.reserved_fill_reclaim_attestation.
-            PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS + 0.01)
+            PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
         future.request_cancel.assert_not_called()
+
+    def test_real_boundary_does_not_charge_startup_to_provider_deadline(self):
+        executor = reserved_capacity.request_process.DisposableExecutor(
+            max_workers=1,
+            initializer=_provider_startup_regression_initializer,
+            initargs=(0.4,))
+        try:
+            with mock.patch.object(
+                    reserved_capacity.reserved_fill_reclaim_attestation,
+                    'PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS',
+                    _PROVIDER_STARTUP_REGRESSION_TIMEOUT_SECONDS), \
+                 mock.patch.object(
+                     reserved_capacity, 'renew_reclaim_provider_proofs_once',
+                     _provider_startup_regression_operation):
+                self.assertTrue(
+                    reserved_capacity.
+                    _renew_reclaim_provider_proofs_in_boundary(executor))
+        finally:
+            executor.shutdown(timeout=reserved_capacity.
+                              _RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
+
+    def test_real_boundary_timeout_drains_complete_process_family(self):
+        executor = reserved_capacity.request_process.DisposableExecutor(
+            max_workers=1)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pid_path = pathlib.Path(temp_dir) / 'provider-family-pids'
+            operation = functools.partial(
+                _hanging_provider_operation_with_descendant, str(pid_path))
+            try:
+                with mock.patch.object(
+                        reserved_capacity,
+                        '_RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS', 1.0), \
+                     mock.patch.object(
+                         reserved_capacity,
+                         'renew_reclaim_provider_proofs_once', operation):
+                    with self.assertRaisesRegex(
+                            reserved_capacity.reserved_fill_reclaim_attestation.
+                            ReclaimAttestationError,
+                            'bounded process lifetime'):
+                        reserved_capacity._renew_reclaim_provider_proofs_in_boundary(
+                            executor)
+
+                pids = tuple(
+                    int(pid)
+                    for pid in pid_path.read_text(encoding='utf-8').split())
+                deadline = time.monotonic() + 5
+                while (any(
+                        pathlib.Path(f'/proc/{pid}').exists() for pid in pids)
+                       and time.monotonic() < deadline):
+                    time.sleep(0.02)
+                self.assertFalse([
+                    pid for pid in pids
+                    if pathlib.Path(f'/proc/{pid}').exists()
+                ])
+                self.assertFalse(executor.poisoned)
+            finally:
+                executor.shutdown(
+                    timeout=reserved_capacity.
+                    _RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
 
     def test_boundary_timeout_cancels_and_requires_drain_result(self):
         executor = mock.Mock()
@@ -1199,12 +1333,11 @@ class TestReclaimProviderProofRenewer(unittest.TestCase):
 
         future.request_cancel.assert_called_once_with()
         self.assertEqual(future.result.call_count, 2)
-        provider_timeout = future.result.call_args_list[0].kwargs['timeout']
+        boundary_lifetime = future.result.call_args_list[0].kwargs['timeout']
         drain_timeout = future.result.call_args_list[1].kwargs['timeout']
-        self.assertLessEqual(
-            provider_timeout,
-            reserved_capacity.reserved_fill_reclaim_attestation.
-            PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
+        self.assertEqual(
+            boundary_lifetime,
+            reserved_capacity._RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS)
         self.assertEqual(
             drain_timeout,
             reserved_capacity._RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS)

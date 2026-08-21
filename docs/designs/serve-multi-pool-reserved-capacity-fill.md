@@ -2882,6 +2882,15 @@ delete replica/request rows, claim a queued launch, or rewrite a RUNNING launch
 request. Current committed-intent PENDING rows therefore remain owned by the
 normal PostgreSQL request and recovery graph.
 
+Each disposable renewal starts its absolute five-second provider/DB deadline
+inside the final handler, after process startup and invocation deserialization.
+The parent independently permits eight seconds for handler startup, result
+transport, and the authenticated process-family drain; that containment budget
+does not extend provider publication authority or receipt freshness. At eight
+seconds the parent requests cancellation and retains the existing separate
+ten-second drain-proof window. Failure to prove the family absent still poisons
+the renewal lane and fails the controller closed.
+
 Serve054's existing PostgreSQL-only
 `serve_reserved_fill_reclaim_provider_proofs` table remains the sole receipt
 store. A fresh random 256-bit `receipt_nonce` is its primary key. The unique
