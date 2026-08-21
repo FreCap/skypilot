@@ -1,9 +1,9 @@
 # Persisted SkyServe Controller and Worker Placement Projection
 
-**Status:** Protocol-v3 typed worker scratch, provisioning timeout, and strict
-worker/Kueue projection binding implemented; platform startup integration and
-non-compute deployment verification pending
-**Last updated:** 2026-08-16
+**Status:** Protocol-v3 typed worker scratch, bounded two-phase Kueue wait, and
+strict worker/Kueue projection binding implemented and unit-verified; platform
+startup integration and non-compute deployment verification pending
+**Last updated:** 2026-08-20
 
 ## Goals
 
@@ -122,7 +122,7 @@ Kubernetes entry in the immutable placement catalog:
     "local_queue_name": "inference",
     "workload_priority_class_name": "inference-low"
   },
-  "provision_timeout": -1,
+  "provision_timeout": 15,
   "pod_identity_role_arn": "arn:aws:iam::123456789012:role/skyserve-worker-phx",
   "accelerator_name": "H200",
   "accelerator_count": 1,
@@ -158,17 +158,28 @@ fences.
 indefinitely) or non-negative. The builder freezes the effective
 server/workspace/context `kubernetes.provision_timeout`. When it is absent, the
 builder freezes the existing Kubernetes default once, using the same replica
-node count, volume state, DWS mode, and projected Kueue admission that would
-otherwise determine the launch default; a Kueue-managed candidate therefore
-defaults to 24 hours. Task/resource overrides are rejected recursively. A
-protocol-v3 terminal launch consumes only this signed value and never consults
-the API server's ambient config or launch-time cluster overrides. This timeout
-controls how long provisioning waits for a Pending Pod; it is not a capacity or
-reclaim classifier. `NO_CAPACITY`, queue waiting, scheduling, and initialization
-remain typed observer/provider states. In particular, a finite timeout must not
-be interpreted as proof of no capacity, while `-1` permits both Kubernetes
-contexts and sibling replicas to initialize concurrently without a wall-clock
-placement failure.
+node count, volume state, and DWS mode that determine ordinary scheduler
+placement. Kueue does not inflate this projected value: its former 24-hour
+queue-aware default is now the separate admission-phase bound. Task/resource
+overrides are rejected recursively. A protocol-v3 terminal launch consumes
+only this signed value and never consults the API server's ambient config or
+launch-time cluster overrides. For required Kueue, a separate provider-owned
+24-hour admission watcher first binds the exact Pod UID and admitted queue
+identity. Its gated observations retain no service/fleet advisory authority or
+process provider phase; after observing admission, one fresh short effect epoch
+revalidates the exact association, Pod UID, and queue outputs before this
+projected timeout starts as a fresh scheduler-binding clock. Non-Kueue launches
+retain the existing single scheduling clock. This timeout is not a capacity or
+reclaim classifier:
+`NO_CAPACITY`, queue waiting, scheduling, and initialization remain typed
+observer/provider states, and a finite timeout is never proof that committed
+capacity disappeared. If the 24-hour watcher expires for protocol-v2 reserved
+fill, it raises the wire-safe typed `ReservedFillProviderPresentError` with the
+exact observed Pod names and UIDs. It neither reacquires request-owned deletion
+authority nor classifies the provider as `NOT_STARTED` or `ABSENT`; the durable
+association stays pinned for the #1608 `PRESENT` -> UID-fenced down -> fresh
+`ABSENT` adjudication path. Generic required-Kueue launches keep the ordinary
+Kubernetes timeout error.
 
 `scheduler_name` is a non-empty string frozen from the effective server-owned
 context/workspace `pod_config.spec.schedulerName`, defaulting to
@@ -519,9 +530,12 @@ admitted state with Kueue's managed finalizer and `podset=role-hash`; TAS
 workload identity is optional, while the exact LocalQueue/ClusterQueue output
 pair is mandatory and requires `AssignQueueLabelsForPods`. This binds admission
 to the ClusterQueue read at preflight even if a LocalQueue changes during a
-long scheduling wait. Unknown Kueue metadata or non-Kueue scheduling gates
-fail closed. A managed finalizer without the PodSet and queue bindings is not
-admission proof because Kueue installs the finalizer before quota grant. After
+long scheduling wait. Kueue v0.19 implicit TAS may add exactly
+`podset-unconstrained-topology="true"` to an otherwise exact admitted, ungated
+Pod; it remains forbidden before admission, and any other value or unknown
+Kueue metadata fails closed. Non-Kueue scheduling gates also fail closed. A
+managed finalizer without the PodSet and queue bindings is not admission proof
+because Kueue installs the finalizer before quota grant. After
 the passive scheduling/running wait, SkyPilot fresh-reads and reattests every
 Pod under a new guard before publishing provisioning success. The fresh object
 must retain the exact UID whose all-running observation ended the wait, remain
@@ -558,16 +572,39 @@ replica admission and each provider-effect guard reselect the exact persisted
 candidate and recompute its digest. An opaque strict-projection provisioner is
 rejected before provider mutation;
 only the instrumented in-tree Kubernetes path can create or adopt its Pod. The
-successful built-in bulk/adoption return is a one-way materialization boundary,
-and config-hash reuse is disabled so an existing Pod re-enters the same
-attestation. After materialization there is no capacity failover or broad
-request-owned teardown. Runtime preparation, internal mounts, Ray/skylet
+first exact Pod create/adoption advances the association to provider I/O and is
+the provider-present boundary. A failure before the complete built-in bulk
+return is terminal and retains that association; specifically, Kueue admission
+timeout publishes the typed exact-Pod handoff above. The successful bulk return
+begins the post-admission materialized tail, and config-hash reuse is disabled
+so an existing Pod re-enters the same attestation. After provider presence
+there is no capacity failover or broad request-owned teardown. Runtime
+preparation, internal mounts, Ray/skylet
 startup, workdir/file synchronization, task setup, autostop/hooks, port
 reconciliation, and job execution each require fresh bounded authority. The
+same short-epoch rule applies before materialization: physical-cluster capture,
+optional ephemeral-volume provisioning, Kubernetes bootstrap mutations, Pod
+create/adoption, admitted handoff, and exact cleanup each reacquire the
+idempotent bound association plus the v2 provider phase only around that
+bounded concrete effect. A passive Kueue or scheduler wait retains only the
+immutable physical-cluster capture token, never the service advisory lock or
+process provider phase. Thus one waiting pool cannot block database-only service
+updates, correctly fenced same-UID protocol-v2 recovery, or compatible v2
+materialization. The capture itself remains an intentional per-context fence:
+same-UID v2 callers may join it, tokenless legacy work against that context
+fails busy until retirement, and isolated ambient work for another context is
+independent. The
 typed reclaim-policy scope is a view derived from that candidate and contains
 its namespace, service account, Pod priority, Kueue admission, context,
 accelerator, and count. A service update or any admission-field change rotates
 claim generation and invalidates prior allocations.
+
+PR #1608 is the sole cleanup consumer for a typed provider-present handoff. It
+must be merged and deployed with or before activation of this timeout path. It
+admits cleanup only after execution quiescence and a fresh exact `PRESENT`
+observation, retains the association/request pin through UID-fenced down, and
+releases them only after a fresh `ABSENT` observation. #1607 deliberately does
+not duplicate that deletion authority.
 
 Projection-bound workers receive no static cloud credential file mounts from
 the API server, including kubeconfig, AWS/GCP credentials, or logging-agent
@@ -736,10 +773,11 @@ source of truth.
    attested caches;
    update the stable service and verify all old replicas are gone.
 7. Advance the sole new-write path to protocol v3/API 79; freeze typed worker
-   scratch and the effective provisioning timeout, reject task-owned timeout,
-   scratch, and Pod configuration, render and attest the final Pod, retain exact
-   v1/v2 readers only until the objective cleanup gate, and update stacked
-   cleanup PR #1452 to remove both readers.
+   scratch and the effective provisioning timeout, separate bounded Kueue
+   admission from the fresh post-admission scheduling timer, reject task-owned
+   timeout, scratch, and Pod configuration, render and attest the final Pod,
+   retain exact v1/v2 readers only until the objective cleanup gate, and update
+   stacked cleanup PR #1452 to remove both readers.
 
 ## Deployment and fix forward
 
@@ -874,15 +912,16 @@ for this rollout.
   live PHX GPU nodes visible and prove no node, label, resource-key, autoscaler,
   or `CUSTOM_GPU_RESOURCE_KEY` lookup occurs; the Pod must still require
   `nvidia.com/gpu.product In [NVIDIA-H200]` and `nvidia.com/gpu: 1`.
-- Configure `provision_timeout: -1` and typed `serve_worker_scratch` for every
-  enabled reserved inference context,
-  deploy the matching platform startup verification first, and verify API 79
-  history, final Pods, and startup evidence agree on kind, `/tmp`, and exact
-  size. No task or service YAML may contain a scratch volume or `pod_config`;
+- Configure typed `serve_worker_scratch` for every enabled reserved inference
+  context, deploy the matching platform startup verification first, and verify
+  API 79 history freezes the effective `provision_timeout`, Kueue quota wait
+  does not consume that timer, and final Pods and startup evidence agree on
+  kind, `/tmp`, and exact size. No task or service YAML may contain a scratch
+  volume or `pod_config`;
   task Kubernetes config also cannot select `provision_timeout`, `auto_mounts`,
   `enable_docker`, or `custom_metadata`, and task resources cannot set labels
-  for projected workers. Verify a terminal v3 launch renders `timeout: -1`
-  even when the API server's ambient config differs.
+  for projected workers. Verify a terminal v3 launch renders the version's
+  exact frozen timeout even when the API server's ambient config later differs.
 - The dedicated inference workspace must be updated without disrupting the
   existing shared service fleet, or migrated during a planned drain.
 - Do not enable nonempty campaigns until Clin ships and verifies a fresh

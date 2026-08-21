@@ -8,6 +8,7 @@ import pathlib
 import pickle
 import types
 import unittest.mock as mock
+import uuid
 
 import botocore.exceptions
 import pytest
@@ -24,8 +25,12 @@ from sky.provision import failover_error_policy
 from sky.provision.aws import instance as aws_instance
 from sky.provision.gcp import instance as gcp_instance
 from sky.provision.gcp import instance_utils as gcp_instance_utils
+from sky.serve import ordinary_launch_binding
+from sky.serve import provider_phase
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
+from sky.server.requests import ordinary_launch as ordinary_launch_request
+from sky.server.requests import storage as request_storage
 
 _CAPACITY_POLICY_SIGNATURES = {
     '_iter_error_chain': '(error)',
@@ -1164,8 +1169,13 @@ def _configure_new_provisioner_callback_attempt(tmp_path,
             cleanup_mock, writer_results)
 
 
-def _configure_reserved_fill_kubernetes_attempt(tmp_path, monkeypatch, events,
-                                                provider_outcomes):
+def _configure_reserved_fill_kubernetes_attempt(tmp_path,
+                                                monkeypatch,
+                                                events,
+                                                provider_outcomes,
+                                                *,
+                                                mock_launch_fence=True,
+                                                mock_provider_guard=True):
     """Converts the callback harness into one protocol-v2 Kubernetes try."""
     (provisioner, _, provision_record, bulk_provision, cleanup,
      _) = _configure_new_provisioner_callback_attempt(tmp_path, monkeypatch,
@@ -1180,15 +1190,30 @@ def _configure_reserved_fill_kubernetes_attempt(tmp_path, monkeypatch, events,
         'H200',
         protocol_version=reserved_capacity_broker.PROTOCOL_V2,
         physical_cluster_uid='physical-uid')
-    provisioner._extra_launch_context = (
-        reserved_capacity.make_protocol_v2_launch_fence(
-            pool_key=pool_key,
-            service_generation=7,
-            service_version=3,
-            physical_cluster_uid='physical-uid',
-            kubernetes_context='phx-context',
-            accelerator='H200',
-            accelerator_count=1))
+    launch_context = reserved_capacity.make_protocol_v2_launch_fence(
+        pool_key=pool_key,
+        service_generation=7,
+        service_version=3,
+        physical_cluster_uid='physical-uid',
+        kubernetes_context='phx-context',
+        accelerator='H200',
+        accelerator_count=1)
+    launch_context, association_id, request_id = _bound_reserved_fill_context(
+        launch_context)
+    provisioner._extra_launch_context = launch_context
+
+    # Protocol-v2 provider retries are generic bound non-pool requests.  Keep
+    # this provider-focused harness on that complete production envelope so
+    # its passive preflight reaches the behavior each test is exercising.
+    claim = types.SimpleNamespace(request_id=request_id,
+                                  worker_instance_id=str(uuid.uuid4()))
+    monkeypatch.setattr(request_storage, 'active_execution_claim',
+                        lambda: claim)
+    monkeypatch.setattr(
+        ordinary_launch_binding, 'binding_allows_request',
+        lambda actual_association_id, actual_request_id:
+        (actual_association_id == association_id and actual_request_id ==
+         request_id))
 
     deploy_variables = clouds.DO.make_deploy_resources_variables
     monkeypatch.setattr(clouds.Kubernetes, 'make_deploy_resources_variables',
@@ -1212,8 +1237,10 @@ def _configure_reserved_fill_kubernetes_attempt(tmp_path, monkeypatch, events,
 
     monkeypatch.setattr(backend.backend_utils, 'write_cluster_config',
                         write_cluster_config)
-    monkeypatch.setattr(provisioner, '_validate_service_replica_launch_fence',
-                        lambda: None)
+    if mock_launch_fence:
+        monkeypatch.setattr(provisioner,
+                            '_validate_service_replica_launch_fence',
+                            lambda: None)
     monkeypatch.setattr(provisioner, '_validate_reserved_fill_candidate',
                         lambda _resources: None)
     monkeypatch.setattr(backend.provisioner, '_BUILTIN_BULK_PROVISION',
@@ -1232,10 +1259,54 @@ def _configure_reserved_fill_kubernetes_attempt(tmp_path, monkeypatch, events,
         finally:
             events.append('guard-exit')
 
-    monkeypatch.setattr(provisioner, '_service_replica_launch_provider_guard',
-                        fresh_guard)
+    if mock_provider_guard:
+        monkeypatch.setattr(provisioner,
+                            '_service_replica_launch_provider_guard',
+                            fresh_guard)
     return (provisioner, to_provision, provision_record, bulk_provision,
             cleanup, blocklist, fresh_guard)
+
+
+def _bound_reserved_fill_context(
+        context: dict[str, object]) -> tuple[dict[str, object], str, str]:
+    """Adds one complete generic association envelope to a physical fence."""
+    association_id = str(uuid.uuid4())
+    request_id = str(uuid.uuid4())
+    replica_record_id = str(uuid.uuid4())
+    profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+        authorization_reference='reserved-fill:test',
+        authorization_generation=1,
+        authorization_payload={'allocation': 'test'})
+    context.update({
+        ordinary_launch_binding.ASSOCIATION_ID_KEY: association_id,
+        ordinary_launch_binding.LAUNCH_GENERATION_KEY: 1,
+        ordinary_launch_binding.BOUND_REQUEST_ID_KEY: request_id,
+        ordinary_launch_binding.INPUT_DIGEST_KEY: 'a' * 64,
+        ordinary_launch_binding.REPLICA_ID_KEY: 1,
+        ordinary_launch_binding.REPLICA_RECORD_ID_KEY: replica_record_id,
+        backend.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+        ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY:
+            ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION,
+        ordinary_launch_binding.PROFILE_KIND_KEY: profile.kind.value,
+        ordinary_launch_binding.PROFILE_VERSION_KEY: profile.version,
+        ordinary_launch_binding.PROFILE_DIGEST_KEY: profile.digest,
+        ordinary_launch_binding.CAPABILITY_COHORT_EPOCH_KEY:
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH,
+        ordinary_launch_binding.CAPABILITY_PROFILE_SET_DIGEST_KEY:
+            ordinary_launch_binding.supported_non_pool_profile_set_digest(),
+        ordinary_launch_binding.RECEIPT_PROTOCOL_VERSION_KEY:
+            ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION,
+        ordinary_launch_binding.AUTHORIZATION_KIND_KEY:
+            profile.authorization_kind.value,
+        ordinary_launch_binding.AUTHORIZATION_REFERENCE_KEY:
+            profile.authorization_reference,
+        ordinary_launch_binding.AUTHORIZATION_GENERATION_KEY:
+            profile.authorization_generation,
+        ordinary_launch_binding.AUTHORIZATION_DIGEST_KEY:
+            profile.authorization_digest,
+    })
+    return context, association_id, request_id
 
 
 def test_new_provisioner_post_bulk_callback_is_authoritative(
@@ -1650,6 +1721,117 @@ def test_reserved_fill_builtin_success_marks_materialized_and_checkpoints(
     # acquired after that point and before any post-create provider tail runs.
     assert 'guard-enter' in events[bulk_return + 1:post_bulk_variables_index]
     assert result['provision_record'] is provision_record
+    cleanup.assert_not_called()
+    blocklist.assert_not_called()
+
+
+def test_reserved_fill_retry_preflight_is_passive_but_bulk_has_active_guard(
+        tmp_path, monkeypatch):
+    """Regression: v2 planning cannot require an effect-only ContextVar."""
+    events = []
+    post_bulk_variables = {
+        'instance_type': '4CPU--16GB--H200:1',
+        'custom_resources': 'H200:1',
+        'region': 'phx-context',
+    }
+    (provisioner, to_provision, provision_record, _, cleanup, blocklist,
+     _) = _configure_reserved_fill_kubernetes_attempt(tmp_path,
+                                                      monkeypatch,
+                                                      events,
+                                                      [post_bulk_variables],
+                                                      mock_launch_fence=False,
+                                                      mock_provider_guard=False)
+    context, association_id, request_id = _bound_reserved_fill_context(
+        provisioner._extra_launch_context)
+    provisioner._extra_launch_context = context
+    active = False
+
+    claim = types.SimpleNamespace(request_id=request_id,
+                                  worker_instance_id=str(uuid.uuid4()))
+    monkeypatch.setattr(request_storage, 'active_execution_claim',
+                        lambda: claim)
+    binding_allows = mock.Mock(return_value=True)
+    monkeypatch.setattr(ordinary_launch_binding, 'binding_allows_request',
+                        binding_allows)
+
+    @contextlib.contextmanager
+    def effect_guard(actual_context):
+        nonlocal active
+        assert actual_context is context
+        assert not active
+        active = True
+        events.append('effect-enter')
+        try:
+            yield
+        finally:
+            events.append('effect-exit')
+            active = False
+
+    def require_active(actual_context):
+        assert actual_context is context
+        assert active
+        return types.SimpleNamespace(
+            durable_replica_info=mock.sentinel.durable_replica)
+
+    @contextlib.contextmanager
+    def committed_guard(_snapshot):
+        assert active
+        yield
+
+    monkeypatch.setattr(ordinary_launch_request, '_provider_effect_guard',
+                        effect_guard)
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'require_active_provider_effect_authorization',
+                        require_active)
+    monkeypatch.setattr(provisioner, '_reserved_fill_committed_provider_guard',
+                        committed_guard)
+    monkeypatch.setattr(provider_phase, 'provider_phase',
+                        lambda _mode: contextlib.nullcontext())
+
+    def builtin_bulk_provision(*_args, **kwargs):
+        # The two local preflights above this call run with ``active == False``.
+        assert not active
+        guard = kwargs['provider_effect_guard_factory']
+        with guard():
+            assert active
+            events.append('provider-create')
+        return provision_record
+
+    monkeypatch.setattr(backend.provisioner, '_BUILTIN_BULK_PROVISION',
+                        builtin_bulk_provision)
+    monkeypatch.setattr(backend.provisioner, 'bulk_provision',
+                        builtin_bulk_provision)
+    monkeypatch.setattr(clouds.Kubernetes, 'get_identity_from_context_name',
+                        lambda *_: ['user'])
+    monkeypatch.setattr(clouds.Kubernetes, 'check_features_are_supported',
+                        lambda *_: None)
+    provisioner._dag = None
+    provisioner._optimize_target = None
+    provisioner._requested_features = set()
+    task = mock.Mock()
+    task.is_controller_task.return_value = False
+    task.resources = {to_provision}
+    task.best_resources = to_provision
+    config = backend.RetryingVmProvisioner.ToProvisionConfig(
+        cluster_name='test-cluster',
+        resources=to_provision,
+        num_nodes=1,
+        prev_cluster_status=None,
+        prev_handle=None,
+        prev_cluster_ever_up=False,
+        prev_config_hash=None)
+
+    result = provisioner.provision_with_retries(
+        task,
+        config,
+        dryrun=False,
+        stream_logs=False,
+        skip_unnecessary_provisioning=False)
+
+    assert result['provision_record'] is provision_record
+    assert events.count('provider-create') == 1
+    assert binding_allows.call_count >= 3
+    binding_allows.assert_any_call(association_id, request_id)
     cleanup.assert_not_called()
     blocklist.assert_not_called()
 
@@ -2163,6 +2345,8 @@ def test_reserved_fill_retry_candidate_drift_is_terminal_before_provider(
         kubernetes_context='phx-context',
         accelerator='H200',
         accelerator_count=1)
+    launch_context, association_id, request_id = _bound_reserved_fill_context(
+        launch_context)
     task = mock.Mock()
     task.is_controller_task.return_value = False
     task.num_nodes = 1
@@ -2193,6 +2377,15 @@ def test_reserved_fill_retry_candidate_drift_is_terminal_before_provider(
         side_effect=exceptions.ResourcesUnavailableError(
             'first exact attempt unavailable'))
     monkeypatch.setattr(provisioner, '_retry_zones', provider_attempt)
+    claim = types.SimpleNamespace(request_id=request_id,
+                                  worker_instance_id=str(uuid.uuid4()))
+    monkeypatch.setattr(request_storage, 'active_execution_claim',
+                        lambda: claim)
+    monkeypatch.setattr(
+        ordinary_launch_binding, 'binding_allows_request',
+        lambda actual_association_id, actual_request_id:
+        (actual_association_id == association_id and actual_request_id ==
+         request_id))
     monkeypatch.setattr(clouds.Kubernetes, 'get_identity_from_context_name',
                         lambda *_: ['user'])
     monkeypatch.setattr(clouds.Kubernetes, 'check_features_are_supported',

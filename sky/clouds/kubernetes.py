@@ -709,7 +709,6 @@ class Kubernetes(clouds.Cloud):
         num_nodes: int,
         volume_mounts: list['volume_lib.VolumeMount'] | None,
         enable_flex_start: bool,
-        is_using_queueing: bool,
     ) -> int:
         """Calculate provision timeout based on number of nodes.
 
@@ -724,11 +723,6 @@ class Kubernetes(clouds.Cloud):
         Returns:
             Timeout in seconds
         """
-        if is_using_queueing:
-            # Return a large timeout to let the
-            # queue system handle the provisioning
-            return 24 * 60 * 60  # 24 hours
-
         base_timeout = 10  # Base timeout for single node
         per_node_timeout = 0.2  # Additional seconds per node
         max_timeout = 60  # Cap at 1 minute
@@ -818,6 +812,10 @@ class Kubernetes(clouds.Cloud):
         has_strict_worker_admission = (
             kubernetes_pod_spec.
             serve_worker_projection_protocol_has_strict_admission(
+                projection_version))
+        has_projected_runtime_readiness = (
+            kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_runtime_readiness(
                 projection_version))
         if projection_version is not None and not has_strict_worker_admission:
             # Protocol v1 has no on-wire marker. An explicit version here is a
@@ -1016,10 +1014,10 @@ class Kubernetes(clouds.Cloud):
                     f'DWS is only supported in GKE, but the autoscaler type '
                     f'for context {context} is {autoscaler_type}')
 
-        # Timeout for resource provisioning. Protocol v3 freezes this value in
-        # the server-owned candidate at version commit. The terminal launch must
-        # not re-resolve ambient API-server or task configuration. Historical
-        # v1/v2 launches retain their exact launch-time behavior.
+        # Timeout for resource provisioning. Protocols v3/v4 freeze this value
+        # in the server-owned candidate at version commit. The terminal launch
+        # must not re-resolve ambient API-server or task configuration.
+        # Historical v1/v2 launches retain their exact launch-time behavior.
         cloud_config_str = self._REPR.lower()
         has_projected_provision_timeout = (
             kubernetes_pod_spec.
@@ -1034,10 +1032,9 @@ class Kubernetes(clouds.Cloud):
             # This timeout determines how long to wait for a Pending Pod before
             # giving up. It includes Kubernetes scheduler latency and scales
             # linearly with node count up to the existing cap.
-            is_using_kueue = k8s_kueue_local_queue_name is not None
             timeout = self.calculate_provision_timeout(
                 num_nodes, volume_mounts, enable_flex_start or
-                enable_flex_start_queued_provisioning, is_using_kueue)
+                enable_flex_start_queued_provisioning)
 
             # Use _REPR instead of directly using 'kubernetes' because this may
             # be an SSH node pool. V1/v2 task overrides intentionally remain.
@@ -1149,6 +1146,9 @@ class Kubernetes(clouds.Cloud):
             'k8s_context': context,
             'k8s_namespace': namespace,
             'k8s_host_network': k8s_host_network,
+            'k8s_projected_serve_worker_runtime_readiness': has_projected_runtime_readiness,
+            'k8s_projected_worker_runtime_ready_marker':
+                kubernetes_pod_spec.SERVE_WORKER_RUNTIME_READY_MARKER,
         }
 
         # Pod-level terminationGracePeriodSeconds rendered from any

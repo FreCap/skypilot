@@ -568,6 +568,18 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
                 fresh_info.get('controller_slot_quiescing')
                 == info.get('controller_slot_quiescing'))
 
+    controller_liveness_cache: dict[managed_job_state.ControllerPidRecord,
+                                    bool] = {}
+
+    def _controller_process_alive_once(
+            record: managed_job_state.ControllerPidRecord) -> bool:
+        cached = controller_liveness_cache.get(record)
+        if cached is not None:
+            return cached
+        alive = controller_process_alive(record)
+        controller_liveness_cache[record] = alive
+        return alive
+
     # Fetch the jobs that need checking together with the small per-job fields
     # the loop consumes. This keeps the refresh tick on a single slim query
     # instead of a filtered job-id query followed by a second detail query.
@@ -685,7 +697,7 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
             failure_reason = f'No controller pid set for {schedule_state.value}'
         else:
             logger.debug(f'Checking controller pid {pid}')
-            if controller_process_alive(
+            if _controller_process_alive_once(
                     managed_job_state.ControllerPidRecord(
                         pid=pid, started_at=pid_started_at)):
                 # The controller is still running, so this job is fine.

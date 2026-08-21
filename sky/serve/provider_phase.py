@@ -1,9 +1,14 @@
-"""Fair process-local admission for incompatible provider authority modes.
+"""Fair process-local admission for incompatible provider effect epochs.
 
-Protocol-v2 Kubernetes work holds immutable physical-cluster captures, while
-legacy work deliberately uses ambient credentials.  Those authority modes
-must not overlap in one process.  This module provides the small concurrency
-primitive used to separate them; it does not perform provider operations.
+Protocol-v2 Kubernetes mutations use immutable physical-cluster captures,
+while legacy work deliberately uses ambient credentials.  Their concrete
+provider-bearing effect epochs must not overlap in one process.  A capture may
+remain active outside this phase during a passive Kubernetes observation: its
+own context-local lease admits compatible v2 callers and rejects an unleased
+ambient caller for that same context, while isolated clients for other
+contexts remain independent.  This module provides the small concurrency
+primitive used around the effect epochs; it does not perform provider
+operations or own capture lifetimes.
 """
 # pylint: disable=protected-access
 

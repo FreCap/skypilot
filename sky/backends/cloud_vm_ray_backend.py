@@ -112,6 +112,9 @@ from sky.utils.plugin_extensions import ExternalFailureSource
 metrics_utils = adaptors_common.LazyImport('sky.metrics.utils')
 ordinary_launch_binding = adaptors_common.LazyImport(
     'sky.serve.ordinary_launch_binding')
+ordinary_launch_request = adaptors_common.LazyImport(
+    'sky.server.requests.ordinary_launch')
+provider_phase = adaptors_common.LazyImport('sky.serve.provider_phase')
 serve_placement_history = adaptors_common.LazyImport(
     'sky.serve.placement_history')
 
@@ -900,145 +903,186 @@ class RetryingVmProvisioner:
                 'Refusing a SkyServe replica launch after its durable '
                 'service generation changed.')
 
-    def _reserved_fill_reclaim_authorization(
-        self,
-        launch_snapshot: serve_state.ServiceReplicaLaunchFenceSnapshot | None,
-    ) -> tuple[bool, reserved_fill_reclaim_attestation.ReclaimLaunchScope |
-               None, reserved_fill_reclaim_attestation.
-               ReclaimLaunchAuthorization | None]:
-        """Bind the durable row, then mint a fresh deployment-policy ticket."""
+    def _validate_service_replica_launch_preflight(self) -> None:
+        """Reject stale protocol-v2 planning without granting provider I/O.
+
+        Protocol-v2 reserved fill deliberately releases its active association
+        guard between bounded provider effects so a passive Kubernetes/Kueue
+        wait cannot retain the service advisory lock.  Planning and local INIT
+        bookkeeping in that interval therefore use the existing conservative
+        non-locking qualification.  Every provider-bearing call still enters
+        ``_service_replica_launch_provider_guard()`` and requires the exact
+        active effect authorization there.
+        """
         try:
-            fence = reserved_capacity.parse_protocol_v2_launch_fence(
-                self._extra_launch_context)
+            reserved_fill_fence = (
+                reserved_capacity.parse_protocol_v2_launch_fence(
+                    self._extra_launch_context))
         except ValueError as error:
             raise reserved_capacity.ReservedFillLaunchFenceError(
-                'Reserved-fill provider policy fence is malformed.') from error
+                'Reserved-fill preflight context is malformed.') from error
+        if reserved_fill_fence is None:
+            self._validate_service_replica_launch_fence()
+            return
+        try:
+            context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
+                self._extra_launch_context)
+            claim = request_storage.active_execution_claim()
+            authorized = bool(
+                claim is not None and claim.worker_instance_id is not None and
+                claim.request_id == context.request_id and
+                ordinary_launch_binding.binding_allows_request(
+                    str(context.association_id), context.request_id))
+        except Exception as error:
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'Unable to prove current bound SkyServe preflight authority.'
+            ) from error
+        if not authorized:
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'Bound SkyServe preflight has no current association '
+                'authority.')
+
+    @contextlib.contextmanager
+    def _reserved_fill_committed_provider_guard(
+        self,
+        launch_snapshot: serve_state.ServiceReplicaLaunchFenceSnapshot | None,
+    ) -> typing.Iterator[None]:
+        """Use a committed intent plus fresh facts for one provider effect."""
         durable_replica = (None if launch_snapshot is None else
                            launch_snapshot.durable_replica_info)
         durable_reserved_fill = bool(durable_replica is not None and
                                      durable_replica.reserved_fill is True)
-        if fence is None:
-            return durable_reserved_fill, None, None
         if not durable_reserved_fill:
-            raise reserved_capacity.ReservedFillLaunchFenceError(
-                'Reserved-fill provider policy fence has no exact durable '
-                'replica row.')
-        assert durable_replica is not None
-        try:
-            reserved_capacity.validate_protocol_v2_launch_fence_against_replica(
-                fence, durable_replica)
-        except ValueError as error:
-            raise reserved_capacity.ReservedFillLaunchFenceError(
-                'Reserved-fill provider policy fence changed from its '
-                'durable replica row.') from error
-        service_name = self._extra_launch_context.get(
-            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
-        if not isinstance(service_name, str) or not service_name:
-            raise reserved_capacity.ReservedFillLaunchFenceError(
-                'Reserved-fill provider policy fence has no service name.')
-        if not fence.policy_bound:
-            return True, None, None
-        try:
-            projections = self._extra_launch_context.get(
-                serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY)
-            _, projected_admission = (
-                reserved_capacity.require_reclaim_worker_projection(
-                    fence, projections))
-            scope = reserved_fill_reclaim_attestation.ReclaimLaunchScope(
-                service_name=service_name,
-                service_version=fence.service_version,
-                pool_key=fence.pool_key,
-                service_generation=fence.service_generation,
-                physical_cluster_uid=fence.physical_cluster_uid,
-                kubernetes_context=fence.kubernetes_context,
-                accelerator=fence.accelerator,
-                accelerator_count=fence.accelerator_count,
-                projected_admission=projected_admission)
-            identity = reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
-                fleet_bundle_sha256=typing.cast(
-                    str, fence.reclaim_fleet_bundle_sha256),
-                policy_revision=typing.cast(str, fence.reclaim_policy_revision),
-                provider_inventory_sha256=typing.cast(
-                    str, fence.reclaim_provider_inventory_sha256))
-            gate_generation = typing.cast(int,
-                                          fence.reconciliation_gate_generation)
-            policy = reserved_fill_reclaim_attestation.require_unique_policy()
-            (reserved_fill_reclaim_attestation.require_exact_policy_identity)(
-                policy, identity)
-            policy_deadline = (reserved_fill_reclaim_attestation.
-                               new_policy_operation_deadline())
-            authorization = policy.authorize_launch(
-                scope,
-                expected_identity=identity,
-                expected_gate_generation=gate_generation,
-                deadline_monotonic=policy_deadline)
-            (reserved_fill_reclaim_attestation.
-             require_policy_operation_completed)(policy_deadline)
-            (reserved_fill_reclaim_attestation.
-             require_exact_launch_authorization)(
-                 authorization,
-                 expected_identity=identity,
-                 expected_gate_generation=gate_generation,
-                 expected_scope=scope)
-        except Exception as error:  # pylint: disable=broad-except
-            raise reserved_capacity.ReservedFillLaunchFenceError(
-                'Deployment reclaim policy refused the reserved-fill '
-                'provider effect.') from error
-        return True, scope, authorization
-
-    @contextlib.contextmanager
-    def _reserved_fill_reclaim_provider_guard(
-        self,
-        launch_snapshot: serve_state.ServiceReplicaLaunchFenceSnapshot | None,
-    ) -> typing.Iterator[None]:
-        """Hold fleet gate authority across one terminal provider effect."""
-        (durable_reserved_fill, scope, authorization
-        ) = self._reserved_fill_reclaim_authorization(launch_snapshot)
-        if not durable_reserved_fill:
+            try:
+                fence = reserved_capacity.parse_protocol_v2_launch_fence(
+                    self._extra_launch_context)
+            except ValueError as error:
+                raise reserved_capacity.ReservedFillLaunchFenceError(
+                    'Reserved-fill committed fence is malformed.') from error
+            if fence is not None:
+                raise reserved_capacity.ReservedFillLaunchFenceError(
+                    'Reserved-fill committed fence has no exact durable '
+                    'replica row.')
             yield
             return
         provider_started = False
         try:
-            with serve_state.reserved_fill_reclaim_gate_authority_guard(
-                    shared=True) as gate_guard:
-                if not (serve_state.
-                        reserved_fill_reclaim_gate_authority_guard_is_valid(
-                            gate_guard)):
-                    raise reserved_capacity.ReservedFillLaunchFenceError(
-                        'Reserved-fill reclaim guard lost its database '
-                        'session before the provider operation.')
-                if not serve_state.reserved_fill_reclaim_launch_authority_holds(
-                        scope, authorization, self._extra_launch_context):
-                    raise reserved_capacity.ReservedFillLaunchFenceError(
-                        'Reserved-fill reclaim authority changed before the '
-                        'provider operation.')
+            fence = reserved_capacity.parse_protocol_v2_launch_fence(
+                self._extra_launch_context)
+            if fence is None:
+                raise reserved_capacity.ReservedFillLaunchFenceError(
+                    'Reserved-fill durable row has no protocol-v2 fence.')
+            try:
+                projections = self._extra_launch_context.get(
+                    serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY)
+                _, projected_admission = (
+                    reserved_capacity.require_reclaim_worker_projection(
+                        fence, projections))
+                service_name = self._extra_launch_context.get(
+                    serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+                if not isinstance(service_name, str) or not service_name:
+                    raise ValueError('service name is missing')
+                scope = reserved_fill_reclaim_attestation.ReclaimLaunchScope(
+                    service_name=service_name,
+                    service_version=fence.service_version,
+                    pool_key=fence.pool_key,
+                    service_generation=fence.service_generation,
+                    physical_cluster_uid=fence.physical_cluster_uid,
+                    kubernetes_context=fence.kubernetes_context,
+                    accelerator=fence.accelerator,
+                    accelerator_count=fence.accelerator_count,
+                    projected_admission=projected_admission)
+                identity = (
+                    reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
+                        fleet_bundle_sha256=typing.cast(
+                            str, fence.reclaim_fleet_bundle_sha256),
+                        policy_revision=typing.cast(
+                            str, fence.reclaim_policy_revision),
+                        provider_inventory_sha256=typing.cast(
+                            str, fence.reclaim_provider_inventory_sha256)))
+                gate_generation = typing.cast(
+                    int, fence.reconciliation_gate_generation)
+                policy = (
+                    reserved_fill_reclaim_attestation.require_unique_policy())
+                (reserved_fill_reclaim_attestation.require_exact_policy_identity
+                )(policy, identity)
+                deadline = (reserved_fill_reclaim_attestation.
+                            new_policy_operation_deadline())
+                authorization = policy.authorize_launch(
+                    scope,
+                    expected_identity=identity,
+                    expected_gate_generation=gate_generation,
+                    deadline_monotonic=deadline)
+                (reserved_fill_reclaim_attestation.
+                 require_policy_operation_completed)(deadline)
+                (reserved_fill_reclaim_attestation.
+                 require_exact_launch_authorization)(
+                     authorization,
+                     expected_identity=identity,
+                     expected_gate_generation=gate_generation,
+                     expected_scope=scope,
+                     minimum_remaining_seconds=(
+                         reserved_fill_reclaim_attestation.
+                         LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS))
+            except Exception as error:  # pylint: disable=broad-except
+                raise reserved_capacity.ReservedFillLaunchFenceError(
+                    'Deployment reclaim policy refused the committed '
+                    'reserved-fill provider effect.') from error
+            if not serve_state.reserved_fill_committed_launch_authority_holds(
+                    scope, authorization, self._extra_launch_context,
+                    launch_snapshot):
+                raise reserved_capacity.ReservedFillLaunchFenceError(
+                    'Reserved-fill committed intent no longer authorizes the '
+                    'provider operation.')
+            # The fresh policy proof attests the exact live admission and
+            # no-paid contract.  The physical fence then pins that attested
+            # context to the committed intent's immutable cluster UID.  The
+            # first create needs no Pod UID; the in-tree provisioner captures
+            # it and later epochs reattest that same object independently.
+            with kubernetes_adaptor.physical_cluster_uid_fence(
+                    fence.kubernetes_context, fence.physical_cluster_uid):
                 provider_started = True
                 yield
-                if not (serve_state.
-                        reserved_fill_reclaim_gate_authority_guard_is_valid(
-                            gate_guard)):
-                    raise reserved_capacity.ReservedFillLaunchFenceError(
-                        'Reserved-fill reclaim guard became indeterminate '
-                        'during the provider operation.')
         except reserved_capacity.ReservedFillLaunchFenceError:
             raise
         except Exception as error:
             if provider_started:
                 raise
             raise reserved_capacity.ReservedFillLaunchFenceError(
-                'Unable to hold reserved-fill reclaim authority across the '
-                'provider operation.') from error
+                'Unable to prove the committed reserved-fill handoff before '
+                'the provider operation.') from error
 
     @contextlib.contextmanager
     def _service_replica_launch_provider_guard(self) -> typing.Iterator[None]:
-        """Hold fleet reclaim and per-service authority across provider I/O."""
-        # Canonical order: existing service (or already-held association)
-        # authority, a fresh five-second policy ticket, then the fleet gate
-        # immediately around provider mutation.
-        with self._service_replica_launch_provider_owner_guard(
-        ) as launch_snapshot:
-            with self._reserved_fill_reclaim_provider_guard(launch_snapshot):
-                yield
+        """Hold one bounded effect epoch across concrete provider I/O."""
+        # Canonical order: exact request/association authority, current
+        # service owner, then the scalar-linked immutable COMMITTED intent.
+        try:
+            reserved_fill_fence = (
+                reserved_capacity.parse_protocol_v2_launch_fence(
+                    self._extra_launch_context))
+        except ValueError as error:
+            raise reserved_capacity.ReservedFillLaunchFenceError(
+                'Reserved-fill provider effect context is malformed.') from (
+                    error)
+        # Ordinary and transitional paths retain execution.py's outer
+        # provider scope. Protocol-v2 Kubernetes fill deliberately does not:
+        # a Kueue quota wait may last hours and must not retain either the
+        # per-service advisory lock or the process provider phase. Re-enter
+        # the idempotent association boundary for each exact effect instead.
+        effect_authority = (
+            ordinary_launch_request._provider_effect_guard(  # pylint: disable=protected-access
+                self._extra_launch_context)
+            if reserved_fill_fence is not None else contextlib.nullcontext())
+        phase = (provider_phase.provider_phase(
+            provider_phase.ProviderPhaseMode.V2_FENCED) if reserved_fill_fence
+                 is not None else contextlib.nullcontext())
+        with effect_authority, phase:
+            with self._service_replica_launch_provider_owner_guard(
+            ) as launch_snapshot:
+                with self._reserved_fill_committed_provider_guard(
+                        launch_snapshot):
+                    yield
 
     @contextlib.contextmanager
     def _service_replica_launch_provider_owner_guard(
@@ -1064,15 +1108,20 @@ class RetryingVmProvisioner:
             # strict contextvar check prevents a forged or directly invoked
             # bound context from using this bypass.
             try:
-                ordinary_launch_binding.require_active_provider_effect_authorization(
-                    launch_context)
+                association_authorization = (
+                    ordinary_launch_binding.
+                    require_active_provider_effect_authorization(launch_context)
+                )
             except Exception as error:
                 raise exceptions.ServeReplicaLaunchFenceError(
                     'Bound SkyServe provider I/O has no exact active '
                     'association authority.') from error
+            bound_launch_snapshot = (
+                serve_state.ServiceReplicaLaunchFenceSnapshot(
+                    association_authorization.durable_replica_info))
             provider_completed = False
             try:
-                yield None
+                yield bound_launch_snapshot
                 provider_completed = True
             finally:
                 if provider_completed:
@@ -1564,7 +1613,7 @@ class RetryingVmProvisioner:
                     region=to_provision.region):
                 # Do not create even a local INIT record for a request that
                 # lost authority while placement/config generation ran.
-                self._validate_service_replica_launch_fence()
+                self._validate_service_replica_launch_preflight()
                 try:
                     config_dict = backend_utils.write_cluster_config(
                         to_provision,
@@ -1675,7 +1724,7 @@ class RetryingVmProvisioner:
                 workload_id, workload_task_id = _get_workload_attribution(
                     task, cluster_name, self._workload_type,
                     self._extra_launch_context)
-                self._validate_service_replica_launch_fence()
+                self._validate_service_replica_launch_preflight()
                 try:
                     self._active_cluster_hash = (
                         global_user_state.add_or_update_cluster(
@@ -2522,7 +2571,7 @@ class RetryingVmProvisioner:
                 # exactly one context and accelerator shape, never a general
                 # cross-cloud/cross-pool retry.
                 self._validate_reserved_fill_candidate(to_provision)
-                self._validate_service_replica_launch_fence()
+                self._validate_service_replica_launch_preflight()
                 # Recheck cluster name as the 'except:' block below may
                 # change the cloud assignment.
                 common_utils.check_cluster_name_is_valid(cluster_name)

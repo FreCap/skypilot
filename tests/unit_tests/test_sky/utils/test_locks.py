@@ -9,6 +9,7 @@ from sky import global_user_state
 from sky.skylet import runtime_utils
 from sky.utils import locks
 from sky.utils.db import db_utils
+from sky.utils.db import postgres_lock
 
 
 class TestLockTimeout:
@@ -239,6 +240,16 @@ class TestPostgresLock:
                 f"Expected deterministic key {expected_key} for '{input_str}', "
                 f"but got {actual_key}. This indicates the hash function is "
                 f"not deterministic across processes.")
+
+    @pytest.mark.parametrize(
+        'lock_id',
+        ('', 'cluster_lock', 'serve-reclaim-provider-proof:["v2","phx","h200"]',
+         'κλειδί-🔒'))
+    def test_postgres_lock_key_extraction_preserves_compatibility(
+            self, lock_id):
+        """The lightweight helper must preserve every existing lock key."""
+        assert (locks.postgres_lock_key(lock_id) ==
+                postgres_lock.postgres_lock_key(lock_id))
 
     @mock.patch.object(locks.PostgresLock, '_get_connection')
     def test_postgres_lock_acquire_success(self, mock_get_connection,

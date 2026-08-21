@@ -285,6 +285,24 @@ def _validate_reserved_fill_final_resources(
             'context and accelerator shape.') from error
 
 
+@contextlib.contextmanager
+def _reserved_fill_effect_epoch(
+        launch_context: dict[str, Any]) -> typing.Iterator[None]:
+    """Hold bound-request and process authority for one concrete v2 effect."""
+    with ordinary_launch_request._provider_effect_guard(  # pylint: disable=protected-access
+            launch_context):
+        with provider_phase.provider_phase(
+                provider_phase.ProviderPhaseMode.V2_FENCED):
+            yield
+            if ordinary_launch_request._has_bound_context_fields(  # pylint: disable=protected-access
+                    launch_context):
+                # Probe the exact advisory-lock session after successful I/O.
+                # A failed operation keeps its own provider classification;
+                # a successful one must not cross a silently lost authority.
+                ordinary_launch_binding.require_active_provider_effect_authorization(
+                    launch_context)
+
+
 def _maybe_clone_disk_from_cluster(clone_disk_from: str | None,
                                    cluster_name: str | None,
                                    task: 'sky.Task') -> 'sky.Task':
@@ -858,36 +876,33 @@ def _execute_dag_under_provider_fence(
     # the physical-identity read and rely on the later actuation-boundary
     # check to reject a drifted result.
 
-    # A bound ordinary Serve launch takes the shared, cross-pod service
-    # authority guard and advances its durable effect phase at the last common
-    # boundary before any provider-bearing work.  Policy evaluation and
-    # optimization above remain pre-effect: rejecting there can still prove
-    # that no provider call began.  The ExitStack holds this guard through
-    # provisioning, setup, and service-job submission, so controller takeover
-    # cannot overlap opaque provider work.
-    _provider_fence_stack.enter_context(
-        ordinary_launch_request._provider_effect_guard(  # pylint: disable=protected-access
-            _extra_launch_context))
+    if reserved_fill_launch_fence is None:
+        # Ordinary launches retain one service and process authority scope
+        # around their opaque provider tail. Protocol-v2 Kubernetes fill is
+        # fully instrumented below and in CloudVmRayBackend: each concrete
+        # effect enters a short epoch, while passive Kueue admission waits hold
+        # neither authority and therefore cannot block updates or other pools.
+        _provider_fence_stack.enter_context(
+            ordinary_launch_request._provider_effect_guard(  # pylint: disable=protected-access
+                _extra_launch_context))
+        _provider_fence_stack.enter_context(
+            provider_phase.provider_phase(
+                provider_phase.ProviderPhaseMode.AMBIENT_LEGACY))
 
-    phase_mode = (provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
-                  if reserved_fill_launch_fence is None else
-                  provider_phase.ProviderPhaseMode.V2_FENCED)
-    # API/executor processes can run ordinary and v2 requests concurrently.
-    # Admit the complete provider-bearing tail before constructing a physical
-    # capture so ambient requests can never overlap that immutable authority.
-    _provider_fence_stack.enter_context(
-        provider_phase.provider_phase(phase_mode))
-
-    if ordinary_launch_request._has_bound_context_fields(  # pylint: disable=protected-access
-            _extra_launch_context):
+    if (ordinary_launch_request._has_bound_context_fields(  # pylint: disable=protected-access
+            _extra_launch_context) and task.storage_mounts):
         # Storage construction may create/check buckets and synchronize local
         # sources.  It is therefore provider-bearing work, not validation.
         # Keep it after the association advances to PROVIDER_IO and while
         # both the exact request claim and service authority guards are held.
         # A crash here must be reduced as an effectful/ambiguous attempt; it
         # must never be replayed as a provably NOT_STARTED successor.
-        for storage in (task.storage_mounts or {}).values():
-            storage.construct()
+        storage_effect = (_reserved_fill_effect_epoch(_extra_launch_context)
+                          if reserved_fill_launch_fence is not None else
+                          contextlib.nullcontext())
+        with storage_effect:
+            for storage in (task.storage_mounts or {}).values():
+                storage.construct()
 
     if reserved_fill_launch_fence is not None:
         # Optimization is allowed to rewrite best_resources. Reject any drift
@@ -896,10 +911,15 @@ def _execute_dag_under_provider_fence(
         # registration, provisioning, setup, and job submission below.
         _validate_reserved_fill_final_resources(task,
                                                 reserved_fill_launch_fence)
-        _provider_fence_stack.enter_context(
-            kubernetes_adaptor.physical_cluster_uid_fence(
-                reserved_fill_launch_fence.kubernetes_context,
-                reserved_fill_launch_fence.physical_cluster_uid))
+        # Capture/UID verification is one bounded provider effect. Retain only
+        # the immutable kubeconfig token across the later passive wait; the
+        # service advisory lock and provider phase retire immediately after
+        # the capture succeeds.
+        with _reserved_fill_effect_epoch(_extra_launch_context):
+            _provider_fence_stack.enter_context(
+                kubernetes_adaptor.physical_cluster_uid_fence(
+                    reserved_fill_launch_fence.kubernetes_context,
+                    reserved_fill_launch_fence.physical_cluster_uid))
 
     backend.register_info(
         dag=dag,
@@ -916,8 +936,13 @@ def _execute_dag_under_provider_fence(
         workload_type=workload_type)
 
     if task.storage_mounts is not None:
-        # Optimizer should eventually choose where to store bucket
-        task.sync_storage_mounts()
+        # Optimizer should eventually choose where to store bucket.
+        storage_sync_effect = (
+            _reserved_fill_effect_epoch(_extra_launch_context)
+            if reserved_fill_launch_fence is not None else
+            contextlib.nullcontext())
+        with storage_sync_effect:
+            task.sync_storage_mounts()
 
     reserved_fill_materialized = False
     try:
@@ -1096,12 +1121,16 @@ def _execute_dag_under_provider_fence(
         if Stage.EXEC in stages:
             try:
                 global_user_state.update_last_use(handle.get_cluster_name())
-                ordinary_launch_request._begin_service_job_io(  # pylint: disable=protected-access
-                    _extra_launch_context)
                 with _materialized_effect_guard('service-job submission'):
+                    # The short reserved-fill effect epoch owns the active
+                    # association authorization. Advance and record the job
+                    # inside that same epoch; no outer service lock spans the
+                    # preceding Kueue admission wait.
+                    ordinary_launch_request._begin_service_job_io(  # pylint: disable=protected-access
+                        _extra_launch_context)
                     job_id = backend.execute(handle, task, dryrun=dryrun)
-                ordinary_launch_request._record_service_job(  # pylint: disable=protected-access
-                    _extra_launch_context, job_id)
+                    ordinary_launch_request._record_service_job(  # pylint: disable=protected-access
+                        _extra_launch_context, job_id)
             finally:
                 # Enables post_execute() to be run after KeyboardInterrupt.
                 backend.post_execute(handle, down)

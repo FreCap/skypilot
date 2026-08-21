@@ -140,3 +140,23 @@ def test_policy_bound_kubernetes_preserves_terminal_fence_classification(
 
     assert exc_info.value is terminal
     patched_bulk_provision.assert_not_called()
+
+
+def test_policy_bound_kubernetes_preserves_provider_present_for_adjudication(
+        patched_bulk_provision, monkeypatch, tmp_path):
+    """The terminal PRESENT receipt never enters legacy teardown/failover."""
+    terminal = exceptions.ReservedFillProviderPresentError(
+        'Kueue admission timed out', ('ns/pod@uid',))
+    monkeypatch.setattr(provisioner, '_bulk_provision',
+                        mock.MagicMock(side_effect=terminal))
+
+    @contextlib.contextmanager
+    def mutation_guard():
+        yield
+
+    with pytest.raises(exceptions.ReservedFillProviderPresentError) as exc_info:
+        _call_bulk_provision(tmp_path, mutation_guard)
+
+    assert exc_info.value is terminal
+    assert exc_info.value.provider_resource_ids == ('ns/pod@uid',)
+    patched_bulk_provision.assert_not_called()

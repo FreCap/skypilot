@@ -29,8 +29,16 @@ _AWS_ROLE_ARN_RE: Final = re.compile(
     r'role/[A-Za-z0-9+=,.@_/-]+$')
 POLICY_ENTRY_POINT_GROUP: Final = 'skypilot.reserved_fill_reclaim_policy'
 POLICY_REVISION_MAX_BYTES: Final = 1024
+RECLAIM_PROVIDER_CONTEXT_MAX_BYTES: Final = 1024
 AUTHORIZATION_MAX_AGE_SECONDS: Final = 5.0
 POLICY_OPERATION_TIMEOUT_SECONDS: Final = 5.0
+# A launch receipt must retain this much of its five-second freshness window
+# when the policy hands it back.  The caller still has to decode and validate
+# the ticket and enter the multi-statement terminal PostgreSQL authority read.
+# The final database predicate independently enforces the full five-second
+# expiry; this budget prevents normal handoff latency from selecting a receipt
+# that is already too close to that fail-closed boundary.
+LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS: Final = 2.0
 
 
 class ReclaimAttestationError(RuntimeError):
@@ -92,6 +100,31 @@ class ReclaimPolicyIdentity:
                               POLICY_REVISION_MAX_BYTES)
         _require_sha256(self.provider_inventory_sha256,
                         'provider_inventory_sha256')
+
+
+def reclaim_provider_proof_lock_id(
+    identity: ReclaimPolicyIdentity,
+    gate_generation: int,
+    kubernetes_context: str,
+) -> str:
+    """Hash the exact context-wide provider-proof advisory-lock authority."""
+    if not isinstance(identity, ReclaimPolicyIdentity):
+        raise ValueError('identity must be ReclaimPolicyIdentity.')
+    _require_positive_int(gate_generation, 'gate_generation')
+    _require_bounded_text(kubernetes_context, 'kubernetes_context',
+                          RECLAIM_PROVIDER_CONTEXT_MAX_BYTES)
+    material = (
+        gate_generation,
+        identity.fleet_bundle_sha256,
+        identity.policy_revision,
+        identity.provider_inventory_sha256,
+        kubernetes_context,
+    )
+    encoded = json.dumps(material,
+                         separators=(',', ':'),
+                         ensure_ascii=False,
+                         allow_nan=False).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -430,12 +463,35 @@ class ReclaimClaimAuthorization:
 
 
 @dataclasses.dataclass(frozen=True)
+class ReclaimProviderProofReference:
+    """Immutable reference to one completed context-wide provider proof."""
+
+    receipt_nonce: str
+    proof_sha256: str
+    identity: ReclaimPolicyIdentity
+    gate_generation: int
+    kubernetes_context: str
+    completed_monotonic: float
+
+    def __post_init__(self) -> None:
+        _require_sha256(self.receipt_nonce, 'receipt_nonce')
+        _require_sha256(self.proof_sha256, 'proof_sha256')
+        if not isinstance(self.identity, ReclaimPolicyIdentity):
+            raise ValueError('identity must be ReclaimPolicyIdentity.')
+        _require_positive_int(self.gate_generation, 'gate_generation')
+        _require_bounded_text(self.kubernetes_context, 'kubernetes_context',
+                              RECLAIM_PROVIDER_CONTEXT_MAX_BYTES)
+        _require_monotonic(self.completed_monotonic, 'completed_monotonic')
+
+
+@dataclasses.dataclass(frozen=True)
 class ReclaimLaunchAuthorization:
     """Fresh exact-scope authorization for one terminal provider effect."""
 
     identity: ReclaimPolicyIdentity
     gate_generation: int
     scope: ReclaimLaunchScope
+    provider_proof_reference: ReclaimProviderProofReference
     completed_monotonic: float
 
     def __post_init__(self) -> None:
@@ -444,7 +500,20 @@ class ReclaimLaunchAuthorization:
         _require_positive_int(self.gate_generation, 'gate_generation')
         if not isinstance(self.scope, ReclaimLaunchScope):
             raise ValueError('scope must be ReclaimLaunchScope.')
-        _require_monotonic(self.completed_monotonic, 'completed_monotonic')
+        completed = _require_monotonic(self.completed_monotonic,
+                                       'completed_monotonic')
+        reference = self.provider_proof_reference
+        if not isinstance(reference, ReclaimProviderProofReference):
+            raise ValueError('Launch authorization must carry one typed '
+                             'provider-proof reference.')
+        if (reference.identity != self.identity or
+                reference.gate_generation != self.gate_generation or
+                reference.kubernetes_context != self.scope.kubernetes_context):
+            raise ValueError('Launch provider-proof reference does not match '
+                             'the authorization scope.')
+        if completed != reference.completed_monotonic:
+            raise ValueError('Launch completion must equal the context-wide '
+                             'provider-proof completion.')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -746,14 +815,28 @@ def require_policy_operation_completed(deadline_monotonic: float) -> None:
             'The deployment reclaim-policy operation exceeded its deadline.')
 
 
-def _require_fresh(completed_monotonic: float, *, now_monotonic: float | None,
-                   subject: str) -> None:
+def _require_fresh(
+    completed_monotonic: float,
+    *,
+    now_monotonic: float | None,
+    subject: str,
+    minimum_remaining_seconds: float = 0.0,
+) -> None:
     completed = _require_monotonic(completed_monotonic,
                                    f'{subject} completed_monotonic')
     now = time.monotonic() if now_monotonic is None else _require_monotonic(
         now_monotonic, 'now_monotonic')
+    if (isinstance(minimum_remaining_seconds, bool) or
+            not isinstance(minimum_remaining_seconds, (int, float)) or
+            not math.isfinite(float(minimum_remaining_seconds)) or
+            minimum_remaining_seconds < 0 or
+            minimum_remaining_seconds >= AUTHORIZATION_MAX_AGE_SECONDS):
+        raise ValueError('minimum_remaining_seconds must be finite and within '
+                         'the authorization freshness horizon.')
     age = now - completed
-    if age < 0 or age > AUTHORIZATION_MAX_AGE_SECONDS:
+    maximum_age = (AUTHORIZATION_MAX_AGE_SECONDS -
+                   float(minimum_remaining_seconds))
+    if age < 0 or age >= maximum_age:
         raise ReclaimAttestationError(f'The reclaim {subject} is stale.')
 
 
@@ -787,6 +870,7 @@ def require_exact_launch_authorization(
     expected_gate_generation: int,
     expected_scope: ReclaimLaunchScope,
     now_monotonic: float | None = None,
+    minimum_remaining_seconds: float = 0.0,
 ) -> ReclaimLaunchAuthorization:
     """Validate one provider-produced ticket at the provider boundary."""
     if not isinstance(authorization, ReclaimLaunchAuthorization):
@@ -800,5 +884,6 @@ def require_exact_launch_authorization(
         )
     _require_fresh(authorization.completed_monotonic,
                    now_monotonic=now_monotonic,
-                   subject='launch authorization')
+                   subject='launch authorization',
+                   minimum_remaining_seconds=minimum_remaining_seconds)
     return authorization

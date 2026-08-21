@@ -4,6 +4,7 @@
 import copy
 import dataclasses
 import pathlib
+import types
 import uuid
 
 from alembic import command as alembic_command
@@ -18,6 +19,7 @@ from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import system_oom_recovery
 from sky.serve import system_recovery_state
+from sky.serve import zero_cost_actuation
 from sky.server import constants as server_constants
 from sky.server.requests import ordinary_launch as ordinary_launch_request
 from sky.server.requests import payloads
@@ -27,6 +29,18 @@ from sky.utils.db import migration_utils
 _SUBMISSION_ID = uuid.UUID('11111111-1111-4111-8111-111111111111')
 _RECORD_ID = uuid.UUID('22222222-2222-4222-8222-222222222222')
 _CONTROLLER_ID = uuid.UUID('33333333-3333-4333-8333-333333333333')
+
+
+def test_reserved_fill_workspace_authority_fails_closed_before_serve055(
+        monkeypatch) -> None:
+    engine = types.SimpleNamespace(dialect=types.SimpleNamespace(
+        name='postgresql'))
+    monkeypatch.setattr(serve_state, 'get_database_engine', lambda: engine)
+    monkeypatch.setattr(migration_utils, 'get_current_alembic_revision',
+                        lambda *_args, **_kwargs: '054')
+
+    assert not binding.reserved_fill_binding_authorizes_workspace(
+        'request-id', 'owner-id', 'workspace-a')
 
 
 def _profile_info() -> replica_managers.ReplicaInfo:
@@ -139,6 +153,21 @@ def test_generic_capability_requires_the_complete_exact_tuple() -> None:
             binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
 
     assert authority.generic_launches_required
+    assert authority.retained_non_pool_settlement_allowed
+    previous_cohort = dataclasses.replace(
+        authority,
+        non_pool_capability_cohort_epoch=(
+            binding.NON_POOL_CAPABILITY_COHORT_EPOCH - 1))
+    assert not previous_cohort.generic_launches_required
+    assert previous_cohort.retained_non_pool_settlement_allowed
+    assert not dataclasses.replace(
+        previous_cohort,
+        non_pool_capability_cohort_epoch=(
+            binding.NON_POOL_CAPABILITY_COHORT_EPOCH -
+            2)).retained_non_pool_settlement_allowed
+    assert not dataclasses.replace(previous_cohort,
+                                   binding_mode=binding.BindingMode.LEGACY
+                                  ).retained_non_pool_settlement_allowed
     assert not dataclasses.replace(
         authority,
         non_pool_profile_set_digest='0' * 64).generic_launches_required
@@ -309,6 +338,24 @@ def test_classify_all_non_pool_launch_profiles() -> None:
     assert binding.classify_non_pool_launch_profile(reserved) == (
         binding.NonPoolLaunchProfileKind.RESERVED_FILL)
 
+    # A protocol-v2 fill freezes its launch thread before the PostgreSQL
+    # admission transaction assigns the first zero-cost sequence.  Only the
+    # launch-path classifier may recognize that exact transient shape.
+    reserved.zero_cost_admission_sequence = None
+    assert binding.classify_non_pool_launch_profile(reserved) is None
+    assert binding.classify_uncommitted_protocol_v2_reserved_fill_profile(
+        reserved,
+        protocol_version=2) == (binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+    assert binding.classify_uncommitted_protocol_v2_reserved_fill_profile(
+        reserved, protocol_version=1) is None
+    reserved.zero_cost_materialization_sequence = 1
+    assert binding.classify_uncommitted_protocol_v2_reserved_fill_profile(
+        reserved, protocol_version=2) is None
+    reserved.zero_cost_materialization_sequence = None
+    reserved.reserved_fill_worker_projection_sha256 = None
+    assert binding.classify_uncommitted_protocol_v2_reserved_fill_profile(
+        reserved, protocol_version=2) is None
+
     replacement = _profile_info()
     replacement.unknown_capacity_replacement = True
     assert binding.classify_non_pool_launch_profile(replacement) == (
@@ -344,6 +391,110 @@ def test_non_pool_profile_classification_rejects_partial_authority() -> None:
     recovery.system_recovery_disposition = (
         system_recovery_state.SystemRecoveryDisposition.CANDIDATE)
     assert binding.classify_non_pool_launch_profile(recovery) is None
+
+
+def test_durable_reserved_fill_profile_uses_committed_handoff(
+        monkeypatch) -> None:
+    info = _profile_info()
+    info.reserved_fill = True
+    info.is_zero_cost = True
+    info.zero_cost_admission_sequence = 6
+    info.reserved_fill_reconciliation_gate_generation = 9
+    info.reserved_fill_intent_idempotency_key = 'b' * 64
+    intent = types.SimpleNamespace(allocation_input_sha256='a' * 64,
+                                   allocation_claim_generation=7,
+                                   idempotency_key='b' * 64,
+                                   protocol_version=2,
+                                   reconciliation_gate_generation=9,
+                                   observation_generation=10,
+                                   observation_sequence=0,
+                                   physical_cluster_uid='physical-uid',
+                                   pool_key='pool-a',
+                                   reclaim_fleet_bundle_sha256='c' * 64,
+                                   reclaim_policy_revision='policy-v1',
+                                   reclaim_provider_inventory_sha256='d' * 64,
+                                   worker_projection_sha256='e' * 64)
+    committed = lambda *_args, **_kwargs: intent
+    monkeypatch.setattr(binding.zero_cost_actuation,
+                        'committed_intent_for_replica_in_connection', committed)
+    sequence = {
+        'admission_sequence': 6,
+        'materialization_sequence': None,
+        'protocol_version': 2,
+        'reconciliation_gate_generation': 12,
+    }
+    monkeypatch.setattr(binding, '_zero_cost_sequence_payload',
+                        lambda *_args, **_kwargs: sequence)
+
+    class _Result:
+
+        def mappings(self):
+            return self
+
+        def one_or_none(self):
+            return {'payload_sha256': 'f' * 64}
+
+    connection = types.SimpleNamespace(execute=lambda _statement: _Result())
+    payload = binding._reserved_fill_payload(
+        connection, {
+            'name': 'svc',
+            'hash': 'svc-hash',
+            'reserved_fill_actuation_mode':
+                zero_cost_actuation.ActuationMode.DURABLE_INTENT.value,
+        }, info)
+
+    assert payload == {
+        'allocation_input_sha256': 'a' * 64,
+        'claim_generation': 7,
+        'intent_idempotency_key': 'b' * 64,
+        'observation_payload_sha256': 'f' * 64,
+        'physical_cluster_uid': 'physical-uid',
+        'pool_key': 'pool-a',
+        'reclaim_fleet_bundle_sha256': 'c' * 64,
+        'reclaim_policy_revision': 'policy-v1',
+        'reclaim_provider_inventory_sha256': 'd' * 64,
+        'sequence': sequence,
+        'worker_projection_sha256': 'e' * 64,
+    }
+    frozen_payload = binding._reserved_fill_payload(
+        connection, {
+            'name': 'svc',
+            'hash': 'svc-hash',
+            'reserved_fill_actuation_mode':
+                zero_cost_actuation.ActuationMode.DURABLE_INTENT.value,
+        },
+        info,
+        freeze_reconciliation_gate=True)
+    assert frozen_payload['sequence'] == {
+        **sequence,
+        'reconciliation_gate_generation': 9,
+    }
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='lost its monotonic gate history'):
+        binding._freeze_reserved_fill_sequence_gate(info, {
+            **sequence,
+            'protocol_version': 1,
+        },
+                                                    committed_intent=intent)
+
+
+def test_durable_reserved_fill_profile_never_falls_back_without_intent(
+        monkeypatch) -> None:
+    monkeypatch.setattr(binding.zero_cost_actuation,
+                        'committed_intent_for_replica_in_connection',
+                        lambda *_args, **_kwargs: None)
+    connection = types.SimpleNamespace(
+        execute=lambda _statement: pytest.fail('live allocation fallback used'))
+
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='committed intent handoff'):
+        binding._reserved_fill_payload(
+            connection, {
+                'name': 'svc',
+                'hash': 'svc-hash',
+                'reserved_fill_actuation_mode':
+                    zero_cost_actuation.ActuationMode.DURABLE_INTENT.value,
+            }, _profile_info())
 
 
 def _excluded_owner(fields: dict[str, object],
@@ -1044,7 +1195,9 @@ def test_api014_serve051_lineage_and_sqlite_stays_at_serve037(
     assert api_scripts.get_revision('013').down_revision == '012'
     assert api_scripts.get_revision('012').down_revision == '011'
     assert api_scripts.get_revision('011').down_revision == '010'
-    assert serve_scripts.get_heads() == ['052']
+    assert serve_scripts.get_heads() == ['056']
+    assert serve_scripts.get_revision('055').down_revision == '054'
+    assert serve_scripts.get_revision('053').down_revision == '052'
     assert serve_scripts.get_revision('052').down_revision == '051'
     assert serve_scripts.get_revision('050').down_revision == '049'
     assert serve_scripts.get_revision('049').down_revision == '048'

@@ -8,12 +8,14 @@ from typing import Any
 
 import fastapi
 import filelock
+import sqlalchemy
 
 from sky import exceptions
 from sky import global_user_state
 from sky import models
 from sky import sky_logging
 from sky import skypilot_config
+from sky.serve import serve_state
 from sky.server import common as server_common
 from sky.server.requests import payloads
 from sky.skylet import constants
@@ -39,6 +41,7 @@ USER_LOCK_TIMEOUT_SECONDS = 20
 _INTERNAL_USER_IDS = (
     common.SERVER_ID,
     constants.SKYPILOT_SYSTEM_USER_ID,
+    constants.SKYPILOT_SERVE_CONTROLLER_SYSTEM_USER_ID,
     constants.SKYPILOT_SYSTEM_VIEWER_USER_ID,
 )
 
@@ -512,6 +515,22 @@ def _delete_user(user_id: str) -> None:
                                     detail=f'Cannot delete internal '
                                     f'API server user {user_info.name}')
 
+    if serve_state.service_owner_attestation_transition_active():
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail=('User deletion is temporarily unavailable while '
+                    'SkyServe service-owner attestation is being completed.'))
+
+    owned_services = serve_state.get_service_names_owned_by_user_id(user_id)
+    if owned_services:
+        preview = ', '.join(owned_services[:5])
+        suffix = '' if len(owned_services) <= 5 else ', ...'
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail=(f'User {user_id} owns active SkyServe service(s): '
+                    f'{preview}{suffix}. Tear them down before deleting the '
+                    'user.'))
+
     # Check for active clusters and managed jobs owned by the user
     try:
         resource_checker.check_no_active_resources_for_users([(user_id,
@@ -520,7 +539,15 @@ def _delete_user(user_id: str) -> None:
         raise fastapi.HTTPException(status_code=400, detail=str(e))
 
     with _user_lock(user_id):
-        global_user_state.delete_user(user_id)
+        try:
+            global_user_state.delete_user(user_id)
+        except sqlalchemy.exc.IntegrityError as error:
+            # The Serve055 foreign key closes the race with a service
+            # creation or one-shot owner attestation after the read above.
+            raise fastapi.HTTPException(
+                status_code=400,
+                detail=(f'User {user_id} acquired a durable resource owner '
+                        'reference and cannot be deleted.')) from error
         permission.permission_service.delete_user(user_id)
 
 

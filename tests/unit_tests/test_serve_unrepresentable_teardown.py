@@ -50,6 +50,7 @@ def _info(status,
         preempted=False,
         purged=purged,
         failed_spot_availability=failed_spot,
+        sky_launch_status=Process.FAILED,
         sky_down_status=None,
     )
     return types.SimpleNamespace(

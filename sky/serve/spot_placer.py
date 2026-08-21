@@ -8,6 +8,7 @@ import math
 import os
 import re
 import time
+import types
 import typing
 from typing import Any, Optional
 
@@ -18,6 +19,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.clouds import cloud as sky_cloud
 from sky.container_images import models as container_image_models
+from sky.serve import constants
 from sky.serve import placement_policy
 from sky.utils import registry
 from sky.utils import resources_utils
@@ -59,7 +61,6 @@ _PREEMPTION_RETRY_SECONDS_ENV_VAR = 'SKYPILOT_SPOT_PLACER_RETRY_SECONDS'
 # probe path rather than launching on a reading nobody has refreshed.
 _MEASURED_CAPACITY_TTL_SECONDS_DEFAULT = 180
 _MEASURED_CAPACITY_TTL_ENV_VAR = 'SKYPILOT_MEASURED_CAPACITY_TTL_SECONDS'
-_PLACEMENT_SNAPSHOT_MAX_LOCATIONS = 500
 _PLACEMENT_CATALOG_SCHEMA_VERSION = 1
 # Public reader contract for bounded consumers such as the dashboard.  The
 # placement JSON remains versioned independently of the API wire version.
@@ -1191,20 +1192,16 @@ class SpotPlacer:
         """Return active candidates in the placer's actual cost order.
 
         This is an observation-only counterpart to repeated
-        select_next_location calls over paid candidates. It deliberately
-        delegates every rank to the same _min_cost_location path used for
-        launches, preserving both machine-hour and logical per-GPU pricing.
+        select_next_location calls over paid candidates. A stable sort uses
+        the exact normalized-cost key used by launch selection, preserving
+        catalog insertion order for ties while avoiding repeated minimum
+        scans of a large catalog.
         """
-        remaining = [
+        active_locations = [
             location for location in self.active_locations()
             if allowed_locations is None or location in allowed_locations
         ]
-        ranked = []
-        while remaining:
-            selected = self._min_cost_location(remaining)
-            ranked.append(selected)
-            remaining.remove(selected)
-        return ranked
+        return sorted(active_locations, key=self._normalized_location_cost)
 
     def resolve_location(
             self,
@@ -1443,12 +1440,14 @@ class SpotPlacer:
         slots = sum((location.accelerators or {}).values())
         return float(slots) if slots > 0 else 1.0
 
+    def _normalized_location_cost(self, location: Location) -> float:
+        """Return the canonical placement-order key for one location."""
+        return self.placement_contract.normalize_hourly_cost(
+            self.location2cost.get(location, float('inf')),
+            self._accelerator_slots(location))
+
     def _min_cost_location(self, locations: list[Location]) -> Location:
-        return min(
-            locations,
-            key=lambda location: self.placement_contract.normalize_hourly_cost(
-                self.location2cost.get(location, float('inf')),
-                self._accelerator_slots(location)))
+        return min(locations, key=self._normalized_location_cost)
 
     def _effective_status(self, location: Location) -> LocationStatus:
         """Status with TTL decay: an expired PREEMPTED mark counts ACTIVE.
@@ -1576,8 +1575,18 @@ class SpotPlacer:
             self.location2retry_reserved_at.pop(resolved, None)
             self._retry_state_dirty = True
 
-    def active_locations(self) -> list[Location]:
-        return self._location_with_status(LocationStatus.ACTIVE)
+    def active_locations(
+        self,
+        known_location_costs: Mapping[Location, float] | None = None,
+    ) -> list[Location]:
+        """Return active locations under current or snapshotted eligibility."""
+        if known_location_costs is None:
+            return self._location_with_status(LocationStatus.ACTIVE)
+        return [
+            location for location in self.location2status
+            if location in known_location_costs and
+            self._effective_status(location) == LocationStatus.ACTIVE
+        ]
 
     def known_locations(self) -> list[Location]:
         """Return every configured location, regardless of retry status.
@@ -1593,16 +1602,39 @@ class SpotPlacer:
             if location in eligible_locations
         ]
 
+    def known_location_costs(self) -> Mapping[Location, float]:
+        """Return one immutable workspace-eligible catalog cost snapshot.
+
+        Ordering a large catalog location-by-location through cost_per_hour()
+        would re-evaluate the O(N) workspace policy for every entry. This bulk
+        view evaluates that mutable policy exactly once, then snapshots the
+        centralized catalog costs without provider calls. Callers acquire a
+        new view for each placement decision tick so later policy changes
+        still take effect.
+        """
+        eligible_locations = self._workspace_eligible_locations()
+        costs = {
+            location: self.location2cost.get(location, float('inf'))
+            for location in self.location2status
+            if location in eligible_locations
+        }
+        return types.MappingProxyType(costs)
+
     def placement_snapshot(
         self,
-        limit: int = _PLACEMENT_SNAPSHOT_MAX_LOCATIONS,
+        limit: int = constants.PLACEMENT_STATE_DEFAULT_PAGE_SIZE,
+        offset: int = 0,
         paid_admission_by_location: dict[Location, dict[str, Any]] | None = None
     ) -> dict[str, Any]:
-        """Serialize already-resident retry state without provider calls."""
+        """Serialize one page of resident retry state without provider calls."""
         if (not isinstance(limit, int) or isinstance(limit, bool) or
-                limit < 1 or limit > _PLACEMENT_SNAPSHOT_MAX_LOCATIONS):
+                limit < 1 or limit > constants.PLACEMENT_STATE_MAX_PAGE_SIZE):
             raise ValueError(f'limit must be an integer from 1 to '
-                             f'{_PLACEMENT_SNAPSHOT_MAX_LOCATIONS}.')
+                             f'{constants.PLACEMENT_STATE_MAX_PAGE_SIZE}.')
+        if (not isinstance(offset, int) or isinstance(offset, bool) or
+                offset < 0 or offset > constants.PLACEMENT_STATE_MAX_OFFSET):
+            raise ValueError(f'offset must be an integer from 0 to '
+                             f'{constants.PLACEMENT_STATE_MAX_OFFSET}.')
         now = time.time()
         retry_seconds = _preemption_retry_seconds()
         eligible_locations = self._workspace_eligible_locations()
@@ -1610,7 +1642,8 @@ class SpotPlacer:
                             if location in eligible_locations),
                            key=lambda location: location.sort_key())
         entries = []
-        for location in locations[:limit]:
+        page_end = min(len(locations), offset + limit)
+        for location in locations[offset:page_end]:
             stored_status = self.location2status[location]
             benched_at = self.location2preempted_at.get(location)
             retry_reserved_at = self.location2retry_reserved_at.get(location)
@@ -1626,7 +1659,7 @@ class SpotPlacer:
             cached_cost = self.location2cost.get(location)
             if cached_cost is not None and not math.isfinite(cached_cost):
                 cached_cost = None
-            entries.append({
+            entry = {
                 'cloud': str(location.cloud),
                 'region': location.region,
                 'zone': location.zone,
@@ -1642,20 +1675,26 @@ class SpotPlacer:
                 'retry_reserved_at': retry_reserved_at,
                 'next_probe_at': next_probe_at,
                 'cached_hourly_cost': cached_cost,
-                'paid_admission':
-                    (None if paid_admission_by_location is None else
-                     paid_admission_by_location.get(location)),
-            })
+            }
+            if paid_admission_by_location is not None:
+                admission = paid_admission_by_location.get(location)
+                if admission is not None:
+                    entry['paid_admission'] = admission
+            entries.append(entry)
         return {
             'available': True,
             'enabled': True,
+            'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+            'page_offset': offset,
+            'next_offset': page_end if page_end < len(locations) else None,
+            'total_locations': len(locations),
             'retry_seconds': retry_seconds,
             'observed_at': now,
             'status_semantics':
                 ('Controller eligibility only; ACTIVE does not guarantee live '
                  'provider capacity.'),
             'locations': entries,
-            'truncated': len(locations) > limit,
+            'truncated': page_end < len(locations),
         }
 
     def is_active_location(self, location: Location) -> bool:

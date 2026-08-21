@@ -4,6 +4,8 @@
 # Fixture imports are referenced indirectly by pytest, and the fixture names
 # intentionally mirror the shared helpers they exercise.
 
+from unittest import mock
+
 from sqlalchemy import event
 from test_jobs_state import _mock_managed_jobs_db_conn
 from test_jobs_state import _seed_multi_task_job
@@ -170,6 +172,70 @@ class TestGetJobsToCheckStatusInfo:
 
         assert info
         assert select_count == 1
+
+    def test_cancellation_snapshot_matches_direct_lookup_for_duplicate_rows(
+            self, _mock_managed_jobs_db_conn):
+        job_id = state.set_job_info_without_job_id(name='duplicate-terminal',
+                                                   workspace='default',
+                                                   entrypoint='ep',
+                                                   pool=None,
+                                                   pool_hash=None,
+                                                   user_hash='user')
+        with _mock_managed_jobs_db_conn.begin() as connection:
+            connection.execute(state.spot_table.insert(), [{
+                'spot_job_id': job_id,
+                'task_id': 0,
+                'task_name': 'task-0',
+                'status': state.ManagedJobStatus.SUCCEEDED.value,
+            }, {
+                'spot_job_id': job_id,
+                'task_id': 0,
+                'task_name': 'task-0',
+                'status': state.ManagedJobStatus.FAILED.value,
+            }])
+
+        info = state.get_jobs_status_check_info([job_id])
+
+        assert (state.get_job_cancellation_states_from_status_check_info(info)
+                == state.get_job_cancellation_states([job_id]))
+
+    def test_cancellation_snapshot_reuses_merged_latest_status(
+            self, _seed_test_jobs, monkeypatch):
+        info = state.get_jobs_status_check_info(list(_seed_test_jobs.values()))
+        monkeypatch.setattr(
+            state, 'get_latest_task_id_from_statuses',
+            mock.Mock(side_effect=AssertionError('rescanned task list')))
+
+        derived = state.get_job_cancellation_states_from_status_check_info(info)
+
+        assert derived == state.get_job_cancellation_states(
+            list(_seed_test_jobs.values()))
+
+    def test_cancellation_snapshot_falls_back_to_public_task_rows(self):
+        info = {
+            7: {
+                'workspace': 'default',
+                'schedule_state': state.ManagedJobScheduleState.ALIVE,
+                'tasks': [{
+                    'task_id': 0,
+                    'status': state.ManagedJobStatus.SUCCEEDED,
+                }, {
+                    'task_id': 0,
+                    'status': state.ManagedJobStatus.FAILED,
+                }, {
+                    'task_id': 1,
+                    'status': state.ManagedJobStatus.RUNNING,
+                }],
+            }
+        }
+
+        derived = state.get_job_cancellation_states_from_status_check_info(info)
+
+        assert derived == {
+            7: state.JobCancellationState(status=state.ManagedJobStatus.RUNNING,
+                                          workspace='default')
+        }
+        assert info[7]['_latest_task_status'] == state.ManagedJobStatus.RUNNING
 
     def test_get_num_tasks_uses_one_count_select(self,
                                                  _mock_managed_jobs_db_conn,

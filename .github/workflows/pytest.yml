@@ -48,6 +48,10 @@ jobs:
           - test-path: tests/test_ssh_proxy_lag.py
             test-name: "Event Loop Lag Tests"
             runner: namespace-profile-skypilot-ci-4x8
+          - test-path: tests/unit_tests/test_reserved_fill_reclaim_proofs.py
+            test-name: "Serve Reclaim Pressure"
+            python-version: "3.14"
+            runner: namespace-profile-skypilot-ci-4x16
           - python-version: "3.14"
             test-path: >-
               tests/unit_tests/test_asyncio_utils.py

@@ -38,6 +38,7 @@ from sky.serve import route_projection
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import serve_statuses
+from sky.utils import common_utils
 from sky.utils import locks
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
@@ -46,6 +47,8 @@ reserved_fill_planner = adaptors_common.LazyImport(
     'sky.serve.reserved_fill_planner')
 system_oom_recovery = adaptors_common.LazyImport(
     'sky.serve.system_oom_recovery')
+zero_cost_actuation = adaptors_common.LazyImport(
+    'sky.serve.zero_cost_actuation')
 
 SUBMISSION_ID_KEY = 'sky_serve_ordinary_launch_submission_id'
 ASSOCIATION_ID_KEY = 'sky_serve_ordinary_launch_association_id'
@@ -82,7 +85,8 @@ DIGEST_VERSION = 'serve-bound-launch.v1'
 NON_POOL_BINDING_PROTOCOL_VERSION = 2
 NON_POOL_PROFILE_VERSION = 1
 NON_POOL_RECEIPT_PROTOCOL_VERSION = 1
-NON_POOL_CAPABILITY_COHORT_EPOCH = 1
+NON_POOL_CAPABILITY_COHORT_EPOCH = (
+    serve_constants.NON_POOL_CAPABILITY_COHORT_EPOCH)
 TOMBSTONE_RETENTION_DAYS = 60
 MAX_GC_BATCH_SIZE = 500
 _SHA256_RE = re.compile(r'[0-9a-f]{64}')
@@ -1059,8 +1063,17 @@ class EffectAuthorization:
     context: BoundLaunchContext
     claim: ExecutionClaim
     owner_revision: int
+    durable_replica_info: Any
     guard: Any
     claim_validator: ClaimValidator
+
+
+@dataclasses.dataclass(frozen=True)
+class EffectAuthoritySnapshot:
+    """Exact association and replica state proven at an effect boundary."""
+
+    association: Mapping[str, Any]
+    durable_replica_info: Any
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1161,13 +1174,39 @@ class ControllerBindingAuthority:
     @property
     def generic_launches_required(self) -> bool:
         """Whether every non-pool launch must use protocol v2."""
-        return bool(self.non_pool_capable is True and
+        return bool(self.capable is True and
+                    self.binding_mode == BindingMode.BOUND and
+                    self.non_pool_capable is True and
                     self.non_pool_binding_protocol_version
                     == NON_POOL_BINDING_PROTOCOL_VERSION and
                     self.non_pool_profile_set_digest
                     == supported_non_pool_profile_set_digest() and
                     self.non_pool_capability_cohort_epoch
                     == NON_POOL_CAPABILITY_COHORT_EPOCH and
+                    self.non_pool_receipt_protocol_version
+                    == NON_POOL_RECEIPT_PROTOCOL_VERSION)
+
+    @property
+    def retained_non_pool_settlement_allowed(self) -> bool:
+        """Whether this owner may settle current/adjacent-cohort actions.
+
+        A provider-semantic cohort rotation closes new admission immediately
+        on the new binary, but the durable service tuple stays on the previous
+        cohort until its requests and replicas are drained.  Permit that one
+        adjacent cohort to adopt, reconcile, or retire existing actions.  This
+        property must never guard request admission or provider-effect start.
+        """
+        cohort = self.non_pool_capability_cohort_epoch
+        return bool(self.capable is True and
+                    self.binding_mode == BindingMode.BOUND and
+                    self.non_pool_capable is True and
+                    self.non_pool_binding_protocol_version
+                    == NON_POOL_BINDING_PROTOCOL_VERSION and
+                    self.non_pool_profile_set_digest
+                    == supported_non_pool_profile_set_digest() and
+                    type(cohort) is int and
+                    cohort in (NON_POOL_CAPABILITY_COHORT_EPOCH,
+                               NON_POOL_CAPABILITY_COHORT_EPOCH - 1) and
                     self.non_pool_receipt_protocol_version
                     == NON_POOL_RECEIPT_PROTOCOL_VERSION)
 
@@ -1866,9 +1905,12 @@ _RESERVED_FILL_PROFILE_FIELDS = (
 )
 
 
-def classify_non_pool_launch_profile(
-        info: Any) -> NonPoolLaunchProfileKind | None:
-    """Classify a retained replica without granting launch authority.
+def _classify_non_pool_launch_profile(
+    info: Any,
+    *,
+    allow_uncommitted_reserved_fill: bool,
+) -> NonPoolLaunchProfileKind | None:
+    """Classify a replica or one exact pre-admission reserved-fill draft.
 
     Classification is intentionally strict. Missing, partial, contradictory,
     or malformed state returns ``None`` and cannot enter the generic binding.
@@ -1926,10 +1968,15 @@ def classify_non_pool_launch_profile(
            for value in zero_cost_sequences) and not is_zero_cost:
         return None
     if reserved_fill:
+        committed_sequence = (type(info.zero_cost_admission_sequence) is int and
+                              info.zero_cost_admission_sequence >= 1)
+        uncommitted_sequence = bool(
+            allow_uncommitted_reserved_fill and
+            info.zero_cost_admission_sequence is None and
+            info.zero_cost_materialization_sequence is None)
         if (not is_zero_cost or
                 any(value is None for value in reserved_values) or
-                type(info.zero_cost_admission_sequence) is not int or
-                info.zero_cost_admission_sequence < 1):
+                not (committed_sequence or uncommitted_sequence)):
             return None
         return NonPoolLaunchProfileKind.RESERVED_FILL
     if unknown_replacement:
@@ -1947,6 +1994,35 @@ def classify_non_pool_launch_profile(
     if replica_has_narrow_ordinary_profile(info):
         return NonPoolLaunchProfileKind.ORDINARY_PAID
     return None
+
+
+def classify_non_pool_launch_profile(
+        info: Any) -> NonPoolLaunchProfileKind | None:
+    """Classify only a fully persisted non-pool replica profile."""
+    return _classify_non_pool_launch_profile(
+        info, allow_uncommitted_reserved_fill=False)
+
+
+def classify_uncommitted_protocol_v2_reserved_fill_profile(
+        info: Any, *, protocol_version: int) -> NonPoolLaunchProfileKind | None:
+    """Classify only a typed v2 fill before its admission transaction.
+
+    Protocol-v2 fill deliberately freezes its launch thread before atomically
+    persisting the replica.  The transaction is the sole owner of the first
+    zero-cost admission sequence, so that one field must still be null while
+    the thread is constructed.  This classifier accepts only that transient
+    v2 shape; every durable reader continues to use the strict classifier.
+    """
+    if type(protocol_version) is not int or protocol_version != 2:
+        return None
+    kind = _classify_non_pool_launch_profile(
+        info, allow_uncommitted_reserved_fill=True)
+    if kind is not NonPoolLaunchProfileKind.RESERVED_FILL:
+        return None
+    if (info.zero_cost_admission_sequence is not None or
+            info.zero_cost_materialization_sequence is not None):
+        return None
+    return kind
 
 
 def _locked_replica_info(replica: Mapping[str, Any]) -> Any:
@@ -2226,8 +2302,55 @@ def _reserved_fill_payload(
     connection: sqlalchemy.engine.Connection,
     service: Mapping[str, Any],
     info: Any,
+    *,
+    freeze_reconciliation_gate: bool = False,
 ) -> dict[str, Any]:
     """Resolve one fill intent against its allocation and observation rows."""
+    if (service.get('reserved_fill_actuation_mode') ==
+            zero_cost_actuation.ActuationMode.DURABLE_INTENT.value):
+        intent = zero_cost_actuation.committed_intent_for_replica_in_connection(
+            connection,
+            service_name=service['name'],
+            service_hash=service['hash'],
+            replica_info=info)
+        if intent is None:
+            raise OrdinaryLaunchBindingConflict(
+                'Durable reserved-fill profile lost its exact committed '
+                'intent handoff.')
+        observations = (pool_capacity_observation_schema.
+                        demand_capacity_observations_v2_table)
+        observation = connection.execute(
+            sqlalchemy.select(observations).where(
+                observations.c.pool_key == intent.pool_key,
+                observations.c.observation_generation ==
+                intent.observation_generation,
+                observations.c.observation_sequence ==
+                intent.observation_sequence, observations.c.observation_status
+                == pool_capacity_observation_schema.SUCCESS)).mappings(
+                ).one_or_none()
+        if observation is None:
+            raise OrdinaryLaunchBindingConflict(
+                'Durable reserved-fill profile lost its committed '
+                'observation evidence.')
+        sequence = _zero_cost_sequence_payload(connection, info)
+        if freeze_reconciliation_gate:
+            sequence = _freeze_reserved_fill_sequence_gate(
+                info, sequence, committed_intent=intent)
+        return {
+            'allocation_input_sha256': intent.allocation_input_sha256,
+            'claim_generation': intent.allocation_claim_generation,
+            'intent_idempotency_key': intent.idempotency_key,
+            'observation_payload_sha256': observation['payload_sha256'],
+            'physical_cluster_uid': intent.physical_cluster_uid,
+            'pool_key': intent.pool_key,
+            'reclaim_fleet_bundle_sha256': intent.reclaim_fleet_bundle_sha256,
+            'reclaim_policy_revision': intent.reclaim_policy_revision,
+            'reclaim_provider_inventory_sha256':
+                intent.reclaim_provider_inventory_sha256,
+            'sequence': sequence,
+            'worker_projection_sha256': intent.worker_projection_sha256,
+        }
+
     allocation_table = (
         pool_capacity_observation_schema.reserved_fill_service_allocation_table)
     allocation_row = connection.execute(
@@ -2346,6 +2469,8 @@ def _reserved_fill_payload(
         info,
         require_current_ordinary_high_water=(
             allocation.ordinary_zero_cost_admission_sequence_high_water))
+    if freeze_reconciliation_gate:
+        sequence = _freeze_reserved_fill_sequence_gate(info, sequence)
     return {
         'allocation_input_sha256': allocation.allocation_input_sha256,
         'claim_generation': allocation.allocation_claim_generation,
@@ -2359,6 +2484,96 @@ def _reserved_fill_payload(
             allocation.reclaim_provider_inventory_sha256,
         'sequence': sequence,
         'worker_projection_sha256': info.reserved_fill_worker_projection_sha256,
+    }
+
+
+def _reserved_fill_cleanup_payload(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    info: Any,
+) -> dict[str, Any]:
+    """Reconstruct immutable fill evidence for provider-present teardown.
+
+    This is the sole compatibility consumer for a retained Serve055 JSON-only
+    intent edge.  It cannot authorize launch, workspace access, materialization,
+    or a lease.  New scalar-linked rows take the canonical resolver.
+    """
+    intent = (zero_cost_actuation.
+              cleanup_only_committed_intent_for_replica_in_connection(
+                  connection,
+                  service_name=service['name'],
+                  service_hash=service['hash'],
+                  replica_info=info))
+    if intent is None:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup lost its exact committed intent '
+            'evidence.')
+    observations = (
+        pool_capacity_observation_schema.demand_capacity_observations_v2_table)
+    observation = connection.execute(
+        sqlalchemy.select(observations).where(
+            observations.c.pool_key == intent.pool_key,
+            observations.c.observation_generation ==
+            intent.observation_generation,
+            observations.c.observation_sequence == intent.observation_sequence,
+            observations.c.observation_status ==
+            pool_capacity_observation_schema.SUCCESS)).mappings().one_or_none()
+    if observation is None:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup lost its committed observation '
+            'evidence.')
+    sequence = _freeze_reserved_fill_sequence_gate(info,
+                                                   _zero_cost_sequence_payload(
+                                                       connection, info),
+                                                   committed_intent=intent)
+    return {
+        'allocation_input_sha256': intent.allocation_input_sha256,
+        'claim_generation': intent.allocation_claim_generation,
+        'intent_idempotency_key': intent.idempotency_key,
+        'observation_payload_sha256': observation['payload_sha256'],
+        'physical_cluster_uid': intent.physical_cluster_uid,
+        'pool_key': intent.pool_key,
+        'reclaim_fleet_bundle_sha256': intent.reclaim_fleet_bundle_sha256,
+        'reclaim_policy_revision': intent.reclaim_policy_revision,
+        'reclaim_provider_inventory_sha256':
+            intent.reclaim_provider_inventory_sha256,
+        'sequence': sequence,
+        'worker_projection_sha256': intent.worker_projection_sha256,
+    }
+
+
+def _freeze_reserved_fill_sequence_gate(
+    info: Any,
+    sequence: Mapping[str, Any],
+    *,
+    committed_intent: Any | None = None,
+) -> dict[str, Any]:
+    """Project the admission-time gate without weakening live sequencing."""
+    frozen_gate = info.reserved_fill_reconciliation_gate_generation
+    frozen_protocol = sequence.get('protocol_version')
+    if committed_intent is not None:
+        if (getattr(committed_intent, 'reconciliation_gate_generation',
+                    None) != frozen_gate or
+                getattr(committed_intent, 'idempotency_key',
+                        None) != info.reserved_fill_intent_idempotency_key):
+            raise OrdinaryLaunchBindingConflict(
+                'Reserved-fill cleanup intent lost its frozen gate identity.')
+        frozen_protocol = getattr(committed_intent, 'protocol_version', None)
+        frozen_gate = getattr(committed_intent,
+                              'reconciliation_gate_generation', None)
+    current_gate = sequence.get('reconciliation_gate_generation')
+    current_protocol = sequence.get('protocol_version')
+    if (type(frozen_gate) is not int or frozen_gate < 1 or
+            type(frozen_protocol) is not int or frozen_protocol < 1 or
+            type(current_gate) is not int or current_gate < frozen_gate or
+            type(current_protocol) is not int or
+            current_protocol < frozen_protocol):
+        raise OrdinaryLaunchBindingConflict(
+            'Reserved-fill cleanup lost its monotonic gate history.')
+    return {
+        **sequence,
+        'protocol_version': frozen_protocol,
+        'reconciliation_gate_generation': frozen_gate,
     }
 
 
@@ -2689,10 +2904,10 @@ def retire_pre_admission_non_pool_launch_intent(
         raise TypeError('authority must be ControllerBindingAuthority.')
     replica_id = _positive_int(replica_id, 'replica_id')
     record_id = _canonical_uuid(replica_record_id, 'replica_record_id')
-    if (authority.binding_mode != BindingMode.BOUND or
-            not authority.generic_launches_required):
+    if not authority.retained_non_pool_settlement_allowed:
         raise OrdinaryLaunchBindingConflict(
-            'Pre-admission retirement requires exact generic authority.')
+            'Pre-admission retirement requires exact retained generic '
+            'settlement authority.')
 
     engine = serve_state.get_database_engine()
     if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
@@ -2982,6 +3197,7 @@ def _validate_generic_capability(
                    capability_profile_set_digest, capability_cohort_epoch,
                    receipt_protocol_version) or capability_profile_set_digest
             != supported_non_pool_profile_set_digest() or
+            capability_cohort_epoch != NON_POOL_CAPABILITY_COHORT_EPOCH or
             receipt_protocol_version != NON_POOL_RECEIPT_PROTOCOL_VERSION):
         raise OrdinaryLaunchBindingConflict(
             'Service is not owned by the exact generic launch cohort.')
@@ -2999,6 +3215,72 @@ def _validate_profile_authority_in_connection(
     if actual != expected:
         raise OrdinaryLaunchBindingConflict(
             'Non-pool planner authorization changed before provider effect.')
+
+
+def _validate_committed_reserved_fill_profile_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    replica: Mapping[str, Any],
+    expected: NonPoolLaunchProfile,
+) -> None:
+    """Validate the frozen Serve056 handoff without mutable planner reads."""
+    if (expected.kind is not NonPoolLaunchProfileKind.RESERVED_FILL or
+            expected.authorization_kind
+            is not NonPoolLaunchAuthorizationKind.RESERVED_FILL_ALLOCATION or
+            service.get('reserved_fill_actuation_mode')
+            != zero_cost_actuation.ActuationMode.DURABLE_INTENT.value):
+        raise OrdinaryLaunchBindingConflict(
+            'Reserved-fill provider effect has no durable intent profile.')
+    info = _locked_replica_info(replica)
+    scalar_key = replica.get('reserved_fill_intent_idempotency_key')
+    if (not isinstance(scalar_key, str) or
+            expected.authorization_reference != f'reserved-fill:{scalar_key}' or
+            expected.authorization_generation
+            != info.reserved_fill_allocation_generation or
+            info.reserved_fill_intent_idempotency_key != scalar_key):
+        raise OrdinaryLaunchBindingConflict(
+            'Reserved-fill profile lost its normalized committed-intent '
+            'edge.')
+    intent = zero_cost_actuation.committed_intent_for_replica_in_connection(
+        connection,
+        service_name=str(service['name']),
+        service_hash=str(service['hash']),
+        replica_info=info)
+    if (intent is None or intent.idempotency_key != scalar_key or
+            expected.authorization_generation != intent.allocation_generation):
+        raise OrdinaryLaunchBindingConflict(
+            'Reserved-fill provider effect lost its immutable committed '
+            'handoff.')
+
+
+def _validate_reserved_fill_cleanup_profile_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    replica: Mapping[str, Any],
+    expected: NonPoolLaunchProfile,
+) -> None:
+    """Match cleanup to the immutable admission authority, not today's plan."""
+    info = _locked_replica_info(replica)
+    kind = classify_non_pool_launch_profile(info)
+    _, paid_claim = _paid_claim_payload(connection, service, replica, info)
+    if (service.get('reserved_fill_actuation_mode')
+            != zero_cost_actuation.ActuationMode.DURABLE_INTENT.value or
+            kind is not NonPoolLaunchProfileKind.RESERVED_FILL or
+            paid_claim is not None):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup lost its durable reserved zero-cost '
+            'profile.')
+    payload = _reserved_fill_cleanup_payload(connection, service, info)
+    actual = NonPoolLaunchProfile.create(
+        NonPoolLaunchProfileKind.RESERVED_FILL,
+        authorization_reference=(
+            f'reserved-fill:{info.reserved_fill_intent_idempotency_key}'),
+        authorization_generation=info.reserved_fill_allocation_generation,
+        authorization_payload=payload)
+    if actual != expected:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup no longer matches its frozen admission '
+            'authority.')
 
 
 def _validate_profile_execution_context(
@@ -3356,6 +3638,14 @@ def _serve042_supported(engine: sqlalchemy.engine.Engine) -> bool:
     return revision is not None and int(revision) >= 42
 
 
+def _serve055_supported(engine: sqlalchemy.engine.Engine) -> bool:
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return False
+    revision = migration_utils.get_current_alembic_revision(
+        engine, migration_utils.SERVE_DB_NAME)
+    return revision is not None and int(revision) >= 55
+
+
 def binding_mode(service_name: str) -> BindingMode | None:
     """Return the durable service cutover mode, or None before Serve042."""
     service_name = _nonempty(service_name, 'service_name')
@@ -3430,25 +3720,111 @@ def get_for_replica(service_name: str, replica_id: int,
     return None if row is None else dict(row)
 
 
-def binding_allows_request(association_id: str, request_id: str) -> bool:
+def list_provider_reconciliation_contexts(
+    authority: ControllerBindingAuthority,) -> list[BoundNonPoolLaunchContext]:
+    """List exact ambiguous non-pool actions still pinned to replicas.
+
+    Provider reconciliation normally starts when a local launch worker
+    finishes.  A controller can instead recover a replica after teardown has
+    already persisted ``INTERRUPTED``; that row has no launch worker, but its
+    exact ambiguous association still needs the same provider-evidence path.
+    This single indexed query finds both shapes without scanning every
+    replica or inferring authority from status.
+    """
+    if not isinstance(authority, ControllerBindingAuthority):
+        raise TypeError('authority must be a ControllerBindingAuthority.')
+    if not authority.retained_non_pool_settlement_allowed:
+        return []
+    engine = serve_state.get_database_engine()
+    if not _serve042_supported(engine):
+        return []
+    associations = ordinary_launch_associations_table
+    replicas = serve_state_schema.replicas_table
+    with engine.connect() as connection:
+        rows = connection.execute(
+            sqlalchemy.select(associations).join(
+                replicas,
+                sqlalchemy.and_(
+                    replicas.c.service_name == associations.c.service_name,
+                    replicas.c.replica_id == associations.c.replica_id,
+                    replicas.c.ordinary_launch_association_id ==
+                    associations.c.association_id)).
+            where(
+                associations.c.service_name == authority.service_name,
+                associations.c.service_hash == authority.service_hash,
+                associations.c.service_workspace == authority.service_workspace,
+                associations.c.service_lifecycle_epoch ==
+                authority.service_lifecycle_epoch,
+                associations.c.service_binding_epoch == authority.binding_epoch,
+                associations.c.owner_controller_incarnation ==
+                authority.controller_incarnation,
+                associations.c.owner_controller_epoch ==
+                authority.controller_owner_epoch,
+                associations.c.resolution == Resolution.AMBIGUOUS.value,
+                associations.c.reconciliation_outcome ==
+                ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value,
+                associations.c.binding_protocol_version ==
+                NON_POOL_BINDING_PROTOCOL_VERSION,
+                associations.c.capability_cohort_epoch ==
+                authority.non_pool_capability_cohort_epoch,
+                associations.c.capability_profile_set_digest ==
+                authority.non_pool_profile_set_digest,
+                associations.c.receipt_protocol_version ==
+                authority.non_pool_receipt_protocol_version,
+                associations.c.profile_kind.is_not(None)).order_by(
+                    associations.c.replica_id)).mappings().all()
+    contexts = []
+    for row in rows:
+        context = bound_context_from_association(row)
+        if not isinstance(context, BoundNonPoolLaunchContext):
+            raise OrdinaryLaunchBindingConflict(
+                'Provider reconciliation selected a non-generic '
+                'association.')
+        contexts.append(context)
+    return contexts
+
+
+def _binding_allows_request(
+    association_id: str | None,
+    request_id: str,
+    *,
+    reserved_fill_workspace_authority: tuple[str, str] | None = None,
+) -> bool:
     """Conservative non-locking pre-claim qualification.
 
     This read can only reject queue work early.  It never grants provider
     authority; the later shared-guard transaction locks and revalidates the
     complete request/Serve tuple.
     """
+    tenant_scope: str | None = None
+    service_workspace: str | None = None
     try:
-        association_uuid = _canonical_uuid(association_id, 'association_id')
+        association_uuid = (None if association_id is None else _canonical_uuid(
+            association_id, 'association_id'))
         request_id = _nonempty(request_id, 'request_id')
+        if reserved_fill_workspace_authority is not None:
+            tenant_scope = _nonempty(reserved_fill_workspace_authority[0],
+                                     'tenant_scope')
+            service_workspace = _nonempty(reserved_fill_workspace_authority[1],
+                                          'service_workspace')
     except ValueError:
         return False
     engine = serve_state.get_database_engine()
-    if not _serve042_supported(engine):
+    if reserved_fill_workspace_authority is not None:
+        if not _serve055_supported(engine):
+            return False
+    elif not _serve042_supported(engine):
         return False
     association = ordinary_launch_associations_table
     service = serve_state_schema.services_table
     replica = serve_state_schema.replicas_table
     lifecycle = serve_state_schema.service_lifecycle_fences_table
+    association_predicates = ([
+        association.c.request_id == request_id
+    ] if association_uuid is None else [
+        association.c.association_id == association_uuid,
+        association.c.request_id == request_id,
+    ])
     statement = sqlalchemy.select(
         association,
         service.c.hash.label('_current_service_hash'),
@@ -3485,9 +3861,13 @@ def binding_allows_request(association_id: str, request_id: str) -> bool:
             sqlalchemy.and_(
                 replica.c.service_name == association.c.service_name,
                 replica.c.replica_id == association.c.replica_id)).where(
-                    association.c.association_id == association_uuid,
-                    association.c.request_id == request_id,
+                    *association_predicates,
                     association.c.resolution == Resolution.BOUND.value)
+    if reserved_fill_workspace_authority is not None:
+        statement = statement.add_columns(
+            service.c.owner_user_id.label('_current_owner_user_id'),
+            service.c.reserved_fill_actuation_mode.label(
+                '_current_reserved_fill_actuation_mode'))
     with engine.connect() as connection:
         row = connection.execute(statement).mappings().one_or_none()
         elected_version = (None if row is None else
@@ -3521,8 +3901,11 @@ def binding_allows_request(association_id: str, request_id: str) -> bool:
          row['_current_non_pool_cohort'] == row['capability_cohort_epoch'] and
          row['_current_non_pool_receipt'] == row['receipt_protocol_version'] ==
          NON_POOL_RECEIPT_PROTOCOL_VERSION))
-    return bool(
-        generic_matches and row['_replica_pointer'] == association_uuid and
+    expected_association_id = (row['association_id'] if association_uuid is None
+                               else association_uuid)
+    authorized = bool(
+        generic_matches and
+        row['_replica_pointer'] == expected_association_id and
         _replica_snapshot_matches_association(
             replica_snapshot, row, require_launch_authorized=True) and
         elected_version == row['service_version'] and
@@ -3536,6 +3919,41 @@ def binding_allows_request(association_id: str, request_id: str) -> bool:
         row['_current_incarnation'] == row['owner_controller_incarnation'] and
         row['_current_owner_epoch'] == row['owner_controller_epoch'] and status
         not in serve_statuses.ServiceStatus.replica_launch_blocking_statuses())
+    if not authorized or reserved_fill_workspace_authority is None:
+        return authorized
+    assert tenant_scope is not None
+    assert service_workspace is not None
+    try:
+        profile = _association_profile(row)
+    except OrdinaryLaunchBindingConflict:
+        return False
+    return bool(profile is not None and
+                profile.kind is NonPoolLaunchProfileKind.RESERVED_FILL and
+                profile.authorization_kind
+                is NonPoolLaunchAuthorizationKind.RESERVED_FILL_ALLOCATION and
+                row['tenant_scope'] == tenant_scope and
+                row['_current_owner_user_id'] == tenant_scope and
+                row['_current_reserved_fill_actuation_mode']
+                == zero_cost_actuation.ActuationMode.DURABLE_INTENT.value and
+                row['service_workspace'] == service_workspace and
+                row['_current_workspace'] == service_workspace)
+
+
+def binding_allows_request(association_id: str, request_id: str) -> bool:
+    """Conservative non-locking pre-claim qualification."""
+    return _binding_allows_request(association_id, request_id)
+
+
+def reserved_fill_binding_authorizes_workspace(
+    request_id: str,
+    tenant_scope: str,
+    service_workspace: str,
+) -> bool:
+    """Authorize one internal fill against its current durable owner tuple."""
+    return _binding_allows_request(
+        None,
+        request_id,
+        reserved_fill_workspace_authority=(tenant_scope, service_workspace))
 
 
 def _lock_effect_rows(
@@ -3725,7 +4143,7 @@ def validate_effect_authority_in_connection(
     claim_validator: ClaimValidator,
     *,
     launch_context: Mapping[str, Any] | None = None,
-) -> Mapping[str, Any]:
+) -> EffectAuthoritySnapshot:
     _require_postgres(connection)
     if (getattr(claim, 'request_id', None) != context.request_id or
             getattr(claim, 'execution_generation', 0) < 1 or
@@ -3742,8 +4160,12 @@ def validate_effect_authority_in_connection(
                           context,
                           require_launch_authorized=True)
     if isinstance(context, BoundNonPoolLaunchContext):
-        _validate_profile_authority_in_connection(connection, service, replica,
-                                                  context.profile)
+        if context.profile.kind is NonPoolLaunchProfileKind.RESERVED_FILL:
+            _validate_committed_reserved_fill_profile_in_connection(
+                connection, service, replica, context.profile)
+        else:
+            _validate_profile_authority_in_connection(connection, service,
+                                                      replica, context.profile)
         if launch_context is None:
             raise OrdinaryLaunchBindingConflict(
                 'Generic provider effect has no immutable launch context.')
@@ -3757,7 +4179,8 @@ def validate_effect_authority_in_connection(
     if not claim_validator(connection, context.association_id, claim):
         raise OrdinaryLaunchBindingConflict(
             'The exact API request execution claim is no longer active.')
-    return association
+    return EffectAuthoritySnapshot(dict(association),
+                                   _locked_replica_info(replica))
 
 
 def _advance_effect_phase(
@@ -3770,17 +4193,19 @@ def _advance_effect_phase(
     *,
     service_job_id: int | None = None,
     launch_context: Mapping[str, Any] | None = None,
-) -> int:
-    association = validate_effect_authority_in_connection(
+) -> tuple[int, Any]:
+    authority = validate_effect_authority_in_connection(
         connection,
         context,
         claim,
         claim_validator,
         launch_context=launch_context)
+    association = authority.association
     if association['effect_phase'] == target.value:
         if (target != EffectPhase.SERVICE_JOB_RECORDED or
                 association['service_job_id'] == service_job_id):
-            return int(association['owner_revision'])
+            return (int(association['owner_revision']),
+                    authority.durable_replica_info)
         raise OrdinaryLaunchBindingConflict(
             'Service-job replay used a different exact job ID.')
     if association['effect_phase'] != expected.value:
@@ -3810,7 +4235,7 @@ def _advance_effect_phase(
     if updated.rowcount != 1:
         raise OrdinaryLaunchBindingConflict(
             'Effect phase lost its exact compare-and-swap.')
-    return next_revision
+    return next_revision, authority.durable_replica_info
 
 
 _ACTIVE_EFFECT_AUTHORIZATION: contextvars.ContextVar[
@@ -3841,15 +4266,17 @@ def provider_effect_guard(
                 'Service launch authority guard lost its database session.')
         engine = serve_state.get_database_engine()
         with engine.begin() as connection:
-            next_revision = _advance_effect_phase(connection,
-                                                  context,
-                                                  claim,
-                                                  claim_validator,
-                                                  EffectPhase.NOT_STARTED,
-                                                  EffectPhase.PROVIDER_IO,
-                                                  launch_context=launch_context)
+            next_revision, durable_replica_info = _advance_effect_phase(
+                connection,
+                context,
+                claim,
+                claim_validator,
+                EffectPhase.NOT_STARTED,
+                EffectPhase.PROVIDER_IO,
+                launch_context=launch_context)
         authorization = EffectAuthorization(context, claim, next_revision,
-                                            guard, claim_validator)
+                                            durable_replica_info, guard,
+                                            claim_validator)
         token = _ACTIVE_EFFECT_AUTHORIZATION.set(authorization)
         try:
             yield authorization
@@ -3881,15 +4308,17 @@ def non_pool_provider_effect_guard(
                 'Service launch authority guard lost its database session.')
         engine = serve_state.get_database_engine()
         with engine.begin() as connection:
-            next_revision = _advance_effect_phase(connection,
-                                                  context,
-                                                  claim,
-                                                  claim_validator,
-                                                  EffectPhase.NOT_STARTED,
-                                                  EffectPhase.PROVIDER_IO,
-                                                  launch_context=launch_context)
+            next_revision, durable_replica_info = _advance_effect_phase(
+                connection,
+                context,
+                claim,
+                claim_validator,
+                EffectPhase.NOT_STARTED,
+                EffectPhase.PROVIDER_IO,
+                launch_context=launch_context)
         authorization = EffectAuthorization(context, claim, next_revision,
-                                            guard, claim_validator)
+                                            durable_replica_info, guard,
+                                            claim_validator)
         token = _ACTIVE_EFFECT_AUTHORIZATION.set(authorization)
         try:
             yield authorization
@@ -3919,7 +4348,7 @@ def _active_authorization(
 
 
 def require_active_provider_effect_authorization(
-        launch_context: Mapping[str, Any]) -> None:
+        launch_context: Mapping[str, Any]) -> EffectAuthorization:
     """Prove the exact bound request still owns its outer provider guard.
 
     Cloud backends retain a legacy per-provider guard for ordinary Serve
@@ -3927,9 +4356,11 @@ def require_active_provider_effect_authorization(
     takeover deliberately replaces those values with fail-closed sentinels,
     but only while this exact association is inside ``provider_effect_guard``.
     """
-    if _active_authorization(launch_context) is None:
+    authorization = _active_authorization(launch_context)
+    if authorization is None:
         raise OrdinaryLaunchBindingConflict(
             'Bound provider I/O has no active association authorization.')
+    return authorization
 
 
 def begin_service_job_io(launch_context: Mapping[str, Any]) -> int | None:
@@ -3938,15 +4369,18 @@ def begin_service_job_io(launch_context: Mapping[str, Any]) -> int | None:
         return None
     engine = serve_state.get_database_engine()
     with engine.begin() as connection:
-        next_revision = _advance_effect_phase(connection,
-                                              authorization.context,
-                                              authorization.claim,
-                                              authorization.claim_validator,
-                                              EffectPhase.PROVIDER_IO,
-                                              EffectPhase.SERVICE_JOB_IO,
-                                              launch_context=launch_context)
+        next_revision, durable_replica_info = _advance_effect_phase(
+            connection,
+            authorization.context,
+            authorization.claim,
+            authorization.claim_validator,
+            EffectPhase.PROVIDER_IO,
+            EffectPhase.SERVICE_JOB_IO,
+            launch_context=launch_context)
     _ACTIVE_EFFECT_AUTHORIZATION.set(
-        dataclasses.replace(authorization, owner_revision=next_revision))
+        dataclasses.replace(authorization,
+                            owner_revision=next_revision,
+                            durable_replica_info=durable_replica_info))
     return next_revision
 
 
@@ -3957,16 +4391,19 @@ def record_service_job(launch_context: Mapping[str, Any],
         return None
     engine = serve_state.get_database_engine()
     with engine.begin() as connection:
-        next_revision = _advance_effect_phase(connection,
-                                              authorization.context,
-                                              authorization.claim,
-                                              authorization.claim_validator,
-                                              EffectPhase.SERVICE_JOB_IO,
-                                              EffectPhase.SERVICE_JOB_RECORDED,
-                                              service_job_id=job_id,
-                                              launch_context=launch_context)
+        next_revision, durable_replica_info = _advance_effect_phase(
+            connection,
+            authorization.context,
+            authorization.claim,
+            authorization.claim_validator,
+            EffectPhase.SERVICE_JOB_IO,
+            EffectPhase.SERVICE_JOB_RECORDED,
+            service_job_id=job_id,
+            launch_context=launch_context)
     _ACTIVE_EFFECT_AUTHORIZATION.set(
-        dataclasses.replace(authorization, owner_revision=next_revision))
+        dataclasses.replace(authorization,
+                            owner_revision=next_revision,
+                            durable_replica_info=durable_replica_info))
     return next_revision
 
 
@@ -4720,18 +5157,83 @@ def promote_non_pool_launch_service_in_connection(
 
     if service['non_pool_launch_binding_capable'] is True:
         capability = _non_pool_capability_from_service(service)
-        if (service['controller_incarnation'] != controller_incarnation or
-                service['controller_owner_epoch'] != controller_owner_epoch or
-                service['ordinary_launch_binding_epoch']
-                != expected_binding_epoch + 1 or
-                capability != (True, NON_POOL_BINDING_PROTOCOL_VERSION,
+        expected_capability = (True, NON_POOL_BINDING_PROTOCOL_VERSION,
                                supported_non_pool_profile_set_digest(),
                                NON_POOL_CAPABILITY_COHORT_EPOCH,
-                               NON_POOL_RECEIPT_PROTOCOL_VERSION)):
+                               NON_POOL_RECEIPT_PROTOCOL_VERSION)
+        if (service['controller_incarnation'] != controller_incarnation or
+                service['controller_owner_epoch'] != controller_owner_epoch):
             raise OrdinaryLaunchBindingConflict(
-                'Already-generic service belongs to a different capability '
-                'cohort or binding epoch.')
-        return int(service['ordinary_launch_binding_epoch'])
+                'Already-generic service belongs to different controller '
+                'authority.')
+        if capability == expected_capability:
+            if (service['ordinary_launch_binding_epoch']
+                    != expected_binding_epoch + 1):
+                raise OrdinaryLaunchBindingConflict(
+                    'Already-generic service belongs to a different binding '
+                    'epoch.')
+            return int(service['ordinary_launch_binding_epoch'])
+
+        # A provider-effect semantic change rotates the complete advertised
+        # cohort.  Keep the old tuple durable until all new participants have
+        # survived the heartbeat/quiescence horizon and every old association
+        # has settled.  The adjacent binding-epoch CAS fences prepared old
+        # requests from the first new admission.
+        previous_capability = (True, NON_POOL_BINDING_PROTOCOL_VERSION,
+                               supported_non_pool_profile_set_digest(),
+                               NON_POOL_CAPABILITY_COHORT_EPOCH - 1,
+                               NON_POOL_RECEIPT_PROTOCOL_VERSION)
+        if (capability != previous_capability or
+                service['ordinary_launch_binding_mode']
+                != BindingMode.BOUND.value or
+                service['ordinary_launch_binding_epoch']
+                != expected_binding_epoch):
+            raise OrdinaryLaunchBindingConflict(
+                'Generic launch capability rotation is not exact and '
+                'adjacent.')
+        if (not _transition_barrier_passes(
+                connection, participant_barrier_passed,
+                'generic participant capability rotation barrier') or
+                not _transition_barrier_passes(
+                    connection, legacy_requests_drained,
+                    'prior-cohort request drain barrier')):
+            raise OrdinaryLaunchBindingUnavailable(
+                'Generic capability rotation requires the exact new fleet '
+                'cohort and complete prior-cohort drain.')
+        pending = [
+            int(replica['replica_id'])
+            for replica in replicas
+            if replica['status'] in ('PENDING', 'PROVISIONING')
+        ]
+        unsettled = [
+            str(association['association_id'])
+            for association in associations
+            if association['resolution'] in tuple(
+                value.value for value in UNSETTLED_RESOLUTIONS)
+        ]
+        if service['pool'] != 0 or pending or unsettled:
+            raise OrdinaryLaunchBindingConflict(
+                'Generic capability rotation requires no pending replicas or '
+                'unsettled prior-cohort associations.')
+        result = connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == service_name,
+                serve_state_schema.services_table.c.controller_incarnation ==
+                controller_incarnation,
+                serve_state_schema.services_table.c.controller_owner_epoch ==
+                controller_owner_epoch, serve_state_schema.services_table.c.
+                ordinary_launch_binding_epoch == expected_binding_epoch,
+                serve_state_schema.services_table.c.
+                non_pool_launch_binding_capable.is_(True), serve_state_schema.
+                services_table.c.non_pool_launch_capability_cohort_epoch ==
+                NON_POOL_CAPABILITY_COHORT_EPOCH - 1).values(
+                    ordinary_launch_binding_epoch=expected_binding_epoch + 1,
+                    non_pool_launch_capability_cohort_epoch=
+                    NON_POOL_CAPABILITY_COHORT_EPOCH))
+        if result.rowcount != 1:
+            raise OrdinaryLaunchBindingConflict(
+                'Generic capability rotation lost its exact service CAS.')
+        return expected_binding_epoch + 1
 
     _non_pool_capability_from_service(service)
     if (service['ordinary_launch_binding_mode'] != BindingMode.BOUND.value or
@@ -5192,7 +5694,15 @@ def record_non_pool_provider_evidence(
         == association['owner_controller_incarnation'] and
         authority.controller_owner_epoch
         == association['owner_controller_epoch'] and
-        authority.generic_launches_required)
+        authority.retained_non_pool_settlement_allowed and
+        association['binding_protocol_version']
+        == authority.non_pool_binding_protocol_version and
+        association['capability_cohort_epoch']
+        == authority.non_pool_capability_cohort_epoch and
+        association['capability_profile_set_digest']
+        == authority.non_pool_profile_set_digest and
+        association['receipt_protocol_version']
+        == authority.non_pool_receipt_protocol_version)
     if not expected_authority:
         raise OrdinaryLaunchBindingConflict(
             'Provider evidence writer no longer owns this association.')
@@ -5276,7 +5786,8 @@ def provider_absence_projection_authority_in_connection(
             != ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value or
             association['provider_evidence'] != ProviderEvidence.ABSENT.value or
             association['effect_phase']
-            not in (EffectPhase.PROVIDER_IO.value,
+            not in (EffectPhase.NOT_STARTED.value,
+                    EffectPhase.PROVIDER_IO.value,
                     EffectPhase.SERVICE_JOB_IO.value) or
             association['paid_capacity_pool_key'] is not None):
         raise OrdinaryLaunchBindingConflict(
@@ -5292,30 +5803,256 @@ def provider_absence_projection_authority_in_connection(
             observed_at < terminal_evidence.quiesced_at):
         raise OrdinaryLaunchBindingConflict(
             'Provider absence predates exact executor quiescence.')
-    payload = association['provider_evidence_payload']
     info = _locked_replica_info(replica)
-    expected_payload = {
-        'association_id': str(context.association_id),
+    expected_payload, expected_digest = _reserved_fill_provider_evidence(
+        association, info, ProviderEvidence.ABSENT)
+    if association['provider_evidence_payload'] != expected_payload:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider absence does not name the exact physical replica.')
+    if association['provider_evidence_digest'] != expected_digest:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider absence evidence digest is not canonical.')
+    return dict(association), info
+
+
+def _reserved_fill_provider_evidence(
+    association: Mapping[str, Any],
+    info: Any,
+    evidence: ProviderEvidence,
+) -> tuple[dict[str, Any], str]:
+    """Build the single canonical physical-replica observation envelope."""
+    payload = {
+        'association_id': str(association['association_id']),
         'cluster_name': info.cluster_name,
         'kubernetes_context': info.reserved_fill_kubernetes_context,
         'physical_cluster_uid': info.reserved_fill_physical_cluster_uid,
         'probe_contract': 'kubernetes-physical-replica-presence-v1',
         'profile_kind': NonPoolLaunchProfileKind.RESERVED_FILL.value,
-        'replica_record_id': str(context.replica_record_id),
-        'result': 'ABSENT',
+        'replica_record_id': str(association['replica_record_id']),
+        'result': evidence.value,
     }
-    if payload != expected_payload:
-        raise OrdinaryLaunchBindingConflict(
-            'Provider absence does not name the exact physical replica.')
-    expected_digest = _canonical_sha256({
-        'association_id': str(context.association_id),
-        'evidence': ProviderEvidence.ABSENT.value,
-        'payload': expected_payload,
-        'profile_digest': context.profile.digest,
+    digest = _canonical_sha256({
+        'association_id': str(association['association_id']),
+        'evidence': evidence.value,
+        'payload': payload,
+        'profile_digest': association['profile_digest'],
     })
+    return payload, digest
+
+
+def replica_has_provider_present_cleanup_marker(
+    replica_info: Any,
+    *,
+    require_scheduled: bool = False,
+) -> bool:
+    """Whether one ReplicaInfo is the closed immediate-cleanup marker."""
+    status = getattr(replica_info, 'status_property', None)
+    if status is None:
+        return False
+    allowed_down_statuses = ({common_utils.ProcessStatus.SCHEDULED}
+                             if require_scheduled else {
+                                 common_utils.ProcessStatus.SCHEDULED,
+                                 common_utils.ProcessStatus.RUNNING,
+                                 common_utils.ProcessStatus.FAILED,
+                             })
+    return bool(
+        getattr(replica_info, 'reserved_fill', None) is True and
+        getattr(replica_info, 'is_zero_cost', None) is True and
+        getattr(replica_info, 'service_job_id', None) is None and
+        getattr(replica_info, 'paid_capacity_pool_key', None) is None and
+        getattr(replica_info, 'zero_cost_materialization_sequence',
+                None) is None and
+        status.sky_launch_status == common_utils.ProcessStatus.INTERRUPTED and
+        status.sky_down_status in allowed_down_statuses and
+        status.service_ready_now is False and status.is_scale_down is True and
+        status.preempted is False and status.purged is False and
+        status.failed_spot_availability is False and
+        status.wait_for_idle_before_termination is False and
+        status.drain_cap_seconds == 0 and status.drain_started_at is None and
+        status.logical_retirement_version is None and
+        status.logical_retirement_controller_epoch is None and
+        status.logical_retirement_generation is None and
+        status.logical_retirement_target_capacity is None and
+        status.logical_retirement_confirmed_generation is None and
+        status.logical_retirement_bounded_deadline is False and
+        status.logical_retirement_committed is False)
+
+
+def provider_presence_cleanup_authority_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    context: BoundNonPoolLaunchContext,
+    terminal_evidence: TerminalEvidence,
+) -> tuple[dict[str, Any], Any]:
+    """Validate exact PRESENT evidence before reserved-fill teardown.
+
+    PRESENT is not settlement evidence: the association, retention pin, and
+    replica pointer remain intact while the existing fenced down worker owns
+    cleanup.  This validator therefore grants only the request layer's atomic
+    transition into that durable cleanup shape.
+    """
+    if not isinstance(context, BoundNonPoolLaunchContext):
+        raise TypeError('context must be a BoundNonPoolLaunchContext.')
+    values = _terminal_values(terminal_evidence)
+    lifecycle, service, replica, association = _lock_effect_rows(
+        connection, context, require_paid_claim=False)
+    _validate_effect_rows(lifecycle,
+                          service,
+                          replica,
+                          association,
+                          context,
+                          allowed_resolutions=frozenset({Resolution.AMBIGUOUS}))
+    if (context.profile.kind != NonPoolLaunchProfileKind.RESERVED_FILL or
+            association['reconciliation_outcome']
+            != ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value or
+            association['provider_evidence'] != ProviderEvidence.PRESENT.value
+            or association['effect_phase']
+            not in (EffectPhase.PROVIDER_IO.value,
+                    EffectPhase.SERVICE_JOB_IO.value) or
+            association['service_job_id'] is not None or
+            association['paid_capacity_pool_key'] is not None):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider presence cannot authorize cleanup for this launch '
+            'profile or phase.')
+    existing_terminal = association['terminal_status']
+    if existing_terminal is None or any(
+            association[key] != value for key, value in values.items()):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider presence lacks the exact copied terminal evidence.')
+
+    observed_at = association['provider_evidence_observed_at']
+    if (observed_at is None or terminal_evidence.quiesced_at is None or
+            observed_at < terminal_evidence.quiesced_at):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider presence predates exact executor quiescence.')
+    info = _locked_replica_info(replica)
+    if (info.service_job_id is not None or
+            info.paid_capacity_pool_key is not None or
+            info.is_zero_cost is not True or
+            info.zero_cost_materialization_sequence is not None):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup requires an unmaterialized zero-cost '
+            'replica with no service job or paid-capacity identity.')
+    # The provider effect has already happened.  Current allocation and gate
+    # generations may advance while its exact physical object is being
+    # reconciled, so cleanup must revalidate the immutable committed intent
+    # and admission-time profile instead of asking today's planner to
+    # re-authorize yesterday's launch.
+    _validate_reserved_fill_cleanup_profile_in_connection(
+        connection, service, replica, context.profile)
+    expected_payload, expected_digest = _reserved_fill_provider_evidence(
+        association, info, ProviderEvidence.PRESENT)
+    if association['provider_evidence_payload'] != expected_payload:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider presence does not name the exact physical replica.')
     if association['provider_evidence_digest'] != expected_digest:
         raise OrdinaryLaunchBindingConflict(
-            'Provider absence evidence digest is not canonical.')
+            'Provider presence evidence digest is not canonical.')
+    return dict(association), info
+
+
+def projected_provider_absence_cleanup_authority_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+) -> tuple[dict[str, Any], Any]:
+    """Validate restart-safe removal after exact ABSENT already committed.
+
+    The association is settled and its replica pointer is deliberately gone,
+    so the live reduction validator cannot address it.  This history readback
+    accepts only the one protocol-v2 reserved-fill tombstone whose canonical
+    provider ABSENT proof postdates executor quiescence.  It grants replica-row
+    removal only; no provider operation can be authorized from this state.
+    """
+    _require_postgres(connection)
+    service_name = _nonempty(service_name, 'service_name')
+    replica_id = _positive_int(replica_id, 'replica_id')
+    record_uuid = _canonical_uuid(replica_record_id, 'replica_record_id')
+    lifecycle = connection.execute(
+        sqlalchemy.select(
+            serve_state_schema.service_lifecycle_fences_table).where(
+                serve_state_schema.service_lifecycle_fences_table.c.name ==
+                service_name).with_for_update()).mappings().one_or_none()
+    service = connection.execute(
+        sqlalchemy.select(serve_state_schema.services_table).where(
+            serve_state_schema.services_table.c.name ==
+            service_name).with_for_update()).mappings().one_or_none()
+    replica = connection.execute(
+        sqlalchemy.select(serve_state_schema.replicas_table).where(
+            serve_state_schema.replicas_table.c.service_name == service_name,
+            serve_state_schema.replicas_table.c.replica_id ==
+            replica_id).with_for_update()).mappings().one_or_none()
+    claim_rows = connection.execute(
+        sqlalchemy.select(
+            serve_state_schema.paid_capacity_claims_table.c.pool_key).where(
+                serve_state_schema.paid_capacity_claims_table.c.service_name ==
+                service_name,
+                serve_state_schema.paid_capacity_claims_table.c.replica_id ==
+                replica_id).with_for_update()).all()
+    associations = list(
+        connection.execute(
+            sqlalchemy.select(ordinary_launch_associations_table).where(
+                ordinary_launch_associations_table.c.service_name ==
+                service_name,
+                ordinary_launch_associations_table.c.replica_id == replica_id,
+                ordinary_launch_associations_table.c.replica_record_id ==
+                record_uuid,
+                ordinary_launch_associations_table.c.binding_protocol_version ==
+                NON_POOL_BINDING_PROTOCOL_VERSION).order_by(
+                    ordinary_launch_associations_table.c.launch_generation).
+            with_for_update()).mappings())
+    if (lifecycle is None or service is None or replica is None or
+            len(associations) != 1 or claim_rows):
+        raise OrdinaryLaunchBindingConflict(
+            'Projected provider absence lost its exact service, replica, '
+            'association, or zero-paid shape.')
+    association = associations[0]
+    profile = _association_profile(association)
+    current_epoch = service['lifecycle_epoch']
+    origin_epoch = association['service_lifecycle_epoch']
+    if (type(current_epoch) is not int or type(origin_epoch) is not int or
+            lifecycle['epoch'] != current_epoch or
+            origin_epoch != current_epoch or
+            service['hash'] != association['service_hash'] or
+            service['workspace'] != association['service_workspace'] or
+            replica['ordinary_launch_association_id'] is not None or
+            association['resolution'] != Resolution.PROJECTED.value or
+            association['reconciliation_outcome']
+            != ReconciliationOutcome.PROJECTED.value or
+            association['provider_evidence'] != ProviderEvidence.ABSENT.value or
+            association['effect_phase'] not in (
+                EffectPhase.NOT_STARTED.value, EffectPhase.PROVIDER_IO.value,
+                EffectPhase.SERVICE_JOB_IO.value) or
+            association['service_job_id'] is not None or
+            association['paid_capacity_pool_key'] is not None or
+            association['terminal_status'] is None or
+            type(association['terminal_execution_generation']) is not int or
+            association['terminal_execution_generation'] < 1 or
+            association['execution_quiescence_required'] is not True or
+            association['execution_quiesced_generation']
+            != association['terminal_execution_generation'] or
+            association['execution_quiesced_at'] is None or
+            association['provider_evidence_observed_at'] is None or
+            association['provider_evidence_observed_at']
+            < association['execution_quiesced_at'] or
+            association['projected_at'] is None or
+            association['pin_released_at'] is None or
+            association['tombstone_not_before'] is None or profile is None or
+            profile.kind != NonPoolLaunchProfileKind.RESERVED_FILL or
+            not _replica_snapshot_matches_association(
+                replica, association, require_launch_authorized=False)):
+        raise OrdinaryLaunchBindingConflict(
+            'Projected provider absence history is not exact and complete.')
+    info = _locked_replica_info(replica)
+    if not replica_has_provider_present_cleanup_marker(info):
+        raise OrdinaryLaunchBindingConflict(
+            'Projected provider absence lost its durable cleanup marker.')
+    expected_payload, expected_digest = _reserved_fill_provider_evidence(
+        association, info, ProviderEvidence.ABSENT)
+    if (association['provider_evidence_payload'] != expected_payload or
+            association['provider_evidence_digest'] != expected_digest):
+        raise OrdinaryLaunchBindingConflict(
+            'Projected provider absence evidence is not canonical.')
     return dict(association), info
 
 

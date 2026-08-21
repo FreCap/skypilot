@@ -330,6 +330,90 @@ def test_backend_bound_provider_guard_requires_active_association():
     legacy_guard.assert_not_called()
 
 
+def test_backend_v2_provider_guard_owns_one_complete_short_epoch():
+    context = _bound_context()
+    provisioner = _retrying_provisioner(context)
+    events = []
+
+    @contextlib.contextmanager
+    def effect_guard(actual_context):
+        assert actual_context is context
+        events.append('association-enter')
+        try:
+            yield
+        finally:
+            events.append('association-exit')
+
+    @contextlib.contextmanager
+    def phase(mode):
+        assert mode is (
+            cloud_vm_ray_backend.provider_phase.ProviderPhaseMode.V2_FENCED)
+        events.append('phase-enter')
+        try:
+            yield
+        finally:
+            events.append('phase-exit')
+
+    @contextlib.contextmanager
+    def owner_guard():
+        events.append('owner-enter')
+        try:
+            yield mock.sentinel.snapshot
+        finally:
+            events.append('owner-exit')
+
+    @contextlib.contextmanager
+    def committed_guard(snapshot):
+        assert snapshot is mock.sentinel.snapshot
+        events.append('committed-enter')
+        try:
+            yield
+        finally:
+            events.append('committed-exit')
+
+    with mock.patch.object(
+            cloud_vm_ray_backend.reserved_capacity,
+            'parse_protocol_v2_launch_fence',
+            return_value=mock.sentinel.fence), \
+         mock.patch.object(cloud_vm_ray_backend.ordinary_launch_request,
+                           '_provider_effect_guard',
+                           side_effect=effect_guard), \
+         mock.patch.object(cloud_vm_ray_backend.provider_phase,
+                           'provider_phase',
+                           side_effect=phase), \
+         mock.patch.object(provisioner,
+                           '_service_replica_launch_provider_owner_guard',
+                           side_effect=owner_guard), \
+         mock.patch.object(provisioner,
+                           '_reserved_fill_committed_provider_guard',
+                           side_effect=committed_guard):
+        with provisioner._service_replica_launch_provider_guard():
+            events.append('provider-effect')
+
+    assert events == [
+        'association-enter', 'phase-enter', 'owner-enter', 'committed-enter',
+        'provider-effect', 'committed-exit', 'owner-exit', 'phase-exit',
+        'association-exit'
+    ]
+
+
+def test_backend_bound_provider_guard_carries_exact_replica_snapshot():
+    context = _bound_context()
+    provisioner = _retrying_provisioner(context)
+    durable_replica = mock.sentinel.durable_replica
+    authorization = types.SimpleNamespace(durable_replica_info=durable_replica)
+
+    with mock.patch.object(cloud_vm_ray_backend.ordinary_launch_binding,
+                           'require_active_provider_effect_authorization',
+                           return_value=authorization) as active:
+        with provisioner._service_replica_launch_provider_owner_guard(
+        ) as snapshot:
+            assert snapshot is not None
+            assert snapshot.durable_replica_info is durable_replica
+
+    assert active.call_args_list == [mock.call(context), mock.call(context)]
+
+
 def test_backend_bound_standalone_validation_uses_active_association():
     context = _bound_context()
     provisioner = _retrying_provisioner(context)

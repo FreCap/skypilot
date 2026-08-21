@@ -552,6 +552,14 @@ LB_CONTROLLER_PROXY_TIMEOUT_SECONDS = 55
 # and can exceed the parent's tight health-check timeout during launch storms.
 CONTROLLER_HEALTH_ENDPOINT_PATH = '/controller/health'
 CONTROLLER_PLACEMENT_ENDPOINT_PATH = '/controller/placement'
+# Placement state is resident controller observability, not provider
+# inventory.  Page it independently from the PostgreSQL placement-history
+# page so a large fallback catalog cannot monopolize the API worker or cross
+# the controller transport deadline.
+PLACEMENT_STATE_PAGINATION_VERSION = 1
+PLACEMENT_STATE_DEFAULT_PAGE_SIZE = 100
+PLACEMENT_STATE_MAX_PAGE_SIZE = 100
+PLACEMENT_STATE_MAX_OFFSET = 100_000
 CONTROLLER_UPDATE_CAPABILITIES_ENDPOINT_PATH = (
     '/controller/update_capabilities')
 CONTROLLER_CONFIG_UPDATE_ENDPOINT_PATH = (
@@ -1069,3 +1077,7 @@ POOL_DUMMY_RUN_COMMAND = 'echo "setup done"'
 # Error message prefix for max number of services reached.
 # This is used as a marker to detect the error in controller logs.
 MAX_NUMBER_OF_SERVICES_REACHED_ERROR = 'Max number of services reached'
+# Serve056 rotates the executor-side provider-effect semantics.  Every live
+# API/controller/executor participant and every service capability tuple must
+# agree on this value before a new protocol-v2 launch is admitted.
+NON_POOL_CAPABILITY_COHORT_EPOCH = 2

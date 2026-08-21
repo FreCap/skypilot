@@ -56,8 +56,13 @@ _POST_REVISION_001_COLUMNS = {
         'reserved_fill_actuation_capable',
         'reserved_fill_actuation_controller_incarnation',
         'reserved_fill_actuation_protocol_version',
+        'owner_user_id',
+        'owner_user_name',
     }),
-    'replicas': frozenset({'ordinary_launch_association_id'}),
+    'replicas': frozenset({
+        'ordinary_launch_association_id',
+        'reserved_fill_intent_idempotency_key',
+    }),
     'paid_capacity_claims': frozenset({
         'capacity_plan_generation',
         'capacity_plan_sha256',
@@ -81,6 +86,7 @@ _POST_REVISION_001_CONSTRAINTS = {
         'serve052_fill_actuation_epoch_ck',
         'serve052_fill_actuation_capability_shape_ck',
         'serve052_durable_fill_actuation_capability_ck',
+        'serve055_owner_user_id_nonempty',
     }),
     'paid_capacity_claims': frozenset({
         'serve050_paid_claim_plan_complete_ck',

@@ -3682,10 +3682,10 @@ class SkyServeController:
             paid_costs: dict[str, float] = {}
             unpriced_cards: set[str] = set()
             try:
-                known_locations = placer.known_locations()
+                known_location_costs = placer.known_location_costs()
             except Exception:  # pylint: disable=broad-except
-                known_locations = []
-            for location in known_locations:
+                known_location_costs = {}
+            for location, raw_cost in known_location_costs.items():
                 accelerators = location.accelerators or {}
                 if len(accelerators) != 1:
                     continue
@@ -3694,7 +3694,7 @@ class SkyServeController:
                 if card is None:
                     continue
                 try:
-                    hourly_cost = float(placer.cost_per_hour(location))
+                    hourly_cost = float(raw_cost)
                 except Exception:  # pylint: disable=broad-except
                     unpriced_cards.add(card)
                     continue
@@ -5659,8 +5659,10 @@ class SkyServeController:
         planning_state_fingerprint: str | None,
         *,
         sequenced_reserved_fill: bool,
+        sequenced_reserved_fill_allocation: (
+            reserved_fill_planner.AuthenticatedAllocationMap | None) = None,
     ) -> tuple[list[autoscalers.AutoscalerDecision], int | None,
-               autoscalers.UnrecoverableRolloutFailure | None, Any,
+               autoscalers.UnrecoverableRolloutFailure | None, Any, Any, Any,
                bool] | None:
         """Mutate one exact autoscaler while update/LB publication is fenced.
 
@@ -5705,6 +5707,53 @@ class SkyServeController:
                            autoscalers.ConcurrencyAutoscaler)):
                 decision_autoscaler.set_free_reserved_slots_by_accelerator(
                     self._get_free_reserved_slots_by_accelerator())
+            retirement_shelter = None
+            if sequenced_reserved_fill:
+                capacity_unit = (
+                    reserved_fill_planner.FillCapacityUnit.LOGICAL
+                    if decision_autoscaler.replica_unit == 'logical' else
+                    reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+                holdings: tuple[reserved_fill_planner.MaterializedFillHolding,
+                                ...] = ()
+                try:
+                    holdings = (decision_autoscaler.
+                                sequenced_reserved_fill_holdings(replica_infos))
+                    retirement_shelter = (
+                        reserved_fill_planner.
+                        derive_sequenced_retirement_shelter(
+                            allocation=sequenced_reserved_fill_allocation,
+                            holdings=holdings,
+                            service_version=decision_version,
+                            max_capacity=decision_autoscaler.max_replicas,
+                            capacity_unit=capacity_unit))
+                except (TypeError, ValueError) as error:
+                    logger.warning(
+                        'Reserved-fill allocation could not produce a '
+                        'retirement shelter; holding materialized fill and '
+                        'authorizing no launch: '
+                        f'{common_utils.format_exception(error)}')
+                    sequenced_reserved_fill_allocation = None
+                    try:
+                        retirement_shelter = (
+                            reserved_fill_planner.
+                            derive_sequenced_retirement_shelter(
+                                allocation=None,
+                                holdings=holdings,
+                                service_version=decision_version,
+                                max_capacity=decision_autoscaler.max_replicas,
+                                capacity_unit=capacity_unit))
+                    except (TypeError, ValueError):
+                        # A malformed holding must not crash reconciliation.
+                        # Unknown authority independently blocks every launch
+                        # and destructive action, so an empty exact projection
+                        # is the conservative terminal fallback.
+                        retirement_shelter = (
+                            reserved_fill_planner.SequencedRetirementShelter(
+                                service_version=decision_version,
+                                target_capacity=0,
+                                target_capacity_by_accelerator=(),
+                                accelerator_shapes=(),
+                                allocation_identity=None))
             planning_context = (
                 decision_autoscaler.sequenced_reserved_fill_planning()
                 if sequenced_reserved_fill else contextlib.nullcontext())
@@ -5717,24 +5766,67 @@ class SkyServeController:
             if decision_autoscaler.has_recomputed_with_fresh_data() is True:
                 demand_target = (
                     decision_autoscaler.get_final_target_num_replicas())
-                fill_target = 0
-                if decision_autoscaler.reserved_capacity_fill is True:
-                    fill_target = decision_autoscaler.fill_target
-                if (type(fill_target) is not int or  # pylint: disable=unidiomatic-typecheck
-                        fill_target < 0):
-                    fill_target = 0
-                target_num_replicas = max(demand_target, fill_target)
+                target_num_replicas = demand_target
             rollout_failure = decision_autoscaler.unrecoverable_rollout_failure
             logical_target = None
+            logical_retirement_floor = None
             invalidate_logical_target = False
             if (isinstance(decision_autoscaler,
                            autoscalers.ConcurrencyAutoscaler) and
                     decision_autoscaler.replica_unit == 'logical'):
                 logical_target = decision_autoscaler.logical_target_state
-                invalidate_logical_target = (logical_target is None and bool(
-                    decision_autoscaler.configured_accelerator_shapes))
+                if logical_target is not None:
+                    logical_retirement_floor = logical_target
+                    if retirement_shelter is not None:
+                        target_by_card = (() if len(logical_target) == 3 else
+                                          logical_target[3])
+                        shapes = (() if len(logical_target) == 3 else
+                                  logical_target[4])
+                        floor = (reserved_fill_planner.
+                                 compose_retirement_capacity_floor(
+                                     demand_capacity=logical_target[2],
+                                     demand_capacity_by_accelerator=(
+                                         target_by_card),
+                                     accelerator_shapes=shapes,
+                                     shelter=retirement_shelter,
+                                     max_capacity=(
+                                         decision_autoscaler.max_replicas)))
+                        if floor is None:
+                            logical_retirement_floor = None
+                        elif (floor.capacity_by_accelerator or
+                              floor.accelerator_shapes):
+                            logical_retirement_floor = (
+                                logical_target[0], logical_target[1],
+                                floor.capacity, floor.capacity_by_accelerator,
+                                floor.accelerator_shapes)
+                        else:
+                            logical_retirement_floor = (logical_target[0],
+                                                        logical_target[1],
+                                                        floor.capacity)
+                invalidate_logical_target = (
+                    (logical_target is None or logical_retirement_floor is None)
+                    and bool(decision_autoscaler.configured_accelerator_shapes))
+            if (sequenced_reserved_fill and
+                    sequenced_reserved_fill_allocation is None):
+                # Unavailable is distinct from a current grant of zero.  It
+                # authorizes neither typed fill nor an ordinary/paid launch.
+                scaling_options = [
+                    option for option in scaling_options if option.operator !=
+                    autoscalers.AutoscalerDecisionOperator.SCALE_UP
+                ]
+            if (sequenced_reserved_fill and
+                    decision_autoscaler.replica_unit != 'logical'):
+                # Logical retirement has a PostgreSQL commit seam at which the
+                # frozen allocation identity is revalidated.  The physical
+                # manager has no equivalent seam yet, so sequenced physical
+                # teardown must fail closed instead of racing a successor map.
+                scaling_options = [
+                    option for option in scaling_options if option.operator !=
+                    autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
+                ]
             return (scaling_options, target_num_replicas, rollout_failure,
-                    logical_target, invalidate_logical_target)
+                    logical_target, logical_retirement_floor,
+                    retirement_shelter, invalidate_logical_target)
 
     @staticmethod
     def _committed_reserved_fill_debits(
@@ -5801,16 +5893,39 @@ class SkyServeController:
                 replica_slots=count)
             for (pool_key, accelerator), count in sorted(counts.items()))
 
+    @staticmethod
+    def _coalesce_committed_reserved_fill_debits(
+        *debit_groups: tuple[reserved_fill_planner.CommittedFillDebit, ...],
+    ) -> tuple[reserved_fill_planner.CommittedFillDebit, ...]:
+        """Combine independently durable debits for one exact pool/card."""
+        counts: dict[tuple[int, str, int, str, str], int] = {}
+        for debits in debit_groups:
+            for debit in debits:
+                key = (debit.allocation_generation,
+                       debit.allocation_input_sha256,
+                       debit.allocation_claim_generation, debit.pool_key,
+                       debit.accelerator)
+                counts[key] = counts.get(key, 0) + debit.replica_slots
+        return tuple(
+            reserved_fill_planner.CommittedFillDebit(
+                allocation_generation=allocation_generation,
+                allocation_input_sha256=allocation_input_sha256,
+                allocation_claim_generation=allocation_claim_generation,
+                pool_key=pool_key,
+                accelerator=accelerator,
+                replica_slots=count)
+            for (allocation_generation, allocation_input_sha256,
+                 allocation_claim_generation, pool_key,
+                 accelerator), count in sorted(counts.items()))
+
     def _accept_sequenced_reserved_fill(
         self,
         allocation: reserved_fill_planner.AuthenticatedAllocationMap | None,
         decision_autoscaler: autoscalers.Autoscaler,
         decision_version: int,
         reconcile_generation: int,
-        replica_infos: list[replica_managers.ReplicaInfo],
-        scaling_options: list[autoscalers.AutoscalerDecision],
     ) -> bool:
-        """Plan from durable authority and spend only the manager receipt."""
+        """Admit provider-free fill from PostgreSQL before demand planning."""
         if allocation is None or not allocation.pool_snapshots:
             return False
         service_hash = self._service_hash
@@ -5819,20 +5934,28 @@ class SkyServeController:
         capacity_unit = (reserved_fill_planner.FillCapacityUnit.LOGICAL
                          if decision_autoscaler.replica_unit == 'logical' else
                          reserved_fill_planner.FillCapacityUnit.PHYSICAL)
-        ordinary_debits = (
-            decision_autoscaler.reserved_fill_ordinary_demand_debits(
-                allocation, replica_infos, scaling_options))
-        committed_debits = self._committed_reserved_fill_debits(
-            allocation, replica_infos)
         try:
-            pending_debits = (
-                self._replica_manager.pending_reserved_fill_debits(allocation))
+            pending = self._replica_manager.pending_reserved_fill_snapshot(
+                allocation, capacity_unit)
+            # Pending -> COMMITTED plus replica insertion is one atomic,
+            # monotonic handoff. Reading pending first and a fresh replica
+            # ledger second can conservatively see both sides but can never
+            # miss both. Reversing this order can overspend a pool/card grant.
+            replica_infos = serve_state.get_replica_infos(self._service_name)
+            committed_debits = self._committed_reserved_fill_debits(
+                allocation, replica_infos)
+            all_committed_debits = (
+                self._coalesce_committed_reserved_fill_debits(
+                    committed_debits, pending.debits))
+            planned_capacity = (
+                decision_autoscaler.reserved_fill_materialized_capacity(
+                    replica_infos) + pending.capacity)
         except Exception as error:  # pylint: disable=broad-except
-            # Losing accepted grants from the planner debit would issue new
-            # intent keys and could reopen paid residual.  Wait for the next
-            # bounded reconciliation instead of guessing that none exist.
+            # Losing either side of the monotonic handoff could issue new
+            # intent keys. Wait for the next bounded reconciliation instead
+            # of guessing that no durable capacity exists.
             logger.warning(
-                'Reserved-fill pending-intent accounting failed closed: %s',
+                'Reserved-fill durable capacity accounting failed closed: %s',
                 common_utils.format_exception(error))
             return False
         plan = reserved_fill_planner.ReservedFillPlanner.plan(
@@ -5843,11 +5966,9 @@ class SkyServeController:
             service_version=decision_version,
             controller_owner=self._controller_owner_fingerprint,
             max_replicas=decision_autoscaler.max_replicas,
-            planned_replicas=(decision_autoscaler.
-                              reserved_fill_planned_capacity(replica_infos)),
+            planned_replicas=planned_capacity,
             capacity_unit=capacity_unit,
-            ordinary_demand_debits=ordinary_debits,
-            committed_fill_debits=(*committed_debits, *pending_debits),
+            committed_fill_debits=all_committed_debits,
             rotation_anchor=(
                 decision_autoscaler.reserved_fill_rotation_anchor()))
         if not plan.intents:
@@ -5995,6 +6116,45 @@ class SkyServeController:
                 durable_demand_promoted = (
                     demand_source is not None and demand_source[0]
                     is capacity_admission.DemandSourceMode.DURABLE_FEED)
+                logical_reconcile_invalidated = False
+                if (durable_demand_promoted and
+                        decision_autoscaler.reserved_capacity_fill):
+                    # Sequenced fill spends an independently authenticated
+                    # PostgreSQL allocation.  Admit that free capacity before
+                    # consulting LB demand: route/report convergence must not
+                    # starve a current reserved grant.  This phase publishes
+                    # durable intents only.  It supplies no ordinary-demand
+                    # debit and installs no target, paid authority, or
+                    # retirement decision.
+                    (sequenced_fill, pre_demand_allocation) = (
+                        self._read_sequenced_reserved_fill_allocation())
+                    if sequenced_fill and pre_demand_allocation is not None:
+                        if not self._scale_actuation_is_current(
+                                actuation_generation, decision_autoscaler,
+                                decision_version):
+                            return
+                        # A successful admission returns before demand is
+                        # read.  Revoke any prior logical retirement pair
+                        # first so unknown demand can never retain destructive
+                        # authority across that early return.
+                        self._durable_demand_snapshot = None
+                        self._replica_manager.invalidate_logical_reconcile_state(
+                        )
+                        logical_reconcile_invalidated = True
+                        reserved_fill_progress = (
+                            self._accept_sequenced_reserved_fill(
+                                pre_demand_allocation, decision_autoscaler,
+                                decision_version, reconcile_generation))
+                        if not self._scale_actuation_is_current(
+                                actuation_generation, decision_autoscaler,
+                                decision_version):
+                            return
+                        if reserved_fill_progress:
+                            # Replan from the accepted durable debits.  The
+                            # manager's PostgreSQL admission is idempotent, so
+                            # a lost wakeup or restart cannot duplicate them.
+                            self._notify_scale_reconcile()
+                            return
                 durable_snapshot = None
                 durable_logical_snapshot: (
                     replica_managers.LogicalReconcileSnapshot | None) = None
@@ -6009,16 +6169,18 @@ class SkyServeController:
                             'because its PostgreSQL snapshot is unavailable: '
                             f'{common_utils.format_exception(error)}')
                         self._durable_demand_snapshot = None
-                        self._replica_manager.invalidate_logical_reconcile_state(
-                        )
+                        if not logical_reconcile_invalidated:
+                            self._replica_manager.invalidate_logical_reconcile_state(
+                            )
                         return
                     if durable_snapshot is None:
                         # Stale or incomplete is unknown, never zero.  Do not
                         # reuse the last promoted snapshot for either free or
                         # paid capacity actuation.
                         self._durable_demand_snapshot = None
-                        self._replica_manager.invalidate_logical_reconcile_state(
-                        )
+                        if not logical_reconcile_invalidated:
+                            self._replica_manager.invalidate_logical_reconcile_state(
+                            )
                         return
                     request_information = dict(
                         durable_snapshot.request_information)
@@ -6185,17 +6347,34 @@ class SkyServeController:
                     replica_infos,
                     active_versions,
                     planning_state_fingerprint,
-                    sequenced_reserved_fill=(sequenced_reserved_fill))
+                    sequenced_reserved_fill=(sequenced_reserved_fill),
+                    sequenced_reserved_fill_allocation=allocation)
                 if plan is None:
                     return
                 (scaling_options, target_num_replicas, rollout_failure,
-                 logical_target, invalidate_logical_target) = plan
+                 logical_target, logical_retirement_floor, retirement_shelter,
+                 invalidate_logical_target) = plan
+                if (retirement_shelter is not None and
+                        not retirement_shelter.authority_current):
+                    allocation = None
                 if fresh_aggregate_zero:
                     target_num_replicas = 0
                     scaling_options = [
                         option for option in scaling_options if option.operator
                         != autoscalers.AutoscalerDecisionOperator.SCALE_UP
                     ]
+                if (sequenced_reserved_fill and
+                        retirement_shelter is not None and
+                        retirement_shelter.authority_current):
+                    (still_sequenced, current_allocation) = (
+                        self._read_sequenced_reserved_fill_allocation())
+                    if (not still_sequenced or
+                            current_allocation != allocation):
+                        logger.info(
+                            'Reserved-fill allocation advanced while '
+                            'planning; retrying before target publication.')
+                        self._notify_scale_reconcile()
+                        return
                 if not self._scale_actuation_is_current(actuation_generation,
                                                         decision_autoscaler,
                                                         decision_version):
@@ -6232,7 +6411,9 @@ class SkyServeController:
                 if logical_target is not None:
                     if durable_logical_snapshot is None:
                         self._replica_manager.publish_logical_target(
-                            *logical_target)
+                            *logical_target,
+                            retirement_floor=logical_retirement_floor,
+                            retirement_shelter=retirement_shelter)
                     else:
                         # Revalidate the exact demand/notification epoch under
                         # the ingestion lock, then install one target/snapshot
@@ -6251,7 +6432,9 @@ class SkyServeController:
                             if not (self._replica_manager.
                                     publish_logical_reconcile_state(
                                         logical_target,
-                                        durable_logical_snapshot)):
+                                        durable_logical_snapshot,
+                                        logical_retirement_floor,
+                                        retirement_shelter)):
                                 return
                 elif invalidate_logical_target:
                     # Exact-card retirement must fail closed while the LB
@@ -6259,24 +6442,6 @@ class SkyServeController:
                     # earlier generation as well as suppressing this tick's
                     # aggregate-only intent.
                     self._replica_manager.invalidate_logical_target()
-                if sequenced_reserved_fill:
-                    if not self._scale_actuation_is_current(
-                            actuation_generation, decision_autoscaler,
-                            decision_version):
-                        return
-                    reserved_fill_progress = self._accept_sequenced_reserved_fill(
-                        allocation, decision_autoscaler, decision_version,
-                        reconcile_generation, replica_infos, scaling_options)
-                    if not self._scale_actuation_is_current(
-                            actuation_generation, decision_autoscaler,
-                            decision_version):
-                        return
-                    if durable_demand_promoted and reserved_fill_progress:
-                        # The plan input was computed before these zero-cost
-                        # rows committed. Replan from their exact-card
-                        # attribution before publishing any paid residual.
-                        self._notify_scale_reconcile()
-                        return
                 if durable_demand_promoted:
                     ordinary_physical_overrides: list[dict[str, Any] | None] = [
                         option.target
@@ -6617,39 +6782,62 @@ class SkyServeController:
         @self._app.get(
             serve_constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
             dependencies=[admin_auth_dependency, controller_owner_dependency])
-        def get_placement_state() -> fastapi.Response:
+        def get_placement_state(
+            limit: int = fastapi.Query(
+                default=serve_constants.PLACEMENT_STATE_DEFAULT_PAGE_SIZE,
+                ge=1,
+                le=serve_constants.PLACEMENT_STATE_MAX_PAGE_SIZE),
+            offset: int = fastapi.Query(
+                default=0, ge=0, le=serve_constants.PLACEMENT_STATE_MAX_OFFSET),
+            include_paid_admission: bool = fastapi.Query(default=False),
+        ) -> fastapi.Response:
+            # Pre-pagination API processes call this route without query
+            # parameters and enforce a two-second read deadline. Keep that
+            # rolling-upgrade path resident-only; the current API explicitly
+            # opts into the advisory database snapshot with its ten-second
+            # transport budget.
             placer = self._replica_manager.spot_placer
+            content: dict[str, Any]
             if placer is None:
                 content = {
                     'available': True,
                     'enabled': False,
+                    'pagination_version':
+                        serve_constants.PLACEMENT_STATE_PAGINATION_VERSION,
+                    'page_offset': offset,
+                    'next_offset': None,
+                    'total_locations': 0,
                     'locations': [],
                     'truncated': False,
                 }
             else:
-                replica_infos = serve_state.get_replica_infos(
-                    self._service_name)
-                try:
-                    budget = paid_capacity.build_launch_budget(
-                        placer,
-                        workspace=self._replica_manager.workspace,
-                        existing_replica_infos=replica_infos,
-                        globally_managed=self._service_hash is not None,
-                        service_name=self._service_name,
-                        service_hash=self._service_hash)
-                    paid_admission = (
-                        paid_capacity.admission_snapshot_by_location(budget))
-                except Exception as e:  # pylint: disable=broad-except
-                    # Admission shown here is explicitly advisory. Keep exact
-                    # location and bench diagnostics available during a
-                    # database outage; the launch path still requires its
-                    # transactional claim and therefore remains fail closed.
-                    logger.warning(
-                        'Could not build advisory paid-capacity placement '
-                        'state: '
-                        f'{common_utils.format_exception(e)}')
-                    paid_admission = None
+                paid_admission = None
+                if include_paid_admission:
+                    try:
+                        replica_infos = serve_state.get_replica_infos(
+                            self._service_name)
+                        budget = paid_capacity.build_launch_budget(
+                            placer,
+                            workspace=self._replica_manager.workspace,
+                            existing_replica_infos=replica_infos,
+                            globally_managed=self._service_hash is not None,
+                            service_name=self._service_name,
+                            service_hash=self._service_hash)
+                        paid_admission = (
+                            paid_capacity.admission_snapshot_by_location(budget)
+                        )
+                    except Exception as e:  # pylint: disable=broad-except
+                        # Admission shown here is explicitly advisory. Keep
+                        # exact location and bench diagnostics available during
+                        # a database outage; the launch path still requires its
+                        # transactional claim and therefore remains fail closed.
+                        logger.warning(
+                            'Could not build advisory paid-capacity placement '
+                            'state: '
+                            f'{common_utils.format_exception(e)}')
                 content = placer.placement_snapshot(
+                    limit=limit,
+                    offset=offset,
                     paid_admission_by_location=paid_admission)
             return responses.JSONResponse(content=content, status_code=200)
 

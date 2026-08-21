@@ -16,6 +16,7 @@ from sky.serve import reserved_fill_planner
 from sky.serve import serve_state_schema
 from sky.serve import serve_statuses
 from sky.serve import zero_cost_actuation_schema
+from sky.utils import common_utils
 from sky.utils.db import db_utils
 
 PROTOCOL_VERSION = 1
@@ -26,16 +27,6 @@ _INTENTS = (zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
 _PROTOCOL = serve_state_schema.reserved_fill_protocol_state_table
 _SEQUENCE = pool_capacity_observation_schema.protocol_state_sequence_table
 _PENDING_STATES = frozenset({'GRANTED', 'ACTUATING', 'RETRYABLE'})
-_TERMINAL_REPLICA_STATUSES = frozenset({
-    'SHUTTING_DOWN',
-    'FAILED',
-    'FAILED_INITIAL_DELAY',
-    'FAILED_PROBING',
-    'FAILED_PROVISION',
-    'FAILED_CLEANUP',
-    'PREEMPTED',
-    'UNKNOWN',
-})
 
 
 class ActuationMode(str, enum.Enum):
@@ -73,6 +64,80 @@ class IntentLease:
     owner: uuid.UUID
     generation: int
     expires_at: datetime.datetime
+
+
+@dataclasses.dataclass(frozen=True)
+class PendingPoolDebit:
+    """One exact-card physical-slot debit awaiting replica materialization."""
+
+    service_name: str
+    pool_key: str
+    accelerator: str
+    replica_slots: int
+
+
+@dataclasses.dataclass(frozen=True)
+class PendingFillSnapshot:
+    """One provider-free read of global headroom and exact allocation debits."""
+
+    capacity: int
+    debits: tuple[reserved_fill_planner.CommittedFillDebit, ...]
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.capacity, int) or
+                isinstance(self.capacity, bool) or self.capacity < 0 or
+                not isinstance(self.debits, tuple) or
+                any(not isinstance(debit,
+                                   reserved_fill_planner.CommittedFillDebit)
+                    for debit in self.debits)):
+            raise ValueError('Pending fill snapshot is malformed.')
+
+
+def pending_pool_debits(
+    pool_key: str,
+    *,
+    engine: sqlalchemy.engine.Engine | None = None,
+) -> tuple[PendingPoolDebit, ...]:
+    """Return live durable intents that already spend physical pool slots.
+
+    The broker calls this while holding its global round lock.  Grant admission
+    takes the same lock, so an intent is either included in a round's debit
+    scan or admitted after that round publishes; it can never fall into the
+    scan-to-publish gap.  One intent represents one physical replica slot even
+    when that replica exposes multiple logical capacity units.
+    """
+    if not isinstance(pool_key, str) or not pool_key:
+        raise ValueError('Pending pool debits require a nonempty pool key.')
+    database = engine or serve_state_schema.get_database_engine()
+    if database.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        # Durable intents are PostgreSQL-only.  Keeping the provider-free read
+        # empty on local SQLite preserves legacy broker tests and controllers;
+        # protocol-v2 activation itself rejects that topology.
+        return ()
+    with database.connect() as connection:
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        rows = connection.execute(
+            sqlalchemy.select(_INTENTS.c.service_name, _INTENTS.c.pool_key,
+                              _INTENTS.c.accelerator).where(
+                                  _INTENTS.c.pool_key == pool_key,
+                                  _INTENTS.c.state.in_(tuple(_PENDING_STATES)),
+                                  _INTENTS.c.valid_until > now)).all()
+    counts: dict[tuple[str, str], int] = {}
+    for service_name, row_pool_key, accelerator in rows:
+        if (not isinstance(service_name, str) or not service_name or
+                row_pool_key != pool_key or not isinstance(accelerator, str) or
+                not accelerator):
+            raise ZeroCostActuationConflict(
+                'Pending physical-slot debit has malformed authority.')
+        key = (service_name, accelerator.casefold())
+        counts[key] = counts.get(key, 0) + 1
+    return tuple(
+        PendingPoolDebit(service_name=service_name,
+                         pool_key=pool_key,
+                         accelerator=accelerator,
+                         replica_slots=count)
+        for (service_name, accelerator), count in sorted(counts.items()))
 
 
 def unavailable_status_summary(reason: str) -> dict[str, Any]:
@@ -281,33 +346,102 @@ def _locked_replica_capacity(
     connection: sqlalchemy.engine.Connection,
     *,
     service_name: str,
-    service_version: int,
     capacity_unit: reserved_fill_planner.FillCapacityUnit,
 ) -> int:
+    """Return service-wide capacity that may still exist at the provider.
+
+    Lifecycle status is not teardown evidence.  Old-version, failed, unknown,
+    and uncommitted logical-retirement rows all continue to consume the
+    service ceiling until their normalized down status proves provider cleanup
+    succeeded.  Locking every capacity-owning row in the same transaction as
+    intent admission closes the update/restart race at the authoritative seam
+    without making cleanup-proven history part of the admission hot path.
+    """
     rows = connection.execute(
-        sqlalchemy.select(
-            _REPLICAS.c.status, _REPLICAS.c.version,
-            _REPLICAS.c.replica_state_version, _REPLICAS.c.replica_state).where(
-                _REPLICAS.c.service_name == service_name).order_by(
-                    _REPLICAS.c.replica_id).with_for_update()).mappings().all()
+        sqlalchemy.select(_REPLICAS.c.sky_down_status,
+                          _REPLICAS.c.replica_state_version,
+                          _REPLICAS.c.replica_state).where(
+                              _REPLICAS.c.service_name == service_name,
+                              _REPLICAS.c.sky_down_status.is_distinct_from(
+                                  common_utils.ProcessStatus.SUCCEEDED.value)).
+        order_by(_REPLICAS.c.replica_id).with_for_update()).mappings().all()
     total = 0
     for row in rows:
-        if (row['version'] != service_version or
-                row['status'] in _TERMINAL_REPLICA_STATUSES):
-            continue
-        if capacity_unit is reserved_fill_planner.FillCapacityUnit.PHYSICAL:
-            total += 1
-            continue
-        state = row['replica_state']
-        planned_capacity = (state.get('planned_capacity') if isinstance(
-            state, Mapping) else None)
-        if (row['replica_state_version'] != 1 or
-                not isinstance(planned_capacity, int) or
-                isinstance(planned_capacity, bool) or planned_capacity < 1):
-            raise ZeroCostActuationConflict(
-                'Current logical replica capacity is malformed.')
-        total += planned_capacity
+        total += _replica_capacity_for_unit(row['replica_state_version'],
+                                            row['replica_state'], capacity_unit)
     return total
+
+
+def _replica_capacity_for_unit(
+    storage_version: Any,
+    state: Any,
+    capacity_unit: reserved_fill_planner.FillCapacityUnit,
+) -> int:
+    """Project a persisted backend shape into the current service unit."""
+    if capacity_unit is reserved_fill_planner.FillCapacityUnit.PHYSICAL:
+        return 1
+    if (storage_version != 1 or not isinstance(state, Mapping) or
+            state.get('replica_info_version') != 18):
+        raise ZeroCostActuationConflict(
+            'Current logical replica state is malformed.')
+    shapes: set[tuple[str, int]] = set()
+    for field in ('resources_override', 'location'):
+        resource_state = state.get(field)
+        if resource_state is None:
+            continue
+        if not isinstance(resource_state, Mapping):
+            raise ZeroCostActuationConflict(
+                'Current logical replica resource state is malformed.')
+        accelerators = resource_state.get('accelerators')
+        if accelerators is None:
+            continue
+        try:
+            shapes.add(
+                reserved_fill_planner.exact_accelerator_shape(accelerators))
+        except ValueError as error:
+            raise ZeroCostActuationConflict(
+                'Current logical replica accelerator shape is malformed.'
+            ) from error
+    if len(shapes) != 1:
+        raise ZeroCostActuationConflict(
+            'Current logical replica has missing or conflicting accelerator '
+            'shapes.')
+    _, accelerator_count = next(iter(shapes))
+    return capacity_unit.intent_cost(accelerator_count)
+
+
+def _pending_row_capacity(
+    row: Mapping[str, Any],
+    capacity_unit: reserved_fill_planner.FillCapacityUnit,
+) -> int:
+    """Validate and project one pending intent into the requested unit."""
+    accelerator_count = row['accelerator_count']
+    planned_capacity = row['planned_capacity']
+    try:
+        row_unit = reserved_fill_planner.FillCapacityUnit(row['capacity_unit'])
+    except (TypeError, ValueError) as error:
+        raise ZeroCostActuationConflict(
+            'Pending zero-cost intent capacity unit is malformed.') from error
+    if (not isinstance(accelerator_count, int) or
+            isinstance(accelerator_count, bool) or accelerator_count < 1 or
+            not isinstance(planned_capacity, int) or
+            isinstance(planned_capacity, bool) or planned_capacity < 1 or
+            planned_capacity != row_unit.intent_cost(accelerator_count)):
+        raise ZeroCostActuationConflict(
+            'Pending zero-cost intent capacity is malformed.')
+    return capacity_unit.intent_cost(accelerator_count)
+
+
+def _pending_capacity_for_unit(
+    rows: list[Mapping[str, Any]],
+    now: datetime.datetime,
+    capacity_unit: reserved_fill_planner.FillCapacityUnit,
+) -> int:
+    """Project every live pending intent into the current service unit."""
+    return sum(
+        _pending_row_capacity(row, capacity_unit)
+        for row in rows
+        if row['state'] in _PENDING_STATES and row['valid_until'] > now)
 
 
 def _retire_expired_locked(connection: sqlalchemy.engine.Connection,
@@ -329,6 +463,25 @@ def _retire_expired_locked(connection: sqlalchemy.engine.Connection,
                     last_error='grant_expired',
                     updated_at=now,
                     terminal_at=now))
+
+
+def _locked_grant_intent_rows(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    service_name: str,
+    plan_keys: tuple[str, ...],
+) -> list[Mapping[str, Any]]:
+    """Lock live pending intents plus exact idempotency replay rows."""
+    if not plan_keys:
+        raise ValueError('Grant intent locking requires current plan keys.')
+    return connection.execute(
+        sqlalchemy.select(_INTENTS).where(
+            _INTENTS.c.service_name == service_name,
+            sqlalchemy.or_(
+                _INTENTS.c.state.in_(tuple(_PENDING_STATES)),
+                _INTENTS.c.intent_idempotency_key.in_(plan_keys))).order_by(
+                    _INTENTS.c.intent_idempotency_key).with_for_update()
+    ).mappings().all()
 
 
 def pending_capacity_in_connection(
@@ -564,28 +717,191 @@ def _replica_matches_intent(replica_info: Any,
         return False
 
 
-def commit_lease_in_connection(
+def committed_intent_for_replica_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    service_name: str,
+    service_hash: str,
+    replica_info: Any,
+) -> reserved_fill_planner.FillIntent | None:
+    """Return the exact committed intent that still owns one replica.
+
+    A committed intent is the durable handoff from a broker generation to a
+    replica.  The normalized replica scalar is the authority edge; the JSON
+    key is only a checked projection.  Serve056 makes both the scalar and the
+    COMMITTED intent update-immutable, so this read deliberately avoids taking
+    another row lock while the caller holds the launch-authority lock order.
+    """
+    _require_postgres(connection)
+    try:
+        # A new server may briefly observe a migration-ceiling deployment
+        # during a rolling rollout.  Fail closed before compiling a SELECT
+        # that names the Serve056 column; do not turn expected cleanup-only
+        # compatibility into a PostgreSQL undefined-column error.
+        revision = connection.execute(
+            sqlalchemy.text(
+                'SELECT version_num FROM alembic_version_serve_state_db')
+        ).scalar_one_or_none()
+        if revision is None or int(revision) < 56:
+            return None
+        replica_id = replica_info.replica_id
+        raw_record_id = replica_info.replica_record_id
+        replica_record_id = uuid.UUID(raw_record_id)
+        if (type(service_name) is not str or not service_name or
+                type(service_hash) is not str or not service_hash or
+                type(replica_id) is not int or replica_id < 1 or
+                type(raw_record_id) is not str or
+                str(replica_record_id) != raw_record_id):
+            return None
+        replica_row = connection.execute(
+            sqlalchemy.select(
+                _REPLICAS.c.reserved_fill_intent_idempotency_key,
+                _REPLICAS.c.replica_state_version,
+                _REPLICAS.c.replica_state,
+            ).where(
+                _REPLICAS.c.service_name == service_name,
+                _REPLICAS.c.replica_id == replica_id)).mappings().one_or_none()
+        if replica_row is None:
+            return None
+        intent_key = replica_row['reserved_fill_intent_idempotency_key']
+        replica_state = replica_row['replica_state']
+        if (type(intent_key) is not str or len(intent_key) != 64 or any(
+                character not in '0123456789abcdef' for character in intent_key)
+                or replica_row['replica_state_version'] != 1 or
+                not isinstance(replica_state, Mapping) or
+                replica_state.get('replica_record_id') != raw_record_id or
+                replica_state.get('reserved_fill_intent_idempotency_key')
+                != intent_key or
+                getattr(replica_info, 'reserved_fill_intent_idempotency_key',
+                        None) != intent_key):
+            return None
+        row = connection.execute(
+            sqlalchemy.select(_INTENTS).where(
+                _INTENTS.c.intent_idempotency_key == intent_key,
+                _INTENTS.c.service_name == service_name,
+                _INTENTS.c.service_hash == service_hash,
+                _INTENTS.c.state == IntentState.COMMITTED.value,
+                _INTENTS.c.replica_id == replica_id,
+                _INTENTS.c.replica_record_id == replica_record_id,
+            )).mappings().one_or_none()
+        if row is None:
+            return None
+        intent = _intent_from_row(row)
+        planned_capacity = row['planned_capacity']
+        if (type(planned_capacity) is not int or
+                planned_capacity <= 0 or not _replica_matches_intent(
+                    replica_info, intent, planned_capacity)):
+            return None
+        return intent
+    except (AttributeError, TypeError, ValueError, ZeroCostActuationError):
+        return None
+
+
+def cleanup_only_committed_intent_for_replica_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    service_name: str,
+    service_hash: str,
+    replica_info: Any,
+) -> reserved_fill_planner.FillIntent | None:
+    """Resolve an exact committed intent solely for fenced cleanup.
+
+    Serve056 intentionally leaves retained protocol-v2 replicas with a NULL
+    normalized intent link, so they can never regain provider-launch
+    authority.  Provider-present reconciliation must nevertheless be able to
+    tear down an already-created object.  This resolver accepts that one
+    historical shape only after rereading the stored JSON projection and
+    exact immutable COMMITTED intent.  Callers must additionally validate the
+    persisted association/profile and terminal provider evidence, and must
+    already hold the exact replica row through the canonical effect-row lock
+    order.
+
+    A non-NULL scalar always takes the canonical resolver and can never fall
+    back to JSON authority.
+    """
+    _require_postgres(connection)
+    try:
+        revision = connection.execute(
+            sqlalchemy.text(
+                'SELECT version_num FROM alembic_version_serve_state_db')
+        ).scalar_one_or_none()
+        if revision is None or int(revision) < 56:
+            return None
+        replica_id = replica_info.replica_id
+        raw_record_id = replica_info.replica_record_id
+        replica_record_id = uuid.UUID(raw_record_id)
+        if (type(service_name) is not str or not service_name or
+                type(service_hash) is not str or not service_hash or
+                type(replica_id) is not int or replica_id < 1 or
+                type(raw_record_id) is not str or
+                str(replica_record_id) != raw_record_id):
+            return None
+        replica_row = connection.execute(
+            sqlalchemy.select(
+                _REPLICAS.c.reserved_fill_intent_idempotency_key,
+                _REPLICAS.c.replica_state_version,
+                _REPLICAS.c.replica_state,
+                _REPLICAS.c.is_spot,
+                _REPLICAS.c.paid_capacity_pool_key,
+            ).where(
+                _REPLICAS.c.service_name == service_name,
+                _REPLICAS.c.replica_id == replica_id)).mappings().one_or_none()
+        if replica_row is None:
+            return None
+        scalar_key = replica_row['reserved_fill_intent_idempotency_key']
+        if scalar_key is not None:
+            return committed_intent_for_replica_in_connection(
+                connection,
+                service_name=service_name,
+                service_hash=service_hash,
+                replica_info=replica_info)
+        replica_state = replica_row['replica_state']
+        intent_key = getattr(replica_info,
+                             'reserved_fill_intent_idempotency_key', None)
+        if (type(intent_key) is not str or len(intent_key) != 64 or any(
+                character not in '0123456789abcdef' for character in intent_key)
+                or replica_row['replica_state_version'] != 1 or
+                not isinstance(replica_state, Mapping) or
+                replica_state.get('replica_record_id') != raw_record_id or
+                replica_state.get('reserved_fill_intent_idempotency_key')
+                != intent_key or replica_row['is_spot'] is not False or
+                replica_row['paid_capacity_pool_key'] is not None or
+                getattr(replica_info, 'is_spot', None) is not False or getattr(
+                    replica_info, 'paid_capacity_pool_key', None) is not None):
+            return None
+        row = connection.execute(
+            sqlalchemy.select(_INTENTS).where(
+                _INTENTS.c.intent_idempotency_key == intent_key,
+                _INTENTS.c.service_name == service_name,
+                _INTENTS.c.service_hash == service_hash,
+                _INTENTS.c.state == IntentState.COMMITTED.value,
+                _INTENTS.c.replica_id == replica_id,
+                _INTENTS.c.replica_record_id == replica_record_id,
+            )).mappings().one_or_none()
+        if row is None:
+            return None
+        intent = _intent_from_row(row)
+        planned_capacity = row['planned_capacity']
+        if (type(planned_capacity) is not int or
+                planned_capacity <= 0 or not _replica_matches_intent(
+                    replica_info, intent, planned_capacity)):
+            return None
+        return intent
+    except (AttributeError, TypeError, ValueError, ZeroCostActuationError):
+        return None
+
+
+def _lock_materialization_authority(
     connection: sqlalchemy.engine.Connection,
     lease: IntentLease,
     *,
     service_name: str,
-    replica_id: int,
-    replica_record_id: uuid.UUID,
-    replica_info: Any,
-) -> None:
-    """Transfer one pending debit to its replica in the caller transaction.
-
-    The caller has already inserted the replica row but has not committed.
-    Any mismatch raises, rolling that insert back with this transition.  This
-    is deliberately not exposed as a second transaction: there must be no
-    crash window in which both the intent and replica consume capacity.
-    """
+) -> tuple[Any, Mapping[str, Any]]:
+    """Lock and validate the common service/intent authority prefix."""
     _require_postgres(connection)
     if (not isinstance(lease, IntentLease) or
-            not isinstance(service_name, str) or not service_name or
-            not isinstance(replica_id, int) or isinstance(replica_id, bool) or
-            replica_id < 1 or not isinstance(replica_record_id, uuid.UUID)):
-        raise ValueError('Intent commit requires exact durable identities.')
+            not isinstance(service_name, str) or not service_name):
+        raise ValueError('Intent materialization authority is malformed.')
     now = connection.execute(
         sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
     service = connection.execute(
@@ -597,7 +913,7 @@ def commit_lease_in_connection(
         with_for_update()).mappings().one_or_none()
     if service is None or intent_row is None:
         raise ZeroCostActuationConflict(
-            'Actuation commit lost its service or intent authority.')
+            'Actuation materialization lost its service or intent authority.')
     try:
         owner = controller_transport.make_controller_owner_fingerprint(
             service['hash'], service['controller_pid'],
@@ -605,7 +921,8 @@ def commit_lease_in_connection(
     except (KeyError, TypeError, ValueError,
             controller_transport.ControllerOwnerError) as error:
         raise ZeroCostActuationConflict(
-            'Actuation commit found malformed controller authority.') from error
+            'Actuation materialization found malformed controller authority.'
+        ) from error
     if (service['pool'] != 0 or service['status'] in {
             status.value for status in
             serve_statuses.ServiceStatus.replica_launch_blocking_statuses()
@@ -622,34 +939,90 @@ def commit_lease_in_connection(
             service['reserved_fill_actuation_protocol_version']
             != PROTOCOL_VERSION):
         raise ZeroCostActuationConflict(
-            'Service actuation authority changed before replica commit.')
+            'Service actuation authority changed before materialization.')
     expected_values = _intent_values(
         lease.intent,
         service_name=service_name,
         service_lifecycle_epoch=lease.service_lifecycle_epoch,
         actuation_epoch=lease.actuation_epoch)
-    if (not _row_matches_values(intent_row, expected_values) or
-            intent_row['state'] != IntentState.ACTUATING.value or
+    if not _row_matches_values(intent_row, expected_values):
+        raise ZeroCostActuationConflict(
+            'Actuation intent no longer matches the leased authority.')
+    return now, intent_row
+
+
+def lock_materialization_lease_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    lease: IntentLease,
+    *,
+    service_name: str,
+    replica_id: int,
+    replica_record_id: uuid.UUID,
+) -> bool:
+    """Lock the materialization authority before any replica ledger row."""
+    if (type(replica_id) is not int or replica_id < 1 or
+            not isinstance(replica_record_id, uuid.UUID)):
+        raise ValueError('Intent materialization requires exact identities.')
+    now, intent_row = _lock_materialization_authority(connection,
+                                                      lease,
+                                                      service_name=service_name)
+    if intent_row['state'] == IntentState.COMMITTED.value:
+        if (intent_row['replica_id'] != replica_id or
+                intent_row['replica_record_id'] != replica_record_id):
+            raise ZeroCostActuationConflict(
+                'Committed actuation intent names a different replica.')
+        return True
+    if (intent_row['state'] != IntentState.ACTUATING.value or
+            intent_row['lease_owner'] != lease.owner or
+            intent_row['lease_generation'] != lease.generation or
+            intent_row['lease_expires_at'] != lease.expires_at or
+            intent_row['valid_until'] <= now):
+        raise ZeroCostActuationConflict(
+            'Actuation lease changed before replica materialization.')
+    return False
+
+
+def commit_lease_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    lease: IntentLease,
+    *,
+    service_name: str,
+    replica_id: int,
+    replica_record_id: uuid.UUID,
+    replica_info: Any,
+) -> None:
+    """Transfer one pending debit to its replica in the caller transaction.
+
+    The caller has validated the mutable planner chain but has not inserted
+    the replica row.  This transitions the exact intent first; Serve056 then
+    permits only the matching scalar-linked replica INSERT.  Both operations
+    occur in the caller's transaction, so any later failure restores the
+    ACTUATING intent and leaves no replica.  This ordering gives the database
+    trigger a committed authority to validate without creating a crash window.
+    """
+    if (not isinstance(replica_id, int) or isinstance(replica_id, bool) or
+            replica_id < 1 or not isinstance(replica_record_id, uuid.UUID)):
+        raise ValueError('Intent commit requires exact durable identities.')
+    now, intent_row = _lock_materialization_authority(connection,
+                                                      lease,
+                                                      service_name=service_name)
+    try:
+        info_record_id = uuid.UUID(replica_info.replica_record_id)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ZeroCostActuationConflict(
+            'Actuation commit received a malformed replica identity.') from (
+                error)
+    if (intent_row['state'] != IntentState.ACTUATING.value or
             intent_row['lease_owner'] != lease.owner or
             intent_row['lease_generation'] != lease.generation or
             intent_row['lease_expires_at'] != lease.expires_at or
             intent_row['valid_until'] <= now or
+            getattr(replica_info, 'replica_id', None) != replica_id or
+            info_record_id != replica_record_id or
             not _replica_matches_intent(replica_info, lease.intent,
                                         int(intent_row['planned_capacity']))):
         raise ZeroCostActuationConflict(
             'Actuation lease or replica handoff changed before commit.')
-    replica = connection.execute(
-        sqlalchemy.select(
-            _REPLICAS.c.replica_id, _REPLICAS.c.replica_state_version,
-            _REPLICAS.c.replica_state).where(
-                _REPLICAS.c.service_name == service_name, _REPLICAS.c.replica_id
-                == replica_id).with_for_update()).mappings().one_or_none()
-    replica_state = None if replica is None else replica['replica_state']
-    if (replica is None or replica['replica_state_version'] != 1 or
-            not isinstance(replica_state, Mapping) or
-            replica_state.get('replica_record_id') != str(replica_record_id)):
-        raise ZeroCostActuationConflict(
-            'Actuation commit does not own the inserted replica record.')
     result = connection.execute(
         sqlalchemy.update(_INTENTS).where(
             _INTENTS.c.intent_idempotency_key == lease.intent.idempotency_key,
@@ -682,6 +1055,26 @@ class ZeroCostActuationRepository:
             raise ZeroCostActuationUnavailable(
                 'Zero-cost actuation intents require PostgreSQL.')
         return engine
+
+    def committed_replica_id_high_water(self, service_name: str) -> int:
+        """Return the largest replica ID durably owned by an intent.
+
+        Committed intents intentionally outlive their replica rows.  The
+        service's process-local replica allocator must therefore include this
+        ledger when it recovers after a restart; otherwise a cleaned replica's
+        ID can be reused and the intent uniqueness constraint rejects the new
+        atomic handoff.
+        """
+        if not isinstance(service_name, str) or not service_name:
+            raise ValueError('Service name must be a non-empty string.')
+        with self.engine.connect() as connection:
+            high_water = connection.execute(
+                sqlalchemy.select(sqlalchemy.func.max(
+                    _INTENTS.c.replica_id)).where(
+                        _INTENTS.c.service_name == service_name,
+                        _INTENTS.c.state ==
+                        IntentState.COMMITTED.value)).scalar_one()
+        return 0 if high_water is None else int(high_water)
 
     @staticmethod
     def _validate_service(
@@ -771,21 +1164,18 @@ class ZeroCostActuationRepository:
             now = connection.execute(
                 sqlalchemy.select(
                     sqlalchemy.func.clock_timestamp())).scalar_one()
-            rows = connection.execute(
-                sqlalchemy.select(_INTENTS).where(
-                    _INTENTS.c.service_name == service_name).order_by(
-                        _INTENTS.c.intent_idempotency_key).with_for_update()
-            ).mappings().all()
+            rows = _locked_grant_intent_rows(
+                connection,
+                service_name=service_name,
+                plan_keys=tuple(
+                    intent.idempotency_key for intent in plan.intents))
             _retire_expired_locked(connection, rows, now)
             rows_by_key = {row['intent_idempotency_key']: row for row in rows}
-            pending_capacity = sum(
-                int(row['planned_capacity'])
-                for row in rows
-                if row['state'] in _PENDING_STATES and row['valid_until'] > now)
+            pending_capacity = _pending_capacity_for_unit(
+                rows, now, plan.capacity_unit)
             current_capacity = _locked_replica_capacity(
                 connection,
                 service_name=service_name,
-                service_version=plan.intents[0].service_version,
                 capacity_unit=plan.capacity_unit)
             remaining = max(0,
                             max_capacity - current_capacity - pending_capacity)
@@ -1009,7 +1399,7 @@ class ZeroCostActuationRepository:
                         terminal_at=now))
             return result.rowcount == 1
 
-    def pending_debits(
+    def pending_fill_snapshot(
         self,
         *,
         service_name: str,
@@ -1017,32 +1407,53 @@ class ZeroCostActuationRepository:
         allocation_generation: int,
         allocation_input_sha256: str,
         allocation_claim_generation: int,
-    ) -> tuple[reserved_fill_planner.CommittedFillDebit, ...]:
-        """Return live grants as planner debits for the same allocation."""
-        with self.engine.begin() as connection:
+        capacity_unit: reserved_fill_planner.FillCapacityUnit,
+    ) -> PendingFillSnapshot:
+        """Read global pending headroom and exact-map debits in one snapshot.
+
+        This is a conservative planning hint, not the admission seam.  Query
+        only live pending states through the service/state index and avoid row
+        locks or historical-intent cleanup; ``grant_plan`` serializes and
+        revalidates the complete service ceiling before accepting any intent.
+        """
+        if (not isinstance(service_name, str) or not service_name or
+                not isinstance(service_hash, str) or
+                not service_hash or not isinstance(
+                    capacity_unit, reserved_fill_planner.FillCapacityUnit)):
+            raise ValueError('Pending fill snapshot requires service identity '
+                             'and a FillCapacityUnit.')
+        with self.engine.connect() as connection:
             now = connection.execute(
                 sqlalchemy.select(
                     sqlalchemy.func.clock_timestamp())).scalar_one()
             rows = connection.execute(
-                sqlalchemy.select(_INTENTS).where(
+                sqlalchemy.select(
+                    _INTENTS.c.service_hash,
+                    _INTENTS.c.allocation_generation,
+                    _INTENTS.c.allocation_input_sha256,
+                    _INTENTS.c.allocation_claim_generation,
+                    _INTENTS.c.pool_key,
+                    _INTENTS.c.accelerator,
+                    _INTENTS.c.accelerator_count,
+                    _INTENTS.c.capacity_unit,
+                    _INTENTS.c.planned_capacity,
+                ).where(
                     _INTENTS.c.service_name == service_name,
-                    _INTENTS.c.service_hash == service_hash,
-                    _INTENTS.c.allocation_generation == allocation_generation,
-                    _INTENTS.c.allocation_input_sha256 ==
-                    allocation_input_sha256,
-                    _INTENTS.c.allocation_claim_generation ==
-                    allocation_claim_generation).order_by(
-                        _INTENTS.c.intent_idempotency_key).with_for_update()
-            ).mappings().all()
-            _retire_expired_locked(connection, rows, now)
-            counts: dict[tuple[str, str], int] = {}
-            for row in rows:
-                if (row['state'] not in _PENDING_STATES or
-                        row['valid_until'] <= now):
-                    continue
+                    _INTENTS.c.state.in_(tuple(_PENDING_STATES)),
+                    _INTENTS.c.valid_until > now).order_by(
+                        _INTENTS.c.intent_idempotency_key)).mappings().all()
+        capacity = sum(
+            _pending_row_capacity(row, capacity_unit) for row in rows)
+        counts: dict[tuple[str, str], int] = {}
+        for row in rows:
+            if (row['service_hash'] == service_hash and
+                    row['allocation_generation'] == allocation_generation and
+                    row['allocation_input_sha256'] == allocation_input_sha256
+                    and row['allocation_claim_generation']
+                    == allocation_claim_generation):
                 key = (str(row['pool_key']), str(row['accelerator']).casefold())
                 counts[key] = counts.get(key, 0) + 1
-        return tuple(
+        debits = tuple(
             reserved_fill_planner.CommittedFillDebit(
                 allocation_generation=allocation_generation,
                 allocation_input_sha256=allocation_input_sha256,
@@ -1051,6 +1462,7 @@ class ZeroCostActuationRepository:
                 accelerator=accelerator,
                 replica_slots=count)
             for (pool_key, accelerator), count in sorted(counts.items()))
+        return PendingFillSnapshot(capacity=capacity, debits=debits)
 
 
 def get_service_mode(service_name: str) -> ActuationMode | None:

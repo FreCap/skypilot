@@ -8,6 +8,7 @@ import json
 import pickle
 import threading
 import time
+import uuid
 
 from alembic import command as alembic_command
 import pytest
@@ -16,7 +17,11 @@ from test_pool_capacity_observation_pg import observation_engine  # noqa: F401
 from test_pool_capacity_observation_pg import pg_server  # noqa: F401
 
 from sky import clouds
+from sky import global_user_state_schema
+from sky.client import sdk
+from sky.serve import constants as serve_constants
 from sky.serve import kubernetes_identity
+from sky.serve import ordinary_launch_binding
 from sky.serve import pool_capacity_observation
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker
@@ -25,7 +30,14 @@ from sky.serve import reserved_fill_planner
 from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
+from sky.serve import serve_utils
 from sky.serve import service_spec
+from sky.serve import zero_cost_actuation
+from sky.server import constants as server_constants
+from sky.server.requests import payloads
+from sky.server.requests import postgres as request_postgres
+from sky.server.requests import reserved_fill_admission
+from sky.skylet import constants as skylet_constants
 from sky.utils.db import migration_utils
 
 _SERVICE = 'svc'
@@ -37,6 +49,15 @@ _POOL_KEY = json.dumps(['v2', _UID, ['a100-80gb', 'h200']])
 _PEER_SERVICE = 'svc-b'
 _PEER_HASH = 'peer-service-hash'
 _PEER_OWNER = (18, '10.0.0.18')
+_CONTROLLER_PORT = 8123
+_PEER_CONTROLLER_PORT = 8124
+_CONTROLLER_INCARNATION = uuid.UUID('11111111-1111-4111-8111-111111111111')
+_PEER_CONTROLLER_INCARNATION = uuid.UUID('22222222-2222-4222-8222-222222222222')
+_CONTROLLER_OWNER_EPOCH = 2
+_BINDING_EPOCH = 1
+_CREATOR_ID = 'reserved-fill-allocation-owner'
+_CREATOR_NAME = 'reserved-fill-allocation-owner@example.com'
+_WORKSPACE = 'workspace-a'
 
 
 def _worker_projection(card: str,
@@ -129,25 +150,42 @@ def _claim_policy_authority(
 
 
 @pytest.fixture
-def allocation_engine(observation_engine):  # noqa: F811
+def allocation_engine(observation_engine, monkeypatch):  # noqa: F811
+    global_user_state_schema.user_table.create(observation_engine,
+                                               checkfirst=True)
     config = migration_utils.get_alembic_config(observation_engine,
                                                 migration_utils.SERVE_DB_NAME)
     alembic_command.upgrade(config, migration_utils.SERVE_VERSION)
+    request_postgres._initialize_schema(observation_engine)
+    monkeypatch.setattr(request_postgres._DB_MANAGER, '_engine',
+                        observation_engine)
+    monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
+                        observation_engine)
+    monkeypatch.setattr(request_postgres,
+                        '_resolved_request_backend_capability', lambda:
+                        ('postgres', 'postgres', True))
     with observation_engine.begin() as connection:
+        connection.execute(global_user_state_schema.user_table.insert().values(
+            id=_CREATOR_ID, name=_CREATOR_NAME, created_at=int(time.time())))
         connection.execute(
             sqlalchemy.text("""
                 INSERT INTO services
                     (name, hash, resource_scope, controller_pid,
                      controller_ip, status, current_version,
-                     logical_replica_semantics)
+                     logical_replica_semantics, workspace,
+                     owner_user_id, owner_user_name)
                 VALUES (:name, :hash, :resource_scope, :controller_pid,
-                        :controller_ip, 'READY', 1, 0)
+                        :controller_ip, 'READY', 1, 0, :workspace,
+                        :owner_user_id, :owner_user_name)
             """), {
                 'name': _SERVICE,
                 'hash': _SERVICE_HASH,
                 'resource_scope': _SERVICE_HASH,
                 'controller_pid': _OWNER[0],
                 'controller_ip': _OWNER[1],
+                'workspace': _WORKSPACE,
+                'owner_user_id': _CREATOR_ID,
+                'owner_user_name': _CREATOR_NAME,
             })
         connection.execute(
             serve_state_schema.version_specs_table.insert().values(
@@ -156,6 +194,9 @@ def allocation_engine(observation_engine):  # noqa: F811
                 spec=pickle.dumps(_service_spec()),
                 yaml_content='service: v1\n',
                 worker_placement_projections=_WORKER_PROJECTIONS))
+        connection.execute(
+            serve_state_schema.service_lifecycle_fences_table.insert().values(
+                name=_SERVICE, epoch=1))
         connection.execute(
             sqlalchemy.text("""
                 UPDATE reserved_fill_protocol_state
@@ -451,15 +492,20 @@ def _insert_peer_service(
                 INSERT INTO services
                     (name, hash, resource_scope, controller_pid,
                      controller_ip, status, current_version,
-                     logical_replica_semantics)
+                     logical_replica_semantics, workspace,
+                     owner_user_id, owner_user_name)
                 VALUES (:name, :hash, :resource_scope, :controller_pid,
-                        :controller_ip, 'READY', 1, 0)
+                        :controller_ip, 'READY', 1, 0, :workspace,
+                        :owner_user_id, :owner_user_name)
             """), {
                 'name': _PEER_SERVICE,
                 'hash': _PEER_HASH,
                 'resource_scope': _PEER_HASH,
                 'controller_pid': _PEER_OWNER[0],
                 'controller_ip': _PEER_OWNER[1],
+                'workspace': _WORKSPACE,
+                'owner_user_id': _CREATOR_ID,
+                'owner_user_name': _CREATOR_NAME,
             })
         connection.execute(
             serve_state_schema.version_specs_table.insert().values(
@@ -468,6 +514,9 @@ def _insert_peer_service(
                 spec=pickle.dumps(_service_spec()),
                 yaml_content='service: v1\n',
                 worker_placement_projections=_WORKER_PROJECTIONS))
+        connection.execute(
+            serve_state_schema.service_lifecycle_fences_table.insert().values(
+                name=_PEER_SERVICE, epoch=1))
         if not with_claim:
             return
         connection.execute(
@@ -583,24 +632,224 @@ def _publish_current_allocation(
     return allocation
 
 
-def _persist_typed_fill(
-    snapshot: reserved_fill_planner.PoolFillSnapshot,
+def _activate_durable_intent_service(
+    engine: sqlalchemy.engine.Engine,
+    *,
+    service_name: str = _SERVICE,
+    service_hash: str = _SERVICE_HASH,
+    controller_owner: tuple[int, str] = _OWNER,
+    controller_port: int = _CONTROLLER_PORT,
+    controller_incarnation: uuid.UUID = _CONTROLLER_INCARNATION,
+) -> str:
+    """Install the exact durable-intent controller authority under test."""
+    with engine.begin() as connection:
+        result = connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == service_name).
+            values(
+                pool=0,
+                lifecycle_epoch=1,
+                controller_port=controller_port,
+                controller_incarnation=controller_incarnation,
+                controller_owner_epoch=_CONTROLLER_OWNER_EPOCH,
+                ordinary_launch_binding_capable=True,
+                ordinary_launch_binding_mode=(
+                    ordinary_launch_binding.BindingMode.BOUND.value),
+                ordinary_launch_binding_epoch=_BINDING_EPOCH,
+                non_pool_launch_binding_capable=True,
+                non_pool_launch_controller_incarnation=(controller_incarnation),
+                non_pool_launch_binding_protocol_version=(
+                    ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+                non_pool_launch_capability_profile_set_digest=(
+                    ordinary_launch_binding.
+                    supported_non_pool_profile_set_digest()),
+                non_pool_launch_capability_cohort_epoch=(
+                    ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+                non_pool_launch_receipt_protocol_version=(
+                    ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION),
+                reserved_fill_actuation_mode=(
+                    zero_cost_actuation.ActuationMode.DURABLE_INTENT.value),
+                reserved_fill_actuation_epoch=1,
+                reserved_fill_actuation_capable=True,
+                reserved_fill_actuation_controller_incarnation=(
+                    controller_incarnation),
+                reserved_fill_actuation_protocol_version=1))
+    assert result.rowcount == 1
+    return serve_utils.make_controller_owner_fingerprint(
+        service_hash, controller_owner[0], controller_owner[1], controller_port)
+
+
+def _plan_durable_fill(
+    allocation: reserved_fill_planner.AuthenticatedAllocationMap,
+    controller_owner: str,
+    *,
+    service_hash: str = _SERVICE_HASH,
+    max_replicas: int = 8,
+    planned_replicas: int = 0,
+    capacity_unit: reserved_fill_planner.FillCapacityUnit = (
+        reserved_fill_planner.FillCapacityUnit.PHYSICAL),
+) -> reserved_fill_planner.FillPlan:
+    return reserved_fill_planner.ReservedFillPlanner.plan(
+        policy_revision=1,
+        reconcile_generation=1,
+        allocation_map=allocation,
+        service_incarnation=service_hash,
+        service_version=1,
+        controller_owner=controller_owner,
+        max_replicas=max_replicas,
+        planned_replicas=planned_replicas,
+        capacity_unit=capacity_unit)
+
+
+def _grant_durable_plan(
+    engine: sqlalchemy.engine.Engine,
+    service_name: str,
+    plan: reserved_fill_planner.FillPlan,
+    *,
+    max_capacity: int,
+    controller_incarnation: uuid.UUID = _CONTROLLER_INCARNATION,
+) -> tuple[zero_cost_actuation.ZeroCostActuationRepository,
+           reserved_fill_planner.FillCommitResult]:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(engine)
+    receipt = repository.grant_plan(
+        service_name,
+        plan,
+        max_capacity=max_capacity,
+        expected_controller_incarnation=controller_incarnation,
+        expected_controller_owner_epoch=_CONTROLLER_OWNER_EPOCH)
+    return repository, receipt
+
+
+def _lease_next(
+    repository: zero_cost_actuation.ZeroCostActuationRepository,
+    service_name: str,
+    pool_key: str,
+) -> zero_cost_actuation.IntentLease | None:
+    return repository.lease_next(service_name=service_name,
+                                 pool_key=pool_key,
+                                 owner=uuid.uuid4(),
+                                 lease_seconds=30)
+
+
+def _stage_durable_fill(
+    engine: sqlalchemy.engine.Engine,
+    service_name: str,
     replica_id: int,
     info: replica_managers.ReplicaInfo,
+    lease: zero_cost_actuation.IntentLease,
+    *,
+    controller_owner: tuple[int, str] = _OWNER,
 ) -> bool:
-    return serve_state.add_replica_if_round_epoch(
-        _SERVICE,
+    """Commit one lease through the complete production admission graph."""
+    if service_name == _SERVICE:
+        service_hash = _SERVICE_HASH
+    elif service_name == _PEER_SERVICE:
+        service_hash = _PEER_HASH
+    else:
+        raise ValueError(f'Unknown test service: {service_name!r}')
+    with engine.connect() as current_connection:
+        service = current_connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.services_table.c.workspace,
+                serve_state_schema.services_table.c.lifecycle_epoch,
+                serve_state_schema.services_table.c.controller_incarnation,
+                serve_state_schema.services_table.c.controller_owner_epoch).
+            where(serve_state_schema.services_table.c.name ==
+                  service_name)).mappings().one()
+    controller_incarnation = service['controller_incarnation']
+    controller_owner_epoch = service['controller_owner_epoch']
+    lifecycle_epoch = service['lifecycle_epoch']
+    assert service['workspace'] == _WORKSPACE
+    assert isinstance(controller_incarnation, uuid.UUID)
+    assert isinstance(controller_owner_epoch, int)
+    assert isinstance(lifecycle_epoch, int)
+    authority = ordinary_launch_binding.ControllerBindingAuthority(
+        service_name=service_name,
+        service_hash=service_hash,
+        service_workspace=_WORKSPACE,
+        service_lifecycle_epoch=lifecycle_epoch,
+        controller_pid=controller_owner[0],
+        controller_ip=controller_owner[1],
+        controller_incarnation=controller_incarnation,
+        controller_owner_epoch=controller_owner_epoch,
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        binding_epoch=_BINDING_EPOCH,
+        non_pool_capable=True,
+        non_pool_binding_protocol_version=(
+            ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+        non_pool_profile_set_digest=(
+            ordinary_launch_binding.supported_non_pool_profile_set_digest()),
+        non_pool_capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+        non_pool_receipt_protocol_version=(
+            ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
+    launch_context = {
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: service_name,
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: service_hash,
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: 1,
+        serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY:
+            controller_owner[0],
+        serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY:
+            controller_owner[1],
+        ordinary_launch_binding.REPLICA_ID_KEY: replica_id,
+        ordinary_launch_binding.REPLICA_RECORD_ID_KEY: info.replica_record_id,
+        ordinary_launch_binding.LIFECYCLE_EPOCH_KEY: lifecycle_epoch,
+        ordinary_launch_binding.BINDING_EPOCH_KEY: _BINDING_EPOCH,
+        ordinary_launch_binding.CONTROLLER_INCARNATION_KEY:
+            str(controller_incarnation),
+        ordinary_launch_binding.CONTROLLER_OWNER_EPOCH_KEY: controller_owner_epoch,
+    }
+    body = payloads.LaunchBody(
+        task=('name: allocation-fill\nresources:\n  accelerators: '
+              'A100-80GB:1\n'),
+        cluster_name=info.cluster_name,
+        is_launched_by_sky_serve_controller=True,
+        client_api_version=server_constants.API_VERSION,
+        extra_launch_context=launch_context,
+        env_vars={
+            skylet_constants.USER_ID_ENV_VAR: _CREATOR_ID,
+            skylet_constants.USER_ENV_VAR: _CREATOR_NAME,
+        },
+        override_skypilot_config={'active_workspace': _WORKSPACE})
+    prepared = sdk.PreparedLaunchRequest(sdk._canonical_launch_body_bytes(body))
+    spec = reserved_fill_admission.AdmissionSpec(
+        prepared_request=prepared,
+        submission_id=uuid.uuid5(
+            uuid.UUID('33333333-3333-4333-8333-333333333333'),
+            f'{service_name}:{replica_id}:{info.replica_record_id}'),
+        authority=authority,
+        replica_info=info,
+        actuation_lease=lease)
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            staged, _ = reserved_fill_admission._stage_and_bind(
+                connection, spec, 7, require_existing=False)
+        except reserved_fill_admission._Rejected:
+            transaction.rollback()
+            return False
+        transaction.commit()
+    staged.publish_after_commit()
+    return True
+
+
+def _typed_fill_for_lease(
+    service_name: str,
+    replica_id: int,
+    snapshot: reserved_fill_planner.PoolFillSnapshot,
+    allocation: reserved_fill_planner.AuthenticatedAllocationMap,
+    lease: zero_cost_actuation.IntentLease,
+) -> replica_managers.ReplicaInfo:
+    return _typed_fill_replica(
+        service_name,
         replica_id,
-        info,
-        pool_key=snapshot.pool_key,
-        expected_epoch=23,
-        expected_service_hash=_SERVICE_HASH,
-        expected_controller_owner=_OWNER,
-        expected_protocol_version=reserved_capacity_broker.PROTOCOL_V2,
-        expected_service_generation=11,
-        expected_physical_cluster_uid=_UID,
-        expected_ordinary_zero_cost_admission_sequence=0,
-        expected_lease_token=7)
+        snapshot,
+        allocation,
+        card=lease.intent.accelerator,
+        intent_key=lease.intent.idempotency_key,
+        planned_capacity=lease.intent.capacity_unit.intent_cost(
+            lease.intent.accelerator_count))
 
 
 def _persisted_replica_count(engine: sqlalchemy.engine.Engine) -> int:
@@ -806,6 +1055,100 @@ def test_publish_is_complete_authenticated_and_idempotent(
     assert retry == first
 
 
+def test_current_allocation_can_be_validated_on_caller_transaction(
+        allocation_engine) -> None:
+    _, snapshot = _commit_evidence(allocation_engine)
+    repository = _repository(allocation_engine)
+    allocation = repository.publish(_SERVICE,
+                                    expected_service_hash=_SERVICE_HASH,
+                                    expected_controller_owner=_OWNER,
+                                    expected_claim_generation=11,
+                                    expected_gate_generation=1,
+                                    pool_snapshots=(snapshot,))
+    assert allocation is not None
+
+    with allocation_engine.begin() as connection:
+        assert repository.read_current_in_connection(connection, _SERVICE,
+                                                     _SERVICE_HASH,
+                                                     _OWNER) == allocation
+
+
+def test_current_allocation_prelocked_mode_does_not_relock_prefix(
+        allocation_engine, monkeypatch) -> None:
+    _, snapshot = _commit_evidence(allocation_engine)
+    repository = _repository(allocation_engine)
+    allocation = repository.publish(_SERVICE,
+                                    expected_service_hash=_SERVICE_HASH,
+                                    expected_controller_owner=_OWNER,
+                                    expected_claim_generation=11,
+                                    expected_gate_generation=1,
+                                    pool_snapshots=(snapshot,))
+    assert allocation is not None
+
+    with allocation_engine.begin() as connection:
+        assert repository._lock_protocol(connection, read=False) is not None
+        assert repository._lock_service(connection,
+                                        _SERVICE,
+                                        _SERVICE_HASH,
+                                        _OWNER,
+                                        read=False) is not None
+
+        def reject_relock(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError('prelocked validation reacquired prefix')
+
+        monkeypatch.setattr(repository, '_lock_protocol', reject_relock)
+        monkeypatch.setattr(repository, '_lock_service', reject_relock)
+        assert repository.read_current_in_connection(
+            connection,
+            _SERVICE,
+            _SERVICE_HASH,
+            _OWNER,
+            protocol_and_service_prelocked=True) == allocation
+
+
+def test_current_allocation_prelocked_mode_revalidates_broker_round(
+        allocation_engine) -> None:
+    _, snapshot = _commit_evidence(allocation_engine)
+    repository = _repository(allocation_engine)
+    allocation = repository.publish(_SERVICE,
+                                    expected_service_hash=_SERVICE_HASH,
+                                    expected_controller_owner=_OWNER,
+                                    expected_claim_generation=11,
+                                    expected_gate_generation=1,
+                                    pool_snapshots=(snapshot,))
+    assert allocation is not None
+    with allocation_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                serve_state_schema.reserved_fill_rounds_table).where(
+                    serve_state_schema.reserved_fill_rounds_table.c.pool_key ==
+                    _POOL_KEY).values(epoch=24))
+
+    with allocation_engine.begin() as connection:
+        assert repository._lock_protocol(connection, read=False) is not None
+        assert repository._lock_service(connection,
+                                        _SERVICE,
+                                        _SERVICE_HASH,
+                                        _OWNER,
+                                        read=False) is not None
+        assert repository.read_current_in_connection(
+            connection,
+            _SERVICE,
+            _SERVICE_HASH,
+            _OWNER,
+            protocol_and_service_prelocked=True) is None
+
+
+def test_current_allocation_connection_requires_caller_transaction(
+        allocation_engine) -> None:
+    repository = _repository(allocation_engine)
+    with allocation_engine.connect() as connection:
+        with pytest.raises(ValueError, match='active caller transaction'):
+            repository.read_current_in_connection(connection, _SERVICE,
+                                                  _SERVICE_HASH, _OWNER)
+
+
 def test_publish_converts_width_eight_raw_gpus_exactly_once(
         allocation_engine) -> None:
     observation, snapshot = _commit_evidence(allocation_engine,
@@ -833,13 +1176,14 @@ def test_reader_rejects_tampered_broker_slot_width(allocation_engine) -> None:
     _, snapshot = _commit_evidence(allocation_engine,
                                    free_slots=10,
                                    broker_slot_width=8)
-    repository = _repository(allocation_engine)
-    allocation = repository.publish(_SERVICE,
-                                    expected_service_hash=_SERVICE_HASH,
-                                    expected_controller_owner=_OWNER,
-                                    expected_claim_generation=11,
-                                    expected_gate_generation=1,
-                                    pool_snapshots=(snapshot,))
+    allocation_repository = _repository(allocation_engine)
+    allocation = allocation_repository.publish(
+        _SERVICE,
+        expected_service_hash=_SERVICE_HASH,
+        expected_controller_owner=_OWNER,
+        expected_claim_generation=11,
+        expected_gate_generation=1,
+        pool_snapshots=(snapshot,))
     assert allocation is not None
 
     table = serve_state_schema.reserved_fill_rounds_table
@@ -854,7 +1198,8 @@ def test_reader_rejects_tampered_broker_slot_width(allocation_engine) -> None:
                 table.c.pool_key == _POOL_KEY).values(
                     feed_by_accelerator=json.dumps(envelope)))
 
-    assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) is None
+    assert allocation_repository.read_current(_SERVICE, _SERVICE_HASH,
+                                              _OWNER) is None
 
 
 def test_physical_observation_is_shared_across_context_aliases(
@@ -1086,19 +1431,35 @@ def test_cross_service_ordinary_admission_invalidates_map_and_fill_persist(
     """Service B demand cannot race service A's stale free-slot authority."""
     monkeypatch.setattr(serve_state._db_manager, '_engine', allocation_engine)
     _, snapshot = _commit_evidence(allocation_engine)
-    repository = _repository(allocation_engine)
-    allocation = repository.publish(_SERVICE,
-                                    expected_service_hash=_SERVICE_HASH,
-                                    expected_controller_owner=_OWNER,
-                                    expected_claim_generation=11,
-                                    expected_gate_generation=1,
-                                    pool_snapshots=(snapshot,))
+    allocation_repository = _repository(allocation_engine)
+    allocation = allocation_repository.publish(
+        _SERVICE,
+        expected_service_hash=_SERVICE_HASH,
+        expected_controller_owner=_OWNER,
+        expected_claim_generation=11,
+        expected_gate_generation=1,
+        pool_snapshots=(snapshot,))
     assert allocation is not None
     _insert_peer_service(allocation_engine, with_claim=False)
     with allocation_engine.begin() as connection:
         connection.execute(
             serve_state_schema.reserved_fill_lease_table.insert().values(
                 id=1, epoch=7))
+    controller_owner = _activate_durable_intent_service(allocation_engine)
+    plan = _plan_durable_fill(allocation, controller_owner, max_replicas=1)
+    actuation_repository, receipt = _grant_durable_plan(allocation_engine,
+                                                        _SERVICE,
+                                                        plan,
+                                                        max_capacity=1)
+    assert len(receipt.accepted) == 1
+    lease = _lease_next(actuation_repository, _SERVICE, snapshot.pool_key)
+    assert lease is not None
+    stale_fill = _typed_fill_replica(_SERVICE,
+                                     1,
+                                     snapshot,
+                                     allocation,
+                                     card=lease.intent.accelerator,
+                                     intent_key=lease.intent.idempotency_key)
 
     ordinary = _ordinary_replica(1)
     assert serve_state.add_or_update_replicas(_PEER_SERVICE, [(1, ordinary)])
@@ -1111,27 +1472,11 @@ def test_cross_service_ordinary_admission_invalidates_map_and_fill_persist(
                 FROM reserved_fill_protocol_state WHERE id = 1
             """)).one()
     assert tuple(sequences) == (1, 1)
-    assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) is None
+    assert allocation_repository.read_current(_SERVICE, _SERVICE_HASH,
+                                              _OWNER) is None
 
-    stale_fill = _typed_fill_replica(_SERVICE,
-                                     1,
-                                     snapshot,
-                                     allocation,
-                                     card='A100-80GB')
-    assert not serve_state.add_replica_if_round_epoch(
-        _SERVICE,
-        1,
-        stale_fill,
-        pool_key=snapshot.pool_key,
-        expected_epoch=23,
-        expected_service_hash=_SERVICE_HASH,
-        expected_controller_owner=_OWNER,
-        expected_protocol_version=reserved_capacity_broker.PROTOCOL_V2,
-        expected_service_generation=11,
-        expected_physical_cluster_uid=_UID,
-        expected_ordinary_zero_cost_admission_sequence=(
-            allocation.ordinary_zero_cost_admission_sequence_high_water),
-        expected_lease_token=7)
+    assert not _stage_durable_fill(allocation_engine, _SERVICE, 1, stale_fill,
+                                   lease)
     with allocation_engine.connect() as connection:
         stale_row_count = connection.execute(
             sqlalchemy.select(sqlalchemy.text('count(*)')).select_from(
@@ -1140,6 +1485,129 @@ def test_cross_service_ordinary_admission_invalidates_map_and_fill_persist(
                     _SERVICE, serve_state_schema.replicas_table.c.replica_id ==
                     1)).scalar_one()
     assert stale_row_count == 0
+
+
+def test_durable_intent_handoff_survives_successor_pool_epoch(
+        allocation_engine, monkeypatch) -> None:
+    """An admitted ledger debit transfers to its row after a heartbeat."""
+    monkeypatch.setattr(serve_state._db_manager, '_engine', allocation_engine)
+    _, snapshot = _commit_evidence(allocation_engine,
+                                   feed_by_accelerator={'a100-80gb': 1},
+                                   free_slots=1)
+    allocation = _publish_current_allocation(allocation_engine, snapshot)
+    controller_port = 8123
+    with allocation_engine.connect() as connection:
+        controller_state = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.services_table.c.controller_incarnation,
+                serve_state_schema.services_table.c.controller_owner_epoch).
+            where(serve_state_schema.services_table.c.name ==
+                  _SERVICE)).mappings().one()
+    previous_controller_incarnation = controller_state['controller_incarnation']
+    controller_owner_epoch = int(controller_state['controller_owner_epoch']) + 1
+    assert isinstance(previous_controller_incarnation, uuid.UUID)
+    controller_incarnation = uuid.uuid4()
+    controller_owner = serve_utils.make_controller_owner_fingerprint(
+        _SERVICE_HASH, _OWNER[0], _OWNER[1], controller_port)
+    with allocation_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).
+            where(serve_state_schema.services_table.c.name == _SERVICE).values(
+                pool=0,
+                lifecycle_epoch=1,
+                controller_port=controller_port,
+                controller_incarnation=controller_incarnation,
+                controller_owner_epoch=controller_owner_epoch,
+                ordinary_launch_binding_capable=True,
+                ordinary_launch_binding_mode=(
+                    ordinary_launch_binding.BindingMode.BOUND.value),
+                ordinary_launch_binding_epoch=_BINDING_EPOCH,
+                non_pool_launch_binding_capable=True,
+                non_pool_launch_controller_incarnation=(controller_incarnation),
+                non_pool_launch_binding_protocol_version=(
+                    ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+                non_pool_launch_capability_profile_set_digest=(
+                    ordinary_launch_binding.
+                    supported_non_pool_profile_set_digest()),
+                non_pool_launch_capability_cohort_epoch=(
+                    ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+                non_pool_launch_receipt_protocol_version=(
+                    ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION),
+                reserved_fill_actuation_mode=(
+                    zero_cost_actuation.ActuationMode.DURABLE_INTENT.value),
+                reserved_fill_actuation_epoch=1,
+                reserved_fill_actuation_capable=True,
+                reserved_fill_actuation_controller_incarnation=(
+                    controller_incarnation),
+                reserved_fill_actuation_protocol_version=1))
+
+    plan = reserved_fill_planner.ReservedFillPlanner.plan(
+        policy_revision=1,
+        reconcile_generation=1,
+        allocation_map=allocation,
+        service_incarnation=_SERVICE_HASH,
+        service_version=1,
+        controller_owner=controller_owner,
+        max_replicas=8,
+        planned_replicas=0,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+    assert len(plan.intents) == 1
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        allocation_engine)
+    receipt = repository.grant_plan(
+        _SERVICE,
+        plan,
+        max_capacity=8,
+        expected_controller_incarnation=controller_incarnation,
+        expected_controller_owner_epoch=controller_owner_epoch)
+    assert len(receipt.accepted) == 1
+    assert zero_cost_actuation.pending_pool_debits(
+        snapshot.pool_key,
+        engine=allocation_engine) == (zero_cost_actuation.PendingPoolDebit(
+            service_name=_SERVICE,
+            pool_key=snapshot.pool_key,
+            accelerator='a100-80gb',
+            replica_slots=1),)
+    lease = repository.lease_next(service_name=_SERVICE,
+                                  pool_key=snapshot.pool_key,
+                                  owner=uuid.uuid4(),
+                                  lease_seconds=30)
+    assert lease is not None
+    info = _typed_fill_replica(_SERVICE,
+                               1,
+                               snapshot,
+                               allocation,
+                               card=lease.intent.accelerator,
+                               intent_key=lease.intent.idempotency_key)
+
+    successor_snapshot = dataclasses.replace(snapshot,
+                                             grant_epoch=snapshot.grant_epoch +
+                                             1)
+    with allocation_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                serve_state_schema.reserved_fill_rounds_table).where(
+                    serve_state_schema.reserved_fill_rounds_table.c.pool_key ==
+                    snapshot.pool_key).values(
+                        epoch=successor_snapshot.grant_epoch))
+    successor_allocation = _repository(allocation_engine).publish(
+        _SERVICE,
+        expected_service_hash=_SERVICE_HASH,
+        expected_controller_owner=_OWNER,
+        expected_claim_generation=11,
+        expected_gate_generation=1,
+        pool_snapshots=(successor_snapshot,))
+    assert successor_allocation is not None
+    assert (successor_allocation.allocation_generation
+            > allocation.allocation_generation)
+
+    assert _stage_durable_fill(allocation_engine, _SERVICE, 1, info, lease)
+    with allocation_engine.connect() as connection:
+        intent_state = connection.execute(
+            sqlalchemy.select(
+                zero_cost_actuation._INTENTS.c.state)).scalar_one()
+    assert intent_state == zero_cost_actuation.IntentState.COMMITTED.value
+    assert _persisted_replica_count(allocation_engine) == 1
 
 
 def test_peer_fill_advances_only_total_and_remains_observable(
@@ -1175,25 +1643,40 @@ def test_peer_fill_advances_only_total_and_remains_observable(
         connection.execute(
             serve_state_schema.reserved_fill_lease_table.insert().values(
                 id=1, epoch=7))
+    peer_controller_owner = _activate_durable_intent_service(
+        allocation_engine,
+        service_name=_PEER_SERVICE,
+        service_hash=_PEER_HASH,
+        controller_owner=_PEER_OWNER,
+        controller_port=_PEER_CONTROLLER_PORT,
+        controller_incarnation=_PEER_CONTROLLER_INCARNATION)
+    plan = _plan_durable_fill(peer_allocation,
+                              peer_controller_owner,
+                              service_hash=_PEER_HASH,
+                              max_replicas=1)
+    actuation_repository, receipt = _grant_durable_plan(
+        allocation_engine,
+        _PEER_SERVICE,
+        plan,
+        max_capacity=1,
+        controller_incarnation=_PEER_CONTROLLER_INCARNATION)
+    assert len(receipt.accepted) == 1
+    lease = _lease_next(actuation_repository, _PEER_SERVICE,
+                        peer_snapshot.pool_key)
+    assert lease is not None
 
     peer_fill = _typed_fill_replica(_PEER_SERVICE,
                                     1,
                                     peer_snapshot,
                                     peer_allocation,
-                                    card='H200')
-    assert serve_state.add_replica_if_round_epoch(
-        _PEER_SERVICE,
-        1,
-        peer_fill,
-        pool_key=peer_snapshot.pool_key,
-        expected_epoch=23,
-        expected_service_hash=_PEER_HASH,
-        expected_controller_owner=_PEER_OWNER,
-        expected_protocol_version=reserved_capacity_broker.PROTOCOL_V2,
-        expected_service_generation=11,
-        expected_physical_cluster_uid=_UID,
-        expected_ordinary_zero_cost_admission_sequence=0,
-        expected_lease_token=7)
+                                    card=lease.intent.accelerator,
+                                    intent_key=lease.intent.idempotency_key)
+    assert _stage_durable_fill(allocation_engine,
+                               _PEER_SERVICE,
+                               1,
+                               peer_fill,
+                               lease,
+                               controller_owner=_PEER_OWNER)
     with allocation_engine.connect() as connection:
         sequences = connection.execute(
             sqlalchemy.text("""
@@ -1254,21 +1737,21 @@ def test_fill_persist_rejects_service_wide_intent_replay(
                                    },
                                    free_slots=2)
     allocation = _publish_current_allocation(allocation_engine, snapshot)
-    first = _typed_fill_replica(_SERVICE,
-                                1,
-                                snapshot,
-                                allocation,
-                                card='A100-80GB',
-                                intent_key='d' * 64)
-    replay = _typed_fill_replica(_SERVICE,
-                                 2,
-                                 snapshot,
-                                 allocation,
-                                 card='H200',
-                                 intent_key='d' * 64)
+    controller_owner = _activate_durable_intent_service(allocation_engine)
+    plan = _plan_durable_fill(allocation, controller_owner, max_replicas=1)
+    repository, receipt = _grant_durable_plan(allocation_engine,
+                                              _SERVICE,
+                                              plan,
+                                              max_capacity=1)
+    assert len(receipt.accepted) == 1
+    lease = _lease_next(repository, _SERVICE, snapshot.pool_key)
+    assert lease is not None
+    first = _typed_fill_for_lease(_SERVICE, 1, snapshot, allocation, lease)
+    replay = _typed_fill_for_lease(_SERVICE, 2, snapshot, allocation, lease)
 
-    assert _persist_typed_fill(snapshot, 1, first)
-    assert not _persist_typed_fill(snapshot, 2, replay)
+    assert _stage_durable_fill(allocation_engine, _SERVICE, 1, first, lease)
+    assert not _stage_durable_fill(allocation_engine, _SERVICE, 2, replay,
+                                   lease)
     assert _persisted_replica_count(allocation_engine) == 1
 
 
@@ -1282,29 +1765,25 @@ def test_fill_persist_enforces_exact_card_slots_before_aggregate_exhaustion(
                                    },
                                    free_slots=2)
     allocation = _publish_current_allocation(allocation_engine, snapshot)
-    a100 = _typed_fill_replica(_SERVICE,
-                               1,
-                               snapshot,
-                               allocation,
-                               card='A100-80GB',
-                               intent_key='d' * 64)
-    second_a100 = _typed_fill_replica(_SERVICE,
-                                      2,
-                                      snapshot,
-                                      allocation,
-                                      card='A100-80GB',
-                                      intent_key='e' * 64)
-    h200 = _typed_fill_replica(_SERVICE,
-                               3,
-                               snapshot,
-                               allocation,
-                               card='H200',
-                               intent_key='f' * 64)
-
-    assert _persist_typed_fill(snapshot, 1, a100)
-    assert not _persist_typed_fill(snapshot, 2, second_a100)
-    # The rejected A100 debit must not spend the aggregate H200 slot.
-    assert _persist_typed_fill(snapshot, 3, h200)
+    controller_owner = _activate_durable_intent_service(allocation_engine)
+    plan = _plan_durable_fill(allocation, controller_owner, max_replicas=3)
+    # The planner is the sole exact-card spender.  It can issue one authority
+    # for each card, never a second A100 authority that consumes H200 feed.
+    assert sorted(intent.accelerator.casefold() for intent in plan.intents) == [
+        'a100-80gb', 'h200'
+    ]
+    repository, receipt = _grant_durable_plan(allocation_engine,
+                                              _SERVICE,
+                                              plan,
+                                              max_capacity=3)
+    assert len(receipt.accepted) == 2
+    for replica_id in range(1, 3):
+        lease = _lease_next(repository, _SERVICE, snapshot.pool_key)
+        assert lease is not None
+        info = _typed_fill_for_lease(_SERVICE, replica_id, snapshot, allocation,
+                                     lease)
+        assert _stage_durable_fill(allocation_engine, _SERVICE, replica_id,
+                                   info, lease)
     assert _persisted_replica_count(allocation_engine) == 2
 
 
@@ -1318,30 +1797,24 @@ def test_fill_persist_enforces_aggregate_snapshot_slots(allocation_engine,
                                    },
                                    free_slots=2)
     allocation = _publish_current_allocation(allocation_engine, snapshot)
-    candidates = (
-        _typed_fill_replica(_SERVICE,
-                            1,
-                            snapshot,
-                            allocation,
-                            card='A100-80GB',
-                            intent_key='d' * 64),
-        _typed_fill_replica(_SERVICE,
-                            2,
-                            snapshot,
-                            allocation,
-                            card='H200',
-                            intent_key='e' * 64),
-        _typed_fill_replica(_SERVICE,
-                            3,
-                            snapshot,
-                            allocation,
-                            card='A100-80GB',
-                            intent_key='f' * 64),
-    )
-
-    assert _persist_typed_fill(snapshot, 1, candidates[0])
-    assert _persist_typed_fill(snapshot, 2, candidates[1])
-    assert not _persist_typed_fill(snapshot, 3, candidates[2])
+    controller_owner = _activate_durable_intent_service(allocation_engine)
+    plan = _plan_durable_fill(allocation, controller_owner, max_replicas=3)
+    # Two aggregate slots produce exactly two durable authorities; there is
+    # no third object that can reach replica/request admission.
+    assert len(plan.intents) == 2
+    repository, receipt = _grant_durable_plan(allocation_engine,
+                                              _SERVICE,
+                                              plan,
+                                              max_capacity=3)
+    assert len(receipt.accepted) == 2
+    for replica_id in range(1, 3):
+        lease = _lease_next(repository, _SERVICE, snapshot.pool_key)
+        assert lease is not None
+        info = _typed_fill_for_lease(_SERVICE, replica_id, snapshot, allocation,
+                                     lease)
+        assert _stage_durable_fill(allocation_engine, _SERVICE, replica_id,
+                                   info, lease)
+    assert _lease_next(repository, _SERVICE, snapshot.pool_key) is None
     assert _persisted_replica_count(allocation_engine) == 2
 
 
@@ -1362,23 +1835,22 @@ def test_fill_persist_enforces_locked_durable_service_maximum(
                                    },
                                    free_slots=2)
     allocation = _publish_current_allocation(allocation_engine, snapshot)
-    first = _typed_fill_replica(_SERVICE,
-                                1,
-                                snapshot,
-                                allocation,
-                                card='A100-80GB',
-                                intent_key='d' * 64)
-    above_max = _typed_fill_replica(_SERVICE,
-                                    2,
-                                    snapshot,
-                                    allocation,
-                                    card='H200',
-                                    intent_key='e' * 64)
-
-    assert _persist_typed_fill(snapshot, 1, first)
-    # H200 still has authenticated pool/card capacity; only max_replicas is
-    # exhausted by the first durable row.
-    assert not _persist_typed_fill(snapshot, 2, above_max)
+    controller_owner = _activate_durable_intent_service(allocation_engine)
+    # Exercise the repository's locked maximum with a valid two-intent plan.
+    # H200 still has authenticated feed, but the durable grant ceiling is one.
+    plan = _plan_durable_fill(allocation, controller_owner, max_replicas=2)
+    assert len(plan.intents) == 2
+    repository, receipt = _grant_durable_plan(allocation_engine,
+                                              _SERVICE,
+                                              plan,
+                                              max_capacity=1)
+    assert len(receipt.accepted) == 1
+    assert len(receipt.deferred) == 1
+    lease = _lease_next(repository, _SERVICE, snapshot.pool_key)
+    assert lease is not None
+    first = _typed_fill_for_lease(_SERVICE, 1, snapshot, allocation, lease)
+    assert _stage_durable_fill(allocation_engine, _SERVICE, 1, first, lease)
+    assert _lease_next(repository, _SERVICE, snapshot.pool_key) is None
     assert _persisted_replica_count(allocation_engine) == 1
 
 
@@ -1389,20 +1861,29 @@ def test_fill_persist_rejects_locked_launch_blocking_service_without_effects(
                                    feed_by_accelerator={'a100-80gb': 1},
                                    free_slots=1)
     allocation = _publish_current_allocation(allocation_engine, snapshot)
-    candidate = _typed_fill_replica(_SERVICE,
-                                    1,
-                                    snapshot,
-                                    allocation,
-                                    card='A100-80GB')
+    controller_owner = _activate_durable_intent_service(allocation_engine)
+    plan = _plan_durable_fill(allocation, controller_owner, max_replicas=1)
+    repository, receipt = _grant_durable_plan(allocation_engine,
+                                              _SERVICE,
+                                              plan,
+                                              max_capacity=1)
+    assert len(receipt.accepted) == 1
+    lease = _lease_next(repository, _SERVICE, snapshot.pool_key)
+    assert lease is not None
+    candidate = _typed_fill_for_lease(_SERVICE, 1, snapshot, allocation, lease)
     with allocation_engine.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.services_table).where(
                 serve_state_schema.services_table.c.name == _SERVICE).values(
                     status=serve_state.ServiceStatus.SHUTTING_DOWN.value))
 
-    assert not _persist_typed_fill(snapshot, 1, candidate)
+    assert not _stage_durable_fill(allocation_engine, _SERVICE, 1, candidate,
+                                   lease)
     assert _persisted_replica_count(allocation_engine) == 0
     with allocation_engine.connect() as connection:
+        intent_state = connection.execute(
+            sqlalchemy.select(
+                zero_cost_actuation._INTENTS.c.state)).scalar_one()
         sequences = connection.execute(
             sqlalchemy.text("""
                 SELECT zero_cost_admission_sequence,
@@ -1410,6 +1891,7 @@ def test_fill_persist_rejects_locked_launch_blocking_service_without_effects(
                 FROM reserved_fill_protocol_state
                 WHERE id = 1
             """)).one()
+    assert intent_state == zero_cost_actuation.IntentState.ACTUATING.value
     assert tuple(sequences) == (0, 0)
 
 
@@ -1426,33 +1908,45 @@ def test_fill_persist_separates_physical_slot_debit_from_logical_ceiling(
                                    free_slots=17,
                                    broker_slot_width=8)
     allocation = _publish_current_allocation(allocation_engine, snapshot)
-    malformed_width = _typed_fill_replica(_SERVICE,
-                                          1,
-                                          snapshot,
-                                          allocation,
-                                          card='H200',
-                                          intent_key='d' * 64,
-                                          planned_capacity=1)
-    exact_width = _typed_fill_replica(_SERVICE,
-                                      2,
-                                      snapshot,
-                                      allocation,
-                                      card='H200',
-                                      intent_key='e' * 64,
-                                      planned_capacity=8)
-    above_logical_max = _typed_fill_replica(_SERVICE,
-                                            3,
-                                            snapshot,
-                                            allocation,
-                                            card='H200',
-                                            intent_key='f' * 64,
-                                            planned_capacity=8)
+    controller_owner = _activate_durable_intent_service(allocation_engine)
+    plan = _plan_durable_fill(
+        allocation,
+        controller_owner,
+        max_replicas=8,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.LOGICAL)
+    assert len(plan.intents) == 1
+    repository, receipt = _grant_durable_plan(allocation_engine,
+                                              _SERVICE,
+                                              plan,
+                                              max_capacity=8)
+    assert len(receipt.accepted) == 1
+    lease = _lease_next(repository, _SERVICE, snapshot.pool_key)
+    assert lease is not None
+    malformed_width = _typed_fill_for_lease(_SERVICE, 1, snapshot, allocation,
+                                            lease)
+    malformed_width.planned_capacity = 1
+    assert not _stage_durable_fill(allocation_engine, _SERVICE, 1,
+                                   malformed_width, lease)
+    exact_width = _typed_fill_for_lease(_SERVICE, 2, snapshot, allocation,
+                                        lease)
+    assert _stage_durable_fill(allocation_engine, _SERVICE, 2, exact_width,
+                               lease)
 
-    assert not _persist_typed_fill(snapshot, 1, malformed_width)
-    assert _persist_typed_fill(snapshot, 2, exact_width)
-    # One physical slot remains, but the first width-eight row consumed the
-    # complete logical max_replicas budget.
-    assert not _persist_typed_fill(snapshot, 3, above_logical_max)
+    # A fresh plan can describe the remaining physical slot, but grant
+    # admission locks the committed width-eight row and defers that intent at
+    # the logical service maximum.
+    expanded_plan = _plan_durable_fill(
+        allocation,
+        controller_owner,
+        max_replicas=16,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.LOGICAL)
+    assert len(expanded_plan.intents) == 2
+    _, expanded_receipt = _grant_durable_plan(allocation_engine,
+                                              _SERVICE,
+                                              expanded_plan,
+                                              max_capacity=8)
+    assert len(expanded_receipt.accepted) == 1
+    assert len(expanded_receipt.deferred) == 1
     assert _persisted_replica_count(allocation_engine) == 1
 
 
@@ -1463,25 +1957,24 @@ def test_concurrent_fill_persists_serialize_one_physical_slot(
                                    feed_by_accelerator={'a100-80gb': 1},
                                    free_slots=1)
     allocation = _publish_current_allocation(allocation_engine, snapshot)
-    candidates = (
-        _typed_fill_replica(_SERVICE,
-                            1,
-                            snapshot,
-                            allocation,
-                            card='A100-80GB',
-                            intent_key='d' * 64),
-        _typed_fill_replica(_SERVICE,
-                            2,
-                            snapshot,
-                            allocation,
-                            card='A100-80GB',
-                            intent_key='e' * 64),
-    )
+    controller_owner = _activate_durable_intent_service(allocation_engine)
+    plan = _plan_durable_fill(allocation, controller_owner, max_replicas=1)
+    repository, receipt = _grant_durable_plan(allocation_engine,
+                                              _SERVICE,
+                                              plan,
+                                              max_capacity=1)
+    assert len(receipt.accepted) == 1
+    lease = _lease_next(repository, _SERVICE, snapshot.pool_key)
+    assert lease is not None
+    candidates = tuple(
+        _typed_fill_for_lease(_SERVICE, replica_id, snapshot, allocation, lease)
+        for replica_id in (1, 2))
     barrier = threading.Barrier(2)
 
     def _race(replica_id: int, info: replica_managers.ReplicaInfo) -> bool:
         barrier.wait(timeout=10)
-        return _persist_typed_fill(snapshot, replica_id, info)
+        return _stage_durable_fill(allocation_engine, _SERVICE, replica_id,
+                                   info, lease)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         futures = [

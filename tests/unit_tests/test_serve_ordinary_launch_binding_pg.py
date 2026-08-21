@@ -15,14 +15,21 @@ from sqlalchemy.dialects import postgresql
 from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
+from sky import global_user_state_schema
+from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
+from sky.serve import demand_state
 from sky.serve import ordinary_launch_binding as binding
 from sky.serve import replica_managers
+from sky.serve import route_projection
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import serve_statuses
+from sky.serve import service_spec
 from sky.serve import system_recovery_state
+from sky.serve import zero_cost_actuation
 from sky.server.requests import payloads
+from sky.skylet import constants as skylet_constants
 from sky.utils import common_utils
 from sky.utils.db import migration_utils
 
@@ -126,6 +133,264 @@ def binding_database(empty_postgres, monkeypatch):
                 is_spot=False,
                 replica_state=_stored_replica_state()))
     return empty_postgres
+
+
+def _register_fresh_service(
+    engine,
+    name: str,
+    *,
+    lifecycle_epoch: int,
+    pool: bool = False,
+    status: serve_statuses.ServiceStatus = serve_statuses.ServiceStatus.
+    CONTROLLER_INIT,
+    owner_user_id: str | None = 'owner-a',
+    owner_user_name: str | None = 'Owner A',
+) -> bool:
+    with engine.begin() as connection:
+        if owner_user_id is not None and owner_user_name is not None:
+            connection.execute(
+                postgresql.insert(global_user_state_schema.user_table).values(
+                    id=owner_user_id,
+                    name=owner_user_name,
+                    created_at=int(time.time())).
+                on_conflict_do_nothing(
+                    index_elements=[global_user_state_schema.user_table.c.id]))
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.service_lifecycle_fences_table).values(
+                    name=name, epoch=lifecycle_epoch))
+    spec = service_spec.SkyServiceSpec.from_yaml_config({
+        'pool': {},
+        'workers': 1
+    } if pool else {'replicas': 1})
+    return serve_state.add_service(name,
+                                   controller_job_id=1,
+                                   policy='policy',
+                                   requested_resources_str='H200:1',
+                                   load_balancing_policy='round_robin',
+                                   status=status,
+                                   tls_encrypted=False,
+                                   pool=pool,
+                                   controller_pid=321,
+                                   controller_ip='10.0.0.3',
+                                   entrypoint='python app.py',
+                                   spec=spec,
+                                   yaml_content='service:\n  replicas: 1\n',
+                                   workspace='workspace-a',
+                                   service_hash=f'{name}-hash',
+                                   lifecycle_epoch=lifecycle_epoch,
+                                   resource_scope=f'{name}-hash',
+                                   owner_user_id=owner_user_id,
+                                   owner_user_name=owner_user_name)
+
+
+def test_fresh_postgres_non_pool_is_born_on_one_canonical_authority(
+        binding_database) -> None:
+    engine = binding_database
+    assert _register_fresh_service(engine, 'fresh', lifecycle_epoch=9)
+
+    services = serve_state_schema.services_table
+    versions = serve_state_schema.version_specs_table
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(services).where(
+                services.c.name == 'fresh')).mappings().one()
+        version = connection.execute(
+            sqlalchemy.select(versions).where(
+                versions.c.service_name == 'fresh')).mappings().one()
+
+    birth_incarnation = row['controller_incarnation']
+    assert isinstance(birth_incarnation, uuid.UUID)
+    assert row['controller_owner_epoch'] == 1
+    assert row['status'] == serve_statuses.ServiceStatus.CONTROLLER_INIT.value
+    assert row['controller_port'] is None
+    assert row['ordinary_launch_binding_capable'] is True
+    assert row[
+        'ordinary_launch_binding_mode'] == binding.BindingMode.BOUND.value
+    assert row['ordinary_launch_binding_epoch'] == 1
+    assert row['non_pool_launch_binding_capable'] is True
+    assert row['non_pool_launch_controller_incarnation'] == birth_incarnation
+    assert (row['non_pool_launch_binding_protocol_version'] ==
+            binding.NON_POOL_BINDING_PROTOCOL_VERSION)
+    assert (row['non_pool_launch_capability_profile_set_digest'] ==
+            binding.supported_non_pool_profile_set_digest())
+    assert (row['non_pool_launch_capability_cohort_epoch'] ==
+            binding.NON_POOL_CAPABILITY_COHORT_EPOCH)
+    assert (row['non_pool_launch_receipt_protocol_version'] ==
+            binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)
+    assert row['route_source_mode'] == 'DURABLE_PROJECTED'
+    assert row['route_source_epoch'] == 1
+    assert row['route_projection_capable'] is True
+    assert row['route_projection_controller_incarnation'] == birth_incarnation
+    assert (row['route_projection_protocol_version'] ==
+            route_projection.INCREMENTAL_PRODUCER_PROTOCOL_VERSION)
+    assert (row['demand_source_mode'] ==
+            capacity_admission.DemandSourceMode.DURABLE_FEED.value)
+    assert row['demand_source_epoch'] == 1
+    assert row['demand_authority_capable'] is True
+    assert row['demand_authority_controller_incarnation'] == birth_incarnation
+    assert (row['demand_authority_protocol_version'] ==
+            capacity_admission.PROTOCOL_VERSION)
+    assert (row['reserved_fill_actuation_mode'] ==
+            zero_cost_actuation.ActuationMode.DURABLE_INTENT.value)
+    assert row['reserved_fill_actuation_epoch'] == 1
+    assert row['reserved_fill_actuation_capable'] is True
+    assert (row['reserved_fill_actuation_controller_incarnation'] ==
+            birth_incarnation)
+    assert (row['reserved_fill_actuation_protocol_version'] ==
+            zero_cost_actuation.PROTOCOL_VERSION)
+    assert version['version'] == serve_constants.INITIAL_VERSION
+    assert version['yaml_content'] == 'service:\n  replicas: 1\n'
+
+
+@pytest.mark.parametrize(
+    ('owner_user_id', 'owner_user_name'),
+    ((None, None), ('explicit-owner', None), (None, 'Explicit Owner')),
+)
+def test_fresh_postgres_birth_requires_exact_explicit_owner(
+        binding_database, monkeypatch, owner_user_id, owner_user_name) -> None:
+    # An existing ambient user must not supply either half of immutable tenant
+    # authority. The service creator passes the complete tuple explicitly.
+    with binding_database.begin() as connection:
+        connection.execute(
+            postgresql.insert(global_user_state_schema.user_table).values(
+                id='ambient-owner',
+                name='Ambient Owner',
+                created_at=int(time.time())).on_conflict_do_nothing(
+                    index_elements=[global_user_state_schema.user_table.c.id]))
+    monkeypatch.setenv(skylet_constants.USER_ID_ENV_VAR, 'ambient-owner')
+    monkeypatch.setenv(skylet_constants.USER_ENV_VAR, 'Ambient Owner')
+
+    with pytest.raises(ValueError, match='owner_user_'):
+        _register_fresh_service(binding_database,
+                                'missing-owner',
+                                lifecycle_epoch=12,
+                                owner_user_id=owner_user_id,
+                                owner_user_name=owner_user_name)
+
+    with binding_database.connect() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table.c.name).where(
+                serve_state_schema.services_table.c.name ==
+                'missing-owner')).one_or_none()
+    assert service is None
+
+
+def test_legacy_postgres_registration_can_remain_ownerless(
+        binding_database) -> None:
+    spec = service_spec.SkyServiceSpec.from_yaml_config({'replicas': 1})
+
+    assert serve_state.add_service('legacy-ownerless',
+                                   controller_job_id=1,
+                                   policy='policy',
+                                   requested_resources_str='H200:1',
+                                   load_balancing_policy='round_robin',
+                                   status=serve_statuses.ServiceStatus.READY,
+                                   tls_encrypted=False,
+                                   pool=False,
+                                   controller_pid=321,
+                                   entrypoint='python app.py',
+                                   spec=spec,
+                                   yaml_content='service:\n  replicas: 1\n')
+
+    with binding_database.connect() as connection:
+        owner = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.services_table.c.owner_user_id,
+                serve_state_schema.services_table.c.owner_user_name).where(
+                    serve_state_schema.services_table.c.name ==
+                    'legacy-ownerless')).one()
+    assert owner == (None, None)
+
+
+def test_fresh_canonical_claim_rebinds_capacity_and_waits_for_new_route(
+        binding_database) -> None:
+    engine = binding_database
+    assert _register_fresh_service(engine, 'fresh-claim', lifecycle_epoch=10)
+    services = serve_state_schema.services_table
+    with engine.connect() as connection:
+        birth_incarnation = connection.execute(
+            sqlalchemy.select(services.c.controller_incarnation).where(
+                services.c.name == 'fresh-claim')).scalar_one()
+
+    claimed_incarnation = uuid.uuid4()
+    authority = binding.claim_controller_incarnation(
+        'fresh-claim',
+        'fresh-claim-hash', (321, '10.0.0.3'),
+        claimed_incarnation,
+        new_parent_owner=(321, '10.0.0.3'),
+        expected_lifecycle_epoch=10,
+        expected_status=serve_statuses.ServiceStatus.CONTROLLER_INIT,
+        expected_recovery_version=serve_constants.INITIAL_VERSION)
+
+    assert authority is not None
+    assert authority.binding_mode is binding.BindingMode.BOUND
+    assert authority.binding_epoch == 1
+    assert authority.generic_launches_required
+    with binding.refresh_controller_authority(authority) as refreshed:
+        assert refreshed == authority
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(services).where(
+                services.c.name == 'fresh-claim')).mappings().one()
+    assert row['controller_incarnation'] == claimed_incarnation
+    assert row['controller_owner_epoch'] == 2
+    assert (
+        row['non_pool_launch_controller_incarnation'] == claimed_incarnation)
+    assert (
+        row['demand_authority_controller_incarnation'] == claimed_incarnation)
+    assert (row['reserved_fill_actuation_controller_incarnation'] ==
+            claimed_incarnation)
+    # Route capability is deliberately not blessed by ownership transfer.
+    # The child must publish a fresh owner-fenced generation first.
+    assert row['route_projection_controller_incarnation'] == birth_incarnation
+    assert demand_state.get_autoscaling_snapshot('fresh-claim',
+                                                 'fresh-claim-hash') is None
+    with pytest.raises(route_projection.RouteProjectionUnavailable):
+        route_projection.RouteProjectionRepository(engine).resolve_sync(
+            'fresh-claim', 'fresh-claim-hash', 'fresh-session')
+
+
+def test_lifecycle_fenced_pool_preserves_separate_legacy_authority(
+        binding_database) -> None:
+    engine = binding_database
+    assert _register_fresh_service(engine,
+                                   'fresh-pool',
+                                   lifecycle_epoch=11,
+                                   pool=True)
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'fresh-pool')).mappings().one()
+    assert row['ordinary_launch_binding_capable'] is False
+    assert row[
+        'ordinary_launch_binding_mode'] == binding.BindingMode.LEGACY.value
+    assert row['ordinary_launch_binding_epoch'] == 0
+    assert row['non_pool_launch_binding_capable'] is False
+    assert row['route_source_mode'] == 'LEGACY_PROXY'
+    assert row['demand_source_mode'] == 'LEGACY_CONTROLLER'
+    assert row['reserved_fill_actuation_mode'] == 'DIRECT_REPLICA'
+
+
+def test_canonical_birth_rejects_non_initializing_status_without_rows(
+        binding_database) -> None:
+    engine = binding_database
+    with pytest.raises(ValueError, match='CONTROLLER_INIT'):
+        _register_fresh_service(engine,
+                                'fresh-ready',
+                                lifecycle_epoch=12,
+                                status=serve_statuses.ServiceStatus.READY)
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table.c.name).where(
+                serve_state_schema.services_table.c.name ==
+                'fresh-ready')).scalar_one_or_none() is None
+        assert connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.version_specs_table.c.service_name).where(
+                    serve_state_schema.version_specs_table.c.service_name ==
+                    'fresh-ready')).scalar_one_or_none() is None
 
 
 def _unbound_context() -> dict[str, object]:
@@ -427,7 +692,8 @@ def _generic_controller_authority() -> binding.ControllerBindingAuthority:
 
 def _admit_generic_paid(
     database,
-) -> tuple[binding.NonPoolBindingIdentity, binding.BoundNonPoolLaunchContext]:
+) -> tuple[binding.NonPoolBindingIdentity, binding.BoundNonPoolLaunchContext,
+           dict[str, object]]:
     with database.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.replicas_table).where(
@@ -488,13 +754,160 @@ def _admit_generic_paid(
         admission = binding.insert_or_get_locked(connection, identity)
     binding.install_bound_non_pool_context(launch_body, identity,
                                            admission.launch_generation)
-    return identity, binding.parse_bound_non_pool_launch_context(
-        launch_body.extra_launch_context)
+    return (identity,
+            binding.parse_bound_non_pool_launch_context(
+                launch_body.extra_launch_context),
+            dict(launch_body.extra_launch_context))
+
+
+def test_serve056_previous_cohort_settles_but_cannot_start_provider_effect(
+        binding_database, monkeypatch) -> None:
+    current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    assert current_cohort > 1
+    with monkeypatch.context() as old_code:
+        old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                         current_cohort - 1)
+        identity, context, launch_context = _admit_generic_paid(
+            binding_database)
+
+    authority = dataclasses.replace(
+        _generic_controller_authority(),
+        non_pool_capability_cohort_epoch=current_cohort - 1)
+    assert not authority.generic_launches_required
+    assert authority.retained_non_pool_settlement_allowed
+    with binding_database.begin() as connection:
+        association = binding.lock_reduction_authority_in_connection(
+            connection, context)
+    assert association['association_id'] == identity.association_id
+
+    claim = _Claim(identity.request_id, 1, str(uuid.uuid4()), str(uuid.uuid4()))
+    entered = False
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='exact generic launch cohort'):
+        with binding.non_pool_provider_effect_guard(
+                launch_context,
+                claim,
+                claim_validator=lambda _connection, _association_id, _claim:
+                True):
+            entered = True
+    assert not entered
+    with binding_database.connect() as connection:
+        phase = connection.execute(
+            sqlalchemy.select(
+                binding.ordinary_launch_associations_table.c.effect_phase).
+            where(binding.ordinary_launch_associations_table.c.association_id ==
+                  identity.association_id)).scalar_one()
+    assert phase == binding.EffectPhase.NOT_STARTED.value
+
+
+def test_serve056_previous_cohort_retires_pre_admission_replica(
+        binding_database, monkeypatch) -> None:
+    current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    with monkeypatch.context() as old_code:
+        old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                         current_cohort - 1)
+        with binding_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status='READY'))
+            assert binding.promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                expected_binding_epoch=5,
+                participant_barrier_passed=lambda _connection: True,
+                legacy_requests_drained=lambda _connection: True) == 6
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status='PROVISIONING',
+                        paid_capacity_pool_key='pool-a',
+                        replica_state=_stored_replica_state(
+                            {'paid_capacity_pool_key': 'pool-a'})))
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_pools_table).values(
+                        pool_key='pool-a',
+                        current_limit=1,
+                        successes_since_resize=0,
+                        updated_at=time.time()))
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_claims_table).values(
+                        service_name='svc',
+                        service_hash='svc-hash',
+                        replica_id=3,
+                        pool_key='pool-a',
+                        priority=1,
+                        claimed_at=time.time()))
+
+    authority = dataclasses.replace(
+        _generic_controller_authority(),
+        non_pool_capability_cohort_epoch=current_cohort - 1)
+    retirement = binding.retire_pre_admission_non_pool_launch_intent(
+        authority, 3, _RECORD_ID)
+    assert retirement.disposition is (
+        binding.PreAdmissionRetirementDisposition.RETIRED)
+    assert retirement.profile_kind is (
+        binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    with binding_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.replicas_table)).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table)).scalar_one(
+                ) == 0
+
+
+def test_serve056_previous_cohort_reconciles_ambiguous_provider_action(
+        binding_database, monkeypatch) -> None:
+    current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    with monkeypatch.context() as old_code:
+        old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                         current_cohort - 1)
+        identity, context, launch_context = _admit_generic_paid(
+            binding_database)
+        claim = _Claim(identity.request_id, 1, str(uuid.uuid4()),
+                       str(uuid.uuid4()))
+        with binding.non_pool_provider_effect_guard(
+                launch_context,
+                claim,
+                claim_validator=lambda _connection, _association_id, _claim:
+                True):
+            pass
+
+    authority = dataclasses.replace(
+        _generic_controller_authority(),
+        non_pool_capability_cohort_epoch=current_cohort - 1)
+    with binding_database.begin() as connection:
+        assert binding.mark_ambiguous_in_connection(
+            connection, context, 'old-cohort-provider-result-uncertain')
+    assert binding.list_provider_reconciliation_contexts(authority) == [context]
+
+    terminal = binding.TerminalEvidence(status=binding.TerminalStatus.CANCELLED,
+                                        cause='execution_lease_expired',
+                                        execution_generation=1,
+                                        quiescence_required=True,
+                                        quiesced_generation=1,
+                                        quiesced_at=datetime.datetime.now(
+                                            datetime.timezone.utc))
+    with binding_database.begin() as connection:
+        assert binding.record_non_pool_provider_evidence(
+            connection, context, authority, binding.ProviderEvidence.UNKNOWN, {
+                'cluster_name': 'svc-3',
+                'probe_contract': 'test-provider-v1',
+                'result': 'UNKNOWN',
+            }, lambda _connection, _context: terminal)
 
 
 def test_serve047_provider_evidence_is_owner_fenced_and_monotonic(
         binding_database) -> None:
-    identity, context = _admit_generic_paid(binding_database)
+    identity, context, _ = _admit_generic_paid(binding_database)
     with binding_database.begin() as connection:
         assert binding.mark_ambiguous_in_connection(
             connection, context, 'provider-result-uncertain')
@@ -681,7 +1094,8 @@ def test_serve047_generic_capability_transition_is_adjacent_and_reversible(
     assert service['non_pool_launch_binding_protocol_version'] == 2
     assert service['non_pool_launch_capability_profile_set_digest'] == (
         binding.supported_non_pool_profile_set_digest())
-    assert service['non_pool_launch_capability_cohort_epoch'] == 1
+    assert service['non_pool_launch_capability_cohort_epoch'] == (
+        binding.NON_POOL_CAPABILITY_COHORT_EPOCH)
     assert service['non_pool_launch_receipt_protocol_version'] == 1
 
     with binding_database.begin() as connection:
@@ -707,6 +1121,137 @@ def test_serve047_generic_capability_transition_is_adjacent_and_reversible(
     assert service['non_pool_launch_receipt_protocol_version'] is None
 
 
+def test_serve056_rotates_generic_cohort_only_after_new_fleet_and_drain(
+        binding_database, monkeypatch) -> None:
+    current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    assert current_cohort > 1
+    with monkeypatch.context() as old_code:
+        old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                         current_cohort - 1)
+        with binding_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status='READY'))
+            assert binding.promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                expected_binding_epoch=5,
+                participant_barrier_passed=lambda _connection: True,
+                legacy_requests_drained=lambda _connection: True) == 6
+
+    with pytest.raises(binding.OrdinaryLaunchBindingUnavailable,
+                       match='exact new fleet cohort'):
+        with binding_database.begin() as connection:
+            binding.promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                expected_binding_epoch=6,
+                participant_barrier_passed=lambda _connection: False,
+                legacy_requests_drained=lambda _connection: True)
+
+    with binding_database.begin() as connection:
+        rotated_epoch = binding.promote_non_pool_launch_service_in_connection(
+            connection,
+            service_name='svc',
+            controller_incarnation=_CONTROLLER_ID,
+            controller_owner_epoch=6,
+            expected_binding_epoch=6,
+            participant_barrier_passed=lambda _connection: True,
+            legacy_requests_drained=lambda _connection: True)
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc')).mappings().one()
+
+    assert rotated_epoch == 7
+    assert service['ordinary_launch_binding_epoch'] == 7
+    assert service['non_pool_launch_capability_cohort_epoch'] == current_cohort
+
+
+def test_serve056_cohort_rotation_rejects_provisioning_replica(
+        binding_database, monkeypatch) -> None:
+    current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    assert current_cohort > 1
+    with monkeypatch.context() as old_code:
+        old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                         current_cohort - 1)
+        with binding_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status='READY'))
+            assert binding.promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                expected_binding_epoch=5,
+                participant_barrier_passed=lambda _connection: True,
+                legacy_requests_drained=lambda _connection: True) == 6
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status='PROVISIONING'))
+
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='no pending replicas'):
+        with binding_database.begin() as connection:
+            assert connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    binding.ordinary_launch_associations_table)).scalar_one(
+                    ) == 0
+            binding.promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                expected_binding_epoch=6,
+                participant_barrier_passed=lambda _connection: True,
+                legacy_requests_drained=lambda _connection: True)
+
+
+def test_serve056_cohort_rotation_rejects_unsettled_association(
+        binding_database, monkeypatch) -> None:
+    current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    assert current_cohort > 1
+    with monkeypatch.context() as old_code:
+        old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                         current_cohort - 1)
+        identity, _, _ = _admit_generic_paid(binding_database)
+
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='unsettled prior-cohort associations'):
+        with binding_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status='READY'))
+            association = connection.execute(
+                sqlalchemy.select(
+                    binding.ordinary_launch_associations_table.c.resolution).
+                where(binding.ordinary_launch_associations_table.c.
+                      association_id == identity.association_id)).scalar_one()
+            assert association in tuple(
+                value.value for value in binding.UNSETTLED_RESOLUTIONS)
+            binding.promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                expected_binding_epoch=6,
+                participant_barrier_passed=lambda _connection: True,
+                legacy_requests_drained=lambda _connection: True)
+
+
 def test_serve047_rejects_capability_change_without_binding_epoch_cas(
         binding_database) -> None:
     with pytest.raises(sqlalchemy.exc.DBAPIError,
@@ -720,7 +1265,8 @@ def test_serve047_rejects_capability_change_without_binding_epoch_cas(
                         non_pool_launch_binding_protocol_version=2,
                         non_pool_launch_capability_profile_set_digest=(
                             binding.supported_non_pool_profile_set_digest()),
-                        non_pool_launch_capability_cohort_epoch=1,
+                        non_pool_launch_capability_cohort_epoch=(
+                            binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
                         non_pool_launch_receipt_protocol_version=1))
 
 
@@ -1874,9 +2420,12 @@ def test_effect_guard_service_job_and_projection_are_monotonic(
         validations.append(association_id)
         return True
 
-    with binding.provider_effect_guard(body.extra_launch_context,
-                                       claim,
-                                       claim_validator=_validate):
+    with binding.provider_effect_guard(
+            body.extra_launch_context, claim,
+            claim_validator=_validate) as authorization:
+        assert authorization is not None
+        assert (authorization.durable_replica_info.replica_record_id == str(
+            identity.replica_record_id))
         binding.begin_service_job_io(body.extra_launch_context)
         binding.record_service_job(body.extra_launch_context, 17)
     assert validations == [identity.association_id] * 3

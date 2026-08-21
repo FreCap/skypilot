@@ -289,6 +289,22 @@ class TestEconomicDecisions:
             autoscalers.AutoscalerDecisionOperator.SCALE_UP
         ]
 
+    def test_cost_snapshot_failure_fails_closed(self):
+        scaler = _autoscaler()
+        placer, _, _, replicas = self._fleet(candidate_cost=0.1)
+        scaler.set_spot_placer(placer)
+        _report(scaler, replicas)
+
+        with mock.patch.object(placer,
+                               'known_location_costs',
+                               side_effect=RuntimeError('policy unavailable')):
+            decisions = _decisions(scaler, replicas)
+
+        assert not [
+            decision for decision in decisions if decision.operator ==
+            autoscalers.AutoscalerDecisionOperator.SCALE_UP
+        ]
+
     def test_lower_capacity_candidate_is_rejected(self):
         scaler = _autoscaler()
         placer, _, _, replicas = self._fleet(candidate_cost=0.1,
@@ -603,13 +619,13 @@ class TestEconomicDecisions:
             _spec(min_replicas=replica_count,
                   max_replicas=replica_count,
                   cost_rebalance_max_parallel_replacements=1))
-        scaler.set_spot_placer(
-            make_placer({
-                paid: 1.0,
-                **{
-                    location: 0.0 for location in cheap_locations
-                },
-            }))
+        placer = make_placer({
+            paid: 1.0,
+            **{
+                location: 0.0 for location in cheap_locations
+            },
+        })
+        scaler.set_spot_placer(placer)
         replicas = [
             _Replica(replica_id, paid, 1.0)
             for replica_id in range(replica_count)
@@ -617,9 +633,17 @@ class TestEconomicDecisions:
         _report(scaler, replicas)
 
         matcher = autoscalers.spot_placer.locations_match_placement
-        with mock.patch.object(autoscalers.spot_placer,
-                               'locations_match_placement',
-                               wraps=matcher) as matches:
+        with mock.patch.object(
+                autoscalers.spot_placer, 'locations_match_placement',
+                wraps=matcher) as matches, mock.patch.object(
+                    placer,
+                    '_workspace_eligible_locations',
+                    wraps=placer._workspace_eligible_locations
+                ) as eligibility, mock.patch.object(
+                    placer,
+                    'cost_per_hour',
+                    side_effect=AssertionError(
+                        'per-location cost lookup is forbidden')):
             launches = [
                 decision for decision in _decisions(scaler, replicas)
                 if decision.operator ==
@@ -631,6 +655,7 @@ class TestEconomicDecisions:
         # for the launched location.  The previous implementation rebuilt the
         # fleet load for every incumbent and exceeded 25,000 comparisons here.
         assert matches.call_count <= len(locations) * (2 * replica_count + 1)
+        eligibility.assert_called_once_with()
 
     def test_disabled_policy_does_not_downgrade_pending_strict_drain(self):
         scaler = _autoscaler()

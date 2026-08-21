@@ -1043,8 +1043,8 @@ def promote_service_in_connection(
                 service['non_pool_launch_capability_profile_set_digest'], str)
             or _SHA256_RE.fullmatch(
                 service['non_pool_launch_capability_profile_set_digest'])
-            is None or
-            service['non_pool_launch_capability_cohort_epoch'] != 1 or
+            is None or service['non_pool_launch_capability_cohort_epoch']
+            != constants.NON_POOL_CAPABILITY_COHORT_EPOCH or
             service['non_pool_launch_receipt_protocol_version'] != 1 or
             service['route_source_mode'] != 'DURABLE_PROJECTED' or
             service['route_source_epoch'] < 1 or

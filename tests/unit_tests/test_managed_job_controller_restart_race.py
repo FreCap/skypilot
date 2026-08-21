@@ -301,3 +301,80 @@ def test_pending_legacy_job_skips_controller_status_read(
 
     assert not get_status_calls
     assert not set_failed_calls
+
+
+def test_shared_controller_pid_is_probed_once_per_refresh_sweep(monkeypatch):
+    info = {
+        1: _make_status_check_info()[1],
+        2: {
+            **_make_status_check_info()[1],
+            'tasks': [{
+                **_make_status_check_info()[1]['tasks'][0],
+                'task_name': 'job-2',
+            }],
+        },
+    }
+    info[1]['controller_pid_started_at'] = 1000.0
+    info[2]['controller_pid_started_at'] = 1000.0
+    calls = []
+
+    _forbid_split_snapshot_helpers(monkeypatch)
+    monkeypatch.setattr(managed_job_state, 'get_current_controller_owner',
+                        lambda: None)
+    monkeypatch.setattr(managed_job_state,
+                        'get_jobs_to_check_status_info',
+                        lambda job_ids=None: info)
+    monkeypatch.setattr(utils, 'controller_process_alive',
+                        lambda record: calls.append(record) or True)
+    monkeypatch.setattr(managed_job_state,
+                        'set_failed_controller_if_current_snapshot',
+                        _unexpected('shared live controller failure write'))
+    monkeypatch.setattr(managed_job_state, 'get_job_status_check_state',
+                        _unexpected('shared live controller fresh reread'))
+    monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
+    _forbid_provider_cleanup(monkeypatch)
+
+    utils.update_managed_jobs_statuses(job_ids=[1, 2])
+
+    assert calls == [
+        managed_job_state.ControllerPidRecord(pid=123, started_at=1000.0)
+    ]
+
+
+def test_same_pid_different_start_times_do_not_share_probe_result(monkeypatch):
+    info = {
+        1: _make_status_check_info()[1],
+        2: {
+            **_make_status_check_info()[1],
+            'tasks': [{
+                **_make_status_check_info()[1]['tasks'][0],
+                'task_name': 'job-2',
+            }],
+        },
+    }
+    info[1]['controller_pid_started_at'] = 1000.0
+    info[2]['controller_pid_started_at'] = 2000.0
+    calls = []
+
+    _forbid_split_snapshot_helpers(monkeypatch)
+    monkeypatch.setattr(managed_job_state, 'get_current_controller_owner',
+                        lambda: None)
+    monkeypatch.setattr(managed_job_state,
+                        'get_jobs_to_check_status_info',
+                        lambda job_ids=None: info)
+    monkeypatch.setattr(utils, 'controller_process_alive',
+                        lambda record: calls.append(record) or True)
+    monkeypatch.setattr(managed_job_state,
+                        'set_failed_controller_if_current_snapshot',
+                        _unexpected('distinct controller incarnation failure'))
+    monkeypatch.setattr(managed_job_state, 'get_job_status_check_state',
+                        _unexpected('distinct controller incarnation reread'))
+    monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
+    _forbid_provider_cleanup(monkeypatch)
+
+    utils.update_managed_jobs_statuses(job_ids=[1, 2])
+
+    assert calls == [
+        managed_job_state.ControllerPidRecord(pid=123, started_at=1000.0),
+        managed_job_state.ControllerPidRecord(pid=123, started_at=2000.0),
+    ]

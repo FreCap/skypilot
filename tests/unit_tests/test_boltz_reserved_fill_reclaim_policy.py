@@ -5,12 +5,14 @@ import base64
 import copy
 import dataclasses
 import datetime
+import hashlib
 import json
 import pathlib
 import sys
 import threading
 import time
 import types
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -24,9 +26,11 @@ from boltz_reserved_fill_reclaim_policy import bundle as bundle_lib
 from boltz_reserved_fill_reclaim_policy import (  # noqa: E402
     kubernetes_attestation)
 from boltz_reserved_fill_reclaim_policy import policy as policy_lib
+from boltz_reserved_fill_reclaim_policy import POLICY_REVISION  # noqa: E402
 from boltz_reserved_fill_reclaim_policy import preflight  # noqa: E402
 
 from sky.serve import reserved_fill_reclaim_attestation as reclaim
+from sky.serve import reserved_fill_reclaim_proofs as reclaim_proofs
 
 
 def _bundle_document() -> dict:
@@ -96,6 +100,9 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
     assert phx['accelerators']['h200']['product_label_values'] == [
         'NVIDIA-H200'
     ]
+    assert bundle.policy_revision == (
+        f'boltz-reserved-fill-reclaim-policy/{POLICY_REVISION}')
+    assert POLICY_REVISION == '1.1.1386'
     assert _quota(phx, 'inference', 'ml.p5e.48xlarge',
                   'cpu')['borrowing_limit'] == '12100'
     assert _quota(phx, 'inference', 'ml.p5e.48xlarge',
@@ -133,12 +140,18 @@ def test_bundle_hashes_are_domain_separated_and_order_independent():
     assert first.fleet_bundle_sha256 == second.fleet_bundle_sha256
     assert (first.provider_inventory_sha256 == second.provider_inventory_sha256)
     assert first.fleet_bundle_sha256 != first.provider_inventory_sha256
+    provider_bytes = bundle_lib._canonical_bytes(
+        bundle_lib._normalized_section(document['provider_inventory']))
+    assert first.provider_inventory_sha256 == hashlib.sha256(
+        b'boltz-reserved-fill/provider/v4\x00' + provider_bytes).hexdigest()
+    assert first.provider_inventory_sha256 != hashlib.sha256(
+        b'boltz-reserved-fill/provider/v3\x00' + provider_bytes).hexdigest()
 
 
 def test_bundle_rejects_duplicate_keys_unknown_keys_and_unsafe_quota():
     with pytest.raises(bundle_lib.BundleValidationError, match='Duplicate'):
         bundle_lib.parse_bundle_bytes(
-            b'{"schema_version":4,"schema_version":4}')
+            b'{"schema_version":5,"schema_version":5}')
 
     document = _bundle_document()
     document['unknown'] = True
@@ -403,14 +416,69 @@ def _context_proof(context: dict, provider: dict) -> policy_lib._ContextProof:
                 for node in provider['node_inventory'])))
 
 
+def _set_summary_path(summary: dict, path: tuple[str | int, ...],
+                      value: object) -> None:
+    target: Any = summary
+    for component in path[:-1]:
+        target = target[component]
+    target[path[-1]] = value
+
+
+@pytest.mark.parametrize(
+    ('domain', 'path', 'value'),
+    (
+        ('aws', ('cluster_arn',), 'arn:aws:eks:us-west-2:1:cluster/wrong'),
+        ('aws', ('expected_role_arn',), 'arn:aws:iam::123456789012:role/wrong'),
+        ('aws', ('identity_absence_proven',), 'yes'),
+        ('kubernetes', ('physical_cluster_uid',), 'wrong-cluster'),
+        ('kubernetes', ('namespace_uid',), 'wrong-namespace'),
+        ('kubernetes', ('local_queue_name',), 'wrong-queue'),
+        ('kubernetes', ('custom_scheduler_deployment_proven',), 'yes'),
+        ('kubernetes',
+         ('resource_flavor_topology_names', 0, 1), 'wrong-topology'),
+        ('kubernetes', ('node_flavors', 0, 'non_deleting_node_count'), 0),
+        ('kubernetes',
+         ('node_flavors', 0, 'product_label_value'), 'wrong-product'),
+    ),
+)
+def test_cached_provider_summary_is_bound_to_exact_reviewed_context(
+        domain, path, value):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    context_name = 'phx_research_cluster_eks'
+    proof = _context_proof(policy._bundle.fleet_context(context_name),
+                           policy._bundle.provider_context(context_name))
+    typed = proof.aws if domain == 'aws' else proof.kubernetes
+    summary, _ = reclaim_proofs.canonical_proof_payload(
+        dataclasses.asdict(typed))
+
+    if domain == 'aws':
+        assert policy._decode_aws_proof_summary(
+            summary, context_name=context_name) == typed
+    else:
+        assert policy._decode_kubernetes_proof_summary(
+            summary, context_name=context_name) == typed
+
+    _set_summary_path(summary, path, value)
+    with pytest.raises(reclaim.ReclaimAttestationError,
+                       match='cached .* provider proof'):
+        if domain == 'aws':
+            policy._decode_aws_proof_summary(summary, context_name=context_name)
+        else:
+            policy._decode_kubernetes_proof_summary(summary,
+                                                    context_name=context_name)
+
+
 def _fake_attest(policy: policy_lib.BoltzReservedFillReclaimPolicy):
 
     def attest(names, _deadline):
-        return {
+        context_names = tuple(names)
+        context_proofs = {
             name: _context_proof(
                 policy._bundle.fleet_context(name),
-                policy._bundle.provider_context(name)) for name in names
+                policy._bundle.provider_context(name)) for name in context_names
         }
+        completed = time.monotonic()
+        return context_proofs, {name: completed for name in context_names}
 
     return attest
 
@@ -436,6 +504,39 @@ def test_two_arbitrary_services_share_one_canonical_claim_path(monkeypatch):
             deadline_monotonic=time.monotonic() + 5)
         assert authorization.scope == scope
         assert authorization.identity == identity
+
+
+def test_unchanged_policy_authorizes_current_service_version_refresh(
+        monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    monkeypatch.setattr(policy, '_attest_contexts', _fake_attest(policy))
+    monkeypatch.setattr(policy, '_emit_proof', mock.Mock())
+    context = policy._bundle.fleet_context('phx_research_cluster_eks')
+    identity = policy.policy_identity()
+    assert identity.policy_revision == (
+        'boltz-reserved-fill-reclaim-policy/1.1.1386')
+
+    authorizations = []
+    for service_version in (63, 64):
+        scope = reclaim.ReclaimClaimSetScope(
+            service_name='boltz-l4-fleet',
+            service_incarnation='current-incarnation',
+            service_version=service_version,
+            semantic_hash=f'semantic-v{service_version}',
+            edges=(_edge(context),))
+        authorizations.append(
+            policy.authorize_claim_set(scope,
+                                       expected_identity=identity,
+                                       expected_gate_generation=1,
+                                       deadline_monotonic=time.monotonic() + 5))
+
+    assert [
+        authorization.scope.service_version for authorization in authorizations
+    ] == [63, 64]
+    assert all(
+        authorization.identity == identity for authorization in authorizations)
+    assert all(
+        authorization.gate_generation == 1 for authorization in authorizations)
 
 
 def test_unmanaged_context_cannot_claim_with_forged_admission(monkeypatch):
@@ -618,7 +719,7 @@ def test_activation_rejects_accelerator_scheduling_mismatch(monkeypatch):
 def test_launch_rejects_accelerator_scheduling_mismatch(monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
     provider_calls = mock.Mock()
-    monkeypatch.setattr(policy, '_attest_contexts', provider_calls)
+    monkeypatch.setattr(policy, '_attest_launch_context', provider_calls)
     context = policy._bundle.fleet_context('phx_research_cluster_eks')
     admission = dataclasses.replace(
         _admission(context, 'h200'),
@@ -740,10 +841,12 @@ def test_provider_domains_and_contexts_start_concurrently(monkeypatch):
         return proof.aws if domain == 'aws' else proof.kubernetes
 
     monkeypatch.setattr(policy, '_provider_job', provider_job)
-    proofs = policy._attest_contexts(policy._bundle.contexts,
-                                     time.monotonic() + 2)
+    proofs, oldest_completions = policy._attest_contexts(
+        policy._bundle.contexts,
+        time.monotonic() + 2)
 
     assert set(proofs) == set(policy._bundle.contexts)
+    assert set(oldest_completions) == set(policy._bundle.contexts)
 
 
 def test_kubernetes_provider_uses_the_exact_assumed_audit_session(monkeypatch):
@@ -1216,81 +1319,12 @@ def _pod_webhook_configuration(contract: dict, controller: dict, *,
     }
 
 
-def _queue_policy_variables() -> list[dict[str, str]]:
-    return [
-        {
-            'name': 'isKubeRayOperatorGeneratedJob',
-            'expression':
-                ('object.kind == "Job" && '
-                 'request.namespace in '
-                 '["hyperpod-ns-research","boltz-research"] && '
-                 'request.resource.group == "batch" && '
-                 'request.resource.version == "v1" && '
-                 'request.resource.resource == "jobs" && '
-                 'request.userInfo.username == '
-                 '"system:serviceaccount:kuberay-system:kuberay-operator" && '
-                 'has(object.metadata.labels) && '
-                 "'ray.io/originated-from-cr-name' in "
-                 'object.metadata.labels && '
-                 "object.metadata.labels['ray.io/originated-from-cr-name'] "
-                 '== object.metadata.name && '
-                 "'ray.io/originated-from-crd' in object.metadata.labels && "
-                 "object.metadata.labels['ray.io/originated-from-crd'] == "
-                 '"RayJob" && '
-                 "'app.kubernetes.io/created-by' in object.metadata.labels && "
-                 "object.metadata.labels['app.kubernetes.io/created-by'] == "
-                 '"kuberay-operator" && '
-                 'has(object.spec.template.metadata.labels) && '
-                 "'kueue.x-k8s.io/queue-name' in "
-                 'object.spec.template.metadata.labels && '
-                 "object.spec.template.metadata.labels"
-                 "['kueue.x-k8s.io/queue-name'] != '' && "
-                 'has(object.metadata.ownerReferences) && '
-                 'object.metadata.ownerReferences.size() == 1 && '
-                 'object.metadata.ownerReferences.exists(ref, '
-                 'ref.kind == "RayJob" && '
-                 'ref.apiVersion == "ray.io/v1" && '
-                 'ref.name == object.metadata.name && '
-                 'has(ref.controller) && ref.controller && '
-                 'has(ref.blockOwnerDeletion) && ref.blockOwnerDeletion)')
-        },
-    ]
-
-
-def _queue_policy_resource_rules() -> list[dict]:
-    common = {
-        'operations': ['CREATE', 'UPDATE'],
-        'scope': '*',
-    }
-    contracts = [
-        (['batch'], ['v1'], ['jobs']),
-        (['kubeflow.org'], ['v1', 'v1beta1'], [
-            'mpijobs', 'paddlejobs', 'pytorchjobs', 'tfjobs', 'xgboostjobs',
-            'jaxjobs'
-        ]),
-        (['ray.io'], ['v1', 'v1alpha1'], ['rayjobs', 'rayclusters']),
-        (['jobset.x-k8s.io'], ['v1alpha2'], ['jobsets']),
-        (['workload.codeflare.dev'], ['v1alpha1'], ['appwrappers']),
-        ([''], ['v1'], ['pods']),
-        (['apps'], ['v1'], ['deployments', 'statefulsets']),
-        (['leaderworkerset.x-k8s.io'], ['v1alpha1'], ['leaderworkersets']),
-        (['sagemaker.amazonaws.com'], ['v1'], ['hyperpodpytorchjobs']),
-    ]
-    return [{
-        'apiGroups': api_groups,
-        'apiVersions': api_versions,
-        'resources': resources,
-        **common,
-    } for api_groups, api_versions, resources in contracts]
-
-
 def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
     namespace = context['namespace']
     kueue_admission = context['kueue_admission']
     enforcement = provider['kueue_enforcement']
     assert kueue_admission is not None
     assert enforcement is not None
-    admission = enforcement['admission_policy']
     controller = enforcement['controller']
     webhooks = enforcement['webhooks']
     queues = kueue_admission['queues']
@@ -1299,10 +1333,7 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
             'metadata': {
                 'name': namespace,
                 'uid': provider['namespace_uid'],
-                'labels': {
-                    admission['namespace_label_key']:
-                        admission['namespace_label_value']
-                },
+                'labels': {},
             },
             'status': {
                 'phase': 'Active'
@@ -1385,52 +1416,6 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
                      ''.join(f'  {name}: {str(enabled).lower()}\n'
                              for name, enabled in
                              controller['required_feature_gates'].items()))
-            },
-        },
-        'admission_policy': {
-            'metadata': {
-                'name': admission['name']
-            },
-            'spec': {
-                'failurePolicy': 'Fail',
-                'variables': _queue_policy_variables(),
-                'matchConstraints': {
-                    'matchPolicy': 'Equivalent',
-                    'namespaceSelector': {},
-                    'objectSelector': {},
-                    'resourceRules': _queue_policy_resource_rules(),
-                },
-                'validations': [{
-                    'expression':
-                        ('variables.isKubeRayOperatorGeneratedJob || '
-                         "(has(object.metadata.labels) && "
-                         "'kueue.x-k8s.io/queue-name' in "
-                         'object.metadata.labels && '
-                         "object.metadata.labels['kueue.x-k8s.io/queue-name'] "
-                         "!= '')"),
-                    'message':
-                        ("The label 'kueue.x-k8s.io/queue-name' is either "
-                         'missing or does not have a value set.'),
-                }],
-            },
-        },
-        'admission_policy_binding': {
-            'metadata': {
-                'name': admission['binding_name']
-            },
-            'spec': {
-                'policyName': admission['name'],
-                'validationActions': ['Deny'],
-                'matchResources': {
-                    'matchPolicy': 'Equivalent',
-                    'namespaceSelector': {
-                        'matchLabels': {
-                            admission['namespace_label_key']:
-                                admission['namespace_label_value']
-                        }
-                    },
-                    'objectSelector': {},
-                },
             },
         },
         'validating_webhook': _pod_webhook_configuration(webhooks,
@@ -1529,12 +1514,6 @@ def test_kubernetes_snapshot_proves_unmanaged_context_without_kueue_reads():
         ('ml.p4de.24xlarge', 'hyperpod'),
     )
 
-    snapshot['namespace']['metadata']['labels'][
-        'boltz.bio/kueue-managed'] = 'true'
-    with pytest.raises(kubernetes_attestation.KubernetesAttestationError,
-                       match='carries the managed Kueue label'):
-        kubernetes_attestation.validate_snapshot(context, provider, snapshot)
-
     snapshot = _unmanaged_kubernetes_snapshot(context, provider)
     snapshot['resource_flavors']['ml.p4d.24xlarge']['spec'][
         'topologyName'] = 'wrong'
@@ -1567,15 +1546,33 @@ def test_kubernetes_snapshot_proves_exact_reclaim_topology():
         resource_name='nvidia.com/gpu',
         capacity_per_node=8),)
 
-    reordered_snapshot = _kubernetes_snapshot(context, provider)
-    policy_spec = reordered_snapshot['admission_policy']['spec']
-    policy_spec['variables'].reverse()
-    policy_spec['matchConstraints']['resourceRules'].reverse()
-    for rule in policy_spec['matchConstraints']['resourceRules']:
-        for field in ('apiGroups', 'apiVersions', 'operations', 'resources'):
-            rule[field].reverse()
+
+def test_kubernetes_snapshot_ignores_platform_admission_policy_objects():
+    bundle = bundle_lib.load_embedded_bundle()
+    context = bundle.fleet_context('phx_research_cluster_eks')
+    provider = bundle.provider_context('phx_research_cluster_eks')
+    snapshot = _kubernetes_snapshot(context, provider)
+    expected = kubernetes_attestation.validate_snapshot(context, provider,
+                                                        snapshot)
+
+    assert 'admission_policy' not in snapshot
+    assert 'admission_policy_binding' not in snapshot
+    snapshot['admission_policy'] = {
+        'metadata': 'not-a-mapping',
+        'spec': {
+            'failurePolicy': 'Ignore',
+            'validations': [],
+        },
+    }
+    snapshot['admission_policy_binding'] = {
+        'spec': {
+            'validationActions': ['Warn'],
+            'matchResources': 'not-a-mapping',
+        },
+    }
+
     assert kubernetes_attestation.validate_snapshot(context, provider,
-                                                    reordered_snapshot) == proof
+                                                    snapshot) == expected
 
 
 def _remove_inference_quota_atom(snapshot: dict, resource_name: str) -> None:
@@ -1648,29 +1645,6 @@ def _duplicate_inference_quota_atom(snapshot: dict) -> None:
     flavor['resources'].append(copy.deepcopy(flavor['resources'][0]))
 
 
-def _queue_policy_rule(snapshot: dict, api_group: str) -> dict:
-    rules = snapshot['admission_policy']['spec']['matchConstraints'][
-        'resourceRules']
-    return next(rule for rule in rules if rule['apiGroups'] == [api_group])
-
-
-def _replace_queue_policy_variable(
-        snapshot: dict,
-        old: str,
-        new: str,
-        variable_name: str = 'isKubeRayOperatorGeneratedJob') -> None:
-    variable = next(
-        item for item in snapshot['admission_policy']['spec']['variables']
-        if item['name'] == variable_name)
-    assert old in variable['expression']
-    variable['expression'] = variable['expression'].replace(old, new, 1)
-
-
-def _append_queue_policy_variable(snapshot: dict, expression: str) -> None:
-    variable = snapshot['admission_policy']['spec']['variables'][0]
-    variable['expression'] += expression
-
-
 @pytest.mark.parametrize('mutation,match', [
     (lambda snapshot: snapshot['service_account']['metadata']['annotations'].
      update({'eks.amazonaws.com/role-arn': 'arn:unreviewed'}), 'IRSA'),
@@ -1690,122 +1664,6 @@ def _append_queue_policy_variable(snapshot: dict, expression: str) -> None:
         'controller_manager_config.yaml',
         'integrations:\n  frameworks:\n  - pod\nfeatureGates: {}\n'),
      'required feature gate'),
-    (lambda snapshot: snapshot['admission_policy_binding']['spec'].__setitem__(
-        'validationActions', ['Warn']), 'binding'),
-    (lambda snapshot: snapshot['admission_policy_binding']['spec'].__setitem__(
-        'paramRef', {'name': 'unreviewed'}), 'binding'),
-    (lambda snapshot: snapshot['admission_policy_binding']['spec'][
-        'matchResources'].__setitem__('resourceRules', []), 'binding'),
-    (lambda snapshot: snapshot['admission_policy']['spec'].__setitem__(
-        'paramKind', {
-            'apiVersion': 'example.com/v1',
-            'kind': 'Unreviewed',
-        }), 'schema'),
-    (lambda snapshot: snapshot['admission_policy']['spec'].__setitem__(
-        'auditAnnotations', []), 'schema'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['validations'][0].
-     __setitem__('expression', 'true'), 'validation'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['validations'][0].
-     __setitem__('message', 'not exact'), 'validation'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['validations'][0].
-     __setitem__('unreviewed', True), 'validation'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['validations'].clear(
-    ), 'validation'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['validations'].
-     append(
-         copy.deepcopy(snapshot['admission_policy']['spec']['validations'][0])),
-     'validation'),
-    (lambda snapshot: snapshot['admission_policy']['spec'].__setitem__(
-        'matchConditions', [{
-            'name': 'caller-controlled-bypass',
-            'expression': 'false',
-        }]), 'no match conditions'),
-    (lambda snapshot: snapshot['admission_policy']['spec'].__setitem__(
-        'matchConditions', []), 'no match conditions'),
-    (lambda snapshot: snapshot['admission_policy']['spec'].__setitem__(
-        'matchConditions', [{
-            'name': 'exclude-hpto-owned',
-            'expression': 'true',
-        }]), 'no match conditions'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['variables'][0].
-     __setitem__('name', 'unreviewedVariable'), 'variables'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['variables'][0].
-     __setitem__('expression', 'true'), 'variables'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['variables'][0].
-     __setitem__('unreviewed', True), 'variables'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['variables'].clear(),
-     'variables'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['variables'].pop(),
-     'variables'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['variables'].append({
-        'name': 'unreviewedVariable',
-        'expression': 'true',
-    }), 'variables'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['variables'].append(
-        copy.deepcopy(snapshot['admission_policy']['spec']['variables'][0])),
-     'variables'),
-    (lambda snapshot: _replace_queue_policy_variable(
-        snapshot, 'system:serviceaccount:kuberay-system:kuberay-operator',
-        'system:serviceaccount:kuberay-system:forged'), 'variables'),
-    (lambda snapshot: _replace_queue_policy_variable(
-        snapshot, 'request.userInfo.username == '
-        '"system:serviceaccount:kuberay-system:kuberay-operator"', 'true'),
-     'variables'),
-    (lambda snapshot: _replace_queue_policy_variable(
-        snapshot, '["hyperpod-ns-research","boltz-research"]',
-        '["hyperpod-ns-research","boltz-research","unreviewed"]'), 'variables'),
-    (lambda snapshot: _replace_queue_policy_variable(
-        snapshot, "'ray.io/originated-from-crd' in object.metadata.labels",
-        'true'), 'variables'),
-    (lambda snapshot: _replace_queue_policy_variable(
-        snapshot, 'has(object.spec.template.metadata.labels)', 'true'),
-     'variables'),
-    (lambda snapshot: _replace_queue_policy_variable(
-        snapshot,
-        "'kueue.x-k8s.io/queue-name' in object.spec.template.metadata.labels",
-        'true'), 'variables'),
-    (lambda snapshot: _replace_queue_policy_variable(
-        snapshot,
-        "object.spec.template.metadata.labels['kueue.x-k8s.io/queue-name'] "
-        "!= ''", 'true'), 'variables'),
-    (lambda snapshot: _replace_queue_policy_variable(
-        snapshot, 'ref.apiVersion == "ray.io/v1"',
-        'ref.apiVersion.startsWith("ray.io/")'), 'variables'),
-    (lambda snapshot: _replace_queue_policy_variable(
-        snapshot, 'has(ref.controller) && ref.controller', 'true'),
-     'variables'),
-    (lambda snapshot: _replace_queue_policy_variable(
-        snapshot, 'has(ref.blockOwnerDeletion) && ref.blockOwnerDeletion',
-        'true'), 'variables'),
-    (lambda snapshot: _replace_queue_policy_variable(
-        snapshot, 'object.metadata.ownerReferences.size() == 1',
-        'object.metadata.ownerReferences.size() > 0'), 'variables'),
-    (lambda snapshot: _append_queue_policy_variable(
-        snapshot, ' || object.kind == "StatefulSet"'), 'variables'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['matchConstraints'][
-        'resourceRules'].pop(), 'resource rules'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['matchConstraints'][
-        'resourceRules'].append({
-            'apiGroups': ['example.com'],
-            'apiVersions': ['v1'],
-            'operations': ['CREATE', 'UPDATE'],
-            'resources': ['unreviewed'],
-            'scope': '*',
-        }), 'resource rules'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['matchConstraints']
-     ['resourceRules'].append(
-         copy.deepcopy(snapshot['admission_policy']['spec']['matchConstraints'][
-             'resourceRules'][0])), 'resource rules'),
-    (lambda snapshot: _queue_policy_rule(snapshot, 'batch')['resources'].clear(
-    ), 'resource rules'),
-    (lambda snapshot: _queue_policy_rule(snapshot, 'batch').__setitem__(
-        'operations', ['CREATE']), 'resource rules'),
-    (lambda snapshot: _queue_policy_rule(snapshot, 'batch').__setitem__(
-        'unreviewed', True), 'resource rules'),
-    (lambda snapshot: _queue_policy_rule(snapshot, 'batch')['operations'].
-     append('CREATE'), 'resource rules'),
-    (lambda snapshot: snapshot['admission_policy']['spec']['matchConstraints'][
-        'resourceRules'][0].__setitem__('operations', None), 'invalid'),
     (lambda snapshot: snapshot['research_cluster_queue']['spec']['preemption'].
      __setitem__('reclaimWithinCohort', 'Never'), 'reclaim contract'),
     (lambda snapshot: _remove_inference_quota_atom(snapshot, 'cpu'),

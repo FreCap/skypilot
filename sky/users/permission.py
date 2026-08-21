@@ -275,36 +275,58 @@ class PermissionService:
         if not missing_policies and not redundant_policies:
             logger.debug('Policies already in sync, skipping initialization')
 
-        # Always ensure users have default roles (this is idempotent)
-        # Get users who already have roles (g policies) to avoid redundant calls
-        users_with_roles = {tuple(g)[0] for g in enforcer.get_grouping_policy()}
+        # Built-in identities have fixed roles.  Define them before assigning
+        # defaults so a system identity already present in the users table can
+        # never be initialized as an ordinary user.
+        system_users = [
+            (common.SERVER_ID, rbac.RoleName.ADMIN.value),
+            (constants.SKYPILOT_SYSTEM_USER_ID, rbac.RoleName.ADMIN.value),
+            (constants.SKYPILOT_SERVE_CONTROLLER_SYSTEM_USER_ID,
+             rbac.RoleName.ADMIN.value),
+            (constants.SKYPILOT_SYSTEM_VIEWER_USER_ID,
+             rbac.RoleName.VIEWER.value),
+        ]
+        system_user_ids = {user_id for user_id, _ in system_users}
+
+        # Always ensure ordinary users have default roles (this is idempotent).
+        # Get users who already have roles (g policies) to avoid redundant calls.
+        roles_by_user: dict[str, list[str]] = {}
+        for grouping in enforcer.get_grouping_policy():
+            if len(grouping) < 2:
+                continue
+            roles_by_user.setdefault(str(grouping[0]),
+                                     []).append(str(grouping[1]))
+        users_with_roles = set(roles_by_user)
         all_users = global_user_state.get_all_users()
         for existing_user in all_users:
+            if str(existing_user.id) in system_user_ids:
+                continue
             if str(existing_user.id) not in users_with_roles:
                 logger.debug(f'Adding role for user: {existing_user.name}'
                              f'({existing_user.id})')
                 user_added = self._add_user_if_not_exists_no_lock(
                     existing_user.id)
                 policy_updated = policy_updated or user_added
-        system_users = [
-            (common.SERVER_ID, rbac.RoleName.ADMIN.value),
-            (constants.SKYPILOT_SYSTEM_USER_ID, rbac.RoleName.ADMIN.value),
-            (constants.SKYPILOT_SYSTEM_VIEWER_USER_ID,
-             rbac.RoleName.VIEWER.value),
-        ]
+        system_permission_cache_invalidations = []
         for system_user_id, system_user_role in system_users:
             global_user_state.add_or_update_user(
                 models.User(id=system_user_id,
                             name=system_user_id,
                             user_type=models.UserType.SYSTEM.value))
-            if system_user_id not in users_with_roles:
-                logger.debug(f'Adding role for system user: {system_user_id} '
-                             f'({system_user_role})')
-                user_added = self._add_user_if_not_exists_no_lock(
-                    system_user_id, system_user_role)
-                policy_updated = policy_updated or user_added
+            current_roles = roles_by_user.get(system_user_id, [])
+            if current_roles == [system_user_role]:
+                continue
+            logger.debug(f'Enforcing role for system user: {system_user_id} '
+                         f'({system_user_role})')
+            for current_role in current_roles:
+                enforcer.remove_grouping_policy(system_user_id, current_role)
+            enforcer.add_grouping_policy(system_user_id, system_user_role)
+            system_permission_cache_invalidations.append(system_user_id)
+            policy_updated = True
         if policy_updated:
             enforcer.save_policy()
+        for system_user_id in system_permission_cache_invalidations:
+            self.invalidate_user_permission_cache(system_user_id)
 
     def add_user_if_not_exists(self, user_id: str) -> None:
         """Add user role relationship."""

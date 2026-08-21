@@ -32,6 +32,8 @@ from sky.serve import drain_observability
 from sky.serve import paid_retirement
 from sky.serve import placement_policy
 from sky.serve import replica_managers
+from sky.serve import reserved_capacity_broker
+from sky.serve import reserved_fill_planner
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import system_recovery_route_lease
@@ -791,13 +793,14 @@ class TestGetRoutingSpec:
 
     def test_configured_catalog_uses_nominal_cost_order_when_card_benched(self):
         ctrl = _make_controller()
-        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
-        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        l4_location = mock.Mock(accelerators={'L4': 1})
+        a100_location = mock.Mock(accelerators={'A100': 1})
         placer = mock.Mock()
         placer.active_locations.return_value = [a100_location]
-        placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cost_per_hour.side_effect = (lambda location: 1.0
-                                            if location is l4_location else 2.0)
+        placer.known_location_costs.return_value = {
+            l4_location: 1.0,
+            a100_location: 2.0,
+        }
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
             yaml_content='service: {}',
             spot_placer=placer)
@@ -817,15 +820,18 @@ class TestGetRoutingSpec:
                 spec)
 
         assert configured == ['L4', 'A100']
+        placer.known_location_costs.assert_called_once_with()
+        placer.cost_per_hour.assert_not_called()
 
     def test_configured_catalog_preserves_order_when_price_is_unknown(self):
         ctrl = _make_controller()
-        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
-        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        l4_location = mock.Mock(accelerators={'L4': 1})
+        a100_location = mock.Mock(accelerators={'A100': 1})
         placer = mock.Mock()
-        placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cost_per_hour.side_effect = (lambda location: float('inf')
-                                            if location is l4_location else 2.0)
+        placer.known_location_costs.return_value = {
+            l4_location: float('inf'),
+            a100_location: 2.0,
+        }
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
             yaml_content='service: {}',
             spot_placer=placer)
@@ -849,17 +855,16 @@ class TestGetRoutingSpec:
     def test_configured_catalog_preserves_order_when_one_location_is_uncached(
             self):
         ctrl = _make_controller()
-        l4_paid = types.SimpleNamespace(accelerators={'L4': 1})
-        l4_uncached = types.SimpleNamespace(accelerators={'L4': 1})
-        a100_paid = types.SimpleNamespace(accelerators={'A100': 1})
+        l4_paid = mock.Mock(accelerators={'L4': 1})
+        l4_uncached = mock.Mock(accelerators={'L4': 1})
+        a100_paid = mock.Mock(accelerators={'A100': 1})
         costs = {
-            id(l4_paid): 2.0,
-            id(l4_uncached): float('inf'),
-            id(a100_paid): 1.0,
+            l4_paid: 2.0,
+            l4_uncached: float('inf'),
+            a100_paid: 1.0,
         }
         placer = mock.Mock()
-        placer.known_locations.return_value = [l4_paid, l4_uncached, a100_paid]
-        placer.cost_per_hour.side_effect = lambda location: costs[id(location)]
+        placer.known_location_costs.return_value = costs
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
             yaml_content='service: {}',
             spot_placer=placer)
@@ -879,16 +884,19 @@ class TestGetRoutingSpec:
                 spec)
 
         assert configured == ['L4', 'A100']
-        assert placer.cost_per_hour.call_count == 3
+        placer.known_location_costs.assert_called_once_with()
+        placer.cost_per_hour.assert_not_called()
 
     def test_prebind_accelerator_configuration_never_resolves_provider_cost(
             self):
         ctrl = _make_controller()
-        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
-        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        l4_location = mock.Mock(accelerators={'L4': 1})
+        a100_location = mock.Mock(accelerators={'A100': 1})
         placer = mock.Mock()
-        placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cost_per_hour.return_value = float('inf')
+        placer.known_location_costs.return_value = {
+            l4_location: float('inf'),
+            a100_location: float('inf'),
+        }
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
             yaml_content='service: {}',
             spot_placer=placer)
@@ -911,7 +919,8 @@ class TestGetRoutingSpec:
             routing_spec = ctrl._build_routing_spec(spec)  # pylint: disable=protected-access
 
         assert routing_spec['configured_accelerators'] == ['L4', 'A100']
-        assert placer.cost_per_hour.call_count == 4
+        assert placer.known_location_costs.call_count == 2
+        placer.cost_per_hour.assert_not_called()
 
     def test_routing_spec_none_when_uninitialized(self):
         ctrl = _make_controller()
@@ -1207,6 +1216,131 @@ def _binding_authority(mode: str, epoch: int, *, generic: bool = False):
             binding.NON_POOL_CAPABILITY_COHORT_EPOCH if generic else None),
         non_pool_receipt_protocol_version=(
             binding.NON_POOL_RECEIPT_PROTOCOL_VERSION if generic else None))
+
+
+def _resident_placement_page():
+    return {
+        'available': True,
+        'enabled': True,
+        'pagination_version': 1,
+        'page_offset': 0,
+        'next_offset': None,
+        'total_locations': 1,
+        'locations': [{
+            'cloud': 'Kubernetes',
+            'region': 'research',
+        }],
+        'truncated': False,
+    }
+
+
+def test_placement_route_default_is_resident_only(monkeypatch):
+    ctrl = _make_update_controller()
+    placer = mock.Mock()
+    placer.placement_snapshot.return_value = _resident_placement_page()
+    ctrl._replica_manager.spot_placer = placer  # pylint: disable=protected-access
+    ctrl._replica_manager.workspace = 'workspace-a'  # pylint: disable=protected-access
+    get_replicas = mock.Mock()
+    build_budget = mock.Mock()
+    monkeypatch.setattr(controller.serve_state, 'get_replica_infos',
+                        get_replicas)
+    monkeypatch.setattr(controller.paid_capacity, 'build_launch_budget',
+                        build_budget)
+
+    client = _register_update_test_routes(ctrl, monkeypatch)
+    response = client.get(constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
+                          params={'limit': 100})
+
+    assert response.status_code == 200
+    assert response.json() == _resident_placement_page()
+    get_replicas.assert_not_called()
+    build_budget.assert_not_called()
+    placer.placement_snapshot.assert_called_once_with(
+        limit=100, offset=0, paid_admission_by_location=None)
+
+
+def test_placement_route_replica_read_failure_preserves_resident_page(
+        monkeypatch):
+    ctrl = _make_update_controller()
+    placer = mock.Mock()
+    placer.placement_snapshot.return_value = _resident_placement_page()
+    ctrl._replica_manager.spot_placer = placer  # pylint: disable=protected-access
+    ctrl._replica_manager.workspace = 'workspace-a'  # pylint: disable=protected-access
+    get_replicas = mock.Mock(side_effect=RuntimeError('database unavailable'))
+    build_budget = mock.Mock()
+    monkeypatch.setattr(controller.serve_state, 'get_replica_infos',
+                        get_replicas)
+    monkeypatch.setattr(controller.paid_capacity, 'build_launch_budget',
+                        build_budget)
+
+    client = _register_update_test_routes(ctrl, monkeypatch)
+    response = client.get(constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
+                          params={
+                              'limit': 100,
+                              'include_paid_admission': True,
+                          })
+
+    assert response.status_code == 200
+    assert response.json() == _resident_placement_page()
+    get_replicas.assert_called_once_with('svc')
+    build_budget.assert_not_called()
+    placer.placement_snapshot.assert_called_once_with(
+        limit=100, offset=0, paid_admission_by_location=None)
+
+
+def test_placement_route_opt_in_includes_paid_admission(monkeypatch):
+    ctrl = _make_update_controller()
+    admission = {'location-a': {'state': 'allowed'}}
+
+    def _placement_snapshot(*, limit, offset, paid_admission_by_location):
+        assert limit == 25
+        assert offset == 50
+        return {
+            **_resident_placement_page(),
+            'page_offset': offset,
+            'locations': [{
+                'cloud': 'Kubernetes',
+                'region': 'research',
+                'paid_admission': paid_admission_by_location['location-a'],
+            }],
+        }
+
+    placer = mock.Mock()
+    placer.placement_snapshot.side_effect = _placement_snapshot
+    ctrl._replica_manager.spot_placer = placer  # pylint: disable=protected-access
+    ctrl._replica_manager.workspace = 'workspace-a'  # pylint: disable=protected-access
+    replicas = [mock.sentinel.replica]
+    budget = mock.sentinel.budget
+    get_replicas = mock.Mock(return_value=replicas)
+    build_budget = mock.Mock(return_value=budget)
+    admission_snapshot = mock.Mock(return_value=admission)
+    monkeypatch.setattr(controller.serve_state, 'get_replica_infos',
+                        get_replicas)
+    monkeypatch.setattr(controller.paid_capacity, 'build_launch_budget',
+                        build_budget)
+    monkeypatch.setattr(controller.paid_capacity,
+                        'admission_snapshot_by_location', admission_snapshot)
+
+    client = _register_update_test_routes(ctrl, monkeypatch)
+    response = client.get(constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
+                          params={
+                              'limit': 25,
+                              'offset': 50,
+                              'include_paid_admission': True,
+                          })
+
+    assert response.status_code == 200
+    assert response.json()['locations'][0]['paid_admission'] == {
+        'state': 'allowed'
+    }
+    get_replicas.assert_called_once_with('svc')
+    build_budget.assert_called_once_with(placer,
+                                         workspace='workspace-a',
+                                         existing_replica_infos=replicas,
+                                         globally_managed=True,
+                                         service_name='svc',
+                                         service_hash='incarnation-a')
+    admission_snapshot.assert_called_once_with(budget)
 
 
 def test_binding_promotion_refreshes_controller_and_manager_in_transition_epoch(
@@ -4071,6 +4205,48 @@ class TestAutoscalerRuntimeSnapshot:
             for _ in snapshots:
                 ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
 
+    @staticmethod
+    def _reserved_fill_allocation(*, grant: int = 1):
+        location = reserved_fill_planner.LocationSnapshot(cloud='Kubernetes',
+                                                          region='context-a',
+                                                          zone=None,
+                                                          accelerators=(('L4',
+                                                                         1),),
+                                                          use_spot=False)
+        pool_key = reserved_capacity_broker.make_pool_key(
+            'context-a',
+            'L4',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='uid-a')
+        snapshot = reserved_fill_planner.PoolFillSnapshot(
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            pool_key=pool_key,
+            physical_cluster_uid='uid-a',
+            service_generation=7,
+            worker_projection_sha256_by_accelerator=(('l4', 'e' * 64),),
+            edge_cap=grant,
+            broker_slot_width=1,
+            free_slots=grant,
+            free_slots_by_accelerator=(('l4', grant),),
+            grant=grant,
+            grant_epoch=23,
+            observation_generation=13,
+            observation_sequence=17,
+            ordinary_zero_cost_admission_sequence=17,
+            valid_until=time.time() + 60,
+            locations=(location,))
+        allocation = reserved_fill_planner.AuthenticatedAllocationMap.create(
+            allocation_generation=5,
+            allocation_claim_generation=11,
+            service_version=1,
+            ordinary_zero_cost_admission_sequence_high_water=17,
+            reconciliation_gate_generation=29,
+            reclaim_fleet_bundle_sha256='c' * 64,
+            reclaim_policy_revision='reclaim-v1',
+            reclaim_provider_inventory_sha256='d' * 64,
+            pool_snapshots=(snapshot,))
+        return allocation, pool_key
+
     def test_ordered_target_uses_supply_aware_cross_card_allocation(self):
         scaler = self._durable_autoscaler(65)
         scaler.configured_accelerator_shapes = {
@@ -4204,7 +4380,8 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._replica_manager.spot_placer = None
         published = []
 
-        def _capture_state(target, snapshot):
+        def _capture_state(target, snapshot, _retirement_floor,
+                           _retirement_shelter):
             assert ctrl._routing_state_lock._is_owned()  # pylint: disable=protected-access
             published.append((target, snapshot))
             return True
@@ -4451,13 +4628,278 @@ class TestAutoscalerRuntimeSnapshot:
         publish.assert_not_called()
         notify.assert_called_once_with()
 
-    def test_promoted_reserved_fill_commit_forces_replan_before_paid_plan(self):
+    def test_promoted_reserved_fill_commits_before_demand_snapshot(self):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._controller_owner_fingerprint = 'owner'  # pylint: disable=protected-access
         scaler = self._durable_autoscaler()
         scaler.reserved_capacity_fill = True
-        scaler.sequenced_reserved_fill_planning.return_value = (
-            contextlib.nullcontext())
+        scaler.replica_unit = 'logical'
+        scaler.max_replicas = 64
+        scaler.reserved_fill_materialized_capacity.return_value = 44
+        scaler.reserved_fill_rotation_anchor.return_value = None
+        ctrl._autoscaler = scaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        location = reserved_fill_planner.LocationSnapshot(cloud='Kubernetes',
+                                                          region='phx',
+                                                          zone=None,
+                                                          accelerators=(('H200',
+                                                                         1),),
+                                                          use_spot=False)
+        pool_key = reserved_capacity_broker.make_pool_key(
+            'phx',
+            'H200',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='uid-phx')
+        pool = reserved_fill_planner.PoolFillSnapshot(
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            pool_key=pool_key,
+            physical_cluster_uid='uid-phx',
+            service_generation=1,
+            worker_projection_sha256_by_accelerator=(('h200', 'e' * 64),),
+            edge_cap=11,
+            broker_slot_width=1,
+            free_slots=11,
+            free_slots_by_accelerator=(('h200', 11),),
+            grant=11,
+            grant_epoch=1,
+            observation_generation=1,
+            observation_sequence=1,
+            ordinary_zero_cost_admission_sequence=1,
+            valid_until=time.time() + 60,
+            locations=(location,))
+        allocation = reserved_fill_planner.AuthenticatedAllocationMap.create(
+            allocation_generation=1,
+            allocation_claim_generation=1,
+            service_version=1,
+            ordinary_zero_cost_admission_sequence_high_water=1,
+            reconciliation_gate_generation=1,
+            reclaim_fleet_bundle_sha256='c' * 64,
+            reclaim_policy_revision='policy',
+            reclaim_provider_inventory_sha256='d' * 64,
+            pool_snapshots=(pool,))
+        receipt = mock.Mock(accepted=(object(),), deferred=())
+        receipt.accepted_rotation_anchor.return_value = None
+        call_order = []
+        accepted_plans = []
+
+        def _pending(*_args, **_kwargs):
+            call_order.append('pending')
+            return controller.zero_cost_actuation.PendingFillSnapshot(
+                capacity=0, debits=())
+
+        def _replicas(_service_name):
+            call_order.append('replicas')
+            return []
+
+        def _accept_plan(fill_plan):
+            call_order.append('accept')
+            accepted_plans.append(fill_plan)
+            return receipt
+
+        ctrl._replica_manager.pending_reserved_fill_snapshot.side_effect = (
+            _pending)
+        ctrl._replica_manager.accept_reserved_fill.side_effect = _accept_plan
+
+        with mock.patch.object(
+                controller.capacity_admission,
+                'get_service_source_mode',
+                return_value=(controller.capacity_admission.DemandSourceMode.
+                              DURABLE_FEED, 1)), \
+             mock.patch.object(controller.demand_state,
+                               'get_autoscaling_snapshot',
+                               return_value=None) as read_demand, \
+             mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               side_effect=_replicas), \
+             mock.patch.object(ctrl,
+                               '_read_sequenced_reserved_fill_allocation',
+                               return_value=(True, allocation)), \
+             mock.patch.object(ctrl,
+                               '_publish_ordered_paid_authority') as publish, \
+             mock.patch.object(
+                 controller.provider_phase,
+                 'provider_phase') as provider_phase, \
+             mock.patch.object(
+                 ctrl,
+                 '_notify_scale_reconcile',
+                 side_effect=lambda: call_order.append('notify')) as notify:
+            ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
+
+        assert call_order == ['pending', 'replicas', 'accept', 'notify']
+        assert len(accepted_plans) == 1
+        assert len(accepted_plans[0].intents) == 11
+        scaler.reserved_fill_materialized_capacity.assert_called_once_with([])
+        receipt.validate_for_plan.assert_called_once_with(accepted_plans[0])
+        read_demand.assert_not_called()
+        publish.assert_not_called()
+        provider_phase.assert_not_called()
+        ctrl._replica_manager.scale_up_batch.assert_not_called()
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()
+        ctrl._replica_manager.scale_down_logically_batch.assert_not_called()
+        ctrl._replica_manager.reconcile_fresh_zero_paid_retirements.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.publish_target_num_replicas.assert_not_called()
+        ctrl._replica_manager.invalidate_logical_reconcile_state.assert_called_once_with()  # pylint: disable=line-too-long
+        notify.assert_called_once_with()
+
+    def test_fill_headroom_includes_global_pending_capacity(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._controller_owner_fingerprint = 'owner'  # pylint: disable=protected-access
+        scaler = self._logical_durable_autoscaler()
+        scaler.max_replicas = 55
+        scaler.reserved_fill_materialized_capacity.return_value = 44
+        scaler.reserved_fill_rotation_anchor.return_value = None
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        allocation, pool_key = self._reserved_fill_allocation(grant=55)
+
+        def _pending_debit(count):
+            return (reserved_fill_planner.CommittedFillDebit(
+                allocation_generation=allocation.allocation_generation,
+                allocation_input_sha256=allocation.allocation_input_sha256,
+                allocation_claim_generation=(
+                    allocation.allocation_claim_generation),
+                pool_key=pool_key,
+                accelerator='l4',
+                replica_slots=count),)
+
+        ctrl._replica_manager.pending_reserved_fill_snapshot.side_effect = [
+            controller.zero_cost_actuation.PendingFillSnapshot(
+                capacity=2, debits=_pending_debit(2)),
+            controller.zero_cost_actuation.PendingFillSnapshot(
+                capacity=11, debits=_pending_debit(11)),
+        ]
+        accepted_plans = []
+
+        def _accept(plan):
+            accepted_plans.append(plan)
+            receipt = mock.Mock(accepted=(object(),), deferred=())
+            receipt.accepted_rotation_anchor.return_value = None
+            return receipt
+
+        ctrl._replica_manager.accept_reserved_fill.side_effect = _accept
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]):
+            assert ctrl._accept_sequenced_reserved_fill(  # pylint: disable=protected-access
+                allocation, scaler, 1, 9)
+            assert len(accepted_plans) == 1
+            assert len(accepted_plans[0].intents) == 9
+
+            # Those accepted grants now consume global service headroom, even
+            # if their incarnation or allocation generation is no longer the
+            # current exact-card debit identity.
+            assert not ctrl._accept_sequenced_reserved_fill(  # pylint: disable=protected-access
+                allocation, scaler, 1, 10)
+
+        assert len(accepted_plans) == 1
+        scaler.reserved_fill_materialized_capacity.assert_has_calls(
+            [mock.call([]), mock.call([])])
+
+    def test_fill_reads_pending_before_replica_materialization_handoff(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._controller_owner_fingerprint = 'owner'  # pylint: disable=protected-access
+        scaler = self._logical_durable_autoscaler()
+        scaler.max_replicas = 10
+        scaler.reserved_fill_materialized_capacity.side_effect = len
+        scaler.reserved_fill_rotation_anchor.return_value = None
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        allocation, pool_key = self._reserved_fill_allocation()
+        provider_location = types.SimpleNamespace(accelerators={'L4': 1})
+        committed = types.SimpleNamespace(
+            replica_id=41,
+            status_property=types.SimpleNamespace(sky_down_status=None),
+            reserved_fill=True,
+            reserved_fill_allocation_generation=(
+                allocation.allocation_generation),
+            reserved_fill_allocation_input_sha256=(
+                allocation.allocation_input_sha256),
+            reserved_fill_allocation_claim_generation=(
+                allocation.allocation_claim_generation),
+            reserved_fill_reconciliation_gate_generation=(
+                allocation.reconciliation_gate_generation),
+            reserved_fill_reclaim_fleet_bundle_sha256=(
+                allocation.reclaim_fleet_bundle_sha256),
+            reserved_fill_reclaim_policy_revision=(
+                allocation.reclaim_policy_revision),
+            reserved_fill_reclaim_provider_inventory_sha256=(
+                allocation.reclaim_provider_inventory_sha256),
+            reserved_fill_pool_key=pool_key,
+            reserved_fill_service_generation=7,
+            reserved_fill_physical_cluster_uid='uid-a',
+            get_spot_location=lambda: provider_location)
+        pending_debit = reserved_fill_planner.CommittedFillDebit(
+            allocation_generation=allocation.allocation_generation,
+            allocation_input_sha256=allocation.allocation_input_sha256,
+            allocation_claim_generation=(
+                allocation.allocation_claim_generation),
+            pool_key=pool_key,
+            accelerator='l4',
+            replica_slots=1)
+        materialized = False
+        read_order = []
+
+        def _pending(*_args, **_kwargs):
+            nonlocal materialized
+            result = (controller.zero_cost_actuation.PendingFillSnapshot(
+                capacity=0, debits=()) if materialized else
+                      controller.zero_cost_actuation.PendingFillSnapshot(
+                          capacity=1, debits=(pending_debit,)))
+            read_order.append('pending')
+            materialized = True
+            return result
+
+        def _replicas(_service_name):
+            nonlocal materialized
+            result = [committed] if materialized else []
+            read_order.append('replicas')
+            materialized = True
+            return result
+
+        ctrl._replica_manager.pending_reserved_fill_snapshot.side_effect = (
+            _pending)
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               side_effect=_replicas):
+            assert not ctrl._accept_sequenced_reserved_fill(  # pylint: disable=protected-access
+                allocation, scaler, 1, 9)
+
+        assert read_order == ['pending', 'replicas']
+        ctrl._replica_manager.accept_reserved_fill.assert_not_called()
+
+    def test_fill_malformed_materialized_capacity_fails_closed(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        scaler = self._logical_durable_autoscaler()
+        scaler.max_replicas = 10
+        scaler.reserved_fill_materialized_capacity.side_effect = ValueError(
+            'conflicting accelerator shapes')
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.pending_reserved_fill_snapshot.return_value = (
+            controller.zero_cost_actuation.PendingFillSnapshot(capacity=0,
+                                                               debits=()))
+        allocation, _ = self._reserved_fill_allocation()
+        ordinary = types.SimpleNamespace(
+            reserved_fill=False,
+            status_property=types.SimpleNamespace(sky_down_status=None))
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[ordinary]):
+            assert not ctrl._accept_sequenced_reserved_fill(  # pylint: disable=protected-access
+                allocation, scaler, 1, 9)
+
+        ctrl._replica_manager.accept_reserved_fill.assert_not_called()
+
+    def test_unknown_demand_after_empty_prefill_blocks_other_actuation(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        scaler = self._logical_durable_autoscaler(target=2, emit_scale_up=True)
+        scaler.reserved_capacity_fill = True
+        scaler.max_replicas = 20
         ctrl._autoscaler = scaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._replica_manager.spot_placer = None
@@ -4470,36 +4912,36 @@ class TestAutoscalerRuntimeSnapshot:
                               DURABLE_FEED, 1)), \
              mock.patch.object(controller.demand_state,
                                'get_autoscaling_snapshot',
-                               return_value=self._durable_snapshot()), \
+                               return_value=None) as read_demand, \
              mock.patch.object(controller.serve_state,
                                'get_replica_infos',
-                               return_value=[]), \
+                               return_value=[]) as get_replicas, \
              mock.patch.object(
                  controller.serve_state,
-                 'get_service_runtime_snapshot',
-                 return_value={'active_versions': [1]}), \
-             mock.patch.object(
-                 autoscalers,
-                 'generate_controller_scaling_decisions',
-                 return_value=[]), \
+                 'get_service_runtime_snapshot') as get_runtime, \
              mock.patch.object(ctrl,
                                '_read_sequenced_reserved_fill_allocation',
                                return_value=(True, allocation)), \
              mock.patch.object(ctrl,
                                '_accept_sequenced_reserved_fill',
-                               return_value=True) as accept, \
+                               return_value=False) as accept, \
              mock.patch.object(ctrl,
-                               '_persist_cost_rebalance_state',
-                               return_value=True), \
-             mock.patch.object(ctrl,
-                               '_publish_ordered_paid_authority') as publish, \
-             mock.patch.object(ctrl, '_notify_scale_reconcile') as notify:
+                               '_publish_ordered_paid_authority') as publish:
             ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
 
-        accept.assert_called_once_with(allocation, scaler, 1, 0, [], [])
+        accept.assert_called_once_with(allocation, scaler, 1, 0)
+        read_demand.assert_called_once_with('svc', 'svc-hash')
+        get_replicas.assert_not_called()
+        get_runtime.assert_not_called()
         publish.assert_not_called()
+        ctrl._replica_manager.publish_target_num_replicas.assert_not_called()
+        ctrl._replica_manager.publish_logical_reconcile_state.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.scale_up_batch.assert_not_called()
-        notify.assert_called_once_with()
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_down_logically_batch.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.reconcile_fresh_zero_paid_retirements.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.cancel_uncommitted_paid_retirements.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.invalidate_logical_reconcile_state.assert_called_once_with()  # pylint: disable=line-too-long
 
     def test_promoted_paid_launch_uses_post_zero_cost_plan_authority(self):
         ctrl = _make_controller()
@@ -4734,44 +5176,54 @@ class TestAutoscalerRuntimeSnapshot:
         assert selected is True
         assert observed is None
 
-    def test_reconcile_routes_selected_gate_through_sequenced_adapter(self):
+    def test_reconcile_derives_shelter_before_sequenced_planning(self):
         ctrl = _make_controller()
         decision_autoscaler = mock.Mock()
         decision_autoscaler.latest_version = 2
         decision_autoscaler.reserved_capacity_fill = True
-        decision_autoscaler.generate_scaling_decisions.return_value = []
+        decision_autoscaler.replica_unit = 'physical_backend'
+        decision_autoscaler.max_replicas = 20
+        decision_autoscaler.generate_scaling_decisions.return_value = [
+            autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_DOWN, 7)
+        ]
         decision_autoscaler.has_recomputed_with_fresh_data.return_value = False
+        decision_autoscaler.sequenced_reserved_fill_holdings.return_value = ()
         sequenced_context = mock.MagicMock()
         decision_autoscaler.sequenced_reserved_fill_planning.return_value = (
             sequenced_context)
         ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
-        allocation = object()
+        ctrl._replica_manager.spot_placer = None
+        allocation = mock.Mock()
+        shelter = mock.Mock(target_capacity=0, authority_current=True)
 
-        with mock.patch.object(controller.serve_state,
-                               'get_replica_infos',
-                               return_value=[]), \
-             mock.patch.object(
-                 controller.serve_state,
-                 'get_service_runtime_snapshot',
-                 return_value={'active_versions': [2]}), \
-             mock.patch.object(
-                 ctrl,
-                 '_read_sequenced_reserved_fill_allocation',
-                 return_value=(True, allocation)), \
-             mock.patch.object(
-                 ctrl, '_persist_cost_rebalance_state', return_value=True), \
-             mock.patch.object(
-                 ctrl, '_accept_sequenced_reserved_fill') as accept:
-            ctrl._reconcile_scale_once(3)  # pylint: disable=protected-access
+        with mock.patch.object(controller.reserved_fill_planner,
+                               'derive_sequenced_retirement_shelter',
+                               return_value=shelter) as derive:
+            plan = ctrl._plan_scale_reconciliation(  # pylint: disable=protected-access
+                decision_autoscaler,
+                2,
+                0,
+                0,
+                0, [], [2],
+                None,
+                sequenced_reserved_fill=True,
+                sequenced_reserved_fill_allocation=allocation)
 
-        decision_autoscaler.sequenced_reserved_fill_planning.assert_called_once_with(  # pylint: disable=line-too-long
+        derive.assert_called_once_with(
+            allocation=allocation,
+            holdings=(),
+            service_version=2,
+            max_capacity=20,
+            capacity_unit=(
+                controller.reserved_fill_planner.FillCapacityUnit.PHYSICAL))
+        decision_autoscaler.sequenced_reserved_fill_planning.assert_called_once_with(
         )
         sequenced_context.__enter__.assert_called_once_with()
         sequenced_context.__exit__.assert_called_once()
-        accept.assert_called_once_with(allocation, decision_autoscaler, 2, 3,
-                                       [], [])
-        ctrl._replica_manager.scale_up_batch.assert_not_called()  # pylint: disable=line-too-long
+        assert plan is not None
+        assert plan[0] == []
 
     def test_run_autoscaler_uses_runtime_snapshot_for_active_versions(self):
         ctrl = _make_controller()
@@ -4858,7 +5310,7 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._replica_manager.clear_scale_reconciliation_signal.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.wait_for_scale_reconciliation.assert_not_called()  # pylint: disable=line-too-long
 
-    def test_run_autoscaler_publishes_fill_capacity_target(self):
+    def test_run_autoscaler_does_not_publish_legacy_fill_as_demand_target(self):
         ctrl = _make_controller()
         ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
         ctrl._autoscaler.latest_version = 2
@@ -4882,7 +5334,7 @@ class TestAutoscalerRuntimeSnapshot:
             ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
 
         ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(  # pylint: disable=line-too-long
-            3, expected_version=2)
+            0, expected_version=2)
         ctrl._replica_manager.clear_scale_reconciliation_signal.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.wait_for_scale_reconciliation.assert_not_called()  # pylint: disable=line-too-long
 

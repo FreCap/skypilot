@@ -83,6 +83,10 @@ services_table = sqlalchemy.Table(
     sqlalchemy.Column('controller_pid', sqlalchemy.Integer,
                       server_default=None),
     sqlalchemy.Column('hash', sqlalchemy.Text, server_default=None),
+    # Immutable tenant authority for every launch across service versions.
+    # Serve055 permits one NULL -> value attestation for retained services.
+    sqlalchemy.Column('owner_user_id', sqlalchemy.Text, server_default=None),
+    sqlalchemy.Column('owner_user_name', sqlalchemy.Text, server_default=None),
     # Serve resource actions are activated explicitly and monotonically.  The
     # legacy default keeps both existing rows and local SQLite Serve databases
     # inert until the PostgreSQL-only action helpers promote a service.
@@ -341,6 +345,11 @@ services_table = sqlalchemy.Table(
         '(reserved_fill_actuation_epoch > 0 AND '
         'reserved_fill_actuation_capable)',
         name='serve052_durable_fill_actuation_capability_ck'),
+    sqlalchemy.CheckConstraint(
+        '(owner_user_id IS NULL) = (owner_user_name IS NULL) AND '
+        '(owner_user_id IS NULL OR '
+        '(length(owner_user_id) > 0 AND length(owner_user_name) > 0))',
+        name='serve055_owner_user_id_nonempty'),
 )
 
 replicas_table = sqlalchemy.Table(
@@ -376,6 +385,12 @@ replicas_table = sqlalchemy.Table(
         'non_pool_launch_authorization',
         sqlalchemy.JSON(none_as_null=True).with_variant(
             postgresql.JSONB(none_as_null=True), 'postgresql')),
+    # Serve056's normalized authority edge. ReplicaInfo keeps the same key as
+    # a checked projection, but provider authorization reads this scalar and
+    # follows its PostgreSQL foreign key to one immutable COMMITTED intent.
+    sqlalchemy.Column('reserved_fill_intent_idempotency_key',
+                      sqlalchemy.Text,
+                      server_default=None),
     # These columns are initialized and mutated only by typed resource-action
     # transitions.  Generic ReplicaInfo persistence deliberately omits them.
     # sqlalchemy.Uuid is native UUID on PostgreSQL and a portable CHAR-backed

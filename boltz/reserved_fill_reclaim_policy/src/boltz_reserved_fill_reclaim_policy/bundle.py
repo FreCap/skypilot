@@ -9,7 +9,7 @@ import json
 import re
 from typing import Any, Final
 
-from boltz_reserved_fill_reclaim_policy import __version__
+from boltz_reserved_fill_reclaim_policy import POLICY_REVISION
 
 _BUNDLE_RESOURCE: Final = 'fleet_bundle.json'
 _MAX_BUNDLE_BYTES: Final = 1024 * 1024
@@ -20,7 +20,7 @@ _ROLE_ARN_RE: Final = re.compile(
 _UUID_RE: Final = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-'
                              r'[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
 _FLEET_HASH_DOMAIN: Final = b'boltz-reserved-fill/fleet/v4\x00'
-_PROVIDER_HASH_DOMAIN: Final = b'boltz-reserved-fill/provider/v3\x00'
+_PROVIDER_HASH_DOMAIN: Final = b'boltz-reserved-fill/provider/v4\x00'
 _REQUIRED_QUEUE_RESOURCES: Final = frozenset(
     {'cpu', 'memory', 'nvidia.com/gpu'})
 _RESOURCE_GROUP_KEYS: Final = frozenset({'covered_resources', 'flavors'})
@@ -38,8 +38,6 @@ _REQUIRED_KUEUE_TAS_FEATURE_GATES: Final = frozenset({
 _RESOURCE_FLAVOR_KEYS: Final = frozenset({'name', 'resources'})
 _RESOURCE_QUOTA_KEYS: Final = frozenset(
     {'resource_name', 'nominal_quota', 'borrowing_limit'})
-_KUEUE_MANAGED_LABEL_KEY: Final = 'boltz.bio/kueue-managed'
-_KUEUE_MANAGED_LABEL_VALUE: Final = 'true'
 _QUANTITY_RE: Final = re.compile(
     r'^(?P<number>[0-9]+(?:\.[0-9]+)?)'
     r'(?P<suffix>n|u|m|k|K|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$')
@@ -449,23 +447,10 @@ def _validate_deployment_contract(value: object, path: str, *,
 
 def _validate_kueue_enforcement(value: object, path: str) -> None:
     enforcement = _mapping(value, path)
-    _exact_keys(enforcement, {'admission_policy', 'controller', 'webhooks'},
-                path)
+    _exact_keys(enforcement, {'controller', 'webhooks'}, path)
     _validate_deployment_contract(enforcement['controller'],
                                   f'{path}.controller',
                                   controller=True)
-    admission = _mapping(enforcement['admission_policy'],
-                         f'{path}.admission_policy')
-    _exact_keys(admission, {
-        'binding_name', 'name', 'namespace_label_key', 'namespace_label_value'
-    }, f'{path}.admission_policy')
-    for key, item in admission.items():
-        _text(item, f'{path}.admission_policy.{key}')
-    if (admission['namespace_label_key'] != _KUEUE_MANAGED_LABEL_KEY or
-            admission['namespace_label_value'] != _KUEUE_MANAGED_LABEL_VALUE):
-        raise BundleValidationError(
-            f'{path}.admission_policy must use the code-owned managed '
-            'namespace label.')
     webhooks = _mapping(enforcement['webhooks'], f'{path}.webhooks')
     _exact_keys(webhooks,
                 {'mutating', 'service_name', 'service_port', 'validating'},
@@ -668,7 +653,7 @@ class FleetBundle:
 
     @property
     def policy_revision(self) -> str:
-        return f'boltz-reserved-fill-reclaim-policy/{__version__}'
+        return f'boltz-reserved-fill-reclaim-policy/{POLICY_REVISION}'
 
     @property
     def contexts(self) -> tuple[str, ...]:
@@ -703,7 +688,7 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
     root = _mapping(document, 'bundle')
     _exact_keys(root, {'schema_version', 'fleet', 'provider_inventory'},
                 'bundle')
-    if root['schema_version'] != 4:
+    if root['schema_version'] != 5:
         raise BundleValidationError(
             'Fleet bundle schema version is unsupported.')
     fleet = _mapping(root['fleet'], 'bundle.fleet')

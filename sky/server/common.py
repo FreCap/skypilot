@@ -1,6 +1,8 @@
 """Common data structures and constants used in the API."""
 
 from collections.abc import Callable
+import contextlib
+import contextvars
 import dataclasses
 import enum
 import functools
@@ -114,6 +116,11 @@ _upgrade_hint_shown = False
 basic_auth_enabled: bool = False
 # Cached client user hash (machine-local identity), computed once.
 client_user_hash: str | None = None
+
+_ServeControllerTokenProvider = Callable[[], tuple[str, ...]]
+_serve_controller_token_provider: contextvars.ContextVar[
+    _ServeControllerTokenProvider | None] = contextvars.ContextVar(
+        'serve_controller_token_provider', default=None)
 
 crypt_ctx = passlib_context.CryptContext([
     'bcrypt', 'sha256_crypt', 'sha512_crypt', 'des_crypt', 'apr_md5_crypt',
@@ -296,9 +303,27 @@ def get_cookies_from_response(
     return cookies
 
 
+@contextlib.contextmanager
+def serve_controller_api_auth(
+    token_provider: _ServeControllerTokenProvider,) -> typing.Iterator[None]:
+    """Scope controller-admin auth to the replica-launch API allowlist.
+
+    The provider is invoked for every request so projected Secret rotation is
+    observed by long-running launch waiters without restarting the controller.
+    """
+    if not callable(token_provider):
+        raise TypeError('Controller API token provider must be callable.')
+    context_token = _serve_controller_token_provider.set(token_provider)
+    try:
+        yield
+    finally:
+        _serve_controller_token_provider.reset(context_token)
+
+
 def _prepare_authenticated_request_params(
         path: str,
         server_url: str | None = None,
+        method: str | None = None,
         **kwargs) -> tuple[str, dict[str, Any]]:
     """Prepare common parameters for authenticated requests (sync or async).
 
@@ -339,6 +364,33 @@ def _prepare_authenticated_request_params(
     for header in controller_origin_headers:
         if header in server_owned_headers:
             headers[header] = server_owned_headers[header]
+
+    # The dedicated controller-auth selector is context-owned just like its
+    # bearer credential. An ordinary caller cannot opt itself into this path.
+    for candidate in list(headers):
+        if (isinstance(candidate, str) and candidate.lower()
+                == server_constants.SERVE_CONTROLLER_API_AUTH_HEADER.lower()):
+            headers.pop(candidate)
+
+    token_provider = _serve_controller_token_provider.get()
+    normalized_path = path.partition('?')[0]
+    if (token_provider is not None and method is not None and
+            server_constants.is_serve_controller_api_request(
+                method, normalized_path)):
+        auth_tokens = token_provider()
+        if not auth_tokens or any(not isinstance(token, str) or not token
+                                  for token in auth_tokens):
+            raise RuntimeError(
+                'SkyServe controller API authentication is unavailable.')
+        # Rotation rings are current-first. Prefer the oldest overlap token so
+        # either side of a projected-Secret rollout accepts the request.
+        for candidate in list(headers):
+            if (isinstance(candidate, str) and
+                    candidate.lower() == 'authorization'):
+                headers.pop(candidate)
+        headers['Authorization'] = f'Bearer {auth_tokens[-1]}'
+        headers[server_constants.SERVE_CONTROLLER_API_AUTH_HEADER] = (
+            server_constants.SERVE_CONTROLLER_API_AUTH_HEADER_VALUE)
     kwargs['headers'] = headers
 
     # Always use the same URL regardless of authentication type
@@ -386,7 +438,9 @@ def make_authenticated_request(method: str,
     Returns:
         requests.Response object
     """
-    url, kwargs = _prepare_authenticated_request_params(path, server_url,
+    url, kwargs = _prepare_authenticated_request_params(path,
+                                                        server_url,
+                                                        method=method,
                                                         **kwargs)
 
     # Make the request
@@ -432,7 +486,9 @@ async def make_authenticated_request_async(
         exceptions.ServerTemporarilyUnavailableError: When server returns 503
         exceptions.RequestInterruptedError: When request is interrupted
     """
-    url, kwargs = _prepare_authenticated_request_params(path, server_url,
+    url, kwargs = _prepare_authenticated_request_params(path,
+                                                        server_url,
+                                                        method=method,
                                                         **kwargs)
 
     # Convert cookies to aiohttp format if needed
@@ -511,9 +567,11 @@ def _handle_non_200_server_status(
                                              timer=time.time),
                    lock=threading.RLock())
 def get_api_server_status_response(
-        endpoint: str | None = None) -> Optional['requests.Response']:
+        endpoint: str | None = None,
+        _serve_controller_auth: bool = False) -> Optional['requests.Response']:
     # Cache the response to set the api version across multiple threads.
     # Refer to https://github.com/skypilot-org/skypilot/issues/8879
+    del _serve_controller_auth  # Included only to isolate the health cache.
     time_out_try_count = 1
     server_url = endpoint if endpoint is not None else get_server_url()
     while time_out_try_count <= RETRY_COUNT_ON_TIMEOUT:
@@ -552,7 +610,9 @@ def get_api_server_status(endpoint: str | None = None) -> ApiServerInfo:
         of the server. The status can be HEALTHY, UNHEALTHY
         or VERSION_MISMATCH.
     """
-    response = get_api_server_status_response(endpoint)
+    response = get_api_server_status_response(
+        endpoint,
+        _serve_controller_token_provider.get() is not None)
     if response is None:
         return ApiServerInfo(status=ApiServerStatus.UNHEALTHY)
 

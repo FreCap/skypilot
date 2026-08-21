@@ -1820,6 +1820,10 @@ describe('service placement', () => {
     placer_state: {
       available: true,
       enabled: true,
+      pagination_version: 1,
+      page_offset: 0,
+      next_offset: null,
+      total_locations: 1,
       retry_seconds: 600,
       status_semantics: 'Eligibility is not live inventory.',
       locations: [
@@ -1905,6 +1909,12 @@ describe('service placement', () => {
     expect(placement.placerState.statusSemantics).toBe(
       'Eligibility is not live inventory.'
     );
+    expect(placement.placerState).toMatchObject({
+      paginationVersion: 1,
+      pageOffset: 0,
+      nextOffset: null,
+      totalLocations: 1,
+    });
     expect(placement.capacityHints.hints[0]).toMatchObject({
       kind: 'capacity',
       cloud: 'aws',
@@ -1928,6 +1938,8 @@ describe('service placement', () => {
       hours: 12,
       limit: 10,
       cursor: 'cursor-a',
+      locationLimit: 25,
+      locationOffset: 50,
     });
 
     expect(apiClient.post).toHaveBeenCalledWith('/serve/placement', {
@@ -1935,6 +1947,8 @@ describe('service placement', () => {
       hours: 12,
       limit: 10,
       cursor: 'cursor-a',
+      location_limit: 25,
+      location_offset: 50,
     });
     expect(apiClient.get).toHaveBeenCalledWith(
       `/api/get?request_id=${REQUEST_ID}`

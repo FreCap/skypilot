@@ -20,9 +20,14 @@ def test_placement_uses_exact_service_incarnation(monkeypatch):
                         capacity)
     monkeypatch.setattr(core.placement_history, 'get_history', history)
 
-    result = core.placement('svc', hours=12, limit=10, cursor='cursor-a')
+    result = core.placement('svc',
+                            hours=12,
+                            limit=10,
+                            cursor='cursor-a',
+                            location_limit=25,
+                            location_offset=50)
 
-    placer.assert_called_once_with('svc', 'hash-a')
+    placer.assert_called_once_with('svc', 'hash-a', limit=25, offset=50)
     capacity.assert_called_once_with('svc', 'hash-a')
     history.assert_called_once_with('svc',
                                     'hash-a',
@@ -81,6 +86,14 @@ def test_placement_rejects_missing_service(monkeypatch):
     'cursor': ''
 }, {
     'cursor': 'x' * 513
+}, {
+    'location_limit': 0
+}, {
+    'location_limit': 101
+}, {
+    'location_offset': -1
+}, {
+    'location_offset': 100_001
 }])
 def test_placement_payload_rejects_unbounded_inputs(overrides):
     with pytest.raises(ValueError):

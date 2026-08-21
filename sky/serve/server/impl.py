@@ -912,7 +912,8 @@ def update(
     # down's local-lock -> controller-purge lifecycle-lock order; reversing the
     # order can deadlock. The lifecycle lock remains the actual HA boundary.
     with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
-        lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
+        lifecycle_lock = serve_utils.get_service_lifecycle_lock(
+            service_name, advance_epoch=False)
         with lifecycle_lock:
             _update_impl(task,
                          service_name,
@@ -931,7 +932,8 @@ def elect_version(service_name: str, version: int, expected_service_hash: str,
             'SkyServe version election is disabled while the server '
             'controller hold is active.')
     with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
-        lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
+        lifecycle_lock = serve_utils.get_service_lifecycle_lock(
+            service_name, advance_epoch=False)
         with lifecycle_lock:
             record = serve_state.get_service_from_name(service_name)
             if (record is None or record.get('hash') != expected_service_hash or
@@ -973,7 +975,8 @@ def set_load_balancer_high_availability(service_name: str, enabled: bool,
             'SkyServe load balancer topology changes are disabled while the '
             'server controller hold is active.')
     with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
-        lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
+        lifecycle_lock = serve_utils.get_service_lifecycle_lock(
+            service_name, advance_epoch=False)
         with lifecycle_lock:
             record = serve_state.get_service_from_name(service_name)
             if (record is None or record.get('pool') or
@@ -1522,8 +1525,19 @@ def apply(
             'SkyServe apply is disabled while the server controller hold is '
             'active.')
     with filelock.FileLock(serve_utils.get_service_filelock_path(service_name)):
-        lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
+        # `apply` chooses update versus creation only after reading durable
+        # service state. Acquire the name mutex first, then retain the live
+        # controller epoch for update or mint a new epoch for creation. A
+        # pre-lock existence check would race a same-name operation on another
+        # API pod.
+        lifecycle_lock = serve_utils.get_service_lifecycle_lock(
+            service_name, advance_epoch=None)
         with lifecycle_lock:
+            service_exists = serve_state.get_service_hash(service_name)
+            if service_exists is None:
+                serve_utils.advance_service_lifecycle_epoch(lifecycle_lock)
+            else:
+                serve_utils.retain_service_lifecycle_epoch(lifecycle_lock)
             try:
                 controller_type = controller_utils.get_controller_for_pool(pool)
                 handle = backend_utils.is_controller_accessible(

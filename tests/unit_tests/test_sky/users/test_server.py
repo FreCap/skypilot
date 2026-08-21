@@ -5,6 +5,7 @@ from unittest import mock
 
 import fastapi
 import pytest
+import sqlalchemy
 
 from sky import models
 from sky.server import common as server_common
@@ -569,13 +570,113 @@ class TestUsersEndpoints:
         delete_body = payloads.UserDeleteBody(user_id='test_user')
 
         # Execute
-        result = server.user_delete(mock_request, delete_body)
+        with mock.patch.object(server.serve_state,
+                               'service_owner_attestation_transition_active',
+                               return_value=False), mock.patch.object(
+                                   server.serve_state,
+                                   'get_service_names_owned_by_user_id',
+                                   return_value=[]):
+            result = server.user_delete(mock_request, delete_body)
 
         # Verify
         assert result is None
         mock_get_user.assert_called_once_with('test_user')
         mock_delete_user.assert_called_once_with('test_user')
         mock_delete_user_role.assert_called_once_with('test_user')
+
+    @pytest.mark.asyncio
+    async def test_user_delete_rejects_durable_service_owner(
+            self, mock_request):
+        test_user = models.User(id='test_user', name='Test User')
+        mock_request.state.auth_user = None
+        delete_body = payloads.UserDeleteBody(user_id='test_user')
+        with mock.patch.object(server.global_user_state,
+                               'get_user',
+                               return_value=test_user), \
+             mock.patch.object(
+                 server.serve_state,
+                 'service_owner_attestation_transition_active',
+                 return_value=False), \
+             mock.patch.object(
+                 server.serve_state,
+                 'get_service_names_owned_by_user_id',
+                 return_value=['scale-zero-service']), \
+             mock.patch.object(server.resource_checker,
+                               'check_no_active_resources_for_users') as active, \
+             mock.patch.object(server.global_user_state,
+                               'delete_user') as delete_user:
+            with pytest.raises(fastapi.HTTPException) as exc_info:
+                server.user_delete(mock_request, delete_body)
+
+        assert exc_info.value.status_code == 400
+        assert 'scale-zero-service' in str(exc_info.value.detail)
+        active.assert_not_called()
+        delete_user.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_user_delete_fk_race_returns_actionable_error_without_rbac_delete(
+            self, mock_request):
+        test_user = models.User(id='test_user', name='Test User')
+        mock_request.state.auth_user = None
+        delete_body = payloads.UserDeleteBody(user_id='test_user')
+        fk_error = sqlalchemy.exc.IntegrityError('DELETE FROM users', {},
+                                                 RuntimeError('owner FK'))
+        with mock.patch.object(server.global_user_state,
+                               'get_user',
+                               return_value=test_user), \
+             mock.patch.object(
+                 server.serve_state,
+                 'service_owner_attestation_transition_active',
+                 return_value=False), \
+             mock.patch.object(
+                 server.serve_state,
+                 'get_service_names_owned_by_user_id',
+                 return_value=[]), \
+             mock.patch.object(server.resource_checker,
+                               'check_no_active_resources_for_users'), \
+             mock.patch.object(server.global_user_state,
+                               'delete_user',
+                               side_effect=fk_error), \
+             mock.patch.object(server.permission.permission_service,
+                               'delete_user') as delete_permission:
+            with pytest.raises(fastapi.HTTPException) as exc_info:
+                server.user_delete(mock_request, delete_body)
+
+        assert exc_info.value.status_code == 400
+        assert 'durable resource owner reference' in str(exc_info.value.detail)
+        delete_permission.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_user_delete_rejects_global_owner_attestation_transition(
+            self, mock_request):
+        test_user = models.User(id='test_user', name='Test User')
+        mock_request.state.auth_user = None
+        delete_body = payloads.UserDeleteBody(user_id='test_user')
+        with mock.patch.object(server.global_user_state,
+                               'get_user',
+                               return_value=test_user), \
+             mock.patch.object(
+                 server.serve_state,
+                 'service_owner_attestation_transition_active',
+                 return_value=True), \
+             mock.patch.object(
+                 server.serve_state,
+                 'get_service_names_owned_by_user_id') as owned_services, \
+             mock.patch.object(server.resource_checker,
+                               'check_no_active_resources_for_users') as active, \
+             mock.patch.object(server.global_user_state,
+                               'delete_user') as delete_user, \
+             mock.patch.object(server.permission.permission_service,
+                               'delete_user') as delete_permission:
+            with pytest.raises(fastapi.HTTPException) as exc_info:
+                server.user_delete(mock_request, delete_body)
+
+        assert exc_info.value.status_code == 409
+        assert 'temporarily unavailable' in str(exc_info.value.detail)
+        owned_services.assert_not_called()
+        active.assert_not_called()
+        delete_user.assert_not_called()
+        delete_permission.assert_not_called()
 
     @mock.patch('sky.global_user_state.get_user')
     @pytest.mark.asyncio

@@ -1483,6 +1483,80 @@ def test_postgres_lifecycle_epoch_uses_lock_owning_session():
     assert lifecycle_lock.epoch == 7
 
 
+def test_postgres_controller_preserving_lock_reads_current_epoch():
+    pg_lock = mock.MagicMock(spec=serve_utils.locks.PostgresLock)
+    pg_lock.is_session_alive.return_value = True
+    connection = object()
+    pg_lock.run_in_lock_session.side_effect = lambda operation: operation(
+        connection)
+    lifecycle_lock = serve_utils.ServiceLifecycleLock('svc',
+                                                      pg_lock,
+                                                      advance_epoch=False)
+
+    with mock.patch.object(serve_utils.serve_state,
+                           'read_service_lifecycle_epoch',
+                           return_value=7) as read, \
+         mock.patch.object(serve_utils.serve_state,
+                           'claim_service_lifecycle_epoch') as claim:
+        lifecycle_lock.acquire()
+
+    read.assert_called_once_with('svc', connection)
+    claim.assert_not_called()
+    assert lifecycle_lock.epoch == 7
+
+
+def test_postgres_deferred_lifecycle_lock_retains_on_lock_session():
+    pg_lock = mock.MagicMock(spec=serve_utils.locks.PostgresLock)
+    pg_lock.is_session_alive.return_value = True
+    connection = object()
+    pg_lock.run_in_lock_session.side_effect = lambda operation: operation(
+        connection)
+    lifecycle_lock = serve_utils.ServiceLifecycleLock('svc',
+                                                      pg_lock,
+                                                      advance_epoch=None)
+
+    with mock.patch.object(serve_utils.serve_state,
+                           'read_service_lifecycle_epoch',
+                           return_value=7) as read, \
+         mock.patch.object(serve_utils.serve_state,
+                           'claim_service_lifecycle_epoch') as claim:
+        lifecycle_lock.acquire()
+        assert lifecycle_lock.epoch is None
+        read.assert_not_called()
+        claim.assert_not_called()
+        assert serve_utils.retain_service_lifecycle_epoch(lifecycle_lock) == 7
+
+    read.assert_called_once_with('svc', connection)
+    claim.assert_not_called()
+    assert lifecycle_lock.epoch == 7
+
+
+def test_postgres_deferred_lifecycle_lock_advances_on_lock_session():
+    pg_lock = mock.MagicMock(spec=serve_utils.locks.PostgresLock)
+    pg_lock.is_session_alive.return_value = True
+    connection = object()
+    pg_lock.run_in_lock_session.side_effect = lambda operation: operation(
+        connection)
+    lifecycle_lock = serve_utils.ServiceLifecycleLock('svc',
+                                                      pg_lock,
+                                                      advance_epoch=None)
+
+    with mock.patch.object(serve_utils.serve_state,
+                           'read_service_lifecycle_epoch') as read, \
+         mock.patch.object(serve_utils.serve_state,
+                           'claim_service_lifecycle_epoch',
+                           return_value=8) as claim:
+        lifecycle_lock.acquire()
+        assert lifecycle_lock.epoch is None
+        read.assert_not_called()
+        claim.assert_not_called()
+        assert serve_utils.advance_service_lifecycle_epoch(lifecycle_lock) == 8
+
+    claim.assert_called_once_with('svc', connection)
+    read.assert_not_called()
+    assert lifecycle_lock.epoch == 8
+
+
 def test_lifecycle_epoch_cancellation_releases_lock():
     pg_lock = mock.MagicMock(spec=serve_utils.locks.PostgresLock)
     pg_lock.run_in_lock_session.side_effect = KeyboardInterrupt
@@ -4201,10 +4275,7 @@ def test_ha_recovery_retires_placeholder_without_committed_version(tmp_path):
          mock.patch.object(serve_state,
                            'get_latest_committed_versions', return_value={}), \
          mock.patch.object(serve_state,
-                           'get_service_mode_and_hashes',
-                           return_value={
-                               'svc': (False, 'placeholder-hash')
-                           }), \
+                           'get_service_mode_and_hashes') as identities, \
          mock.patch.object(
              serve_state,
              'mark_unrecoverable_service_for_cleanup',
@@ -4221,6 +4292,7 @@ def test_ha_recovery_retires_placeholder_without_committed_version(tmp_path):
                            'LocalProcessCommandRunner') as runner_cls:
         serve_utils.ha_recovery_for_consolidation_mode(pool=False)
 
+    identities.assert_not_called()
     retire.assert_called_once_with('svc', 'placeholder-hash', False)
     runner_cls.return_value.run.assert_not_called()
 
@@ -4272,7 +4344,7 @@ def test_ha_recovery_batches_placeholder_and_raw_identity_fallback_reads(
 
     committed_versions.assert_called_once_with(
         ['orphan-svc', 'placeholder-svc'])
-    identities.assert_called_once_with(['orphan-svc', 'placeholder-svc'])
+    identities.assert_called_once_with(['orphan-svc'])
     retire.assert_called_once_with('placeholder-svc', 'placeholder-hash', False)
     runner_cls.return_value.run.assert_not_called()
 
@@ -4298,10 +4370,8 @@ def test_ha_recovery_preserves_placeholder_with_committed_version(tmp_path):
              return_value={
                  'svc': 1
              }) as committed_versions, \
-         mock.patch.object(
-             serve_state,
-             'get_service_mode_and_hashes',
-             return_value={}) as identities, \
+         mock.patch.object(serve_state,
+                           'get_service_mode_and_hashes') as identities, \
          mock.patch.object(
              serve_state,
              'mark_unrecoverable_service_for_cleanup') as retire, \
@@ -4322,7 +4392,7 @@ def test_ha_recovery_preserves_placeholder_with_committed_version(tmp_path):
         serve_utils.ha_recovery_for_consolidation_mode(pool=True)
 
     committed_versions.assert_called_once_with(['svc'])
-    identities.assert_called_once_with([])
+    identities.assert_not_called()
     retire.assert_not_called()
     runner_cls.return_value.run.assert_called_once_with('recover',
                                                         require_outputs=True)

@@ -205,6 +205,46 @@ class TestPreemptionTtlRetry:
         }
         assert prices == {'seoul': 1.0, 'oregon': 2.0, 'iowa': 3.0}
 
+    def test_snapshot_pages_all_resident_locations_deterministically(
+            self, placer_and_locations):
+        placer, cheap, other, third = placer_and_locations
+
+        first = placer.placement_snapshot(limit=2)
+        second = placer.placement_snapshot(limit=2, offset=first['next_offset'])
+
+        assert first['page_offset'] == 0
+        assert first['next_offset'] == 2
+        assert first['total_locations'] == 3
+        assert first['truncated'] is True
+        assert second['page_offset'] == 2
+        assert second['next_offset'] is None
+        assert second['total_locations'] == 3
+        assert second['truncated'] is False
+        expected_regions = [
+            location.region
+            for location in sorted((cheap, other, third),
+                                   key=lambda item: item.sort_key())
+        ]
+        assert [
+            item['region'] for item in first['locations'] + second['locations']
+        ] == expected_regions
+
+    def test_snapshot_default_page_is_bounded(self):
+        locations = [
+            make_location(f'region-{index:03d}', cloud_name='AWS')
+            for index in range(101)
+        ]
+        placer = make_placer({
+            location: float(index) for index, location in enumerate(locations)
+        })
+
+        snapshot = placer.placement_snapshot()
+
+        assert len(snapshot['locations']) == 100
+        assert snapshot['next_offset'] == 100
+        assert snapshot['total_locations'] == 101
+        assert snapshot['truncated'] is True
+
     def test_retry_state_survives_restart_with_original_expiry(
             self, monkeypatch):
         location = spot_placer.Location(cloud=clouds.AWS(),

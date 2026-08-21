@@ -94,15 +94,36 @@ RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND = (
     f'{RAY_PORT_COMMAND}; '
     f'RAY_ADDRESS=127.0.0.1:$RAY_PORT {constants.SKY_RAY_CMD} status')
 
+
+def _ray_head_wait_initialized_command(ray_command: str) -> str:
+    """Wait on Ray initialization without masking a failed status command."""
+    ray_status_command = (
+        'RAY_ADDRESS=127.0.0.1:${SKYPILOT_RAY_PORT:-'
+        f'{constants.SKY_REMOTE_RAY_PORT}}} {ray_command} status')
+    return ('while true; do '
+            f'if RAY_STATUS_OUTPUT=$({ray_status_command} 2>&1); then '
+            'RAY_STATUS_CODE=0; '
+            'else '
+            'RAY_STATUS_CODE=$?; '
+            'fi; '
+            'if printf \'%s\\n\' "$RAY_STATUS_OUTPUT" | '
+            'grep -qF "No cluster status."; then '
+            'sleep 0.5; '
+            'echo "Waiting ray cluster to be initialized"; '
+            'continue; '
+            'fi; '
+            'if [ "$RAY_STATUS_CODE" -ne 0 ]; then '
+            'printf \'%s\\n\' "$RAY_STATUS_OUTPUT" >&2; '
+            'exit "$RAY_STATUS_CODE"; '
+            'fi; '
+            'break; '
+            'done;')
+
+
 # Command that waits for the ray status to be initialized. Otherwise, a later
 # `sky status -r` may fail due to the ray cluster not being ready.
-RAY_HEAD_WAIT_INITIALIZED_COMMAND = (
-    'while `RAY_ADDRESS=127.0.0.1:${SKYPILOT_RAY_PORT:-'
-    f'{constants.SKY_REMOTE_RAY_PORT}}} '
-    f'{constants.SKY_RAY_CMD} status | grep -q "No cluster status."`; do '
-    'sleep 0.5; '
-    'echo "Waiting ray cluster to be initialized"; '
-    'done;')
+RAY_HEAD_WAIT_INITIALIZED_COMMAND = _ray_head_wait_initialized_command(
+    constants.SKY_RAY_CMD)
 
 
 def ray_gpu_options(custom_resource: str) -> str:

@@ -10,6 +10,7 @@ import pickle
 import pytest
 
 from sky import clouds
+from sky import exceptions
 from sky import global_user_state
 from sky import provision
 from sky.provision import common
@@ -158,8 +159,6 @@ def test_bulk_provision_propagates_exact_optional_incarnation(
     monkeypatch.setattr(provisioner.provision_logging,
                         'setup_provision_logging',
                         lambda *_: contextlib.nullcontext())
-    monkeypatch.setattr(provisioner.provision_volume,
-                        'provision_ephemeral_volumes', lambda *_: None)
     monkeypatch.setattr(global_user_state, 'add_cluster_event', lambda *_: None)
 
     calls = []
@@ -174,11 +173,17 @@ def test_bulk_provision_propagates_exact_optional_incarnation(
         finally:
             guard_depth -= 1
 
+    def provision_ephemeral_volumes(cloud, region, cluster_name_on_cloud,
+                                    config):
+        assert guard_depth == 1
+        calls.append(
+            ('ephemeral', cloud, region, cluster_name_on_cloud, config))
+
     def bootstrap_instances(provider_name, region, cluster_name_on_cloud,
                             config):
-        # Auxiliary setup is not accelerator-bearing; the in-tree Kubernetes
-        # provider enters this factory only at its exact Pod mutation seams.
-        assert guard_depth == 0
+        # Kubernetes bootstrap may create or patch Services and RBAC, so its
+        # complete bounded transaction needs fresh provider authority.
+        assert guard_depth == 1
         calls.append(
             ('bootstrap', provider_name, region, cluster_name_on_cloud, config))
         return config
@@ -194,6 +199,9 @@ def test_bulk_provision_propagates_exact_optional_incarnation(
                       cluster_name_on_cloud, config))
         return record
 
+    monkeypatch.setattr(provisioner.provision_volume,
+                        'provision_ephemeral_volumes',
+                        provision_ephemeral_volumes)
     monkeypatch.setattr(provision, 'bootstrap_instances', bootstrap_instances)
     monkeypatch.setattr(provision, 'run_instances', run_instances)
 
@@ -213,12 +221,63 @@ def test_bulk_provision_propagates_exact_optional_incarnation(
     )
 
     assert result is record
-    assert [call[0] for call in calls] == ['bootstrap', 'run']
+    assert [call[0] for call in calls] == ['ephemeral', 'bootstrap', 'run']
     bootstrap_config = calls[0][-1]
     assert calls[1][-1] is bootstrap_config
+    assert calls[2][-1] is bootstrap_config
     assert bootstrap_config.cluster_incarnation is marker
     assert (bootstrap_config.provider_effect_guard_factory
             is provider_effect_guard)
+
+
+def test_bulk_provision_rechecks_authority_between_auxiliary_mutations(
+        monkeypatch):
+    """A stale launch cannot reach bootstrap after an earlier provider write."""
+    events = []
+    guard_attempt = 0
+
+    @contextlib.contextmanager
+    def provider_effect_guard():
+        nonlocal guard_attempt
+        guard_attempt += 1
+        events.append(f'guard-{guard_attempt}-enter')
+        if guard_attempt == 2:
+            raise exceptions.ReservedFillLaunchFenceError(
+                'authority changed before bootstrap')
+        try:
+            yield
+        finally:
+            events.append(f'guard-{guard_attempt}-exit')
+
+    config = common.ProvisionConfig(
+        provider_config={},
+        authentication_config={},
+        docker_config={},
+        node_config={},
+        count=1,
+        tags={},
+        resume_stopped_nodes=True,
+        ports_to_open_on_launch=None,
+        provider_effect_guard_factory=provider_effect_guard)
+    monkeypatch.setattr(provisioner.provision_volume,
+                        'provision_ephemeral_volumes',
+                        lambda *_: events.append('ephemeral-provider-write'))
+    monkeypatch.setattr(provision, 'bootstrap_instances',
+                        lambda *_: events.append('bootstrap-provider-write'))
+    monkeypatch.setattr(
+        provision, 'run_instances',
+        lambda *_args, **_kwargs: events.append('run-provider-write'))
+
+    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
+                       match='authority changed before bootstrap'):
+        provisioner._bulk_provision(
+            clouds.Kubernetes(), clouds.Region('test-region'),
+            resources_utils.ClusterName('display-name', 'cloud-name'), config)
+
+    assert events == [
+        'guard-1-enter', 'ephemeral-provider-write', 'guard-1-exit',
+        'guard-2-enter'
+    ]
 
 
 def test_builtin_bulk_identity_refreshes_with_module_reload():

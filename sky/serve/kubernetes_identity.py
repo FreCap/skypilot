@@ -57,7 +57,9 @@ _WORKER_KUEUE_ADMISSION_KEYS = frozenset(
     {'local_queue_name', 'workload_priority_class_name'})
 _WORKER_V2_KEYS = (_WORKER_V1_KEYS | frozenset(
     {'projection_version', 'kueue_admission', 'scheduler_name'}))
-_WORKER_V3_KEYS = _WORKER_V2_KEYS | frozenset({'provision_timeout', 'scratch'})
+_WORKER_V3_V4_KEYS = (_WORKER_V2_KEYS |
+                      frozenset({'provision_timeout', 'scratch'}))
+_WORKER_V3_V4_PROTOCOL_VERSIONS = frozenset({3, 4})
 _ACCELERATOR_SCHEDULING_KEYS = frozenset(
     {'label_key', 'label_values', 'resource_key'})
 _MAX_ACCELERATOR_LABEL_VALUES = 16
@@ -423,8 +425,11 @@ def worker_projection_protocol_version(projection: Mapping[str, Any]) -> int:
 
     Protocol v1 intentionally has no discriminator.  Its old exact key set is
     the only implicit-v1 shape accepted during the ordinary-launch transition.
-    Protocol v2 remains an isolated decoder for already-committed rows. New
-    rows carry the explicit v3 discriminator and closed v3 key set.
+    Protocol v2 remains an isolated decoder for already-committed rows.
+    Protocols v3 and v4 intentionally share one closed key set: v3 retains its
+    historical Running-only provisioning semantics, while v4 requires
+    UID-bound runtime readiness.  New rows carry the explicit v4
+    discriminator.
     """
     if not isinstance(projection, Mapping):
         raise ValueError('Worker placement projection must be a mapping.')
@@ -437,20 +442,19 @@ def worker_projection_protocol_version(projection: Mapping[str, Any]) -> int:
             raise ValueError('Worker placement projection_version must be '
                              'exactly 2 for the protocol-v2 key set.')
         return 2
-    if keys == _WORKER_V3_KEYS:
-        if (type(projection['projection_version']) is not int or
-                projection['projection_version']
-                != PLACEMENT_PROJECTION_PROTOCOL_VERSION):
+    if keys == _WORKER_V3_V4_KEYS:
+        projection_version = projection['projection_version']
+        if (type(projection_version) is not int or
+                projection_version not in _WORKER_V3_V4_PROTOCOL_VERSIONS):
             raise ValueError('Worker placement projection_version must be '
-                             f'exactly '
-                             f'{PLACEMENT_PROJECTION_PROTOCOL_VERSION} for the '
-                             'protocol-v3 key set.')
-        return PLACEMENT_PROJECTION_PROTOCOL_VERSION
+                             'exactly 3 or 4 for the '
+                             'protocol-v3/v4 key set.')
+        return projection_version
     raise ValueError(
         'Worker placement projection must contain exactly the protocol-v1 '
         f'keys {sorted(_WORKER_V1_KEYS)!r} or protocol-v2 keys '
-        f'{sorted(_WORKER_V2_KEYS)!r} or protocol-v3 keys '
-        f'{sorted(_WORKER_V3_KEYS)!r}.')
+        f'{sorted(_WORKER_V2_KEYS)!r} or protocol-v3/v4 keys '
+        f'{sorted(_WORKER_V3_V4_KEYS)!r}.')
 
 
 def worker_projection_has_strict_admission(
@@ -661,7 +665,8 @@ def worker_projection_sha256(projection: Mapping[str, Any]) -> str:
     if not (kubernetes_pod_spec.
             serve_worker_projection_protocol_has_strict_admission)(
                 worker_projection_protocol_version(validated[0])):
-        raise ValueError('Worker projection digest requires protocol 2 or 3.')
+        raise ValueError(
+            'Worker projection digest requires protocol 2, 3, or 4.')
     canonical_json = json.dumps(validated[0],
                                 sort_keys=True,
                                 separators=(',', ':'),
@@ -1147,9 +1152,8 @@ def _project_worker_provision_timeout(
     *,
     num_nodes: int,
     volume_mounts: list[Any] | None,
-    kueue_admission: dict[str, str] | None,
 ) -> int:
-    """Freeze the existing effective timeout under the version's config."""
+    """Freeze the post-admission scheduling wait owned by the version."""
     dws_config = skypilot_config.get_effective_workspace_region_config(
         cloud='kubernetes',
         region=context,
@@ -1158,8 +1162,7 @@ def _project_worker_provision_timeout(
         default_value={})
     enable_flex_start = bool(dws_config and dws_config.get('enabled', False))
     default_timeout = kubernetes_cloud.Kubernetes.calculate_provision_timeout(
-        num_nodes, volume_mounts, enable_flex_start, kueue_admission
-        is not None)
+        num_nodes, volume_mounts, enable_flex_start)
     configured = skypilot_config.get_effective_workspace_region_config(
         cloud='kubernetes',
         region=context,
@@ -1318,8 +1321,7 @@ def build_worker_placement_projections(
                 context,
                 workspace,
                 num_nodes=task.num_nodes,
-                volume_mounts=task.volume_mounts,
-                kueue_admission=kueue_admission),
+                volume_mounts=task.volume_mounts),
             'accelerator_name': accelerator_name,
             'accelerator_count': accelerator_count,
             'accelerator_scheduling': _project_accelerator_scheduling(
@@ -1373,7 +1375,7 @@ def cache_environment(projection: dict[str, Any]) -> dict[str, str]:
 
 
 def scratch_environment(projection: dict[str, Any]) -> dict[str, str]:
-    """Return server-owned runtime scratch environment for one v3 worker."""
+    """Return server-owned runtime scratch environment for one v3/v4 worker."""
     if not kubernetes_pod_spec.serve_worker_projection_protocol_has_scratch(
             worker_projection_protocol_version(projection)):
         return {}

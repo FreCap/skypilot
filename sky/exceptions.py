@@ -893,7 +893,22 @@ class ProviderPhaseMisuseError(ProviderPhaseError):
 
 
 class ReservedFillLaunchFenceError(RequestCancelled):
-    """A durable reserved-fill launch no longer matches its exact pin."""
+    """A durable reserved-fill request cannot safely continue provider I/O."""
+
+
+class ReservedFillProviderPresentError(ReservedFillLaunchFenceError):
+    """A v2 launch stopped after exact provider resources were observed.
+
+    The request must not delete, fail over, or publish absence from this
+    observation. Durable reserved-fill reconciliation retains the association
+    and performs the single UID-fenced PRESENT-to-ABSENT cleanup protocol.
+    """
+
+    def __init__(
+        self, message: str, provider_resource_ids: tuple[str,
+                                                         ...] = ()) -> None:
+        super().__init__(message)
+        self.provider_resource_ids = provider_resource_ids
 
 
 class ApiServerConnectionError(RuntimeError):

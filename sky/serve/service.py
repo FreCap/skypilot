@@ -74,6 +74,20 @@ class ServiceOwnershipLostError(RuntimeError):
     """Raised when teardown no longer owns the exact service incarnation."""
 
 
+def _service_owner_from_launch_environment() -> tuple[str, str]:
+    """Read the explicit tenant tuple frozen into the controller launch."""
+    user_id = os.environ.get(skylet_constants.USER_ID_ENV_VAR)
+    user_name = os.environ.get(skylet_constants.USER_ENV_VAR)
+    if not isinstance(user_id,
+                      str) or not common_utils.is_valid_user_hash(user_id):
+        raise RuntimeError(
+            'Service controller launch has no explicit valid owner user ID.')
+    if not isinstance(user_name, str) or not user_name:
+        raise RuntimeError(
+            'Service controller launch has no explicit owner user name.')
+    return user_id, user_name
+
+
 def load_task_for_storage_cleanup(yaml_content: str) -> task_lib.Task:
     """Load storage metadata without revalidating historical Serve policy."""
     config = yaml_utils.safe_load(yaml_content)
@@ -761,39 +775,39 @@ def _exit_on_ownership_loss(
     _orphan_exit(controller_process)
 
 
-def _promote_fresh_ordinary_launch_binding(
+def _verify_fresh_non_pool_launch_authority(
     authority: ordinary_launch_binding.ControllerBindingAuthority | None,
     *,
     is_recovery: bool,
     is_pool: bool,
 ) -> ordinary_launch_binding.ControllerBindingAuthority | None:
-    """Promote an eligible fresh service before its controller can spawn.
+    """Verify canonical fresh authority before its controller can spawn.
 
     Recovery preserves the persisted binding mode, pools have no inference
     endpoint, and stores without Serve042 PostgreSQL support return no durable
-    authority.  Every other fresh service must complete the transactional
-    participant/drain barriers and then prove the exact committed authority.
+    authority.  Every other fresh service is born on the generic PostgreSQL
+    path and must prove that exact committed authority.  There is no fresh
+    legacy interval or runtime promotion transaction.
     """
     if is_recovery or is_pool or authority is None:
         return authority
-    if authority.capable is not True:
+    if (authority.capable is not True or authority.binding_mode
+            is not ordinary_launch_binding.BindingMode.BOUND or
+            authority.binding_epoch != 1 or
+            not authority.generic_launches_required):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-            'Fresh ordinary-launch binding requires capable authority.')
+            'Fresh non-pool service lacks canonical generic launch authority.')
 
-    promoted_epoch = request_postgres.promote_ordinary_launch_binding_service(
-        authority)
-    expected_epoch = authority.binding_epoch + 1
-    if promoted_epoch != expected_epoch:
-        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-            'Fresh ordinary-launch binding promotion returned an unexpected '
-            'epoch.')
     with ordinary_launch_binding.refresh_controller_authority(
             authority) as refreshed:
-        if (refreshed.binding_mode != ordinary_launch_binding.BindingMode.BOUND
-                or refreshed.binding_epoch != promoted_epoch):
+        if (refreshed != authority or refreshed.capable is not True or
+                refreshed.binding_mode
+                is not ordinary_launch_binding.BindingMode.BOUND or
+                refreshed.binding_epoch != 1 or
+                not refreshed.generic_launches_required):
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                'Fresh ordinary-launch binding promotion could not be '
-                'verified under the exact controller authority.')
+                'Fresh canonical launch authority could not be verified '
+                'under the exact controller owner.')
         return refreshed
 
 
@@ -1886,6 +1900,10 @@ def _start(service_name: str,
     # Generate ssh key pair to avoid race condition when multiple sky.launch
     # are executed at the same time.
     auth_utils.get_or_generate_keys()
+    # The controller launch environment freezes the initiating tenant. Capture
+    # it once; updates and HA takeovers must never replace this authority.
+    (service_owner_user_id,
+     service_owner_user_name) = _service_owner_from_launch_environment()
 
     service = serve_state.get_service_from_name(service_name)
     is_recovery = service is not None
@@ -2267,6 +2285,8 @@ def _start(service_name: str,
                     service_hash=service_incarnation,
                     lifecycle_epoch=lifecycle_epoch,
                     resource_scope=resource_scope,
+                    owner_user_id=service_owner_user_id,
+                    owner_user_name=service_owner_user_name,
                     created_by=created_by,
                     submitted_yaml_content=submitted_yaml_content,
                     placement_catalog=placement_catalog,
@@ -2404,7 +2424,12 @@ def _start(service_name: str,
                                         'claiming fresh controller startup',
                                         None)
 
-        controller_binding_authority = (_promote_fresh_ordinary_launch_binding(
+        if controller_binding_authority is not None:
+            serve_state.attest_service_owner_user_id(
+                controller_binding_authority, service_owner_user_id,
+                service_owner_user_name)
+
+        controller_binding_authority = (_verify_fresh_non_pool_launch_authority(
             controller_binding_authority,
             is_recovery=is_recovery,
             is_pool=service_spec.pool))

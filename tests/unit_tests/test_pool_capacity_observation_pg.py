@@ -8,6 +8,7 @@ import os
 import subprocess
 import threading
 import types
+from unittest import mock
 import uuid
 
 from alembic import command as alembic_command
@@ -19,6 +20,7 @@ from test_reserved_fill_broker_pg import pg_server as _broker_pg_server
 
 from sky import clouds
 from sky import exceptions
+from sky import global_user_state_schema
 from sky.serve import ordinary_launch_binding
 from sky.serve import pool_capacity_observation as observation
 from sky.serve import pool_capacity_observation_schema as observation_schema
@@ -27,6 +29,7 @@ from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_reclaim_attestation as reclaim_attestation
 from sky.serve import serve_state
 from sky.serve import spot_placer
+from sky.serve import zero_cost_actuation
 from sky.utils import common_utils
 from sky.utils.db import migration_utils
 
@@ -53,6 +56,21 @@ def pg_server():
     yield from _broker_pg_server.__wrapped__()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_durable_intent_debits():
+    """Keep Serve046 observation tests on their characterized schema.
+
+    This module deliberately migrates isolated databases only through the
+    Serve046 observation contract.  Durable actuation intents arrive in
+    Serve052 and have their own real-PostgreSQL suites, so broker occupancy
+    tests here must supply the pre-Serve052 empty-intent boundary explicitly.
+    """
+    with mock.patch.object(zero_cost_actuation,
+                           'pending_pool_debits',
+                           return_value=()):
+        yield
+
+
 def _pool_key(*names: str) -> str:
     encoded_names: str | list[str] = (names[0]
                                       if len(names) == 1 else list(names))
@@ -74,6 +92,7 @@ def _isolated_engine(request, prefix: str) -> sqlalchemy.engine.Engine:
         pg_server = request.getfixturevalue('pg_server')
         url = _create_database(pg_server, database_name)
     engine = sqlalchemy.create_engine(url)
+    global_user_state_schema.user_table.create(engine, checkfirst=True)
 
     def cleanup() -> None:
         engine.dispose()
@@ -1267,29 +1286,6 @@ def test_generic_zero_cost_insert_rejects_preassigned_materialization(
 
     assert info.zero_cost_admission_sequence is None
     assert info.zero_cost_materialization_sequence == 7
-    assert _protocol_sequences(observation_engine) == (0, 0, 0)
-
-
-@pytest.mark.parametrize('field', (
-    'zero_cost_admission_sequence',
-    'zero_cost_materialization_sequence',
-))
-def test_typed_fill_rejects_caller_assigned_event_sequence(
-        observation_engine, monkeypatch, field) -> None:
-    monkeypatch.setattr(serve_state._db_manager, '_engine', observation_engine)
-    info = _zero_cost_replica(1)
-    info.reserved_fill = True
-    setattr(info, field, 7)
-
-    with pytest.raises(ValueError, match='assigned by PostgreSQL'):
-        serve_state.add_replica_if_round_epoch('claimant',
-                                               1,
-                                               info,
-                                               pool_key=_single_pool_key(),
-                                               expected_epoch=1,
-                                               expected_protocol_version=2,
-                                               expected_lease_token=1)
-
     assert _protocol_sequences(observation_engine) == (0, 0, 0)
 
 

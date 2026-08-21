@@ -69,21 +69,28 @@ def _bulk_provision(
 
     start = time.time()
 
-    # Auxiliary setup cannot occupy an accelerator reservation. It remains
-    # outside the reclaim mutation guard; the exact Pod-create boundary below
-    # revalidates authority after setup and before any compute can exist.
-    provision_volume.provision_ephemeral_volumes(cloud, region_name,
-                                                 cluster_name.name_on_cloud,
-                                                 bootstrap_config)
+    # Ephemeral volumes are optional provider objects.  Keep their creation in
+    # a separate bounded effect epoch when this launch carries runtime
+    # authorization; a stale reserved-fill request must not leak a PVC before
+    # the later Pod-create boundary gets a chance to reject it.
+    with _runtime_effect_guard(bootstrap_config.provider_effect_guard_factory):
+        provision_volume.provision_ephemeral_volumes(cloud, region_name,
+                                                     cluster_name.name_on_cloud,
+                                                     bootstrap_config)
 
     # TODO(suquark): Should we cache the bootstrapped result?
     #  Currently it is not necessary as bootstrapping takes
     #  only ~3s, caching it seems over-engineering and could
     #  cause other issues like the cache is not synced
     #  with the cloud configuration.
-    config = provision.bootstrap_instances(provider_name, region_name,
-                                           cluster_name.name_on_cloud,
-                                           bootstrap_config)
+    # Kubernetes bootstrap creates or patches Services, RBAC, namespaces, and
+    # other provider objects.  It is short, but it is not passive validation;
+    # fence the complete bootstrap transaction before run_instances enters its
+    # finer Pod mutation epochs and passive admission/scheduling waits.
+    with _runtime_effect_guard(bootstrap_config.provider_effect_guard_factory):
+        config = provision.bootstrap_instances(provider_name, region_name,
+                                               cluster_name.name_on_cloud,
+                                               bootstrap_config)
     if (bootstrap_config.provider_effect_guard_factory is not None and
             getattr(config, 'provider_effect_guard_factory', None)
             is not bootstrap_config.provider_effect_guard_factory):

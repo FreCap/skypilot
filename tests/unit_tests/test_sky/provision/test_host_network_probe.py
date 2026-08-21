@@ -13,8 +13,10 @@ and are exercised by smoke tests instead.
 import base64
 import gzip
 import hashlib
+import os
 import pickle
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -25,6 +27,36 @@ from sky.provision import instance_setup
 from sky.provision import ray_commands
 from sky.provision.kubernetes import host_network_probe
 from sky.skylet import constants
+
+
+def _fake_ray_status_command(tmp_path, mode):
+    fake_ray = tmp_path / 'fake-ray'
+    fake_ray.write_text(
+        '#!/bin/sh\n'
+        'COUNT=$(cat "$RAY_WAIT_TEST_COUNT" 2>/dev/null || echo 0)\n'
+        'COUNT=$((COUNT + 1))\n'
+        'printf \'%s\\n\' "$COUNT" > "$RAY_WAIT_TEST_COUNT"\n'
+        'if [ "$RAY_WAIT_TEST_MODE" = "initializing" ] && '
+        '[ "$COUNT" -eq 1 ]; then\n'
+        '  echo "No cluster status." >&2\n'
+        '  exit 17\n'
+        'fi\n'
+        'if [ "$RAY_WAIT_TEST_MODE" = "failure" ]; then\n'
+        '  echo "ray status transport failed" >&2\n'
+        '  exit 23\n'
+        'fi\n'
+        'echo "Healthy"\n',
+        encoding='utf-8')
+    fake_ray.chmod(0o755)
+    count_path = tmp_path / 'ray-status-count'
+    # pylint: disable-next=protected-access,no-member
+    command = ray_commands._ray_head_wait_initialized_command(
+        shlex.quote(str(fake_ray)))
+    return command, count_path, {
+        **os.environ,
+        'RAY_WAIT_TEST_COUNT': str(count_path),
+        'RAY_WAIT_TEST_MODE': mode,
+    }
 
 
 class TestProbePorts:
@@ -80,6 +112,35 @@ class TestRayStartCommands:
             assert pickle.loads(
                 pickle.dumps(facade_callable)) is facade_callable
 
+    def test_head_initialization_wait_retries_only_explicit_condition(
+            self, tmp_path):
+        command, count_path, env = _fake_ray_status_command(
+            tmp_path, 'initializing')
+
+        result = subprocess.run(['bash', '-c', f'set -e\n{command}'],
+                                text=True,
+                                capture_output=True,
+                                env=env,
+                                check=False)
+
+        assert result.returncode == 0
+        assert count_path.read_text(encoding='utf-8').strip() == '2'
+        assert 'Waiting ray cluster to be initialized' in result.stdout
+
+    def test_head_initialization_wait_propagates_unexpected_failure(
+            self, tmp_path):
+        command, count_path, env = _fake_ray_status_command(tmp_path, 'failure')
+
+        result = subprocess.run(['bash', '-c', f'set -e\n{command}'],
+                                text=True,
+                                capture_output=True,
+                                env=env,
+                                check=False)
+
+        assert result.returncode == 23
+        assert count_path.read_text(encoding='utf-8').strip() == '1'
+        assert 'ray status transport failed' in result.stderr
+
     def test_generated_commands_are_byte_for_byte_stable(self, monkeypatch):
         monkeypatch.setattr(instance_setup, '_host_network_probe_cmd',
                             lambda mode: f'probe:{mode};')
@@ -97,8 +158,8 @@ class TestRayStartCommands:
             name: hashlib.sha256(value.encode()).hexdigest()
             for name, value in samples.items()
         } == {
-            'head_default': '072a8fcf86016bc82dc9d9abd9a08295eb6416cdcf494ff6dc3252dcd06c1ec0',
-            'head_gpu': '5b77a2fb64fda2351403e78ee164891c1c4a5faa0a45d6e63ae9242a1eb65ec9',
+            'head_default': '22b75426f3a00ad92d92b44d72e123be33cf7588a58b11845fe67556f0ea71a0',
+            'head_gpu': 'b0e4ddc9d5a2bfd96f20a3272d9aa4a95417142e3d4023a5396f6002d6b2732a',
             'worker_restart': 'b6261bf80d5eea19687f6fb057beb870665171c977ac36e535c2675e66589533',
             'worker_no_restart': 'ec56741f765842a5a4dad58f09b03a1c904793bb99207b75790393e70070a21f',
         }

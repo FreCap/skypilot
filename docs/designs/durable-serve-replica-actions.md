@@ -1,6 +1,6 @@
 # Durable SkyServe Replica Actions
 
-Last updated: 2026-08-19
+Last updated: 2026-08-20
 
 Status: the dedicated resource-action authority proposal is retired before
 activation. PRs #1112, #1239, #1240, #1336, #1338, and #1343 are closed. PR
@@ -31,10 +31,12 @@ revision 407 / release `1.1.1310` at API-request 014/Serve050. Live
 qualification disproved the first cleanup's route-freshness prerequisite and
 also confirmed row-before-pool-lane reserved-fill actuation. P2c Serve051 and
 P2d Serve052 in `skyserve-demand-capacity-convergence.md` must land first. The
-G2 authority cleanup in draft PR #1506 is then restacked as API016/Serve053,
-and final generic non-pool cleanup #1510 immediately above it as
-API017/Serve054. Both cleanup PRs remain draft and undeployed until their
-operational and adversarial-review gates pass.
+Historical cleanup PRs #1506 and #1510 are closed and superseded. They reserve
+no API or Serve revisions and must not be restacked. Any later deletion-only
+cleanup is re-derived from current old-path-use evidence and receives a schema
+head only if its concrete implementation needs one; Serve054 belongs to the
+reserved-fill provider-proof receipt owned by
+`serve-multi-pool-reserved-capacity-fill.md`.
 No service was promoted through the proposed authority path, no authority
 worker claimed a request, and no provider effect ran through that path. Source
 cleanup is merged and deployed, but operational closeout remains open: the
@@ -73,14 +75,18 @@ in this document. Issue #1352 owns that telemetry-first follow-up; it is not an
 R0 authority-retirement blocker.
 
 The localized follow-up is now authored as a stack through R3. R1 adds only
-diagnostic evidence, R2 adds the bounded binding/adoption machinery while
-leaving all services in `legacy`, and this R3 change makes that machinery
-mandatory before the first controller child is spawned for a fresh eligible
-central-PostgreSQL non-pool service. R3 does not change schema defaults,
-migrate an existing service, promote a recovery, or change pool/local/pre-042
-behavior. R4, the already-planned legacy-fallback removal, remains blocked on
-the rollout and migration gates below. None of R1--R3 is treated as deployed
-merely because its stacked source is authored.
+diagnostic evidence and R2 adds the bounded binding/adoption machinery while
+leaving retained services in `legacy`. R3 is corrected by the current fresh-
+service canonical-birth change: one `add_service()` transaction creates every
+lifecycle-fenced central-PostgreSQL non-pool service on the complete generic
+authority tuple, and `_start()` verifies that exact tuple before its first
+controller child is spawned. There is no committed fresh legacy interval and
+no runtime promotion in the canonical birth path. R3 does not add a schema
+migration, migrate an existing service, promote a recovery, or change
+pool/local/pre-042 behavior. The replacement G2 legacy-fallback removal remains
+blocked on the rollout and retirement gates below. The canonical-birth source
+is implemented on `feature/canonical-fresh-service-birth`, but is not merged,
+deployed, activated, or production-proven merely because it is authored.
 
 The 2026-08-15 mixed-version incident materially changes the accepted steady
 state. An old executor claimed launch requests, ran real provider effects, and
@@ -88,9 +94,10 @@ later left terminal request state without the newer execution-quiescence
 receipt. Consequently, `execution_generation = 0`, a missing PID or process
 entrypoint, and `execution_quiescence_required = false` are not proof that no
 effect occurred. The earlier ordinary-only scope and R4 cleanup are superseded
-by the generalized non-pool launch-binding stack below. The existing R1--R3
-work remains useful transition machinery, but it is not the long-term boundary
-and must not be deployed as though excluded launch profiles can remain
+by the generalized non-pool launch-binding stack below. R1/R2 and the explicit
+promotion/demotion surfaces remain retained-service transition machinery, but
+they are not the long-term boundary and fresh services no longer consume them.
+They must not be deployed as though excluded launch profiles can remain
 permanently unbound.
 
 As of 2026-08-16, G1 is merged as PR #1498. It was present in the v1.1.1296
@@ -185,6 +192,126 @@ admission failure caused by a missing server-owned Kueue queue label. Those
 rows remain ordinary typed-recovery work after the lineage fix; the label
 defect is owned by workspace/provider admission configuration, not this action
 protocol.
+
+### 2026-08-20 exact provider-present cleanup adjudication
+
+Production protocol-v2 reserved-fill recovery exposed a second closed outcome
+that the absence projector alone cannot initiate. A launch request can be
+terminal and exactly execution-quiesced with no recorded service job while its
+immutable Kubernetes Pod is still `PRESENT`. Such a Pod is not an adoptable
+Serve replica: transport success and provider presence do not supply the
+missing service-job result. It is also not absent, so neither the request
+reducer nor the provider-absence projector may release its association. Keeping
+the row ambiguous forever, however, pins a committed zero-cost allocation and
+prevents a clean successor from using the same free capacity.
+
+The accepted adjudication is a two-phase reduction through the existing
+cleanup worker, not a new execution topology or a broader meaning for
+`PROJECTED`:
+
+1. A fresh provider read outside all manager and database locks reports exact
+   `PRESENT`. One PostgreSQL transaction then re-locks the lifecycle fence,
+   current service hash and owner, replica record and association, terminal
+   request generation, queue and retention pin. It revalidates the canonical
+   request-body digest, the complete protocol-v2 `RESERVED_FILL` profile and
+   its committed intent, the exact Kubernetes context and physical cluster
+   UID, provider-evidence payload and digest, exact required quiescence, a null
+   service-job ID, and absence of both a replica paid-pool key and every paid
+   claim. The association must already have crossed the durable provider-effect
+   boundary (`PROVIDER_IO` or `SERVICE_JOB_IO`); `PRESENT` while still
+   `NOT_STARTED` is not attributable to this action and remains quarantined.
+   Only then may it persist the existing durable cleanup shape:
+   `sky_launch_status = INTERRUPTED`, `sky_down_status = SCHEDULED`,
+   `is_scale_down = true`, no idle wait, a zero-second drain cap, and no
+   logical-retirement metadata. The association, replica pointer, and request
+   pin remain unsettled. Replaying the same transaction is idempotent. Once
+   admitted, `RUNNING` and `FAILED` are recognized as later states of this same
+   exact authorization; neither requires a second provider-present write.
+2. The ordinary restart-recoverable down scheduler consumes that durable
+   `SHUTTING_DOWN` shape and runs the existing record- and physical-UID-fenced
+   teardown. In the same down worker, after teardown returns, it performs a
+   new provider read. The worker may report successful cleanup only when that
+   read is exact `ABSENT` and the existing absence projector atomically clears
+   the association pointer, changes the association to `PROJECTED`, releases
+   the retention pin, and proves there is still no paid claim. Normal down
+   completion can then remove the scale-down row. A crash at any boundary
+   leaves either the unsettled association plus durable cleanup intent, or the
+   settled association plus removable row; controller restart re-enters the
+   same path without inventing a request result.
+
+The digest check has one contract. The locked durable body must hash to the
+association input digest, its tenant/name tuple must equal the immutable
+service owner, and the locked request/body tenant and cluster tuple must equal
+the association. The temporary `LEGACY_HTTP_NORMALIZED` verifier existed only
+to settle the nine enumerated pre-atomic rows and is removed after all nine
+reach exact provider `ABSENT`, release their pins and debits, and one complete
+stale/quiescence horizon remains at zero legacy rows. The transition never
+authorized launch, adoption, cancellation, paid capacity, or result
+projection; those operations remain on the single current path.
+
+The removal gate was captured on 2026-08-21. Production censuses at
+02:18:15 UTC and 02:21:53 UTC (218 seconds apart) each found zero unsettled
+`RESERVED_FILL` associations, zero associated request-retention pins, and zero
+`boltz-l4-fleet` paid-capacity claims. All two API, two controller, and two
+executor Pods were Ready with zero restarts on image digest
+`sha256:a61cc5ecf391ed5dfc9861d3ecebbbc55f5c7bf9c3ba0089ec3691bbe0618e3a`.
+The obsolete verifier therefore has no remaining provider-present cleanup
+population.
+
+The settled crash boundary is authorized from history, not from the now-cleared
+replica pointer. Before removing that row, restart recovery re-locks the exact
+service/replica record and its sole protocol-v2 association tombstone. It
+requires canonical post-quiescence `ABSENT` evidence, `PROJECTED`, a released
+and actually absent request pin, a null replica pointer, the unchanged
+zero-paid cleanup marker, and no paid claim. This readback authorizes only the
+existing record-fenced row removal and never another provider operation. It
+requires the association lifecycle epoch to exactly equal the current agreeing
+lifecycle/service fence. A stale tombstone cannot acquire authority from a
+later lifecycle even after provider absence has been proven.
+
+No schema or migration is added. The initial `SCHEDULED` transition is the
+atomic authorization receipt and the existing down status is its
+restart-recovery state machine. A finished local launch worker consumes that
+receipt instead of retaining itself indefinitely. An unowned recovered row is
+consumed by the existing failed/committed cleanup reconciler; a live down
+worker excludes the background provider observer so that its own post-down
+read is the sole completion read. If the exact SkyPilot cluster record has
+already disappeared, the row remains pinned while the background observer
+classifies the immutable physical Pod. Exact `ABSENT` projects the association
+and is handed to the normal successful-down completion path; `PRESENT`,
+`UNKNOWN`, or `REPLACED` leaves the row quarantined.
+
+`UNKNOWN`, `REPLACED`, `NOT_QUERIED`, a stale or contradictory `PRESENT`, a
+missing/mismatched request payload, profile, committed intent, context, UID,
+replica record, terminal generation, quiescence receipt, or pin, any recorded
+service-job ID, and any paid-capacity evidence remain quarantined. Autoscaler
+teardown never bypasses this adjudication: an ambiguous association without
+the exact durable provider-present cleanup shape continues to reject
+cancellation and provider cleanup. The lifecycle epoch stored on the
+association remains immutable controller identity; both phases require exact
+equality with the current service operation fence and require the current
+lifecycle and service fence rows to agree.
+
+Authored verification covers the real PostgreSQL transaction from terminal
+generation-one quiescence through `PRESENT` authorization, idempotent replay,
+retained association/pointer/pin, and later `ABSENT` projection/release. Manager
+tests cover the closed evidence dispatch, forced post-down provider reread,
+ambiguous-cancel bypass only for a revalidated marker, exact zero-drain status
+projection, normal down-result completion after asynchronous absence, and a
+restart at the committed-`ABSENT`/pre-row-removal boundary. A PostgreSQL
+negative gate proves `NOT_STARTED` plus `PRESENT` cannot authorize teardown.
+
+Merged PR #1606 prevents controller-preserving `update`, election, and
+external-LB operations from advancing the lifecycle epoch. Production
+inspection on 2026-08-20 proved that all five eligible ambiguous rows (55334,
+55337, 55363, 55371, and 55425) already carry lifecycle epoch 83, owner epoch
+335, and the current service incarnation; all six Serve042 guard/consistency
+triggers are enabled. This adjudication therefore retains exact lifecycle and
+owner equality throughout. Closed PR #1603 is not a dependency, reserves no
+Serve revision, and its historical-origin relaxation is intentionally
+excluded. PR #1609 closes the
+independent `apply` recurrence gap without changing recovery authority for
+these existing rows.
 
 ## Decision record
 
@@ -631,12 +758,13 @@ The forward schema contract is:
 - API012/Serve048 add the controller-independent demand feed, ordered
   zero-cost-before-paid admission, and provider-free route projections owned by
   `skyserve-demand-capacity-convergence.md`.
-- API016/Serve053 are the first blocked cleanup heads, and API017/Serve054 are
-  the immediately stacked final non-pool cleanup heads. They remove protocol-
-  v1/new-admission compatibility, API013 evidence participant-version 1, and
-  transition columns/constraints only after G2's gates; they preserve immutable
-  V1 evidence rows as diagnostic tombstones, typed profiles, current cohort,
-  route history needed by live clients, and permanent reserved authorization.
+- Closed cleanup PRs #1506/#1510 reserve no API or Serve heads. A future
+  deletion-only cleanup may remove protocol-v1/new-admission compatibility,
+  API013 evidence participant-version 1, and transition columns/constraints
+  only after G2's gates and only from a newly reviewed current-source diff. It
+  must preserve immutable V1 evidence rows as diagnostic tombstones, typed
+  profiles, current cohort, route history needed by live clients, and permanent
+  reserved authorization.
 
 An active correlated bound request without its queue row is invariant
 corruption, not an activation state. Startup locks and types the correlated
@@ -777,16 +905,31 @@ incarnation by a separately constrained capable-controller-incarnation UUID,
 monotonic binding epoch. Every controller subprocess startup supplies a fresh
 incarnation UUID;
 the owner CAS changes it and increments the epoch even when PID/IP are reused.
-Serve042 migration rows and existing services default to `legacy`. Fresh R3
-services also insert as `legacy`; after claiming a fresh capable controller
-incarnation, but before spawning its child, an eligible central-PostgreSQL
-non-pool service must complete the existing explicit promotion transaction and
-refresh the exact committed authority. That transaction requires the full
-participant/quiescence barrier and zero legacy nonterminal ordinary requests or
-PENDING/PROVISIONING replica rows. Any promotion or exact mode/epoch refresh
-failure aborts startup before child creation. Recovery preserves the persisted
-mode, and pools plus stores without a capable Serve042 authority remain outside
-automatic promotion. A fenced rollback demotion to `legacy` is permitted only
+Serve042 migration rows and retained services default to `legacy`. A fresh
+lifecycle-fenced central-PostgreSQL non-pool service instead commits the
+complete canonical birth tuple with one controller-incarnation UUID and owner
+epoch 1: ordinary `bound` at binding epoch 1; generic non-pool protocol,
+profile-set digest, cohort, and receipt capability; `DURABLE_PROJECTED` route,
+`DURABLE_FEED` demand, and `DURABLE_INTENT` reserved-fill authority, each
+capable at epoch 1 and tied to that UUID. The retained Serve047 INSERT guard
+forbids the generic tuple on an INSERT, so `add_service()` first inserts its
+uncommitted bootstrap shape and then performs the sole permitted adjacent
+`legacy/0 -> bound/1` UPDATE inside the same transaction as the initial version
+row. PostgreSQL MVCC exposes either no service or the complete final tuple;
+there is no externally observable legacy interval and no new migration.
+
+The fresh controller claim rebinds generic launch, demand, and reserved-fill
+authority to its new incarnation. It deliberately does not bless route
+evidence from the birth incarnation: route admission remains unavailable until
+the replacement child publishes a fresh owner-fenced projection. Before child
+spawn, `_start()` refreshes and requires exact equality with the claimed
+generic bound epoch-1 authority; a missing, partial, changed, or unavailable
+tuple aborts startup. `CONTROLLER_INIT` is the required birth status, while the
+null controller port, absent route/report evidence, and pre-spawn verification
+are the effect fence; `CONTROLLER_INIT` is not itself added to the replica
+launch-blocking-status enum. Recovery preserves the persisted mode, and pools
+plus stores without a capable Serve042 authority remain outside canonical
+birth. A fenced rollback demotion to `legacy` is permitted only
 after every bound association is terminal,
 quiescent, copied, projected and unpinned and no launch generation is active;
 it increments the binding epoch. An incapable controller can never claim a
@@ -828,6 +971,16 @@ side read followed by generic cancel is forbidden. Normal replacement detaches
 the old waiter and adopts the association without legacy owner-loss
 cancellation. Cancellation is reserved for a committed supersession/teardown
 intent owned by the current epoch/revision.
+
+A configuration update through either `update` or `apply`, immutable-version
+election, or external-LB topology change preserves the live controller and
+therefore preserves its service lifecycle epoch. These operations still take
+the exclusive cross-pod name-scoped advisory lock and retain service-hash,
+version, owner, and request fences. Advancing the lifecycle epoch for such an
+operation is invalid: the epoch is part of every unresolved association's
+immutable controller identity
+and would otherwise make both the update and later evidence reduction
+impossible. Destructive lifecycle ownership continues to mint a fresh epoch.
 
 ### Pre-I/O fence
 
@@ -1209,23 +1362,30 @@ faster child projection always wins.
 
 ### R3: mandatory fresh-service adoption
 
-Keep `add_service()` and the Serve042 migration default at `legacy`; directly
-creating a bound row would bypass both the request-side participant/drain
-barriers and the exact capable controller authority required by promotion.
-For a fresh service only, `_start()` first claims a capable controller
-incarnation. If the service is non-pool and the claim returned a Serve042
-central-PostgreSQL authority, it then transactionally promotes that exact
-authority, refreshes it, and requires mode `bound` at exactly the returned
-adjacent binding epoch before calling the child-spawn boundary. Promotion,
-barrier, epoch, or refresh failure propagates and therefore fails closed before
-any child can admit a launch.
+Keep the Serve042 migration default at `legacy` for retained rows, but make
+`add_service()` the only fresh central-PostgreSQL non-pool authority writer.
+The service row and initial version row commit atomically with the complete
+bound/projected-route/durable-demand/durable-intent tuple described above. The
+two SQL statements are an implementation accommodation for Serve047's retained
+INSERT guard, not two lifecycle states: both are inside one transaction and
+the intermediate bootstrap row cannot be observed.
+
+For a fresh service, `_start()` claims a capable controller incarnation,
+refreshes that exact authority, and requires capable generic mode `bound` at
+binding epoch 1 before calling the child-spawn boundary. It never calls the
+legacy promotion surface. A noncanonical claim, owner change, unavailable
+refresh, or tuple mismatch propagates and therefore fails closed before any
+child can admit a launch. The new owner must subsequently publish fresh route
+evidence; takeover alone cannot make the stale birth route usable.
 
 Recovery, including recovery of an existing `legacy` row, never automatically
 promotes. Pools and an absent authority (the local, SQLite, and pre-042
 compatibility result) also preserve their prior behavior. This phase performs
 no bulk migration and exposes no new public switch. The explicit R2 transition
-and fenced demotion surfaces remain available for controlled migration and
-rollback of existing services.
+and fenced demotion surfaces remain available only for controlled migration
+and rollback of retained services. Service recreation may replace that
+migration operationally, but deletion still obeys normal teardown/quiescence
+evidence and never fabricates effect absence.
 
 ### R4: ordinary-only fallback removal (superseded)
 
@@ -1279,16 +1439,25 @@ disposition is unknown.
 
 ### G2: blocked steady-state cleanup
 
-G2 is authored with G1 and the demand-convergence P2 change and remains
-draft/blocked until every gate below is recorded. Its first migration-bearing
-cleanup must be restacked onto forward-only API-request revision 015 and Serve
-revision 051; its immediately stacked final non-pool cleanup must move to
-API-request revision 016 and Serve revision 052. API012 and Serve048--050 are
-already published by demand, route, and ordered-admission convergence; API013
-is G1Sb's executor-termination evidence and API014 is G1Se's correction of its
-invalid cross-clock constraint. Any cleanup draft using API013 or API014 is
-stale and must not merge. Migration numbers are globally unique and
+G2 is re-derived only after every gate below is recorded. Closed historical
+cleanup PRs #1506/#1510 reserve no API or Serve revision and must not be
+restacked. The future deletion-only diff is based on then-current source and
+old-path-use evidence; it receives a migration only if its concrete schema
+change requires one. Migration numbers are globally unique and
 already-published revisions are immutable.
+
+The simultaneously prepared
+`cleanup/remove-legacy-serve-authority-transitions` branch is the blocked stack
+location for that re-derived deletion, not a revival of either closed PR. Its
+merge gate is explicit: every live central-PostgreSQL non-pool service is
+recreated on canonical birth or evidence-backed retired; no active/unsettled
+unbound request, association, replica, controller, or old writer remains; the
+full stale-writer/quiescence and HA takeover horizon passes; and source census
+finds no production central-service registration without a lifecycle epoch.
+Only then may the branch delete the retained-service promotion/demotion API,
+unbound admission/recovery, and transition-only metrics/tests. It must preserve
+historical evidence reads until their independent retention gate and must not
+add a migration, EFS, provider path, or fallback merely to accelerate removal.
 
 G2 removes every unbound non-pool admission and recovery branch, the ordinary-
 only handler/profile alias, cluster-name quiescence as active authority, global
@@ -1346,9 +1515,9 @@ G1Sd merged as PR #1526 at
 continuity and exposed the independent clock-domain defect described below.
 G1Se merged as PR #1527 at
 `bf9e2907a39ef90a6e9f741be050da9b3fe662a5`; the exact `boltz-test`
-qualification below passed. G1S is complete. G2 remains blocked on its
-API016/Serve053 and API017/Serve054 restack plus the independent operational
-and adversarial-review gates below.
+qualification below passed. G1S is complete. G2 remains blocked on the
+independent operational and adversarial-review gates below. Closed PRs
+#1506/#1510 are superseded and own no reserved migration heads.
 The steady-state winner is the marker-driven runtime protocol with the
 three-part budget. The old runtime that waits for Kubernetes' post-`preStop`
 SIGTERM is transition-only.
@@ -1621,10 +1790,11 @@ event type, successful terminal phase, exit outcome, and resource version are
 part of the canonical digest. The migration precedes new writers. Old observers
 may emit only diagnostic V1 rows during overlap, and an application rollback
 may read the broader retained table without issuing V2 evidence.
-The API014 instance-version allowance is isolated rollout code. The already
-blocked G2/P3a cleanup PR #1506 must remove participant protocol 1 after the
-complete stale-writer/quiescence horizon while retaining immutable V1 evidence
-rows under the closed source constraint.
+The API014 instance-version allowance is isolated rollout code. A future
+re-derived G2/P3a deletion-only cleanup must remove participant protocol 1
+after the complete stale-writer/quiescence horizon while retaining immutable
+V1 evidence rows under the closed source constraint; closed #1506 is not that
+change.
 G1Se passed all 31 exact-head CI checks and merged as PR #1527 at
 `bf9e2907a39ef90a6e9f741be050da9b3fe662a5`. Release `1.1.1310` records that
 exact revision. The source and copied `boltz-test` images share digest
@@ -1790,28 +1960,28 @@ open, and requires rollback if investigation connects it to the new artifact.
 
 Historically, R2 was designed to ship with every service in durable `legacy`
 mode, so schema and capability writes are dark. Promotion changes one approved
-non-pool service to `bound` only after its controller capability, the full
-participant barrier, and the
-legacy-drain transaction pass. R3 retains that same transition as the safe
-bootstrap for a fresh eligible service: the row is inserted in `legacy`, its
-fresh capable incarnation is claimed, promotion commits, and the exact bound
-epoch is refreshed before child spawn. A failed barrier or refresh leaves no
-controller child running. Existing services and recovery are not implicitly
-migrated. The participant barrier includes every API,
-queue-executor, and service-controller role that must preserve and revalidate
-the closed excluded-profile discriminator; a queued special request may cross
-promotion only because all of those roles understand its exact persisted
-identity. An incapable controller cannot own that service.
+retained non-pool service to `bound` only after its controller capability, the
+full participant barrier, and the legacy-drain transaction pass. The earlier
+R3 draft reused that transition for fresh-service bootstrap; the canonical-
+birth correction supersedes it. Fresh lifecycle-fenced PostgreSQL non-pool
+rows commit at generic `bound` epoch 1, and startup only refreshes/verifies the
+claimed tuple before child spawn. Existing services and recovery are not
+implicitly migrated. The retained-service participant barrier includes every
+API, queue-executor, and service-controller role that must preserve and
+revalidate the closed excluded-profile discriminator; a queued special request
+may cross promotion only because all of those roles understand its exact
+persisted identity. An incapable controller cannot own that service.
 Rollback disables further promotion, keeps capable binaries serving existing
 bound rows, and waits for every request to become terminal, quiescent, copied,
 projected, and unpinned. The fenced demotion transaction then proves no active
 generation, sets the service back to `legacy`, and increments its binding epoch
 before any incapable image may own it. A rollback must not clear associations
 or tombstones, release pins early, change replica record IDs, or race a
-predecessor with a successor. R3 makes `bound` mandatory before the first child
-spawn for each newly created eligible non-pool service. After all existing
-eligible services are explicitly promoted or retired and rollout evidence
-passes, the superseded R4 would have removed only the ordinary fallback.
+predecessor with a successor. Canonical birth makes `bound` mandatory at the
+service/version commit before the first child spawn for each newly created
+eligible non-pool service. After all existing eligible services are explicitly
+promoted or retired and rollout evidence passes, the superseded R4 would have
+removed only the ordinary fallback.
 
 G1 replaces that ordinary-only rollout boundary. Eligibility is exactly every
 central-PostgreSQL non-pool launch, including reserved fill, zero-cost/
@@ -2856,11 +3026,11 @@ approved canary:
   (API012/Serve048--050).
 - [x] Merge G1Sa as PR #1519 and G1Sb executor-termination evidence on API013
   as PR #1522; author G1Sc as draft PR #1523 with its exact merge gate.
-- [ ] Land P2c Serve051 and P2d Serve052, then restack blocked G2 PR #1506
-  onto API016/Serve053.
-- [ ] Restack PR #1510 immediately above #1506 onto API017/Serve054.
-- [ ] Complete adversarial re-review of both cleanup diffs. Neither cleanup
-  may merge until that review and the operational gates are complete.
+- [ ] After P2c/P2d and the operational horizon, re-derive the smallest
+  deletion-only cleanup from current old-path-use evidence. Do not revive
+  closed/superseded PRs #1506/#1510 or reserve schema heads speculatively.
+- [ ] Complete adversarial review of that exact future cleanup diff. It may
+  merge only after the operational gates are complete.
 - [ ] Prove each schema
   lineage has one forward-only head and no historical migration changed.
 - [x] Inventory the historical seven incident rows and prove that IDs
@@ -2890,6 +3060,19 @@ approved canary:
   owner-fenced, and per-row isolated; activation remains closed until exact
   `ABSENT` can atomically project the replica, association, request pin, and
   capacity claim without weakening the Serve042 transition invariants.
+- [x] Author the no-migration provider-`PRESENT` adjudication on top of the
+  existing absence projector: exact PostgreSQL revalidation, durable immediate
+  cleanup marker, existing UID-fenced down worker, and forced post-down
+  `ABSENT` projection. Focused PostgreSQL and manager tests pass locally.
+- [x] Rebase the provider-`PRESENT` adjudication above merged PRs #1600 and
+  #1606. Prove all five production candidates have the exact current lifecycle
+  epoch, owner epoch, and incarnation with every Serve042 trigger enabled;
+  exclude PR #1603 and historical-origin authority from this recovery.
+- [ ] Complete adversarial review, merge and deploy the provider-`PRESENT`
+  adjudication. Production completion requires all eligible exact `PRESENT`
+  rows to converge through fenced teardown and later `ABSENT`; every `UNKNOWN`
+  or `REPLACED` row must remain pinned and visible. Merge and deploy PR #1609
+  independently to prevent `apply` from creating a future epoch mismatch.
 - [ ] Pass reserved-fill conservation, no-paid-spill, exact binding receipt,
   provider-free route projection, bounded manager-lock, and poisoned-row
   progress tests.
@@ -2986,13 +3169,16 @@ approved canary:
   owner-epoch/provider/service-job fences, retention pin, local-handler claim,
   mixed-version/demotion, teardown-order, and crash-matrix implementation in
   the stack. It remains operationally dark until the preceding R1 gate passes.
-- [x] Author R3's fresh-service adoption: claim first; transactionally promote
-  only a fresh capable central-PostgreSQL non-pool authority; verify the exact
-  adjacent bound epoch; and fail before spawn on any transition error. Preserve
-  recovery, existing rows, pools, and absent-authority stores.
-- [ ] Merge and deploy R1, R2, and R3 in stack order. On the exact R3 artifact,
-  verify successful promotion precedes first child spawn and an injected
-  participant/drain-barrier failure produces no child or launch request.
+- [x] Author the corrected R3 canonical birth: atomically commit a fresh
+  lifecycle-fenced central-PostgreSQL non-pool service and initial version with
+  one complete generic bound/route/demand/fill authority tuple; claim and
+  refresh that tuple without runtime promotion; and fail before spawn on any
+  mismatch. Preserve recovery, retained rows, pools, and absent-authority
+  stores.
+- [ ] Merge and deploy the corrected R3 source. On its exact artifact, verify
+  that the committed canonical tuple exists before first child spawn, an
+  injected claim/refresh mismatch produces no child or launch request, and
+  takeover keeps routes unavailable until fresh replacement publication.
 - [ ] Inventory every existing eligible `legacy` service and explicitly
   promote or retire it; R3 intentionally does not perform that migration.
 - [x] Retire the ordinary-only R4 cleanup without merge. G2 supersedes it and

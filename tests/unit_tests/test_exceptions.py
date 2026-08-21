@@ -46,6 +46,19 @@ def test_reserved_fill_launch_fence_error_round_trip():
     assert str(deserialized) == 'candidate changed'
 
 
+def test_reserved_fill_provider_present_error_round_trip():
+    """Pinned provider identity survives the API exception wire."""
+    error = exceptions.ReservedFillProviderPresentError(
+        'provider resource remains present', ('ns/pod@uid',))
+
+    deserialized = _serialize_deserialize(error)
+
+    assert isinstance(deserialized, exceptions.ReservedFillProviderPresentError)
+    assert isinstance(deserialized, exceptions.ReservedFillLaunchFenceError)
+    assert deserialized.provider_resource_ids == ('ns/pod@uid',)
+    assert str(deserialized) == 'provider resource remains present'
+
+
 def test_exception_notes_are_restored_outside_constructor_kwargs():
     error = TypeError('test')
     setattr(error, '__notes__', ['when serializing dict item bad'])

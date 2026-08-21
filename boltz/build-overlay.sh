@@ -209,9 +209,9 @@ if replacements != 1:
 path.write_text(content, encoding='utf-8')
 PY
 
-# The policy revision is the overlay release, not a manually maintained
-# constant. Any implementation change therefore rotates the durable policy
-# identity even when the static fleet JSON is unchanged.
+# Stamp only the policy distribution's artifact version.  Its independently
+# reviewed POLICY_REVISION is durable authority and must not rotate merely
+# because unrelated SkyPilot code produced a new overlay release.
 OVERLAY_VERSION="$SKYPILOT_VERSION" \
   python3 - \
     "$ctx/boltz/reserved_fill_reclaim_policy/pyproject.toml" \
@@ -243,7 +243,7 @@ content, replacements = re.subn(
     count=1,
     flags=re.MULTILINE)
 if replacements != 1:
-    raise RuntimeError(f'could not stamp policy revision in {package}')
+    raise RuntimeError(f'could not stamp policy artifact version in {package}')
 package.write_text(content, encoding='utf-8')
 PY
 echo ">> Stamped overlay identity: version ${SKYPILOT_VERSION}, commit ${overlay_commit}, checked in ${overlay_commit_timestamp}, build ${overlay_build}"
@@ -295,7 +295,8 @@ assert len(entries) == 1, entries
 assert entries[0].name == 'boltz'
 policy = entries[0].load()()
 assert policy.policy_identity().policy_revision == (
-    'boltz-reserved-fill-reclaim-policy/' + sky.__version__)
+    'boltz-reserved-fill-reclaim-policy/' +
+    boltz_reserved_fill_reclaim_policy.POLICY_REVISION)
 index = os.path.join(server_constants.DASHBOARD_DIR, 'index.html')
 assert os.path.isfile(index), f'dashboard missing from image: {index}'
 print('overlay verify OK')"

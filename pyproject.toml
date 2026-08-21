@@ -21,6 +21,9 @@ addopts = "-s -n 16 -q --tb=short --dist loadgroup --disable-warnings"
 asyncio_mode = "strict"
 asyncio_debug = true
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "serve054_process_pressure: 90-process Serve054 gate for dedicated non-xdist CI",
+]
 filterwarnings = [
     "error::RuntimeWarning",
     "error::pytest.PytestUnhandledThreadExceptionWarning",

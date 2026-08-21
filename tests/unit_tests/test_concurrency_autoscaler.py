@@ -304,12 +304,12 @@ class TestColdPaidCardOrdering(unittest.TestCase):
 
     def _order(self, costs):
         placer = mock.Mock()
-        placer.known_locations.return_value = list(costs)
-        placer.cost_per_hour.side_effect = costs.get
+        placer.known_location_costs.return_value = costs
         order = autoscalers._order_cold_paid_cards(['L4', 'A100'], placer,
                                                    lambda _: 1, lambda location:
                                                    (location, 1))
-        self.assertEqual(placer.cost_per_hour.call_count, len(costs))
+        placer.known_location_costs.assert_called_once_with()
+        placer.cost_per_hour.assert_not_called()
         return order
 
     def test_uses_catalog_costs_without_provider_resolution(self):
@@ -336,15 +336,137 @@ class TestColdPaidCardOrdering(unittest.TestCase):
             l4_paid: 'L4',
         }
         placer = mock.Mock()
-        placer.known_locations.return_value = list(costs)
-        placer.cost_per_hour.side_effect = costs.get
+        placer.known_location_costs.return_value = costs
 
         order = autoscalers._order_cold_paid_cards(['A100', 'L4'], placer,
                                                    lambda _: 1, lambda location:
                                                    (cards[location], 1))
 
         self.assertEqual(order, ['A100', 'L4'])
-        self.assertEqual(placer.cost_per_hour.call_count, len(costs))
+        placer.known_location_costs.assert_called_once_with()
+        placer.cost_per_hour.assert_not_called()
+
+    def test_one_fresh_bulk_cost_view_is_shared_per_decision_tick(self):
+        autoscaler = _make_autoscaler()
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        l4 = mock.Mock(accelerators={'L4': 1})
+        a100 = mock.Mock(accelerators={'A100': 1})
+        placer = mock.Mock()
+        placer.known_location_costs.side_effect = [
+            {
+                l4: 2.0,
+                a100: 1.0
+            },
+            {
+                l4: 1.0,
+                a100: 2.0
+            },
+        ]
+        autoscaler.set_spot_placer(placer)
+        observed_orders = []
+
+        def _exercise_repeated_ordering(*_):
+            observed_orders.append([
+                autoscaler._cold_paid_card_order(['L4', 'A100'])
+                for _ in range(5)
+            ])
+            return []
+
+        inputs = autoscalers.ScalingDecisionInputs(replica_ids=(),
+                                                   gpu_shape_handles={},
+                                                   historical_scaling_values={})
+        with mock.patch.object(autoscaler,
+                               '_generate_scaling_decisions_locked',
+                               side_effect=_exercise_repeated_ordering):
+            autoscaler._generate_scaling_decisions_with_inputs([], [1], inputs)
+            autoscaler._generate_scaling_decisions_with_inputs([], [1], inputs)
+
+        self.assertEqual(observed_orders,
+                         [[['A100', 'L4']] * 5, [['L4', 'A100']] * 5])
+        self.assertEqual(placer.known_location_costs.call_count, 2)
+        placer.cost_per_hour.assert_not_called()
+
+    def test_workspace_policy_mutation_is_observed_on_the_next_tick(self):
+        autoscaler = _make_autoscaler()
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        l4 = mock.Mock(accelerators={'L4': 1})
+        a100 = mock.Mock(accelerators={'A100': 1})
+        catalog_costs = {l4: 2.0, a100: 1.0}
+        workspace_eligible = set(catalog_costs)
+        placer = mock.Mock()
+        placer.known_location_costs.side_effect = lambda: {
+            location: cost
+            for location, cost in catalog_costs.items()
+            if location in workspace_eligible
+        }
+        autoscaler.set_spot_placer(placer)
+        observed_orders = []
+
+        def _mutate_workspace_during_first_tick(*_):
+            observed_orders.append(
+                autoscaler._cold_paid_card_order(['L4', 'A100']))
+            workspace_eligible.remove(a100)
+            observed_orders.append(
+                autoscaler._cold_paid_card_order(['L4', 'A100']))
+            return []
+
+        inputs = autoscalers.ScalingDecisionInputs(replica_ids=(),
+                                                   gpu_shape_handles={},
+                                                   historical_scaling_values={})
+        with mock.patch.object(autoscaler,
+                               '_generate_scaling_decisions_locked',
+                               side_effect=_mutate_workspace_during_first_tick):
+            autoscaler._generate_scaling_decisions_with_inputs([], [1], inputs)
+        with mock.patch.object(
+                autoscaler,
+                '_generate_scaling_decisions_locked',
+                side_effect=lambda *_: observed_orders.append(
+                    autoscaler._cold_paid_card_order(['L4', 'A100'])) or []):
+            autoscaler._generate_scaling_decisions_with_inputs([], [1], inputs)
+
+        self.assertEqual(observed_orders,
+                         [['A100', 'L4'], ['A100', 'L4'], ['L4', 'A100']])
+        self.assertEqual(placer.known_location_costs.call_count, 2)
+
+    def test_nested_snapshot_exception_restores_outer_tick(self):
+        autoscaler = _make_autoscaler()
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        l4 = mock.Mock(accelerators={'L4': 1})
+        a100 = mock.Mock(accelerators={'A100': 1})
+        placer = mock.Mock()
+        placer.known_location_costs.side_effect = [
+            {
+                l4: 2.0,
+                a100: 1.0
+            },
+            RuntimeError('nested snapshot unavailable'),
+        ]
+        autoscaler.set_spot_placer(placer)
+
+        with autoscaler._cold_paid_cost_snapshot_for_tick():
+            self.assertEqual(autoscaler._cold_paid_card_order(['L4', 'A100']),
+                             ['A100', 'L4'])
+            with self.assertRaisesRegex(RuntimeError, 'nested body failed'):
+                with autoscaler._cold_paid_cost_snapshot_for_tick():
+                    self.assertEqual(
+                        autoscaler._cold_paid_card_order(['L4', 'A100']),
+                        ['L4', 'A100'])
+                    raise RuntimeError('nested body failed')
+            self.assertEqual(autoscaler._cold_paid_card_order(['L4', 'A100']),
+                             ['A100', 'L4'])
+
+        self.assertFalse(autoscaler._cold_paid_costs_tick_active)
+        self.assertIsNone(autoscaler._cold_paid_location_costs_for_tick)
+
+    def test_snapshot_failure_preserves_service_order(self):
+        placer = mock.Mock()
+        placer.known_location_costs.side_effect = RuntimeError('unavailable')
+
+        order = autoscalers._order_cold_paid_cards(['L4', 'A100'], placer,
+                                                   lambda _: 1, lambda location:
+                                                   (location, 1))
+
+        self.assertEqual(order, ['L4', 'A100'])
 
 
 class TestTargetMath(unittest.TestCase):
@@ -3846,12 +3968,13 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(decisions[0].target, {'accelerators': {'A100': 1}})
 
     def test_zero_cost_only_card_does_not_precede_paid_fallback(self):
-        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
-        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
+        a100_location = mock.Mock(accelerators={'A100': 1})
+        l4_location = mock.Mock(accelerators={'L4': 1})
         placer = mock.Mock()
-        placer.known_locations.return_value = [a100_location, l4_location]
-        placer.cost_per_hour.side_effect = (
-            lambda location: 0.0 if location is a100_location else 1.0)
+        placer.known_location_costs.return_value = {
+            a100_location: 0.0,
+            l4_location: 1.0,
+        }
 
         flexible = _make_autoscaler(max_replicas=1, replica_unit='logical')
         flexible.set_configured_accelerator_shapes({'A100': 1, 'L4': 1})
@@ -3884,16 +4007,15 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(exact.target_num_replicas_by_accelerator, {'A100': 1})
 
     def test_inconclusive_zero_cost_card_preserves_service_order(self):
-        a100_zero = types.SimpleNamespace(accelerators={'A100': 1})
-        a100_unpriced = types.SimpleNamespace(accelerators={'A100': 1})
-        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
+        a100_zero = mock.Mock(accelerators={'A100': 1})
+        a100_unpriced = mock.Mock(accelerators={'A100': 1})
+        l4_location = mock.Mock(accelerators={'L4': 1})
         placer = mock.Mock()
-        placer.known_locations.return_value = [
-            a100_zero, a100_unpriced, l4_location
-        ]
-        placer.cost_per_hour.side_effect = (
-            lambda location: 0.0 if location is a100_zero else float('inf')
-            if location is a100_unpriced else 1.0)
+        placer.known_location_costs.return_value = {
+            a100_zero: 0.0,
+            a100_unpriced: float('inf'),
+            l4_location: 1.0,
+        }
         autoscaler = _make_autoscaler(max_replicas=1, replica_unit='logical')
         autoscaler.set_configured_accelerator_shapes({'A100': 1, 'L4': 1})
         autoscaler.set_spot_placer(placer)
@@ -3913,12 +4035,13 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
     def test_partial_nominal_prices_preserve_service_order(self):
         autoscaler = _make_autoscaler(max_replicas=1, replica_unit='logical')
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
-        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
-        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        l4_location = mock.Mock(accelerators={'L4': 1})
+        a100_location = mock.Mock(accelerators={'A100': 1})
         placer = mock.Mock()
-        placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cost_per_hour.side_effect = (lambda location: float('inf')
-                                            if location is l4_location else 2.0)
+        placer.known_location_costs.return_value = {
+            l4_location: float('inf'),
+            a100_location: 2.0,
+        }
         autoscaler.set_spot_placer(placer)
         _report(autoscaler,
                 in_flight={},

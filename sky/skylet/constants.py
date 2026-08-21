@@ -784,6 +784,11 @@ ALL_CLOUDS = ('aws', 'azure', 'gcp', 'ibm', 'lambda', 'scp', 'oci',
 # The user ID of the SkyPilot system.
 SKYPILOT_SYSTEM_USER_ID = 'skypilot-system'
 
+# The bounded system identity used by the authenticated SkyServe controller
+# launch transport.  This is also used as the provider resource-name suffix,
+# so it must stay within USER_HASH_LENGTH.
+SKYPILOT_SERVE_CONTROLLER_SYSTEM_USER_ID = 'skyserve'
+
 # A built-in viewer-role counterpart to SKYPILOT_SYSTEM_USER_ID.
 SKYPILOT_SYSTEM_VIEWER_USER_ID = 'skypilot-system-viewer'
 

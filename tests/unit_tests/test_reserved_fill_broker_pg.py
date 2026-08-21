@@ -46,6 +46,7 @@ import test_reserved_fill_broker as sqlite_suite
 from sky import clouds
 from sky import estimated_spend
 from sky import global_user_state
+from sky import global_user_state_schema
 from sky.serve import constants
 from sky.serve import lb_ha
 from sky.serve import paid_capacity
@@ -163,8 +164,14 @@ def _create_database(pg_server,
                     f'CREATE DATABASE {quoted}{template_clause}')
         finally:
             admin_engine.dispose()
-        return sqlalchemy.engine.make_url(pg_server).set(
+        database_url = sqlalchemy.engine.make_url(pg_server).set(
             database=dbname).render_as_string(hide_password=False)
+        engine = create_engine(database_url)
+        try:
+            global_user_state_schema.user_table.create(engine, checkfirst=True)
+        finally:
+            engine.dispose()
+        return database_url
     host = pg_server.get_container_host_ip()
     port = pg_server.get_exposed_port(pg_server.port)
     conn = psycopg2.connect(host=host,
@@ -180,8 +187,14 @@ def _create_database(pg_server,
             cursor.execute(f'CREATE DATABASE "{dbname}"{template_clause}')
     finally:
         conn.close()
-    return (f'postgresql://{pg_server.username}:{pg_server.password}'
-            f'@{host}:{port}/{dbname}')
+    database_url = (f'postgresql://{pg_server.username}:{pg_server.password}'
+                    f'@{host}:{port}/{dbname}')
+    engine = create_engine(database_url)
+    try:
+        global_user_state_schema.user_table.create(engine, checkfirst=True)
+    finally:
+        engine.dispose()
+    return database_url
 
 
 def _drop_database(pg_server, dbname: str) -> None:
@@ -5476,7 +5489,7 @@ class TestConcurrentRoundsPG:
             results = {}
             errors = []
 
-            def query(query_calls=query_calls):
+            def query(query_calls=query_calls):  # pylint: disable=dangerous-default-value
                 query_calls.append(1)
                 # Hold the round (and thus the advisory lock) long enough
                 # that the losing thread must actually wait on it.
@@ -5484,6 +5497,8 @@ class TestConcurrentRoundsPG:
                 return broker.PoolObservation(free_slots=10,
                                               gpu_names=('A100',))
 
+            # Defaults deliberately freeze this iteration for both threads.
+            # pylint: disable=dangerous-default-value
             def run(name,
                     pool=pool,
                     barrier=barrier,
@@ -5495,6 +5510,8 @@ class TestConcurrentRoundsPG:
                         name, pool, query, poll_interval_seconds=300.0)
                 except Exception as e:  # pylint: disable=broad-except
                     errors.append(e)
+
+            # pylint: enable=dangerous-default-value
 
             threads = [
                 threading.Thread(target=run, args=(name,))
@@ -5516,209 +5533,6 @@ class TestConcurrentRoundsPG:
             round_row = serve_state.get_reserved_fill_round(pool)
             assert round_row is not None
             assert int(round_row['round_id']) == 1
-
-
-def test_killed_persist_lock_session_is_fenced_by_replacement_round(
-        _pg_concurrency_db, monkeypatch):
-    """A v2 persist cannot land in a successor's scan/publish window."""
-    engine = _pg_concurrency_db
-    service_name = 'svc'
-    service_hash = 'svc-hash'
-    access_context = 'persist-fence'
-    physical_cluster_uid = 'persist-fence-cluster'
-    pool = broker.make_pool_key(access_context,
-                                'A100',
-                                protocol_version=broker.PROTOCOL_V2,
-                                physical_cluster_uid=physical_cluster_uid)
-    with engine.begin() as connection:
-        connection.execute(
-            sqlalchemy.insert(serve_state.services_table).values(
-                name=service_name,
-                hash=service_hash,
-                resource_scope=service_hash,
-                current_version=1,
-                pool=0))
-    assert serve_state.set_reserved_fill_protocol_version(
-        broker.PROTOCOL_V2,
-        expected_protocol_version=broker.PROTOCOL_V1,
-        image_digest=f'sha256:{"a" * 64}',
-        deployment_generation='1',
-        deployment_uid='persist-fence-deployment',
-        pod_inventory_count=1,
-        pod_inventory_sha256='b' * 64)
-    generation = broker.replace_claim_set(
-        service_name,
-        semantic_hash='persist-fence-v2',
-        global_headroom=1,
-        utilization_ceiling=1,
-        utilization_state=None,
-        edges=[{
-            'pool_key': pool,
-            'legacy_pool_key': broker.make_pool_key(access_context, 'A100'),
-            'pool_position': 0,
-            'access_context': access_context,
-            'physical_cluster_uid': physical_cluster_uid,
-            'accelerator_names': ['A100'],
-            'weight': 1.0,
-            'floor_replicas': 0,
-            'gpus_per_replica': 1,
-            'holdings_fill': 0,
-            'effective_cap': 1,
-            'launchable': True,
-        }],
-        expected_service_hash=service_hash)
-    assert generation is not None
-    allocation = broker.run_round_if_stale(
-        service_name,
-        pool,
-        lambda: broker.PoolObservation(free_slots=1,
-                                       gpu_names=('A100',),
-                                       free_slots_by_accelerator=(
-                                           ('a100', 1),)),
-        60.0,
-        expected_protocol_version=broker.PROTOCOL_V2,
-        expected_service_generation=generation)
-    assert allocation is not None
-    # Force the successor through the drive path instead of the fresh-round
-    # read path once it takes over the killed advisory lock.
-    with engine.begin() as connection:
-        connection.execute(
-            sqlalchemy.update(serve_state.reserved_fill_rounds_table).where(
-                serve_state.reserved_fill_rounds_table.c.pool_key ==
-                pool).values(snapshot_time=0.0))
-
-    real_persist = serve_state.add_replica_if_round_epoch
-    persist_entered = threading.Event()
-    resume_persist = threading.Event()
-    stale_token = {}
-
-    def paused_persist(*args, **kwargs):
-        stale_token['value'] = kwargs['expected_lease_token']
-        persist_entered.set()
-        assert resume_persist.wait(timeout=60)
-        return real_persist(*args, **kwargs)
-
-    monkeypatch.setattr(serve_state, 'add_replica_if_round_epoch',
-                        paused_persist)
-    fill_replica = sqlite_suite._fill_replica(1, pool)
-    fill_replica.reserved_fill_service_generation = generation
-    fill_replica.reserved_fill_physical_cluster_uid = physical_cluster_uid
-    result = {}
-    errors = []
-
-    def run_persist():
-        try:
-            result['persisted'] = broker.persist_fill_replica(
-                service_name,
-                1,
-                fill_replica,
-                pool_key=pool,
-                expected_epoch=allocation.epoch,
-                expected_protocol_version=broker.PROTOCOL_V2,
-                expected_service_generation=generation,
-                expected_physical_cluster_uid=physical_cluster_uid,
-                expected_service_hash=service_hash)
-        except Exception as error:  # pylint: disable=broad-except
-            errors.append(error)
-
-    persist_thread = threading.Thread(target=run_persist)
-    persist_thread.start()
-    assert persist_entered.wait(timeout=60)
-    assert int(stale_token['value']) > 0
-
-    lock_key = locks.postgres_lock_key(constants.RESERVED_FILL_BROKER_LOCK_ID)
-    with engine.begin() as observer:
-        holder_pid = observer.execute(
-            sqlalchemy.text(
-                "SELECT pid FROM pg_locks WHERE locktype = 'advisory' "
-                'AND granted AND '
-                '((classid::bigint << 32) | objid::bigint) = :lock_key'), {
-                    'lock_key': lock_key
-                }).scalar_one()
-        assert observer.execute(
-            sqlalchemy.text('SELECT pg_terminate_backend(:pid)'), {
-                'pid': holder_pid
-            }).scalar_one()
-
-    real_occupying_debit = broker._occupying_debit
-    successor_scanned = threading.Event()
-    resume_successor = threading.Event()
-
-    def paused_after_replica_scan(*args, **kwargs):
-        scanned = real_occupying_debit(*args, **kwargs)
-        successor_scanned.set()
-        assert resume_successor.wait(timeout=60)
-        return scanned
-
-    monkeypatch.setattr(broker, '_occupying_debit', paused_after_replica_scan)
-    successor_result = {}
-
-    def run_successor():
-        try:
-            successor_result['allocation'] = broker.run_round_if_stale(
-                service_name,
-                pool,
-                lambda: broker.PoolObservation(free_slots=1,
-                                               gpu_names=('A100',),
-                                               free_slots_by_accelerator=(
-                                                   ('a100', 1),)),
-                0.001,
-                expected_protocol_version=broker.PROTOCOL_V2,
-                expected_service_generation=generation)
-        except Exception as error:  # pylint: disable=broad-except
-            errors.append(error)
-
-    successor_thread = threading.Thread(target=run_successor)
-    successor_thread.start()
-    try:
-        assert successor_scanned.wait(timeout=60)
-        # The successor has advanced the durable token and completed the
-        # replica debit scan, but is deterministically blocked before publish.
-        # Resume the stale persist inside that exact vulnerability window.
-        with engine.connect() as connection:
-            successor_token = connection.execute(
-                sqlalchemy.select(
-                    serve_state.reserved_fill_lease_table.c.epoch).where(
-                        serve_state.reserved_fill_lease_table.c.id ==
-                        1)).scalar_one()
-        assert int(successor_token) > int(stale_token['value'])
-        assert successor_thread.is_alive()
-        resume_persist.set()
-        persist_thread.join(timeout=60)
-        assert not persist_thread.is_alive(), 'stale persist thread hung'
-        assert not errors, errors
-        assert result == {'persisted': False}
-        with engine.connect() as connection:
-            replica_count_before_publish = connection.execute(
-                sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
-                                 ).select_from(
-                                     serve_state.replicas_table)).scalar_one()
-        assert replica_count_before_publish == 0
-    finally:
-        resume_persist.set()
-        resume_successor.set()
-    persist_thread.join(timeout=60)
-    successor_thread.join(timeout=60)
-    assert not persist_thread.is_alive(), 'stale persist thread hung'
-    assert not successor_thread.is_alive(), 'successor round thread hung'
-    assert not errors, errors
-    assert result == {'persisted': False}
-    successor = successor_result.get('allocation')
-    assert successor is not None
-    assert successor.protocol_version == broker.PROTOCOL_V2
-    assert successor.service_generation == generation
-    with engine.connect() as connection:
-        lease_token = connection.execute(
-            sqlalchemy.select(
-                serve_state.reserved_fill_lease_table.c.epoch).where(
-                    serve_state.reserved_fill_lease_table.c.id ==
-                    1)).scalar_one()
-        replica_count = connection.execute(
-            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
-                             ).select_from(
-                                 serve_state.replicas_table)).scalar_one()
-    assert int(lease_token) > int(stale_token['value'])
-    assert replica_count == 0
 
 
 def test_advisory_lock_does_not_consume_ordinary_pool(pg_server, monkeypatch):

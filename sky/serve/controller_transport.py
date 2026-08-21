@@ -233,19 +233,94 @@ def _get_to_controller_with_retry(service_name: str, expected_service_hash: str,
                                              **kwargs)
 
 
-def get_service_placement_state(service_name: str,
-                                expected_service_hash: str) -> dict[str, Any]:
-    """Read one controller's in-memory placer state with bounded I/O."""
+def _normalize_placement_page(payload: dict[str, Any], *, limit: int,
+                              offset: int) -> dict[str, Any]:
+    """Normalize paged and rolling-upgrade placement responses."""
+    locations = payload.get('locations')
+    if locations is None:
+        return payload
+    if not isinstance(locations, list):
+        raise ValueError('Placement-state locations must be a list.')
+
+    pagination_version = payload.get('pagination_version')
+    if pagination_version == constants.PLACEMENT_STATE_PAGINATION_VERSION:
+        page_offset = payload.get('page_offset')
+        next_offset = payload.get('next_offset')
+        total_locations = payload.get('total_locations')
+        if page_offset != offset:
+            raise ValueError('Placement-state page offset does not match the '
+                             'requested offset.')
+        if len(locations) > limit:
+            raise ValueError('Placement-state page exceeds the requested '
+                             'limit.')
+        if (not isinstance(total_locations, int) or
+                isinstance(total_locations, bool) or total_locations < 0 or
+                total_locations > constants.PLACEMENT_STATE_MAX_OFFSET):
+            raise ValueError('Placement-state total location count is invalid.')
+        page_end = offset + len(locations)
+        if locations and page_end > total_locations:
+            raise ValueError('Placement-state page exceeds the total location '
+                             'count.')
+        if offset < total_locations and not locations:
+            raise ValueError('Placement-state page is empty before the total '
+                             'location count.')
+        expected_next_offset = (page_end if offset < total_locations and
+                                page_end < total_locations else None)
+        if next_offset != expected_next_offset:
+            raise ValueError('Placement-state next offset is invalid.')
+        return payload
+    if pagination_version is not None:
+        raise ValueError('Placement-state pagination version is unsupported.')
+
+    # A controller from before pagination ignores the query parameters and
+    # returns its complete (historically capped at 500) list. Slice that list
+    # in the API process so a rolling upgrade keeps the public response
+    # bounded. The longer transport timeout below is intentionally retained
+    # until every old controller has exited.
+    page = locations[offset:offset + limit]
+    page_end = offset + len(page)
+    normalized = dict(payload)
+    normalized.update({
+        'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+        'page_offset': offset,
+        'next_offset': page_end if page_end < len(locations) else None,
+        'total_locations': len(locations),
+        'locations': page,
+        'truncated': (payload.get('truncated') is True or
+                      page_end < len(locations)),
+    })
+    return normalized
+
+
+def get_service_placement_state(
+    service_name: str,
+    expected_service_hash: str,
+    *,
+    limit: int = constants.PLACEMENT_STATE_DEFAULT_PAGE_SIZE,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Read one bounded page of a controller's resident placer state."""
+    if (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or
+            limit > constants.PLACEMENT_STATE_MAX_PAGE_SIZE):
+        raise ValueError('Placement-state limit is invalid.')
+    if (not isinstance(offset, int) or isinstance(offset, bool) or offset < 0 or
+            offset > constants.PLACEMENT_STATE_MAX_OFFSET):
+        raise ValueError('Placement-state offset is invalid.')
     response = _get_to_controller_with_retry(
         service_name,
         expected_service_hash,
         constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
-        timeout=(1.0, 2.0))
+        params={
+            'limit': limit,
+            'offset': offset,
+            'include_paid_admission': True,
+        },
+        timeout=_CONTROLLER_HTTP_TIMEOUT_SECONDS)
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict):
         raise ValueError('Placement-state response must be an object.')
-    return payload
+    return _normalize_placement_page(payload, limit=limit, offset=offset)
 
 
 def _get_to_local_controller_with_retry(service_name: str,

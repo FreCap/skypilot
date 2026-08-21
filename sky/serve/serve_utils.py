@@ -663,18 +663,36 @@ class ServiceLifecycleLock:
     Mutual exclusion handles the normal case; the epoch handles silent
     PostgreSQL session loss.  Resource mutations additionally use
     incarnation-scoped identities, while authoritative DB commits validate
-    this token under a row lock.
+    this token under a row lock. ``advance_epoch=None`` defers the epoch choice
+    until the caller has inspected durable state under the acquired name lock.
     """
 
-    def __init__(self, service_name: str, lock: locks.DistributedLock) -> None:
+    def __init__(self,
+                 service_name: str,
+                 lock: locks.DistributedLock,
+                 *,
+                 advance_epoch: bool | None = True) -> None:
         self.service_name = service_name
         self.lock = lock
+        self.advance_epoch = advance_epoch
         self.epoch: int | None = None
 
     def acquire(self) -> 'ServiceLifecycleLock':
         self.lock.acquire()
         try:
-            if isinstance(self.lock, locks.PostgresLock):
+            if self.advance_epoch is None:
+                # Some operations decide whether they are a mutation of an
+                # existing incarnation or a same-name creation only after
+                # acquiring the name mutex. They initialize the epoch under
+                # this still-held lock with retain_service_lifecycle_epoch()
+                # or advance_service_lifecycle_epoch().
+                pass
+            elif (isinstance(self.lock, locks.PostgresLock) and
+                  not self.advance_epoch):
+                self.epoch = self.lock.run_in_lock_session(
+                    lambda connection: serve_state.read_service_lifecycle_epoch(
+                        self.service_name, connection))
+            elif isinstance(self.lock, locks.PostgresLock):
                 self.epoch = self.lock.run_in_lock_session(
                     lambda connection:
                     serve_state.claim_service_lifecycle_epoch(
@@ -684,7 +702,7 @@ class ServiceLifecycleLock:
                     self.service_name)
             if not self.session_is_valid():
                 raise RuntimeError('Lifecycle lock session was lost while '
-                                   f'claiming {self.service_name!r}.')
+                                   f'acquiring {self.service_name!r}.')
         except BaseException:
             # Executor cancellation is delivered as KeyboardInterrupt.  If it
             # lands while claiming the fencing epoch, release the already-held
@@ -708,7 +726,10 @@ class ServiceLifecycleLock:
         self.release()
 
 
-def get_service_lifecycle_lock(service_name: str) -> ServiceLifecycleLock:
+def get_service_lifecycle_lock(
+        service_name: str,
+        *,
+        advance_epoch: bool | None = True) -> ServiceLifecycleLock:
     """Return the cross-pod lock serializing destructive service lifecycles.
 
     The lock ID is outside the service working directory: deleting or
@@ -735,7 +756,7 @@ def get_service_lifecycle_lock(service_name: str) -> ServiceLifecycleLock:
                            f'lifecycle lock: {engine.dialect.name!r}.')
     digest = hashlib.sha256(service_name.encode('utf-8')).hexdigest()
     lock = locks.get_lock(f'skyserve-lifecycle-{digest}', lock_type=lock_type)
-    return ServiceLifecycleLock(service_name, lock)
+    return ServiceLifecycleLock(service_name, lock, advance_epoch=advance_epoch)
 
 
 def lifecycle_lock_is_valid(lock: ServiceLifecycleLock) -> bool:
@@ -758,9 +779,33 @@ def get_service_lifecycle_epoch(lock: ServiceLifecycleLock) -> int:
     return lock.epoch
 
 
+def retain_service_lifecycle_epoch(lock: ServiceLifecycleLock) -> int:
+    """Bind a deferred name lock to an existing controller's epoch."""
+    if lock.advance_epoch is not None or lock.epoch is not None:
+        raise RuntimeError('Service lifecycle lock is not awaiting an epoch.')
+    if not lock.session_is_valid():
+        raise RuntimeError('Cannot retain a lost service lifecycle lock.')
+    if isinstance(lock.lock, locks.PostgresLock):
+        epoch = lock.lock.run_in_lock_session(
+            lambda connection: serve_state.read_service_lifecycle_epoch(
+                lock.service_name, connection))
+    else:
+        # Local/SQLite service state still uses the historical per-operation
+        # epoch contract. The central PostgreSQL path is the controller-
+        # preserving path guarded by the same lock-owning DB session.
+        epoch = serve_state.claim_service_lifecycle_epoch(lock.service_name)
+    lock.epoch = epoch
+    if not lock.session_is_valid():
+        raise RuntimeError('Lifecycle lock session was lost while retaining '
+                           f'{lock.service_name!r}.')
+    return epoch
+
+
 def advance_service_lifecycle_epoch(lock: ServiceLifecycleLock) -> int:
     """Fence an in-flight lifecycle operation while retaining its name lock."""
-    if not lifecycle_lock_is_valid(lock):
+    if ((lock.epoch is None and
+         (lock.advance_epoch is not None or not lock.session_is_valid())) or
+        (lock.epoch is not None and not lifecycle_lock_is_valid(lock))):
         raise RuntimeError('Cannot advance a lost service lifecycle lock.')
     if isinstance(lock.lock, locks.PostgresLock):
         epoch = lock.lock.run_in_lock_session(
@@ -959,10 +1004,15 @@ def ha_recovery_for_consolidation_mode(pool: bool,
         ]
         latest_committed_versions = serve_state.get_latest_committed_versions(
             committed_version_candidates)
-        raw_identities = serve_state.get_service_mode_and_hashes([
+        raw_identity_candidates = [
             service_name for service_name in committed_version_candidates
-            if service_name not in latest_committed_versions
-        ])
+            if (service_name not in latest_committed_versions and
+                liveness_snapshots.get(service_name) is None)
+        ]
+        raw_identities = {}
+        if raw_identity_candidates:
+            raw_identities = serve_state.get_service_mode_and_hashes(
+                raw_identity_candidates)
         for service_name in service_names:
             svc = liveness_snapshots.get(service_name)
             # A row with no version_specs row is invisible to the joined
@@ -977,13 +1027,20 @@ def ha_recovery_for_consolidation_mode(pool: bool,
             if needs_committed_version_check:
                 committed_version = latest_committed_versions.get(service_name)
                 if committed_version is None:
-                    raw_identity = raw_identities.get(service_name)
-                    if (raw_identity is not None and raw_identity[0] == pool and
-                            isinstance(raw_identity[1], str) and
-                            raw_identity[1]):
+                    expected_service_hash = None
+                    if svc is None:
+                        raw_identity = raw_identities.get(service_name)
+                        if (raw_identity is not None and
+                                raw_identity[0] == pool and
+                                isinstance(raw_identity[1], str) and
+                                raw_identity[1]):
+                            expected_service_hash = raw_identity[1]
+                    elif isinstance(svc.get('hash'), str) and svc['hash']:
+                        expected_service_hash = svc['hash']
+                    if expected_service_hash is not None:
                         retired = (
                             serve_state.mark_unrecoverable_service_for_cleanup(
-                                service_name, raw_identity[1], pool))
+                                service_name, expected_service_hash, pool))
                         if retired:
                             f.write(
                                 f'{capnoun} {service_name} has no committed '

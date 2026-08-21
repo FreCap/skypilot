@@ -38,6 +38,7 @@ from sky.serve import service as service_lib
 from sky.serve import service_spec as service_spec_lib
 from sky.serve import system_oom_recovery
 from sky.serve import system_recovery_state as recovery_state
+from sky.skylet import constants as skylet_constants
 from sky.utils import common_utils
 from sky.utils.db import migration_utils
 
@@ -703,7 +704,9 @@ def _add_minimal_service(name: str,
                          placement_catalog=None,
                          controller_config=None,
                          controller_config_digest=None,
-                         controller_config_snapshot_id=None):
+                         controller_config_snapshot_id=None,
+                         owner_user_id=None,
+                         owner_user_name=None):
     """Add a service row with all-required-args defaults so individual tests
     only need to specify what they care about."""
     if spec is None:
@@ -733,6 +736,8 @@ def _add_minimal_service(name: str,
         controller_config=controller_config,
         controller_config_digest=controller_config_digest,
         controller_config_snapshot_id=controller_config_snapshot_id,
+        owner_user_id=owner_user_id,
+        owner_user_name=owner_user_name,
     )
 
 
@@ -768,6 +773,37 @@ def test_system_recovery_persistence_fails_closed_on_sqlite(_mock_serve_db):
             expected_lifecycle_epoch=1,
             expected_controller_owner=(123, '10.0.0.1'),
             expected_revision=0)
+
+
+def test_legacy_sqlite_registration_remains_ownerless(_mock_serve_db,
+                                                      monkeypatch) -> None:
+    """Local controller state must not invent central tenant authority."""
+    monkeypatch.setenv(skylet_constants.USER_ID_ENV_VAR, 'ambient-owner')
+    monkeypatch.setenv(skylet_constants.USER_ENV_VAR, 'ambient@example.com')
+
+    assert _add_minimal_service('local-ownerless')
+
+    with _mock_serve_db.connect() as connection:
+        owner = connection.execute(
+            sqlalchemy.select(
+                serve_state.services_table.c.owner_user_id,
+                serve_state.services_table.c.owner_user_name).where(
+                    serve_state.services_table.c.name ==
+                    'local-ownerless')).one()
+    assert owner == (None, None)
+
+
+@pytest.mark.parametrize('owner_user_id,owner_user_name', [
+    ('explicit-owner', None),
+    (None, 'explicit@example.com'),
+])
+def test_explicit_partial_service_owner_is_rejected(_mock_serve_db,
+                                                    owner_user_id,
+                                                    owner_user_name) -> None:
+    with pytest.raises(ValueError, match='owner_user_'):
+        _add_minimal_service('partial-owner',
+                             owner_user_id=owner_user_id,
+                             owner_user_name=owner_user_name)
 
 
 def test_system_recovery_transaction_advances_revision_once(

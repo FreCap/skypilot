@@ -48,6 +48,7 @@ from sky.server.requests import registry as request_registry
 from sky.server.requests import requests as requests_lib
 from sky.server.requests import storage as request_storage
 from sky.server.requests.queues import base as queue_base
+from sky.skylet import constants as skylet_constants
 from sky.utils import controller_capability
 from sky.utils import locks
 from sky.utils.db import db_utils
@@ -2894,11 +2895,12 @@ def bind_and_enqueue_ordinary_launch(
         return admission
 
 
-def bind_and_enqueue_non_pool_launch(
+def bind_and_enqueue_non_pool_launch_in_transaction(
+    connection: sqlalchemy.engine.Connection,
     request: requests_lib.Request,
     identity: ordinary_launch_binding_lib.NonPoolBindingIdentity,
 ) -> ordinary_launch_binding_lib.BindingAdmission:
-    """Atomically commit one generic association/request/queue/pin tuple."""
+    """Commit one generic association/request/queue/pin on a caller txn."""
     if not isinstance(identity, ordinary_launch_binding.NonPoolBindingIdentity):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Generic launch admission requires a protocol-v2 identity.')
@@ -2915,37 +2917,58 @@ def bind_and_enqueue_non_pool_launch(
         raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
             'Generic launch binding requires the built-in PostgreSQL '
             'request and queue backends.')
+    if connection.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Generic launch binding requires central PostgreSQL state.')
+    submitted_user_id = request.request_body.env_vars.get(
+        skylet_constants.USER_ID_ENV_VAR)
+    if (request.user_id != identity.tenant_scope or
+            submitted_user_id != identity.tenant_scope):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Generic launch request, binding, and LaunchBody tenant scopes '
+            'must be identical.')
+    admission = ordinary_launch_binding.insert_or_get_locked(
+        connection, identity)
+    if (admission.association_id != str(identity.association_id) or
+            admission.request_id != identity.request_id):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Generic admission returned a different deterministic identity.')
+    (ordinary_launch_binding.
+     validate_non_pool_submission_execution_context_in_connection(
+         connection, identity, request.request_body.extra_launch_context))
+    ordinary_launch_binding.install_bound_non_pool_context(
+        request.request_body, identity, admission.launch_generation)
+    if admission.created:
+        inserted = insert_bound_non_pool_request_and_queue_in_transaction(
+            connection, request, identity=identity)
+        if not inserted:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'New generic association collided with an API request ID.')
+    else:
+        _validate_existing_bound_request_in_transaction(connection, request,
+                                                        identity, admission)
+    return admission
+
+
+def bind_and_enqueue_non_pool_launch(
+    request: requests_lib.Request,
+    identity: ordinary_launch_binding_lib.NonPoolBindingIdentity,
+) -> ordinary_launch_binding_lib.BindingAdmission:
+    """Atomically commit one generic association/request/queue/pin tuple."""
     engine = initialize_and_get_db()
     if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
         raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
             'Generic launch binding requires central PostgreSQL state.')
+    # SERVER_INSTANCES is heartbeat-owned rather than transactional request
+    # authority. Observe rollout readiness before taking service/replica locks;
+    # the locked service capability tuple remains the commit-time fence.
+    if not non_pool_launch_binding_fleet_capable():
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Generic launch binding is waiting for one exact capable '
+            'API/executor cohort stale window.')
     with engine.begin() as connection:
-        if not non_pool_launch_binding_fleet_capable(connection=connection):
-            raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
-                'Generic launch binding is waiting for one exact capable '
-                'API/executor cohort stale window.')
-        admission = ordinary_launch_binding.insert_or_get_locked(
-            connection, identity)
-        if (admission.association_id != str(identity.association_id) or
-                admission.request_id != identity.request_id):
-            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                'Generic admission returned a different deterministic '
-                'identity.')
-        (ordinary_launch_binding.
-         validate_non_pool_submission_execution_context_in_connection(
-             connection, identity, request.request_body.extra_launch_context))
-        ordinary_launch_binding.install_bound_non_pool_context(
-            request.request_body, identity, admission.launch_generation)
-        if admission.created:
-            inserted = insert_bound_non_pool_request_and_queue_in_transaction(
-                connection, request, identity=identity)
-            if not inserted:
-                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                    'New generic association collided with an API request ID.')
-        else:
-            _validate_existing_bound_request_in_transaction(
-                connection, request, identity, admission)
-        return admission
+        return bind_and_enqueue_non_pool_launch_in_transaction(
+            connection, request, identity)
 
 
 def _bound_context_from_association(
@@ -3088,13 +3111,7 @@ def _lock_bound_request_evidence(
             candidate_error = _request_from_mapping(
                 typing.cast(sqlalchemy.engine.RowMapping,
                             request_row)).get_error()
-            if (not isinstance(candidate_error, dict) or
-                    set(candidate_error) != {'object', 'type', 'message'} or
-                    not isinstance(candidate_error.get('object'), BaseException)
-                    or candidate_error.get('type') != type(
-                        candidate_error['object']).__name__ or
-                    candidate_error.get('message') != str(
-                        candidate_error['object'])):
+            if not requests_lib.decoded_error_is_valid(candidate_error):
                 error_decode_failed = True
             else:
                 decoded_error = candidate_error
@@ -3363,7 +3380,7 @@ def _controller_authority_matches_reduction(
     association: Mapping[str, Any],
     authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
 ) -> bool:
-    return bool(
+    base_matches = bool(
         isinstance(authority,
                    ordinary_launch_binding.ControllerBindingAuthority) and
         authority.capable is True and
@@ -3378,6 +3395,19 @@ def _controller_authority_matches_reduction(
         == association['owner_controller_incarnation'] and
         authority.controller_owner_epoch
         == association['owner_controller_epoch'])
+    if not base_matches:
+        return False
+    if association.get('binding_protocol_version') is None:
+        return True
+    return bool(authority.retained_non_pool_settlement_allowed and
+                association['binding_protocol_version']
+                == authority.non_pool_binding_protocol_version and
+                association['capability_cohort_epoch']
+                == authority.non_pool_capability_cohort_epoch and
+                association['capability_profile_set_digest']
+                == authority.non_pool_profile_set_digest and
+                association['receipt_protocol_version']
+                == authority.non_pool_receipt_protocol_version)
 
 
 def _paid_capacity_claim_is_exact(
@@ -3803,6 +3833,180 @@ def record_bound_non_pool_provider_evidence(
             _request_terminal_evidence)
 
 
+def _lock_bound_non_pool_provider_present_cleanup(
+    connection: sqlalchemy.engine.Connection,
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+) -> tuple[Mapping[str, Any], BoundOrdinaryLaunchRequestFacts,
+           replica_managers.ReplicaInfo]:
+    """Lock and validate the complete provider-present cleanup authority."""
+    # The ReplicaInfo projector touches zero-cost sequencing.  Preserve its
+    # global lock order before locking lifecycle/service/replica/association.
+    serve_state.lock_zero_cost_protocol_for_bound_launch_projection(connection)
+    association = ordinary_launch_binding.lock_reduction_authority_in_connection(
+        connection, context)
+    if not _controller_authority_matches_reduction(association, authority):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup writer no longer owns this '
+            'association.')
+    facts, request_row, queue_row, _ = _lock_bound_request_evidence(
+        connection, context)
+    if (request_row is None or not facts.exists or
+            facts.status not in requests_lib.RequestStatus.finished_status() or
+            facts.terminal_cause is None or
+            facts.execution_generation is None or
+            facts.execution_generation < 1 or
+            facts.execution_quiescence_required is not True or
+            facts.execution_quiesced_generation != facts.execution_generation or
+            facts.execution_quiesced_at is None or not facts.quiescent or
+            queue_row is not None or not facts.retention_pin_active or
+            facts.error_decode_failed or facts.return_value is not None):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup requires one exact terminal request '
+            'generation, quiescence receipt, and active retention pin.')
+    try:
+        request = _request_from_mapping(
+            typing.cast(sqlalchemy.engine.RowMapping, request_row))
+        parsed_context = (
+            ordinary_launch_binding.parse_bound_non_pool_launch_context(
+                request.request_body.extra_launch_context))
+        request_service_job_id = _request_service_job_id(
+            request_row, str(association['cluster_name']))
+    except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
+        raise
+    except Exception as error:  # pylint: disable=broad-except
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup could not decode the exact bound '
+            'request payload.') from error
+    if (parsed_context != context or
+            not _provider_present_cleanup_input_digest_matches(
+                connection, association, request_row, request, context) or
+            request_service_job_id is not None or
+            association['service_job_id'] is not None):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup request identity, profile, digest, or '
+            'service-job result is inconsistent.')
+    terminal_evidence = _terminal_evidence(facts)
+    checked_association, locked_replica_info = (
+        ordinary_launch_binding.
+        provider_presence_cleanup_authority_in_connection(
+            connection, context, terminal_evidence))
+    if not _paid_capacity_claim_is_exact(connection, checked_association):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup found unexpected paid capacity.')
+    return checked_association, facts, locked_replica_info
+
+
+def _provider_present_cleanup_input_digest_matches(
+    connection: sqlalchemy.engine.Connection,
+    association: Mapping[str, Any],
+    request_row: sqlalchemy.engine.RowMapping,
+    request: requests_lib.Request,
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+) -> bool:
+    """Match the exact atomic executable digest and service owner."""
+    body = request.request_body
+    env_vars = getattr(body, 'env_vars', None)
+    tenant_scope = association.get('tenant_scope')
+    cluster_name = association.get('cluster_name')
+    if (not isinstance(env_vars, Mapping) or
+            request_row['user_id'] != tenant_scope or
+            env_vars.get(skylet_constants.USER_ID_ENV_VAR) != tenant_scope or
+            request_row['cluster_name'] != cluster_name or
+            getattr(body, 'cluster_name', None) != cluster_name):
+        return False
+    try:
+        executable_exact = (ordinary_launch_binding.canonical_launch_digest(
+            body) == context.input_digest)
+    except ValueError:
+        return False
+    service_owner = connection.execute(
+        sqlalchemy.select(
+            serve_state_schema.services_table.c.owner_user_id,
+            serve_state_schema.services_table.c.owner_user_name).where(
+                serve_state_schema.services_table.c.name ==
+                context.service_name)).mappings().one_or_none()
+    if service_owner is None:
+        return False
+    owner_user_id = service_owner['owner_user_id']
+    owner_user_name = service_owner['owner_user_name']
+    if (not isinstance(owner_user_id, str) or not owner_user_id or
+            not isinstance(owner_user_name, str) or not owner_user_name):
+        return False
+    # Atomic fill stamps the immutable service-owner tuple before hashing.
+    return bool(executable_exact and tenant_scope == owner_user_id and
+                env_vars.get(skylet_constants.USER_ENV_VAR) == owner_user_name)
+
+
+def authorize_bound_non_pool_provider_present_cleanup(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    *,
+    project_replica_result: BoundOrdinaryLaunchReplicaProjector,
+) -> bool:
+    """Atomically enter fenced teardown for one exact PRESENT allocation."""
+    if not callable(project_replica_result):
+        raise TypeError('project_replica_result must be callable.')
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Generic provider reconciliation requires PostgreSQL.')
+    with engine.begin() as connection:
+        association, facts, locked_replica_info = (
+            _lock_bound_non_pool_provider_present_cleanup(
+                connection, context, authority))
+        if ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+                locked_replica_info):
+            return True
+        projection = BoundOrdinaryLaunchProjectionInput(
+            context=context,
+            request=facts,
+            locked_replica_info=locked_replica_info,
+            status=typing.cast(requests_lib.RequestStatus, facts.status),
+            cause=typing.cast(event_api_models.EventCause,
+                              facts.terminal_cause),
+            service_job_id=None,
+            pre_effect_terminal=False,
+            cancel_reason=association.get('cancel_reason'),
+            paid_capacity_pool_key=None,
+            provider_evidence=ordinary_launch_binding.ProviderEvidence.PRESENT)
+        if project_replica_result(connection, projection) is not True:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider-present cleanup persistence lost its exact row.')
+        persisted = (
+            serve_state.read_replica_for_bound_ordinary_launch_in_transaction(
+                connection, context.service_name, context.replica_id,
+                str(context.replica_record_id), context.association_id))
+        if not ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+                persisted, require_scheduled=True):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider-present cleanup projector did not persist the '
+                'closed immediate-cleanup marker.')
+        if not _paid_capacity_claim_is_exact(connection, association):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider-present cleanup changed paid-capacity identity.')
+    return True
+
+
+def bound_non_pool_provider_present_cleanup_is_authorized(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+) -> bool:
+    """Revalidate a durable PRESENT cleanup marker without provider I/O."""
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return False
+    try:
+        with engine.begin() as connection:
+            _, _, locked_replica_info = (
+                _lock_bound_non_pool_provider_present_cleanup(
+                    connection, context, authority))
+            return ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+                locked_replica_info)
+    except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
+        return False
+
+
 def project_bound_non_pool_provider_absence(
     context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
     authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
@@ -3876,6 +4080,49 @@ def project_bound_non_pool_provider_absence(
     return True
 
 
+def bound_non_pool_projected_provider_absence_is_authorized(
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+) -> bool:
+    """Authorize only replica-row removal after committed exact ABSENT."""
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return False
+    try:
+        with engine.begin() as connection:
+            association, _ = (
+                ordinary_launch_binding.
+                projected_provider_absence_cleanup_authority_in_connection(
+                    connection, service_name, replica_id, replica_record_id))
+            context = _bound_context_from_association(association)
+            facts, _, queue_row, pin_row = _lock_bound_request_evidence(
+                connection, context)
+            if (queue_row is not None or pin_row is not None or
+                    facts.retention_pin_active or
+                    not _paid_capacity_claim_is_exact(connection, association)):
+                return False
+            if facts.exists:
+                if (facts.status
+                        not in requests_lib.RequestStatus.finished_status() or
+                        facts.terminal_cause is None or
+                        facts.status.value != association['terminal_status'] or
+                        facts.terminal_cause.value
+                        != association['terminal_cause'] or
+                        facts.execution_generation
+                        != association['terminal_execution_generation'] or
+                        facts.execution_quiescence_required is not True or
+                        facts.execution_quiesced_generation
+                        != association['execution_quiesced_generation'] or
+                        facts.execution_quiesced_at
+                        != association['execution_quiesced_at'] or
+                        not facts.quiescent):
+                    return False
+            return True
+    except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
+        return False
+
+
 def bound_non_pool_provider_reconciliation_ready(
     context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
     authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
@@ -3900,6 +4147,27 @@ def bound_non_pool_provider_reconciliation_ready(
             facts.status in requests_lib.RequestStatus.finished_status() and
             facts.quiescent and queue_row is None and
             facts.retention_pin_active)
+
+
+def bound_non_pool_provider_absence_is_recorded(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+) -> bool:
+    """Return whether immutable exact absence is ready for projection."""
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return False
+    with engine.begin() as connection:
+        association = ordinary_launch_binding.lock_reduction_authority_in_connection(
+            connection, context)
+        return bool(
+            _controller_authority_matches_reduction(association, authority) and
+            association['resolution']
+            == ordinary_launch_binding.Resolution.AMBIGUOUS.value and
+            association['reconciliation_outcome'] == ordinary_launch_binding.
+            ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value and
+            association['provider_evidence']
+            == ordinary_launch_binding.ProviderEvidence.ABSENT.value)
 
 
 def _commit_bound_ordinary_launch_cancel_intent(
@@ -4207,6 +4475,17 @@ def _ordinary_launch_binding_participants_quiesced_in_transaction(
             ORDINARY_LAUNCH_BINDING_PARTICIPANT_QUIESCENCE_SECONDS))
 
 
+def _non_pool_launch_binding_participants_quiesced_in_transaction(
+    connection: sqlalchemy.engine.Connection,) -> bool:
+    """Close capability-heartbeat phantoms before cohort rotation."""
+    connection.execute(
+        sqlalchemy.text('LOCK TABLE api_server_instances IN SHARE MODE'))
+    return non_pool_launch_binding_fleet_capable(
+        connection=connection,
+        quiescence_seconds=(
+            ORDINARY_LAUNCH_BINDING_PARTICIPANT_QUIESCENCE_SECONDS))
+
+
 def promote_ordinary_launch_binding_service(
     authority: ordinary_launch_binding_lib.ControllerBindingAuthority,) -> int:
     """Explicitly promote one service under fleet and legacy-drain barriers."""
@@ -4253,8 +4532,10 @@ def promote_non_pool_launch_binding_service(
                 expected_binding_epoch=authority.binding_epoch,
                 participant_barrier_passed=lambda conn:
                 (_transition_authority_is_current(
-                    conn, authority, ordinary_launch_binding.BindingMode.BOUND)
-                 and non_pool_launch_binding_fleet_capable(connection=conn)),
+                    conn, authority, ordinary_launch_binding.BindingMode.BOUND
+                ) and
+                 _non_pool_launch_binding_participants_quiesced_in_transaction(
+                     conn)),
                 legacy_requests_drained=lambda conn:
                 (_bound_ordinary_launch_requests_clear_in_transaction(
                     conn, authority.service_name) and

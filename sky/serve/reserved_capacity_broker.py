@@ -38,6 +38,7 @@ import binascii
 from collections.abc import Callable
 from collections.abc import Mapping
 from collections.abc import Sequence
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -51,6 +52,7 @@ import typing
 from typing import Any, TypeGuard
 
 from sky import sky_logging
+from sky.adaptors import common as adaptors_common
 from sky.adaptors import kubernetes
 from sky.serve import constants
 from sky.serve import pool_capacity_observation
@@ -65,6 +67,9 @@ from sky.utils.db import migration_utils
 if typing.TYPE_CHECKING:
     from sky.serve import replica_managers
     from sky.serve import zero_cost_actuation
+else:
+    zero_cost_actuation = adaptors_common.LazyImport(
+        'sky.serve.zero_cost_actuation')
 
 logger = sky_logging.init_logger(__name__)
 
@@ -1631,6 +1636,58 @@ def demote_protocol_v1() -> bool:
 # is set: published epochs start at 1, so no launch ever carries it and
 # the launch-path comparison fails closed (skip) without a special case.
 _FENCE_PENDING_EPOCH = -1
+_PersistResultT = typing.TypeVar('_PersistResultT')
+
+
+class ReservedFillPersistRejected(RuntimeError):
+    """The broker fence definitely rejected work before SQL admission."""
+
+
+def run_fill_persist_transaction(
+    transaction: Callable[[int | None], _PersistResultT],) -> _PersistResultT:
+    """Run a caller-owned transaction while holding the broker fence.
+
+    The callback owns its PostgreSQL transaction. This facade owns only the
+    cross-process broker lock and the exact-session lease token, retaining both
+    through callback return (and therefore through transaction commit).
+    """
+    lock = locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID)
+    stack = contextlib.ExitStack()
+    try:
+        stack.enter_context(lock.acquire(blocking=False))
+    except locks.LockTimeout as error:
+        raise ReservedFillPersistRejected(
+            'Reserved-fill broker persist fence is busy.') from error
+    callback_error: BaseException | None = None
+    try:
+        lease_token = None
+        if isinstance(lock, locks.PostgresLock):
+            try:
+                lease_token = lock.run_in_lock_session(
+                    serve_state.advance_reserved_fill_persist_token)
+            except Exception as error:  # pylint: disable=broad-except
+                raise ReservedFillPersistRejected(
+                    'Reserved-fill persist fencing token advance failed.'
+                ) from error
+            if lease_token is None:
+                raise ReservedFillPersistRejected(
+                    'Reserved-fill persist fencing token was unavailable.')
+        return transaction(lease_token)
+    except BaseException as error:
+        callback_error = error
+        raise
+    finally:
+        try:
+            stack.close()
+        except BaseException as exit_error:
+            # Context-manager cleanup must not turn an operator interrupt into
+            # an ordinary ambiguous admission result.  The callback owns the
+            # durable transaction, so admit() still gets to hydrate evidence
+            # before re-raising the original interrupt.
+            if (callback_error is not None and
+                    not isinstance(callback_error, Exception)):
+                raise callback_error from exit_error
+            raise
 
 
 def current_epoch(pool_key: str) -> int | None:
@@ -1665,16 +1722,10 @@ def persist_fill_replica(
     *,
     pool_key: str,
     expected_epoch: int,
-    expected_protocol_version: int = PROTOCOL_V1,
-    expected_service_generation: int = 0,
-    expected_physical_cluster_uid: str | None = None,
-    expected_ordinary_zero_cost_admission_sequence: int | None = None,
     expected_service_hash: str | None = None,
     expected_controller_owner: tuple[int | None, str | None] | None = None,
-    expected_actuation_mode: str | None = None,
-    actuation_lease: 'zero_cost_actuation.IntentLease | None' = None,
 ) -> bool:
-    """Atomically persists a fill replica row, excluded from broker rounds.
+    """Atomically persist one historical protocol-v1 fill replica.
 
     Ordering invariant (the other half lives on run_round_if_stale): a
     fill row must never become durable INSIDE a round's scan->publish
@@ -1703,43 +1754,23 @@ def persist_fill_replica(
     itself is one quick DB write, so a round waiting behind it is never
     delayed noticeably.
     """
+
+    def _persist(lease_token: int | None) -> bool:
+        return serve_state.add_replica_if_round_epoch(
+            service_name,
+            replica_id,
+            replica_info,
+            pool_key=pool_key,
+            expected_epoch=expected_epoch,
+            expected_protocol_version=PROTOCOL_V1,
+            expected_lease_token=lease_token,
+            expected_service_hash=expected_service_hash,
+            expected_controller_owner=expected_controller_owner)
+
     try:
-        lock = locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID)
-        with lock.acquire(blocking=False):
-            lease_token = None
-            if isinstance(lock, locks.PostgresLock):
-                try:
-                    lease_token = lock.run_in_lock_session(
-                        serve_state.advance_reserved_fill_persist_token)
-                except Exception as error:  # pylint: disable=broad-except
-                    # The dedicated advisory-lock session may have died before
-                    # or during the token transaction.  This launch is not
-                    # authorized to fall back to an unrelated ORM connection.
-                    logger.error('Reserved-fill broker: persist fencing token '
-                                 f'advance failed; skipping fill launch: '
-                                 f'{error}')
-                    return False
-                if lease_token is None:
-                    logger.error('Reserved-fill broker: could not advance the '
-                                 'persist fencing token; skipping fill launch.')
-                    return False
-            return serve_state.add_replica_if_round_epoch(
-                service_name,
-                replica_id,
-                replica_info,
-                pool_key=pool_key,
-                expected_epoch=expected_epoch,
-                expected_protocol_version=expected_protocol_version,
-                expected_service_generation=expected_service_generation,
-                expected_physical_cluster_uid=(expected_physical_cluster_uid),
-                expected_ordinary_zero_cost_admission_sequence=(
-                    expected_ordinary_zero_cost_admission_sequence),
-                expected_lease_token=lease_token,
-                expected_service_hash=expected_service_hash,
-                expected_controller_owner=expected_controller_owner,
-                expected_actuation_mode=expected_actuation_mode,
-                actuation_lease=actuation_lease)
-    except locks.LockTimeout:
+        return run_fill_persist_transaction(_persist)
+    except ReservedFillPersistRejected as error:
+        logger.info('Reserved-fill broker: %s', error)
         return False
 
 
@@ -2959,9 +2990,13 @@ def _occupying_debit(
       undercount by live demand pods is by design; non-claimants'
       nonterminal DEMAND rows stay invisible for the same reason).
       In sequenced rounds, FAILED_CLEANUP fill rows with materialization proof
-      are also conserved until cleanup is proven.  They may persist after the
-      pod eventually dies, but this can only withhold fill; treating unresolved
-      cleanup as free could oversubscribe a still-bound slot.
+      are also conserved until cleanup is proven.  A successful ``sky.down``
+      status is durable cleanup proof even when the retained diagnostic row
+      still renders as SHUTTING_DOWN because its launch was interrupted.  Such
+      a row must not continue withholding capacity after provider absence was
+      proved.  Other retained rows may persist after the pod eventually dies,
+      but this can only withhold fill; treating unresolved cleanup as free
+      could oversubscribe a still-bound slot.
 
     A sequenced round requires the grouped replica scan to succeed completely;
     partial enumeration or decode is not spendable authority. It includes
@@ -3064,8 +3099,11 @@ def _occupying_debit(
                 current_service_generation=(claim_generations or {}).get(name),
                 pool_gpus_per_replica=pool_gpus_per_replica)
             if info.is_terminal:
+                cleanup_succeeded = (info.status_property.sky_down_status ==
+                                     common_utils.ProcessStatus.SUCCEEDED)
                 cleanup_not_proven = (
-                    info.status == serve_state.ReplicaStatus.SHUTTING_DOWN or
+                    (info.status == serve_state.ReplicaStatus.SHUTTING_DOWN and
+                     not cleanup_succeeded) or
                     (has_sequence_boundary and
                      info.status == serve_state.ReplicaStatus.FAILED_CLEANUP))
                 if occupancy is not None and cleanup_not_proven:
@@ -3125,6 +3163,30 @@ def _occupying_debit(
                             feed_debit_by_accelerator.get(card, 0) + slots)
                 if post_snapshot:
                     entitlement_debit += occupancy.slots
+
+    if has_sequence_boundary:
+        try:
+            pending_debits = zero_cost_actuation.pending_pool_debits(pool_key)
+        except Exception as intent_error:  # pylint: disable=broad-except
+            raise IncompleteReplicaOccupancySnapshotError(
+                'Sequenced reserved-fill intent snapshot is incomplete: '
+                f'{common_utils.format_exception(intent_error)}'
+            ) from intent_error
+        for debit in pending_debits:
+            if (debit.pool_key != pool_key or debit.replica_slots < 1 or
+                    debit.accelerator not in identity.gpu_names):
+                raise IncompleteReplicaOccupancySnapshotError(
+                    'Sequenced reserved-fill intent has inconsistent physical '
+                    'pool attribution.')
+            occupancy = _ReplicaPoolOccupancy(
+                slots=debit.replica_slots,
+                by_accelerator=((debit.accelerator, debit.replica_slots),))
+            debit_occupancy(occupancy)
+            if debit.service_name in claimants:
+                live_fill[debit.service_name] = (
+                    live_fill.get(debit.service_name, 0) + debit.replica_slots)
+            else:
+                unclaimed_fill += debit.replica_slots
     return (feed_debit, entitlement_debit,
             dict(sorted(feed_debit_by_accelerator.items())), live_fill,
             unclaimed_fill)
