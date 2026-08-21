@@ -1770,7 +1770,7 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
     assert pin_count == 0
 
 
-def test_provider_present_cleanup_exact_digest_requires_owner_relations(
+def test_provider_present_cleanup_requires_exact_digest_and_owner_relations(
         bound_request_database) -> None:
     """Atomic digest equality cannot replace tenant/owner/cluster checks."""
     engine, _ = bound_request_database
@@ -1800,6 +1800,10 @@ def test_provider_present_cleanup_exact_digest_requires_owner_relations(
     context = mock.Mock(
         service_name='gc-service',
         input_digest=ordinary_launch_binding.canonical_launch_digest(body))
+    pre_normalization_body = body.model_copy(deep=True)
+    pre_normalization_body.client_api_version = None
+    pre_normalization_digest = (
+        ordinary_launch_binding.canonical_launch_digest(pre_normalization_body))
     original = body.model_dump_json()
     with engine.begin() as connection:
         connection.execute(
@@ -1828,6 +1832,10 @@ def test_provider_present_cleanup_exact_digest_requires_owner_relations(
             connection, {
                 **association, 'tenant_scope': 'different-tenant'
             }, request_row, request, context)
+        legacy_context = mock.Mock(service_name='gc-service',
+                                   input_digest=pre_normalization_digest)
+        assert not request_postgres._provider_present_cleanup_input_digest_matches(
+            connection, association, request_row, request, legacy_context)
     assert body.model_dump_json() == original
 
 
@@ -1861,15 +1869,13 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
                     replica_state=info.to_storage_dict()))
         connection.execute(
             sqlalchemy.insert(global_user_state_schema.user_table).values(
-                id='submitted-owner',
-                name='Submitted Owner',
-                created_at=int(time.time())))
+                id='tenant-a', name='Tenant A', created_at=int(time.time())))
         connection.execute(
             sqlalchemy.update(serve_state_schema.services_table).where(
                 serve_state_schema.services_table.c.name ==
                 'gc-service').values(
-                    owner_user_id='submitted-owner',
-                    owner_user_name='Submitted Owner',
+                    owner_user_id='tenant-a',
+                    owner_user_name='Tenant A',
                     reserved_fill_actuation_mode=(
                         zero_cost_actuation.ActuationMode.DURABLE_INTENT.value),
                     reserved_fill_actuation_epoch=1,
@@ -1889,8 +1895,14 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
     monkeypatch.setattr(
         ordinary_launch_binding, '_reserved_fill_cleanup_payload',
         lambda *_args, **_kwargs: {'physical_cluster_uid': 'physical-uid-a'})
+    launch_body = _gc_unbound_non_pool_launch_body()
+    # Atomic admission stamps trusted fields before the shared builder hashes
+    # the body, so the submitted and executable digests are identical.
+    launch_body.env_vars[constants.USER_ID_ENV_VAR] = 'tenant-a'
+    launch_body.env_vars[constants.USER_ENV_VAR] = 'Tenant A'
+    launch_body.client_api_version = 77
     built = non_pool_admission.build(
-        _gc_unbound_non_pool_launch_body(),
+        launch_body,
         uuid.UUID('44444444-4444-4444-8444-444444444444'),
         profile,
         non_pool_admission.AdmissionAuthority(
@@ -1916,11 +1928,8 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
                         lambda **_kwargs: True)
     admission = request_postgres.bind_and_enqueue_non_pool_launch(
         request, identity)
-    # The authenticated HTTP contract hashes submitted bytes before request
-    # construction normalizes tenant and API fields.  Provider cleanup must
-    # not mistake this legitimate representation boundary for mutation.
     assert ordinary_launch_binding.canonical_launch_digest(
-        request.request_body) != identity.input_digest
+        request.request_body) == identity.input_digest
     context = ordinary_launch_binding.BoundNonPoolLaunchContext(
         association_id=identity.association_id,
         request_id=identity.request_id,
@@ -2053,6 +2062,10 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
     tampered_env['env_vars'] = dict(tampered_env['env_vars'])
     tampered_env['env_vars']['UNRELATED_TAMPER'] = 'true'
     tampered_payloads.append(tampered_env)
+    tampered_owner = dict(original_payload)
+    tampered_owner['env_vars'] = dict(tampered_owner['env_vars'])
+    tampered_owner['env_vars'][constants.USER_ENV_VAR] = 'Tampered Owner'
+    tampered_payloads.append(tampered_owner)
     tampered_tenant = dict(original_payload)
     tampered_tenant['env_vars'] = dict(tampered_tenant['env_vars'])
     tampered_tenant['env_vars'][constants.USER_ID_ENV_VAR] = 'other-tenant'
@@ -2060,6 +2073,9 @@ def test_reserved_fill_provider_presence_authorizes_only_fenced_cleanup(
     tampered_cluster = dict(original_payload)
     tampered_cluster['cluster_name'] = 'different-cluster'
     tampered_payloads.append(tampered_cluster)
+    tampered_api = dict(original_payload)
+    tampered_api['client_api_version'] = 78
+    tampered_payloads.append(tampered_api)
     for tampered_payload in tampered_payloads:
         with engine.begin() as connection:
             connection.execute(
