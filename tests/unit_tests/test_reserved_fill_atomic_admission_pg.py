@@ -176,8 +176,9 @@ def _authority():
             ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
 
 
-def _atomic_specs(engine, count=1, *, image_id=None):
-    authority = _authority()
+def _atomic_specs(engine, count=1, *, image_id=None, authority=None):
+    if authority is None:
+        authority = _authority()
     serve_state.attest_service_owner_user_id(authority, _CREATOR_ID,
                                              _CREATOR_NAME)
     _, snapshot = _commit_evidence(engine)
@@ -235,7 +236,7 @@ def _atomic_specs(engine, count=1, *, image_id=None):
             ordinary_launch_binding.REPLICA_RECORD_ID_KEY:
                 info.replica_record_id,
             ordinary_launch_binding.LIFECYCLE_EPOCH_KEY: 4,
-            ordinary_launch_binding.BINDING_EPOCH_KEY: _BINDING_EPOCH,
+            ordinary_launch_binding.BINDING_EPOCH_KEY: authority.binding_epoch,
             ordinary_launch_binding.CONTROLLER_INCARNATION_KEY:
                 str(_CONTROLLER_INCARNATION),
             ordinary_launch_binding.CONTROLLER_OWNER_EPOCH_KEY: _CONTROLLER_OWNER_EPOCH,
@@ -1355,7 +1356,7 @@ def _reconstruct_serve055_replica_handoff_boundary(engine) -> None:
         'EXISTS serve056_intent_service_key_uq',
         'ALTER TABLE replicas DROP COLUMN '
         'reserved_fill_intent_idempotency_key',
-        "UPDATE alembic_version SET version_num = '055'",
+        "UPDATE alembic_version_serve_state_db SET version_num = '055'",
     )
     with engine.begin() as connection:
         for statement in statements:
@@ -1378,7 +1379,21 @@ def test_serve056_retained_provider_present_cleanup_reaches_manager_down_shape(
         connection.execute(
             sqlalchemy.update(serve_state_schema.services_table).where(
                 serve_state_schema.services_table.c.name == _SERVICE).values(
+                    ordinary_launch_binding_epoch=(
+                        serve_state_schema.services_table.c.
+                        ordinary_launch_binding_epoch + 1),
                     non_pool_launch_capability_cohort_epoch=previous_cohort))
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                _SERVICE)).mappings().one()
+    previous_authority = ordinary_launch_binding._authority_from_service(
+        service,
+        controller_pid=service['controller_pid'],
+        controller_ip=service['controller_ip'],
+        controller_incarnation=service['controller_incarnation'],
+        controller_owner_epoch=service['controller_owner_epoch'],
+        capable=True)
     # Produce the retained graph exactly as the previous binary cohort did.
     # The provider-effect phase below is a durable historical fact; no current
     # provider admission or provider-effect start is exercised by this test.
@@ -1386,7 +1401,7 @@ def test_serve056_retained_provider_present_cleanup_reaches_manager_down_shape(
         previous_binary.setattr(ordinary_launch_binding,
                                 'NON_POOL_CAPABILITY_COHORT_EPOCH',
                                 previous_cohort)
-        spec = _atomic_spec(atomic_database)
+        spec = _atomic_spec(atomic_database, authority=previous_authority)
         staged, receipt = reserved_fill_admission._transaction(
             spec, 7, require_existing=False)
     with atomic_database.connect() as connection:
