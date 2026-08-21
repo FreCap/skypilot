@@ -394,11 +394,10 @@ tests:
           content:
             name: SKYPILOT_API_SERVER_ROLE
             value: api
-      - contains:
+      - notContains:
           path: spec.template.spec.containers[0].env
           content:
             name: IS_SKYPILOT_SERVER
-            value: "true"
       - notContains:
           path: spec.template.spec.containers[0].env
           content:
@@ -2025,11 +2024,10 @@ tests:
             value: "x"
       # The four HA role and identity variables extend the prior baseline.
       # The chart-owned quiescence guard and Serve hold extend the baseline.
-      # The pre-import server marker adds one chart-owned variable.
-      # A duplicate POD_IP would push the count to 22.
+      # A duplicate POD_IP would push the count to 21.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 21
+          count: 20
 
   - it: should not duplicate POD_IP env when global.extraEnvs already provides it
     set:
@@ -2041,11 +2039,10 @@ tests:
     asserts:
       # The four HA role and identity variables extend the prior baseline.
       # The chart-owned quiescence guard and Serve hold extend the baseline.
-      # The pre-import server marker adds one chart-owned variable.
-      # A duplicate POD_IP would push the count to 21.
+      # A duplicate POD_IP would push the count to 20.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 20
+          count: 19
 
   - it: should allow custom GCP workload identity env when native credentials are disabled
     set:

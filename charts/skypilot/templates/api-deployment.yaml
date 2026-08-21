@@ -371,8 +371,6 @@ spec:
           value: {{ default false $requestStore.enforceBuiltinExecutionQuiescenceBackends | quote }}
         - name: SKYPILOT_API_SERVER_ROLE
           value: {{ ternary "api" "all" $haEnabled | quote }}
-        - name: IS_SKYPILOT_SERVER
-          value: "true"
         - name: SKYPILOT_API_SERVER_INSTANCE_ID
           valueFrom:
             fieldRef:
