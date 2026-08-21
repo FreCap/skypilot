@@ -1,13 +1,12 @@
 # Production-Grade Multi-Replica API Server
 
 Status: PostgreSQL request authority and the 2/2/2 API/executor/controller
-split are live in production and were revalidated after the 2026-08-19 direct
-Helm rollout at revision 436 / release 1.1.1349. Release 1.1.1350 is published
-but not deployed. The private durable HA-observer canary and M5 compatibility
-cleanup remain gated. The former executable RWX/EFS migration plan has been
-removed and is available only in Git history.
+split are live in production and were revalidated on 2026-08-21 at Helm
+revision 469 / release 1.1.1396. The private durable HA-observer canary and M5
+compatibility cleanup remain gated. The former executable RWX/EFS migration
+plan has been removed and is available only in Git history.
 
-Last updated: 2026-08-19
+Last updated: 2026-08-21
 
 Canonical owner: this file owns the role split, PostgreSQL request delivery,
 controller leadership, execution fencing, and availability contract. External
@@ -145,7 +144,7 @@ replica-independent and keeps each migration milestone deployable.
   request ID. Their underlying request and log state must remain available.
 - API readiness is false when PostgreSQL is unreachable, the request schema is
   incompatible, or the active committed durable-byte provider fails its
-  generation/fingerprint/read-write readiness contract.
+  generation and exact-object readiness contract.
 - SIGTERM makes the pod fail readiness before it begins application shutdown.
   A pre-stop drain interval allows EndpointSlice and kube-proxy state to
   converge before Uvicorn exits.
@@ -425,8 +424,8 @@ operational table, is the 35-day evidence authority.
   `before-hook-creation`. Release-managed, least-privilege RBAC permits the
   verifier to read only the exact role Deployments. Tests cover retry, failure,
   TTL cleanup, and uninstall residue. In guarded HA, every migration, seed, and
-  verifier Job and its Pod must also pass the separately owned principal-aware
-  storage admission fence; Helm hook annotations are not an exemption.
+  verifier Job must read and validate the committed storage mode and generation
+  before it mutates durable state; Helm hook annotations are not an exemption.
 - API and worker pods run in verify-only migration mode.
 - New schema revisions are additive during the expand phase.
 - A release may read both the old and new representation while mixed versions
@@ -637,28 +636,15 @@ API shutdown follows this order:
 ## Helm Contract
 
 Production SkyPilot application runtime is owned exclusively by direct Helm.
-The reviewed bundle pins immutable chart and image digests, captures retained
-values and the rendered diff, and upgrades the existing release with
-`--reuse-values`. The separately authorized storage-fence identity applies its
-own direct-Helm release from that reviewed bundle before an application
-rollout; the ordinary release cannot change it. `boltz-platform` owns only
-static infrastructure and the identity/RBAC separation; it owns neither Helm
-release, the mutable image allowlist, nor an application-version pin. An
-ordinary SkyPilot rollout never waits for, changes, or backfills application
-state into a platform apply. After rollout convergence, a subsequent
-nonoverlapping fence phase under the same lease tightens the policy from the
-exact current/candidate overlap to the candidate tuple alone.
-
-Guarded-HA fence and application mutations are sequential phases of one
-PostgreSQL cutover lease and random fencing token; their Helm processes may not
-overlap. Every application Deployment/hook carries that token and must match
-the active fence parameters. Before every fence mutation, the separately
-authorized holder freshly verifies the committed PostgreSQL storage mode and
-generation as specified by the storage design. A VAP cannot safely
-self-validate replacement of its own policy/binding, so the fence release
-forbids native `helm rollback`, `--atomic`, and historical-revision reuse. Lost
-lease or command responses are reconciled from PostgreSQL plus both exact Helm
-release receipts before another forward phase starts.
+The reviewed bundle pins immutable chart and image identities, captures
+retained values and the rendered diff, and upgrades the existing release with
+`--reuse-values`. `boltz-platform` owns only minimum static infrastructure
+and identity/RBAC boundaries; it owns neither the SkyPilot Helm release nor an
+application-version pin. The one-way storage cutover lease, generation commit,
+and pre-commit/post-commit recovery boundary are defined only by
+`docs/designs/stateless-ha-control-plane-storage.md`. This role-split design
+adds no admission policy, second Helm release, or storage-specific rollout
+controller.
 
 HA mode introduces:
 
@@ -1675,7 +1661,7 @@ by HA mode.
 - Run the full repository CI rollup on the exact pushed SHA for every stacked
   pull request before merge.
 
-Historical storage-fence test counts are not acceptance evidence for the
+Historical storage test counts are not acceptance evidence for the
 current storage design. Role/PDB/Helm changes require the exact-head suites
 above; storage changes require the independent suite and gates in
 `docs/designs/stateless-ha-control-plane-storage.md`.
@@ -1712,6 +1698,10 @@ capacity migration have all been accepted with empty superseded nodes. A
 wall-clock timer, PR age, or Helm uptime never unlocks cleanup; provider-
 specific runbook step names are not part of this application contract.
 
+This clock gates only the role-split M5 compatibility cleanup described by
+this file. It does not gate the independently reviewed no-EFS cutover, retain-
+forever S3 object policy, or exact SkyPilot PVC/access-point removal.
+
 The separately reviewed observation deployment installs a
 `rainier-ha-observer` CronJob inside the private cluster
 with `* * * * *`, `concurrencyPolicy: Forbid`, a 30-second starting deadline,
@@ -1730,8 +1720,8 @@ sample/reset/checkpoint objects but cannot overwrite or delete them. The bucket
 policy independently denies missing or non-`*` conditional headers for both
 this prefix and the disjoint seed prefix; identity policy alone is not the
 append-only boundary.
-Each sample binds the attempt ID, committed storage generation/fingerprint,
-accepted storage-admission-policy receipt, exact direct-Helm release-bundle
+Each sample binds the attempt ID, committed storage mode and generation,
+accepted storage-readiness receipt, exact direct-Helm release-bundle
 digest, immutable environment/placement evidence, any applicable capacity-cost
 approval receipt and hard end, predicate result and source query IDs, prior-
 sample digest, and observer build digest. Failed predicates and missing UTC-
@@ -1832,11 +1822,10 @@ slower; any failed, stale, or missing observation resets the clock:
   aggregate headroom for all three possible rollout surges remains satisfied
   after accounting for DaemonSets, external load balancers, the observer, and
   all other live workloads;
-- the committed storage generation is Ready in all six role pods, its
-  fingerprint agrees, and its independent storage acceptance predicates have
-  no stale or failed observation. Before the separate storage cutover, legacy-
-  provider health is operational telemetry only; after `S3_V1`, any PVC/EFS
-  mount or I/O fails the storage gate;
+- the committed storage mode and generation are Ready in all six role pods and
+  exact-version object probes have no stale or failed observation. Before the
+  separate storage cutover, EFS health is operational telemetry only; after
+  S3_V1, any PVC/EFS mount or I/O fails the storage gate;
 - PostgreSQL CPU remains below 70% at p95, connections below 70% of the
   configured maximum, and connection/error counters show no HA-attributable
   increase; and
@@ -1849,9 +1838,9 @@ slower; any failed, stale, or missing observation resets the clock:
   change that durable mode, and pools continue to require zero endpoint/LB
   replicas.
 
-The completed isolated restore rehearsal and its restore-specific sentinel and
-inventory evidence are a separate cleanup prerequisite; they do not repair or
-backdate a reset clock.
+The storage design owns its own inventory/import rehearsal and production
+cutover evidence. That evidence neither repairs nor backdates this role-split
+observation clock.
 
 ## Rollback and fix-forward
 
@@ -1863,19 +1852,15 @@ backdate a reset clock.
   an immutable compatible image/chart and the complete retained values. Native
   `helm rollback` to a stored pre-PostgreSQL or incompatible storage revision is
   unsupported.
-- The separately owned fence release is also fix-forward only: neither native
-  `helm rollback` nor `--atomic` is permitted in any storage mode, and a fresh
-  PostgreSQL mode/generation check under the shared cutover lease precedes each
-  mutation.
-- After `S3_V1`, guarded production HA cannot return to `--role=all`; the
-  external storage fence admits only the split API, executor, and controller
-  topology. Recovery fixes that topology forward with an S3-capable image.
+- After S3_V1, guarded production HA cannot return to `--role=all`.
+  Recovery fixes the split API, executor, and controller topology forward with
+  an S3-capable image.
   The all-role entrypoint may remain only for explicit non-HA/local
   compatibility until its M5 removal gate.
 - Disabling `apiService.metrics.enabled` removes all role metrics ports and
   scrape annotations together; it cannot be used to satisfy a metrics-dependent
   rollout gate.
-- The one-way storage boundary, pre-commit abort, post-commit admission fence,
+- The one-way storage boundary, pre-commit abort, post-commit fix-forward rule,
   and exact infrastructure retention/deletion behavior are owned exclusively by
   `docs/designs/stateless-ha-control-plane-storage.md`. This file defines no
   alternate storage rollback.
