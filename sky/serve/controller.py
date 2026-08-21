@@ -5659,8 +5659,10 @@ class SkyServeController:
         planning_state_fingerprint: str | None,
         *,
         sequenced_reserved_fill: bool,
+        sequenced_reserved_fill_allocation: (
+            reserved_fill_planner.AuthenticatedAllocationMap | None) = None,
     ) -> tuple[list[autoscalers.AutoscalerDecision], int | None,
-               autoscalers.UnrecoverableRolloutFailure | None, Any,
+               autoscalers.UnrecoverableRolloutFailure | None, Any, Any, Any,
                bool] | None:
         """Mutate one exact autoscaler while update/LB publication is fenced.
 
@@ -5705,6 +5707,53 @@ class SkyServeController:
                            autoscalers.ConcurrencyAutoscaler)):
                 decision_autoscaler.set_free_reserved_slots_by_accelerator(
                     self._get_free_reserved_slots_by_accelerator())
+            retirement_shelter = None
+            if sequenced_reserved_fill:
+                capacity_unit = (
+                    reserved_fill_planner.FillCapacityUnit.LOGICAL
+                    if decision_autoscaler.replica_unit == 'logical' else
+                    reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+                holdings: tuple[reserved_fill_planner.MaterializedFillHolding,
+                                ...] = ()
+                try:
+                    holdings = (decision_autoscaler.
+                                sequenced_reserved_fill_holdings(replica_infos))
+                    retirement_shelter = (
+                        reserved_fill_planner.
+                        derive_sequenced_retirement_shelter(
+                            allocation=sequenced_reserved_fill_allocation,
+                            holdings=holdings,
+                            service_version=decision_version,
+                            max_capacity=decision_autoscaler.max_replicas,
+                            capacity_unit=capacity_unit))
+                except (TypeError, ValueError) as error:
+                    logger.warning(
+                        'Reserved-fill allocation could not produce a '
+                        'retirement shelter; holding materialized fill and '
+                        'authorizing no launch: '
+                        f'{common_utils.format_exception(error)}')
+                    sequenced_reserved_fill_allocation = None
+                    try:
+                        retirement_shelter = (
+                            reserved_fill_planner.
+                            derive_sequenced_retirement_shelter(
+                                allocation=None,
+                                holdings=holdings,
+                                service_version=decision_version,
+                                max_capacity=decision_autoscaler.max_replicas,
+                                capacity_unit=capacity_unit))
+                    except (TypeError, ValueError):
+                        # A malformed holding must not crash reconciliation.
+                        # Unknown authority independently blocks every launch
+                        # and destructive action, so an empty exact projection
+                        # is the conservative terminal fallback.
+                        retirement_shelter = (
+                            reserved_fill_planner.SequencedRetirementShelter(
+                                service_version=decision_version,
+                                target_capacity=0,
+                                target_capacity_by_accelerator=(),
+                                accelerator_shapes=(),
+                                allocation_identity=None))
             planning_context = (
                 decision_autoscaler.sequenced_reserved_fill_planning()
                 if sequenced_reserved_fill else contextlib.nullcontext())
@@ -5717,24 +5766,67 @@ class SkyServeController:
             if decision_autoscaler.has_recomputed_with_fresh_data() is True:
                 demand_target = (
                     decision_autoscaler.get_final_target_num_replicas())
-                fill_target = 0
-                if decision_autoscaler.reserved_capacity_fill is True:
-                    fill_target = decision_autoscaler.fill_target
-                if (type(fill_target) is not int or  # pylint: disable=unidiomatic-typecheck
-                        fill_target < 0):
-                    fill_target = 0
-                target_num_replicas = max(demand_target, fill_target)
+                target_num_replicas = demand_target
             rollout_failure = decision_autoscaler.unrecoverable_rollout_failure
             logical_target = None
+            logical_retirement_floor = None
             invalidate_logical_target = False
             if (isinstance(decision_autoscaler,
                            autoscalers.ConcurrencyAutoscaler) and
                     decision_autoscaler.replica_unit == 'logical'):
                 logical_target = decision_autoscaler.logical_target_state
-                invalidate_logical_target = (logical_target is None and bool(
-                    decision_autoscaler.configured_accelerator_shapes))
+                if logical_target is not None:
+                    logical_retirement_floor = logical_target
+                    if retirement_shelter is not None:
+                        target_by_card = (() if len(logical_target) == 3 else
+                                          logical_target[3])
+                        shapes = (() if len(logical_target) == 3 else
+                                  logical_target[4])
+                        floor = (reserved_fill_planner.
+                                 compose_retirement_capacity_floor(
+                                     demand_capacity=logical_target[2],
+                                     demand_capacity_by_accelerator=(
+                                         target_by_card),
+                                     accelerator_shapes=shapes,
+                                     shelter=retirement_shelter,
+                                     max_capacity=(
+                                         decision_autoscaler.max_replicas)))
+                        if floor is None:
+                            logical_retirement_floor = None
+                        elif (floor.capacity_by_accelerator or
+                              floor.accelerator_shapes):
+                            logical_retirement_floor = (
+                                logical_target[0], logical_target[1],
+                                floor.capacity, floor.capacity_by_accelerator,
+                                floor.accelerator_shapes)
+                        else:
+                            logical_retirement_floor = (logical_target[0],
+                                                        logical_target[1],
+                                                        floor.capacity)
+                invalidate_logical_target = (
+                    (logical_target is None or logical_retirement_floor is None)
+                    and bool(decision_autoscaler.configured_accelerator_shapes))
+            if (sequenced_reserved_fill and
+                    sequenced_reserved_fill_allocation is None):
+                # Unavailable is distinct from a current grant of zero.  It
+                # authorizes neither typed fill nor an ordinary/paid launch.
+                scaling_options = [
+                    option for option in scaling_options if option.operator !=
+                    autoscalers.AutoscalerDecisionOperator.SCALE_UP
+                ]
+            if (sequenced_reserved_fill and
+                    decision_autoscaler.replica_unit != 'logical'):
+                # Logical retirement has a PostgreSQL commit seam at which the
+                # frozen allocation identity is revalidated.  The physical
+                # manager has no equivalent seam yet, so sequenced physical
+                # teardown must fail closed instead of racing a successor map.
+                scaling_options = [
+                    option for option in scaling_options if option.operator !=
+                    autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
+                ]
             return (scaling_options, target_num_replicas, rollout_failure,
-                    logical_target, invalidate_logical_target)
+                    logical_target, logical_retirement_floor,
+                    retirement_shelter, invalidate_logical_target)
 
     @staticmethod
     def _committed_reserved_fill_debits(
@@ -6212,17 +6304,34 @@ class SkyServeController:
                     replica_infos,
                     active_versions,
                     planning_state_fingerprint,
-                    sequenced_reserved_fill=(sequenced_reserved_fill))
+                    sequenced_reserved_fill=(sequenced_reserved_fill),
+                    sequenced_reserved_fill_allocation=allocation)
                 if plan is None:
                     return
                 (scaling_options, target_num_replicas, rollout_failure,
-                 logical_target, invalidate_logical_target) = plan
+                 logical_target, logical_retirement_floor, retirement_shelter,
+                 invalidate_logical_target) = plan
+                if (retirement_shelter is not None and
+                        not retirement_shelter.authority_current):
+                    allocation = None
                 if fresh_aggregate_zero:
                     target_num_replicas = 0
                     scaling_options = [
                         option for option in scaling_options if option.operator
                         != autoscalers.AutoscalerDecisionOperator.SCALE_UP
                     ]
+                if (sequenced_reserved_fill and
+                        retirement_shelter is not None and
+                        retirement_shelter.authority_current):
+                    (still_sequenced, current_allocation) = (
+                        self._read_sequenced_reserved_fill_allocation())
+                    if (not still_sequenced or
+                            current_allocation != allocation):
+                        logger.info(
+                            'Reserved-fill allocation advanced while '
+                            'planning; retrying before target publication.')
+                        self._notify_scale_reconcile()
+                        return
                 if not self._scale_actuation_is_current(actuation_generation,
                                                         decision_autoscaler,
                                                         decision_version):
@@ -6259,7 +6368,9 @@ class SkyServeController:
                 if logical_target is not None:
                     if durable_logical_snapshot is None:
                         self._replica_manager.publish_logical_target(
-                            *logical_target)
+                            *logical_target,
+                            retirement_floor=logical_retirement_floor,
+                            retirement_shelter=retirement_shelter)
                     else:
                         # Revalidate the exact demand/notification epoch under
                         # the ingestion lock, then install one target/snapshot
@@ -6278,7 +6389,9 @@ class SkyServeController:
                             if not (self._replica_manager.
                                     publish_logical_reconcile_state(
                                         logical_target,
-                                        durable_logical_snapshot)):
+                                        durable_logical_snapshot,
+                                        logical_retirement_floor,
+                                        retirement_shelter)):
                                 return
                 elif invalidate_logical_target:
                     # Exact-card retirement must fail closed while the LB

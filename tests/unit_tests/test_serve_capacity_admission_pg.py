@@ -2,8 +2,10 @@
 # pylint: disable=not-callable,protected-access,redefined-outer-name,unused-import
 
 import dataclasses
+import datetime
 import threading
 import time
+import types
 import uuid
 
 from alembic import command as alembic_command
@@ -19,6 +21,7 @@ from sky.serve import constants
 from sky.serve import demand_state
 from sky.serve import ordinary_launch_binding
 from sky.serve import replica_managers
+from sky.serve import reserved_fill_planner
 from sky.serve import route_projection
 from sky.serve import route_projection_schema
 from sky.serve import serve_state
@@ -366,7 +369,7 @@ def _prepare_logical_retirement(capacity_database):
     return info, snapshot.reconcile_authority, route_receipt
 
 
-def _commit_logical(info, authority):
+def _commit_logical(info, authority, allocation_identity=None):
     return serve_state.commit_logical_retirement(
         'svc',
         1,
@@ -374,7 +377,23 @@ def _commit_logical(info, authority):
         authority,
         expected_service_hash='svc-hash',
         expected_controller_owner=(123, '10.0.0.5'),
-        expected_logical_controller_epoch='logical-controller-a')
+        expected_logical_controller_epoch='logical-controller-a',
+        expected_reserved_fill_allocation_identity=allocation_identity)
+
+
+def _allocation_identity(
+    generation: int = 1
+) -> reserved_fill_planner.ReservedFillAllocationIdentity:
+    return reserved_fill_planner.ReservedFillAllocationIdentity(
+        allocation_generation=generation,
+        allocation_input_sha256=f'{generation:064x}',
+        allocation_claim_generation=11,
+        service_version=1,
+        ordinary_zero_cost_admission_sequence_high_water=0,
+        reconciliation_gate_generation=1,
+        reclaim_fleet_bundle_sha256='a' * 64,
+        reclaim_policy_revision='test-policy',
+        reclaim_provider_inventory_sha256='b' * 64)
 
 
 def test_serve050_schema_and_promotion_are_explicit(capacity_database):
@@ -501,6 +520,77 @@ def test_logical_retirement_preserves_global_sql_lock_order(capacity_database):
 
     assert result.state is serve_state.LogicalRetirementCommitState.COMMITTED
     assert ordered_locks == list(relevant_tables)
+
+
+def test_logical_retirement_rejects_allocation_successor(
+        capacity_database, monkeypatch):
+    """A successor map observed at the final commit fence preserves routing."""
+    info, authority, _ = _prepare_logical_retirement(capacity_database)
+    planned_identity = _allocation_identity(1)
+    successor_identity = _allocation_identity(2)
+
+    def _read_successor(_repository,
+                        connection,
+                        service_name,
+                        expected_service_hash,
+                        expected_controller_owner,
+                        *,
+                        protocol_and_service_prelocked=False):
+        assert connection.in_transaction()
+        assert service_name == 'svc'
+        assert expected_service_hash == 'svc-hash'
+        assert expected_controller_owner == (123, '10.0.0.5')
+        assert protocol_and_service_prelocked is True
+        return types.SimpleNamespace(identity=successor_identity,
+                                     pool_snapshots=())
+
+    monkeypatch.setattr(
+        serve_state.reserved_fill_allocation.ReservedFillAllocationRepository,
+        'read_current_in_connection', _read_successor)
+
+    result = _commit_logical(info, authority, planned_identity)
+
+    assert result.state is serve_state.LogicalRetirementCommitState.REJECTED
+    durable = serve_state.get_replica_info_from_id('svc', 1)
+    assert durable is not None
+    assert durable.status_property.logical_retirement_committed is False
+    assert (durable.status_property.sky_down_status ==
+            common_utils.ProcessStatus.SCHEDULED)
+
+
+def test_logical_retirement_resamples_clock_after_allocation_wait(
+        capacity_database, monkeypatch):
+    """Authority expiry while allocation locks block cannot authorize down."""
+    info, authority, _ = _prepare_logical_retirement(capacity_database)
+    identity = _allocation_identity()
+    authority = dataclasses.replace(
+        authority,
+        valid_until=(datetime.datetime.now(datetime.timezone.utc) +
+                     datetime.timedelta(milliseconds=50)))
+
+    def _delayed_current(_repository,
+                         connection,
+                         service_name,
+                         expected_service_hash,
+                         expected_controller_owner,
+                         *,
+                         protocol_and_service_prelocked=False):
+        del service_name, expected_service_hash, expected_controller_owner
+        assert connection.in_transaction()
+        assert protocol_and_service_prelocked is True
+        time.sleep(0.1)
+        return types.SimpleNamespace(identity=identity, pool_snapshots=())
+
+    monkeypatch.setattr(
+        serve_state.reserved_fill_allocation.ReservedFillAllocationRepository,
+        'read_current_in_connection', _delayed_current)
+
+    result = _commit_logical(info, authority, identity)
+
+    assert result.state is serve_state.LogicalRetirementCommitState.REJECTED
+    durable = serve_state.get_replica_info_from_id('svc', 1)
+    assert durable is not None
+    assert durable.status_property.logical_retirement_committed is False
 
 
 def _wait_for_blocked_postgres_backend(engine, backend_pid: int) -> None:

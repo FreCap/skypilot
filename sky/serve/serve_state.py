@@ -70,6 +70,7 @@ if typing.TYPE_CHECKING:
     from sky.serve import paid_retirement
     from sky.serve import placement_contract_normalization
     from sky.serve import replica_managers
+    from sky.serve import reserved_fill_allocation
     from sky.serve import reserved_fill_planner
     from sky.serve import resource_action_state
     from sky.serve import route_projection
@@ -85,6 +86,8 @@ else:
     kubernetes_identity = adaptors_common.LazyImport(
         'sky.serve.kubernetes_identity')
     replica_managers = adaptors_common.LazyImport('sky.serve.replica_managers')
+    reserved_fill_allocation = adaptors_common.LazyImport(
+        'sky.serve.reserved_fill_allocation')
     reserved_fill_planner = adaptors_common.LazyImport(
         'sky.serve.reserved_fill_planner')
     resource_action_state = adaptors_common.LazyImport(
@@ -6377,6 +6380,8 @@ def commit_logical_retirement(
     expected_service_hash: str,
     expected_controller_owner: tuple[int | None, str | None],
     expected_logical_controller_epoch: str,
+    expected_reserved_fill_allocation_identity: (
+        'reserved_fill_planner.ReservedFillAllocationIdentity | None') = None,
 ) -> LogicalRetirementCommitResult:
     """Atomically authorize logical teardown against current durable demand.
 
@@ -6401,7 +6406,11 @@ def commit_logical_retirement(
                 authority.controller_pid != expected_controller_owner[0] or
                 authority.controller_ip != expected_controller_owner[1] or
                 not isinstance(expected_logical_controller_epoch, str) or
-                not expected_logical_controller_epoch):
+                not expected_logical_controller_epoch or
+            (expected_reserved_fill_allocation_identity is not None and
+             not isinstance(
+                 expected_reserved_fill_allocation_identity,
+                 reserved_fill_planner.ReservedFillAllocationIdentity))):
             return LogicalRetirementCommitResult(
                 LogicalRetirementCommitState.REJECTED)
     except (AttributeError, TypeError, ValueError):
@@ -6413,8 +6422,11 @@ def commit_logical_retirement(
                                                                    session):
         if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
             raise RuntimeError('Logical retirement requires PostgreSQL.')
-        _prelock_zero_cost_protocol_for_replica_write(
-            session, engine, caller_infos, expected_replica_exists=True)
+        if expected_reserved_fill_allocation_identity is not None:
+            _lock_zero_cost_protocol_sequence_for_update(session)
+        else:
+            _prelock_zero_cost_protocol_for_replica_write(
+                session, engine, caller_infos, expected_replica_exists=True)
         # Lifecycle acquisition advances the durable fence before updating
         # the service row. Lock and validate that fence before taking the
         # service mutex too; taking it later through the generic replica
@@ -6462,13 +6474,36 @@ def commit_logical_retirement(
                 == authority.lb_cutover_generation)
         except (AttributeError, KeyError, TypeError, ValueError):
             service_matches = False
-        now = session.execute(
-            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
-        if not service_matches or authority_valid_until <= now:
+        if not service_matches:
             session.rollback()
             return LogicalRetirementCommitResult(
                 LogicalRetirementCommitState.REJECTED)
 
+        allocation_identity = expected_reserved_fill_allocation_identity
+        current_allocation = None
+        if allocation_identity is not None:
+            try:
+                current_allocation = (
+                    reserved_fill_allocation.ReservedFillAllocationRepository(
+                        engine).read_current_in_connection(
+                            session.connection(),
+                            service_name,
+                            expected_service_hash,
+                            expected_controller_owner,
+                            protocol_and_service_prelocked=True))
+            except (reserved_fill_allocation.ReservedFillAllocationError,
+                    TypeError, ValueError):
+                current_allocation = None
+            if (current_allocation is None or
+                    current_allocation.identity != allocation_identity):
+                session.rollback()
+                return LogicalRetirementCommitResult(
+                    LogicalRetirementCommitState.REJECTED)
+
+        # This clock only narrows which report rows must be locked.  A second
+        # sample after every evidence lock is the sole freshness authority.
+        report_query_now = session.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
         generations = demand_state_schema.serve_demand_feed_generations_table
         reports = demand_state_schema.serve_lb_demand_reports_table
         current_generation = session.execute(
@@ -6476,19 +6511,13 @@ def commit_logical_retirement(
                 generations.c.service_name == service_name,
                 generations.c.service_hash ==
                 expected_service_hash).with_for_update()).scalar_one_or_none()
-        fresh_reports = session.execute(
+        report_rows = session.execute(
             sqlalchemy.select(reports).where(
                 reports.c.service_name == service_name,
                 reports.c.service_hash == expected_service_hash,
                 reports.c.valid_until
-                > now).order_by(reports.c.reporter_session_id).with_for_update(
-                )).mappings().all()
-        if (current_generation != authority.demand_feed_generation or
-                not _logical_retirement_reports_are_current(
-                    fresh_reports, service, authority, now)):
-            session.rollback()
-            return LogicalRetirementCommitResult(
-                LogicalRetirementCommitState.REJECTED)
+                > report_query_now).order_by(reports.c.reporter_session_id).
+            with_for_update()).mappings().all()
 
         route_heads = route_projection_schema.serve_route_heads_table
         routes = route_projection_schema.serve_route_snapshots_table
@@ -6500,7 +6529,35 @@ def commit_logical_retirement(
             sqlalchemy.select(routes).where(
                 routes.c.service_name == service_name, routes.c.generation ==
                 authority.route_generation)).mappings().one_or_none()
-        if (route_head is None or route is None or
+        row = session.execute(
+            sqlalchemy.select(replicas_table.c.replica_state_version,
+                              replicas_table.c.replica_state).where(
+                                  replicas_table.c.service_name == service_name,
+                                  replicas_table.c.replica_id ==
+                                  replica_id).with_for_update()).one_or_none()
+        if row is None:
+            session.rollback()
+            return LogicalRetirementCommitResult(
+                LogicalRetirementCommitState.REJECTED)
+        current = _replica_from_state(row.replica_state_version,
+                                      row.replica_state)
+
+        # Every potentially blocking evidence lock is now held.  Sample one
+        # final database clock so authority that expired while waiting cannot
+        # authorize teardown.  The allocation validator retained all of its
+        # locks, so an in-memory final expiry check is sufficient here.
+        now = session.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        allocation_fresh = bool(
+            current_allocation is None or
+            all(snapshot.valid_until >= now.timestamp()
+                for snapshot in current_allocation.pool_snapshots))
+        if (authority_valid_until <= now or not allocation_fresh or
+                current_generation != authority.demand_feed_generation or
+                not all(report['valid_until'] > now for report in report_rows)
+                or not _logical_retirement_reports_are_current(
+                    report_rows, service, authority, now) or
+                route_head is None or route is None or
                 route_head['generation'] != authority.route_generation or
                 route_head['valid_until'] <= now or
                 route['content_sha256'] != authority.route_sha256 or
@@ -6529,19 +6586,6 @@ def commit_logical_retirement(
             session.rollback()
             return LogicalRetirementCommitResult(
                 LogicalRetirementCommitState.REJECTED)
-
-        row = session.execute(
-            sqlalchemy.select(replicas_table.c.replica_state_version,
-                              replicas_table.c.replica_state).where(
-                                  replicas_table.c.service_name == service_name,
-                                  replicas_table.c.replica_id ==
-                                  replica_id).with_for_update()).one_or_none()
-        if row is None:
-            session.rollback()
-            return LogicalRetirementCommitResult(
-                LogicalRetirementCommitState.REJECTED)
-        current = _replica_from_state(row.replica_state_version,
-                                      row.replica_state)
         if not _logical_retirement_precommit_matches(
                 current, replica_info, authority,
                 expected_logical_controller_epoch):

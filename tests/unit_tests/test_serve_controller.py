@@ -4588,12 +4588,15 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
         scaler = self._durable_autoscaler()
         scaler.reserved_capacity_fill = True
+        scaler.max_replicas = 20
+        scaler.sequenced_reserved_fill_holdings.return_value = ()
         scaler.sequenced_reserved_fill_planning.return_value = (
             contextlib.nullcontext())
         ctrl._autoscaler = scaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._replica_manager.spot_placer = None
         allocation = object()
+        shelter = mock.Mock(authority_current=True, service_version=1)
 
         with mock.patch.object(
                 controller.capacity_admission,
@@ -4614,6 +4617,10 @@ class TestAutoscalerRuntimeSnapshot:
                  autoscalers,
                  'generate_controller_scaling_decisions',
                  return_value=[]), \
+             mock.patch.object(
+                 controller.reserved_fill_planner,
+                 'derive_sequenced_retirement_shelter',
+                 return_value=shelter), \
              mock.patch.object(ctrl,
                                '_read_sequenced_reserved_fill_allocation',
                                return_value=(True, allocation)), \
@@ -4866,44 +4873,54 @@ class TestAutoscalerRuntimeSnapshot:
         assert selected is True
         assert observed is None
 
-    def test_reconcile_routes_selected_gate_through_sequenced_adapter(self):
+    def test_reconcile_derives_shelter_before_sequenced_planning(self):
         ctrl = _make_controller()
         decision_autoscaler = mock.Mock()
         decision_autoscaler.latest_version = 2
         decision_autoscaler.reserved_capacity_fill = True
-        decision_autoscaler.generate_scaling_decisions.return_value = []
+        decision_autoscaler.replica_unit = 'physical_backend'
+        decision_autoscaler.max_replicas = 20
+        decision_autoscaler.generate_scaling_decisions.return_value = [
+            autoscalers.AutoscalerDecision(
+                autoscalers.AutoscalerDecisionOperator.SCALE_DOWN, 7)
+        ]
         decision_autoscaler.has_recomputed_with_fresh_data.return_value = False
+        decision_autoscaler.sequenced_reserved_fill_holdings.return_value = ()
         sequenced_context = mock.MagicMock()
         decision_autoscaler.sequenced_reserved_fill_planning.return_value = (
             sequenced_context)
         ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
-        allocation = object()
+        ctrl._replica_manager.spot_placer = None
+        allocation = mock.Mock()
+        shelter = mock.Mock(target_capacity=0, authority_current=True)
 
-        with mock.patch.object(controller.serve_state,
-                               'get_replica_infos',
-                               return_value=[]), \
-             mock.patch.object(
-                 controller.serve_state,
-                 'get_service_runtime_snapshot',
-                 return_value={'active_versions': [2]}), \
-             mock.patch.object(
-                 ctrl,
-                 '_read_sequenced_reserved_fill_allocation',
-                 return_value=(True, allocation)), \
-             mock.patch.object(
-                 ctrl, '_persist_cost_rebalance_state', return_value=True), \
-             mock.patch.object(
-                 ctrl, '_accept_sequenced_reserved_fill') as accept:
-            ctrl._reconcile_scale_once(3)  # pylint: disable=protected-access
+        with mock.patch.object(controller.reserved_fill_planner,
+                               'derive_sequenced_retirement_shelter',
+                               return_value=shelter) as derive:
+            plan = ctrl._plan_scale_reconciliation(  # pylint: disable=protected-access
+                decision_autoscaler,
+                2,
+                0,
+                0,
+                0, [], [2],
+                None,
+                sequenced_reserved_fill=True,
+                sequenced_reserved_fill_allocation=allocation)
 
-        decision_autoscaler.sequenced_reserved_fill_planning.assert_called_once_with(  # pylint: disable=line-too-long
+        derive.assert_called_once_with(
+            allocation=allocation,
+            holdings=(),
+            service_version=2,
+            max_capacity=20,
+            capacity_unit=(
+                controller.reserved_fill_planner.FillCapacityUnit.PHYSICAL))
+        decision_autoscaler.sequenced_reserved_fill_planning.assert_called_once_with(
         )
         sequenced_context.__enter__.assert_called_once_with()
         sequenced_context.__exit__.assert_called_once()
-        accept.assert_called_once_with(allocation, decision_autoscaler, 2, 3,
-                                       [], [])
-        ctrl._replica_manager.scale_up_batch.assert_not_called()  # pylint: disable=line-too-long
+        assert plan is not None
+        assert plan[0] == []
 
     def test_run_autoscaler_uses_runtime_snapshot_for_active_versions(self):
         ctrl = _make_controller()
