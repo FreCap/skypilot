@@ -29,6 +29,7 @@ from sky.serve import service_spec
 from sky.serve import system_recovery_state
 from sky.serve import zero_cost_actuation
 from sky.server.requests import payloads
+from sky.skylet import constants as skylet_constants
 from sky.utils import common_utils
 from sky.utils.db import migration_utils
 
@@ -141,13 +142,18 @@ def _register_fresh_service(
     lifecycle_epoch: int,
     pool: bool = False,
     status: serve_statuses.ServiceStatus = serve_statuses.ServiceStatus.
-    CONTROLLER_INIT
+    CONTROLLER_INIT,
+    owner_user_id: str | None = 'owner-a',
+    owner_user_name: str | None = 'Owner A',
 ) -> bool:
     with engine.begin() as connection:
-        connection.execute(
-            postgresql.insert(global_user_state_schema.user_table).values(
-                id='owner-a', name='Owner A',
-                created_at=int(time.time())).on_conflict_do_nothing(
+        if owner_user_id is not None and owner_user_name is not None:
+            connection.execute(
+                postgresql.insert(global_user_state_schema.user_table).values(
+                    id=owner_user_id,
+                    name=owner_user_name,
+                    created_at=int(time.time())).
+                on_conflict_do_nothing(
                     index_elements=[global_user_state_schema.user_table.c.id]))
         connection.execute(
             sqlalchemy.insert(
@@ -174,8 +180,8 @@ def _register_fresh_service(
                                    service_hash=f'{name}-hash',
                                    lifecycle_epoch=lifecycle_epoch,
                                    resource_scope=f'{name}-hash',
-                                   owner_user_id='owner-a',
-                                   owner_user_name='Owner A')
+                                   owner_user_id=owner_user_id,
+                                   owner_user_name=owner_user_name)
 
 
 def test_fresh_postgres_non_pool_is_born_on_one_canonical_authority(
@@ -235,6 +241,66 @@ def test_fresh_postgres_non_pool_is_born_on_one_canonical_authority(
             zero_cost_actuation.PROTOCOL_VERSION)
     assert version['version'] == serve_constants.INITIAL_VERSION
     assert version['yaml_content'] == 'service:\n  replicas: 1\n'
+
+
+@pytest.mark.parametrize(
+    ('owner_user_id', 'owner_user_name'),
+    ((None, None), ('explicit-owner', None), (None, 'Explicit Owner')),
+)
+def test_fresh_postgres_birth_requires_exact_explicit_owner(
+        binding_database, monkeypatch, owner_user_id, owner_user_name) -> None:
+    # An existing ambient user must not supply either half of immutable tenant
+    # authority. The service creator passes the complete tuple explicitly.
+    with binding_database.begin() as connection:
+        connection.execute(
+            postgresql.insert(global_user_state_schema.user_table).values(
+                id='ambient-owner',
+                name='Ambient Owner',
+                created_at=int(time.time())).on_conflict_do_nothing(
+                    index_elements=[global_user_state_schema.user_table.c.id]))
+    monkeypatch.setenv(skylet_constants.USER_ID_ENV_VAR, 'ambient-owner')
+    monkeypatch.setenv(skylet_constants.USER_ENV_VAR, 'Ambient Owner')
+
+    with pytest.raises(ValueError, match='owner_user_'):
+        _register_fresh_service(binding_database,
+                                'missing-owner',
+                                lifecycle_epoch=12,
+                                owner_user_id=owner_user_id,
+                                owner_user_name=owner_user_name)
+
+    with binding_database.connect() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table.c.name).where(
+                serve_state_schema.services_table.c.name ==
+                'missing-owner')).one_or_none()
+    assert service is None
+
+
+def test_legacy_postgres_registration_can_remain_ownerless(
+        binding_database) -> None:
+    spec = service_spec.SkyServiceSpec.from_yaml_config({'replicas': 1})
+
+    assert serve_state.add_service('legacy-ownerless',
+                                   controller_job_id=1,
+                                   policy='policy',
+                                   requested_resources_str='H200:1',
+                                   load_balancing_policy='round_robin',
+                                   status=serve_statuses.ServiceStatus.READY,
+                                   tls_encrypted=False,
+                                   pool=False,
+                                   controller_pid=321,
+                                   entrypoint='python app.py',
+                                   spec=spec,
+                                   yaml_content='service:\n  replicas: 1\n')
+
+    with binding_database.connect() as connection:
+        owner = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.services_table.c.owner_user_id,
+                serve_state_schema.services_table.c.owner_user_name).where(
+                    serve_state_schema.services_table.c.name ==
+                    'legacy-ownerless')).one()
+    assert owner == (None, None)
 
 
 def test_fresh_canonical_claim_rebinds_capacity_and_waits_for_new_route(

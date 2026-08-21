@@ -15,6 +15,7 @@ from alembic import script as alembic_script
 import pytest
 import sqlalchemy
 
+from sky import global_user_state_schema
 from sky.serve import placement_contract_normalization
 from sky.serve import placement_normalization_authority
 from sky.serve import serve_state_schema
@@ -1081,6 +1082,10 @@ def test_serve040_runtime_authority_rejects_wrong_revision(serve040) -> None:
 ])
 def test_serve040_runtime_authority_accepts_recognized_additive_head(
         serve040, revision: str) -> None:
+    if revision == '055':
+        # Serve055's FK target is owned by the global user-state lineage. The
+        # production migration job establishes it before advancing Serve.
+        global_user_state_schema.user_table.create(serve040, checkfirst=True)
     _upgrade(serve040, revision)
 
     with serve040.connect() as connection:
