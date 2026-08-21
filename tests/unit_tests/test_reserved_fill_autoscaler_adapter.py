@@ -304,7 +304,7 @@ def test_reversible_retirements_are_frozen_materialized_holdings():
         capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL)
 
     assert shelter.target_capacity == 45
-    assert autoscaler.reserved_fill_planned_capacity(replicas) == 45
+    assert autoscaler.reserved_fill_materialized_capacity(replicas) == 45
 
 
 def test_missing_sequenced_authority_is_distinct_from_grant_zero():
@@ -435,125 +435,10 @@ def test_logical_retirement_floor_composes_incompatible_cards_and_clips():
     assert overlap.capacity_by_accelerator == (('h200', 10),)
 
 
-def test_physical_debits_duplicate_ambiguous_card_and_use_map_local_caps():
-    autoscaler = autoscalers.Autoscaler('svc', _spec())
-    east = _snapshot('east-context', 'uid-east', 'H200', 2, width=8)
-    west = _snapshot('west-context', 'uid-west', 'H200', 1, width=8)
-    a100 = _snapshot('a100-context', 'uid-a100', 'A100-80GB', 3, width=8)
-    allocation = _allocation(east, west, a100)
-    # This stale global value must not cap an authenticated-map decision.
-    autoscaler.free_reserved_slots_by_accelerator = {'H200': 0}
-    ambiguous = autoscalers.AutoscalerDecision(
-        autoscalers.AutoscalerDecisionOperator.SCALE_UP,
-        {'accelerators': {
-            'h200': 8
-        }})
-    east_only = autoscalers.AutoscalerDecision(
-        autoscalers.AutoscalerDecisionOperator.SCALE_UP, {
-            'region': 'east-context',
-            'accelerators': {
-                'H200': 8
-            }
-        })
-
-    debits = autoscaler.reserved_fill_ordinary_demand_debits(
-        allocation, [], [ambiguous, east_only])
-
-    assert debits == (
-        reserved_fill_planner.OrdinaryDemandDebit(east.pool_key, 'h200', 2),
-        reserved_fill_planner.OrdinaryDemandDebit(west.pool_key, 'h200', 1),
-    )
-
-
-def test_targetless_ordinary_demand_debits_every_possible_pool_card():
-    autoscaler = autoscalers.Autoscaler('svc', _spec())
-    east = _snapshot('east-context', 'uid-east', 'H200', 2, width=8)
-    west = _snapshot('west-context', 'uid-west', 'A100-80GB', 3, width=8)
-    allocation = _allocation(east, west)
-    targetless = [
-        autoscalers.AutoscalerDecision(
-            autoscalers.AutoscalerDecisionOperator.SCALE_UP, None)
-        for _ in range(2)
-    ]
-
-    debits = autoscaler.reserved_fill_ordinary_demand_debits(
-        allocation, [], targetless)
-
-    # Until the ordinary placer commits a location, either authenticated pool
-    # could be its consumer.  Conservatively reserve both possibilities; each
-    # debit remains bounded by that pool/card's own authenticated feed.
-    assert debits == (
-        reserved_fill_planner.OrdinaryDemandDebit(east.pool_key, 'h200', 2),
-        reserved_fill_planner.OrdinaryDemandDebit(west.pool_key, 'a100-80gb',
-                                                  2),
-    )
-
-
-def test_logical_target_debits_physical_slots_with_wave_and_replacement_fence():
+def test_materialized_capacity_and_receipt_driven_rotation_use_configured_unit(
+):
     autoscaler = _LogicalAccountingAutoscaler('svc',
                                               _spec(replica_unit='logical'))
-    h200 = _snapshot('h200-context', 'uid-h200', 'H200', 3, width=8)
-    a100 = _snapshot('a100-context', 'uid-a100', 'A100', 2, width=4)
-    allocation = _allocation(h200, a100)
-    replicas = [
-        _replica(1, card='H200', width=8, planned_capacity=8),
-        _replica(2, card='A100', width=4, planned_capacity=4),
-    ]
-    logical_target = autoscalers.LogicalScaleTarget(
-        version=1,
-        reconcile_generation=9,
-        target_capacity=32,
-        target_capacity_by_accelerator=(('H200', 24), ('A100', 8)),
-        accelerator_shapes=(('H200', 8), ('A100', 4)),
-        replace_unknown_replica_ids=(2,),
-        launch_budget=8,
-    )
-    decision = autoscalers.AutoscalerDecision(
-        autoscalers.AutoscalerDecisionOperator.SCALE_UP, logical_target)
-
-    debits = autoscaler.reserved_fill_ordinary_demand_debits(
-        allocation, replicas, [decision])
-
-    # The shared logical wave could land on either card.  Each card therefore
-    # receives its own conservative maximum, expressed as physical replicas.
-    assert debits == (
-        reserved_fill_planner.OrdinaryDemandDebit(h200.pool_key, 'h200', 1),
-        reserved_fill_planner.OrdinaryDemandDebit(a100.pool_key, 'a100', 2),
-    )
-
-
-def test_persisted_rows_are_not_redebit_after_exact_ordinary_fence():
-    autoscaler = autoscalers.Autoscaler('svc', _spec())
-    east = _snapshot('east-context',
-                     'uid-east',
-                     'H200',
-                     2,
-                     observation_sequence=11,
-                     ordinary_admission_sequence=10)
-    allocation = _allocation(east)
-    location = east.locations[0].to_location()
-    before = _replica(1,
-                      location=location,
-                      is_zero_cost=True,
-                      zero_cost_admission_sequence=10)
-    after = _replica(2,
-                     location=location,
-                     is_zero_cost=True,
-                     zero_cost_admission_sequence=11)
-
-    debits = autoscaler.reserved_fill_ordinary_demand_debits(
-        allocation, [before, after], [])
-
-    # Total sequence 11 can include a peer fill before this observation while
-    # ordinary high-water remains 10. Persisted rows are already reflected in
-    # the observed feed; only same-tick ordinary decisions are debited.
-    assert not debits
-
-
-def test_planned_capacity_and_receipt_driven_rotation_use_configured_unit():
-    autoscaler = _LogicalAccountingAutoscaler('svc',
-                                              _spec(replica_unit='logical'))
-    autoscaler.target_num_replicas = 12
     replicas = [
         _replica(1, planned_capacity=8),
         _replica(2, version=0, planned_capacity=4),
@@ -561,7 +446,7 @@ def test_planned_capacity_and_receipt_driven_rotation_use_configured_unit():
                  planned_capacity=100,
                  status=serve_state.ReplicaStatus.FAILED),
     ]
-    assert autoscaler.reserved_fill_planned_capacity(replicas) == 16
+    assert autoscaler.reserved_fill_materialized_capacity(replicas) == 12
 
     snapshot = _snapshot('east-context', 'uid-east', 'H200', 1)
     autoscaler.collect_reserved_capacity_pools(

@@ -2,16 +2,17 @@
 
 Last updated: 2026-08-21
 
-Status: production qualification is **active but failed**. Helm revision 470
-runs release `1.1.1397` from PR #1623 at
-`39fe1268d7b5bc9c6fa6a3ac6d8c44718d612075`. Service version 64 was elected and
-activated, then entered `FAILED` after a controller child restart generated 45
-demand-zero logical retirements. Forty-four physical worker Pods still survive;
-one additional Pod was independently evicted for node disk pressure. All 45
-retirement rows remain before the irreversible provider-down commit seam, so
-they are restart-recoverable. Kueue and both physical pools are healthy. This
-is a SkyServe controller correctness incident and cannot be ignored or repaired
-by Kueue, a timeout, or a Helm rollback.
+Status: production qualification is **active but failed**. Helm revision 471
+includes the merged PR #1624 retirement-shelter fix at
+`6a3605d7b11ab27eb3cb9006213055616ed781f8`; reserved-fill admission convergence
+is still incomplete. The preceding revision 470 / release `1.1.1397` incident
+from PR #1623 at `39fe1268d7b5bc9c6fa6a3ac6d8c44718d612075`
+caused service version 64 to enter `FAILED` after a controller child restart
+generated 45 demand-zero logical retirements. Forty-four physical worker Pods
+survived; one additional Pod was independently evicted for node disk pressure.
+All 45 retirement rows remained before the irreversible provider-down commit
+seam and were restart-recoverable. Kueue and both physical pools were healthy.
+This was a SkyServe controller correctness incident, not a Kueue condition.
 
 The root cause is a volatile authority gap. The restarted controller had a
 fresh PostgreSQL `AuthenticatedAllocationMap`, but its process-local legacy
@@ -20,6 +21,18 @@ therefore treated fresh zero traffic as a complete target of zero and admitted
 retirement before consuming the durable reserved-fill allocation. A rollback
 does not undo the already persisted logical retirements and can reproduce the
 same cold-start race.
+
+Revision 471 exposed a second controller-ordering defect. At about 04:06 UTC,
+one transiently aligned route/demand report allowed 11 fill intents to be
+accepted: nine H200, one A100, and one A100-80GB. A later current H200
+allocation reported grant 30, free 4, feed 2,
+and 28 represented slots (26 ready plus two pending), but the expected
+two-intent admission did not converge; the one visible replacement row did not
+close that deficit. The authenticated allocation and free physical capacity
+were present. The controller instead read load-balancer demand before fill
+admission and returned when route/report churn made that independent snapshot
+unavailable. This proves the remaining blocker is controller ordering, not GPU
+availability or Kueue admission.
 
 The fix-forward source is under qualification. Every sequenced decision tick
 must derive one frozen retirement shelter from the current authenticated
@@ -94,6 +107,13 @@ The completed system has these invariants:
 - reserved capacity is committed before the paid residual is calculated, so
   compatible reserved capacity suppresses new Spot launches and existing paid
   replicas drain as reserved replicas become healthy;
+- sequenced reserved-fill admission uses only the current authenticated
+  PostgreSQL allocation plus durable row/pending debits and runs before the
+  independent load-balancer demand read. It may commit fill intents only; it
+  cannot publish a target, paid authority, provider effect, or retirement;
+- missing or stale demand remains unknown, never zero: after a no-progress fill
+  admission it still blocks paid launch, target publication, and destructive
+  retirement;
 - controllers and adopters recover exclusively from PostgreSQL. Reserved-fill
   correctness, request observation, and takeover do not open or require an
   RWX/EFS launch log;
@@ -131,9 +151,10 @@ Remaining work, in exact order:
    uncommitted retirement rows from durable evidence, replacing only the
    independently disk-pressure-evicted Pod; do not manually delete a row or
    begin provider teardown.
-4. Fill the 11 currently schedulable compatible GPUs and prove a fresh current
-   allocation is consumed before both scale decisions
-   and the final retirement commit. Publish an allocation successor, advance
+4. Fill every currently schedulable compatible GPU and prove a fresh current
+   allocation is admitted from PostgreSQL before the load-balancer demand read,
+   both paid scale decisions, and the final retirement commit. Publish an
+   allocation successor, advance
    the ordinary-admission high-water, and expire a pool round between planning
    and commit; each must reject teardown and preserve routing.
 5. Canary-uncordon the three empty East nodes, then the loaded East node, and
@@ -1269,10 +1290,11 @@ required for this fix-forward rollout.
 - Publish only a complete service-wide planner input authenticated against the
   current service owner, claim generation, pool rounds, physical identities,
   and exact observations.
-- Use the same autoscaler decision tick for demand, scale-down shelter, and
-  reserved fill, with one reconciliation coordinator and no lost wakeup.
-- Debit ordinary demand and already accepted fill before producing new fill
-  intents.
+- Use one reconciliation coordinator with a single reserved-fill admission
+  site before the independent demand, target, paid, and retirement phases.
+- Debit all already represented service capacity and accepted fill from durable
+  PostgreSQL state before producing new fill intents; never reserve capacity
+  for an ordinary-demand action that has not committed.
 - Count capacity as spent and advance pool rotation only from a validated
   durable commit receipt.
 - Atomically bind every accepted fill row to the exact generic non-pool API
@@ -1400,8 +1422,10 @@ The existing service-wide meanings remain authoritative:
   its fill budget. It does not create ordinary paid demand or weaken any pool,
   service, or admission ceiling.
 - `max_replicas` is a hard service-wide ceiling across versions and pools.
-- Ordinary demand has priority in the service headroom calculation and in the
-  allocation-local pool/card debits.
+- Ordinary zero-cost admission and sequenced fill serialize through the same
+  PostgreSQL admission order. A committed ordinary row consumes service
+  headroom and advances the allocation high-water; speculative demand does not
+  debit a grant. Paid residual is computed only after accepted fill is visible.
 
 `kubernetes.provision_timeout` is not changed by this feature. In particular,
 `-1` may remain the correct choice for preemptible reserved capacity that
@@ -1845,71 +1869,58 @@ The controller takes a short optimistic actuation generation before planning
 and revalidates it before each mutation. An update moves that generation to an
 odd transition value, so stale work cannot publish into the successor runtime.
 
-Once the durable gate is `SEQUENCED_ACTIVE`, the controller enters
-`Autoscaler.sequenced_reserved_fill_planning()`. The existing autoscaler still
-computes ordinary demand, scale-down shelter, and the legacy status projection,
-but it emits no legacy fill launch and does not spend feed or advance rotation.
-A missing or unreadable authenticated map means zero new fill for that pass;
-there is no fallback.
+Once the durable gate is `SEQUENCED_ACTIVE`, the controller first reads the
+current authenticated allocation and row-represented capacity, then invokes the
+single reserved-fill admission site. That provider-free phase can commit only
+durable intents. If it commits any, the controller notifies reconciliation and
+returns so the next pass replans from those PostgreSQL debits before reading
+demand or publishing paid authority. It never invokes a provider path. The
+later demand/planning phase enters
+`Autoscaler.sequenced_reserved_fill_planning()` only to compute demand, target,
+paid residual, and the PostgreSQL-derived retirement shelter; it has no second
+fill-admission site. A missing or unreadable authenticated map means zero new
+fill for that pass; there is no fallback.
 
 `ReservedFillPlanner` is database- and provider-free. From one immutable map it
 computes deterministic, exact pool/card intents after applying:
 
 - service-global `max_replicas` headroom in the configured physical or logical
   capacity unit;
-- ordinary demand debits;
+- all nonterminal row-represented service capacity, without an inferred demand
+  target;
 - durable nonterminal fill rows from the same allocation map; and
 - the last receipt-proven rotation anchor.
 
 Planning mutates no feed, fairness cursor, or replica state. Its deterministic
-idempotency key is correlation and replay-debit evidence; the database-assigned
-replica row and returned receipt remain the commit boundary.
+idempotency key is correlation and replay-debit evidence; the PostgreSQL intent
+and returned receipt are the pre-provider grant boundary.
 
-### 5. Concurrent multi-cluster preflight and commit receipt
+### 5. Atomic intent grant and asynchronous pool dispatch
 
 `SkyPilotReplicaManager.accept_reserved_fill()` validates the typed plan and
-manager/service owner before provider admission. It then acquires one fenced
-provider phase and starts one physical-UID capture thread per distinct
-`(Kubernetes context, physical UID)` pair. Independent contexts initialize in
-parallel. A same-context initializer already in progress returns typed
-backpressure instead of blocking the whole wave. The preflight deadline is 45
-seconds for the whole batch, measured from one shared absolute deadline, and is
-unrelated to `kubernetes.provision_timeout`. Per-context waits and thread joins
-must consume only the remaining batch budget.
+manager/service owner, rereads the exact current allocation under the broker
+serialization lock, and calls the PostgreSQL `grant_plan()` transaction. That
+transaction locks the service and existing intent set, retires expired grants,
+recomputes row plus pending-intent headroom, and persists accepted intents in
+plan order. This call owns no provider phase, physical-cluster read, replica ID,
+API request, or worker thread.
 
-After all distinct-pool preflights report, one manager critical section
-acquires the global demand-capacity reservation lock and revalidates service
-ownership, current version, service-global headroom, pool epochs, observation
-expiry, and physical identities. Intents are admitted in plan order while both
-locks remain held through the existing protocol-v2 replica-row transaction.
-That transaction independently revalidates the ordinary admission generation,
-gate, allocation identity, round provenance, fresh observation, claim topology,
-and owner before assigning the total zero-cost admission sequence. The
-in-process lock order is manager then demand reservation; provider preflight
-holds neither. Inside PostgreSQL, the zero-cost event sequencer is acquired
-before lifecycle/service, round, claim, and replica rows, matching ordinary
-admission and launch-result writers.
+`FillCommitResult` accounts for every planned intent exactly once as accepted
+or deferred. Replaying the same idempotency key returns the existing pending or
+committed intent, and the controller advances rotation only from this durable
+receipt. A changed allocation, owner, version, ceiling, or actuation authority
+fails closed before provider work.
 
-`FillCommitResult` is a bijective receipt that accounts for every planned
-intent exactly once as accepted or deferred. A pool-local identity or preflight
-failure produces a sparse receipt and does not starve healthy independent
-contexts; a service-global owner, version, sequence, headroom, or provider-phase
-failure defers the remaining ordered tail. Each accepted entry names its intent
-hash, durable replica ID, generalized launch association ID, and exact API
-request ID. All four identities were committed in the same admission
-transaction. The controller advances pool rotation only from
-durably accepted rows. If authority remains current while any intent is
-deferred, the controller immediately coalesces another reconciliation pass.
-
-This avoids `N * provision_timeout` cluster initialization. For a 200-intent
-wave across two Kubernetes clusters, the two physical-cluster captures begin in
-parallel, then the manager persists every independently admissible intent and
-returns an exact sparse receipt. Receipt acceptance proves durable replica-row
-admission, not provider completion or readiness. Launch workers and the existing
-request machinery proceed asynchronously. Readiness may still be
-gradual because Kubernetes scheduling, image pulls, setup, model loading, the
-provider phase, and executor capacity are real limits; the feature does not
-claim all 200 become ready at once.
+The existing durable-intent dispatcher subsequently leases each physical pool
+on an independent lane. It performs the bounded physical preflight and then
+uses the shared generalized non-pool transaction to materialize the replica,
+association, executable request, queue/pin, and capacity debit atomically. Only
+that committed materialization can reach the ordinary asynchronous provider
+path. Independent pools therefore progress concurrently, while a busy pool
+cannot delay PostgreSQL admission or another pool's lane. Receipt acceptance
+proves a durable pre-provider intent, not provider completion or readiness;
+Kubernetes scheduling, image pulls, setup, model loading, and executor capacity
+retain their real latencies.
 
 ### 6. BCL reclaim invariant
 
@@ -4005,6 +4016,23 @@ to create zero-cost compute automatically; observing that effect is required.
 
 ## Verification plan and evidence
 
+The reserved-fill ordering source gate uses a fresh authenticated allocation
+with unavailable load-balancer demand. It must accept the exact fill deficit,
+return and notify before attempting the demand read, and invoke no paid,
+target, retirement, scale-up/down, or provider path. A second case with no new
+intent must continue to the unavailable demand read and prove that all paid and
+destructive actuation remains blocked. Source inspection must show exactly one
+sequenced fill-admission call site.
+
+The production rollout gate repeats revision 471's route/report churn while a
+fresh allocation has positive feed. Every granted compatible slot must become
+either a durable intent or a correctly attributed row even when demand is
+temporarily unavailable; replay and controller restart must create no duplicate
+intent. Only after those debits are visible may a fresh demand snapshot publish
+a paid residual. Verify immediately, at +10, +30, and through the complete
+stale/quiescence horizon that no paid claim, provider effect, or retirement was
+authorized by an unknown demand snapshot.
+
 The projected-worker runtime-readiness source gate must prove all of the
 following before merge:
 
@@ -4391,8 +4419,8 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   sequenced-controller selection. Status tests cover exact durable-provenance
   joins, legacy/unavailable shapes, optional diagnostic failure,
   endpoint fail-closed fallback, and service-status propagation.
-- Added tests prove same-tick `target=None` ordinary-demand debit, one shared
-  multi-context preflight deadline, release of observer capacity after a
+- Added tests prove one shared multi-context preflight deadline, release of
+  observer capacity after a
   timed-out Kubernetes query, access-context alias consumption with preserved
   UID/context fences, and alias de-duplication without physical-pool double
   counting.
@@ -4735,6 +4763,11 @@ canary. If it fails, fix the feature or cleanup branch forward; do not reopen
 legacy activation.
 
 ## Open gates
+
+- [ ] Merge and direct-Helm deploy the single pre-demand PostgreSQL fill
+  admission. Reproduce route/report unavailability with positive authenticated
+  feed, prove exact intent convergence with no second admission site, and pass
+  the no-paid/no-provider/no-retirement immediate/+10/+30/full-horizon gates.
 
 - [x] Deploy Serve053 recognition and empty durable-intent recovery as exact
   Helm release `1.1.1377`; prove the controller advances route generations and
