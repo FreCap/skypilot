@@ -60,6 +60,7 @@ import json
 import os
 import pathlib
 import re
+import secrets
 import tempfile
 import threading
 import typing
@@ -116,6 +117,14 @@ logger = sky_logging.init_logger(__name__)
 # is only used by jobs controller tasks to ensure recoveries of the same job
 # use the same config file.
 ENV_VAR_SKYPILOT_CONFIG = f'{constants.SKYPILOT_ENV_VAR_PREFIX}CONFIG'
+ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_KIND = (
+    f'{constants.SKYPILOT_ENV_VAR_PREFIX}SERVER_CONFIG_SNAPSHOT_KIND')
+ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_PATH = (
+    f'{constants.SKYPILOT_ENV_VAR_PREFIX}SERVER_CONFIG_SNAPSHOT_PATH')
+ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_DIGEST = (
+    f'{constants.SKYPILOT_ENV_VAR_PREFIX}SERVER_CONFIG_SNAPSHOT_DIGEST')
+ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_IDENTITY = (
+    f'{constants.SKYPILOT_ENV_VAR_PREFIX}SERVER_CONFIG_SNAPSHOT_IDENTITY')
 
 # Environment variables for setting non-default server and user
 # config files.
@@ -128,6 +137,12 @@ ENV_VAR_PROJECT_CONFIG = f'{constants.SKYPILOT_ENV_VAR_PREFIX}PROJECT_CONFIG'
 ENV_VAR_SERVER_CONFIG_MODE = (
     f'{constants.SKYPILOT_ENV_VAR_PREFIX}SERVER_CONFIG_MODE')
 SERVER_CONFIG_MODE_POSTGRES = 'postgres'
+INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE = 'serve'
+INTERNAL_CONFIG_SNAPSHOT_KIND_MANAGED_JOB = 'managed-job'
+_INTERNAL_CONFIG_SNAPSHOT_KINDS = frozenset({
+    INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE,
+    INTERNAL_CONFIG_SNAPSHOT_KIND_MANAGED_JOB,
+})
 
 # Path to the client config files.
 _GLOBAL_CONFIG_PATH = '~/.sky/config.yaml'
@@ -494,6 +509,37 @@ def get_server_config() -> config_utils.Config:
 
 def _config_value_digest(value: str) -> str:
     return hashlib.sha256(value.encode('utf-8')).hexdigest()
+
+
+def internal_config_snapshot_digest(config_bytes: bytes) -> str:
+    """Return the immutable content identity for an internal child snapshot."""
+    return hashlib.sha256(config_bytes).hexdigest()
+
+
+def internal_config_snapshot_identity(kind: str, path: str, digest: str) -> str:
+    """Bind one server-issued child snapshot to kind, path, and bytes."""
+    if kind not in _INTERNAL_CONFIG_SNAPSHOT_KINDS:
+        raise ValueError(f'Unsupported internal config snapshot kind {kind!r}.')
+    if not path:
+        raise ValueError('Internal config snapshot path must be non-empty.')
+    if re.fullmatch(r'[0-9a-f]{64}', digest) is None:
+        raise ValueError('Invalid internal config snapshot digest.')
+    identity_bytes = b'\x00'.join(
+        (kind.encode('utf-8'), path.encode('utf-8'), digest.encode('ascii')))
+    return hashlib.sha256(identity_bytes).hexdigest()
+
+
+def internal_config_snapshot_environment(kind: str, path: str,
+                                         config_bytes: bytes) -> dict[str, str]:
+    """Build the exact environment receipt for a server-issued snapshot."""
+    digest = internal_config_snapshot_digest(config_bytes)
+    return {
+        ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_KIND: kind,
+        ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_PATH: path,
+        ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_DIGEST: digest,
+        ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_IDENTITY:
+            internal_config_snapshot_identity(kind, path, digest),
+    }
 
 
 def _validate_identity_fields(*, key: str, revision: Any,
@@ -1091,17 +1137,46 @@ def safe_reload_config() -> None:
 
 
 def _guarded_ha_scoped_child_snapshot() -> str | None:
-    """Classify an exact server-owned child that may read SKYPILOT_CONFIG."""
+    """Validate and classify a server-owned child snapshot receipt."""
+    internal_config_path = os.environ.get(ENV_VAR_SKYPILOT_CONFIG)
+    if internal_config_path is None:
+        return None
+    kind: str | None = None
     if os.environ.get(constants.IS_SKYPILOT_SERVE_CONTROLLER) == 'true':
-        return 'serve'
+        kind = INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE
     managed_job_identity = (
         controller_constants.MANAGED_JOB_ID_ENV_VAR,
         controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ID_ENV_VAR,
         controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ATTEMPT_ENV_VAR,
     )
     if all(os.environ.get(name) is not None for name in managed_job_identity):
-        return 'managed-job'
-    return None
+        if kind is not None:
+            raise RuntimeError('A guarded child cannot be both Serve and '
+                               'Managed Jobs.')
+        kind = INTERNAL_CONFIG_SNAPSHOT_KIND_MANAGED_JOB
+    if kind is None:
+        return None
+
+    receipt_kind = os.environ.get(ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_KIND)
+    receipt_path = os.environ.get(ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_PATH)
+    receipt_digest = os.environ.get(ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_DIGEST)
+    receipt_identity = os.environ.get(ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_IDENTITY)
+    if None in (receipt_kind, receipt_path, receipt_digest, receipt_identity):
+        raise RuntimeError(
+            'Guarded child config requires an exact server-issued '
+            'snapshot receipt.')
+    assert receipt_kind is not None
+    assert receipt_path is not None
+    assert receipt_digest is not None
+    assert receipt_identity is not None
+    if receipt_kind != kind or receipt_path != internal_config_path:
+        raise RuntimeError('Guarded child config snapshot scope does not match '
+                           'its server-issued receipt.')
+    expected_identity = internal_config_snapshot_identity(
+        receipt_kind, receipt_path, receipt_digest)
+    if not secrets.compare_digest(receipt_identity, expected_identity):
+        raise RuntimeError('Guarded child config snapshot identity is invalid.')
+    return kind
 
 
 def reload_config() -> None:
@@ -1113,9 +1188,10 @@ def reload_config() -> None:
         # PostgreSQL authority, even if an inherited SKYPILOT_CONFIG happens to
         # be present.  Only server-issued Serve/Managed-Jobs child snapshots
         # retain their explicitly scoped immutable-file semantics until D6.
-        if (internal_config_path is not None and
-                _guarded_ha_scoped_child_snapshot() is not None):
-            _reload_config_from_internal_file(internal_config_path)
+        snapshot_kind = _guarded_ha_scoped_child_snapshot()
+        if internal_config_path is not None and snapshot_kind is not None:
+            _reload_config_from_guarded_child_snapshot(internal_config_path,
+                                                       snapshot_kind)
         else:
             _reload_config_as_server()
         return
@@ -1188,6 +1264,30 @@ def install_internal_config_snapshot(config: config_utils.Config,
     expanded_path = os.path.expanduser(config_path)
     if not os.path.exists(expanded_path):
         raise FileNotFoundError(expanded_path)
+    if (_postgres_server_config_is_authoritative() and
+            os.environ.get(constants.ENV_VAR_IS_SKYPILOT_SERVER) is not None):
+        snapshot_kind: str | None = None
+        if os.environ.get(constants.IS_SKYPILOT_SERVE_CONTROLLER) == 'true':
+            snapshot_kind = INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE
+        managed_job_identity = (
+            controller_constants.MANAGED_JOB_ID_ENV_VAR,
+            controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ID_ENV_VAR,
+            controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ATTEMPT_ENV_VAR,
+        )
+        if all(
+                os.environ.get(name) is not None
+                for name in managed_job_identity):
+            if snapshot_kind is not None:
+                raise RuntimeError('A guarded child cannot be both Serve and '
+                                   'Managed Jobs.')
+            snapshot_kind = INTERNAL_CONFIG_SNAPSHOT_KIND_MANAGED_JOB
+        if snapshot_kind is not None:
+            with open(expanded_path, 'rb') as snapshot_file:
+                snapshot_bytes = snapshot_file.read()
+            os.environ.update(
+                internal_config_snapshot_environment(snapshot_kind,
+                                                     expanded_path,
+                                                     snapshot_bytes))
     os.environ[ENV_VAR_SKYPILOT_CONFIG] = expanded_path
     _replace_config_context(copy.deepcopy(config),
                             expanded_path,
@@ -1233,6 +1333,33 @@ def _reload_config_from_internal_file(internal_config_path: str) -> None:
     _replace_config_context(loaded_config, config_path)
 
 
+def _reload_config_from_guarded_child_snapshot(internal_config_path: str,
+                                               snapshot_kind: str) -> None:
+    """Read one attested child snapshot once and reject path/content drift."""
+    del snapshot_kind  # Kind is bound into the receipt validated by the caller.
+    config_path = os.path.expanduser(internal_config_path)
+    receipt_digest = os.environ.get(ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_DIGEST)
+    if receipt_digest is None:
+        raise RuntimeError('Guarded child config snapshot digest is missing.')
+    try:
+        with open(config_path, 'rb') as snapshot_file:
+            config_bytes = snapshot_file.read()
+    except OSError as e:
+        raise RuntimeError(
+            'Guarded child config snapshot is unavailable.') from e
+    actual_digest = internal_config_snapshot_digest(config_bytes)
+    if not secrets.compare_digest(actual_digest, receipt_digest):
+        raise RuntimeError(
+            'Guarded child config snapshot content does not match '
+            'its server-issued digest.')
+    loaded_config = parse_and_validate_config_bytes(
+        config_bytes,
+        config_path,
+        apply_db_env=False,
+    )
+    _replace_config_context(loaded_config, config_path)
+
+
 def _create_table(engine: sqlalchemy.engine.Engine):
     """Initialize the config database with migrations."""
     migration_utils.safe_alembic_upgrade(
@@ -1261,7 +1388,10 @@ def _lock_postgres_server_config_transaction(session: orm.Session) -> None:
         {'lock_key': _POSTGRES_SERVER_CONFIG_ADVISORY_LOCK_KEY})
 
 
-def initialize_postgres_server_config_authority() -> None:
+def initialize_postgres_server_config_authority(
+    transaction_hook: Callable[[orm.Session, ServerConfigRecord], Any] |
+    None = None,
+) -> None:
     """Seed or verify guarded HA's sole structured config authority.
 
     The chart disallows inline configuration when an external database is
@@ -1313,6 +1443,8 @@ def initialize_postgres_server_config_authority() -> None:
             generation_insert = generation_insert.on_conflict_do_nothing(
                 index_elements=[config_yaml_table.c.key])
             session.execute(generation_insert)
+            if transaction_hook is not None:
+                transaction_hook(session, config_record)
 
     # Validate the retained winner, including the pre-existing-row and
     # verify-only cases.  Validation performs no DML.
@@ -1347,17 +1479,25 @@ def _reload_config_as_server() -> None:
         # A fresh bootstrap has no config table yet.  The migration entrypoint
         # creates it and immediately seeds the authoritative empty row.  Every
         # other role/mode reads PostgreSQL without first touching a file.
-        if migration_utils.configured_migration_mode() == 'bootstrap':
+        migration_mode = migration_utils.configured_migration_mode()
+        if migration_mode == 'bootstrap':
             server_config = config_utils.Config()
         else:
             record = _get_server_config_record_from_db()
             if record is None:
-                raise RuntimeError(
-                    'Guarded HA requires the PostgreSQL api_server_config '
-                    'row. Run the database migration job before starting '
-                    'runtime roles.')
-            server_config = record.config
-            server_config_identity = record.identity
+                if migration_mode == 'upgrade':
+                    # The explicit migration owner seeds a legitimately absent
+                    # schema-001 row after module imports complete. Runtime and
+                    # verify modes must never take this path.
+                    server_config = config_utils.Config()
+                else:
+                    raise RuntimeError(
+                        'Guarded HA requires the PostgreSQL api_server_config '
+                        'row. Run the database migration job before starting '
+                        'runtime roles.')
+            else:
+                server_config = record.config
+                server_config_identity = record.identity
     else:
         server_config_path = _resolve_server_config_path()
         server_config = _get_config_from_path(server_config_path)

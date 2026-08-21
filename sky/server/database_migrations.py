@@ -15,6 +15,7 @@ def initialize_central_databases() -> None:
     from sky.jobs import state_storage
     from sky.physical_capacity import config as capacity_config
     from sky.serve import serve_state
+    from sky.users import permission
 
     # pylint: enable=import-outside-toplevel
     capacity_configuration = capacity_config.load_config()
@@ -22,8 +23,16 @@ def initialize_central_databases() -> None:
     # effective PostgreSQL schema is empty before any companion schema creates
     # objects in it.
     global_engine = global_user_state.initialize_and_get_db()
-    skypilot_config.initialize_and_get_db()
-    skypilot_config.initialize_postgres_server_config_authority()
+    config_engine = skypilot_config.initialize_and_get_db()
+    if skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+        permission.initialize_guarded_workspace_policy_schema(global_engine)
+        if config_engine.url != global_engine.url:
+            raise RuntimeError(
+                'Guarded config and Casbin authorities must use the same '
+                'PostgreSQL database.')
+        skypilot_config.initialize_postgres_server_config_authority(
+            transaction_hook=(
+                permission.reconcile_guarded_workspace_policies_in_session))
     serve_state.get_database_engine()
     state_storage.initialize_and_get_db()
     if os.environ.get('SKYPILOT_API_REQUEST_BACKEND') == 'postgres':

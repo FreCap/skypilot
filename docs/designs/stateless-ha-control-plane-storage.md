@@ -123,18 +123,20 @@ Literal EFS removal is not source-ready. The current seams and missing work are:
 | Upload blobs | Current clients compute a content SHA-256 and send parallel `/upload_v2` chunk requests; request/job rows retain the logical blob ID | `LocalFilesystemBlobStorage` is the only backend; chunks rely on a shared staging directory, existence/GC use paths and mtimes, the server does not verify that bytes match the claimed blob ID, resolve returns a permanent path, and expired `/upload` clients write an uncorrelated mutable per-user tree | PostgreSQL upload sessions, direct conditional S3 multipart publication, verified logical aliases, owner references, scoped materialization, and removal of `/upload` at the S3_V1 boundary |
 | Managed Jobs | DAG, environment, config, and original YAML are stored in PostgreSQL | Legacy disk fallbacks, blob bytes, controller/task logs | Validate retained rows, remove guarded-HA fallbacks, use S3/log provider |
 | Serve | Version YAML, submitted YAML, placement, controller snapshots, and recovery scripts are in PostgreSQL | Up/update staging, controller files, replica launch artifacts, and logs | Transactional admission payload, local reconstruction, S3 logs |
-| Server config | D1 source seeds only in explicit migration mode, validates revision/digest-fenced PostgreSQL rows, resolves central roles directly from PostgreSQL, and atomically commits workspace config, exact Casbin deltas, and permission generation | D1 is not production-activated; non-workspace policy operations and legacy Serve/Managed Jobs child snapshots retain their scoped filesystem locks until D6 | Qualify and deploy D1, then replace the remaining explicitly deferred snapshot and non-workspace policy paths in D6 |
+| Server config | D1 source makes explicit bootstrap/upgrade the only config/Casbin schema and workspace-reconciliation owner, validates revision/digest-fenced PostgreSQL rows, resolves central roles directly from PostgreSQL, atomically commits workspace config, exact Casbin deltas, and permission generation, and requires exact kind/path/digest/identity receipts for scoped child files | D1 is not production-activated; non-workspace policy operations and legacy Serve/Managed Jobs child snapshots retain their scoped filesystem locks until D6 | Complete independent exact-head review and deploy D1, then replace the remaining explicitly deferred snapshot and non-workspace policy paths in D6 |
 | Generated SSH | Generated per-user keypairs and cluster YAML are in PostgreSQL | /root/.ssh is shared; SSH-node-pool uploads use local key paths | Local regeneration; externally supplied keys only from projected Secrets |
 | Caches and scratch | Derivable from durable state | Catalogs, locks, wheels, generated YAML, debug files, and request stages use shared roots | Bounded emptyDir only |
 | Helm | D1 source removes every guarded-HA `skypilot-config` object/reference, config volume/mount, synchronization RBAC rule, and image-worker `SKYPILOT_GLOBAL_CONFIG` environment variable | Every HA role still mounts the general RWX state claim and HA still hard-fails without it | Qualify and deploy D1; D7 produces the PVC-free render with bounded ephemeral storage after D3--D6 remove the remaining runtime consumers |
 
-D1 source qualification exercises the real PostgreSQL migration, retained-row
-precedence, read-only verification, malformed-state rejection, mixed-version
-write rejection, concurrent CAS writers, transaction rollback and post-commit
+D1 source qualification exercises fresh-process real-PostgreSQL upgrades from
+both an absent and retained schema-001 row, exact Casbin reconciliation,
+read-only verification under a PostgreSQL role that rejects writes,
+malformed/drifted-state rejection without repair, mixed-version write
+rejection, concurrent CAS writers, transaction rollback and post-commit
 recovery, workspace authorization fencing, and actual central/child reload
-dispatch. The complete Helm unit suite also renders guarded-HA negative and
-explicit non-HA compatibility cases. Production deployment and runtime proof
-remain open gates.
+dispatch with exact child receipts. The complete Helm unit suite also renders
+guarded-HA negative and explicit non-HA compatibility cases. Production
+deployment and runtime proof remain open gates.
 
 The existing BlobStorage abstraction is path-oriented and has no S3
 implementation. The existing LogProvider abstraction reads local files but
@@ -679,18 +681,26 @@ Database-backed guarded HA already rejects inline Helm config. On a fresh
 schema, only the migration job in explicit bootstrap/upgrade mode inserts one
 validated empty `api_server_config` row with `ON CONFLICT DO NOTHING`; an
 existing row always wins. Verify mode and every runtime role execute no seed
-DML. Canonical central server-config resolution requires PostgreSQL, reads that
-row directly, and fails closed if it is absent or invalid; it never overlays a
-ConfigMap or shared file. Configuration updates lock the canonical PostgreSQL
-config row across the complete read-modify-write, or compare-and-swap its exact
-expected content digest, and commit the new content plus digest atomically. For
-a workspace mutation, that same caller-owned transaction and lock boundary also
-applies the exact Casbin workspace-policy delta and advances the database-backed
-permission-cache generation/invalidation receipt. The config and permission
-repositories accept the caller's PostgreSQL transaction and neither commits
-independently. A stale writer must re-read and retry or return a conflict; it
-cannot overwrite a concurrent update. A failure exposes either the old config,
-policy, and cache generation or the new set, never a mixture.
+DML. A schema-001 upgrade with a legitimately absent row may hold an empty
+in-process value only inside that explicit migration owner until its seed
+transaction runs; verify/runtime never receive that exception. The migration
+owner also creates the Casbin table before the seed transaction, then reconciles
+the exact retained workspace-policy set and initializes/advances its permission
+receipt inside that same transaction. Verify and runtime only inspect the table,
+row, receipt, and exact policy set and fail closed on absence or drift; they do
+not repair them. Canonical central server-config resolution requires
+PostgreSQL, reads that row directly, and fails closed if it is absent or
+invalid; it never overlays a ConfigMap or shared file. Configuration updates
+lock the canonical PostgreSQL config row across the complete read-modify-write,
+or compare-and-swap its exact expected content digest, and commit the new
+content plus digest atomically. For a workspace mutation, that same
+caller-owned transaction and lock boundary also applies the exact Casbin
+workspace-policy delta and advances the database-backed permission-cache
+generation/invalidation receipt. The config and permission repositories accept
+the caller's PostgreSQL transaction and neither commits independently. A stale
+writer must re-read and retry or return a conflict; it cannot overwrite a
+concurrent update. A failure exposes either the old config, policy, and cache
+generation or the new set, never a mixture.
 
 Every current guarded-HA config writer routes through that one repository
 transaction. `update_api_server_config_no_lock` cannot remain a public blind-
@@ -729,9 +739,12 @@ loads the exact snapshot from PostgreSQL, materializes it pod-locally for the
 child lifetime, and may set `SKYPILOT_CONFIG` only to that server-issued path.
 In a central-server context, `reload_config()` ignores file precedence and
 resolves PostgreSQL directly. In a scoped child context, it validates the exact
-snapshot identity before reading the local projection. Tests exercise this real
-dispatch boundary; testing only `get_server_config()` or an effective-config
-helper is insufficient.
+snapshot kind, path, content digest, and bound identity before reading the local
+projection. Those receipt fields use the server-owned environment namespace,
+which request decoding strips from client payloads. A Serve/Managed Jobs marker
+without the complete exact receipt is not child authority and fails closed.
+Tests exercise this real dispatch boundary; testing only `get_server_config()`
+or an effective-config helper is insufficient.
 
 The guarded-HA chart omits the `skypilot-config` ConfigMap itself, every config
 volume and mount from API, controller, executor, and image-worker pods, and the
@@ -1031,8 +1044,12 @@ The dependency graph and minimum clean stack are:
    `get_skypilot_config_lock_path()`; retain and protocol-fence that legacy
    shared lock for Serve snapshots until D6. Exercise actual `reload_config()`
    dispatch so central contexts resolve PostgreSQL while scoped child snapshots
-   retain their explicit version semantics. Route every guarded-HA config writer
-   through the one transaction repository and remove or internalize the blind
+   retain their explicit version semantics. Managed Jobs installs its exact
+   server-owned job identity before reload, ignores receipts copied through the
+   retained environment, and mints a fresh kind/path/content-digest/identity
+   receipt from the restored snapshot; a missing or unreadable snapshot fails
+   the guarded job context closed. Route every guarded-HA config writer through
+   the one transaction repository and remove or internalize the blind
    `update_api_server_config_no_lock` bypass. This is the first bounded source
    PR because it removes one real EFS correctness edge without inventing the
    object protocol. It depends only on D0.

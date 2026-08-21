@@ -47,7 +47,8 @@ def _create_basic_job(tmp_path,
                       *,
                       name: str = 'test-job',
                       store_content: bool = True,
-                      set_paths: bool = False) -> Dict[str, str]:
+                      set_paths: bool = False,
+                      config_content: str | None = None) -> Dict[str, str]:
     dag_path = tmp_path / f'{name}.yaml'
     env_path = tmp_path / f'{name}.env'
     user_yaml_path = tmp_path / f'{name}.user.yaml'
@@ -77,7 +78,7 @@ def _create_basic_job(tmp_path,
                                     dag_content,
                                     user_yaml_content,
                                     env_content,
-                                    config_file_content=None,
+                                    config_file_content=config_content,
                                     priority=100)
 
     if set_paths:
@@ -164,3 +165,44 @@ def test_get_job_dag_content_missing_returns_none(_mock_managed_jobs_db_conn,
     os.remove(job_info['dag_path'])
 
     assert file_content_utils.get_job_dag_content(job_id) is None
+
+
+def test_restore_job_config_returns_exact_database_snapshot(
+        _mock_managed_jobs_db_conn, tmp_path, monkeypatch):
+    config_content = 'active_workspace: research\n'
+    job_info = _create_basic_job(tmp_path,
+                                 name='config-from-db',
+                                 config_content=config_content)
+    config_path = tmp_path / 'restored' / 'config.yaml'
+    monkeypatch.setenv('SKYPILOT_CONFIG', str(config_path))
+
+    restored = file_content_utils.restore_job_config_file(job_info['job_id'])
+
+    assert restored == (str(config_path), config_content.encode('utf-8'))
+    assert config_path.read_bytes() == config_content.encode('utf-8')
+
+
+def test_restore_job_config_returns_exact_legacy_file_snapshot(
+        _mock_managed_jobs_db_conn, tmp_path, monkeypatch):
+    job_info = _create_basic_job(tmp_path,
+                                 name='config-from-file',
+                                 config_content=None)
+    config_path = tmp_path / 'legacy-config.yaml'
+    config_bytes = b'active_workspace: legacy\n'
+    config_path.write_bytes(config_bytes)
+    monkeypatch.setenv('SKYPILOT_CONFIG', str(config_path))
+
+    restored = file_content_utils.restore_job_config_file(job_info['job_id'])
+
+    assert restored == (str(config_path), config_bytes)
+
+
+def test_restore_job_config_missing_snapshot_returns_none(
+        _mock_managed_jobs_db_conn, tmp_path, monkeypatch):
+    job_info = _create_basic_job(tmp_path,
+                                 name='config-missing',
+                                 config_content=None)
+    monkeypatch.setenv('SKYPILOT_CONFIG', str(tmp_path / 'missing-config.yaml'))
+
+    assert file_content_utils.restore_job_config_file(
+        job_info['job_id']) is None

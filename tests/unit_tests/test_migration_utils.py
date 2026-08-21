@@ -16,6 +16,7 @@ from sky.serve import serve_state
 from sky.server import database_migrations
 from sky.server.requests import postgres as request_postgres
 from sky.skylet import constants
+from sky.users import permission
 from sky.utils.db import migration_utils
 
 
@@ -233,6 +234,54 @@ def test_database_migration_initializes_selected_request_store(
     initialize_serve.assert_called_once_with()
     initialize_jobs.assert_called_once_with()
     initialize_requests.assert_called_once_with()
+
+
+def test_guarded_migration_owns_casbin_before_config_reconciliation(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    order: list[str] = []
+    postgres_engine = mock.Mock()
+    postgres_engine.dialect.name = 'postgresql'
+    configuration = mock.Mock(mode=capacity_config.CapacityMode.DISABLED)
+
+    monkeypatch.setattr(global_user_state, 'initialize_and_get_db',
+                        lambda: order.append('global') or postgres_engine)
+    monkeypatch.setattr(skypilot_config, 'initialize_and_get_db',
+                        lambda: order.append('config') or postgres_engine)
+    monkeypatch.setattr(skypilot_config,
+                        '_postgres_server_config_is_authoritative',
+                        lambda: True)
+    monkeypatch.setattr(permission,
+                        'initialize_guarded_workspace_policy_schema',
+                        lambda engine: order.append('casbin_schema'))
+    reconcile = permission.reconcile_guarded_workspace_policies_in_session
+
+    def initialize_authority(*, transaction_hook):
+        assert transaction_hook is reconcile
+        order.append('config_policy_transaction')
+
+    monkeypatch.setattr(skypilot_config,
+                        'initialize_postgres_server_config_authority',
+                        initialize_authority)
+    monkeypatch.setattr(serve_state, 'get_database_engine',
+                        lambda: order.append('serve'))
+    monkeypatch.setattr(state_storage, 'initialize_and_get_db',
+                        lambda: order.append('jobs'))
+    monkeypatch.setattr(capacity_config, 'load_config', lambda: configuration)
+    monkeypatch.setattr(
+        capacity_config, 'validate_runtime_capability',
+        lambda *_args, **_kwargs: order.append('capacity_check'))
+    monkeypatch.setattr(lifecycle_actions_state, 'initialize_and_verify',
+                        lambda: order.append('lifecycle'))
+    monkeypatch.setattr(capacity_state, 'initialize_and_get_db',
+                        lambda: order.append('capacity'))
+    monkeypatch.delenv('SKYPILOT_API_REQUEST_BACKEND', raising=False)
+
+    database_migrations.initialize_central_databases()
+
+    assert order == [
+        'global', 'config', 'casbin_schema', 'config_policy_transaction',
+        'serve', 'jobs', 'lifecycle', 'capacity_check', 'capacity'
+    ]
 
 
 def test_database_migration_initializes_lifecycle_before_capacity_on_postgres(

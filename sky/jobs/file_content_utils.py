@@ -80,8 +80,8 @@ def get_job_env_content(job_id: int) -> str | None:
     return None
 
 
-def restore_job_config_file(job_id: int) -> None:
-    """Restore config file from database if SKYPILOT_CONFIG is set.
+def restore_job_config_file(job_id: int) -> tuple[str, bytes] | None:
+    """Restore and return the exact job config snapshot, when configured.
 
     This reads the config file content from the database and writes it to the
     path specified in the SKYPILOT_CONFIG environment variable. This ensures
@@ -93,11 +93,15 @@ def restore_job_config_file(job_id: int) -> None:
 
     Args:
         job_id: The job ID
+
+    Returns:
+        The unexpanded ``SKYPILOT_CONFIG`` path and exact restored bytes, or
+        ``None`` when no config snapshot is configured or available.
     """
     config_path = os.environ.get(skypilot_config.ENV_VAR_SKYPILOT_CONFIG)
     if not config_path:
         # No config file for this job
-        return
+        return None
 
     file_info = managed_job_state.get_job_file_contents(job_id)
     config_content = file_info['config_file_content']
@@ -109,19 +113,25 @@ def restore_job_config_file(job_id: int) -> None:
         # Config content is in database - restore it
         # Ensure the directory exists
         os.makedirs(os.path.dirname(config_path_expanded), exist_ok=True)
-        # Write the config file
-        with open(config_path_expanded, 'w', encoding='utf-8') as f:
-            f.write(config_content)
+        config_bytes = config_content.encode('utf-8')
+        # Write bytes so the content attested by guarded controllers is
+        # exactly the content later read by reload_config().
+        with open(config_path_expanded, 'wb') as f:
+            f.write(config_bytes)
         logger.info(f'Restored config file for job {job_id} to '
-                    f'{config_path_expanded} ({len(config_content)} bytes)')
+                    f'{config_path_expanded} ({len(config_bytes)} bytes)')
+        return config_path, config_bytes
     elif os.path.exists(config_path_expanded):
         # Backward compatibility: config not in DB but file exists on disk
         # This can happen for jobs submitted before config persistence
         logger.debug(f'Config file for job {job_id} not in database, but '
                      f'found on disk at {config_path_expanded}')
+        with open(config_path_expanded, 'rb') as config_file:
+            return config_path, config_file.read()
     else:
         # Config should exist but doesn't - warn about it
         logger.warning(
             f'SKYPILOT_CONFIG is set to {config_path} but config content not '
             f'found in database or on disk for job {job_id}. The job may fail '
             f'if it relies on custom config settings.')
+        return None

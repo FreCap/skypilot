@@ -256,6 +256,16 @@ def shared_controller_vars_to_fill(
     if local_user_config_path is not None:
         env_vars[
             skypilot_config.ENV_VAR_SKYPILOT_CONFIG] = remote_user_config_path
+        if skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+            snapshot_kind = (
+                skypilot_config.INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE
+                if controller == Controllers.SKY_SERVE_CONTROLLER else
+                skypilot_config.INTERNAL_CONFIG_SNAPSHOT_KIND_MANAGED_JOB)
+            with open(local_user_config_path, 'rb') as config_file:
+                config_bytes = config_file.read()
+            env_vars.update(
+                skypilot_config.internal_config_snapshot_environment(
+                    snapshot_kind, remote_user_config_path, config_bytes))
     vars_to_fill['controller_envs'].update(env_vars)
     return vars_to_fill
 

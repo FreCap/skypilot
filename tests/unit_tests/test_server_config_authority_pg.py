@@ -3,6 +3,9 @@
 
 import concurrent.futures
 import os
+import pathlib
+import subprocess
+import sys
 import threading
 
 import casbin
@@ -11,6 +14,9 @@ import sqlalchemy
 import sqlalchemy_adapter
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
+from sky import global_user_state
+from sky import global_user_state_schema
+from sky import models
 from sky import skypilot_config
 from sky.skylet import constants
 from sky.users import permission as permission_lib
@@ -83,6 +89,109 @@ def _read_workspace_rules(engine) -> set[tuple[str, str, str]]:
                         rule.c.v1.not_like('/%')))}
 
 
+def _prepare_config_schema_001(engine,
+                               value: str | None,
+                               *,
+                               user_ids: tuple[str, ...] = ()) -> None:
+    """Install the exact pre-D1 config schema in an isolated database."""
+    with engine.begin() as connection:
+        connection.exec_driver_sql('DROP SCHEMA public CASCADE')
+        connection.exec_driver_sql('CREATE SCHEMA public')
+        connection.exec_driver_sql('CREATE TABLE config_yaml ('
+                                   'key TEXT PRIMARY KEY, value TEXT)')
+        if value is not None:
+            connection.execute(
+                sqlalchemy.text('INSERT INTO config_yaml(key, value) '
+                                'VALUES (:key, :value)'),
+                {
+                    'key': skypilot_config.API_SERVER_CONFIG_KEY,
+                    'value': value,
+                })
+        connection.exec_driver_sql(
+            'CREATE TABLE alembic_version_sky_config_db ('
+            'version_num VARCHAR(32) NOT NULL)')
+        connection.exec_driver_sql(
+            "INSERT INTO alembic_version_sky_config_db VALUES ('001')")
+    global_user_state_schema.user_table.create(engine)
+    if user_ids:
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(global_user_state_schema.user_table), [{
+                    'id': user_id,
+                    'name': user_id,
+                    'type': models.UserType.SSO.value,
+                } for user_id in user_ids])
+
+
+def _guarded_subprocess_environment(engine, mode: str) -> dict[str, str]:
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    process_env = os.environ.copy()
+    for variable in (
+            skypilot_config.ENV_VAR_SKYPILOT_CONFIG,
+            skypilot_config.ENV_VAR_GLOBAL_CONFIG,
+            skypilot_config.ENV_VAR_PROJECT_CONFIG,
+            constants.IS_SKYPILOT_SERVE_CONTROLLER,
+            controller_constants.MANAGED_JOB_ID_ENV_VAR,
+            controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ID_ENV_VAR,
+            controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ATTEMPT_ENV_VAR,
+            skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_KIND,
+            skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_PATH,
+            skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_DIGEST,
+            skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_IDENTITY,
+    ):
+        process_env.pop(variable, None)
+    process_env.update({
+        skypilot_config.ENV_VAR_SERVER_CONFIG_MODE:
+            skypilot_config.SERVER_CONFIG_MODE_POSTGRES,
+        constants.ENV_VAR_DB_CONNECTION_URI:
+            engine.url.render_as_string(hide_password=False),
+        constants.ENV_VAR_IS_SKYPILOT_SERVER: 'true',
+        constants.ENV_VAR_STATE_DB_MIGRATION_MODE: mode,
+        'PYTHONPATH': os.pathsep.join(
+            filter(None, (str(repo_root), process_env.get('PYTHONPATH')))),
+    })
+    return process_env
+
+
+def _run_guarded_config_process(engine,
+                                mode: str,
+                                *,
+                                read_only: bool = False,
+                                verify_runtime: bool = False):
+    """Run guarded config migration/runtime through a fresh module import."""
+    code = """
+from sky import global_user_state
+from sky import skypilot_config
+from sky.users import permission
+
+engine = skypilot_config.initialize_and_get_db()
+global_user_state._db_manager._engine = engine
+permission.initialize_guarded_workspace_policy_schema(engine)
+skypilot_config.initialize_postgres_server_config_authority(
+    transaction_hook=permission.reconcile_guarded_workspace_policies_in_session)
+"""
+    if verify_runtime:
+        code += """
+global_user_state.initialize_and_get_db = lambda: engine
+permission._enforcer_instance = None
+service = permission.PermissionService()
+service._lazy_initialize()
+"""
+    process_env = _guarded_subprocess_environment(engine, mode)
+    if read_only:
+        prior_options = process_env.get('PGOPTIONS', '')
+        process_env['PGOPTIONS'] = (
+            f'{prior_options} -c default_transaction_read_only=on'.strip())
+    return subprocess.run(
+        [sys.executable, '-c', code],
+        cwd=pathlib.Path(__file__).resolve().parents[2],
+        env=process_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def _permission_service_with_postgres_enforcer(engine):
     adapter = sqlalchemy_adapter.Adapter(engine,
                                          db_class=sqlalchemy_adapter.CasbinRule)
@@ -95,6 +204,179 @@ def _permission_service_with_postgres_enforcer(engine):
 
 def _set_label(config: dict, label: str) -> None:
     config.setdefault('aws', {}).setdefault('labels', {})[label] = 'true'
+
+
+def test_upgrade_process_seeds_absent_schema_001_row_and_permissions(
+        config_store):
+    _prepare_config_schema_001(config_store, None)
+
+    result = _run_guarded_config_process(config_store, 'upgrade')
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    with config_store.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.text('SELECT value, revision, digest FROM config_yaml '
+                            'WHERE key = :key'), {
+                                'key': skypilot_config.API_SERVER_CONFIG_KEY
+                            }).one()
+    assert yaml_utils.read_yaml_str(row.value) == {}
+    assert row.revision == 1
+    assert row.digest == skypilot_config._config_value_digest(row.value)
+    assert _read_workspace_rules(config_store) == {('*', 'default', '*')}
+    receipt = skypilot_config.get_workspace_permission_generation()
+    assert receipt.generation == 1
+    assert receipt.config_identity == skypilot_config.ServerConfigIdentity(
+        revision=row.revision, digest=row.digest)
+
+    # A fresh process executes the actual verify/read path under a PostgreSQL
+    # role that rejects every write. This proves imports, schema inspection,
+    # config verification, and workspace-policy reload are read-only.
+    verify = _run_guarded_config_process(config_store,
+                                         'verify',
+                                         read_only=True,
+                                         verify_runtime=True)
+    assert verify.returncode == 0, verify.stdout + verify.stderr
+
+
+def test_upgrade_process_preserves_retained_schema_001_row_and_reconciles(
+        config_store):
+    retained_value = yaml_utils.dump_yaml_str({
+        'active_workspace': 'team-a',
+        'workspaces': {
+            'team-a': {
+                'private': True,
+                'allowed_users': ['user-a'],
+            },
+        },
+    })
+    _prepare_config_schema_001(config_store,
+                               retained_value,
+                               user_ids=('user-a',))
+
+    result = _run_guarded_config_process(config_store, 'upgrade')
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    with config_store.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.text('SELECT value, revision, digest FROM config_yaml '
+                            'WHERE key = :key'), {
+                                'key': skypilot_config.API_SERVER_CONFIG_KEY
+                            }).one()
+    assert row.value == retained_value
+    assert row.revision == 1
+    assert row.digest == skypilot_config._config_value_digest(retained_value)
+    assert _read_workspace_rules(config_store) == {
+        ('*', 'default', '*'),
+        ('user-a', 'team-a', '*'),
+    }
+    receipt = skypilot_config.get_workspace_permission_generation()
+    assert receipt.generation == 1
+    assert receipt.config_identity == skypilot_config.ServerConfigIdentity(
+        revision=row.revision, digest=row.digest)
+
+
+def test_guarded_workspace_runtime_verification_performs_zero_writes(
+        config_store, monkeypatch):
+    monkeypatch.setattr(global_user_state, 'get_all_users',
+                        lambda: [models.User(id='user-a', name='user-a')])
+    _seed_authority(config_store, {
+        'workspaces': {
+            'team-a': {
+                'private': True,
+                'allowed_users': ['user-a'],
+            },
+        },
+    })
+    monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'upgrade')
+    skypilot_config.initialize_postgres_server_config_authority(
+        transaction_hook=(
+            permission_lib.reconcile_guarded_workspace_policies_in_session))
+    monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'verify')
+    skypilot_config._reload_config_as_server()
+    monkeypatch.setattr(global_user_state, 'initialize_and_get_db',
+                        lambda: config_store)
+    monkeypatch.setattr(permission_lib, '_enforcer_instance', None)
+    writes: list[str] = []
+
+    def record_writes(_conn, _cursor, statement, _parameters, _context,
+                      _executemany):
+        verb = statement.lstrip().split(None, 1)[0].upper()
+        if verb in ('CREATE', 'ALTER', 'DROP', 'INSERT', 'UPDATE', 'DELETE'):
+            writes.append(statement)
+
+    sqlalchemy.event.listen(config_store, 'before_cursor_execute',
+                            record_writes)
+    try:
+        service = permission_lib.PermissionService()
+        service._lazy_initialize()
+    finally:
+        sqlalchemy.event.remove(config_store, 'before_cursor_execute',
+                                record_writes)
+
+    assert not writes
+    assert service.enforcer is not None
+    assert service.enforcer.enforce('user-a', 'team-a', '*')
+
+
+def test_guarded_workspace_runtime_fails_closed_on_drift_without_repair(
+        config_store, monkeypatch):
+    monkeypatch.setattr(global_user_state, 'get_all_users', lambda: [])
+    _seed_authority(config_store, {'workspaces': {'default': {}}})
+    monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'upgrade')
+    skypilot_config.initialize_postgres_server_config_authority(
+        transaction_hook=(
+            permission_lib.reconcile_guarded_workspace_policies_in_session))
+    monkeypatch.setenv(constants.ENV_VAR_STATE_DB_MIGRATION_MODE, 'verify')
+    skypilot_config._reload_config_as_server()
+    rule = sqlalchemy_adapter.CasbinRule.__table__
+    with config_store.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(rule).values(ptype='p',
+                                           v0='rogue-user',
+                                           v1='rogue-workspace',
+                                           v2='*'))
+    monkeypatch.setattr(global_user_state, 'initialize_and_get_db',
+                        lambda: config_store)
+    monkeypatch.setattr(permission_lib, '_enforcer_instance', None)
+    writes: list[str] = []
+
+    def record_writes(_conn, _cursor, statement, _parameters, _context,
+                      _executemany):
+        verb = statement.lstrip().split(None, 1)[0].upper()
+        if verb in ('CREATE', 'ALTER', 'DROP', 'INSERT', 'UPDATE', 'DELETE'):
+            writes.append(statement)
+
+    sqlalchemy.event.listen(config_store, 'before_cursor_execute',
+                            record_writes)
+    try:
+        service = permission_lib.PermissionService()
+        with pytest.raises(RuntimeError, match='does not match'):
+            service._lazy_initialize()
+        assert service.enforcer is None
+        assert permission_lib._enforcer_instance is None
+        # A retry must attest again rather than returning through the
+        # instance-local fast path with the previously rejected policy.
+        with pytest.raises(RuntimeError, match='does not match'):
+            service._lazy_initialize()
+    finally:
+        sqlalchemy.event.remove(config_store, 'before_cursor_execute',
+                                record_writes)
+
+    assert not writes
+    assert ('rogue-user', 'rogue-workspace',
+            '*') in _read_workspace_rules(config_store)
+
+
+def test_guarded_verify_fails_closed_when_casbin_schema_is_missing(
+        config_store):
+    _seed_authority(config_store, {})
+    sqlalchemy_adapter.Base.metadata.drop_all(config_store)
+
+    with pytest.raises(RuntimeError, match='Casbin schema is missing'):
+        permission_lib.initialize_guarded_workspace_policy_schema(config_store)
+
+    assert not sqlalchemy.inspect(config_store).has_table(
+        sqlalchemy_adapter.CasbinRule.__tablename__)
 
 
 def test_two_writers_retry_without_lost_update(config_store, monkeypatch):
@@ -575,6 +857,10 @@ def test_reload_dispatches_central_and_scoped_child_roles(
     assert skypilot_config.get_nested(('active_workspace',), None) == 'postgres'
 
     monkeypatch.setenv(constants.IS_SKYPILOT_SERVE_CONTROLLER, 'true')
+    for name, value in skypilot_config.internal_config_snapshot_environment(
+            skypilot_config.INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE,
+            str(child_path), child_path.read_bytes()).items():
+        monkeypatch.setenv(name, value)
     skypilot_config.reload_config()
     assert skypilot_config.get_nested(('active_workspace',), None) == 'child'
 
@@ -583,6 +869,83 @@ def test_reload_dispatches_central_and_scoped_child_roles(
         controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ID_ENV_VAR, 'slot-1')
     monkeypatch.setenv(
         controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ATTEMPT_ENV_VAR, '1')
+    for name, value in skypilot_config.internal_config_snapshot_environment(
+            skypilot_config.INTERNAL_CONFIG_SNAPSHOT_KIND_MANAGED_JOB,
+            str(child_path), child_path.read_bytes()).items():
+        monkeypatch.setenv(name, value)
+    skypilot_config.reload_config()
+    assert skypilot_config.get_nested(('active_workspace',), None) == 'child'
+
+
+def test_guarded_child_snapshot_fails_closed_without_exact_receipt(
+        config_store, monkeypatch, tmp_path):
+    _seed_authority(config_store, {'active_workspace': 'postgres'})
+    child_path = tmp_path / 'unattested-child.yaml'
+    child_path.write_text('active_workspace: child\n', encoding='utf-8')
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, str(child_path))
+    monkeypatch.setenv(constants.IS_SKYPILOT_SERVE_CONTROLLER, 'true')
+
+    with pytest.raises(RuntimeError, match='server-issued snapshot receipt'):
+        skypilot_config.reload_config()
+
+
+def test_guarded_child_snapshot_fails_closed_on_content_or_scope_drift(
+        config_store, monkeypatch, tmp_path):
+    _seed_authority(config_store, {'active_workspace': 'postgres'})
+    child_path = tmp_path / 'attested-child.yaml'
+    child_path.write_text('active_workspace: child\n', encoding='utf-8')
+    monkeypatch.setenv(skypilot_config.ENV_VAR_SKYPILOT_CONFIG, str(child_path))
+    monkeypatch.setenv(constants.IS_SKYPILOT_SERVE_CONTROLLER, 'true')
+    receipt = skypilot_config.internal_config_snapshot_environment(
+        skypilot_config.INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE, str(child_path),
+        child_path.read_bytes())
+    for name, value in receipt.items():
+        monkeypatch.setenv(name, value)
+
+    child_path.write_text('active_workspace: replaced\n', encoding='utf-8')
+    with pytest.raises(RuntimeError, match='server-issued digest'):
+        skypilot_config.reload_config()
+
+    child_path.write_text('active_workspace: child\n', encoding='utf-8')
+    wrong_path = str(tmp_path / 'other.yaml')
+    wrong_receipt = skypilot_config.internal_config_snapshot_environment(
+        skypilot_config.INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE, wrong_path,
+        child_path.read_bytes())
+    for name, value in wrong_receipt.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(RuntimeError, match='scope does not match'):
+        skypilot_config.reload_config()
+
+
+def test_install_guarded_child_snapshot_reissues_exact_receipt(
+        config_store, monkeypatch, tmp_path):
+    _seed_authority(config_store, {'active_workspace': 'postgres'})
+    child_path = tmp_path / 'installed-child.yaml'
+    child_path.write_text('active_workspace: child\n', encoding='utf-8')
+    monkeypatch.setenv(constants.IS_SKYPILOT_SERVE_CONTROLLER, 'true')
+    for name in (
+            skypilot_config.ENV_VAR_SKYPILOT_CONFIG,
+            skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_KIND,
+            skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_PATH,
+            skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_DIGEST,
+            skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_IDENTITY,
+    ):
+        # Register every process-global mutation with monkeypatch so this
+        # controller-install test cannot leak its child identity to later
+        # server-role tests.
+        monkeypatch.setenv(name, 'test-placeholder')
+    child_config = skypilot_config.parse_and_validate_config_file(
+        str(child_path))
+
+    skypilot_config.install_internal_config_snapshot(child_config,
+                                                     str(child_path))
+
+    expected = skypilot_config.internal_config_snapshot_environment(
+        skypilot_config.INTERNAL_CONFIG_SNAPSHOT_KIND_SERVE, str(child_path),
+        child_path.read_bytes())
+    assert os.environ[skypilot_config.ENV_VAR_SKYPILOT_CONFIG] == str(
+        child_path)
+    assert all(os.environ[name] == value for name, value in expected.items())
     skypilot_config.reload_config()
     assert skypilot_config.get_nested(('active_workspace',), None) == 'child'
 

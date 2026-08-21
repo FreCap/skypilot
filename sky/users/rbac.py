@@ -1,6 +1,9 @@
 """RBAC (Role-Based Access Control) functionality for SkyPilot API Server."""
 
+from collections.abc import Mapping
+import copy
 import enum
+from typing import Any
 
 from sky import sky_logging
 from sky import skypilot_config
@@ -556,7 +559,8 @@ def get_role_permissions(
     return config_permissions
 
 
-def get_workspace_policy_permissions() -> dict[str, list[str]]:
+def get_workspace_policy_permissions(
+    config: Mapping[str, Any] | None = None,) -> dict[str, list[str]]:
     """Get workspace policy permissions from config.
 
     Returns:
@@ -568,8 +572,12 @@ def get_workspace_policy_permissions() -> dict[str, list[str]]:
             'default': ['*']
         }
     """
-    current_workspaces = skypilot_config.get_nested(('workspaces',),
-                                                    default_value={})
+    if config is None:
+        current_workspaces = skypilot_config.get_nested(('workspaces',),
+                                                        default_value={})
+    else:
+        current_workspaces = config.get('workspaces', {})
+    current_workspaces = copy.deepcopy(current_workspaces)
     if constants.SKYPILOT_DEFAULT_WORKSPACE not in current_workspaces:
         current_workspaces[constants.SKYPILOT_DEFAULT_WORKSPACE] = {}
     workspaces_to_policy = {}

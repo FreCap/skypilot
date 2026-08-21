@@ -1,4 +1,7 @@
 """Permission service for SkyPilot API Server."""
+# The guarded config/permission repositories intentionally share internal
+# transaction and receipt primitives; neither exposes them as a public API.
+# pylint: disable=protected-access
 from collections.abc import Generator
 from collections.abc import Mapping
 import contextlib
@@ -13,6 +16,7 @@ import casbin
 from casbin import util as casbin_util
 import filelock
 import sqlalchemy
+from sqlalchemy import orm
 import sqlalchemy_adapter
 
 from sky import global_user_state
@@ -25,6 +29,7 @@ from sky.utils import common
 from sky.utils import common_utils
 from sky.utils.db import db_utils
 from sky.utils.db import kv_cache
+from sky.utils.db import migration_utils
 
 logging.getLogger('casbin.policy').setLevel(sky_logging.ERROR)
 logging.getLogger('casbin.role').setLevel(sky_logging.ERROR)
@@ -43,6 +48,44 @@ _WORKSPACE_PERM_CACHE_PREFIX = 'perm:ws:'
 _WORKSPACE_PERM_CACHE_KEY_SEP = ':'
 # Long TTL as safety net; primary freshness is explicit invalidation on update.
 _WORKSPACE_PERM_CACHE_TTL_SECONDS = 60 * 60  # 1h
+
+
+def initialize_guarded_workspace_policy_schema(
+        engine: sqlalchemy.engine.Engine) -> None:
+    """Create or verify guarded Casbin storage under explicit ownership."""
+    if not skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+        return
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise RuntimeError('Guarded Casbin authority requires PostgreSQL.')
+    migration_mode = migration_utils.configured_migration_mode()
+    if migration_mode in ('bootstrap', 'upgrade'):
+        db_utils.add_all_tables_to_db_sqlalchemy(
+            sqlalchemy_adapter.Base.metadata, engine)
+        return
+    if migration_mode != 'verify':
+        raise RuntimeError('Guarded Casbin schema creation is migration-owned.')
+
+    inspector = sqlalchemy.inspect(engine)
+    if not inspector.has_table(sqlalchemy_adapter.CasbinRule.__tablename__):
+        raise RuntimeError('Guarded Casbin schema is missing; run the database '
+                           'migration job.')
+    observed_columns = {
+        column['name'] for column in inspector.get_columns(
+            sqlalchemy_adapter.CasbinRule.__tablename__)
+    }
+    required_columns = {'id', 'ptype', 'v0', 'v1', 'v2', 'v3', 'v4', 'v5'}
+    if not required_columns.issubset(observed_columns):
+        raise RuntimeError('Guarded Casbin schema is invalid; run the database '
+                           'migration job.')
+
+
+def reconcile_guarded_workspace_policies_in_session(
+        session: orm.Session,
+        config_record: skypilot_config.ServerConfigRecord) -> int:
+    """Install the exact workspace policy set in the config seed transaction."""
+    policies = rbac.get_workspace_policy_permissions(config_record.config)
+    return permission_service.replace_all_workspace_policies_in_session(
+        session, policies, config_record.identity)
 
 
 class PermissionService:
@@ -66,13 +109,22 @@ class PermissionService:
             if self.enforcer is not None:
                 return
             global _enforcer_instance
+            publish_enforcer = False
             if _enforcer_instance is None:
                 engine = global_user_state.initialize_and_get_db()
-                if full_initialize:
+                guarded_ha = skypilot_config._postgres_server_config_is_authoritative(
+                )  # pylint: disable=protected-access
+                if full_initialize and not guarded_ha:
                     db_utils.add_all_tables_to_db_sqlalchemy(
                         sqlalchemy_adapter.Base.metadata, engine)
-                adapter = sqlalchemy_adapter.Adapter(
-                    engine, db_class=sqlalchemy_adapter.CasbinRule)
+                adapter_kwargs = {
+                    'db_class': sqlalchemy_adapter.CasbinRule,
+                }
+                if guarded_ha:
+                    # The migration owner creates and verifies this schema.
+                    # Runtime must not issue schema DDL in guarded HA mode.
+                    adapter_kwargs['create_table'] = False
+                adapter = sqlalchemy_adapter.Adapter(engine, **adapter_kwargs)
                 model_path = os.path.join(os.path.dirname(__file__),
                                           'model.conf')
                 # Use SyncedEnforcer for thread safety. It uses a
@@ -83,27 +135,34 @@ class PermissionService:
                 # concurrent iteration/mutation of RoleManager.all_roles.
                 enforcer = casbin.SyncedEnforcer(model_path, adapter)
                 self.enforcer = enforcer
-                # Only set the enforcer instance once the enforcer
-                # is successfully initialized, if we change it and then fail
-                # we will set it to None and all subsequent calls will fail.
-                _enforcer_instance = self
-                if full_initialize:
-                    with _policy_lock():
-                        self._maybe_initialize_policies()
-                        self._maybe_initialize_basic_auth_user()
+                publish_enforcer = True
             else:
                 assert _enforcer_instance is not None
                 self.enforcer = _enforcer_instance.enforcer
-            # The viewer allowlist is in-process state (not stored in
-            # casbin). It MUST be populated in every process that handles
-            # requests.
-            self._build_viewer_allowlist_no_lock()
-            if skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
-                # Workspace rules deliberately do not participate in the
-                # legacy file-locked initializer above. Reconcile their exact
-                # set under the central PostgreSQL config transaction, then
-                # load and attest that committed generation in this process.
-                self._synchronize_guarded_workspace_policies()
+            try:
+                if publish_enforcer and full_initialize:
+                    with _policy_lock():
+                        self._maybe_initialize_policies()
+                        self._maybe_initialize_basic_auth_user()
+                # The viewer allowlist is in-process state (not stored in
+                # casbin). It MUST be populated in every process that handles
+                # requests.
+                self._build_viewer_allowlist_no_lock()
+                if skypilot_config._postgres_server_config_is_authoritative():  # pylint: disable=protected-access
+                    # Explicit bootstrap/upgrade owns schema and policy
+                    # reconciliation. Runtime roles are read-only here and
+                    # refuse readiness if config, receipt, and exact workspace
+                    # rules drift.
+                    self._verify_guarded_workspace_policy_authority()
+            except Exception:
+                # A failed authority check must not leave a published or
+                # instance-local enforcer that bypasses verification on retry.
+                self.enforcer = None
+                raise
+            if publish_enforcer:
+                # Publish only after every initialization and authority check
+                # succeeds. A later caller must never inherit partial state.
+                _enforcer_instance = self
 
     def _ensure_enforcer(self) -> casbin.SyncedEnforcer:
         """Ensure enforcer is initialized and return it."""
@@ -593,24 +652,27 @@ class PermissionService:
             casbin_rule.c.v1.not_like('/%'),
         )
 
-    def _synchronize_guarded_workspace_policies(self) -> None:
-        """Normalize the full workspace-rule set under the config lock."""
-        generation: int | None = None
-        while True:
-            expected_identity = (
-                skypilot_config.get_loaded_server_config_identity())
-            policies = rbac.get_workspace_policy_permissions()
-            try:
-                with skypilot_config.locked_postgres_server_config_transaction(
-                        expected_identity) as (session, current):
-                    # The exact CAS guarantees ``policies`` came from this row.
-                    generation = self.replace_all_workspace_policies_in_session(
-                        session, policies, current.identity)
-                break
-            except skypilot_config.StaleServerConfigError:
-                skypilot_config.safe_reload_config()
-        assert generation is not None
-        self.reload_workspace_policy_after_commit(generation)
+    def _verify_guarded_workspace_policy_authority(self) -> None:
+        """Read and attest migration-owned workspace state without DDL/DML."""
+        engine = global_user_state.initialize_and_get_db()
+        if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            raise RuntimeError('Guarded Casbin authority requires PostgreSQL.')
+        desired_mapping = rbac.get_workspace_policy_permissions()
+        desired = {(user, workspace_name, '*')
+                   for workspace_name, users in desired_mapping.items()
+                   for user in set(users)}
+        with orm.Session(engine) as session:
+            casbin_rule = sqlalchemy_adapter.CasbinRule.__table__
+            actual = self._workspace_policy_set_in_session(session, casbin_rule)
+            receipt = (
+                skypilot_config._get_workspace_permission_generation_in_session(
+                    session))  # pylint: disable=protected-access
+        self._ensure_config_covers_workspace_receipt(receipt)
+        if actual != desired:
+            raise RuntimeError('Guarded workspace policy authority does not '
+                               'match the PostgreSQL server config; run the '
+                               'database migration job.')
+        self._ensure_workspace_permission_generation_current(force_reload=True)
 
     def replace_all_workspace_policies_in_session(
             self, session, policies: Mapping[str, list[str]],
@@ -625,10 +687,7 @@ class PermissionService:
                 'Transactional workspace policies require PostgreSQL.')
         casbin_rule = sqlalchemy_adapter.CasbinRule.__table__
         predicate = self._workspace_policy_predicate(casbin_rule)
-        existing = {(str(row.v0), str(row.v1), str(row.v2))
-                    for row in session.execute(
-                        sqlalchemy.select(casbin_rule.c.v0, casbin_rule.c.v1,
-                                          casbin_rule.c.v2).where(predicate))}
+        existing = self._workspace_policy_set_in_session(session, casbin_rule)
         desired = {(user, workspace_name, '*')
                    for workspace_name, users in policies.items()
                    for user in set(users)}
@@ -646,6 +705,15 @@ class PermissionService:
                                                       v2=action))
         return skypilot_config.advance_workspace_permission_generation_in_session(
             session, config_identity)
+
+    def _workspace_policy_set_in_session(
+            self, session: orm.Session,
+            casbin_rule) -> set[tuple[str, str, str]]:
+        predicate = self._workspace_policy_predicate(casbin_rule)
+        return {(str(row.v0), str(row.v1), str(row.v2))
+                for row in session.execute(
+                    sqlalchemy.select(casbin_rule.c.v0, casbin_rule.c.v1,
+                                      casbin_rule.c.v2).where(predicate))}
 
     def replace_workspace_policies_in_session(
             self, session, policies: Mapping[str, list[str] | None],
