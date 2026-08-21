@@ -550,7 +550,7 @@ def test_pre_serve054_controller_cannot_adopt_head(proof_engine, monkeypatch):
     prior_revisions = frozenset(
         revision for revision in
         placement_normalization_authority.RECOGNIZED_ADDITIVE_REVISIONS
-        if revision not in ('054', '055'))
+        if int(revision) < 54)
     monkeypatch.setattr(placement_normalization_authority,
                         'RECOGNIZED_ADDITIVE_REVISIONS', prior_revisions)
     with proof_engine.connect() as connection:
@@ -871,8 +871,8 @@ def test_disposable_boundary_kills_stalled_proof_family(proof_engine):
         elapsed = time.monotonic() - started
         assert future.boundary_result is not None
         assert future.boundary_result.family_drained
-        assert (future.boundary_result.outcome.kind
-                is request_process.InvocationOutcomeKind.FAILED)
+        assert (future.boundary_result.outcome.kind is
+                request_process.InvocationOutcomeKind.FAILED)
     finally:
         executor.shutdown()
 
