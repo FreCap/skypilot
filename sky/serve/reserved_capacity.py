@@ -53,6 +53,7 @@ from sky.serve import reserved_fill_projection_authority
 from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import serve_state
 from sky.serve import spot_placer as spot_placer_lib
+from sky.server.requests import process as request_process
 from sky.utils import common_utils
 from sky.utils import locks
 
@@ -63,6 +64,12 @@ if typing.TYPE_CHECKING:
 logger = sky_logging.init_logger(__name__)
 
 ReservedFillLaunchFenceError = exceptions.ReservedFillLaunchFenceError
+
+# Provider SDK calls are not guaranteed to honor Python thread cancellation.
+# Leave enough time after the provider deadline for the disposable invocation
+# guardian to kill and reap the complete process family before another renewal
+# may begin.
+_RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS = 10.0
 
 
 def raise_protocol_v2_materialized_launch_error(error: Exception, *,
@@ -2406,6 +2413,8 @@ def _broker_cycle_v2(
     allocation_repository: (
         reserved_fill_allocation.ReservedFillAllocationRepository |
         None) = None,
+    claim_authorization_executor: request_process.DisposableExecutor |
+    None = None,
 ) -> None:
     """Publish and consume one atomic protocol-v2 multi-pool heartbeat."""
     reconciliation_gate = None
@@ -2595,7 +2604,8 @@ def _broker_cycle_v2(
         utilization_state=utilization_state,
         edges=edges,
         expected_service_hash=expected_service_hash,
-        expected_controller_owner=expected_controller_owner)
+        expected_controller_owner=expected_controller_owner,
+        claim_authorization_executor=claim_authorization_executor)
     if generation is None:
         autoscaler.collect_reserved_capacity_pools({})
         logger.info('Reserved-fill broker: complete claim-set heartbeat was '
@@ -2838,6 +2848,119 @@ def _poller_fixed_rate_deadline(previous_deadline: float, now: float,
     return now if candidate <= now else candidate
 
 
+def renew_reclaim_provider_proofs_once(
+        deadline_monotonic: float | None = None) -> bool:
+    """Renew the current sequenced gate's provider facts, if active."""
+    if deadline_monotonic is None:
+        deadline_monotonic = (time.monotonic() +
+                              reserved_fill_reclaim_attestation.
+                              PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
+    repository = pool_capacity_observation.PoolCapacityObservationRepository()
+    gate = repository.read_reconciliation_gate()
+    if not gate.sequenced_active:
+        return False
+    identity = gate.reclaim_policy_identity
+    if identity is None:
+        raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
+            'Sequenced reclaim-proof renewal has no durable policy identity.')
+    policy = reserved_fill_reclaim_attestation.require_unique_policy()
+    reserved_fill_reclaim_attestation.require_exact_policy_identity(
+        policy, identity)
+    observed_fresh_publication = policy.renew_provider_proofs(
+        expected_identity=identity,
+        expected_gate_generation=gate.generation,
+        deadline_monotonic=deadline_monotonic)
+    if type(observed_fresh_publication) is not bool:
+        raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
+            'Reclaim-provider renewal returned an untyped publication result.')
+    reserved_fill_reclaim_attestation.require_policy_operation_completed(
+        deadline_monotonic)
+    return observed_fresh_publication
+
+
+def _renew_reclaim_provider_proofs_in_boundary(
+        executor: request_process.DisposableExecutor) -> bool:
+    """Run one refresh behind an authenticated process-family drain proof."""
+    deadline = (
+        time.monotonic() +
+        reserved_fill_reclaim_attestation.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS
+    )
+    future = executor.submit(renew_reclaim_provider_proofs_once, deadline)
+    try:
+        return bool(future.result(timeout=max(0.0, deadline -
+                                              time.monotonic())))
+    except concurrent.futures.TimeoutError as timeout_error:
+        # Do not start another proof while an uncooperative SDK call could
+        # still publish. The guardian must first prove the complete invocation
+        # family absent.
+        if not future.done():
+            future.request_cancel()
+            try:
+                future.result(
+                    timeout=_RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
+            except concurrent.futures.TimeoutError as drain_error:
+                if not future.done():
+                    boundary_error = request_process.BoundaryExecutionError(
+                        'Reclaim-provider refresh timed out without a '
+                        'process-family drain result.')
+                    boundary_error.__cause__ = drain_error
+                    ambiguity = request_process.AmbiguousBoundaryError(
+                        'Reclaim-provider refresh cannot prove its process '
+                        'family absent after cancellation.')
+                    ambiguity.__cause__ = boundary_error
+                    # A second provider reader cannot start while the first
+                    # family is unproved. Poisoning invokes the controller
+                    # fail-stop callback synchronously and makes this executor
+                    # permanently unavailable.
+                    executor._poison(  # pylint: disable=protected-access
+                        ambiguity)
+                    raise ambiguity from boundary_error
+            except Exception:  # pylint: disable=broad-except
+                # Cancellation or the handler's original failure is expected
+                # once the authenticated result proves the family absent.
+                pass
+        raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
+            'Reclaim-provider refresh exceeded its bounded process '
+            'lifetime.') from timeout_error
+
+
+def reclaim_provider_proof_renewer_loop(
+    *,
+    stop_event: threading.Event,
+    is_enabled: Callable[[], bool],
+    notify_fresh: Callable[[], Any] | None = None,
+    on_ambiguous_boundary: Callable[[request_process.AmbiguousBoundaryError],
+                                    None] | None = None,
+) -> None:
+    """Supervise proactive PostgreSQL receipt publication for one controller."""
+    executor = request_process.DisposableExecutor(
+        max_workers=1, on_ambiguous_boundary=on_ambiguous_boundary)
+    try:
+        while not stop_event.is_set():
+            if is_enabled():
+                try:
+                    renewed = _renew_reclaim_provider_proofs_in_boundary(
+                        executor)
+                    if renewed and notify_fresh is not None:
+                        notify_fresh()
+                except (request_process.AmbiguousBoundaryError,
+                        request_process.BoundaryShutdownPendingError):
+                    # Missing family-lifetime proof poisons this observer. Let
+                    # the outer thread supervisor replace the complete loop
+                    # instead of continuing with overlapping provider readers.
+                    raise
+                except Exception as error:  # pylint: disable=broad-except
+                    logger.error('Reserved-fill reclaim-proof renewal failed '
+                                 'closed: '
+                                 f'{common_utils.format_exception(error)}')
+            if stop_event.wait(reserved_fill_reclaim_attestation.
+                               PROVIDER_PROOF_RENEW_INTERVAL_SECONDS):
+                return
+    finally:
+        executor.shutdown(
+            timeout=_RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
+
+
 def poller_loop(
     get_autoscaler: Callable[[], 'autoscalers.Autoscaler'],
     get_spot_placer: Callable[[], Optional['spot_placer_lib.SpotPlacer']],
@@ -2849,6 +2972,9 @@ def poller_loop(
     get_actuation_generation: Callable[[], int] | None = None,
     actuation_generation_is_current: Callable[[int], bool] | None = None,
     notify_reconcile: Callable[[], Any] | None = None,
+    wake_event: threading.Event | None = None,
+    on_ambiguous_boundary: Callable[[request_process.AmbiguousBoundaryError],
+                                    None] | None = None,
 ) -> None:
     """Observe at fixed rate and reconcile committed capacity evidence.
 
@@ -2879,8 +3005,12 @@ def poller_loop(
     observation_repository = None
     allocation_repository = None
     observation_worker = None
+    claim_authorization_executor = (request_process.DisposableExecutor(
+        max_workers=1, on_ambiguous_boundary=on_ambiguous_boundary)
+                                    if service_name is not None else None)
     last_resolved_specs: tuple[FillPoolSpec, ...] = ()
     deadline = time.monotonic()
+    scheduled_cycle = True
     try:
         while stop_event is None or not stop_event.is_set():
             # The fallback holds the historical broad lock only for callers
@@ -3022,7 +3152,9 @@ def poller_loop(
                                             observation_repository=(
                                                 observation_repository),
                                             allocation_repository=(
-                                                allocation_repository))
+                                                allocation_repository),
+                                            claim_authorization_executor=(
+                                                claim_authorization_executor))
                                         did_reconcile = True
                                     else:
                                         logger.info(
@@ -3035,10 +3167,15 @@ def poller_loop(
                                   reserved_capacity_broker.PROTOCOL_V2):
                                 # Transition-only fallback for direct callers
                                 # without generation fencing.
-                                _broker_cycle_v2(autoscaler, placer,
-                                                 service_name, zero_cost,
-                                                 expected_service_hash,
-                                                 expected_controller_owner)
+                                _broker_cycle_v2(
+                                    autoscaler,
+                                    placer,
+                                    service_name,
+                                    zero_cost,
+                                    expected_service_hash,
+                                    expected_controller_owner,
+                                    claim_authorization_executor=(
+                                        claim_authorization_executor))
                                 did_reconcile = True
                             else:
                                 _broker_cycle(autoscaler, placer, service_name,
@@ -3072,18 +3209,42 @@ def poller_loop(
 
                     if did_reconcile and notify_reconcile is not None:
                         notify_reconcile()
+                except (request_process.AmbiguousBoundaryError,
+                        request_process.BoundaryShutdownPendingError):
+                    raise
                 except Exception as error:  # pylint: disable=broad-except
                     logger.error('Error in reserved-capacity poller: '
                                  f'{common_utils.format_exception(error)}')
 
             interval = poll_interval_seconds()
             now = time.monotonic()
-            deadline = _poller_fixed_rate_deadline(deadline, now, interval)
+            if scheduled_cycle:
+                deadline = _poller_fixed_rate_deadline(deadline, now, interval)
             delay = max(0.0, deadline - now)
-            if stop_event is None:
-                time.sleep(delay)
-            elif stop_event.wait(delay):
-                return
+            if wake_event is None:
+                if stop_event is None:
+                    time.sleep(delay)
+                elif stop_event.wait(delay):
+                    return
+                scheduled_cycle = True
+            else:
+                while True:
+                    if stop_event is not None and stop_event.is_set():
+                        return
+                    delay = max(0.0, deadline - time.monotonic())
+                    if delay <= 0:
+                        scheduled_cycle = True
+                        break
+                    wait_slice = min(delay, 0.25)
+                    if wake_event.wait(wait_slice):
+                        wake_event.clear()
+                        # Renewal wakeups add observations; they never advance
+                        # the next fixed-rate tick or the withdrawal horizon.
+                        scheduled_cycle = False
+                        break
     finally:
         if observation_worker is not None:
             observation_worker.close()
+        if claim_authorization_executor is not None:
+            claim_authorization_executor.shutdown(
+                timeout=_RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS)

@@ -22,6 +22,7 @@ import sqlalchemy
 from sqlalchemy.dialects import postgresql
 
 from sky.adaptors import common as adaptors_common
+from sky.serve import pool_capacity_observation_schema as observation_schema
 from sky.serve import reserved_fill_reclaim_attestation as reclaim
 from sky.serve import reserved_fill_reclaim_proof_schema as proof_schema
 from sky.utils.db import db_utils
@@ -84,11 +85,34 @@ class ReclaimProviderProofReceipt:
     proof_payload: dict[str, Any]
     completed_at: datetime.datetime
     database_now: datetime.datetime
+    # Local observation only; it is deliberately absent from PostgreSQL and
+    # the signed proof payload.  Consumers use it to wake reconciliation after
+    # this call either committed a renewal or waited for another owner to do
+    # so.  Merely reading an already-fresh receipt leaves it false.
+    publication_observed: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.publication_observed) is not bool:
+            raise ValueError('publication_observed must be bool.')
 
     @property
     def is_fresh(self) -> bool:
         age = (self.database_now - self.completed_at).total_seconds()
-        return age < reclaim.AUTHORIZATION_MAX_AGE_SECONDS
+        return age < reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS
+
+    def has_remaining(self, minimum_remaining_seconds: float) -> bool:
+        """Whether the provider fact has a conservative remaining horizon."""
+        if (isinstance(minimum_remaining_seconds, bool) or
+                not isinstance(minimum_remaining_seconds, (int, float)) or
+                not math.isfinite(float(minimum_remaining_seconds)) or
+                minimum_remaining_seconds < 0 or minimum_remaining_seconds
+                >= reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS):
+            raise ValueError('minimum_remaining_seconds must be finite and '
+                             'within the provider-proof freshness horizon.')
+        age = time.monotonic() - self.reference.completed_monotonic
+        maximum_age = (reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS -
+                       float(minimum_remaining_seconds))
+        return 0 <= age < maximum_age
 
     @property
     def has_terminal_guard_reserve(self) -> bool:
@@ -97,9 +121,8 @@ class ReclaimProviderProofReceipt:
         # the database read that produced this receipt.  Unlike database_now,
         # this live comparison includes payload validation, transaction close,
         # physical connection close, and every other local handoff delay.
-        age = time.monotonic() - self.reference.completed_monotonic
-        return 0 <= age < (reclaim.AUTHORIZATION_MAX_AGE_SECONDS -
-                           reclaim.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS)
+        return self.has_remaining(
+            reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS)
 
 
 def _require_deadline(deadline_monotonic: float) -> float:
@@ -344,13 +367,25 @@ class ReclaimProviderProofRepository:
             table.c.kubernetes_context == kubernetes_context).subquery()
         anchor = sqlalchemy.select(
             sqlalchemy.literal(1).label('_anchor')).subquery()
+        gate = observation_schema.protocol_state_sequence_table
+        gate_holds = sqlalchemy.exists(
+            sqlalchemy.select(sqlalchemy.literal(1)).select_from(gate).where(
+                gate.c.id == 1, gate.c.protocol_version == 2,
+                gate.c.reconciliation_gate_state ==
+                observation_schema.SEQUENCED_ACTIVE,
+                gate.c.reconciliation_gate_generation == gate_generation,
+                gate.c.reclaim_fleet_bundle_sha256 ==
+                identity.fleet_bundle_sha256,
+                gate.c.reclaim_policy_revision == identity.policy_revision,
+                gate.c.reclaim_provider_inventory_sha256 ==
+                identity.provider_inventory_sha256)).label('_gate_holds')
         # The anchor preserves one database-clock row on a miss; multiple
         # exact-authority rows remain multiple results and fail closed.
         return sqlalchemy.select(
             *(candidates.c[column.name] for column in table.columns),
-            sqlalchemy.func.clock_timestamp().label(
-                '_database_now')).select_from(
-                    anchor.outerjoin(candidates, sqlalchemy.true()))
+            sqlalchemy.func.clock_timestamp().label('_database_now'),
+            gate_holds).select_from(
+                anchor.outerjoin(candidates, sqlalchemy.true()))
 
     def _decode_query_row(
         self,
@@ -367,6 +402,9 @@ class ReclaimProviderProofRepository:
                 'The provider proof read returned no database clock.')
         database_now = _require_database_time(row.get('_database_now'),
                                               'Database clock')
+        if row.get('_gate_holds') is not True:
+            raise ReclaimProviderProofError(
+                'The provider proof authority is not the live sequenced gate.')
         round_trip = local_read_finished - local_read_started
         if not math.isfinite(round_trip) or round_trip < 0:
             raise _ReclaimProviderProofClockError(
@@ -387,6 +425,31 @@ class ReclaimProviderProofRepository:
         except ReclaimProviderProofError:
             return None, database_now
         return receipt, database_now
+
+    @staticmethod
+    def _lock_live_gate(
+        connection: sqlalchemy.engine.Connection,
+        *,
+        identity: reclaim.ReclaimPolicyIdentity,
+        gate_generation: int,
+    ) -> None:
+        """Fence publication to the exact live gate until transaction end."""
+        gate = observation_schema.protocol_state_sequence_table
+        row = connection.execute(
+            sqlalchemy.select(gate.c.id).where(
+                gate.c.id == 1, gate.c.protocol_version == 2,
+                gate.c.reconciliation_gate_state ==
+                observation_schema.SEQUENCED_ACTIVE,
+                gate.c.reconciliation_gate_generation == gate_generation,
+                gate.c.reclaim_fleet_bundle_sha256 ==
+                identity.fleet_bundle_sha256,
+                gate.c.reclaim_policy_revision == identity.policy_revision,
+                gate.c.reclaim_provider_inventory_sha256 ==
+                identity.provider_inventory_sha256).with_for_update(
+                    read=True)).one_or_none()
+        if row is None:
+            raise ReclaimProviderProofError(
+                'The provider proof authority lost its live gate fence.')
 
     def _read(
         self,
@@ -448,6 +511,12 @@ class ReclaimProviderProofRepository:
         deadline: float,
     ) -> ReclaimProviderProofReceipt:
         table = (proof_schema.serve_reserved_fill_reclaim_provider_proofs_table)
+        # Hold the current protocol row in share mode across publication. A
+        # reauthorization cannot advance the gate between this predicate and
+        # commit, and an obsolete observer cannot refresh its old generation.
+        self._lock_live_gate(connection,
+                             identity=identity,
+                             gate_generation=gate_generation)
         receipt_nonce = secrets.token_hex(32)
         values = {
             'receipt_nonce': receipt_nonce,
@@ -485,7 +554,8 @@ class ReclaimProviderProofRepository:
                 'completed_at': insert.excluded.completed_at,
             }).returning(
                 table,
-                sqlalchemy.func.clock_timestamp().label('_database_now'))
+                sqlalchemy.func.clock_timestamp().label('_database_now'),
+                sqlalchemy.literal(True).label('_gate_holds'))
 
         # Decode and verify RETURNING before commit. Any clock, digest, payload,
         # nonce, or authority uncertainty rolls back together with the exact
@@ -518,6 +588,29 @@ class ReclaimProviderProofRepository:
         """Commit through a narrow acknowledgement-ambiguity test seam."""
         transaction.commit()
 
+    def _invalidate_exact_authority(
+        self,
+        connection: sqlalchemy.engine.Connection,
+        *,
+        identity: reclaim.ReclaimPolicyIdentity,
+        gate_generation: int,
+        kubernetes_context: str,
+    ) -> None:
+        """Delete a positive receipt after observed nonconformance."""
+        self._lock_live_gate(connection,
+                             identity=identity,
+                             gate_generation=gate_generation)
+        table = proof_schema.serve_reserved_fill_reclaim_provider_proofs_table
+        connection.execute(
+            sqlalchemy.delete(table).where(
+                table.c.reconciliation_gate_generation == gate_generation,
+                table.c.reclaim_fleet_bundle_sha256 ==
+                identity.fleet_bundle_sha256,
+                table.c.reclaim_policy_revision == identity.policy_revision,
+                table.c.reclaim_provider_inventory_sha256 ==
+                identity.provider_inventory_sha256,
+                table.c.kubernetes_context == kubernetes_context))
+
     def _wait_for_published_receipt(
         self,
         *,
@@ -526,6 +619,7 @@ class ReclaimProviderProofRepository:
         kubernetes_context: str,
         deadline: float,
         validate: Callable[[Mapping[str, Any]], bool],
+        minimum_remaining_seconds: float,
     ) -> ReclaimProviderProofReceipt:
         """Wait locally for one owner; never enter a lock-handoff convoy."""
 
@@ -560,9 +654,9 @@ class ReclaimProviderProofRepository:
             _remaining_wait()
             if (waiting is not None and self._payload_is_accepted(
                     waiting.proof_payload, validate) and
-                    waiting.has_terminal_guard_reserve):
+                    waiting.has_remaining(minimum_remaining_seconds)):
                 _remaining_wait()
-                return waiting
+                return dataclasses.replace(waiting, publication_observed=True)
             poll_seconds = min(_RECEIPT_POLL_MAX_SECONDS, poll_seconds * 2)
 
     def _read_elect_and_maybe_publish(
@@ -574,6 +668,7 @@ class ReclaimProviderProofRepository:
         deadline: float,
         prove: Callable[[], ReclaimProviderProofCandidate],
         validate: Callable[[Mapping[str, Any]], bool],
+        minimum_remaining_seconds: float,
     ) -> ReclaimProviderProofReceipt | None:
         """Use one transaction for exact read, election, and publication."""
         _require_deadline(deadline)
@@ -590,7 +685,7 @@ class ReclaimProviderProofRepository:
                     connection=connection)
                 if (receipt is not None and self._payload_is_accepted(
                         receipt.proof_payload, validate) and
-                        receipt.has_terminal_guard_reserve):
+                        receipt.has_remaining(minimum_remaining_seconds)):
                     selected = receipt
                 else:
                     _require_deadline(deadline)
@@ -631,12 +726,29 @@ class ReclaimProviderProofRepository:
                             connection=connection)
                         if (existing is not None and self._payload_is_accepted(
                                 existing.proof_payload, validate) and
-                                existing.has_terminal_guard_reserve):
-                            selected = existing
+                                existing.has_remaining(
+                                    minimum_remaining_seconds)):
+                            # The first read could not use this authority and
+                            # the post-election reread can. Freshness cannot
+                            # improve with elapsed time, so a committed
+                            # publication was observed between the two reads.
+                            selected = dataclasses.replace(
+                                existing, publication_observed=True)
                         else:
                             provider_deadline = provider_proof_deadline(
                                 deadline)
-                            candidate = prove()
+                            try:
+                                candidate = prove()
+                            except reclaim.ReclaimProviderNonconformanceError as error:
+                                self._invalidate_exact_authority(
+                                    connection,
+                                    identity=identity,
+                                    gate_generation=gate_generation,
+                                    kubernetes_context=kubernetes_context)
+                                # The deletion is the fail-closed publication
+                                # of this completed negative observation.
+                                self._commit(transaction)
+                                raise error
                             proof_returned = time.monotonic()
                             if proof_returned >= provider_deadline:
                                 raise ReclaimProviderProofError(
@@ -687,9 +799,35 @@ class ReclaimProviderProofRepository:
         # Authorization is possible only after commit/rollback released the
         # transaction lock and NullPool physically closed the backend.
         _require_deadline(deadline)
+        if publish and selected is not None:
+            selected = dataclasses.replace(selected, publication_observed=True)
         return selected
 
-    def get_or_prove(
+    def get_fresh(
+        self,
+        *,
+        identity: reclaim.ReclaimPolicyIdentity,
+        gate_generation: int,
+        kubernetes_context: str,
+        deadline_monotonic: float,
+        validate: Callable[[Mapping[str, Any]], bool],
+        minimum_remaining_seconds: float,
+    ) -> ReclaimProviderProofReceipt:
+        """Read one exact positive receipt without performing provider I/O."""
+        deadline = _require_deadline(deadline_monotonic)
+        receipt, _, _ = self._read(identity=identity,
+                                   gate_generation=gate_generation,
+                                   kubernetes_context=kubernetes_context,
+                                   deadline=deadline)
+        _require_deadline(deadline)
+        if (receipt is None or
+                not self._payload_is_accepted(receipt.proof_payload, validate)
+                or not receipt.has_remaining(minimum_remaining_seconds)):
+            raise ReclaimProviderProofError(
+                'No fresh exact provider-proof receipt is available.')
+        return receipt
+
+    def renew(
         self,
         *,
         identity: reclaim.ReclaimPolicyIdentity,
@@ -698,14 +836,17 @@ class ReclaimProviderProofRepository:
         deadline_monotonic: float,
         prove: Callable[[], ReclaimProviderProofCandidate],
         validate: Callable[[Mapping[str, Any]], bool],
+        minimum_remaining_seconds: float = (
+            reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS),
     ) -> ReclaimProviderProofReceipt:
-        """Read a fresh receipt or publish one proof under exact authority."""
+        """Proactively renew one receipt under exact durable authority."""
         deadline = _require_deadline(deadline_monotonic)
         initial_remaining = deadline - time.monotonic()
         initial_jitter = min(_INITIAL_JITTER_MAX_SECONDS,
                              initial_remaining / 10)
         if initial_jitter > 0:
             time.sleep(initial_jitter * secrets.randbelow(1024) / 1024)
+        publication_observed = False
         while True:
             selected = self._read_elect_and_maybe_publish(
                 identity=identity,
@@ -713,7 +854,8 @@ class ReclaimProviderProofRepository:
                 kubernetes_context=kubernetes_context,
                 deadline=deadline,
                 prove=prove,
-                validate=validate)
+                validate=validate,
+                minimum_remaining_seconds=minimum_remaining_seconds)
             _require_deadline(deadline)
             if selected is None:
                 # A loser does not reacquire while the elected owner is still
@@ -724,13 +866,19 @@ class ReclaimProviderProofRepository:
                     gate_generation=gate_generation,
                     kubernetes_context=kubernetes_context,
                     deadline=deadline,
-                    validate=validate)
+                    validate=validate,
+                    minimum_remaining_seconds=minimum_remaining_seconds)
                 _require_deadline(deadline)
+            publication_observed = (publication_observed or
+                                    selected.publication_observed)
             # This is the actual handoff boundary: validation and every
             # commit/rollback/physical-close delay have already elapsed. If
             # they consumed the reserve, re-enter election under the original
             # deadline and never expose the near-expiry receipt.
-            if selected.has_terminal_guard_reserve:
+            if selected.has_remaining(minimum_remaining_seconds):
+                if (publication_observed and not selected.publication_observed):
+                    selected = dataclasses.replace(selected,
+                                                   publication_observed=True)
                 return selected
 
 
@@ -760,19 +908,32 @@ def provider_proof_reference_holds_in_connection(
     # visible and therefore orders this guard before that transition. A row
     # lock would add false failures without protecting the later provider
     # effect, because this transaction ends before that effect starts.
+    gate = observation_schema.protocol_state_sequence_table
     row = connection.execute(
         sqlalchemy.select(
             table,
-            sqlalchemy.func.clock_timestamp().label('_database_now')).where(
-                table.c.receipt_nonce ==
-                reference.receipt_nonce)).mappings().one_or_none()
+            sqlalchemy.func.clock_timestamp().label('_database_now')).
+        select_from(table.join(gate, gate.c.id == 1)).where(
+            table.c.receipt_nonce == reference.receipt_nonce,
+            gate.c.protocol_version == 2, gate.c.reconciliation_gate_state ==
+            observation_schema.SEQUENCED_ACTIVE,
+            gate.c.reconciliation_gate_generation == reference.gate_generation,
+            gate.c.reclaim_fleet_bundle_sha256 ==
+            reference.identity.fleet_bundle_sha256,
+            gate.c.reclaim_policy_revision ==
+            reference.identity.policy_revision,
+            gate.c.reclaim_provider_inventory_sha256 ==
+            reference.identity.provider_inventory_sha256,
+            table.c.kubernetes_context == reference.kubernetes_context,
+            table.c.proof_payload['kubernetes']['physical_cluster_uid'].astext
+            == expected_physical_cluster_uid)).mappings().one_or_none()
     if row is None:
         return False
     database_now = row['_database_now']
     local_now = time.monotonic()
     reference_age = local_now - reference.completed_monotonic
     if (not math.isfinite(reference_age) or reference_age < 0 or
-            reference_age >= reclaim.AUTHORIZATION_MAX_AGE_SECONDS):
+            reference_age >= reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS):
         return False
     try:
         receipt = _decode_receipt(

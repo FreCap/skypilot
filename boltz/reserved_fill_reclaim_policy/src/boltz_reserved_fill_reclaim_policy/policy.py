@@ -291,17 +291,52 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                     futures[(context_name,
                              domain)] = executor.submit(_timed_provider,
                                                         context_name, domain)
-            remaining = deadline_monotonic - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError
-            done, pending = concurrent.futures.wait(
-                futures.values(),
-                timeout=remaining,
-                return_when=concurrent.futures.ALL_COMPLETED)
-            if pending or len(done) != len(futures):
-                raise TimeoutError
-            values = {key: future.result() for key, future in futures.items()}
+            values = {}
+            failures = []
+            pending = set(futures.values())
+            keys_by_future = {future: key for key, future in futures.items()}
+            while pending:
+                remaining = deadline_monotonic - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                completed, pending = concurrent.futures.wait(
+                    pending,
+                    timeout=remaining,
+                    return_when=concurrent.futures.FIRST_COMPLETED)
+                if not completed:
+                    raise TimeoutError
+                nonconforming = False
+                for future in completed:
+                    key = keys_by_future[future]
+                    try:
+                        values[key] = future.result()
+                    except (aws_attestation.AwsAttestationNonconformanceError,
+                            kubernetes_attestation.
+                            KubernetesAttestationNonconformanceError):
+                        # One complete exact domain mismatch disproves the
+                        # conjunction immediately. In particular, do not wait
+                        # for a peer SDK call that may ignore its deadline: the
+                        # caller must be able to commit durable invalidation
+                        # while the enclosing disposable boundary still owns
+                        # that peer.
+                        nonconforming = True
+                    except Exception as error:  # pylint: disable=broad-except
+                        # An indeterminate result cannot mask a later completed
+                        # negative, so retain it until all peers finish or the
+                        # common deadline expires.
+                        failures.append(error)
+                if nonconforming:
+                    raise reclaim.ReclaimProviderNonconformanceError(
+                        'The exact reclaim provider inventory is nonconforming.'
+                    )
+            if failures:
+                raise failures[0]
             self._require_deadline(deadline_monotonic)
+        except reclaim.ReclaimProviderNonconformanceError:
+            cancellation.set()
+            for future in futures.values():
+                future.cancel()
+            raise
         except Exception:
             cancellation.set()
             for future in futures.values():
@@ -487,6 +522,63 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                                  summary['kubernetes'],
                                  context_name=context_name))
 
+    def _validate_context_summary(self, context_name: str,
+                                  summary: Mapping[str, Any]) -> bool:
+        try:
+            self._decode_context_proof_summary(summary,
+                                               context_name=context_name)
+        except reclaim.ReclaimAttestationError:
+            return False
+        return True
+
+    def _prove_context(
+        self,
+        context_name: str,
+        deadline_monotonic: float,
+    ) -> reserved_fill_reclaim_proofs.ReclaimProviderProofCandidate:
+        proofs, oldest_completions = self._attest_contexts((context_name,),
+                                                           deadline_monotonic)
+        proof = proofs[context_name]
+        return reserved_fill_reclaim_proofs.ReclaimProviderProofCandidate(
+            proof_payload={
+                'aws': dataclasses.asdict(proof.aws),
+                'kubernetes': dataclasses.asdict(proof.kubernetes),
+            },
+            oldest_completed_monotonic=oldest_completions[context_name])
+
+    def _read_launch_context(
+        self,
+        context_name: str,
+        identity: reclaim.ReclaimPolicyIdentity,
+        gate_generation: int,
+        deadline_monotonic: float,
+    ) -> tuple[_ContextProof, reclaim.ReclaimProviderProofReference]:
+        """Read one receipt inside the launch handler's disposable boundary."""
+        self._require_deadline(deadline_monotonic)
+        try:
+            repository = (
+                reserved_fill_reclaim_proofs.ReclaimProviderProofRepository)()
+            receipt = repository.get_fresh(
+                identity=identity,
+                gate_generation=gate_generation,
+                kubernetes_context=context_name,
+                deadline_monotonic=deadline_monotonic,
+                validate=lambda summary: self._validate_context_summary(
+                    context_name, summary),
+                minimum_remaining_seconds=(
+                    reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS))
+            self._require_deadline(deadline_monotonic)
+        except Exception:
+            raise reclaim.ReclaimAttestationError(
+                'The Boltz deployment has no fresh exact reclaim-provider '
+                'receipt for this launch.') from None
+        proof = self._decode_context_proof_summary(receipt.proof_payload,
+                                                   context_name=context_name)
+        return proof, receipt.reference
+
+    # Kept as the policy's narrow test/extension seam. Despite the historical
+    # name it now attests only a PostgreSQL receipt and performs no provider
+    # reads from the launch handler.
     def _attest_launch_context(
         self,
         context_name: str,
@@ -494,73 +586,8 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         gate_generation: int,
         deadline_monotonic: float,
     ) -> tuple[_ContextProof, reclaim.ReclaimProviderProofReference]:
-        """Share one complete context fact through a PostgreSQL receipt."""
-        self._require_deadline(deadline_monotonic)
-        provider_deadline = (reserved_fill_reclaim_proofs.
-                             provider_proof_deadline(deadline_monotonic))
-
-        def _authorization_job(
-        ) -> reserved_fill_reclaim_proofs.ReclaimProviderProofReceipt:
-            # Default construction may lazily initialize or migrate the Serve
-            # database. Keep that network-capable work off the handler's main
-            # thread, but construct only one receipt engine per authorization.
-            repository = (
-                reserved_fill_reclaim_proofs.ReclaimProviderProofRepository)()
-
-            def _prove(
-            ) -> (reserved_fill_reclaim_proofs.ReclaimProviderProofCandidate):
-                proofs, oldest_completions = self._attest_contexts(
-                    (context_name,), provider_deadline)
-                proof = proofs[context_name]
-                return (
-                    reserved_fill_reclaim_proofs.ReclaimProviderProofCandidate)(
-                        proof_payload={
-                            'aws': dataclasses.asdict(proof.aws),
-                            'kubernetes': dataclasses.asdict(proof.kubernetes),
-                        },
-                        oldest_completed_monotonic=(
-                            oldest_completions[context_name]))
-
-            def _validate(summary: Mapping[str, Any]) -> bool:
-                try:
-                    self._decode_context_proof_summary(
-                        summary, context_name=context_name)
-                except reclaim.ReclaimAttestationError:
-                    return False
-                return True
-
-            return repository.get_or_prove(
-                identity=identity,
-                gate_generation=gate_generation,
-                kubernetes_context=context_name,
-                deadline_monotonic=deadline_monotonic,
-                prove=_prove,
-                validate=_validate)
-
-        executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix='boltz-reclaim-launch')
-        future = executor.submit(_authorization_job)
-        try:
-            remaining = deadline_monotonic - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError
-            receipt = future.result(timeout=remaining)
-            self._require_deadline(deadline_monotonic)
-        except Exception:
-            future.cancel()
-            raise reclaim.ReclaimAttestationError(
-                'The Boltz deployment could not prove the exact reclaim '
-                'launch inventory before its deadline.') from None
-        finally:
-            # Do not join a client-library call that cannot be mathematically
-            # bounded (for example synchronous DNS). The enclosing canonical
-            # DisposableExecutor handler reports failure; its inner warden
-            # then kills and proves absence of the exact invocation family.
-            executor.shutdown(wait=False, cancel_futures=True)
-        self._require_deadline(deadline_monotonic)
-        proof = self._decode_context_proof_summary(receipt.proof_payload,
-                                                   context_name=context_name)
-        return proof, receipt.reference
+        return self._read_launch_context(context_name, identity,
+                                         gate_generation, deadline_monotonic)
 
     def _proof_payload(self, operation: str, proofs: Mapping[str,
                                                              _ContextProof],
@@ -659,7 +686,13 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
             raise reclaim.ReclaimAttestationError(
                 'The claim authorization scope is not typed.')
         context_names = self._require_claim_edges(scope.edges)
-        proofs, _ = self._attest_contexts(context_names, deadline_monotonic)
+        proofs = {}
+        for context_name in context_names:
+            proof, _ = self._read_launch_context(context_name,
+                                                 expected_identity,
+                                                 expected_gate_generation,
+                                                 deadline_monotonic)
+            proofs[context_name] = proof
         completed = time.monotonic()
         self._require_deadline(deadline_monotonic)
         authorization = reclaim.ReclaimClaimAuthorization(
@@ -676,6 +709,109 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                                       semantic_hash=scope.semantic_hash)
         self._emit_proof(payload)
         return authorization
+
+    def renew_provider_proofs(
+        self,
+        *,
+        expected_identity: reclaim.ReclaimPolicyIdentity,
+        expected_gate_generation: int,
+        deadline_monotonic: float,
+    ) -> bool:
+        """Proactively refresh every bundle context outside launch handlers."""
+        self._require_deadline(deadline_monotonic)
+        self._require_identity(expected_identity, expected_gate_generation)
+        repository = (
+            reserved_fill_reclaim_proofs.ReclaimProviderProofRepository)()
+        provider_deadline = (reserved_fill_reclaim_proofs.
+                             provider_proof_deadline(deadline_monotonic))
+
+        def _renew_context(
+            context_name: str,
+        ) -> reserved_fill_reclaim_proofs.ReclaimProviderProofReceipt:
+            return repository.renew(
+                identity=expected_identity,
+                gate_generation=expected_gate_generation,
+                kubernetes_context=context_name,
+                deadline_monotonic=deadline_monotonic,
+                prove=lambda: self._prove_context(context_name,
+                                                  provider_deadline),
+                validate=lambda summary: self._validate_context_summary(
+                    context_name, summary),
+                minimum_remaining_seconds=(
+                    reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS))
+
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(self._bundle.contexts),
+            thread_name_prefix='boltz-reclaim-renew')
+        futures = {
+            context_name: executor.submit(_renew_context, context_name)
+            for context_name in self._bundle.contexts
+        }
+        try:
+            receipts = {}
+            failures = []
+            pending = set(futures.values())
+            contexts_by_future = {
+                future: context_name
+                for context_name, future in futures.items()
+            }
+            while pending:
+                remaining = deadline_monotonic - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                completed, pending = concurrent.futures.wait(
+                    pending,
+                    timeout=remaining,
+                    return_when=concurrent.futures.FIRST_COMPLETED)
+                if not completed:
+                    raise TimeoutError
+                nonconformance = None
+                for future in completed:
+                    context_name = contexts_by_future[future]
+                    try:
+                        receipts[context_name] = future.result()
+                    except reclaim.ReclaimProviderNonconformanceError as error:
+                        # Each context renews and commits invalidation inside
+                        # its own PostgreSQL transaction. One completed exact
+                        # negative therefore dominates immediately, even when
+                        # another context's provider call ignores its deadline.
+                        nonconformance = error
+                    except Exception as error:  # pylint: disable=broad-except
+                        # Retain indeterminate failures until every context
+                        # finishes or the common deadline expires: a later
+                        # committed negative must still win.
+                        failures.append(error)
+                if nonconformance is not None:
+                    for future in pending:
+                        future.cancel()
+                    raise nonconformance
+            if failures:
+                raise failures[0]
+            self._require_deadline(deadline_monotonic)
+        except reclaim.ReclaimProviderNonconformanceError:
+            raise
+        except Exception:
+            raise reclaim.ReclaimAttestationError(
+                'The Boltz deployment could not renew the exact reclaim '
+                'provider inventory before its deadline.') from None
+        finally:
+            for future in futures.values():
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+        proofs = {
+            context_name: self._decode_context_proof_summary(
+                receipt.proof_payload, context_name=context_name)
+            for context_name, receipt in receipts.items()
+        }
+        observed_fresh_publication = any(
+            receipt.publication_observed for receipt in receipts.values())
+        if observed_fresh_publication:
+            self._emit_proof(
+                self._proof_payload('renewal',
+                                    proofs,
+                                    time.monotonic(),
+                                    gate_generation=expected_gate_generation))
+        return observed_fresh_publication
 
     def authorize_launch(
         self,
@@ -702,7 +838,7 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         proof, reference = self._attest_launch_context(
             scope.kubernetes_context, expected_identity,
             expected_gate_generation, deadline_monotonic)
-        completed = reference.completed_monotonic
+        completed = time.monotonic()
         self._require_deadline(deadline_monotonic)
         authorization = reclaim.ReclaimLaunchAuthorization(
             identity=self.policy_identity(),

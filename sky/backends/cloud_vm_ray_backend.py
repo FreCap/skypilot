@@ -1007,7 +1007,7 @@ class RetryingVmProvisioner:
                 (reserved_fill_reclaim_attestation.require_exact_policy_identity
                 )(policy, identity)
                 deadline = (reserved_fill_reclaim_attestation.
-                            new_policy_operation_deadline())
+                            new_provider_proof_read_deadline())
                 authorization = policy.authorize_launch(
                     scope,
                     expected_identity=identity,

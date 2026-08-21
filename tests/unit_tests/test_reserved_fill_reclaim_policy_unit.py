@@ -1,6 +1,7 @@
 """Non-PostgreSQL tests for terminal reserved-fill reclaim enforcement."""
 # pylint: disable=protected-access,unexpected-keyword-arg
 
+import concurrent.futures
 import contextlib
 import time
 import types
@@ -450,6 +451,11 @@ class _Policy(reclaim.ReservedFillReclaimPolicy):
             expected_gate_generation=expected_gate_generation,
             deadline_monotonic=deadline_monotonic)
 
+    def renew_provider_proofs(self, *, expected_identity,
+                              expected_gate_generation, deadline_monotonic):
+        del expected_identity, expected_gate_generation, deadline_monotonic
+        raise NotImplementedError
+
     def authorize_launch(self, scope, *, expected_identity,
                          expected_gate_generation, deadline_monotonic):
         if self._authorize_launch is None:
@@ -768,8 +774,9 @@ def test_physical_uid_retarget_fails_before_provider_effect(monkeypatch):
 
     @contextlib.contextmanager
     def _retargeted_physical_guard(_context, _uid):
-        raise exceptions.KubernetesPhysicalClusterIdentityError(
-            'context alias was retargeted')
+        if _context is not None:
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'context alias was retargeted')
         yield  # pragma: no cover
 
     monkeypatch.setattr(backend.kubernetes_adaptor,
@@ -938,15 +945,17 @@ def _claim_edge() -> dict[str, object]:
     }
 
 
-def _replace_claim_set() -> int | None:
-    return broker.replace_claim_set('svc',
-                                    semantic_hash='semantic-v1',
-                                    global_headroom=3,
-                                    utilization_ceiling=3,
-                                    utilization_state={},
-                                    edges=[_claim_edge()],
-                                    expected_service_hash='incarnation-a',
-                                    expected_controller_owner=(123, '10.0.0.1'))
+def _replace_claim_set(claim_authorization_executor=None,) -> int | None:
+    return broker.replace_claim_set(
+        'svc',
+        semantic_hash='semantic-v1',
+        global_headroom=3,
+        utilization_ceiling=3,
+        utilization_state={},
+        edges=[_claim_edge()],
+        expected_service_hash='incarnation-a',
+        expected_controller_owner=(123, '10.0.0.1'),
+        claim_authorization_executor=(claim_authorization_executor))
 
 
 @pytest.mark.parametrize('failure_kind', ['missing-identity', 'missing-policy'])
@@ -956,38 +965,37 @@ def test_sequenced_claim_without_complete_policy_fails_before_broker_lock(
         gate = types.SimpleNamespace(sequenced_active=True,
                                      generation=_GATE_GENERATION,
                                      reclaim_policy_identity=None)
-        require_policy = mock.Mock()
+        authorize = mock.Mock()
     else:
         gate = _gate(sequenced=True)
-        require_policy = mock.Mock(
+        authorize = mock.Mock(
             side_effect=reclaim.ReclaimAttestationError('no policy'))
     _install_gate(monkeypatch, gate)
-    monkeypatch.setattr(reclaim, 'require_unique_policy', require_policy)
+    monkeypatch.setattr(broker, '_authorize_reclaim_claim_set_in_boundary',
+                        authorize)
     get_lock = mock.Mock()
     monkeypatch.setattr(broker.locks, 'get_lock', get_lock)
 
-    assert _replace_claim_set() is None
+    assert _replace_claim_set(mock.Mock()) is None
     get_lock.assert_not_called()
     if failure_kind == 'missing-identity':
-        require_policy.assert_not_called()
+        authorize.assert_not_called()
     else:
-        require_policy.assert_called_once_with()
+        authorize.assert_called_once()
 
 
 def test_sequenced_claim_policy_identity_mismatch_precedes_ticket_and_lock(
         monkeypatch):
     _install_gate(monkeypatch, _gate(sequenced=True))
-    authorize_claim_set = mock.Mock()
-    policy = _Policy(identity=_identity(
-        fleet_digest=_OTHER_FLEET_DIGEST,
-        inventory_digest=_OTHER_INVENTORY_DIGEST),
-                     authorize_claim_set=authorize_claim_set)
-    monkeypatch.setattr(reclaim, 'require_unique_policy', lambda: policy)
+    authorize = mock.Mock(
+        side_effect=reclaim.ReclaimAttestationError('identity mismatch'))
+    monkeypatch.setattr(broker, '_authorize_reclaim_claim_set_in_boundary',
+                        authorize)
     get_lock = mock.Mock()
     monkeypatch.setattr(broker.locks, 'get_lock', get_lock)
 
-    assert _replace_claim_set() is None
-    authorize_claim_set.assert_not_called()
+    assert _replace_claim_set(mock.Mock()) is None
+    authorize.assert_called_once()
     get_lock.assert_not_called()
 
 
@@ -996,10 +1004,9 @@ def test_sequenced_claim_policy_callback_precedes_broker_lock(monkeypatch):
     _install_gate(monkeypatch, gate)
     events = []
 
-    def _authorize(scope, *, expected_identity, expected_gate_generation,
-                   deadline_monotonic):
+    def _authorize(_executor, scope, expected_identity,
+                   expected_gate_generation):
         events.append('policy')
-        assert deadline_monotonic > time.monotonic()
         assert expected_identity == _identity()
         assert expected_gate_generation == _GATE_GENERATION
         return reclaim.ReclaimClaimAuthorization(
@@ -1035,8 +1042,8 @@ def test_sequenced_claim_policy_callback_precedes_broker_lock(monkeypatch):
                           reclaim.ReclaimClaimAuthorization)
         return 7
 
-    monkeypatch.setattr(reclaim, 'require_unique_policy',
-                        lambda: _Policy(authorize_claim_set=_authorize))
+    monkeypatch.setattr(broker, '_authorize_reclaim_claim_set_in_boundary',
+                        _authorize)
     monkeypatch.setattr(broker.locks, 'get_lock', _get_lock)
     monkeypatch.setattr(broker, 'get_protocol_version',
                         lambda: broker.PROTOCOL_V2)
@@ -1045,8 +1052,101 @@ def test_sequenced_claim_policy_callback_precedes_broker_lock(monkeypatch):
     monkeypatch.setattr(serve_state, 'replace_reserved_fill_claim_set',
                         _persist)
 
-    assert _replace_claim_set() == 7
+    assert _replace_claim_set(mock.Mock()) == 7
     assert events == [
         'policy', 'broker-lock-create', 'broker-lock-enter', 'persist',
         'broker-lock-exit'
     ]
+
+
+def test_claim_boundary_timeout_cancels_drains_and_rejects_late_success():
+    executor = mock.Mock()
+    executor.max_workers = 1
+    future = executor.submit.return_value
+    future.done.return_value = False
+    future.result.side_effect = (concurrent.futures.TimeoutError(),
+                                 'late-success')
+    with pytest.raises(reclaim.ReclaimAttestationError,
+                       match='bounded process lifetime'):
+        broker._execute_claim_authorization_in_boundary(executor, int, ('7',),
+                                                        5)
+
+    executor.submit.assert_called_once_with(int, '7')
+    future.request_cancel.assert_called_once_with()
+    assert future.result.call_count == 2
+    assert future.result.call_args_list[0].kwargs['timeout'] <= 5
+    assert future.result.call_args_list[1].kwargs['timeout'] == (
+        broker._RECLAIM_CLAIM_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
+
+
+def test_claim_boundary_missing_drain_proof_poison_is_controller_terminal():
+    callback = mock.Mock()
+    executor = mock.Mock()
+    executor.max_workers = 1
+    executor.poisoned = False
+    future = executor.submit.return_value
+    future.done.return_value = False
+    future.result.side_effect = concurrent.futures.TimeoutError()
+
+    def _poison(error):
+        executor.poisoned = True
+        callback(error)
+
+    executor._poison.side_effect = _poison
+    with pytest.raises(broker.request_process.AmbiguousBoundaryError,
+                       match='cannot prove its process family absent') as info:
+        broker._execute_claim_authorization_in_boundary(executor, int, ('7',),
+                                                        5)
+
+    future.request_cancel.assert_called_once_with()
+    executor._poison.assert_called_once_with(info.value)
+    callback.assert_called_once_with(info.value)
+    assert executor.poisoned
+    assert isinstance(info.value.__cause__,
+                      broker.request_process.BoundaryExecutionError)
+    assert 'without a process-family drain result' in str(info.value.__cause__)
+
+
+def test_claim_boundary_unreleased_lane_poison_is_controller_terminal(
+        monkeypatch):
+    executor = mock.Mock()
+    executor.max_workers = 1
+    executor.poisoned = False
+    executor.has_idle_workers.return_value = False
+    executor.submit.return_value.result.return_value = 'late-success'
+    monkeypatch.setattr(broker, '_RECLAIM_CLAIM_BOUNDARY_DRAIN_TIMEOUT_SECONDS',
+                        0)
+
+    with pytest.raises(broker.request_process.AmbiguousBoundaryError) as info:
+        broker._execute_claim_authorization_in_boundary(executor, str,
+                                                        ('value',), 5)
+
+    assert isinstance(info.value.__cause__,
+                      broker.request_process.BoundaryExecutionError)
+    executor._poison.assert_called_once_with(info.value)
+
+
+def test_claim_boundary_requires_one_finite_lane():
+    executor = mock.Mock()
+    executor.max_workers = None
+
+    with pytest.raises(ValueError, match='one finite owned lane'):
+        broker._execute_claim_authorization_in_boundary(executor, str,
+                                                        ('value',), 5)
+
+    executor.submit.assert_not_called()
+
+
+def test_claim_boundary_ambiguity_propagates_before_broker_lock(monkeypatch):
+    _install_gate(monkeypatch, _gate(sequenced=True))
+    ambiguity = broker.request_process.AmbiguousBoundaryError(
+        'unproven claim family')
+    monkeypatch.setattr(broker, '_authorize_reclaim_claim_set_in_boundary',
+                        mock.Mock(side_effect=ambiguity))
+    get_lock = mock.Mock()
+    monkeypatch.setattr(broker.locks, 'get_lock', get_lock)
+
+    with pytest.raises(broker.request_process.AmbiguousBoundaryError):
+        _replace_claim_set(mock.Mock())
+
+    get_lock.assert_not_called()

@@ -2,6 +2,7 @@
 
 # pylint: disable=protected-access,redefined-outer-name,unused-import
 # pylint: disable=wrong-import-position,not-callable,unnecessary-lambda
+from collections.abc import Callable
 from collections.abc import Mapping
 import concurrent.futures
 import contextlib
@@ -30,6 +31,8 @@ from test_pool_capacity_observation_pg import observation_engine  # noqa: F401
 from test_pool_capacity_observation_pg import pg_server  # noqa: F401
 
 from sky.serve import placement_normalization_authority
+from sky.serve import pool_capacity_observation
+from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_reclaim_attestation as reclaim
 from sky.serve import reserved_fill_reclaim_proof_schema as proof_schema
 from sky.serve import reserved_fill_reclaim_proofs as proofs
@@ -52,7 +55,7 @@ pytestmark = pytest.mark.skipif(
     reason='Docker unavailable; skipping real-PostgreSQL proof tests')
 
 _CONTEXT = 'phx_research_cluster_eks'
-_GATE_GENERATION = 17
+_GATE_GENERATION = 1
 _CGROUP_MEMORY_MAX_ENV_VAR = 'SKYPILOT_SERVE054_CGROUP_MEMORY_MAX_BYTES'
 
 
@@ -124,9 +127,28 @@ def test_pressure_cgroup_memory_limit_empty_is_disabled(monkeypatch):
 
 
 def _identity() -> reclaim.ReclaimPolicyIdentity:
-    return reclaim.ReclaimPolicyIdentity(fleet_bundle_sha256='a' * 64,
-                                         policy_revision='test-policy-v1',
-                                         provider_inventory_sha256='b' * 64)
+    # The live gate and the bundled deployment policy deliberately share one
+    # identity. Low-level repository tests may use the same exact authority
+    # without inventing a second, impossible sequenced gate.
+    return policy_lib.BoltzReservedFillReclaimPolicy().policy_identity()
+
+
+def _activation_receipt(
+    identity: reclaim.ReclaimPolicyIdentity,
+    *,
+    marker: str = 'c',
+) -> reclaim.ReclaimActivationReceipt:
+    claim_count, claim_digest = reclaim.claim_scope_projection(())
+    return reclaim.ReclaimActivationReceipt(
+        identity=identity,
+        claim_scope_count=claim_count,
+        claim_scope_sha256=claim_digest,
+        evidence_sha256=marker * 64,
+        writer_image_digest='sha256:' + marker * 64,
+        writer_deployment_generation=f'proof-test-generation-{marker}',
+        writer_deployment_uid=f'proof-test-deployment-{marker}',
+        writer_pod_inventory_count=1,
+        writer_pod_inventory_sha256=marker * 64)
 
 
 def _proof_payload() -> dict[str, Any]:
@@ -161,6 +183,36 @@ def _accept_payload(_payload: Mapping[str, Any]) -> bool:
     return True
 
 
+def _renew_receipt(
+    repository: proofs.ReclaimProviderProofRepository,
+    prove: Callable[[], proofs.ReclaimProviderProofCandidate],
+) -> proofs.ReclaimProviderProofReceipt:
+    return repository.renew(
+        identity=_identity(),
+        gate_generation=_GATE_GENERATION,
+        kubernetes_context=_CONTEXT,
+        deadline_monotonic=time.monotonic() +
+        reclaim.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS,
+        prove=prove,
+        validate=_accept_payload,
+        minimum_remaining_seconds=(
+            reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS))
+
+
+def _read_receipt(
+    repository: proofs.ReclaimProviderProofRepository,
+) -> proofs.ReclaimProviderProofReceipt:
+    return repository.get_fresh(
+        identity=_identity(),
+        gate_generation=_GATE_GENERATION,
+        kubernetes_context=_CONTEXT,
+        deadline_monotonic=time.monotonic() +
+        reclaim.PROVIDER_PROOF_READ_TIMEOUT_SECONDS,
+        validate=_accept_payload,
+        minimum_remaining_seconds=(
+            reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS))
+
+
 @pytest.fixture
 def proof_engine(observation_engine):  # noqa: F811
     config = migration_utils.get_alembic_config(observation_engine,
@@ -174,6 +226,10 @@ def proof_engine(observation_engine):  # noqa: F811
                     call_count bigint NOT NULL
                 )
             """))
+    activated = (pool_capacity_observation.PoolCapacityObservationRepository(
+        observation_engine).authorize_sequenced_reconciliation(
+            expected_generation=0, receipt=_activation_receipt(_identity())))
+    assert activated.gate.generation == _GATE_GENERATION
     yield observation_engine
 
 
@@ -226,12 +282,13 @@ def _launch_scope(
 def _provider_proof(
     policy: policy_lib.BoltzReservedFillReclaimPolicy,
     domain: str,
+    context_name: str = _CONTEXT,
 ) -> object:
-    context = policy._bundle.fleet_context(_CONTEXT)
-    provider = policy._bundle.provider_context(_CONTEXT)
+    context = policy._bundle.fleet_context(context_name)
+    provider = policy._bundle.provider_context(context_name)
     if domain == 'aws':
         return aws_attestation.PodIdentityProof(
-            kubernetes_context=_CONTEXT,
+            kubernetes_context=context_name,
             cluster_arn=provider['eks']['cluster_arn'],
             namespace=context['namespace'],
             service_account_name=context['service_account_name'],
@@ -239,18 +296,20 @@ def _provider_proof(
             association_count=0,
             identity_absence_proven=True)
     admission = context['kueue_admission']
-    assert admission is not None
+    kueue_managed = admission is not None
     return kubernetes_attestation.KubernetesContextProof(
-        kubernetes_context=_CONTEXT,
+        kubernetes_context=context_name,
         physical_cluster_uid=context['physical_cluster_uid'],
         namespace_uid=provider['namespace_uid'],
-        kueue_managed=True,
-        local_queue_name=admission['local_queue_name'],
-        cluster_queue_name=admission['queues']['inference_cluster_queue'],
+        kueue_managed=kueue_managed,
+        local_queue_name=(None if admission is None else
+                          admission['local_queue_name']),
+        cluster_queue_name=(None if admission is None else
+                            admission['queues']['inference_cluster_queue']),
         pod_identity_irsa_annotation_absent=True,
-        assign_queue_labels_for_pods=True,
-        topology_aware_scheduling=True,
-        custom_scheduler_deployment_proven=False,
+        assign_queue_labels_for_pods=(True if kueue_managed else None),
+        topology_aware_scheduling=(True if kueue_managed else None),
+        custom_scheduler_deployment_proven=(provider['scheduler'] is not None),
         resource_flavor_topology_names=tuple(
             sorted((flavor['name'], flavor['topology_name'])
                    for flavor in provider['resource_flavors'])),
@@ -325,8 +384,8 @@ def _wait_for_no_thread(prefix: str, timeout: float = 1) -> bool:
     return False
 
 
-def _disposable_stalled_launch(database_url: str) -> None:
-    """Stall both providers while their exact proof locks are held."""
+def _disposable_stalled_renewal(database_url: str) -> None:
+    """Stall both providers while their exact proof lock is held."""
     engine = sqlalchemy.create_engine(database_url)
     counter_engine = sqlalchemy.create_engine(database_url,
                                               poolclass=sqlalchemy.NullPool)
@@ -350,13 +409,18 @@ def _disposable_stalled_launch(database_url: str) -> None:
     policy._provider_job = _provider_job
     policy._emit_proof = lambda _payload: None
     try:
-        with mock.patch.object(policy_lib.reserved_fill_reclaim_proofs,
-                               'ReclaimProviderProofRepository',
-                               return_value=repository):
-            policy.authorize_launch(_launch_scope(policy),
-                                    expected_identity=policy.policy_identity(),
-                                    expected_gate_generation=_GATE_GENERATION,
-                                    deadline_monotonic=time.monotonic() + 5)
+        deadline = time.monotonic() + 5
+        repository.renew(
+            identity=policy.policy_identity(),
+            gate_generation=_GATE_GENERATION,
+            kubernetes_context=_CONTEXT,
+            deadline_monotonic=deadline,
+            prove=lambda: policy._prove_context(
+                _CONTEXT, proofs.provider_proof_deadline(deadline)),
+            validate=lambda summary: policy._validate_context_summary(
+                _CONTEXT, summary),
+            minimum_remaining_seconds=(
+                reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS))
     finally:
         repository._proof_engine.dispose()
         counter_engine.dispose()
@@ -598,6 +662,286 @@ def test_repository_preserves_url_options_and_installs_named_metrics(
         configured_engine.dispose()
 
 
+def test_cold_consumer_withholds_admission_without_creating_proof(proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+
+    with pytest.raises(proofs.ReclaimProviderProofError,
+                       match='No fresh exact'):
+        _read_receipt(repository)
+
+    with proof_engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                proof_schema.serve_reserved_fill_reclaim_provider_proofs_table)
+        ).scalar_one() == 0
+
+
+def test_one_renewal_serves_100_concurrent_consumers_without_provider_io(
+        proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    provider_calls = 0
+    renewal_started = threading.Event()
+    release_renewal = threading.Event()
+
+    def prove():
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 2:
+            renewal_started.set()
+            assert release_renewal.wait(timeout=5)
+        return _proof_candidate()
+
+    seeded = _renew_receipt(repository, prove)
+    assert seeded.publication_observed
+    assert not _read_receipt(repository).publication_observed
+    # Force proactive renewal (below its configured reserve) while leaving more
+    # than the five-second consumer reserve. Readers may safely use either the
+    # old committed version or the identical renewed version.
+    with proof_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                UPDATE serve_reserved_fill_reclaim_provider_proofs
+                SET completed_at = clock_timestamp()
+                    - make_interval(secs => :age)
+            """), {
+                'age': (reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS -
+                        reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS + 1)
+            })
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
+        renewing = executor.submit(_renew_receipt, repository, prove)
+        assert renewal_started.wait(timeout=5)
+        reads = tuple(
+            executor.submit(_read_receipt, repository) for _ in range(100))
+        read_receipts = tuple(future.result(timeout=5) for future in reads)
+        release_renewal.set()
+        renewed = renewing.result(timeout=5)
+
+    assert provider_calls == 2
+    assert renewed.publication_observed
+    assert renewed.reference.receipt_nonce == seeded.reference.receipt_nonce
+    assert {receipt.reference.receipt_nonce for receipt in read_receipts
+           } == {seeded.reference.receipt_nonce}
+
+
+def test_changed_positive_rotates_and_proven_negative_revokes(proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    first = _renew_receipt(repository, _proof_candidate)
+    with proof_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                UPDATE serve_reserved_fill_reclaim_provider_proofs
+                SET completed_at = clock_timestamp()
+                    - make_interval(secs => :age)
+            """), {
+                'age': (reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS -
+                        reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS + 1)
+            })
+    changed_payload = _proof_payload()
+    changed_payload['aws']['count'] = 2
+    changed = _renew_receipt(repository,
+                             lambda: _proof_candidate(changed_payload))
+    assert changed.reference.receipt_nonce != first.reference.receipt_nonce
+    with proof_engine.begin() as connection:
+        assert not proofs.provider_proof_reference_holds_in_connection(
+            connection,
+            first.reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
+        assert proofs.provider_proof_reference_holds_in_connection(
+            connection,
+            changed.reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
+        connection.execute(
+            sqlalchemy.text("""
+                UPDATE serve_reserved_fill_reclaim_provider_proofs
+                SET completed_at = clock_timestamp()
+                    - make_interval(secs => :age)
+            """), {
+                'age': (reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS -
+                        reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS + 1)
+            })
+
+    def prove_negative() -> proofs.ReclaimProviderProofCandidate:
+        raise reclaim.ReclaimProviderNonconformanceError(
+            'observed nonconformance')
+
+    with pytest.raises(reclaim.ReclaimProviderNonconformanceError):
+        _renew_receipt(repository, prove_negative)
+    with pytest.raises(proofs.ReclaimProviderProofError,
+                       match='No fresh exact'):
+        _read_receipt(repository)
+    with proof_engine.begin() as connection:
+        assert not proofs.provider_proof_reference_holds_in_connection(
+            connection,
+            changed.reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                proof_schema.serve_reserved_fill_reclaim_provider_proofs_table)
+        ).scalar_one() == 0
+
+
+def test_completed_negative_revokes_before_never_returning_peer(proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    payload = {
+        'aws': dataclasses.asdict(_provider_proof(policy, 'aws')),
+        'kubernetes': dataclasses.asdict(_provider_proof(policy, 'kubernetes')),
+    }
+
+    def _positive_candidate():
+        return proofs.ReclaimProviderProofCandidate(
+            proof_payload=payload, oldest_completed_monotonic=time.monotonic())
+
+    repository.renew(identity=_identity(),
+                     gate_generation=_GATE_GENERATION,
+                     kubernetes_context=_CONTEXT,
+                     deadline_monotonic=time.monotonic() + 5,
+                     prove=_positive_candidate,
+                     validate=lambda summary: policy._validate_context_summary(
+                         _CONTEXT, summary),
+                     minimum_remaining_seconds=(
+                         reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS))
+    with proof_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                UPDATE serve_reserved_fill_reclaim_provider_proofs
+                SET completed_at = clock_timestamp()
+                    - make_interval(secs => :age)
+            """), {
+                'age': (reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS -
+                        reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS + 1)
+            })
+
+    peer_started = threading.Event()
+    release_peer = threading.Event()
+
+    def _provider_job(_context_name, domain, _deadline, _cancellation):
+        if domain == 'aws':
+            peer_started.set()
+            assert release_peer.wait(timeout=10)
+            raise RuntimeError('late indeterminate AWS transport')
+        assert peer_started.wait(timeout=1)
+        raise kubernetes_attestation.KubernetesAttestationNonconformanceError(
+            'complete Kubernetes mismatch')
+
+    policy._provider_job = _provider_job
+    deadline = time.monotonic() + 5
+    started = time.monotonic()
+    try:
+        with pytest.raises(reclaim.ReclaimProviderNonconformanceError):
+            repository.renew(
+                identity=_identity(),
+                gate_generation=_GATE_GENERATION,
+                kubernetes_context=_CONTEXT,
+                deadline_monotonic=deadline,
+                prove=lambda: policy._prove_context(
+                    _CONTEXT, proofs.provider_proof_deadline(deadline)),
+                validate=lambda summary: policy._validate_context_summary(
+                    _CONTEXT, summary),
+                minimum_remaining_seconds=(
+                    reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS))
+        assert time.monotonic() - started < 1
+        with proof_engine.begin() as connection:
+            proof_table = (
+                proof_schema.serve_reserved_fill_reclaim_provider_proofs_table)
+            assert connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    proof_table)).scalar_one() == 0
+        assert any(
+            thread.name.startswith('boltz-reclaim-attest')
+            for thread in threading.enumerate())
+    finally:
+        release_peer.set()
+    assert _wait_for_no_thread('boltz-reclaim-attest')
+
+
+def test_indeterminate_observer_failure_preserves_row_only_until_expiry(
+        proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    receipt = _renew_receipt(repository, _proof_candidate)
+    with proof_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                UPDATE serve_reserved_fill_reclaim_provider_proofs
+                SET completed_at = clock_timestamp()
+                    - make_interval(secs => :age)
+            """), {
+                'age': (reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS -
+                        reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS + 1)
+            })
+
+    def fail_indeterminately() -> proofs.ReclaimProviderProofCandidate:
+        raise TimeoutError('provider transport stalled')
+
+    with pytest.raises(TimeoutError, match='transport stalled'):
+        _renew_receipt(repository, fail_indeterminately)
+    # An indeterminate observer failure does not invent a negative fact. The
+    # committed positive row remains usable inside its bounded horizon.
+    surviving = _read_receipt(repository)
+    assert surviving.reference.receipt_nonce == receipt.reference.receipt_nonce
+
+    with proof_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                UPDATE serve_reserved_fill_reclaim_provider_proofs
+                SET completed_at = clock_timestamp()
+                    - make_interval(secs => :age)
+            """), {'age': reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS + 1})
+    with pytest.raises(proofs.ReclaimProviderProofError,
+                       match='No fresh exact'):
+        _read_receipt(repository)
+    with proof_engine.begin() as connection:
+        assert not proofs.provider_proof_reference_holds_in_connection(
+            connection,
+            receipt.reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
+        # Expiry withholds authority without destructively rewriting history.
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                proof_schema.serve_reserved_fill_reclaim_provider_proofs_table)
+        ).scalar_one() == 1
+
+
+def test_gate_rotation_rejects_old_receipt_and_cold_successor_does_not_churn(
+        proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    old_receipt = _renew_receipt(repository, _proof_candidate)
+    successor_identity = dataclasses.replace(_identity(),
+                                             policy_revision='successor-policy')
+    rotated = (pool_capacity_observation.PoolCapacityObservationRepository(
+        proof_engine).authorize_sequenced_reconciliation(
+            expected_generation=_GATE_GENERATION,
+            receipt=_activation_receipt(successor_identity, marker='f')))
+    assert rotated.gate.generation == _GATE_GENERATION + 1
+
+    with pytest.raises(proofs.ReclaimProviderProofError,
+                       match='live sequenced gate'):
+        _read_receipt(repository)
+    provider = mock.Mock(side_effect=_proof_candidate)
+    with pytest.raises(proofs.ReclaimProviderProofError,
+                       match='live sequenced gate'):
+        repository.renew(
+            identity=_identity(),
+            gate_generation=_GATE_GENERATION,
+            kubernetes_context=_CONTEXT,
+            deadline_monotonic=time.monotonic() + 1,
+            prove=provider,
+            validate=_accept_payload,
+            minimum_remaining_seconds=(
+                reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS))
+    provider.assert_not_called()
+    with proof_engine.begin() as connection:
+        assert not proofs.provider_proof_reference_holds_in_connection(
+            connection,
+            old_receipt.reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                proof_schema.serve_reserved_fill_reclaim_provider_proofs_table)
+        ).scalar_one() == 1
+
+
 def test_slow_database_read_is_bounded_and_reaps_launch_workers(
         proof_engine, monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
@@ -616,7 +960,7 @@ def test_slow_database_read_is_bounded_and_reaps_launch_workers(
                            'ReclaimProviderProofRepository',
                            return_value=repository):
         with pytest.raises(reclaim.ReclaimAttestationError,
-                           match='before its deadline'):
+                           match='no fresh exact'):
             policy.authorize_launch(_launch_scope(policy),
                                     expected_identity=policy.policy_identity(),
                                     expected_gate_generation=_GATE_GENERATION,
@@ -648,7 +992,7 @@ def test_blackholed_connect_is_single_attempt_reaps_workers_and_recovers(
                                'ReclaimProviderProofRepository',
                                return_value=repository):
             with pytest.raises(reclaim.ReclaimAttestationError,
-                               match='before its deadline'):
+                               match='no fresh exact'):
                 policy.authorize_launch(
                     _launch_scope(policy),
                     expected_identity=policy.policy_identity(),
@@ -685,6 +1029,17 @@ def test_blackholed_connect_is_single_attempt_reaps_workers_and_recovers(
     with mock.patch.object(policy_lib.reserved_fill_reclaim_proofs,
                            'ReclaimProviderProofRepository',
                            return_value=healthy_repository):
+        healthy_repository.renew(
+            identity=policy.policy_identity(),
+            gate_generation=_GATE_GENERATION,
+            kubernetes_context=_CONTEXT,
+            deadline_monotonic=outer_deadline,
+            prove=lambda: policy._prove_context(
+                _CONTEXT, proofs.provider_proof_deadline(outer_deadline)),
+            validate=lambda summary: policy._validate_context_summary(
+                _CONTEXT, summary),
+            minimum_remaining_seconds=(
+                reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS))
         authorization = policy.authorize_launch(
             _launch_scope(policy),
             expected_identity=policy.policy_identity(),
@@ -713,12 +1068,12 @@ def test_blackholed_election_transaction_has_no_retry_or_provider_call(
         provider = mock.Mock()
         started = time.monotonic()
         with pytest.raises(Exception):
-            repository.get_or_prove(identity=_identity(),
-                                    gate_generation=_GATE_GENERATION,
-                                    kubernetes_context=_CONTEXT,
-                                    deadline_monotonic=started + 5,
-                                    prove=provider,
-                                    validate=_accept_payload)
+            repository.renew(identity=_identity(),
+                             gate_generation=_GATE_GENERATION,
+                             kubernetes_context=_CONTEXT,
+                             deadline_monotonic=started + 5,
+                             prove=provider,
+                             validate=_accept_payload)
         elapsed = time.monotonic() - started
         repository._proof_engine.dispose()
         unavailable_engine.dispose()
@@ -747,12 +1102,12 @@ def test_slow_leader_reread_is_bounded_before_provider(proof_engine,
     provider = mock.Mock()
     started = time.monotonic()
     with pytest.raises(Exception):
-        repository.get_or_prove(identity=_identity(),
-                                gate_generation=_GATE_GENERATION,
-                                kubernetes_context=_CONTEXT,
-                                deadline_monotonic=started + 5,
-                                prove=provider,
-                                validate=_accept_payload)
+        repository.renew(identity=_identity(),
+                         gate_generation=_GATE_GENERATION,
+                         kubernetes_context=_CONTEXT,
+                         deadline_monotonic=started + 5,
+                         prove=provider,
+                         validate=_accept_payload)
 
     assert time.monotonic() - started < 2
     assert statement_count == 2
@@ -780,12 +1135,12 @@ def test_slow_publication_rolls_back_and_closes_transaction(proof_engine):
     provider = mock.Mock(side_effect=_proof_candidate)
     started = time.monotonic()
     with pytest.raises(Exception):
-        repository.get_or_prove(identity=_identity(),
-                                gate_generation=_GATE_GENERATION,
-                                kubernetes_context=_CONTEXT,
-                                deadline_monotonic=started + 5,
-                                prove=provider,
-                                validate=_accept_payload)
+        repository.renew(identity=_identity(),
+                         gate_generation=_GATE_GENERATION,
+                         kubernetes_context=_CONTEXT,
+                         deadline_monotonic=started + 5,
+                         prove=provider,
+                         validate=_accept_payload)
 
     assert time.monotonic() - started < 2
     provider.assert_called_once()
@@ -815,12 +1170,12 @@ def test_provider_does_not_begin_without_publication_reserve(
     started = time.monotonic()
     with pytest.raises(proofs.ReclaimProviderProofError,
                        match='deadline is invalid or expired'):
-        repository.get_or_prove(identity=_identity(),
-                                gate_generation=_GATE_GENERATION,
-                                kubernetes_context=_CONTEXT,
-                                deadline_monotonic=started + 1.8,
-                                prove=provider,
-                                validate=_accept_payload)
+        repository.renew(identity=_identity(),
+                         gate_generation=_GATE_GENERATION,
+                         kubernetes_context=_CONTEXT,
+                         deadline_monotonic=started + 1.8,
+                         prove=provider,
+                         validate=_accept_payload)
     provider.assert_not_called()
     assert read_count == 2
     assert time.monotonic() - started < 1.8
@@ -831,7 +1186,7 @@ def test_disposable_boundary_kills_stalled_proof_family(proof_engine):
     database_url = proof_engine.url.render_as_string(hide_password=False)
     executor = request_process.DisposableExecutor(max_workers=1)
     try:
-        future = executor.submit(_disposable_stalled_launch, database_url)
+        future = executor.submit(_disposable_stalled_renewal, database_url)
         wait_deadline = time.monotonic() + 10
         calls = {}
         while time.monotonic() < wait_deadline:
@@ -871,8 +1226,8 @@ def test_disposable_boundary_kills_stalled_proof_family(proof_engine):
         elapsed = time.monotonic() - started
         assert future.boundary_result is not None
         assert future.boundary_result.family_drained
-        assert (future.boundary_result.outcome.kind is
-                request_process.InvocationOutcomeKind.FAILED)
+        assert (future.boundary_result.outcome.kind
+                is request_process.InvocationOutcomeKind.FAILED)
     finally:
         executor.shutdown()
 
@@ -905,14 +1260,51 @@ def test_disposable_boundary_kills_stalled_proof_family(proof_engine):
     assert rows == 0
     assert proof_locks == 0
 
-    recovered = proofs.ReclaimProviderProofRepository(
-        proof_engine).get_or_prove(identity=_identity(),
-                                   gate_generation=_GATE_GENERATION,
-                                   kubernetes_context=_CONTEXT,
-                                   deadline_monotonic=time.monotonic() + 5,
-                                   prove=lambda: _proof_candidate(),
-                                   validate=_accept_payload)
+    recovered = proofs.ReclaimProviderProofRepository(proof_engine).renew(
+        identity=_identity(),
+        gate_generation=_GATE_GENERATION,
+        kubernetes_context=_CONTEXT,
+        deadline_monotonic=time.monotonic() + 5,
+        prove=lambda: _proof_candidate(),
+        validate=_accept_payload)
     assert len(recovered.reference.receipt_nonce) == 64
+
+
+def test_claim_boundary_repeatedly_drains_never_returning_libpq(
+        proof_engine, tmp_path):
+    execute_boundary = (
+        reserved_capacity_broker._execute_claim_authorization_in_boundary)
+    executor = request_process.DisposableExecutor(max_workers=1)
+    try:
+        for attempt in range(2):
+            marker = tmp_path / f'claim-handler-{attempt}'
+            with _tcp_accept_blackhole() as (port, accepted):
+                unavailable_url = proof_engine.url.set(host='127.0.0.1',
+                                                       port=port)
+                with pytest.raises(reclaim.ReclaimAttestationError,
+                                   match='bounded process lifetime'):
+                    execute_boundary(
+                        executor,
+                        pressure_worker.never_returning_claim_libpq_connect,
+                        (unavailable_url.render_as_string(hide_password=False),
+                         str(marker)), 10)
+                assert len(accepted) == 1
+                accepted[0].settimeout(1)
+                while True:
+                    try:
+                        payload = accepted[0].recv(4096)
+                    except ConnectionResetError:
+                        payload = b''
+                    if not payload:
+                        break
+            assert marker.exists()
+            handler_pid = int(marker.read_text(encoding='utf-8'))
+            assert not pathlib.Path(f'/proc/{handler_pid}').exists()
+            assert _proof_session_count(proof_engine) == 0
+
+        assert execute_boundary(executor, str, ('healthy',), 5) == 'healthy'
+    finally:
+        executor.shutdown()
 
 
 def test_physical_close_crossing_deadline_denies_but_receipt_is_reusable(
@@ -942,9 +1334,9 @@ def test_physical_close_crossing_deadline_denies_but_receipt_is_reusable(
     }
     with pytest.raises(proofs.ReclaimProviderProofError,
                        match='physical close'):
-        repository.get_or_prove(**kwargs,
-                                deadline_monotonic=time.monotonic() + 5,
-                                prove=provider)
+        repository.renew(**kwargs,
+                         deadline_monotonic=time.monotonic() + 5,
+                         prove=provider)
     provider.assert_called_once()
     sqlalchemy.event.remove(repository._proof_engine, 'close', _closed)
     monkeypatch.setattr(proofs, '_require_deadline', original_require_deadline)
@@ -957,9 +1349,9 @@ def test_physical_close_crossing_deadline_denies_but_receipt_is_reusable(
     # A result crossing the boundary after commit/physical close denies this
     # caller but does not make the exact server-committed row unsafe to reuse.
     unexpected_provider = mock.Mock()
-    reused = repository.get_or_prove(**kwargs,
-                                     deadline_monotonic=time.monotonic() + 5,
-                                     prove=unexpected_provider)
+    reused = repository.renew(**kwargs,
+                              deadline_monotonic=time.monotonic() + 5,
+                              prove=unexpected_provider)
     unexpected_provider.assert_not_called()
     assert reused.reference.receipt_nonce == persisted_nonce
 
@@ -984,15 +1376,15 @@ def test_lost_commit_ack_denies_current_but_later_reuses_receipt(
     }
     with pytest.raises(proofs.ReclaimProviderProofError,
                        match='lost commit acknowledgement'):
-        repository.get_or_prove(**kwargs,
-                                deadline_monotonic=time.monotonic() + 5,
-                                prove=provider)
+        repository.renew(**kwargs,
+                         deadline_monotonic=time.monotonic() + 5,
+                         prove=provider)
     provider.assert_called_once()
     monkeypatch.setattr(repository, '_commit', original_commit)
     unexpected_provider = mock.Mock()
-    reused = repository.get_or_prove(**kwargs,
-                                     deadline_monotonic=time.monotonic() + 5,
-                                     prove=unexpected_provider)
+    reused = repository.renew(**kwargs,
+                              deadline_monotonic=time.monotonic() + 5,
+                              prove=unexpected_provider)
     unexpected_provider.assert_not_called()
     with proof_engine.connect() as connection:
         assert reused.reference.receipt_nonce == connection.execute(
@@ -1010,9 +1402,9 @@ def test_physical_close_crossing_deadline_denies_existing_receipt_under_lock(
         'kubernetes_context': _CONTEXT,
         'validate': _accept_payload,
     }
-    seeded = repository.get_or_prove(**kwargs,
-                                     deadline_monotonic=time.monotonic() + 5,
-                                     prove=lambda: _proof_candidate())
+    seeded = repository.renew(**kwargs,
+                              deadline_monotonic=time.monotonic() + 5,
+                              prove=lambda: _proof_candidate())
     original_read = repository._read
     read_count = 0
 
@@ -1043,9 +1435,9 @@ def test_physical_close_crossing_deadline_denies_existing_receipt_under_lock(
     provider = mock.Mock()
     with pytest.raises(proofs.ReclaimProviderProofError,
                        match='physical close'):
-        repository.get_or_prove(**kwargs,
-                                deadline_monotonic=time.monotonic() + 5,
-                                prove=provider)
+        repository.renew(**kwargs,
+                         deadline_monotonic=time.monotonic() + 5,
+                         prove=provider)
     provider.assert_not_called()
     assert read_count == 2
     sqlalchemy.event.remove(repository._proof_engine, 'close', _closed)
@@ -1057,47 +1449,64 @@ def test_physical_close_crossing_deadline_denies_existing_receipt_under_lock(
     assert nonces == [seeded.reference.receipt_nonce]
 
 
-def test_launch_database_and_provider_io_run_only_on_proof_workers(
+def test_renewal_runs_provider_io_and_launch_only_reads_receipt(
         proof_engine, monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
-    original_get_or_prove = repository.get_or_prove
+    original_renew = repository.renew
+    original_get_fresh = repository.get_fresh
     construction_threads = []
     repository_threads = []
+    launch_read_threads = []
     provider_threads = []
 
     def _repository_factory():
         construction_threads.append(threading.current_thread().name)
-        assert threading.current_thread().name.startswith(
-            'boltz-reclaim-launch')
         return repository
 
-    def _get_or_prove(**kwargs):
+    def _renew(**kwargs):
         repository_threads.append(threading.current_thread().name)
+        assert threading.current_thread().name.startswith('boltz-reclaim-renew')
+        return original_renew(**kwargs)
+
+    def _get_fresh(**kwargs):
+        launch_read_threads.append(threading.current_thread().name)
         assert threading.current_thread().name.startswith(
             'boltz-reclaim-launch')
-        return original_get_or_prove(**kwargs)
+        return original_get_fresh(**kwargs)
 
     def _provider_job(context_name, domain, _deadline, _cancellation):
-        assert context_name == _CONTEXT
         provider_threads.append(threading.current_thread().name)
         assert threading.current_thread().name.startswith(
             'boltz-reclaim-attest')
-        return _provider_proof(policy, domain)
+        return _provider_proof(policy, domain, context_name)
 
-    monkeypatch.setattr(repository, 'get_or_prove', _get_or_prove)
+    monkeypatch.setattr(repository, 'renew', _renew)
+    monkeypatch.setattr(repository, 'get_fresh', _get_fresh)
     monkeypatch.setattr(proofs, 'ReclaimProviderProofRepository',
                         _repository_factory)
     monkeypatch.setattr(policy, '_provider_job', _provider_job)
     monkeypatch.setattr(policy, '_emit_proof', lambda _payload: None)
+    assert policy.renew_provider_proofs(
+        expected_identity=policy.policy_identity(),
+        expected_gate_generation=_GATE_GENERATION,
+        deadline_monotonic=time.monotonic() + 5)
+    assert not policy.renew_provider_proofs(
+        expected_identity=policy.policy_identity(),
+        expected_gate_generation=_GATE_GENERATION,
+        deadline_monotonic=time.monotonic() + 5)
     policy.authorize_launch(_launch_scope(policy),
                             expected_identity=policy.policy_identity(),
                             expected_gate_generation=_GATE_GENERATION,
                             deadline_monotonic=time.monotonic() + 5)
 
-    assert len(construction_threads) == 1
-    assert len(repository_threads) == 1
-    assert len(provider_threads) == 2
+    assert len(construction_threads) == 3
+    assert all(not name.startswith('boltz-reclaim-launch')
+               for name in construction_threads[:2])
+    assert construction_threads[2].startswith('boltz-reclaim-launch')
+    assert len(repository_threads) == 2 * len(policy._bundle.contexts)
+    assert len(launch_read_threads) == 1
+    assert len(provider_threads) == len(policy._bundle.contexts) * 2
     assert _wait_for_no_thread('boltz-reclaim-launch')
 
 
@@ -1118,14 +1527,26 @@ def test_context_receipt_uses_oldest_asymmetric_domain_completion(
 
     monkeypatch.setattr(policy, '_provider_job', _provider_job)
     monkeypatch.setattr(policy, '_emit_proof', lambda _payload: None)
+    deadline = time.monotonic() + 5
     with mock.patch.object(policy_lib.reserved_fill_reclaim_proofs,
                            'ReclaimProviderProofRepository',
                            return_value=repository):
+        repository.renew(
+            identity=policy.policy_identity(),
+            gate_generation=_GATE_GENERATION,
+            kubernetes_context=_CONTEXT,
+            deadline_monotonic=deadline,
+            prove=lambda: policy._prove_context(
+                _CONTEXT, proofs.provider_proof_deadline(deadline)),
+            validate=lambda summary: policy._validate_context_summary(
+                _CONTEXT, summary),
+            minimum_remaining_seconds=(
+                reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS))
         authorization = policy.authorize_launch(
             _launch_scope(policy),
             expected_identity=policy.policy_identity(),
             expected_gate_generation=_GATE_GENERATION,
-            deadline_monotonic=time.monotonic() + 5)
+            deadline_monotonic=deadline)
 
     completed = authorization.provider_proof_reference.completed_monotonic
     assert completed - min(starts.values()) >= 0.15
@@ -1151,12 +1572,12 @@ def test_repository_rejects_untyped_or_out_of_interval_candidate(proof_engine):
     )
     for prove, message in cases:
         with pytest.raises(proofs.ReclaimProviderProofError, match=message):
-            repository.get_or_prove(identity=_identity(),
-                                    gate_generation=_GATE_GENERATION,
-                                    kubernetes_context=_CONTEXT,
-                                    deadline_monotonic=time.monotonic() + 5,
-                                    prove=prove,
-                                    validate=_accept_payload)
+            repository.renew(identity=_identity(),
+                             gate_generation=_GATE_GENERATION,
+                             kubernetes_context=_CONTEXT,
+                             deadline_monotonic=time.monotonic() + 5,
+                             prove=prove,
+                             validate=_accept_payload)
     with proof_engine.connect() as connection:
         assert connection.execute(
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
@@ -1167,7 +1588,7 @@ def test_repository_rejects_untyped_or_out_of_interval_candidate(proof_engine):
 @pytest.mark.parametrize(
     'worker_count',
     (15, pytest.param(90, marks=pytest.mark.serve054_process_pressure)))
-def test_multiprocess_launches_share_fresh_provider_receipt(
+def test_multiprocess_renewers_share_receipt_and_launch_reads(
         proof_engine, worker_count):
     # The ordinary pytest process keeps the normal package initializers. Only
     # each clean spawned worker takes the pressure helper's narrow import path.
@@ -1282,7 +1703,8 @@ def test_multiprocess_launches_share_fresh_provider_receipt(
                 barrier_cleanup.callback(start_event.set)
                 futures = tuple(
                     executor.submit(
-                        pressure_worker.multiprocess_launch_authorization,
+                        pressure_worker.
+                        multiprocess_proof_renewal_and_launch_read,
                         database_url, ready_queue, start_event, deadline_value,
                         provider_started_queue, provider_release_event,
                         loser_parked_queue, loser_release_event)
@@ -1467,7 +1889,7 @@ def test_multiprocess_launches_share_fresh_provider_receipt(
             f'the dedicated-runner limit {cgroup_memory_limit}.')
 
 
-def test_expired_identical_receipt_refreshes_once_without_revoking_reference(
+def test_aged_identical_receipt_refreshes_once_without_revoking_reference(
         proof_engine):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
     calls = 0
@@ -1488,16 +1910,22 @@ def test_expired_identical_receipt_refreshes_once_without_revoking_reference(
         'prove': prove,
         'validate': _accept_payload,
     }
-    first = repository.get_or_prove(**kwargs)
+    first = repository.renew(**kwargs)
+    assert first.publication_observed
     with proof_engine.begin() as connection:
         connection.execute(
             sqlalchemy.text("""
                 UPDATE serve_reserved_fill_reclaim_provider_proofs
-                SET completed_at = CURRENT_TIMESTAMP - INTERVAL '10 seconds'
-            """))
+                SET completed_at = clock_timestamp()
+                    - make_interval(secs => :age)
+            """), {
+                'age':
+                    (reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS -
+                     reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS + 1)
+            })
 
     def refresh():
-        return repository.get_or_prove(**{
+        return repository.renew(**{
             **kwargs,
             'deadline_monotonic': time.monotonic() + 5,
         })
@@ -1505,6 +1933,7 @@ def test_expired_identical_receipt_refreshes_once_without_revoking_reference(
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         refreshed = tuple(executor.map(lambda _: refresh(), range(8)))
     assert calls == 2
+    assert any(item.publication_observed for item in refreshed)
     refreshed_nonces = {item.reference.receipt_nonce for item in refreshed}
     assert len(refreshed_nonces) == 1
     assert refreshed_nonces == {first.reference.receipt_nonce}
@@ -1531,10 +1960,10 @@ def test_receipt_without_terminal_guard_reserve_is_refreshed(proof_engine):
         'prove': prove,
         'validate': _accept_payload,
     }
-    first = repository.get_or_prove(**kwargs,
-                                    deadline_monotonic=time.monotonic() + 5)
-    near_expiry_age = (reclaim.AUTHORIZATION_MAX_AGE_SECONDS -
-                       reclaim.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS / 2)
+    first = repository.renew(**kwargs, deadline_monotonic=time.monotonic() + 5)
+    near_expiry_age = (
+        reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS -
+        reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS / 2)
     with proof_engine.begin() as connection:
         connection.execute(
             sqlalchemy.text("""
@@ -1543,8 +1972,8 @@ def test_receipt_without_terminal_guard_reserve_is_refreshed(proof_engine):
                     - make_interval(secs => :age)
             """), {'age': near_expiry_age})
 
-    refreshed = repository.get_or_prove(**kwargs,
-                                        deadline_monotonic=time.monotonic() + 5)
+    refreshed = repository.renew(**kwargs,
+                                 deadline_monotonic=time.monotonic() + 5)
 
     assert calls == 2
     assert refreshed.reference.receipt_nonce == first.reference.receipt_nonce
@@ -1575,11 +2004,10 @@ def test_concurrent_launches_refresh_before_delayed_terminal_guard(
         'prove': prove,
         'validate': _accept_payload,
     }
-    seeded = repository.get_or_prove(**common,
-                                     deadline_monotonic=time.monotonic() + 5)
+    seeded = repository.renew(**common, deadline_monotonic=time.monotonic() + 5)
     old_handoff_remaining = 1.0
     assert old_handoff_remaining < (
-        reclaim.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS)
+        reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS)
     with proof_engine.begin() as connection:
         connection.execute(
             sqlalchemy.text("""
@@ -1587,7 +2015,7 @@ def test_concurrent_launches_refresh_before_delayed_terminal_guard(
                 SET completed_at = clock_timestamp()
                     - make_interval(secs => :age)
             """), {
-                'age': (reclaim.AUTHORIZATION_MAX_AGE_SECONDS -
+                'age': (reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS -
                         old_handoff_remaining)
             })
 
@@ -1596,9 +2024,8 @@ def test_concurrent_launches_refresh_before_delayed_terminal_guard(
     terminal_entry_delay = old_handoff_remaining + 0.1
 
     def launch():
-        receipt = repository.get_or_prove(**common,
-                                          deadline_monotonic=time.monotonic() +
-                                          5)
+        receipt = repository.renew(**common,
+                                   deadline_monotonic=time.monotonic() + 5)
         handoff_barrier.wait(timeout=5)
         time.sleep(terminal_entry_delay)
         with proof_engine.begin() as connection:
@@ -1627,13 +2054,13 @@ def test_slow_validation_cannot_consume_terminal_guard_reserve(proof_engine):
         'gate_generation': _GATE_GENERATION,
         'kubernetes_context': _CONTEXT,
     }
-    repository.get_or_prove(**common,
-                            deadline_monotonic=time.monotonic() + 5,
-                            prove=_proof_candidate,
-                            validate=_accept_payload)
+    repository.renew(**common,
+                     deadline_monotonic=time.monotonic() + 5,
+                     prove=_proof_candidate,
+                     validate=_accept_payload)
     age_before_validation = (
-        reclaim.AUTHORIZATION_MAX_AGE_SECONDS -
-        reclaim.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS - 0.2)
+        reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS -
+        reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS - 0.2)
     with proof_engine.begin() as connection:
         connection.execute(
             sqlalchemy.text("""
@@ -1655,10 +2082,10 @@ def test_slow_validation_cannot_consume_terminal_guard_reserve(proof_engine):
         prove_calls += 1
         return _proof_candidate()
 
-    refreshed = repository.get_or_prove(**common,
-                                        deadline_monotonic=time.monotonic() + 5,
-                                        prove=prove,
-                                        validate=slow_validate)
+    refreshed = repository.renew(**common,
+                                 deadline_monotonic=time.monotonic() + 5,
+                                 prove=prove,
+                                 validate=slow_validate)
 
     assert validation_calls >= 2
     assert prove_calls == 1
@@ -1672,12 +2099,12 @@ def test_connection_close_cannot_consume_terminal_guard_reserve(proof_engine):
         'gate_generation': _GATE_GENERATION,
         'kubernetes_context': _CONTEXT,
     }
-    repository.get_or_prove(**common,
-                            deadline_monotonic=time.monotonic() + 5,
-                            prove=_proof_candidate,
-                            validate=_accept_payload)
-    age_before_close = (reclaim.AUTHORIZATION_MAX_AGE_SECONDS -
-                        reclaim.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS -
+    repository.renew(**common,
+                     deadline_monotonic=time.monotonic() + 5,
+                     prove=_proof_candidate,
+                     validate=_accept_payload)
+    age_before_close = (reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS -
+                        reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS -
                         0.4)
     with proof_engine.begin() as connection:
         connection.execute(
@@ -1702,11 +2129,10 @@ def test_connection_close_cannot_consume_terminal_guard_reserve(proof_engine):
     sqlalchemy.event.listen(repository._proof_engine, 'close',
                             delay_first_physical_close)
     try:
-        refreshed = repository.get_or_prove(**common,
-                                            deadline_monotonic=time.monotonic()
-                                            + 5,
-                                            prove=prove,
-                                            validate=_accept_payload)
+        refreshed = repository.renew(**common,
+                                     deadline_monotonic=time.monotonic() + 5,
+                                     prove=prove,
+                                     validate=_accept_payload)
     finally:
         sqlalchemy.event.remove(repository._proof_engine, 'close',
                                 delay_first_physical_close)
@@ -1723,18 +2149,18 @@ def test_changed_proof_refresh_rotates_nonce_and_revokes_old_reference(
         **_proof_payload(),
         'inventory_revision': 'old',
     }
-    first = repository.get_or_prove(identity=_identity(),
-                                    gate_generation=_GATE_GENERATION,
-                                    kubernetes_context=_CONTEXT,
-                                    deadline_monotonic=time.monotonic() + 5,
-                                    prove=lambda: _proof_candidate(old_payload),
-                                    validate=_accept_payload)
+    first = repository.renew(identity=_identity(),
+                             gate_generation=_GATE_GENERATION,
+                             kubernetes_context=_CONTEXT,
+                             deadline_monotonic=time.monotonic() + 5,
+                             prove=lambda: _proof_candidate(old_payload),
+                             validate=_accept_payload)
     new_payload = {
         **_proof_payload(),
         'inventory_revision': 'new',
     }
 
-    refreshed = repository.get_or_prove(
+    refreshed = repository.renew(
         identity=_identity(),
         gate_generation=_GATE_GENERATION,
         kubernetes_context=_CONTEXT,
@@ -1754,50 +2180,6 @@ def test_changed_proof_refresh_rotates_nonce_and_revokes_old_reference(
             expected_physical_cluster_uid='physical-cluster-uid')
 
 
-def test_staggered_launches_span_two_identical_renewals(proof_engine):
-    repository = proofs.ReclaimProviderProofRepository(proof_engine)
-    proof_calls = 0
-    proof_calls_lock = threading.Lock()
-    worker_count = 90
-    wave_horizon_seconds = 10.0
-    wave_started = time.monotonic() + 0.1
-
-    def prove():
-        nonlocal proof_calls
-        with proof_calls_lock:
-            proof_calls += 1
-        time.sleep(0.03)
-        return _proof_candidate()
-
-    def launch(index):
-        scheduled = (wave_started + wave_horizon_seconds * index /
-                     (worker_count - 1))
-        remaining = scheduled - time.monotonic()
-        if remaining > 0:
-            time.sleep(remaining)
-        receipt = repository.get_or_prove(identity=_identity(),
-                                          gate_generation=_GATE_GENERATION,
-                                          kubernetes_context=_CONTEXT,
-                                          deadline_monotonic=time.monotonic() +
-                                          5,
-                                          prove=prove,
-                                          validate=_accept_payload)
-        with proof_engine.begin() as connection:
-            holds = proofs.provider_proof_reference_holds_in_connection(
-                connection,
-                receipt.reference,
-                expected_physical_cluster_uid='physical-cluster-uid')
-        return receipt.reference.receipt_nonce, holds
-
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=worker_count) as executor:
-        results = tuple(executor.map(launch, range(worker_count)))
-
-    assert proof_calls >= 3
-    assert len({nonce for nonce, _ in results}) == 1
-    assert all(holds for _, holds in results)
-
-
 def test_distinct_context_authorities_prove_in_parallel(proof_engine):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
     provider_barrier = threading.Barrier(2)
@@ -1807,12 +2189,12 @@ def test_distinct_context_authorities_prove_in_parallel(proof_engine):
         return _proof_candidate()
 
     def authorize(context_name):
-        return repository.get_or_prove(identity=_identity(),
-                                       gate_generation=_GATE_GENERATION,
-                                       kubernetes_context=context_name,
-                                       deadline_monotonic=time.monotonic() + 5,
-                                       prove=prove,
-                                       validate=_accept_payload)
+        return repository.renew(identity=_identity(),
+                                gate_generation=_GATE_GENERATION,
+                                kubernetes_context=context_name,
+                                deadline_monotonic=time.monotonic() + 5,
+                                prove=prove,
+                                validate=_accept_payload)
 
     contexts = ('context-a', 'context-b')
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -1852,7 +2234,7 @@ def test_leader_transaction_uses_live_idle_timeout_and_holds_xact_lock(
 
     monkeypatch.setattr(repository, '_read', observed_read)
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(repository.get_or_prove,
+        future = executor.submit(repository.renew,
                                  identity=_identity(),
                                  gate_generation=_GATE_GENERATION,
                                  kubernetes_context=_CONTEXT,
@@ -1922,13 +2304,13 @@ def test_waiter_timeout_does_not_cancel_leader(proof_engine):
         'kubernetes_context': _CONTEXT,
     }
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        leader = executor.submit(leader_repository.get_or_prove,
+        leader = executor.submit(leader_repository.renew,
                                  **common,
                                  deadline_monotonic=time.monotonic() + 5,
                                  prove=leader_proof,
                                  validate=_accept_payload)
         assert leader_entered.wait(timeout=2)
-        waiter = executor.submit(waiter_repository.get_or_prove,
+        waiter = executor.submit(waiter_repository.renew,
                                  **common,
                                  deadline_monotonic=time.monotonic() + 1.8,
                                  prove=waiter_proof,
@@ -1959,8 +2341,7 @@ def test_malformed_receipt_is_reproved_under_exact_lock(proof_engine):
         'prove': prove,
         'validate': _accept_payload,
     }
-    first = repository.get_or_prove(**kwargs,
-                                    deadline_monotonic=time.monotonic() + 5)
+    first = repository.renew(**kwargs, deadline_monotonic=time.monotonic() + 5)
     with proof_engine.begin() as connection:
         connection.execute(
             sqlalchemy.text("""
@@ -1968,8 +2349,8 @@ def test_malformed_receipt_is_reproved_under_exact_lock(proof_engine):
                 SET proof_sha256 = :wrong_digest
             """), {'wrong_digest': 'f' * 64})
 
-    refreshed = repository.get_or_prove(**kwargs,
-                                        deadline_monotonic=time.monotonic() + 5)
+    refreshed = repository.renew(**kwargs,
+                                 deadline_monotonic=time.monotonic() + 5)
 
     assert calls == 2
     assert refreshed.reference.receipt_nonce != first.reference.receipt_nonce
@@ -1977,7 +2358,7 @@ def test_malformed_receipt_is_reproved_under_exact_lock(proof_engine):
 
 
 @pytest.mark.parametrize('bad_domain', ('aws', 'kubernetes'))
-def test_semantically_wrong_cached_summary_is_reproved_by_policy(
+def test_semantically_wrong_receipt_is_repaired_only_by_renewer(
         proof_engine, monkeypatch, bad_domain):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
@@ -1991,13 +2372,12 @@ def test_semantically_wrong_cached_summary_is_reproved_by_policy(
     else:
         bad_payload['kubernetes'][
             'physical_cluster_uid'] = 'wrong-physical-cluster'
-    seeded = repository.get_or_prove(
-        identity=policy.policy_identity(),
-        gate_generation=_GATE_GENERATION,
-        kubernetes_context=_CONTEXT,
-        deadline_monotonic=time.monotonic() + 5,
-        prove=lambda: _proof_candidate(bad_payload),
-        validate=_accept_payload)
+    seeded = repository.renew(identity=policy.policy_identity(),
+                              gate_generation=_GATE_GENERATION,
+                              kubernetes_context=_CONTEXT,
+                              deadline_monotonic=time.monotonic() + 5,
+                              prove=lambda: _proof_candidate(bad_payload),
+                              validate=_accept_payload)
     provider_calls = []
 
     def provider_job(context_name, domain, _deadline, _cancellation):
@@ -2007,9 +2387,28 @@ def test_semantically_wrong_cached_summary_is_reproved_by_policy(
 
     monkeypatch.setattr(policy, '_provider_job', provider_job)
     monkeypatch.setattr(policy, '_emit_proof', lambda _payload: None)
+    deadline = time.monotonic() + 5
     with mock.patch.object(policy_lib.reserved_fill_reclaim_proofs,
                            'ReclaimProviderProofRepository',
                            return_value=repository):
+        with pytest.raises(reclaim.ReclaimAttestationError,
+                           match='no fresh exact'):
+            policy.authorize_launch(_launch_scope(policy),
+                                    expected_identity=policy.policy_identity(),
+                                    expected_gate_generation=_GATE_GENERATION,
+                                    deadline_monotonic=deadline)
+        assert not provider_calls
+        repository.renew(
+            identity=policy.policy_identity(),
+            gate_generation=_GATE_GENERATION,
+            kubernetes_context=_CONTEXT,
+            deadline_monotonic=deadline,
+            prove=lambda: policy._prove_context(
+                _CONTEXT, proofs.provider_proof_deadline(deadline)),
+            validate=lambda summary: policy._validate_context_summary(
+                _CONTEXT, summary),
+            minimum_remaining_seconds=(
+                reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS))
         authorization = policy.authorize_launch(
             _launch_scope(policy),
             expected_identity=policy.policy_identity(),
@@ -2030,9 +2429,9 @@ def test_cached_receipt_cannot_cross_caller_deadline_during_validation(
         'kubernetes_context': _CONTEXT,
         'prove': lambda: _proof_candidate(),
     }
-    repository.get_or_prove(**kwargs,
-                            deadline_monotonic=time.monotonic() + 5,
-                            validate=_accept_payload)
+    repository.renew(**kwargs,
+                     deadline_monotonic=time.monotonic() + 5,
+                     validate=_accept_payload)
 
     def slow_validation(_payload):
         time.sleep(0.08)
@@ -2040,9 +2439,9 @@ def test_cached_receipt_cannot_cross_caller_deadline_during_validation(
 
     with pytest.raises(proofs.ReclaimProviderProofError,
                        match='deadline is invalid or expired'):
-        repository.get_or_prove(**kwargs,
-                                deadline_monotonic=time.monotonic() + 0.05,
-                                validate=slow_validation)
+        repository.renew(**kwargs,
+                         deadline_monotonic=time.monotonic() + 0.05,
+                         validate=slow_validation)
 
 
 def test_future_receipt_clock_fails_before_provider_io(proof_engine):
@@ -2061,8 +2460,7 @@ def test_future_receipt_clock_fails_before_provider_io(proof_engine):
         'prove': prove,
         'validate': _accept_payload,
     }
-    first = repository.get_or_prove(**kwargs,
-                                    deadline_monotonic=time.monotonic() + 5)
+    first = repository.renew(**kwargs, deadline_monotonic=time.monotonic() + 5)
     with proof_engine.begin() as connection:
         connection.execute(
             sqlalchemy.text("""
@@ -2072,8 +2470,7 @@ def test_future_receipt_clock_fails_before_provider_io(proof_engine):
 
     with pytest.raises(proofs.ReclaimProviderProofError,
                        match='database clock is indeterminate'):
-        repository.get_or_prove(**kwargs,
-                                deadline_monotonic=time.monotonic() + 5)
+        repository.renew(**kwargs, deadline_monotonic=time.monotonic() + 5)
     with proof_engine.connect() as connection:
         nonce, digest = connection.execute(
             sqlalchemy.select(
@@ -2101,12 +2498,12 @@ def test_uncertain_returning_row_rolls_back_publication(proof_engine,
     monkeypatch.setattr(repository, '_decode_query_row', reject_inserted_row)
     with pytest.raises(proofs.ReclaimProviderProofError,
                        match='forced post-insert clock uncertainty'):
-        repository.get_or_prove(identity=_identity(),
-                                gate_generation=_GATE_GENERATION,
-                                kubernetes_context=_CONTEXT,
-                                deadline_monotonic=time.monotonic() + 5,
-                                prove=lambda: _proof_candidate(),
-                                validate=_accept_payload)
+        repository.renew(identity=_identity(),
+                         gate_generation=_GATE_GENERATION,
+                         kubernetes_context=_CONTEXT,
+                         deadline_monotonic=time.monotonic() + 5,
+                         prove=lambda: _proof_candidate(),
+                         validate=_accept_payload)
 
     with proof_engine.connect() as connection:
         assert connection.execute(
@@ -2122,12 +2519,12 @@ def test_failed_provider_proof_is_not_persisted(proof_engine):
         raise RuntimeError('provider failed')
 
     with pytest.raises(RuntimeError, match='provider failed'):
-        repository.get_or_prove(identity=_identity(),
-                                gate_generation=_GATE_GENERATION,
-                                kubernetes_context=_CONTEXT,
-                                deadline_monotonic=time.monotonic() + 5,
-                                prove=fail,
-                                validate=_accept_payload)
+        repository.renew(identity=_identity(),
+                         gate_generation=_GATE_GENERATION,
+                         kubernetes_context=_CONTEXT,
+                         deadline_monotonic=time.monotonic() + 5,
+                         prove=fail,
+                         validate=_accept_payload)
     with proof_engine.connect() as connection:
         assert connection.execute(
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
@@ -2153,12 +2550,12 @@ def test_lost_advisory_session_cannot_publish(proof_engine, monkeypatch):
 
     monkeypatch.setattr(repository, '_publish', lose_session)
     with pytest.raises(Exception):
-        repository.get_or_prove(identity=_identity(),
-                                gate_generation=_GATE_GENERATION,
-                                kubernetes_context=_CONTEXT,
-                                deadline_monotonic=time.monotonic() + 5,
-                                prove=lambda: _proof_candidate(),
-                                validate=_accept_payload)
+        repository.renew(identity=_identity(),
+                         gate_generation=_GATE_GENERATION,
+                         kubernetes_context=_CONTEXT,
+                         deadline_monotonic=time.monotonic() + 5,
+                         prove=lambda: _proof_candidate(),
+                         validate=_accept_payload)
     with proof_engine.connect() as connection:
         assert connection.execute(
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
@@ -2222,14 +2619,14 @@ def test_lost_leader_fails_wave_and_later_call_recovers(proof_engine,
         'validate': _accept_payload,
     }
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        leader = executor.submit(leader_repository.get_or_prove,
+        leader = executor.submit(leader_repository.renew,
                                  **common,
                                  deadline_monotonic=time.monotonic() + 5,
                                  prove=leader_proof)
         assert leader_entered.wait(timeout=2)
         waiter_deadline = time.monotonic() + 1.8
         waiters = tuple(
-            executor.submit(repository.get_or_prove,
+            executor.submit(repository.renew,
                             **common,
                             deadline_monotonic=waiter_deadline,
                             prove=waiter_proof)
@@ -2256,10 +2653,8 @@ def test_lost_leader_fails_wave_and_later_call_recovers(proof_engine,
         recovery_calls += 1
         return _proof_candidate()
 
-    recovered = proofs.ReclaimProviderProofRepository(
-        proof_engine).get_or_prove(**common,
-                                   deadline_monotonic=time.monotonic() + 5,
-                                   prove=recovery_proof)
+    recovered = proofs.ReclaimProviderProofRepository(proof_engine).renew(
+        **common, deadline_monotonic=time.monotonic() + 5, prove=recovery_proof)
     assert provider_calls == ['lost-leader']
     assert all(election.call_count == 1 for election in waiter_elections)
     assert recovery_calls == 1
@@ -2268,12 +2663,12 @@ def test_lost_leader_fails_wave_and_later_call_recovers(proof_engine,
 
 def test_final_guard_rejects_stale_or_mismatched_receipt(proof_engine):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
-    receipt = repository.get_or_prove(identity=_identity(),
-                                      gate_generation=_GATE_GENERATION,
-                                      kubernetes_context=_CONTEXT,
-                                      deadline_monotonic=time.monotonic() + 5,
-                                      prove=_proof_candidate,
-                                      validate=_accept_payload)
+    receipt = repository.renew(identity=_identity(),
+                               gate_generation=_GATE_GENERATION,
+                               kubernetes_context=_CONTEXT,
+                               deadline_monotonic=time.monotonic() + 5,
+                               prove=_proof_candidate,
+                               validate=_accept_payload)
     reference = receipt.reference
     with proof_engine.begin() as connection:
         assert proofs.provider_proof_reference_holds_in_connection(
@@ -2293,7 +2688,7 @@ def test_final_guard_rejects_stale_or_mismatched_receipt(proof_engine):
         locally_stale = dataclasses.replace(
             reference,
             completed_monotonic=(reference.completed_monotonic -
-                                 reclaim.AUTHORIZATION_MAX_AGE_SECONDS - 1))
+                                 reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS - 1))
         assert not proofs.provider_proof_reference_holds_in_connection(
             connection,
             locally_stale,
@@ -2322,8 +2717,9 @@ def test_final_guard_rejects_stale_or_mismatched_receipt(proof_engine):
         connection.execute(
             sqlalchemy.text("""
                 UPDATE serve_reserved_fill_reclaim_provider_proofs
-                SET completed_at = CURRENT_TIMESTAMP - INTERVAL '10 seconds'
-            """))
+                SET completed_at = clock_timestamp()
+                    - make_interval(secs => :age)
+            """), {'age': reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS + 1})
     with proof_engine.begin() as connection:
         assert not proofs.provider_proof_reference_holds_in_connection(
             connection,
@@ -2333,12 +2729,12 @@ def test_final_guard_rejects_stale_or_mismatched_receipt(proof_engine):
 
 def test_final_guard_requires_read_committed_isolation(proof_engine):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
-    receipt = repository.get_or_prove(identity=_identity(),
-                                      gate_generation=_GATE_GENERATION,
-                                      kubernetes_context=_CONTEXT,
-                                      deadline_monotonic=time.monotonic() + 5,
-                                      prove=_proof_candidate,
-                                      validate=_accept_payload)
+    receipt = repository.renew(identity=_identity(),
+                               gate_generation=_GATE_GENERATION,
+                               kubernetes_context=_CONTEXT,
+                               deadline_monotonic=time.monotonic() + 5,
+                               prove=_proof_candidate,
+                               validate=_accept_payload)
     with proof_engine.connect().execution_options(
             isolation_level='REPEATABLE READ') as connection:
         with connection.begin():
@@ -2359,12 +2755,12 @@ def test_final_guard_requires_read_committed_isolation(proof_engine):
 def test_final_guard_rejects_malformed_authority_row(proof_engine, column,
                                                      value):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
-    receipt = repository.get_or_prove(identity=_identity(),
-                                      gate_generation=_GATE_GENERATION,
-                                      kubernetes_context=_CONTEXT,
-                                      deadline_monotonic=time.monotonic() + 5,
-                                      prove=_proof_candidate,
-                                      validate=_accept_payload)
+    receipt = repository.renew(identity=_identity(),
+                               gate_generation=_GATE_GENERATION,
+                               kubernetes_context=_CONTEXT,
+                               deadline_monotonic=time.monotonic() + 5,
+                               prove=_proof_candidate,
+                               validate=_accept_payload)
     reference = receipt.reference
     table = proof_schema.serve_reserved_fill_reclaim_provider_proofs_table
     with proof_engine.begin() as connection:
@@ -2381,12 +2777,12 @@ def test_final_guard_rejects_malformed_authority_row(proof_engine, column,
 
 def test_final_guard_rejects_missing_row(proof_engine):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
-    receipt = repository.get_or_prove(identity=_identity(),
-                                      gate_generation=_GATE_GENERATION,
-                                      kubernetes_context=_CONTEXT,
-                                      deadline_monotonic=time.monotonic() + 5,
-                                      prove=_proof_candidate,
-                                      validate=_accept_payload)
+    receipt = repository.renew(identity=_identity(),
+                               gate_generation=_GATE_GENERATION,
+                               kubernetes_context=_CONTEXT,
+                               deadline_monotonic=time.monotonic() + 5,
+                               prove=_proof_candidate,
+                               validate=_accept_payload)
     reference = receipt.reference
     table = proof_schema.serve_reserved_fill_reclaim_provider_proofs_table
     with proof_engine.begin() as connection:
@@ -2402,12 +2798,12 @@ def test_final_guard_rejects_missing_row(proof_engine):
 
 def test_final_guard_rejects_delete_reinsert_aba(proof_engine):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
-    receipt = repository.get_or_prove(identity=_identity(),
-                                      gate_generation=_GATE_GENERATION,
-                                      kubernetes_context=_CONTEXT,
-                                      deadline_monotonic=time.monotonic() + 5,
-                                      prove=_proof_candidate,
-                                      validate=_accept_payload)
+    receipt = repository.renew(identity=_identity(),
+                               gate_generation=_GATE_GENERATION,
+                               kubernetes_context=_CONTEXT,
+                               deadline_monotonic=time.monotonic() + 5,
+                               prove=_proof_candidate,
+                               validate=_accept_payload)
     old_reference = receipt.reference
     table = proof_schema.serve_reserved_fill_reclaim_provider_proofs_table
     with proof_engine.begin() as connection:
@@ -2415,13 +2811,12 @@ def test_final_guard_rejects_delete_reinsert_aba(proof_engine):
             sqlalchemy.delete(table).where(
                 table.c.receipt_nonce == old_reference.receipt_nonce))
 
-    replacement = repository.get_or_prove(identity=_identity(),
-                                          gate_generation=_GATE_GENERATION,
-                                          kubernetes_context=_CONTEXT,
-                                          deadline_monotonic=time.monotonic() +
-                                          5,
-                                          prove=lambda: _proof_candidate(),
-                                          validate=_accept_payload)
+    replacement = repository.renew(identity=_identity(),
+                                   gate_generation=_GATE_GENERATION,
+                                   kubernetes_context=_CONTEXT,
+                                   deadline_monotonic=time.monotonic() + 5,
+                                   prove=lambda: _proof_candidate(),
+                                   validate=_accept_payload)
     assert replacement.reference.proof_sha256 == (old_reference.proof_sha256)
     assert replacement.reference.receipt_nonce != (old_reference.receipt_nonce)
     with proof_engine.begin() as connection:
@@ -2442,13 +2837,12 @@ def test_mvcc_guard_orders_before_changed_refresh_commit_without_blocking(
         **_proof_payload(),
         'inventory_revision': 'old',
     }
-    receipt = repository.get_or_prove(
-        identity=_identity(),
-        gate_generation=_GATE_GENERATION,
-        kubernetes_context=_CONTEXT,
-        deadline_monotonic=time.monotonic() + 5,
-        prove=lambda: _proof_candidate(old_payload),
-        validate=_accept_payload)
+    receipt = repository.renew(identity=_identity(),
+                               gate_generation=_GATE_GENERATION,
+                               kubernetes_context=_CONTEXT,
+                               deadline_monotonic=time.monotonic() + 5,
+                               prove=lambda: _proof_candidate(old_payload),
+                               validate=_accept_payload)
     old_reference = receipt.reference
     refresh_calls = 0
 
@@ -2471,7 +2865,7 @@ def test_mvcc_guard_orders_before_changed_refresh_commit_without_blocking(
             old_reference,
             expected_physical_cluster_uid='physical-cluster-uid')
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            refresh = executor.submit(repository.get_or_prove,
+            refresh = executor.submit(repository.renew,
                                       identity=_identity(),
                                       gate_generation=_GATE_GENERATION,
                                       kubernetes_context=_CONTEXT,
@@ -2508,12 +2902,12 @@ def test_mvcc_guard_orders_before_changed_refresh_commit_without_blocking(
 def test_uncommitted_identical_refresh_does_not_block_or_reject_final_guard(
         proof_engine):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
-    receipt = repository.get_or_prove(identity=_identity(),
-                                      gate_generation=_GATE_GENERATION,
-                                      kubernetes_context=_CONTEXT,
-                                      deadline_monotonic=time.monotonic() + 5,
-                                      prove=_proof_candidate,
-                                      validate=_accept_payload)
+    receipt = repository.renew(identity=_identity(),
+                               gate_generation=_GATE_GENERATION,
+                               kubernetes_context=_CONTEXT,
+                               deadline_monotonic=time.monotonic() + 5,
+                               prove=_proof_candidate,
+                               validate=_accept_payload)
     table = proof_schema.serve_reserved_fill_reclaim_provider_proofs_table
     provider_effect = mock.Mock()
     refresh_connection = proof_engine.connect()

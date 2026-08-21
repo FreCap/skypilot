@@ -67,7 +67,20 @@ from boltz_reserved_fill_reclaim_policy import (  # noqa: E402
 from boltz_reserved_fill_reclaim_policy import policy as policy_lib
 
 _CONTEXT = 'phx_research_cluster_eks'
-_GATE_GENERATION = 17
+_GATE_GENERATION = 1
+
+
+def never_returning_claim_libpq_connect(database_url: str,
+                                        marker_path: str) -> None:
+    """Expose the handler identity, then block in a libpq handshake."""
+    pathlib.Path(marker_path).write_text(str(os.getpid()), encoding='utf-8')
+    engine = sqlalchemy.create_engine(database_url,
+                                      poolclass=sqlalchemy.NullPool)
+    try:
+        with engine.connect():
+            raise AssertionError('Blackholed libpq connection returned.')
+    finally:
+        engine.dispose()
 
 
 def _admission(
@@ -157,7 +170,7 @@ def _provider_proof(
             for node in provider['node_inventory']))
 
 
-def multiprocess_launch_authorization(
+def multiprocess_proof_renewal_and_launch_read(
     database_url: str,
     ready_queue: Any,
     start_event: Any,
@@ -167,7 +180,7 @@ def multiprocess_launch_authorization(
     loser_parked_queue: Any,
     loser_release_event: Any,
 ) -> tuple[str, bool, float, float, bool]:
-    """Create one independent policy/engine, like a disposable handler."""
+    """Collide independent renewers, then consume the shared exact receipt."""
     engine = sqlalchemy.create_engine(
         database_url,
         pool_size=2,
@@ -223,6 +236,17 @@ def multiprocess_launch_authorization(
     with mock.patch.object(policy_lib.reserved_fill_reclaim_proofs,
                            'ReclaimProviderProofRepository',
                            return_value=repository):
+        repository.renew(
+            identity=identity,
+            gate_generation=_GATE_GENERATION,
+            kubernetes_context=_CONTEXT,
+            deadline_monotonic=deadline,
+            prove=lambda: policy._prove_context(
+                _CONTEXT, proofs.provider_proof_deadline(deadline)),
+            validate=lambda summary: policy._validate_context_summary(
+                _CONTEXT, summary),
+            minimum_remaining_seconds=(
+                reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS))
         authorization = policy.authorize_launch(
             _launch_scope(policy),
             expected_identity=identity,
