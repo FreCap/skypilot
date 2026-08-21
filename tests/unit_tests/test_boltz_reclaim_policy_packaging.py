@@ -59,7 +59,7 @@ def test_policy_contract_revision_is_independent_from_artifact_version():
     # __version__; executable policy authority remains review-owned source.
     assert assignments == {
         '__version__': '0.0.0',
-        'POLICY_REVISION': '1.1.1416',
+        'POLICY_REVISION': '1.1.1422',
     }
     # This is the exact already-authorized production policy contract.  An
     # executable policy change must deliberately advance it; ordinary overlay
@@ -84,6 +84,7 @@ def test_policy_contract_revision_is_independent_from_artifact_version():
         'f1669f55fa671cf037835867a773389792fba7871b2ffa03922b7d9e2ddd41e0': '1.1.1386',
         'c7a7c52526f96eb6dc5e1abab069fc3b0eec9f2cd2804f879f543ee4d030e831': '1.1.1415',
         '1835a060709064448fc5bc6560ebd5b7b265857f0a0ce20fe7eef09baa4944a1': '1.1.1416',
+        'f7a8962ecbc54f4327a446cee1685c56cf9bb84963696d4734a2192a0a556de2': '1.1.1422',
     }
     assert reviewed_revisions[implementation_digest.hexdigest()] == (
         assignments['POLICY_REVISION'])

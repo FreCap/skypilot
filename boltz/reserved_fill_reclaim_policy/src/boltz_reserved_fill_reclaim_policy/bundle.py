@@ -42,7 +42,6 @@ _CLUSTER_QUEUE_KEYS: Final = frozenset({
     'cohort_name', 'fair_sharing_weight', 'flavor_fungibility', 'name',
     'namespace', 'preemption', 'queueing_strategy', 'quota_profile'
 })
-_COHORT_KEYS: Final = frozenset({'name', 'parent_name'})
 _FLAVOR_FUNGIBILITY_KEYS: Final = frozenset(
     {'when_can_borrow', 'when_can_preempt'})
 _QUANTITY_RE: Final = re.compile(
@@ -74,28 +73,28 @@ _WORKER_RESOURCE_PER_GPU: Final = {
 }
 _RESERVED_FILL_POD_PRIORITY_CLASS: Final = (
     'rescluster-k8s-prod-east1-preemptible-inference-low')
-_RESERVED_FILL_WORKLOAD_PRIORITY_CLASS: Final = 'skypilot-reserved-fill'
-_RESERVED_FILL_PRIORITY_VALUE: Final = -1000
-_REVIEWED_KUEUE_COHORTS: Final = {
-    'shared-pool': None,
-    'research-workloads': 'shared-pool',
-}
+_RESERVED_FILL_POD_PRIORITY_VALUE: Final = -1000
+_RESERVED_FILL_WORKLOAD_PRIORITY_CLASS: Final = 'be-lt'
+_RESERVED_FILL_WORKLOAD_PRIORITY_VALUE: Final = 11
+_REVIEWED_KUEUE_COHORT: Final = 'shared-pool'
+_REVIEWED_FILL_QUEUES: Final = frozenset({'skypilot-be', 'skypilot-wa'})
 _REVIEWED_KUEUE_QUEUES: Final = {
-    'skypilot-be': ('rescluster-k8s-prod-east1-preemptible-inference',
-                    'shared-pool', 'BestEffortFIFO', 'Never'),
-    'skypilot-wa':
-        ('rescluster-k8s-phx', 'shared-pool', 'BestEffortFIFO', 'Never'),
+    'skypilot-be':
+        ('rescluster-k8s-prod-east1-preemptible-inference', 'BestEffortFIFO',
+         'Never', 'LowerPriority', 'LowerPriority'),
+    'skypilot-wa': ('rescluster-k8s-phx', 'BestEffortFIFO', 'Never',
+                    'LowerPriority', 'LowerPriority'),
     'hyperpod-ns-research-clusterqueue':
-        ('hyperpod-ns-research', 'research-workloads', 'BestEffortFIFO', 'Never'
-        ),
-    'research-ha':
-        ('boltz-research', 'research-workloads', 'StrictFIFO', 'LowerPriority'),
-    'research-ma':
-        ('boltz-research', 'research-workloads', 'StrictFIFO', 'LowerPriority'),
-    'research-wa': ('boltz-research', 'research-workloads', 'BestEffortFIFO',
+        ('hyperpod-ns-research', 'BestEffortFIFO', 'LowerPriority', 'Any',
+         'Never'),
+    'research-ha': ('boltz-research', 'StrictFIFO', 'Never', 'LowerPriority',
                     'LowerPriority'),
-    'research-be': ('boltz-research', 'research-workloads', 'BestEffortFIFO',
+    'research-ma': ('boltz-research', 'StrictFIFO', 'Never', 'LowerPriority',
                     'LowerPriority'),
+    'research-wa': ('boltz-research', 'BestEffortFIFO', 'Never',
+                    'LowerPriority', 'LowerPriority'),
+    'research-be': ('boltz-research', 'BestEffortFIFO', 'Never',
+                    'LowerPriority', 'LowerPriority'),
 }
 
 
@@ -295,38 +294,17 @@ def _validate_kueue_queue_topology(
     claimed_flavors: set[str],
     inference_namespace: str,
 ) -> None:
-    """Validate the complete hierarchical research/fill reclaim boundary."""
+    """Validate Simone's complete flat research/fill Kueue boundary."""
     queues = _mapping(value, path)
     _exact_keys(queues, {
         'cluster_queues', 'cohorts', 'inference_cluster_queue', 'quota_profiles'
     }, path)
 
     cohort_rows = _list(queues['cohorts'], f'{path}.cohorts')
-    cohorts: dict[str, str | None] = {}
-    for index, raw_cohort in enumerate(cohort_rows):
-        cohort_path = f'{path}.cohorts[{index}]'
-        cohort = _mapping(raw_cohort, cohort_path)
-        _exact_keys(cohort, set(_COHORT_KEYS), cohort_path)
-        name = _text(cohort['name'], f'{cohort_path}.name')
-        parent = cohort['parent_name']
-        if parent is not None:
-            parent = _text(parent, f'{cohort_path}.parent_name')
-        if name in cohorts:
-            raise BundleValidationError(f'{path}.cohorts has duplicate names.')
-        cohorts[name] = parent
-    roots = [name for name, parent in cohorts.items() if parent is None]
-    if len(cohorts) != 2 or len(roots) != 1:
+    if cohort_rows:
         raise BundleValidationError(
-            f'{path}.cohorts must contain one root and one research child.')
-    root_cohort = roots[0]
-    child_cohorts = [name for name in cohorts if name != root_cohort]
-    research_cohort = child_cohorts[0]
-    if cohorts[research_cohort] != root_cohort:
-        raise BundleValidationError(
-            f'{path}.cohorts must place research directly below the root.')
-    if cohorts != _REVIEWED_KUEUE_COHORTS:
-        raise BundleValidationError(
-            f'{path}.cohorts is not the exact reviewed hierarchy.')
+            f'{path}.cohorts must not declare explicit Cohort objects; the '
+            'reviewed platform contract uses one implicit flat cohort.')
 
     raw_profiles = _mapping(queues['quota_profiles'], f'{path}.quota_profiles')
     if not raw_profiles:
@@ -346,7 +324,7 @@ def _validate_kueue_queue_topology(
         queue = _validate_cluster_queue_contract(
             raw_queue,
             queue_path,
-            cohort_names=set(cohorts),
+            cohort_names={_REVIEWED_KUEUE_COHORT},
             quota_profiles=set(quota_profiles))
         name = queue['name']
         if name in cluster_queues:
@@ -356,11 +334,15 @@ def _validate_kueue_queue_topology(
     if set(cluster_queues) != set(_REVIEWED_KUEUE_QUEUES):
         raise BundleValidationError(
             f'{path}.cluster_queues is not the exact reviewed queue set.')
-    for name, (namespace, cohort, strategy,
+    for name, (namespace, strategy, borrow_policy, reclaim_policy,
                within_policy) in _REVIEWED_KUEUE_QUEUES.items():
         queue = cluster_queues[name]
-        if (queue['namespace'] != namespace or queue['cohort_name'] != cohort or
+        if (queue['namespace'] != namespace or
+                queue['cohort_name'] != _REVIEWED_KUEUE_COHORT or
                 queue['queueing_strategy'] != strategy or
+                queue['preemption']['borrow_within_cohort'] != borrow_policy or
+                queue['preemption']['reclaim_within_cohort'] != reclaim_policy
+                or
                 queue['preemption']['within_cluster_queue'] != within_policy):
             raise BundleValidationError(
                 f'{path}.cluster_queues.{name} is not the exact reviewed '
@@ -372,42 +354,22 @@ def _validate_kueue_queue_topology(
         raise BundleValidationError(
             f'{path}.inference_cluster_queue is not in the closed queue set.')
     if (inference_queue['namespace'] != inference_namespace or
-            inference_queue['cohort_name'] != root_cohort):
+            inference_queue['cohort_name'] != _REVIEWED_KUEUE_COHORT):
         raise BundleValidationError(
-            f'{path}.inference_cluster_queue must be a direct root queue in '
-            'the inference namespace.')
+            f'{path}.inference_cluster_queue must be in the reviewed flat '
+            'cohort and the inference namespace.')
 
-    root_queues = [
-        queue for queue in cluster_queues.values()
-        if queue['cohort_name'] == root_cohort
-    ]
+    fill_queues = [cluster_queues[name] for name in _REVIEWED_FILL_QUEUES]
     research_queues = [
-        queue for queue in cluster_queues.values()
-        if queue['cohort_name'] == research_cohort
+        queue for name, queue in cluster_queues.items()
+        if name not in _REVIEWED_FILL_QUEUES
     ]
-    if not root_queues or not research_queues:
-        raise BundleValidationError(
-            f'{path}.cluster_queues must contain root fill and child research '
-            'queues.')
-    never = {
-        'borrow_within_cohort': 'Never',
-        'reclaim_within_cohort': 'Never',
-        'within_cluster_queue': 'Never',
-    }
-    for queue in root_queues:
+    for queue in fill_queues:
         quotas = quota_profiles[queue['quota_profile']]
-        if (queue['preemption'] != never or
-                any(nominal != 0 for nominal, _ in quotas.values())):
+        if any(nominal != 0 for nominal, _ in quotas.values()):
             raise BundleValidationError(
                 f'{path}.cluster_queues.{queue["name"]} must be '
-                'zero-nominal fill with no outbound preemption.')
-    for queue in research_queues:
-        preemption = queue['preemption']
-        if (preemption['borrow_within_cohort'] != 'Never' or
-                preemption['reclaim_within_cohort'] != 'Any'):
-            raise BundleValidationError(
-                f'{path}.cluster_queues.{queue["name"]} must reclaim root '
-                'fill without borrowing through sibling nominal floors.')
+                'zero-nominal fill.')
 
     inference_quotas = quota_profiles[inference_queue['quota_profile']]
     positive_inference_gpu_flavors = {
@@ -438,10 +400,10 @@ def _validate_kueue_queue_topology(
                     f'{path} {resource_name} borrowing cannot fit the '
                     'reviewed workers.')
 
-    # Every direct-root fill queue must expose the same physical ceiling. The
-    # research subtree's nominal sum is that ceiling exactly; this prevents a
-    # partial or overcommitted hierarchy from masquerading as reclaimability.
-    for queue in root_queues:
+    # Every fill queue must expose the same physical ceiling. Research nominal
+    # ownership sums to that ceiling exactly; this prevents a partial or
+    # overcommitted flat cohort from masquerading as reclaimability.
+    for queue in fill_queues:
         if quota_profiles[queue['quota_profile']] != inference_quotas:
             raise BundleValidationError(
                 f'{path}.cluster_queues.{queue["name"]} does not use the '
@@ -561,7 +523,7 @@ def _validate_fleet_context(value: object, path: str) -> None:
     if priority != {
             'name': _RESERVED_FILL_POD_PRIORITY_CLASS,
             'preemption_policy': 'Never',
-            'value': _RESERVED_FILL_PRIORITY_VALUE,
+            'value': _RESERVED_FILL_POD_PRIORITY_VALUE,
     }:
         raise BundleValidationError(
             f'{path}.priority_class is not the exact server-owned reserved-fill '
@@ -588,16 +550,13 @@ def _validate_fleet_context(value: object, path: str) -> None:
             f'{path}.kueue_admission.workload_priority_value exceeds '
             'Kubernetes limits.')
 
-    if (admission['workload_priority_value'] != priority['value'] or
-            admission['workload_priority_class_name'] == priority['name']):
-        raise BundleValidationError(
-            f'{path}.kueue_admission must use an independent workload-only '
-            'priority at the server-owned Pod priority value.')
     if (admission['workload_priority_class_name']
-            != _RESERVED_FILL_WORKLOAD_PRIORITY_CLASS):
+            != _RESERVED_FILL_WORKLOAD_PRIORITY_CLASS or
+            admission['workload_priority_value']
+            != _RESERVED_FILL_WORKLOAD_PRIORITY_VALUE):
         raise BundleValidationError(
-            f'{path}.kueue_admission is not the exact reviewed independent '
-            'Pod/workload priority contract.')
+            f'{path}.kueue_admission is not the exact existing be-lt '
+            'WorkloadPriorityClass contract.')
     _validate_kueue_queue_topology(admission['queues'],
                                    f'{path}.kueue_admission.queues',
                                    claimed_flavors=set(claimed_flavors),

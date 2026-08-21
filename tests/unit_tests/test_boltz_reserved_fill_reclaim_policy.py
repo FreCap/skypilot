@@ -107,21 +107,14 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
     assert phx['kueue_admission']['local_queue_name'] == 'be'
     assert phx['kueue_admission']['queues'][
         'inference_cluster_queue'] == 'skypilot-be'
-    assert (phx['kueue_admission']['workload_priority_class_name'] ==
-            'skypilot-reserved-fill')
-    assert phx['kueue_admission']['workload_priority_value'] == -1000
+    assert (phx['kueue_admission']['workload_priority_class_name'] == 'be-lt')
+    assert phx['kueue_admission']['workload_priority_value'] == 11
     assert phx['priority_class'] == {
         'name': 'rescluster-k8s-prod-east1-preemptible-inference-low',
         'preemption_policy': 'Never',
         'value': -1000,
     }
-    assert phx['kueue_admission']['queues']['cohorts'] == [{
-        'name': 'research-workloads',
-        'parent_name': 'shared-pool',
-    }, {
-        'name': 'shared-pool',
-        'parent_name': None,
-    }]
+    assert phx['kueue_admission']['queues']['cohorts'] == []
     assert {
         queue['name']
         for queue in phx['kueue_admission']['queues']['cluster_queues']
@@ -129,10 +122,23 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
         'skypilot-be', 'skypilot-wa', 'hyperpod-ns-research-clusterqueue',
         'research-ha', 'research-ma', 'research-wa', 'research-be'
     }
-    for queue in phx['kueue_admission']['queues']['cluster_queues']:
-        if queue['cohort_name'] == 'research-workloads':
-            assert queue['preemption']['borrow_within_cohort'] == 'Never'
-            assert queue['preemption']['reclaim_within_cohort'] == 'Any'
+    assert {
+        queue['cohort_name']
+        for queue in phx['kueue_admission']['queues']['cluster_queues']
+    } == {'shared-pool'}
+    assert _cluster_queue_contract(
+        phx, 'hyperpod-ns-research-clusterqueue')['preemption'] == {
+            'borrow_within_cohort': 'LowerPriority',
+            'reclaim_within_cohort': 'Any',
+            'within_cluster_queue': 'Never',
+        }
+    for name in ('research-ha', 'research-ma', 'research-wa', 'research-be',
+                 'skypilot-be', 'skypilot-wa'):
+        assert _cluster_queue_contract(phx, name)['preemption'] == {
+            'borrow_within_cohort': 'Never',
+            'reclaim_within_cohort': 'LowerPriority',
+            'within_cluster_queue': 'LowerPriority',
+        }
     assert east['scheduler_name'] == 'gpu-binpack-scheduler'
     assert phx['scheduler_name'] == 'default-scheduler'
     assert east['accelerators']['a100-80gb'] == {
@@ -150,7 +156,7 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
     ]
     assert bundle.policy_revision == (
         f'boltz-reserved-fill-reclaim-policy/{POLICY_REVISION}')
-    assert POLICY_REVISION == '1.1.1416'
+    assert POLICY_REVISION == '1.1.1422'
     assert _quota(phx, 'skypilot-be', 'ml.p5e.48xlarge',
                   'cpu')['borrowing_limit'] == '12100'
     assert _quota(phx, 'skypilot-be', 'ml.p5e.48xlarge',
@@ -314,18 +320,23 @@ def test_bundle_rejects_fractional_gpu_borrowing():
     ), 'exact reviewed queue set'),
     (lambda context: _cluster_queue_contract(context, 'skypilot-wa').
      __setitem__('cohort_name', 'research-workloads'),
-     'exact reviewed queue contract'),
-    (lambda context: context['kueue_admission']['queues']['cohorts'][1].
-     __setitem__('parent_name', 'research-workloads'), 'directly below'),
+     'must name a reviewed Cohort'),
+    (lambda context: context['kueue_admission']['queues']['cohorts'].append({
+        'name': 'shared-pool',
+        'parent_name': None,
+    }), 'must not declare explicit Cohort'),
     (lambda context: _cluster_queue_contract(context, 'research-be')[
         'preemption'].__setitem__('borrow_within_cohort', 'LowerPriority'),
-     'without borrowing through sibling nominal floors'),
+     'exact reviewed queue contract'),
     (lambda context: context['kueue_admission'].__setitem__(
-        'workload_priority_class_name', 'be-ls'), 'exact reviewed independent'),
+        'workload_priority_class_name', 'skypilot-reserved-fill'),
+     'exact existing be-lt'),
+    (lambda context: context['kueue_admission'].__setitem__(
+        'workload_priority_value', -1000), 'exact existing be-lt'),
     (lambda context: context['priority_class'].__setitem__('value', 12),
      'exact server-owned'),
 ])
-def test_bundle_requires_exact_hierarchical_kueue_contract(mutation, match):
+def test_bundle_requires_exact_flat_kueue_contract(mutation, match):
     document = _bundle_document()
     context = _managed_document_context(document)
     mutation(context)
@@ -615,7 +626,7 @@ def test_unchanged_policy_authorizes_current_service_version_refresh(
     context = policy._bundle.fleet_context('phx_research_cluster_eks')
     identity = policy.policy_identity()
     assert identity.policy_revision == (
-        'boltz-reserved-fill-reclaim-policy/1.1.1416')
+        'boltz-reserved-fill-reclaim-policy/1.1.1422')
 
     authorizations = []
     for service_version in (63, 64):
@@ -1559,7 +1570,6 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
             },
             'value': kueue_admission['workload_priority_value'],
         },
-        'workload_priority_pod_class': None,
         'local_queue': _active_object(
             kueue_admission['local_queue_name'], {
                 'clusterQueue': queues['inference_cluster_queue'],
@@ -1625,11 +1635,6 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
     return snapshot
 
 
-def _snapshot_cohort(snapshot: dict, name: str) -> dict:
-    return next(item for item in snapshot['cohort_inventory']
-                if item['metadata']['name'] == name)
-
-
 def _snapshot_cluster_queue(snapshot: dict, name: str) -> dict:
     return next(item for item in snapshot['cluster_queue_inventory']
                 if item['metadata']['name'] == name)
@@ -1649,13 +1654,6 @@ def _membership_cluster_queue(name: str, cohort_name: str) -> dict:
 def _remove_snapshot_cluster_queue(snapshot: dict, name: str) -> None:
     snapshot['cluster_queue_inventory'] = [
         item for item in snapshot['cluster_queue_inventory']
-        if item['metadata']['name'] != name
-    ]
-
-
-def _remove_snapshot_cohort(snapshot: dict, name: str) -> None:
-    snapshot['cohort_inventory'] = [
-        item for item in snapshot['cohort_inventory']
         if item['metadata']['name'] != name
     ]
 
@@ -1753,8 +1751,10 @@ def test_kubernetes_snapshot_proves_exact_reclaim_topology():
     context = bundle.fleet_context('phx_research_cluster_eks')
     provider = bundle.provider_context('phx_research_cluster_eks')
 
-    proof = kubernetes_attestation.validate_snapshot(
-        context, provider, _kubernetes_snapshot(context, provider))
+    snapshot = _kubernetes_snapshot(context, provider)
+    assert 'workload_priority_pod_class' not in snapshot
+    proof = kubernetes_attestation.validate_snapshot(context, provider,
+                                                     snapshot)
 
     assert proof.kueue_managed
     assert proof.local_queue_name == 'be'
@@ -1788,10 +1788,8 @@ def test_kubernetes_node_list_selector_uses_all_resource_flavor_labels():
 @pytest.mark.parametrize('extra', [
     ('cluster_queue_inventory',
      _membership_cluster_queue('foreign-root-member', 'shared-pool')),
-    ('cohort_inventory',
-     _cohort_object('foreign-child-cohort', 'research-workloads')),
-    ('cluster_queue_inventory',
-     _membership_cluster_queue('foreign-child-member', 'research-workloads')),
+    ('cohort_inventory', _cohort_object('shared-pool', None)),
+    ('cohort_inventory', _cohort_object('foreign-child-cohort', 'shared-pool')),
 ])
 def test_kubernetes_snapshot_rejects_unreviewed_governed_members(extra):
     bundle = bundle_lib.load_embedded_bundle()
@@ -1803,7 +1801,7 @@ def test_kubernetes_snapshot_rejects_unreviewed_governed_members(extra):
 
     with pytest.raises(
             kubernetes_attestation.KubernetesAttestationNonconformanceError,
-            match='joins the governed Kueue subtree'):
+            match='governed Kueue subtree|reviewed implicit flat cohort'):
         kubernetes_attestation.validate_snapshot(context, provider, snapshot)
 
 
@@ -2060,12 +2058,11 @@ def _duplicate_inference_quota_atom(snapshot: dict) -> None:
         'clusterQueue', 'wrong'), 'LocalQueue target'),
     (lambda snapshot: snapshot['workload_priority_class'].__setitem__(
         'value', 12), 'WorkloadPriorityClass reclaim contract'),
-    (lambda snapshot: snapshot.__setitem__('workload_priority_pod_class', {}),
-     'workload-only priority'),
-    (lambda snapshot: _snapshot_cohort(snapshot, 'research-workloads')['spec'].
-     __setitem__('parentName', 'wrong'), 'exact reviewed parent'),
-    (lambda snapshot: _remove_snapshot_cohort(snapshot, 'research-workloads'),
-     'missing reviewed objects'),
+    (lambda snapshot: snapshot['cohort_inventory'].append(
+        _cohort_object('shared-pool', None)), 'reviewed implicit flat cohort'),
+    (lambda snapshot: snapshot['cohort_inventory'].append(
+        _cohort_object('foreign-child', 'shared-pool')),
+     'joins the governed Kueue subtree'),
     (lambda snapshot: _remove_snapshot_cluster_queue(snapshot, 'research-be'),
      'missing reviewed objects'),
     (lambda snapshot: _snapshot_cluster_queue(snapshot, 'skypilot-wa')['spec'][
@@ -2187,7 +2184,10 @@ def test_kubernetes_snapshot_keeps_malformed_response_indeterminate():
 @pytest.mark.parametrize('mutation', [
     lambda snapshot: snapshot['cluster_queue_inventory'].append(
         copy.deepcopy(snapshot['cluster_queue_inventory'][0])),
-    lambda snapshot: snapshot['cohort_inventory'][0]['metadata'].pop('name'),
+    lambda snapshot: snapshot['cohort_inventory'].append({
+        'metadata': {},
+        'spec': None,
+    }),
     lambda snapshot: snapshot['cohort_inventory'].append({
         'metadata': {
             'name': 'unclassifiable-cohort'

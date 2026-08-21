@@ -431,21 +431,6 @@ def _resource_groups(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-def _validate_cohort(value: Mapping[str, Any], *, name: str,
-                     parent_name: str | None) -> None:
-    _metadata(value, name=name)
-    spec = value.get('spec')
-    if parent_name is None:
-        if spec not in (None, {}):
-            raise KubernetesAttestationError(
-                f'Cohort {name!r} must be the quota-free root.')
-        return
-    spec = _dict(spec, f'{name} Cohort spec')
-    if set(spec) != {'parentName'} or spec.get('parentName') != parent_name:
-        raise KubernetesAttestationError(
-            f'Cohort {name!r} does not have the exact reviewed parent.')
-
-
 def _inventory_by_name(value: object,
                        path: str) -> dict[str, Mapping[str, Any]]:
     """Index one complete cluster-wide custom-resource inventory."""
@@ -491,7 +476,7 @@ def _cluster_queue_cohort_for_closure(value: Mapping[str, Any],
 def _validate_governed_kueue_closure(
     queue_contract: Mapping[str, Any], snapshot: Mapping[str, Any]
 ) -> tuple[dict[str, Mapping[str, Any]], dict[str, Mapping[str, Any]]]:
-    """Prove that no unreviewed object joins the governed Cohort subtree."""
+    """Prove the complete inventory around the governed implicit cohort."""
     cohort_contracts = {
         cohort['name']: cohort for cohort in queue_contract['cohorts']
     }
@@ -502,10 +487,12 @@ def _validate_governed_kueue_closure(
                                           'Cohort inventory')
     observed_queues = _inventory_by_name(
         snapshot.get('cluster_queue_inventory'), 'ClusterQueue inventory')
-    governed_cohorts = set(cohort_contracts)
+    governed_cohorts = {
+        queue['cohort_name'] for queue in cluster_queue_contracts.values()
+    }
     missing_cohorts = governed_cohorts.difference(observed_cohorts)
     missing_queues = set(cluster_queue_contracts).difference(observed_queues)
-    if missing_cohorts:
+    if cohort_contracts and missing_cohorts:
         raise KubernetesAttestationError(
             'The governed Cohort inventory is missing reviewed objects.')
     if missing_queues:
@@ -514,6 +501,10 @@ def _validate_governed_kueue_closure(
             'objects.')
     for name, cohort in observed_cohorts.items():
         parent_name = _cohort_parent_for_closure(cohort, name)
+        if (name in governed_cohorts and name not in cohort_contracts):
+            raise KubernetesAttestationError(
+                f'Explicit Cohort {name!r} replaces the reviewed implicit '
+                'flat cohort.')
         if name not in cohort_contracts and parent_name in governed_cohorts:
             raise KubernetesAttestationError(
                 f'Unreviewed Cohort {name!r} joins the governed Kueue '
@@ -756,11 +747,6 @@ def _validate_kueue_snapshot(fleet_context: Mapping[str, Any],
     if workload_priority.get('value') != admission['workload_priority_value']:
         raise KubernetesAttestationError(
             'The WorkloadPriorityClass reclaim contract is invalid.')
-    if ('workload_priority_pod_class' not in snapshot or
-            snapshot['workload_priority_pod_class'] is not None):
-        raise KubernetesAttestationError(
-            'The workload-only priority unexpectedly exists as a Pod '
-            'PriorityClass.')
 
     queue_contract = _dict(admission['queues'], 'Kueue queue contract')
     local_queue_name = admission['local_queue_name']
@@ -774,15 +760,8 @@ def _validate_kueue_snapshot(fleet_context: Mapping[str, Any],
             local_queue_spec.get('stopPolicy') not in (None, 'None')):
         raise KubernetesAttestationError(
             'The inference LocalQueue target is invalid.')
-    cohort_contracts = {
-        cohort['name']: cohort for cohort in queue_contract['cohorts']
-    }
-    observed_cohorts, observed_queues = _validate_governed_kueue_closure(
+    _, observed_queues = _validate_governed_kueue_closure(
         queue_contract, snapshot)
-    for name, contract in cohort_contracts.items():
-        _validate_cohort(_dict(observed_cohorts[name], f'Cohort {name}'),
-                         name=name,
-                         parent_name=contract['parent_name'])
 
     cluster_queue_contracts = {
         queue['name']: queue for queue in queue_contract['cluster_queues']
@@ -1045,19 +1024,6 @@ def _read_required(read: Callable[[], Any], *, subject: str) -> Any:
         raise
 
 
-def _read_absent_priority_class(scheduling: Any, name: str) -> None:
-    """Prove that a workload-only priority name is not a Pod class."""
-    try:
-        scheduling.read_priority_class(
-            name, _request_timeout=kubernetes_adaptor.API_TIMEOUT)
-    except kubernetes_adaptor.api_exception() as error:
-        if getattr(error, 'status', None) == 404:
-            return None
-        raise
-    raise KubernetesAttestationNonconformanceError(
-        'The workload-only priority also exists as a Pod PriorityClass.')
-
-
 def _resource_flavor_node_selector(provider_context: Mapping[str, Any],
                                    flavor: str) -> str:
     """Return the complete reviewed ResourceFlavor selector for a Node list."""
@@ -1153,9 +1119,6 @@ def attest_context(fleet_context: Mapping[str,
                         custom,
                         plural='workloadpriorityclasses',
                         name=(kueue_admission['workload_priority_class_name'])),
-                    'workload_priority_pod_class': (_read_absent_priority_class(
-                        scheduling,
-                        kueue_admission['workload_priority_class_name'])),
                     'local_queue': _get_kueue_object(
                         custom,
                         plural='localqueues',

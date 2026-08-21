@@ -6,11 +6,17 @@ Status: the atomic reserved-capacity allocator and PostgreSQL recovery
 boundary are deployed, but end-to-end 100% physical backfill is **not yet
 production-converged**. Production release `1.1.1414` still uses the
 launch-liveness-sensitive reclaim-provider proof path. Independent PostgreSQL
-proof renewal and the complete hierarchical Kueue attestation are implemented
-and locally source-qualified in the current change; they are neither merged
-nor deployed at this status update. The PHX audit role's two read-only Kueue
-LIST permissions must land before the first successful schema-v6 preflight.
-Historical-state cleanup, request
+proof renewal and the complete flat Kueue attestation are implemented
+and locally source-qualified in the current SkyPilot change; they are neither
+merged nor deployed at this status update. Platform PR #8822 is separately
+merged and deployed as platform revision 29: PHX retains the flat implicit
+`shared-pool`, has zero explicit Cohort objects and no new priority class, only
+the SkyPilot queues remain held, the exact audit role has the two read-only
+Kueue LIST permissions, and the PostgreSQL worker projection points to the
+existing `be-lt` WorkloadPriorityClass at value 11. That is platform deployment
+evidence, not SkyPilot activation or end-to-end convergence evidence; the held
+queues intentionally prevent activation while the source correction is being
+qualified. Historical-state cleanup, request
 telemetry, and the independent removal of EFS also remain active.
 
 At the 2026-08-21 10:45 UTC observation, `boltz-l4-fleet` version 64 was
@@ -42,17 +48,18 @@ admissible to inference.
 An earlier PHX observation exposed Kueue v0.19's
 unreclaimable-preemptor reservation: a priority-31 64-GPU MA gang had 504/512
 GPUs assigned. A temporary LocalQueue `Hold` experiment allowed fill admission
-but was unsafe because legacy fill WorkloadPriorityClass `be-ls` (12)
-preempted a research `be-lt` (11) RayJob. The permanent correction uses a
-quota-free `shared-pool` root Cohort, a direct `research-workloads` child
-Cohort, zero-nominal direct-root fill ClusterQueues with every outbound
-preemption policy `Never`, and child research ClusterQueues with reclaim
-authority. New fill uses workload-only `skypilot-reserved-fill` at -1000;
-there must be no Pod PriorityClass with that name. Pod scheduling independently
-uses the server-owned
+but was unsafe because fill used WorkloadPriorityClass `be-ls` (12) and
+preempted a research `be-lt` (11) RayJob. The permanent correction does not
+redesign research scheduling. It preserves Simone's exact #8407/#8517 flat
+implicit `shared-pool`, all seven existing ClusterQueues, their nominal quotas,
+and their preemption policies. Fill uses the existing lowest Kueue tranche,
+WorkloadPriorityClass `be-lt` at 11; SkyPilot creates no Cohort,
+ClusterQueue, or WorkloadPriorityClass. Pod scheduling independently uses the
+server-owned
 `rescluster-k8s-prod-east1-preemptible-inference-low` PriorityClass at -1000
-with `preemptionPolicy: Never`. The ten already-Pending legacy Workloads may
-still show `be-ls`/12 during transition; their existence is not provider-proof,
+with `preemptionPolicy: Never`. A Pod PriorityClass named `be-lt` may coexist;
+its presence is not part of the worker contract. Retained Workloads may still
+show `be-ls`/12 during transition; their existence is not provider-proof,
 capacity, or replica authority.
 
 In the prior launch-liveness incident, after the eight fill rows 56282--56289
@@ -330,7 +337,7 @@ single-flight receipt. PR #1610 owns atomic admission, #1611 the durable-owner
 execution boundary, #1612 passive preflight, and #1613 nonce-stable receipt
 renewal across launch waves. The current source change moves provider renewal
 out of those launch waves and expands the immutable PHX inventory proof to the
-complete two-Cohort/seven-ClusterQueue topology; the existing receipt row
+complete implicit-cohort/seven-ClusterQueue topology; the existing receipt row
 remains the sole durable authority rather than introducing another table or
 allocator. That change is implemented but not yet merged, deployed, or
 production-proven. Production readback, not source state, establishes the live
@@ -339,7 +346,7 @@ authority facts above.
 Remaining work, in exact order:
 
 1. Open and merge the source-qualified independent provider-proof renewal and
-   schema-6 full Kueue hierarchy change, already rebased onto current
+   schema-6 full flat Kueue inventory attestation, already rebased onto current
    `improvements`.
    Separate the fast PostgreSQL launch-read deadline, the provider refresh
    timeout, and the bounded receipt maximum age. The proactive refresh margin
@@ -2409,8 +2416,10 @@ inference context that:
   SkyPilot configuration;
 - its ClusterQueue admits that namespace and shares a reviewed preemption
   domain with BCL/research workloads;
-- lower inference workload priority and higher BCL/research priority are
-  enforced in that domain;
+- PHX fill uses the existing lowest Kueue WorkloadPriorityClass, `be-lt` at
+  value 11, while the worker Pod independently uses the server-owned
+  -1000/`Never` PriorityClass; SkyPilot does not manufacture a lower Kueue
+  class or alter research queue policy;
 - SkyPilot's strict plain-Pod path can read the queue objects and fails closed
   unless the admission response attests `managed=true`, the exact queue, and
   the Kueue scheduling gate; and
@@ -2433,13 +2442,15 @@ drift stop otherwise safe fill.
 Policy-bundle schema v6 performs no ValidatingAdmissionPolicy reads and retains
 the exact controller/config, Pod webhooks, TAS feature gates, priority, flavor,
 immutable projection, and per-Pod lifecycle proofs. It additionally closes the
-fleet-side PHX inventory over both exact Cohorts, all seven exact
+fleet-side PHX inventory over zero explicit Cohort objects and all seven exact
 ClusterQueues, their namespace selectors, queueing/fungibility/fair-sharing
-settings, preemption tuples, and complete quota profiles. It proves that the
-root Cohort is quota-free, both direct-root fill queues have zero nominal quota
-and no outbound preemption, the research child owns the physical nominal
-ceiling exactly, and the independent workload-only priority name does not
-exist as a Pod PriorityClass. Schema v5's removal of admission-policy authority
+settings, preemption tuples, and complete quota profiles. It proves that every
+queue remains in Simone's implicit flat `shared-pool`, both fill queues have
+zero nominal quota, and research nominal ownership sums to the physical ceiling
+exactly. It separately proves the existing `be-lt` WorkloadPriorityClass at 11
+and the server-owned worker Pod PriorityClass at -1000/`Never`; their numeric
+values need not match, and the existence of a Pod PriorityClass named `be-lt`
+is neither forbidden nor used as worker authority. Schema v5's removal of admission-policy authority
 advanced provider inventory from `provider/v3` to `provider/v4`; v6 leaves
 that provider domain unchanged and advances the changed fleet domain from
 `fleet/v4` to `fleet/v5`. `boltz-l4-fleet` creates direct core/v1 Pods and has
@@ -2452,10 +2463,12 @@ paginated, cluster-wide LISTs made by the per-spoke audit role. Those LIST
 payloads are the sole source for both the configured-object shape checks and
 membership closure; there are no per-name Cohort or ClusterQueue GETs. Every
 reviewed object must be present and retain its exact spec. No unexpected
-ClusterQueue may name either governed Cohort, and no unexpected Cohort may
-name either governed Cohort as its parent. This closes every foreign subtree
-at its first edge while allowing unrelated roots and subtrees elsewhere in the
-shared cluster. Duplicate or missing names, malformed membership specs,
+ClusterQueue may name the governed implicit `shared-pool`. The expected
+explicit Cohort inventory for that governed name is empty: an explicit
+`shared-pool` Cohort or an unexpected Cohort whose parent is `shared-pool`
+fails closed. This closes every foreign edge while allowing unrelated roots
+and subtrees elsewhere in the shared cluster. Duplicate or missing names,
+malformed membership specs,
 invalid or repeated continuation tokens, list errors, and pagination-cap
 exhaustion are indeterminate and therefore cannot publish or renew authority.
 
@@ -2659,34 +2672,43 @@ second scheduling path exists. The exact shared object contract is:
 | Physical cluster UID | `14de98b4-cb7b-4f82-beb7-6f754a96f1dd` | `ba2dcdca-2a0d-447f-ad8a-31849a63c1d5` |
 | Namespace / service account | `rescluster-k8s-prod-east1-preemptible-inference` / `skypilot-pool-sa` | same |
 | Pod Identity | absent | absent |
-| Kueue admission | absent; east remains ordinary Pod scheduling | LocalQueue `be` -> direct-root ClusterQueue `skypilot-be`; workload-only `skypilot-reserved-fill` at -1000; exact `shared-pool` -> `research-workloads` hierarchy and seven-queue inventory |
+| Kueue admission | absent; east remains ordinary Pod scheduling | LocalQueue `be` -> ClusterQueue `skypilot-be`; existing WorkloadPriorityClass `be-lt` at 11; exact implicit flat `shared-pool` and seven-queue inventory |
 | Pod PriorityClass (spoke-module-owned) | `rescluster-k8s-prod-east1-preemptible-inference-low`, value -1000, `Never` | same |
 | Scheduler / topology authority | exact `gpu-binpack-scheduler` Deployment | Kubernetes `default-scheduler`; Kueue v0.19 TAS owns admission topology and no custom scheduler Deployment is permitted |
 | GPU resource | `nvidia.com/gpu` | `nvidia.com/gpu` |
 | Exact worker accelerator scheduling | `A100`: `nvidia.com/gpu.product=NVIDIA-A100-SXM4-40GB`, `nvidia.com/gpu`; `A100-80GB`: `nvidia.com/gpu.product=NVIDIA-A100-SXM4-80GB`, `nvidia.com/gpu` | `H200`: `nvidia.com/gpu.product=NVIDIA-H200`, `nvidia.com/gpu` |
 
-PHX has a quota-free root Cohort `shared-pool` and direct child Cohort
-`research-workloads`. Direct-root fill queues `skypilot-be` and `skypilot-wa`
-have zero nominal quota, the full reviewed borrowing ceiling, and `Never` for
-all three preemption directions. The research child contains
+PHX retains the implicit flat Cohort name `shared-pool`; there is no Cohort
+object or hierarchy. ClusterQueues `skypilot-be`, `skypilot-wa`,
 `hyperpod-ns-research-clusterqueue`, `research-ha`, `research-ma`,
-`research-wa`, and `research-be`; every research queue sets
-`borrowWithinCohort: Never` and `reclaimWithinCohort: Any`. The Cohort hierarchy
-lets even a zero-nominal research leaf reclaim direct-root fill without
-piercing a sibling research queue's nominal floor. The legacy queue sets
-`withinCohort: Never`, while the four class queues set
-`withinCohort: LowerPriority` to preserve the reviewed research ladder. The MA
+`research-wa`, and `research-be` retain the exact specs introduced by Simone's
+Platform PRs #8407 and #8517. The two SkyPilot queues have zero nominal quota
+and use `Never`/`LowerPriority`/`LowerPriority` for borrow/reclaim/within-queue
+preemption. The legacy queue retains
+`LowerPriority`/`Any`/`Never`; the four class queues retain
+`Never`/`LowerPriority`/`LowerPriority`. The MA
 and WA nominal profiles sum to the physical 512 H200 / 12100 CPU / 120Ti memory
 / 2048 EFA ceiling (plus the exact m6i CPU/memory atoms). East
 has no Kueue admission pair and must not be forced through a nonexistent
 queue. Bundle schema v6 retains one nullable `kueue_admission` object per fleet
 context and matching nullable `kueue_enforcement` object per provider context.
+
+This choice preserves a real platform boundary rather than claiming a stronger
+one: Kueue `LowerPriority` reclaim does not select an equal-priority `be-lt`
+Workload as its victim. The independently injected -1000 Pod priority keeps an
+admitted research Pod above a fill Pod at kube-scheduler, while SkyPilot's
+zero-nominal grant is revoked when fresh provider capacity is no longer free.
+If the existing Kueue contract later needs stronger equal-tranche reclaim, that
+is a separately reviewed research-scheduling change owned in boltz-platform;
+SkyPilot must not synthesize it with a new priority or Cohort hierarchy.
+
 Both objects must be null or both non-null. Null selects the exact
 custom-scheduler reclaim authority and performs no Kueue reads; the typed
 projection must also carry `KUBERNETES_SCHEDULER`, null queue identities, and
 the reviewed scheduler name. It does not silently downgrade reclaim to Pod
 priority. The PHX pair binds `be`, `skypilot-be`,
-`skypilot-reserved-fill`, the two Cohorts, and all seven ClusterQueues as one
+`be-lt`, the absence of an explicit governed Cohort object, and all seven
+ClusterQueues as one
 closed contract. Schema v6 retains schema v5's nullable provider
 custom-scheduler Deployment, exact Kueue TAS feature gates, and ResourceFlavor
 topology-name fields. Fleet `scheduler_name` remains a required string because
@@ -2699,8 +2721,9 @@ enforcement pair plus the scheduler contract select the sole placement path.
 Schema v6 excludes the redundant ValidatingAdmissionPolicy snapshot from that
 enforcement object; strict Pod preparation and synchronous/fresh lifecycle
 attestation remain the sole per-Pod runtime admission proof.
-The policy proves the exact LocalQueue target, both Cohorts, and all seven
-current Active ClusterQueues when the pair is non-null, plus hierarchy,
+The policy proves the exact LocalQueue target, complete Cohort inventory, and
+all seven current Active ClusterQueues when the pair is non-null, plus flat
+membership,
 namespace selectors, complete flavor/resource quotas,
 preemption policies, provider-owned ResourceFlavor instance selectors,
 WorkloadPriorityClass name/value, Pod PriorityClass, and the context's one
@@ -3893,12 +3916,13 @@ adopted the transitional `be` -> `skypilot-be` and `be-ls`/`be-lt` priorities;
 east intentionally remains outside Kueue. Both retain the exact Pod
 PriorityClass at value -1000 with `preemptionPolicy: Never`, and
 `skypilot-pool-sa` is the exact worker service account. The reviewed successor
-does not rely on `be-ls` outranking another workload. It proves the quota-free
-root/child Cohort hierarchy, both no-preempt fill queues, all five research
-queues, their complete quotas, and workload-only
-`skypilot-reserved-fill=-1000`. Research nominal ownership sums to the 512-GPU
-physical ceiling, while child `reclaimWithinCohort: Any` provides structural
-reclaim of direct-root fill independent of the legacy Workload priorities.
+does not rely on `be-ls` outranking another workload. It proves the unchanged
+implicit flat `shared-pool`, both zero-nominal SkyPilot queues, all five
+research queues, their complete quotas and exact #8407/#8517 preemption tuples,
+and existing `be-lt=11` WorkloadPriorityClass. Research nominal ownership sums
+to the 512-GPU physical ceiling. SkyPilot deliberately does not claim or create
+a stronger Cohort hierarchy; the worker Pod remains independently lower at
+-1000/`Never`.
 The inference service accounts have no IRSA annotation. PHX has no Pod
 Identity association. The 2026-08-18 production preflight corrected an earlier
 inventory mistake: east association `a-rsvzwdtaesxvxorkh` to
@@ -3924,6 +3948,14 @@ controller or webhook reads; its null admission/enforcement pair selects the
 independently attested custom-scheduler path. PHX must pass the complete
 code-owned v0.19 Kueue controller/webhook contract through deployment preflight
 before activation.
+Platform PR #8822 was merged and deployed as platform revision 29 on
+2026-08-21. Its readback preserves the exact flat implicit `shared-pool`, zero
+explicit Cohort objects, the existing `be-lt=11` WorkloadPriorityClass, and the
+list-only audit-role boundary; the PostgreSQL worker projection also names
+`be-lt`. Only the SkyPilot queues remain held. This qualifies the platform
+shape expected by schema v6, but does not claim that the unmerged SkyPilot
+policy is deployed, that the held queues admit work, or that reserved-fill is
+activated.
 The 2026-08-18 read
 found two ready Kueue controller replicas, the required Pod integration and TAS
 feature gates, a `hyperpod` topology on `ml.p5e.48xlarge`, and no
@@ -4019,6 +4051,7 @@ either case.
 | 2a.2 | Isolated audit-role Kubernetes authentication and exact east identity-free inventory | Merged and deployed through revision 429 / release 1.1.1336. East passes. PHX now explicitly enables `AssignQueueLabelsForPods=true`; a clean current platform plan is empty. The successful full two-context preflight remains gated by 2a.4. |
 | 2a.3 | Global activation scope with per-service duplicate-pool validation | Revision 431 preflight exposed that the deployment policy incorrectly treated two services sharing one broker pool/card as a duplicate claim. The fix groups activation claims by service, retains same-service duplicate rejection, and permits the documented cross-service sharing before one fleet-wide provider attestation. |
 | 2a.4 | Remove redundant admission-policy authority from reserved fill | Platform PR #8649 is superseded and must not change the shared KubeRay/HPTO policy for fleet activation. Policy-bundle schema v5 removes ValidatingAdmissionPolicy and binding reads while retaining the stronger exact Kueue controller/webhook and synchronous/fresh Pod lifecycle proof. Activation requires only the SkyPilot fix-forward deployment and a fresh full-fleet preflight; no Terraform or platform Helm change is part of this gate. |
+| 2a.5 | Preserve Simone's flat PHX Kueue contract and attest its complete inventory | Platform PR #8822 is merged and deployed as platform revision 29: zero explicit Cohort objects, no new priority class, existing `be-lt=11`, list-only audit access, PostgreSQL projection updated to `be-lt`, and only SkyPilot queues held. The matching SkyPilot schema-v6 correction is locally source-qualified but not merged or deployed. This phase is not activated or production-proven. |
 | 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 63 is committed, elected, and controller-applied at lifecycle epoch 82 on known-good image `v3.682.2-boltz-2`; it is the clean demand-gated activation successor. Version 62 remains rejected historical projection evidence. |
 | 2b.1 | UID-bound base-runtime readiness for canonical projected Kubernetes workers | Merged in PR #1618 at `6ad2407d813d04aed79de2fea62723987ee56670` and present in the revision-472 image. The focused render, source-composition, template-owned bootstrap-digest, typed Kubernetes-model, mutation, bounded-wait, UID-replacement, SSH-listener-failure, and final fresh-read tests pass, but the exact live runtime-readiness path is not yet production-exercised or proven. Generic Kubernetes and projection v1/v2/v3 remain unchanged. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. Historical cleanup #1506 is closed/superseded and reserves no head. |
@@ -5453,14 +5486,18 @@ legacy activation.
   east Pod Identity association `a-rsvzwdtaesxvxorkh` is absent.
 - [x] Close superseded Platform PR #8649 without deploying it; the shared and
   partition admission policies remain unchanged.
+- [x] Merge and deploy Platform PR #8822 as platform revision 29. Readback
+  proves Simone's flat implicit `shared-pool`, zero explicit Cohort objects,
+  no new priority class, existing `be-lt=11`, list-only audit permissions, and
+  a PostgreSQL projection naming `be-lt`; only the SkyPilot queues remain held.
+  This is platform-shape evidence, not SkyPilot activation evidence.
 - [ ] Merge and deploy the schema-v6 SkyPilot attester: retain schema-v5's
-  removal of admission-policy/binding reads, add the exact two-Cohort/
-  seven-ClusterQueue PHX topology, governed-subtree closure from two complete
-  cluster-wide LISTs, policy revision `1.1.1416`, and independent renewable
-  provider receipts, then obtain one fresh successful two-context preflight.
-  Deploy the audit role's two read-only list permissions before that
-  preflight. No runtime pin,
-  KubeRay path, second scheduler, or EFS authority is part of this gate.
+  removal of admission-policy/binding reads, add the exact implicit-flat-cohort/
+  seven-ClusterQueue PHX topology, governed membership closure from two
+  complete cluster-wide LISTs, policy revision `1.1.1422`, and independent
+  renewable provider receipts, then obtain one fresh successful two-context
+  preflight. No runtime pin, KubeRay path, second scheduler, or EFS authority
+  is part of this gate.
 - [x] Commit and elect version 62 whose non-null immutable east and PHX worker
   projections exactly match the corrected server configuration. It proves the
   projection generator but is not an activation candidate because its
@@ -5476,8 +5513,8 @@ legacy activation.
   durable-actuation promotions below, apply the full-backfill policy and prove
   one automatically
   generated zero-cost PHX H200 Pod is admitted
-  through `be` -> `skypilot-be` with workload-only
-  `skypilot-reserved-fill=-1000`, the independent -1000/`Never` Pod priority,
+  through `be` -> `skypilot-be` with existing
+  `be-lt=11` WorkloadPriorityClass, the independent -1000/`Never` Pod priority,
   `skypilot-pool-sa`, `default-scheduler`, a Kueue TAS assignment, and exact
   H200/cluster identity. Do not create a temporary floor, manufacture traffic,
   use direct fill, or launch paid compute for this gate.

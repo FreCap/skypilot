@@ -70,8 +70,8 @@
                 "namespace": "rescluster-k8s-prod-east1-preemptible-inference",
                 "preemption": {
                   "borrow_within_cohort": "Never",
-                  "reclaim_within_cohort": "Never",
-                  "within_cluster_queue": "Never"
+                  "reclaim_within_cohort": "LowerPriority",
+                  "within_cluster_queue": "LowerPriority"
                 },
                 "queueing_strategy": "BestEffortFIFO",
                 "quota_profile": "fleet"
@@ -87,14 +87,14 @@
                 "namespace": "rescluster-k8s-phx",
                 "preemption": {
                   "borrow_within_cohort": "Never",
-                  "reclaim_within_cohort": "Never",
-                  "within_cluster_queue": "Never"
+                  "reclaim_within_cohort": "LowerPriority",
+                  "within_cluster_queue": "LowerPriority"
                 },
                 "queueing_strategy": "BestEffortFIFO",
                 "quota_profile": "fleet"
               },
               {
-                "cohort_name": "research-workloads",
+                "cohort_name": "shared-pool",
                 "fair_sharing_weight": "100",
                 "flavor_fungibility": {
                   "when_can_borrow": "TryNextFlavor",
@@ -103,7 +103,7 @@
                 "name": "hyperpod-ns-research-clusterqueue",
                 "namespace": "hyperpod-ns-research",
                 "preemption": {
-                  "borrow_within_cohort": "Never",
+                  "borrow_within_cohort": "LowerPriority",
                   "reclaim_within_cohort": "Any",
                   "within_cluster_queue": "Never"
                 },
@@ -111,7 +111,7 @@
                 "quota_profile": "legacy"
               },
               {
-                "cohort_name": "research-workloads",
+                "cohort_name": "shared-pool",
                 "fair_sharing_weight": "400",
                 "flavor_fungibility": {
                   "when_can_borrow": "TryNextFlavor",
@@ -121,14 +121,14 @@
                 "namespace": "boltz-research",
                 "preemption": {
                   "borrow_within_cohort": "Never",
-                  "reclaim_within_cohort": "Any",
+                  "reclaim_within_cohort": "LowerPriority",
                   "within_cluster_queue": "LowerPriority"
                 },
                 "queueing_strategy": "StrictFIFO",
                 "quota_profile": "fleet"
               },
               {
-                "cohort_name": "research-workloads",
+                "cohort_name": "shared-pool",
                 "fair_sharing_weight": "300",
                 "flavor_fungibility": {
                   "when_can_borrow": "TryNextFlavor",
@@ -138,14 +138,14 @@
                 "namespace": "boltz-research",
                 "preemption": {
                   "borrow_within_cohort": "Never",
-                  "reclaim_within_cohort": "Any",
+                  "reclaim_within_cohort": "LowerPriority",
                   "within_cluster_queue": "LowerPriority"
                 },
                 "queueing_strategy": "StrictFIFO",
                 "quota_profile": "ma"
               },
               {
-                "cohort_name": "research-workloads",
+                "cohort_name": "shared-pool",
                 "fair_sharing_weight": "200",
                 "flavor_fungibility": {
                   "when_can_borrow": "TryNextFlavor",
@@ -155,14 +155,14 @@
                 "namespace": "boltz-research",
                 "preemption": {
                   "borrow_within_cohort": "Never",
-                  "reclaim_within_cohort": "Any",
+                  "reclaim_within_cohort": "LowerPriority",
                   "within_cluster_queue": "LowerPriority"
                 },
                 "queueing_strategy": "BestEffortFIFO",
                 "quota_profile": "wa"
               },
               {
-                "cohort_name": "research-workloads",
+                "cohort_name": "shared-pool",
                 "fair_sharing_weight": "100",
                 "flavor_fungibility": {
                   "when_can_borrow": "TryNextFlavor",
@@ -172,23 +172,14 @@
                 "namespace": "boltz-research",
                 "preemption": {
                   "borrow_within_cohort": "Never",
-                  "reclaim_within_cohort": "Any",
+                  "reclaim_within_cohort": "LowerPriority",
                   "within_cluster_queue": "LowerPriority"
                 },
                 "queueing_strategy": "BestEffortFIFO",
                 "quota_profile": "fleet"
               }
             ],
-            "cohorts": [
-              {
-                "name": "shared-pool",
-                "parent_name": null
-              },
-              {
-                "name": "research-workloads",
-                "parent_name": "shared-pool"
-              }
-            ],
+            "cohorts": [],
             "inference_cluster_queue": "skypilot-be",
             "quota_profiles": {
               "fleet": [
@@ -316,8 +307,8 @@
               ]
             }
           },
-          "workload_priority_class_name": "skypilot-reserved-fill",
-          "workload_priority_value": -1000
+          "workload_priority_class_name": "be-lt",
+          "workload_priority_value": 11
         },
         "namespace": "rescluster-k8s-prod-east1-preemptible-inference",
         "physical_cluster_uid": "ba2dcdca-2a0d-447f-ad8a-31849a63c1d5",
