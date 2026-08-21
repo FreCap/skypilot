@@ -123,10 +123,10 @@ Literal EFS removal is not source-ready. The current seams and missing work are:
 | Upload blobs | Current clients compute a content SHA-256 and send parallel `/upload_v2` chunk requests; request/job rows retain the logical blob ID | `LocalFilesystemBlobStorage` is the only backend; chunks rely on a shared staging directory, existence/GC use paths and mtimes, the server does not verify that bytes match the claimed blob ID, resolve returns a permanent path, and expired `/upload` clients write an uncorrelated mutable per-user tree | PostgreSQL upload sessions, direct conditional S3 multipart publication, verified logical aliases, owner references, scoped materialization, and removal of `/upload` at the S3_V1 boundary |
 | Managed Jobs | DAG, environment, config, and original YAML are stored in PostgreSQL | Legacy disk fallbacks, blob bytes, controller/task logs | Validate retained rows, remove guarded-HA fallbacks, use S3/log provider |
 | Serve | Version YAML, submitted YAML, placement, controller snapshots, and recovery scripts are in PostgreSQL | Up/update staging, controller files, replica launch artifacts, and logs | Transactional admission payload, local reconstruction, S3 logs |
-| Server config | Canonical server config is in PostgreSQL and database-backed Helm installs reject inline config | Startup still seeds and synchronizes ~/.sky/config.yaml through shared storage | Seed an empty PostgreSQL row once, read PostgreSQL directly, and use only optional pod-local projections |
+| Server config | Canonical server config and Casbin policy are in PostgreSQL and database-backed Helm installs reject inline config | Startup still seeds and synchronizes ~/.sky/config.yaml through shared storage; workspace mutation uses an EFS policy lock and independently commits config and authorization | Seed an empty PostgreSQL row once, read PostgreSQL directly, atomically commit workspace config/policy/cache invalidation, and use only optional pod-local projections |
 | Generated SSH | Generated per-user keypairs and cluster YAML are in PostgreSQL | /root/.ssh is shared; SSH-node-pool uploads use local key paths | Local regeneration; externally supplied keys only from projected Secrets |
 | Caches and scratch | Derivable from durable state | Catalogs, locks, wheels, generated YAML, debug files, and request stages use shared roots | Bounded emptyDir only |
-| Helm | Role split and PostgreSQL guards exist | Every HA role mounts one RWX claim and HA hard-fails without it | PVC-free guarded-HA render with bounded ephemeral storage |
+| Helm | Role split and PostgreSQL guards exist | Every HA role mounts one RWX claim and HA hard-fails without it; API/controller/executor/image-worker renders also retain an unused `skypilot-config` file dependency | D1 removes every guarded-HA config ConfigMap/env/mount/volume; D7 produces the PVC-free render with bounded ephemeral storage |
 
 The existing BlobStorage abstraction is path-oriented and has no S3
 implementation. The existing LogProvider abstraction reads local files but
@@ -152,8 +152,8 @@ PostgreSQL owns:
 - log-stream identity, ordered segment metadata, terminal markers, and typed
   gap records;
 - migration inventory, item result, manifest digest, and cutover receipt; and
-- all existing request, queue, job, Serve, config, cluster, and generated-SSH
-  structured state.
+- all existing request, queue, job, Serve, config, Casbin authorization,
+  permission-cache generation, cluster, and generated-SSH structured state.
 
 One additive schema migration creates the storage generation and
 object/log-catalog tables. A reference and its owning domain mutation commit in
@@ -170,27 +170,41 @@ column names may follow repository conventions, but the keys, state machines,
 and constraints are contract, not implementation suggestions:
 
 - one storage-authority row with protocol (`LEGACY_EFS` or `S3_V1`), monotonic
-  generation, database-incarnation UUID, and the committed cutover receipt;
+  generation, database-incarnation UUID, and the committed cutover receipt. An
+  `S3_V1` row also binds one immutable provider-target tuple: provider and
+  region, bucket name, expected bucket-owner account, server-owned key root and
+  key-schema version, KMS key ARN, required `Enabled` versioning and
+  bucket-owner-enforced ownership modes, conditional-write policy-contract
+  version, incomplete-multipart lifecycle horizon, and the digest/operation ID
+  of the qualified policy probe. Changing that tuple requires a new storage
+  generation; a Helm value or environment variable can only advertise a
+  capability that exactly matches it and can never select the target;
 - logical upload heads unique on
   `(storage_generation, tenant_id, object_kind, logical_blob_id)`, containing a
-  monotonic session epoch and current session ID. The head is the only mutable
-  rendezvous pointer; advancing it requires a locked compare-and-swap from the
-  exact terminal predecessor;
+  monotonic session epoch, current session ID, authority incarnation, and
+  monotonic head-fence epoch. The head is the only mutable rendezvous pointer;
+  advancing it requires a locked compare-and-swap from the exact terminal
+  predecessor and current storage authority;
 - upload sessions keyed by a server-generated UUID and unique on
   `(upload_head_id, session_epoch)`, with expected chunk count, immutable
-  per-session limits, lease owner/epoch/expiry, current attempt epoch, state,
-  and optional predecessor session. Concurrent first chunks converge on the
-  current row. An active conflicting chunk count or limit set is rejected. A
-  terminal pre-publication session remains immutable audit evidence but may be
-  superseded by one freshly fenced session epoch; concurrent successor creation
-  converges through the upload-head compare-and-swap;
+  per-session limits including the idle timeout, authority generation and
+  incarnation, database-clock `created_at`, `last_durable_progress_at`, and
+  `idle_deadline_at`, lease owner/epoch/expiry, session-fence epoch, current
+  attempt epoch, state, optional predecessor session, and terminal
+  reason/time/fence receipt.
+  Concurrent first chunks converge on the current row. An active conflicting
+  chunk count or limit set is rejected. A terminal pre-publication session
+  remains immutable audit evidence but may be superseded by one freshly fenced
+  session epoch; concurrent successor creation converges through the upload-head
+  compare-and-swap;
 - upload attempts unique on `(upload_session_id, attempt_epoch)`, with a fresh
-  object UUID/key, S3 multipart upload ID, and terminal outcome. A rejected or
-  conflicted immutable attempt is retained and a successor attempt never reuses
-  its key;
+  authority generation/incarnation and provider-target identity, object
+  UUID/key, S3 multipart upload ID and creation receipt, multipart-cleanup
+  state/receipt, and terminal outcome. A rejected or conflicted immutable
+  attempt is retained and a successor attempt never reuses its key;
 - upload-part receipts unique on
   `(upload_session_id, attempt_epoch, part_number)`, containing exact byte
-  count, part checksum, ETag, and a provider-call lease epoch;
+  count, part checksum, ETag, and provider-call lease epoch and expiry;
 - immutable objects keyed by object UUID, containing the exact S3 identity and
   verification data below, tenant, logical object kind, representation
   encoding, origin (`NEW_UPLOAD` or `EFS_IMPORT`), and reference state;
@@ -221,8 +235,43 @@ logical digest forever. If no logical alias was published, a later first chunk
 may lock the upload head and atomically insert one successor session with a
 higher epoch and new immutable chunk plan/limits. If the predecessor is still
 active, a conflicting plan is rejected; if an alias is already published, the
-alias wins and no successor is created. Old sessions and attempts are never
-rewritten or reused.
+alias wins and no successor is created. Terminal session/attempt protocol state,
+immutable identity, and audit fields are never rewritten or reused; only their
+explicit receipt-backed multipart cleanup state may advance after fencing.
+
+An active session cannot hold the logical head forever. Its idle deadline moves
+only in the same PostgreSQL transaction that records durable progress: the
+multipart-creation receipt, a new matching part receipt, or a finalization
+state receipt. An existence check, duplicate/conflicting request, HTTP retry,
+lease acquisition/renewal, or failed provider call does not refresh it. The
+idle timeout and resulting deadlines use the PostgreSQL clock and are fixed by
+the session's admitted limits; pod-local clocks and S3 timestamps are not
+authority.
+
+The first-chunk allocation path owns the correctness transition. While locking
+the logical head and current session, it may compare-and-swap an unpublished
+`ALLOCATED` or `MULTIPART_ACTIVE` session to `ABORTED` only after database time
+has reached its idle deadline and no multipart-create, part, or finalizer lease
+is unexpired. Any expired/ambiguous provider-call lease first rejects the exact
+attempt. The same transaction terminalizes any current nonterminal attempt,
+sets multipart cleanup `PENDING` when an exact upload ID was recorded,
+increments both head and session fence epochs, and records `IDLE_TIMEOUT`,
+`aborted_at`, and the exact predecessor/attempt receipt before a successor can
+be inserted. The existing bounded blob-maintenance loop may call the same
+repository transition with `FOR UPDATE SKIP LOCKED` to reduce abandoned
+multipart cost, but it is not required for liveness and introduces no second
+state machine or daemon. On-access compare-and-swap remains sufficient when
+maintenance has not run.
+
+Every part receipt, finalizer result, immutable-object insertion, alias
+insertion, and session transition re-locks and validates the exact authority
+protocol/generation/incarnation, upload-head current session/epoch, active
+head/session fence epochs, attempt epoch, and provider-call lease. If abort or
+successor creation wins first, a late old request or provider response can at
+most leave bytes under the old random key; it cannot record a receipt, publish
+an object or alias, or mutate the successor. A later HTTP retry that begins
+after the fence resolves the current session normally, but no operation already
+admitted under the old epoch is retargeted silently.
 
 The later domain admission transaction locks the alias, validates tenant,
 generation, object kind, publication state, exact digest, and size, inserts the
@@ -265,6 +314,18 @@ in their server-owned roots. They cannot list object prefixes, copy objects,
 delete completed objects or versions, change bucket configuration, or alter the
 KMS key.
 
+Before any provider call, allocation locks the storage-authority row and reads
+the exact target tuple committed for that generation. It derives a random key
+under that server root and copies the target identity, authority generation,
+and authority incarnation into the attempt or log-segment allocation. Any
+projected bucket, region, owner, root, KMS, or policy-capability hint must equal
+the PostgreSQL tuple byte-for-byte after canonicalization; absence or mismatch
+fails readiness and the call is not issued. IAM independently grants only that
+tuple. The hint and IAM grant prove capability but neither is a target selector.
+An object read continues to use its own committed exact identity, including
+after an authorized later generation; prefix discovery and "the currently
+configured bucket" are never read authority.
+
 Every committed object record includes:
 
 - provider, bucket, key, and exact version ID;
@@ -294,11 +355,23 @@ and
 [multipart conditional-write behavior](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
 and are covered by a real-bucket policy test, not only an SDK mock.
 
-Incomplete multipart parts are not committed objects. The runtime may call
-`AbortMultipartUpload` for its exact recorded upload, and a prefix-scoped
-`AbortIncompleteMultipartUpload` lifecycle rule removes abandoned parts after
-the documented retry horizon. No lifecycle rule expires completed current or
-noncurrent object versions in version 1.
+Incomplete multipart parts are not committed objects. After PostgreSQL has
+fenced an attempt, the same repository records multipart cleanup as `PENDING`
+before issuing `AbortMultipartUpload` for only its exact recorded provider,
+region, bucket, key, upload ID, expected owner, authority generation/
+incarnation, and creation receipt. Cleanup never substitutes the current
+process target. It is idempotent and never unfences the attempt. Because an
+in-flight `UploadPart` may finish after an abort, cleanup waits out every
+recorded provider-call lease, repeats exact abort as needed, and calls
+`ListParts` until the upload is absent or the part list is empty before
+recording `CONFIRMED_ABSENT`. Lost abort acknowledgement, retryable provider
+failure, or an unexpectedly nonempty part list leaves the receipt retryable.
+The existing bounded maintenance loop retries that same repository operation;
+successor creation does not wait for provider cleanup because it uses a
+different upload ID and key. A prefix-scoped
+`AbortIncompleteMultipartUpload` lifecycle rule is the final cost backstop
+after the documented retry horizon, not a correctness transition. No lifecycle
+rule expires completed current or noncurrent object versions in version 1.
 
 Opaque object kinds in version 1 are:
 
@@ -382,11 +455,15 @@ reference.
    it does not allocate state. The first chunk request creates/locks the upload
    head, current session, and first server-generated attempt/object identity in
    PostgreSQL. Concurrent first chunks converge through the unique logical
-   head. A retry returns the same active attempt when its immutable plan
-   matches. A conflicting plan is rejected while that session is active; after
-   a terminal pre-publication abort, one compare-and-swapped successor session
-   epoch may adopt the new plan. A published alias always returns the existing
+   head. Before returning or rejecting any active attempt, the allocation path
+   performs the database-clock abandonment check above. A nonexpired retry
+   returns the same attempt when its immutable plan matches and rejects a
+   conflict; an idle session is fenced to terminal `ABORTED` and one compare-
+   and-swapped successor session epoch may adopt either the same or a changed
+   plan with a fresh attempt/key. A published alias always returns the existing
    object. One lease epoch owns multipart creation or finalization at a time.
+   Allocation copies the locked PostgreSQL authority generation/incarnation and
+   exact S3 target into the attempt before releasing the transaction.
 2. Each parallel chunk request may land on any API replica. It validates chunk
    number/count and HTTP bounds, spools at most that chunk to a reserved local
    path while computing its checksum and size, uploads the corresponding S3
@@ -399,12 +476,14 @@ reference.
    size match.
    A provider-call lease that expires or loses its owning process is never
    reassigned against the same multipart upload: the attempt becomes
-   `REJECTED`, its exact upload is aborted best-effort, and a fresh
-   attempt/upload ID/key requires the client to resend all parts. This prevents
-   a late, unfenceable `UploadPart` response from changing a part after another
-   owner recorded its receipt.
+   `REJECTED`, its exact upload receives a durable cleanup receipt, and a fresh
+   attempt/upload ID/key requires the client to resend all parts. Receipt-backed
+   exact abort/ListParts reconciliation proceeds independently as defined
+   above. This prevents a late, unfenceable `UploadPart` response from changing
+   a part after another owner recorded its receipt.
 3. A finalizer locks the complete receipt set, conditionally completes the
    multipart upload whose create request fixed the required SSE-KMS controls,
+   revalidates the current authority, head, session, attempt, and lease epochs,
    and records its attempt epoch. A `409` rejects that attempt, creates a fresh
    fenced attempt/key, clears its part-receipt view, and asks the still-owning
    client to resend all parts. A `412` or lost response is reconciled only
@@ -421,13 +500,16 @@ reference.
    reference in its own domain transaction as defined above.
 
 A crash before the session records an S3 multipart upload may leave only
-incomplete parts; the narrow abort lifecycle handles them. A crash after object
-completion but before PostgreSQL publication is recovered from the exact
-session key and conditional-write invariant. A lost acknowledgement cannot
-select a prefix-list winner, overwrite bytes, or create a second logical alias.
-Digest, encryption, owner, size, or format failure rejects that immutable
-attempt and requires a fresh attempt/key; it can never overwrite or bless the
-bad version. No step requires all chunks or retries to reach one pod.
+incomplete parts; the narrow lifecycle is the cost backstop when no exact upload
+ID was durably received. A recorded upload instead follows receipt-backed exact
+abort/ListParts reconciliation. A crash after object completion but before
+PostgreSQL publication is recovered from the exact session key and
+conditional-write invariant. Every recovery transaction revalidates authority
+generation and incarnation. A lost acknowledgement cannot select a prefix-list
+winner, overwrite bytes, or create a second logical alias. Digest, encryption,
+owner, size, or format failure rejects that immutable attempt and requires a
+fresh attempt/key; it can never overwrite or bless the bad version. No step
+requires all chunks or retries to reach one pod.
 
 The legacy `/upload` endpoint cannot be adapted safely to this protocol: its
 client does not include the upload handle in the later domain request, so two
@@ -457,11 +539,14 @@ their metadata in PostgreSQL. Segment order is a monotonically allocated stream
 sequence, not S3 listing order. Each segment uses the same conditional
 publication and lost-ack reconciliation contract as a blob.
 
-Each stream has one PostgreSQL lease owner and monotonic lease epoch. Segment
-and gap identities are unique on `(stream_id, sequence)` and carry the writer
-epoch, so a deposed writer cannot append after takeover. The writer flushes on
-a bounded time or size threshold and before publishing a terminal lifecycle
-transition.
+Each stream has one PostgreSQL lease owner, monotonic lease epoch, and writer
+authority generation/incarnation. Segment and gap identities are unique on
+`(stream_id, sequence)` and carry that complete writer fence. Segment allocation
+locks the storage authority and copies its exact S3 target, generation, and
+incarnation before issuing a provider call. Metadata commit revalidates all of
+them, so a deposed or pre-restore writer can at most leave an unreferenced
+immutable key and cannot append after takeover. The writer flushes on a bounded
+time or size threshold and before publishing a terminal lifecycle transition.
 
 A hard-killed writer cannot write its own gap marker. After the old lease
 expires, the next owner first commits an `OWNER_LOSS_TAIL_GAP` at the next
@@ -471,6 +556,15 @@ owner/epoch and last committed sequence; it does not invent an unknowable byte
 count. Only then may the new owner append. Thus a hard process kill may lose an
 uncommitted local tail, but recovery exposes that durability boundary instead
 of silently pretending the bytes exist.
+
+An authority-incarnation change invalidates every writer lease immediately,
+independently of its wall-clock expiry. The first new-incarnation owner commits
+a `RESTORE_TAIL_GAP` at the next sequence in the same transaction that acquires
+its writer epoch unless the restored database proves the prior writer durably
+closed. The marker names the restore receipt, old incarnation, writer epoch,
+and last committed sequence. An old segment upload that finishes later cannot
+commit metadata because every segment transaction compares the current
+authority incarnation.
 
 Readers combine committed segments with a live local tail only when connected
 to its current lease owner. A request handled by another API replica streams
@@ -519,17 +613,66 @@ Database-backed guarded HA already rejects inline Helm config. On a fresh
 schema, only the migration job in explicit bootstrap/upgrade mode inserts one
 validated empty `api_server_config` row with `ON CONFLICT DO NOTHING`; an
 existing row always wins. Verify mode and every runtime role execute no seed
-DML: they require PostgreSQL, read that row directly, and fail closed if it is
-absent or invalid. They never overlay a ConfigMap or shared file. Configuration
-updates commit in PostgreSQL and reload per-process state; any compatibility
-path that requires a file receives a versioned pod-local projection and may
-recreate it after restart. The config reload lock is pod-local because
-PostgreSQL, not a filesystem lock, serializes durable updates.
+DML. Canonical central server-config resolution requires PostgreSQL, reads that
+row directly, and fails closed if it is absent or invalid; it never overlays a
+ConfigMap or shared file. Configuration updates lock the canonical PostgreSQL
+config row across the complete read-modify-write, or compare-and-swap its exact
+expected content digest, and commit the new content plus digest atomically. For
+a workspace mutation, that same caller-owned transaction and lock boundary also
+applies the exact Casbin workspace-policy delta and advances the database-backed
+permission-cache generation/invalidation receipt. The config and permission
+repositories accept the caller's PostgreSQL transaction and neither commits
+independently. A stale writer must re-read and retry or return a conflict; it
+cannot overwrite a concurrent update. A failure exposes either the old config,
+policy, and cache generation or the new set, never a mixture.
 
-The final guarded-HA chart has no config ConfigMap correctness dependency. It
-may omit the ConfigMap entirely for guarded HA; calling it immutable is not a
-substitute for PostgreSQL authority. Explicit non-HA installations retain their
-separate file/ConfigMap compatibility behavior.
+Every current guarded-HA config writer routes through that one repository
+transaction. `update_api_server_config_no_lock` cannot remain a public blind-
+upsert escape hatch: D1 either removes it or makes it repository-private and
+requires the caller's active PostgreSQL transaction plus exact expected digest.
+No handler, permission callback, bootstrap helper, or background path may write
+the config row outside the locked/CAS contract.
+
+Only after commit does each process reload the committed config and in-memory
+Casbin enforcer. Authorization readers compare their observed cache generation
+with PostgreSQL and reload/fail closed before making a decision under a newer
+generation, so a crash after commit but before local reload cannot preserve
+stale authorization. Any compatibility path that requires a file receives a
+versioned pod-local projection and may recreate it after restart. A pod-local
+lock protects only in-process projection/reload; it has no cross-pod or durable-
+update authority. No filesystem config or policy lock participates in a
+guarded-HA workspace mutation. D6 removes remaining filesystem locks from
+non-workspace permission operations rather than expanding D1 into unrelated
+authorization behavior.
+
+D1 introduces a distinct pod-local lock only for central-config in-process
+reload; it does not globally repoint `get_skypilot_config_lock_path()`. During
+the `LEGACY_EFS` transition, that existing shared lock still fences the shared
+Serve `config.yaml.v*` promote/restore/scrub path, including recovery before a
+controller-incarnation claim. Those operations must check the protocol on both
+sides of the lock. D6 first replaces the shared Serve/Managed Jobs snapshot
+path with an exact versioned projection materialized from PostgreSQL into
+bounded pod-local storage, then deletes the legacy shared snapshot lock and
+path. Repointing the generic helper early would create two unsynchronized locks
+over the same shared files and is forbidden.
+
+Likewise, D1's direct-PostgreSQL claim is scoped to canonical central server-
+config resolution. Guarded Serve/Managed Jobs child processes retain their
+explicit immutable per-owner/version snapshot semantics: after D6 the server
+loads the exact snapshot from PostgreSQL, materializes it pod-locally for the
+child lifetime, and may set `SKYPILOT_CONFIG` only to that server-issued path.
+In a central-server context, `reload_config()` ignores file precedence and
+resolves PostgreSQL directly. In a scoped child context, it validates the exact
+snapshot identity before reading the local projection. Tests exercise this real
+dispatch boundary; testing only `get_server_config()` or an effective-config
+helper is insufficient.
+
+The guarded-HA chart omits the `skypilot-config` ConfigMap itself, every config
+volume and mount from API, controller, executor, and image-worker pods, and the
+image worker's `SKYPILOT_GLOBAL_CONFIG` environment variable. A PostgreSQL
+short-circuit while retaining any of those references is insufficient because
+a missing unused ConfigMap can still prevent pod scheduling. Explicit non-HA
+installations retain their separate file/ConfigMap compatibility behavior.
 
 Generated SSH keypairs and cluster YAML continue to come from PostgreSQL.
 Externally managed key files are read-only Secret projections. /root/.ssh is no
@@ -551,6 +694,15 @@ after cutover. Every public blob, log, materialization, config, Job, and Serve
 entrypoint resolves the protocol through the same repository. There is no
 per-role flag or Helm value that can contradict PostgreSQL.
 
+For `S3_V1`, that same row also selects the exact provider target. The
+transition and PVC-free charts may project the tuple as a capability hint so a
+pod can construct its SDK client, but startup canonicalizes and compares every
+field with PostgreSQL before readiness. A missing or divergent hint fails
+closed; it cannot override, fill in, or migrate the authority row. Allocation
+copies the locked tuple plus generation/incarnation into durable writer state,
+and a later retry uses those recorded values rather than whichever values a new
+pod happens to receive.
+
 The release fence Secret contains the expected database incarnation plus an
 anti-rollback protocol/generation floor. Those values never select a provider:
 PostgreSQL remains the authority, and a mismatch only makes every role
@@ -571,24 +723,26 @@ proves that all 2/2/2 pods run the immutable transition digest while the
 protocol is still `LEGACY_EFS`. A restarted pre-feature image fails schema
 verification before serving requests or acquiring provider authority.
 
-The `S3_V1` commit records the minimum storage capability and qualified image
-and chart digests in its receipt. Activation is refused unless the database
-head, importer manifest, quiescence evidence, exact S3/KMS policy probe, and
-intended deployment digests match. After that commit, an S3-capable process
-that cannot implement the recorded protocol fails readiness; it cannot select
-EFS. Native rollback to a pre-feature image is unsupported and fails the
-database-head gate. The stacked cleanup removes `LEGACY_EFS` code after the
-acceptance horizon.
+The `S3_V1` commit records the complete immutable target tuple, policy-contract
+version and probe receipt, minimum storage capability, and qualified image,
+chart, values, and rendered-manifest digests in its receipt. Activation is
+refused unless the database head, importer manifest, quiescence evidence, exact
+S3/KMS policy probe, and intended deployment digests match. After that commit,
+an S3-capable process that cannot implement or reach the recorded target fails
+readiness; it cannot select EFS or another bucket. Native rollback to a
+pre-feature image is unsupported and fails the database-head gate. The stacked
+cleanup removes `LEGACY_EFS` code after the acceptance horizon.
 
 A fresh guarded-HA database never bootstraps through EFS. The same activation
 command has a fresh-install mode that requires an empty product database, the
 release fence Secret, qualified image/chart identities, and successful
 exact S3/KMS/IAM probes, then inserts the first authority row directly as
-`S3_V1` with a unique install receipt. It refuses a nonempty or previously
-initialized database. During the transition stack, upgrades of an existing
-installation initialize `LEGACY_EFS`; after D10, fresh guarded-HA installation
-supports only the receipt-backed `S3_V1` bootstrap. No normal pod startup or
-Helm render chooses a protocol automatically.
+`S3_V1` with the exact target tuple and a unique install receipt. It refuses a
+nonempty or previously initialized database. During the transition stack,
+upgrades of an existing installation initialize `LEGACY_EFS`; after D10, fresh
+guarded-HA installation supports only the receipt-backed `S3_V1` bootstrap. No
+normal pod startup or Helm render chooses a protocol or provider target
+automatically.
 
 ## Database restore behavior
 
@@ -605,30 +759,63 @@ generation to satisfy that projected fence. Normal Helm upgrades reuse the
 Secret and normal application roles can only compare it; they cannot create,
 update, lower, or rotate it.
 
-An authorized restore is a separate, one-shot operator transaction while all
+An authorized restore is a separate, one-shot operator operation while all
 application writers and provider mutation are fenced. The operator generates a
 fresh UUID, updates the incarnation field in the release fence Secret, and runs
-the restore command with the expected restored UUID, fresh UUID, immutable restore
-operation ID, and the existing control-plane authorization evidence. The
-command locks the storage-authority row, compare-and-swaps only the expected old
-incarnation, inserts a unique restore receipt, and commits the fresh
-incarnation. A retry with the same operation and values returns the receipt; a
-different value or already-advanced incarnation fails closed. Runtime roles
+the restore command with the expected restored UUID, fresh UUID, immutable
+restore operation ID, and the existing control-plane authorization evidence.
+Its first transaction locks the storage-authority row, compare-and-swaps only
+the expected old incarnation, and inserts a unique `FENCED` restore receipt
+binding old/new incarnation, protocol, generation, and provider-target digest.
+That commit globally invalidates every old writer before any row-by-row
+recovery. A retry with the same operation and values resumes from the receipt;
+a different value or already-advanced incarnation fails closed. Runtime roles
 have no code path that performs this rotation during normal startup.
 
 The restore command first proves the restored row already satisfies the
-non-lowerable protocol/generation floor. It may rotate only incarnation; it
-cannot change protocol or generation. A pre-S3_V1 snapshot is therefore not a
-valid restore source after cutover. The operator may update the incarnation
-field of the fenced Secret only while all roles are stopped; a failed CAS
-leaves them fail-closed until the operator restores the prior incarnation input
-or completes the authorized repair.
+non-lowerable protocol/generation floor and that its complete S3 target tuple
+matches the projected capability. It may rotate only incarnation; it cannot
+change protocol, generation, provider target, or policy contract. A pre-S3_V1
+snapshot is therefore not a valid restore source after cutover. The operator
+may update the incarnation field of the fenced Secret only while all roles are
+stopped; a failed CAS leaves them fail-closed until the operator restores the
+prior incarnation input or completes the authorized repair.
 
-Only after that transaction and the existing provider-authority recovery gates
-pass may application writers become Ready. Restored exact object references
-remain readable because version 1 never deletes authoritative S3 objects. Fresh
-writes include the new incarnation in their server-generated keys and cannot
-overwrite an old version.
+Every mutable storage writer row carries the incarnation under which it was
+allocated. Every create/part/finalize/publication receipt and log-segment commit
+compares it with the current authority row, so the `FENCED` transaction alone is
+sufficient to stop an old process from committing even if an S3 call completes
+late. The restore operation then performs a bounded, retryable PostgreSQL
+recovery pass before writer readiness:
+
+- each old-incarnation upload head is handled in one locked transaction. If its
+  current session is `ALLOCATED` or `MULTIPART_ACTIVE`, any current nonterminal
+  attempt becomes terminal `ABORTED` with reason `RESTORE_INCARNATION` and
+  cleanup `PENDING` when it has a recorded multipart upload; that session
+  becomes terminal `ABORTED` with the same reason and exact restore operation
+  ID, and its session-fence epoch increments. Whether the current session was
+  just aborted or was already terminal, the upload head advances to the fresh
+  authority incarnation and increments its head-fence epoch while retaining
+  that terminal predecessor as its current audit pointer. A later request may
+  compare-and-swap an exact aborted predecessor to only a new-incarnation
+  session/attempt/key; a published alias still prevents a successor;
+- each old-incarnation log writer lease is invalidated. The first new writer
+  commits the `RESTORE_TAIL_GAP` described above while acquiring its new
+  incarnation and epoch; and
+- old-incarnation completed objects, aliases, owner references, and committed
+  log segments present in the restored snapshot remain valid and readable.
+  Effects absent from the snapshot remain unreferenced retained garbage and are
+  never rediscovered by prefix listing.
+
+When all old-incarnation mutable heads/leases are durably fenced, the command
+marks the same restore receipt `RECOVERED`. Exact multipart abort/ListParts
+cleanup may continue through the existing bounded maintenance path because the
+fresh key makes it cost cleanup rather than correctness. Only a current
+`RECOVERED` receipt and the existing provider-authority recovery gates permit
+application writers to become Ready. Restored exact object references remain
+readable because version 1 never deletes authoritative S3 objects. Fresh writes
+include the new incarnation in their server-generated keys and cannot overwrite
+an old version.
 
 The existing control-plane authority and provider-mutation fences still apply
 to a restored database. This storage design does not make an old database
@@ -651,6 +838,9 @@ The migration has one authority transition: EFS to S3_V1.
    infrastructure slice; the current account has no compliant SkyPilot bucket
    and its broad role policy is insufficient. The bucket-policy explicit deny
    and least-privilege workload grants must be effective before any upload.
+   Produce the canonical provider-target tuple and qualified policy-probe
+   receipt that the S3_V1 authority transaction will bind; a chart value alone
+   is not activation evidence.
 3. Inventory the exact PVC, PV, access point, EFS root, path types, byte counts,
    ownership, modes, symlinks, and PostgreSQL retained references.
 4. Classify every path as structured state already in PostgreSQL, an object to
@@ -682,8 +872,9 @@ No production authority changes in these steps.
 4. Capture a final exact EFS inventory and copy required opaque bytes to
    immutable S3 versions.
 5. Verify every object twice by exact version, size, and digest. Commit imported
-   object rows, logical aliases, owner references, manifest digest, qualified
-   image/chart identities, and one S3_V1 generation receipt in one PostgreSQL
+   object rows, logical aliases, owner references, manifest digest, the complete
+   provider-target tuple and policy-probe receipt, qualified image/chart/values/
+   manifest identities, and one S3_V1 generation receipt in one PostgreSQL
    transaction.
 6. After that commit, advance the stopped release's non-lowerable fence Secret
    to the committed S3_V1 generation, then start only the PVC-free release. A
@@ -698,9 +889,10 @@ EFS can no longer be selected as authority.
 
 1. Deploy the PVC-free 2/2/2 release with direct Helm, immutable image/chart
    identity, retained values, and --reuse-values.
-2. Require every role to read the committed S3_V1 generation and pass
-   PostgreSQL, S3 exact-version, KMS, local-space, and projected-identity
-   readiness probes.
+2. Require every role to read the committed S3_V1 generation, prove every
+   projected provider-capability field exactly matches its PostgreSQL target,
+   and pass PostgreSQL, S3 exact-version, KMS, local-space, and
+   projected-identity readiness probes.
 3. Verify upload/download, request logs, nonterminal Managed Job recovery,
    Serve reconstruction/takeover, config projection, generated SSH recovery,
    and cluster status after complete pod blackout.
@@ -736,51 +928,90 @@ The dependency graph and minimum clean stack are:
 
 1. **D0 -- this design.** Merge the exact authority, upload-session,
    transaction, restore, rollout, and removal contract before implementation.
-2. **D1 -- PostgreSQL config authority.** Stop guarded-HA roles from copying or
-   locking config on RWX; seed the PostgreSQL row only in explicit
-   bootstrap/upgrade migration modes, make verify/runtime read-only and
-   fail-closed, and preserve every retained row. This is the first bounded
-   source PR because it removes one real EFS correctness edge without inventing
-   the object protocol. It depends only on D0.
+2. **D1 -- PostgreSQL config authority.** Stop canonical central server config
+   from copying to or locking on RWX; seed the PostgreSQL row only in explicit
+   bootstrap/upgrade migration modes, make verify/runtime initialization seed-
+   free and fail-closed, preserve every retained row, and serialize each
+   configuration read-modify-write with a PostgreSQL row lock or exact expected-
+   digest CAS.
+   Commit each workspace config change, exact Casbin workspace-policy delta,
+   and database-backed permission-cache invalidation in that same caller-owned
+   transaction, then reload in-memory enforcers. Pod-local locking remains only
+   for in-process projection/reload, and no filesystem policy lock participates
+   in workspace mutation. In the same D1 PR, guarded-HA chart rendering removes
+   the `skypilot-config` ConfigMap, all role and image-worker config volumes/
+   mounts, and `SKYPILOT_GLOBAL_CONFIG`; negative renders prove no reference
+   remains. Add a distinct pod-local central reload lock without repointing
+   `get_skypilot_config_lock_path()`; retain and protocol-fence that legacy
+   shared lock for Serve snapshots until D6. Exercise actual `reload_config()`
+   dispatch so central contexts resolve PostgreSQL while scoped child snapshots
+   retain their explicit version semantics. Route every guarded-HA config writer
+   through the one transaction repository and remove or internalize the blind
+   `update_api_server_config_no_lock` bypass. This is the first bounded source
+   PR because it removes one real EFS correctness edge without inventing the
+   object protocol. It depends only on D0.
 3. **D2 -- inert PostgreSQL storage foundation.** Add the protocol/generation,
-   incarnation/restore receipt, upload-head/session/part,
-   object/alias/reference,
-   log-stream/segment/gap, and migration-receipt schema plus the repository that
-   accepts caller-owned transactions on the existing mandatory central
-   migration head. The migration creates no authority row and changes no
-   runtime routing. A separately invoked, idempotent `initialize-legacy`
-   command records the exact retained installation, expected incarnation, EFS
-   identity, and qualified transition digest before those processes start; it
-   refuses a fresh/nonmatching database. A fresh database remains unactivated
-   for D8's validated S3_V1 bootstrap. It depends on D0; D1 may merge before or
-   with it.
+   exact provider-target tuple, incarnation and `FENCED`/`RECOVERED` restore
+   receipt, upload-head/session/attempt/part and cleanup-receipt,
+   object/alias/reference, log-stream/writer/segment/gap, and migration-receipt
+   schema. Stamp every mutable writer/lease with authority generation and
+   incarnation; add database-clock durable-progress/deadline fields and the
+   indexed current-head/old-incarnation recovery queries. Add the repository
+   with the one on-access abandonment/restore-fence compare-and-swap and
+   caller-owned transaction support on the existing mandatory central migration
+   head. The migration creates no authority row and changes no runtime routing.
+   A separately invoked, idempotent `initialize-legacy` command records the
+   exact retained installation, expected incarnation, EFS identity, and
+   qualified transition digest before those processes start; it refuses a
+   fresh/nonmatching database. A fresh database remains unactivated for D8's
+   validated S3_V1 bootstrap. It depends on D0; D1 may merge before or with it.
 4. **D3 -- exact S3 provider and cross-replica upload.** Add conditional
    multipart publication, checksums, exact-version verification, lost-ack
-   recovery, bounded part spool, lifecycle/policy probes, logical aliasing, and
-   the object `PUBLISHED_UNREFERENCED` state and upload-session `PUBLISHED`
-   state. Integrate owner references into request,
-   Managed Job, and Serve admission transactions. It depends on D2 and the
-   static S3 boundary.
+   recovery, PostgreSQL-target allocation, bounded part spool,
+   lifecycle/policy probes, logical aliasing, and the object
+   `PUBLISHED_UNREFERENCED` state and upload-session `PUBLISHED` state. Implement
+   database-clock idle fencing on first-chunk access, exact stale-epoch
+   rejection, and receipt-backed abort/ListParts cleanup through the existing
+   bounded maintenance loop; cleanup never gates a fresh-key successor.
+   Integrate owner references into request, Managed Job, and Serve admission
+   transactions. It depends on D2 and the static S3 boundary.
 5. **D4 -- scoped materialization.** Replace permanent blob paths in guarded HA
    with checked, bounded context-managed materialization and route every
    file-mount consumer through it. It depends on D3.
-6. **D5 -- common durable logs.** Add leased writers, immutable segments,
-   next-owner gap records, readers, downloads, and reconnect for requests,
-   Managed Jobs, Serve controllers, and replica launches. It depends on D2 and
-   the S3 provider from D3, but can proceed in parallel with D4.
+6. **D5 -- common durable logs.** Add authority-incarnation-fenced leased
+   writers, PostgreSQL-targeted immutable segments, owner-loss and restore-tail
+   gap records, readers, downloads, and reconnect for requests, Managed Jobs,
+   Serve controllers, and replica launches. Every segment receipt revalidates
+   authority after provider I/O. It depends on D2 and the S3 provider from D3,
+   but can proceed in parallel with D4.
 7. **D6 -- remove remaining product filesystem authority.** Make Managed Jobs,
    Serve staging/reconstruction, generated SSH, catalogs, locks, wheels, and
    caches use PostgreSQL, exact S3 versions, Secrets, or bounded local state.
-   It depends on D4/D5 for the surfaces it consumes.
-8. **D7 -- PVC-free chart.** Render guarded HA with disk-backed bounded
-   emptyDir and no `/root/.sky`, `/root/.ssh`, `/root/sky_logs`, PVC, PV, or EFS
-   CSI reference. Add resource limits, readiness probes, and negative render
-   tests. It depends on D1 and all applicable D3--D6 runtime removals.
+   Replace every remaining guarded-HA non-workspace caller of
+   `~/.sky/.policy_update.lock`; D1 bypasses that lock only for its atomic
+   workspace-config transaction. Replace the legacy shared Serve/Managed Jobs
+   config snapshots with exact PostgreSQL-backed pod-local materializations,
+   then delete their shared snapshot path and lock. It depends on D4/D5 for the
+   surfaces it consumes.
+8. **D7 -- PVC-free chart.** Building on D1's removal of every guarded-HA config
+   ConfigMap reference, render guarded HA with disk-backed bounded emptyDir and
+   no `/root/.sky`, `/root/.ssh`, `/root/sky_logs`, PVC, PV, or EFS CSI
+   reference. D7 is blocked until D6 proves no guarded-HA caller still requires
+   `~/.sky/.policy_update.lock` or the legacy shared snapshot lock. Add resource
+   limits, readiness probes, and storage-negative render tests. It depends on
+   D1 and all applicable D3--D6 runtime removals.
 9. **D8 -- importer, rehearsal, and activation command.** Inventory EFS and
-   PostgreSQL, import exact versions, construct owner references, commit the
-   one-way generation, support receipt-backed fresh-database S3_V1 bootstrap,
-   and emit the verification bundle. Add a separate explicit restore CAS
-   command; importer, cutover, Helm migration, and normal startup never rotate
+   PostgreSQL, import exact versions, construct owner references, bind the exact
+   S3 target/policy receipt while committing the one-way generation, support
+   receipt-backed fresh-database S3_V1 bootstrap, and emit the verification
+   bundle. Add the separate explicit restore operation: atomically rotate only
+   incarnation into a `FENCED` receipt; then, in bounded locked PostgreSQL
+   transactions, terminalize each active old-incarnation session and attempt,
+   advance every old-incarnation upload head to the new incarnation/fence, and
+   invalidate old log leases. Mark that same receipt `RECOVERED` before writer
+   readiness. Provider abort cleanup can continue afterward through the
+   existing maintenance path.
+   Importer, cutover, Helm migration, and normal startup never rotate
    incarnation. It depends on D2--D7.
 10. **D9 -- production activation.** Apply the dedicated minimal S3/KMS/IAM
     slice with the completed-object delete deny and conditional-write policy,
@@ -816,16 +1047,40 @@ lines. The common log path is the largest portion.
 ### Source
 
 - PostgreSQL migration upgrades, downgrade boundaries, idempotent retry, and
-  mixed-version rejection pass against real PostgreSQL.
+  mixed-version rejection pass against real PostgreSQL. Schema constraints and
+  repository tests cover the exact authority target, authority incarnation on
+  every mutable writer, upload durable-progress/deadline fields, head/session/
+  attempt fences, and cleanup receipts.
 - Parallel chunks deliberately routed across both API replicas produce one
   session, one logical alias, and one exact object without sticky routing.
 - Upload allocation, multipart creation/completion acknowledgement loss, `409`,
   `412`, duplicate/conflicting parts, wrong tenant/owner, wrong version, wrong
   KMS key, digest mismatch, truncation, local ENOSPC, and pod deletion are
   covered.
-- An active upload rejects a conflicting chunk plan; an aborted unpublished
-  session can be superseded by exactly one higher session epoch; immutable old
-  audit rows remain unchanged; and a published alias prevents all successors.
+- Before its PostgreSQL-clock idle deadline, an active upload rejects a
+  conflicting chunk plan. At or after the deadline, concurrent first-chunk
+  requests perform one on-access compare-and-swap that terminalizes the current
+  attempt, aborts the unpublished session, advances both fences, and admits
+  exactly one higher session epoch with a fresh key and either the same or a
+  changed plan. Duplicate requests, lease renewal, failed provider calls, and
+  process-local clocks do not extend the deadline; the result is identical when
+  periodic maintenance never runs or races through the same repository
+  transition. Immutable old identity and protocol-state audit fields remain
+  unchanged (only the cleanup receipt may advance), and a published alias
+  prevents all successors.
+- After idle, restore, or attempt fencing, every delayed old request and every
+  late multipart-create, UploadPart, or complete response fails the current
+  authority/head/session/attempt/lease comparison and cannot record a receipt,
+  publish an object/alias, or mutate the successor.
+- Multipart cleanup tests cover abort acknowledgement loss, an UploadPart that
+  completes after abort, repeated exact `AbortMultipartUpload`, and `ListParts`
+  reconciliation through `CONFIRMED_ABSENT`. Cleanup remains retryable through
+  the existing bounded maintenance loop and never gates fresh-key successor
+  admission; the bucket lifecycle is tested only as the final cost backstop.
+- A source-topology test proves first-chunk access alone can perform the idle
+  transition and that only the existing bounded maintenance loop invokes the
+  same repository compare-and-swap; no additional correctness-only process,
+  state machine, timer, or daemon exists.
 - An uploaded object is durably `PUBLISHED_UNREFERENCED` before domain
   admission; request, Job, and Serve tests prove that owner plus reference
   commit atomically through a caller-owned PostgreSQL transaction.
@@ -845,19 +1100,63 @@ lines. The common log path is the largest portion.
 - Managed Job and Serve recovery use only PostgreSQL, exact S3 versions,
   Secrets, and emptyDir in guarded HA.
 - Bootstrap/upgrade config seed, retained-row precedence, verify-mode zero
-  INSERT, missing/invalid-row fail-closed, cross-role reload, and zero
-  shared-file read/write are covered.
+  INSERT, missing/invalid-row fail-closed, and cross-role reload run against
+  real PostgreSQL, not only mocks. A real-PostgreSQL two-writer test locks or
+  exact-digest-CASes the full workspace read-modify-write and proves no lost
+  config or policy update. Failpoints before commit and after commit/before
+  reload prove the config row, exact Casbin workspace policy, and database-
+  backed permission-cache generation expose only one atomic version and that
+  every in-memory enforcer reloads or fails closed. The central/workspace path
+  performs zero shared-file read/write and gives no filesystem config or policy
+  lock workspace-mutation authority.
+- A source inventory and real-PostgreSQL tests route every guarded-HA config
+  writer through the transaction repository. No public blind-upsert variant of
+  `update_api_server_config_no_lock` can bypass the expected digest, workspace
+  policy mutation, or permission-cache invalidation.
+- Actual guarded-HA `reload_config()` tests prove central contexts ignore file
+  precedence and read PostgreSQL, while scoped Serve/Managed Jobs children may
+  read only an exact server-issued version snapshot. D1 uses a distinct pod-
+  local central reload lock and does not repoint the legacy shared Serve
+  snapshot lock; protocol-fenced `LEGACY_EFS` restore/promote/scrub still
+  serializes across pods until D6 replaces and deletes that path.
+- Guarded-HA negative Helm renders for API, controller, executor, and image
+  workers contain no `skypilot-config` ConfigMap object or reference, config
+  volume/mount, or `SKYPILOT_GLOBAL_CONFIG`; explicit non-HA renders retain
+  their compatibility path.
 - Normal startup cannot rotate database incarnation; explicit restore CAS,
   idempotent receipt, stale expected-incarnation rejection, and readiness
   mismatch are tested against real PostgreSQL.
+- Restoring a snapshot with a current active multipart attempt proves the first
+  transaction fences the old incarnation, and the locked recovery transaction
+  terminalizes the attempt and session, advances the head to the new
+  incarnation/fence, and leaves the old rows immutable. Completion
+  acknowledgement loss and every later old provider response cannot publish;
+  the next request creates only a new-incarnation session, attempt, upload ID,
+  and key while old exact-abort cleanup proceeds independently.
+- Restore invalidates every old log-writer lease before wall-clock expiry. The
+  new owner commits one `RESTORE_TAIL_GAP` before appending, and an old segment
+  response cannot commit metadata under the fresh incarnation.
+- Restore recovery is idempotent and resumable in bounded batches from the same
+  `FENCED` receipt. No application writer becomes Ready until all mutable heads
+  and leases are fenced and that receipt is `RECOVERED`; provider cleanup may
+  still be pending at readiness.
 - A restored authority row below the release's S3_V1 generation floor is
   rejected and cannot be upgraded by the restore command; runtime and normal
   Helm paths cannot lower that floor.
 - A fresh empty guarded-HA database can bootstrap directly to receipt-backed
   S3_V1 after exact policy/capability checks, while a nonempty or previously
   initialized database cannot use that path.
+- Two replicas with a missing capability hint, stale release generation/
+  incarnation, or a divergent bucket, region, expected owner, root, KMS key, or
+  policy contract cannot issue S3 calls. Allocation uses only the exact
+  PostgreSQL target tuple and stamps it into the attempt or segment; reads use
+  each object's committed identity rather than current process configuration.
 - Guarded-HA Helm rendering contains no PVC, persistentVolumeClaim,
-  /root/.sky, /root/.ssh, or /root/sky_logs persistent mount.
+  /root/.sky, /root/.ssh, or /root/sky_logs persistent mount; this D7 gate is
+  independent of the D1 config-ConfigMap negative render gate above.
+- Before that PVC-free render, source inventory proves no guarded-HA caller of
+  `~/.sky/.policy_update.lock` or the legacy shared Serve snapshot lock remains;
+  explicit non-HA filesystem compatibility stays outside this gate.
 - Every ephemeral volume has size and pod ephemeral-storage bounds.
 - Runtime and importer identities cannot delete S3 object versions.
 
@@ -877,8 +1176,9 @@ lines. The common log path is the largest portion.
   no provider mutation.
 - Every imported object passes exact-version, size, digest, owner, and
   encryption verification.
-- One PostgreSQL transaction commits the complete reference set and S3_V1
-  generation; partial commit is impossible.
+- One PostgreSQL transaction commits the complete reference set, exact provider
+  target/policy-probe receipt, and S3_V1 generation; partial commit is
+  impossible.
 
 ### Production
 
@@ -887,6 +1187,10 @@ lines. The common log path is the largest portion.
   file repair.
 - Uploads, log streaming, retained Managed Jobs, Serve takeover, cluster
   status, config, and generated SSH all pass.
+- Every Ready replica reports a capability tuple identical to PostgreSQL; a
+  deliberately divergent value fails readiness without provider I/O, and S3
+  request evidence names only the committed bucket, owner, root, KMS key, and
+  authority generation/incarnation.
 - One role at a time is deleted and replaced with no duplicate execution or
   provider mutation.
 - Local ephemeral usage remains within limits under a measured peak upload and
