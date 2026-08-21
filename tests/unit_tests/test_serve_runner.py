@@ -280,6 +280,95 @@ class TestStatusDelegatesToRunner:
         assert captured['summary_only'] is False
         assert captured['include_target_num_replicas'] is None
 
+    def test_authenticated_owner_scope_filters_wildcards_before_controller(
+            self):
+        records = [{
+            'name': 'owned-a',
+            'load_balancer_port': None,
+            'tls_encrypted': False,
+        }]
+        runner = mock.Mock()
+        runner.get_service_status.return_value = records
+        serve_runner.register(runner)
+
+        with contextlib.ExitStack() as stack:
+            for patcher in self._common_patches():
+                stack.enter_context(patcher)
+            get_names = stack.enter_context(
+                mock.patch.object(serve_status.serve_state,
+                                  'get_glob_service_names',
+                                  return_value=['owned-a']))
+            get_owned_names = stack.enter_context(
+                mock.patch.object(serve_status.serve_state,
+                                  'get_service_names_owned_by_user_id',
+                                  return_value=['owned-a']))
+            result = impl.status(
+                service_names=['owned-*', 'other-*'],
+                pool=False,
+                authorized_owner_user_id='owner-a',
+            )
+
+        get_names.assert_called_once_with(['owned-*', 'other-*'],
+                                          pool=False,
+                                          owner_user_id='owner-a')
+        get_owned_names.assert_called_once_with('owner-a')
+        assert runner.get_service_status.call_args.kwargs['service_names'] == [
+            'owned-a'
+        ]
+        assert [record['name'] for record in result] == ['owned-a']
+
+    def test_authenticated_scope_drops_same_name_successor_after_controller(
+            self):
+        runner = mock.Mock()
+        runner.get_service_status.return_value = [{
+            'name': 'recreated',
+            'load_balancer_port': None,
+            'tls_encrypted': False,
+        }]
+        serve_runner.register(runner)
+
+        with contextlib.ExitStack() as stack:
+            for patcher in self._common_patches():
+                stack.enter_context(patcher)
+            stack.enter_context(
+                mock.patch.object(serve_status.serve_state,
+                                  'get_glob_service_names',
+                                  return_value=['recreated']))
+            get_owned_names = stack.enter_context(
+                mock.patch.object(serve_status.serve_state,
+                                  'get_service_names_owned_by_user_id',
+                                  return_value=[]))
+            result = impl.status(
+                service_names=['recreated'],
+                pool=False,
+                authorized_owner_user_id='owner-a',
+            )
+
+        get_owned_names.assert_called_once_with('owner-a')
+        assert result == []
+
+    def test_empty_authenticated_owner_scope_skips_controller(self):
+        runner = mock.Mock()
+        serve_runner.register(runner)
+
+        with mock.patch.object(serve_status.serve_state,
+                               'get_glob_service_names',
+                               return_value=[]) as get_names, \
+             mock.patch.object(serve_status.backend_utils,
+                               'check_network_connection') as network:
+            result = impl.status(
+                service_names=None,
+                pool=False,
+                authorized_owner_user_id='owner-a',
+            )
+
+        get_names.assert_called_once_with(None,
+                                          pool=False,
+                                          owner_user_id='owner-a')
+        assert result == []
+        network.assert_not_called()
+        runner.get_service_status.assert_not_called()
+
     def test_rpc_then_legacy_fallback_end_to_end_via_status(self):
         """status() -> default runner -> RPC raises NotImplemented -> legacy.
 

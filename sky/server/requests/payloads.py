@@ -308,7 +308,8 @@ class RequestBody(BasePayload):
         if 'entrypoint' not in data:
             data['entrypoint'] = usage_lib.messages.usage.entrypoint or ''
         if 'entrypoint_command' not in data:
-            data['entrypoint_command'] = common_utils.get_pretty_entrypoint_cmd()
+            data['entrypoint_command'] = common_utils.get_pretty_entrypoint_cmd(
+            )
         if 'using_remote_api_server' not in data:
             data['using_remote_api_server'] = not common.is_api_server_local()
         if 'override_skypilot_config' not in data:
@@ -1375,6 +1376,9 @@ class ServeStatusBody(RequestBody):
     # Summary responses skip endpoint resolution by default because it requires
     # Kubernetes reads. Dashboard list enrichment opts in after metadata lands.
     include_endpoints: bool = False
+    # Server-derived object scope. The route overwrites any wire value before
+    # enqueueing; authenticated non-admin execution rechecks this owner in SQL.
+    authorized_owner_user_id: str | None = None
 
 
 class ServePlacementBody(RequestBody):
@@ -1390,6 +1394,9 @@ class ServePlacementBody(RequestBody):
     # initialized creates a sky.client <-> sky.serve package cycle.
     location_limit: int = pydantic.Field(default=100, ge=1, le=100)
     location_offset: int = pydantic.Field(default=0, ge=0, le=100_000)
+    # Server-derived object scope. The route overwrites any wire value before
+    # enqueueing so a same-name successor cannot cross a tenant boundary.
+    authorized_owner_user_id: str | None = None
 
 
 class RealtimeGpuAvailabilityRequestBody(RequestBody):

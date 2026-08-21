@@ -27,6 +27,7 @@ def dashboard_database(postgres_engine, monkeypatch):
     )
     monkeypatch.setattr(serve_dashboard, '_postgres_engine',
                         lambda: postgres_engine)
+    monkeypatch.setattr(serve_state._db_manager, '_engine', postgres_engine)
     return postgres_engine
 
 
@@ -160,3 +161,70 @@ def test_pricing_projection_executes_jsonb_bounds_and_modes(dashboard_database):
         'invalid_version_catalog')
     assert rows[5]['hourly_cost_exclusion_reason'] == (
         'missing_version_catalog')
+
+
+def test_dashboard_reads_apply_owner_scope_before_selection_and_aggregation(
+        dashboard_database):
+    services = [{
+        'name': 'owned',
+        'hash': 'hash-owned',
+        'pool': 0,
+        'status': 'READY',
+        'owner_user_id': 'owner-a',
+        'owner_user_name': 'Owner A',
+    }, {
+        'name': 'other',
+        'hash': 'hash-other',
+        'pool': 0,
+        'status': 'READY',
+        'owner_user_id': 'owner-b',
+        'owner_user_name': 'Owner B',
+    }, {
+        'name': 'unattributed',
+        'hash': 'hash-null',
+        'pool': 0,
+        'status': 'READY',
+        'owner_user_id': None,
+        'owner_user_name': None,
+    }]
+    with dashboard_database.begin() as connection:
+        connection.execute(serve_state.services_table.insert(), services)
+        connection.execute(serve_state.version_specs_table.insert(), [{
+            'service_name': service['name'],
+            'version': 1,
+        } for service in services])
+
+    scoped = serve_dashboard.get_replica_summaries(owner_user_id='owner-a')
+    unrestricted = serve_dashboard.get_replica_summaries()
+
+    assert [row['service_name'] for row in scoped['summaries']] == ['owned']
+    assert {row['service_name'] for row in unrestricted['summaries']
+           } == {'owned', 'other', 'unattributed'}
+    assert serve_state.get_service_status_snapshot(
+        'owned', owner_user_id='owner-a') is not None
+    assert serve_state.get_service_status_snapshot(
+        'other', owner_user_id='owner-a') is None
+    assert serve_state.get_service_status_snapshot(
+        'unattributed', owner_user_id='owner-a') is None
+    assert serve_state.get_service_from_name(
+        'owned', owner_user_id='owner-a') is not None
+    assert serve_state.get_service_from_name('other',
+                                             owner_user_id='owner-a') is None
+    assert serve_state.get_glob_service_names(
+        ['*'], pool=False, owner_user_id='owner-a') == ['owned']
+
+    with pytest.raises(serve_dashboard.ServiceNotFoundError):
+        serve_dashboard.get_replica_page(
+            'other',
+            'hash-other',
+            serve_dashboard.CURRENT_OR_UNCERTAIN_SCOPE,
+            50,
+            None,
+            owner_user_id='owner-a',
+        )
+    with pytest.raises(serve_dashboard.ServiceNotFoundError):
+        serve_dashboard.get_service_pricing(
+            'unattributed',
+            'hash-null',
+            owner_user_id='owner-a',
+        )

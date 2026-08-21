@@ -201,6 +201,7 @@ def status(
     history_hours: int | None = None,
     metadata_only: bool = False,
     include_endpoints: bool = False,
+    authorized_owner_user_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Gets service statuses.
 
@@ -303,13 +304,17 @@ def status(
         RuntimeError: if failed to get the service status.
         exceptions.ClusterNotUpError: if the sky serve controller is not up.
     """
+    kwargs: dict[str, Any] = {}
+    if authorized_owner_user_id is not None:
+        kwargs['authorized_owner_user_id'] = authorized_owner_user_id
     return impl.status(service_names,
                        pool=False,
                        summary_only=summary_only,
                        metadata_only=metadata_only,
                        include_target_num_replicas=include_target_num_replicas,
                        history_hours=history_hours,
-                       include_endpoints=include_endpoints)
+                       include_endpoints=include_endpoints,
+                       **kwargs)
 
 
 @usage_lib.entrypoint
@@ -319,9 +324,14 @@ def placement(
         limit: int = placement_history.DEFAULT_PAGE_SIZE,
         cursor: str | None = None,
         location_limit: int = serve_constants.PLACEMENT_STATE_DEFAULT_PAGE_SIZE,
-        location_offset: int = 0) -> dict[str, Any]:
+        location_offset: int = 0,
+        authorized_owner_user_id: str | None = None) -> dict[str, Any]:
     """Return bounded placement state for one exact service incarnation."""
-    record = serve_state.get_service_from_name(service_name)
+    if authorized_owner_user_id is None:
+        record = serve_state.get_service_from_name(service_name)
+    else:
+        record = serve_state.get_service_from_name(
+            service_name, owner_user_id=authorized_owner_user_id)
     if record is None or record.get('pool'):
         raise ValueError(f'Service {service_name!r} not found.')
     service_hash = record.get('hash')

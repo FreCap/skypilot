@@ -2,6 +2,7 @@
 
 import asyncio
 import enum
+import glob
 
 import fastapi
 
@@ -16,6 +17,7 @@ from sky.serve import zero_cost_actuation
 from sky.serve.server import core
 from sky.server import common as server_common
 from sky.server import stream_utils
+from sky.server.requests import access as request_access
 from sky.server.requests import executor
 from sky.server.requests import payloads
 from sky.server.requests import request_names
@@ -53,6 +55,33 @@ def _require_admin(request: fastapi.Request) -> None:
             status_code=403,
             detail='Only admins can manage service versions and load '
             'balancers.')
+
+
+async def _service_read_owner_user_id(request: fastapi.Request) -> str | None:
+    """Return the canonical SQL owner predicate for one Serve reader."""
+    auth_user = getattr(request.state, 'auth_user', None)
+    roles: list[str] = []
+    if auth_user is not None:
+        roles = await asyncio.to_thread(
+            permission.permission_service.get_user_roles, auth_user.id)
+    return request_access.resolve_request_access(auth_user, roles).owner_user_id
+
+
+async def _require_readable_service(service_name: str,
+                                    owner_user_id: str | None) -> dict:
+    """Resolve one non-pool service without revealing another tenant's row."""
+    if owner_user_id is None:
+        service = await asyncio.to_thread(
+            serve_state.get_service_status_snapshot, service_name)
+    else:
+        service = await asyncio.to_thread(
+            serve_state.get_service_status_snapshot,
+            service_name,
+            owner_user_id=owner_user_id)
+    if service is None or service.get('pool'):
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service not found.')
+    return service
 
 
 def _redact_version_yaml(yaml_content: str | None,
@@ -225,6 +254,7 @@ def version_detail(request: fastapi.Request, service_name: str,
 
 @router.get('/{service_name}/history')
 async def status_history(
+    request: fastapi.Request,
     service_name: str,
     expected_service_hash: str = fastapi.Query(min_length=1),
     hours: int = fastapi.Query(default=1,
@@ -235,14 +265,15 @@ async def status_history(
 ) -> dict:
     """Read selected persisted history without contacting the controller."""
     requested_sections = {item.value for item in section}
+    owner_user_id = await _service_read_owner_user_id(request)
+    service = None
+    if owner_user_id is not None:
+        service = await _require_readable_service(service_name, owner_user_id)
     if not await asyncio.to_thread(serve_utils.is_consolidation_mode):
         return serve_history.unavailable_status_history('non_consolidated',
                                                         requested_sections)
-    service = await asyncio.to_thread(serve_state.get_service_status_snapshot,
-                                      service_name)
-    if service is None or service.get('pool'):
-        raise fastapi.HTTPException(status_code=404,
-                                    detail='Service not found.')
+    if service is None:
+        service = await _require_readable_service(service_name, owner_user_id)
     if service.get('hash') != expected_service_hash:
         raise fastapi.HTTPException(
             status_code=409,
@@ -267,10 +298,15 @@ async def status_history(
 
 @router.get('/{service_name}/demand')
 async def current_demand(
+        request: fastapi.Request,
         service_name: str,
         expected_service_hash: str = fastapi.Query(min_length=1),
 ) -> dict:
     """Read current request telemetry without contacting the controller."""
+    owner_user_id = await _service_read_owner_user_id(request)
+    service = None
+    if owner_user_id is not None:
+        service = await _require_readable_service(service_name, owner_user_id)
     if not await asyncio.to_thread(serve_utils.is_consolidation_mode):
         summary = demand_state.unavailable_request_summary('non_consolidated')
         return {
@@ -279,11 +315,8 @@ async def current_demand(
             **summary,
             **zero_cost_actuation.unavailable_status_summary('non_consolidated'),
         }
-    service = await asyncio.to_thread(serve_state.get_service_status_snapshot,
-                                      service_name)
-    if service is None or service.get('pool'):
-        raise fastapi.HTTPException(status_code=404,
-                                    detail='Service not found.')
+    if service is None:
+        service = await _require_readable_service(service_name, owner_user_id)
     if service.get('hash') != expected_service_hash:
         raise fastapi.HTTPException(
             status_code=409,
@@ -315,16 +348,26 @@ async def current_demand(
 
 @router.get('/replica-summaries')
 async def replica_summaries(
-        service_name: list[str] | None = fastapi.Query(default=None),) -> dict:
+        request: fastapi.Request,
+        service_name: list[str] | None = fastapi.Query(default=None),
+) -> dict:
     """Read compact persisted counts without contacting a controller."""
+    owner_user_id = await _service_read_owner_user_id(request)
+    names = list(dict.fromkeys(service_name or []))
+    if owner_user_id is not None and len(names) == 1:
+        await _require_readable_service(names[0], owner_user_id)
     if not await asyncio.to_thread(serve_utils.is_consolidation_mode):
         return serve_dashboard.unavailable_replica_summaries('non_consolidated')
+    if owner_user_id is None:
+        return await asyncio.to_thread(serve_dashboard.get_replica_summaries,
+                                       service_name)
     return await asyncio.to_thread(serve_dashboard.get_replica_summaries,
-                                   service_name)
+                                   service_name, owner_user_id)
 
 
 @router.get('/{service_name}/replicas')
 async def replica_page(
+    request: fastapi.Request,
     service_name: str,
     expected_service_hash: str = fastapi.Query(min_length=1),
     scope: ReplicaScope = fastapi.Query(),
@@ -335,20 +378,21 @@ async def replica_page(
 ) -> dict:
     """Read one bounded persisted replica page without controller work."""
     scope_value = scope.value
+    owner_user_id = await _service_read_owner_user_id(request)
+    if owner_user_id is not None:
+        await _require_readable_service(service_name, owner_user_id)
     if not await asyncio.to_thread(serve_utils.is_consolidation_mode):
         return serve_dashboard.unavailable_replica_page(service_name,
                                                         expected_service_hash,
                                                         scope_value,
                                                         'non_consolidated')
     try:
-        return await asyncio.to_thread(
-            serve_dashboard.get_replica_page,
-            service_name,
-            expected_service_hash,
-            scope_value,
-            limit,
-            cursor,
-        )
+        args = (service_name, expected_service_hash, scope_value, limit, cursor)
+        if owner_user_id is None:
+            return await asyncio.to_thread(serve_dashboard.get_replica_page,
+                                           *args)
+        return await asyncio.to_thread(serve_dashboard.get_replica_page, *args,
+                                       owner_user_id)
     except serve_dashboard.ServiceNotFoundError as exc:
         raise fastapi.HTTPException(status_code=404,
                                     detail='Service not found.') from exc
@@ -365,6 +409,7 @@ async def replica_page(
 
 @router.get('/{service_name}/pricing')
 async def service_pricing(
+        request: fastapi.Request,
         service_name: str,
         expected_service_hash: str = fastapi.Query(min_length=1),
         replica_id: list[int] | None = fastapi.Query(default=None),
@@ -383,16 +428,19 @@ async def service_pricing(
                 status_code=422,
                 detail='Replica IDs must be positive PostgreSQL INTEGER '
                 'values.')
+    owner_user_id = await _service_read_owner_user_id(request)
+    if owner_user_id is not None:
+        await _require_readable_service(service_name, owner_user_id)
     if not await asyncio.to_thread(serve_utils.is_consolidation_mode):
         return serve_dashboard.unavailable_service_pricing(
             service_name, expected_service_hash, 'non_consolidated')
     try:
-        return await asyncio.to_thread(
-            serve_dashboard.get_service_pricing,
-            service_name,
-            expected_service_hash,
-            replica_id,
-        )
+        args = (service_name, expected_service_hash, replica_id)
+        if owner_user_id is None:
+            return await asyncio.to_thread(serve_dashboard.get_service_pricing,
+                                           *args)
+        return await asyncio.to_thread(serve_dashboard.get_service_pricing,
+                                       *args, owner_user_id)
     except serve_dashboard.ServiceNotFoundError as exc:
         raise fastapi.HTTPException(status_code=404,
                                     detail='Service not found.') from exc
@@ -512,6 +560,15 @@ async def status(
     request: fastapi.Request,
     status_body: payloads.ServeStatusBody,
 ) -> None:
+    owner_user_id = await _service_read_owner_user_id(request)
+    status_body.authorized_owner_user_id = owner_user_id
+    requested_names = status_body.service_names
+    if isinstance(requested_names, str):
+        requested_names = [requested_names]
+    if (owner_user_id is not None and requested_names is not None and
+            len(requested_names) == 1 and
+            not glob.has_magic(requested_names[0])):
+        await _require_readable_service(requested_names[0], owner_user_id)
     await executor.schedule_request_async(
         request_id=request.state.request_id,
         request_name=request_names.RequestName.SERVE_STATUS,
@@ -528,6 +585,11 @@ async def placement(
     request: fastapi.Request,
     placement_body: payloads.ServePlacementBody,
 ) -> None:
+    owner_user_id = await _service_read_owner_user_id(request)
+    if owner_user_id is not None:
+        await _require_readable_service(placement_body.service_name,
+                                        owner_user_id)
+    placement_body.authorized_owner_user_id = owner_user_id
     await executor.schedule_request_async(
         request_id=request.state.request_id,
         request_name=request_names.RequestName.SERVE_PLACEMENT,

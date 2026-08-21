@@ -9,6 +9,7 @@ from sky.serve import lb_k8s
 from sky.serve import runner as serve_runner
 from sky.serve import serve_history
 from sky.serve import serve_rpc_utils
+from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.utils import controller_utils
 from sky.utils import subprocess_utils
@@ -112,6 +113,7 @@ def status(
     history_hours: int | None = None,
     metadata_only: bool = False,
     include_endpoints: bool = False,
+    authorized_owner_user_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Gets statuses of services or pools.
 
@@ -132,11 +134,16 @@ def status(
     if service_names is not None:
         if isinstance(service_names, str):
             service_names = [service_names]
+    if authorized_owner_user_id is not None:
+        service_names = serve_state.get_glob_service_names(
+            service_names, pool=pool, owner_user_id=authorized_owner_user_id)
     if history_hours is not None:
         if pool:
             raise ValueError('Status history is only supported for services.')
         if service_names is None or len(service_names) != 1:
             raise ValueError('Status history requires exactly one service.')
+    if service_names == []:
+        return []
 
     try:
         backend_utils.check_network_connection()
@@ -165,6 +172,18 @@ def status(
         # new projection and is guarded by the API/Serve version bump.
         runner_kwargs['metadata_only'] = True
     service_records = serve_runner.current().get_service_status(**runner_kwargs)
+    if authorized_owner_user_id is not None:
+        # The controller call can outlive a delete/recreate of the same service
+        # name.  Re-read exact current ownership before returning enrichment so
+        # a successor owned by another tenant is omitted even if it appeared
+        # after the pre-controller wildcard expansion.
+        current_owned_names = set(
+            serve_state.get_service_names_owned_by_user_id(
+                authorized_owner_user_id))
+        service_records = [
+            record for record in service_records
+            if record.get('name') in current_owned_names
+        ]
 
     # Keep summary-only requests on the cheap DB-only path: callers that opt
     # out of replica detail should not pay an extra per-service Kubernetes
