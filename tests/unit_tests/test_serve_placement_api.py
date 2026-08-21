@@ -74,6 +74,16 @@ def test_placement_rejects_missing_service(monkeypatch):
         core.placement('missing')
 
 
+def test_placement_rechecks_server_derived_owner_scope(monkeypatch):
+    get_service = mock.Mock(return_value=None)
+    monkeypatch.setattr(core.serve_state, 'get_service_from_name', get_service)
+
+    with pytest.raises(ValueError, match='not found'):
+        core.placement('recreated', authorized_owner_user_id='owner-a')
+
+    get_service.assert_called_once_with('recreated', owner_user_id='owner-a')
+
+
 @pytest.mark.parametrize('overrides', [{
     'hours': 0
 }, {

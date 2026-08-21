@@ -7,6 +7,7 @@ import dataclasses
 import hashlib
 import json
 import math
+import pickle
 import time
 import typing
 from typing import Any
@@ -130,10 +131,14 @@ def _scope_predicate(scope: str) -> sqlalchemy.ColumnElement[bool]:
 
 
 def _replica_summary_query(
-    service_names: Collection[str] | None = None,) -> sqlalchemy.Select:
+    service_names: Collection[str] | None = None,
+    owner_user_id: str | None = None,
+) -> sqlalchemy.Select:
     """Build one grouped scan over compact replica state."""
     services = serve_state.services_table
     replicas = serve_state.replicas_table
+    elected_spec = serve_state.version_specs_table.alias(
+        'dashboard_elected_version_spec')
     has_replica = replicas.c.replica_id.is_not(None)
     raw_planned_capacity = replicas.c.replica_state[
         'planned_capacity'].as_integer()
@@ -151,7 +156,7 @@ def _replica_summary_query(
             services.c.logical_replica_semantics,
             services.c.status.label('service_status'),
             services.c.uptime.label('service_uptime'),
-            services.c.policy.label('service_policy'),
+            elected_spec.c.spec.label('elected_service_spec'),
             services.c.requested_resources_str,
             replicas.c.status,
             sqlalchemy.func.count(  # pylint: disable=not-callable
@@ -161,19 +166,42 @@ def _replica_summary_query(
                 0).label('capacity_count'),
         ).select_from(
             services.outerjoin(
-                replicas, replicas.c.service_name == services.c.name)).where(
-                    services.c.pool == 0))
+                elected_spec,
+                sqlalchemy.and_(
+                    elected_spec.c.service_name == services.c.name,
+                    elected_spec.c.version == services.c.current_version,
+                )).outerjoin(replicas,
+                             replicas.c.service_name == services.c.name)).where(
+                                 services.c.pool == 0))
     if service_names is not None:
         names = list(dict.fromkeys(service_names))
         if not names:
             query = query.where(sqlalchemy.false())
         else:
             query = query.where(services.c.name.in_(names))
+    if owner_user_id is not None:
+        query = query.where(services.c.owner_user_id == owner_user_id)
     return query.group_by(services.c.name, services.c.hash,
                           services.c.logical_replica_semantics,
                           services.c.status, services.c.uptime,
-                          services.c.policy, services.c.requested_resources_str,
+                          elected_spec.c.spec,
+                          services.c.requested_resources_str,
                           replicas.c.status).order_by(services.c.name)
+
+
+def _elected_policy_string(serialized_spec: Any) -> str | None:
+    """Return policy only from the elected immutable version projection."""
+    if serialized_spec is None:
+        return None
+    try:
+        spec = pickle.loads(serialized_spec)
+        policy = spec.autoscaling_policy_str()
+    except Exception:  # pylint: disable=broad-except
+        # A missing/transitional/corrupt version projection must fail closed;
+        # services.policy is mutable legacy state and may describe an older
+        # version, so it is never a display fallback.
+        return None
+    return policy if isinstance(policy, str) and policy else None
 
 
 def _build_replica_summaries(rows: Collection[Any]) -> list[dict[str, Any]]:
@@ -198,7 +226,8 @@ def _build_replica_summaries(rows: Collection[Any]) -> list[dict[str, Any]]:
                      mapping['service_status'] else ReplicaStatus.UNKNOWN.value
                     ),
                 'service_uptime': mapping['service_uptime'],
-                'service_policy': mapping['service_policy'],
+                'service_policy': _elected_policy_string(
+                    mapping['elected_service_spec']),
                 'requested_resources_str': mapping['requested_resources_str'],
                 'replica_unit':
                     ('logical_slot' if logical else 'physical_backend'),
@@ -223,14 +252,17 @@ def _build_replica_summaries(rows: Collection[Any]) -> list[dict[str, Any]]:
 
 
 def get_replica_summaries(
-    service_names: Collection[str] | None = None,) -> dict[str, Any]:
+    service_names: Collection[str] | None = None,
+    owner_user_id: str | None = None,
+) -> dict[str, Any]:
     """Return one persisted summary for each selected non-pool service."""
     engine = _postgres_engine()
     with _repeatable_read_connection(engine) as connection:
         with connection.begin():
             observed_at = time.time()
             rows = connection.execute(
-                _replica_summary_query(service_names)).fetchall()
+                _replica_summary_query(service_names,
+                                       owner_user_id)).fetchall()
     return {
         'available': True,
         # Explicit rollout capability: new dashboard assets may be served
@@ -299,12 +331,17 @@ def _decode_cursor(cursor: str, expected_service_hash: str,
     return payload['max'], payload['last']
 
 
-def _service_identity_query(service_name: str) -> sqlalchemy.Select:
+def _service_identity_query(
+        service_name: str,
+        owner_user_id: str | None = None) -> sqlalchemy.Select:
     services = serve_state.services_table
-    return sqlalchemy.select(
+    query = sqlalchemy.select(
         services.c.hash,
         services.c.logical_replica_semantics,
     ).where(services.c.name == service_name, services.c.pool == 0)
+    if owner_user_id is not None:
+        query = query.where(services.c.owner_user_id == owner_user_id)
+    return query
 
 
 def _bounded_scope_predicate(
@@ -526,8 +563,12 @@ def _serialize_replica_row(row: Any) -> dict[str, Any]:
     }
 
 
-def get_replica_page(service_name: str, expected_service_hash: str, scope: str,
-                     limit: int, cursor: str | None) -> dict[str, Any]:
+def get_replica_page(service_name: str,
+                     expected_service_hash: str,
+                     scope: str,
+                     limit: int,
+                     cursor: str | None,
+                     owner_user_id: str | None = None) -> dict[str, Any]:
     """Return one stable descending page of lightweight replica rows."""
     if scope not in REPLICA_SCOPES:
         raise ValueError(f'Unknown replica scope: {scope!r}')
@@ -541,7 +582,8 @@ def get_replica_page(service_name: str, expected_service_hash: str, scope: str,
     with _repeatable_read_connection(engine) as connection:
         with connection.begin():
             identity = connection.execute(
-                _service_identity_query(service_name)).fetchone()
+                _service_identity_query(service_name,
+                                        owner_user_id)).fetchone()
             if identity is None:
                 raise ServiceNotFoundError(service_name)
             service_hash, logical_replica_semantics = identity
@@ -1217,6 +1259,7 @@ def get_service_pricing(
     service_name: str,
     expected_service_hash: str,
     replica_ids: Collection[int] | None = None,
+    owner_user_id: str | None = None,
 ) -> dict[str, Any]:
     """Return bounded persisted pricing for a service incarnation."""
     if (not isinstance(expected_service_hash, str) or
@@ -1239,7 +1282,8 @@ def get_service_pricing(
     with _repeatable_read_connection(engine) as connection:
         with connection.begin():
             identity = connection.execute(
-                _service_identity_query(service_name)).fetchone()
+                _service_identity_query(service_name,
+                                        owner_user_id)).fetchone()
             if identity is None:
                 raise ServiceNotFoundError(service_name)
             service_hash = identity[0]

@@ -4,6 +4,7 @@
 import base64
 import contextlib
 import json
+import pickle
 from unittest import mock
 
 import pytest
@@ -11,6 +12,19 @@ from sqlalchemy.dialects import postgresql
 
 from sky.serve import serve_dashboard
 from sky.serve import spot_placer
+
+
+class _PolicySpec:
+
+    def __init__(self, policy: str):
+        self._policy = policy
+
+    def autoscaling_policy_str(self) -> str:
+        return self._policy
+
+
+def _elected_spec(policy: str) -> bytes:
+    return pickle.dumps(_PolicySpec(policy))
 
 
 def _compiled(statement) -> str:
@@ -172,13 +186,14 @@ def test_summary_query_is_one_compact_grouped_scan():
 
 
 def test_summary_counts_physical_attempts_separately_from_capacity():
+    elected_spec = _elected_spec('autoscaling(min=0,max=8)')
     rows = [{
         'name': 'svc',
         'hash': 'hash-a',
         'logical_replica_semantics': 1,
         'service_status': 'READY',
         'service_uptime': 100,
-        'service_policy': 'autoscaling(min=0,max=8)',
+        'elected_service_spec': elected_spec,
         'requested_resources_str': '1x[L4:4]',
         'status': 'READY',
         'physical_count': 2,
@@ -189,7 +204,7 @@ def test_summary_counts_physical_attempts_separately_from_capacity():
         'logical_replica_semantics': 1,
         'service_status': 'READY',
         'service_uptime': 100,
-        'service_policy': 'autoscaling(min=0,max=8)',
+        'elected_service_spec': elected_spec,
         'requested_resources_str': '1x[L4:4]',
         'status': 'FAILED_PROVISION',
         'physical_count': 3,
@@ -200,7 +215,7 @@ def test_summary_counts_physical_attempts_separately_from_capacity():
         'logical_replica_semantics': 1,
         'service_status': 'READY',
         'service_uptime': 100,
-        'service_policy': 'autoscaling(min=0,max=8)',
+        'elected_service_spec': elected_spec,
         'requested_resources_str': '1x[L4:4]',
         'status': None,
         'physical_count': 1,
@@ -238,7 +253,7 @@ def test_replica_summaries_execute_one_batched_query(monkeypatch):
             'logical_replica_semantics': 0,
             'service_status': 'READY',
             'service_uptime': 100,
-            'service_policy': 'autoscaling(min=0,max=1)',
+            'elected_service_spec': _elected_spec('autoscaling(min=0,max=1)'),
             'requested_resources_str': '1x[L4:1]',
             'status': 'READY',
             'physical_count': 1,

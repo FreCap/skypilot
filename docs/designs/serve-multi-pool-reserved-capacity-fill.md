@@ -7,8 +7,9 @@ Status: the reserved-capacity allocator and PostgreSQL recovery objective is
 independent removal of EFS remain active. Helm revision 479 / release
 `1.1.1410` runs immutable image digest
 `sha256:cc8ff796eb008c2d085f6e0933be7bf00d00c288794e493e57382fcf13ac4d35`
-on two API, two controller, and two executor Pods. All six Pods were Ready with
-zero restarts at the 2026-08-21 10:45 UTC observation.
+on two API, two controller, and two executor Pods. All six Pods and both
+`boltz-l4-fleet` load-balancer Pods were Ready at the 2026-08-21 10:45 UTC
+observation.
 
 At that observation, `boltz-l4-fleet` version 64 was `READY` at 80/80:
 13 East A100, 37 East A100-80GB, and 30 PHX H200 replicas. Every READY row was
@@ -18,7 +19,9 @@ protocol-v2 broker rounds reported `last_observed_free=0`, `feed=0`, and
 holdings of 13, 37, and 30 for the three exact-card pools. The revision-479
 controller rollout recovered the same service and endpoint from PostgreSQL.
 Earlier forced-controller and lost-ack tests had already qualified durable
-intent hydration and no-duplicate recovery.
+intent hydration and no-duplicate recovery. After PR #1638's narrow occupancy
+fence deployed, 100 samples spanning 79 demand generations remained
+fresh/complete with two reporters and zero unknown occupancy.
 
 Release `1.1.1410` includes the complete committed-handoff correction through
 PR #1630, capability-rotation fencing from PR #1635, batch pruning of
@@ -32,9 +35,12 @@ The broader initiative is not complete. The retained version-64 inventory
 still contains 958 terminal failed rows and 1,013 rows whose reserved-fill
 intent identity exists only in retained JSON rather than the normalized scalar
 column. PR #1636 cannot prune current-version terminal history until a version
-transition or controlled service recreation supersedes it. Request-count UI
-work and the PostgreSQL-plus-S3 replacement for EFS are separate remaining
-workstreams; neither is required for the already-converged allocation result.
+transition or controlled service recreation supersedes it. PR #1637 implements
+the controller-independent request-count UI and exact post-controller
+authorization contract; it remains under adversarial review and is not yet
+deployed. The PostgreSQL-plus-S3 replacement for EFS is an independent major
+workstream. Neither remaining workstream is required for the already-converged
+allocation result.
 
 ## Qualification history
 
@@ -334,6 +340,73 @@ takeover succeeds without RWX/EFS, and every immediate/+10/+30/full-horizon
 production gate passes. Source-complete, deployed, activated, and
 production-proven are distinct states; this effort is not complete until all
 four are true.
+
+### Controller-independent dashboard read boundary
+
+Status: implemented in PR #1637 and under adversarial review; not yet merged,
+deployed, or production-proven. Review corrections require exact post-RPC
+name/hash authorization, exact modern controller-enrichment identity, a fresh
+persisted list read, one queued post-boundary identity refresh, authoritative
+clearing of unavailable demand metrics, and snapshot-relative terminal-report
+age wording.
+
+The services list and one-service detail identity load from the existing
+PostgreSQL-backed `GET /serve/replica-summaries` projection. Persisted replica,
+demand, history, and pricing reads therefore start as soon as that immutable
+service hash lands. The detail bootstrap is the single owner of that summary;
+the bounded replica hook consumes the landed snapshot and owns only replica
+pages plus optional controller enrichment. Controller status remains optional
+enrichment for endpoint and live autoscaler fields. It owns a separate
+single-flight boundary, so a hung controller request cannot hold the persisted
+refresh owner, suppress a manual/visibility refresh, or hide confirmed
+processing, queued, rejected, and freshness fields. A freshness boundary
+fences a stale enrichment response but does not accumulate a second controller
+request while the first is hung. If a rolling old-server or non-consolidated
+response revokes the direct capability, the sole fenced request must settle
+before exactly one compatibility successor starts. A modern direct `not_found`
+response is authoritative absence and never falls back to controller identity.
+
+A successful modern direct response is authoritative for the complete service
+identity set, including an empty set. Controller rows may enrich only an exact
+name/hash match; they cannot retain a controller-only row, resurrect a removed
+service, replace PostgreSQL lifecycle/count fields, or merge two service
+incarnations. A direct transport failure after capability was proved preserves
+the last authoritative identity and schedules a later direct retry; it does not
+silently restore controller identity authority. Policy display is derived only
+from the elected version's immutable `version_specs.spec`. The mutable legacy
+`services.policy` field is never a fallback because it may describe an older
+stored or previously elected version. A missing or unreadable elected
+projection renders policy unavailable.
+
+Request activity has three distinct honesty levels. In-flight is exact only
+when every currently relevant backend reporter is covered; otherwise the UI
+shows the confirmed lower bound and the number of backends whose occupancy is
+unknown. Queue depth, recent arrivals, rejects, and their observation age come
+from the controller-independent PostgreSQL demand projection. The prediction
+histogram is not an exact completed-logical-request ledger: it contains bounded
+per-load-balancer terminal prediction observations, an async terminal may be
+missed before polling, and retries or load-balancer failover may duplicate a
+logical request. The UI therefore labels the sum as terminal prediction
+observations, not completed requests. Its latest-hour report timestamp is the
+most recent report containing nonzero terminal observations; equal cumulative
+retries can advance it without a new completion. It describes report recency,
+not event time, unique-request completeness, reporter coverage, or proof that a
+displayed zero means no logical request completed. If a demand refresh fails,
+retained values are labeled `last reported`/`last confirmed`, their frozen
+server age is hidden, and the UI identifies the value as the last persisted
+snapshot. A controller enrichment refresh similarly returns endpoint/target
+cells to Loading and then Unavailable on failure instead of presenting the
+previous controller value as fresh alongside a newer PostgreSQL timestamp.
+
+All direct Serve dashboard reads use the existing canonical request-access
+resolver. The resulting owner predicate is pushed into the service identity or
+grouped summary SQL, rather than filtering returned rows in application code.
+Queued status and placement reads carry a server-derived execution scope; the
+route overwrites any caller-supplied value and execution rechecks the same
+owner predicate, closing same-name replacement races. Versions endpoints stay
+unchanged because they are already administrator-only. This slice adds no
+schema, EFS/RWX, KubeRay, Terraform, Terragrunt, service-version, or platform-pin
+dependency.
 
 The remaining production launch wave exposed two steady-state gates. First,
 many simultaneous terminal launch authorizations independently repeat the
@@ -820,9 +893,9 @@ The live Helm release is authoritative. Merged SkyPilot artifacts are deployed
 directly with `--reuse-values`; no `boltz-platform` runtime pin is created or
 updated.
 
-Last updated: 2026-08-21 (Platform PR #8652 service-spec merge, revision-473
-atomic accounting evidence, incomplete PR #1629 source merge, and corrective
-Serve056 provider-handoff/cohort PR #1630)
+Last updated: 2026-08-21 (Platform PR #8652 service-spec merge, Helm revision
+479 / release 1.1.1410, PR #1638 occupancy-fence production sample, and PR
+#1637 adversarial review corrections)
 
 Canonical owner: this file
 

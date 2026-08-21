@@ -260,6 +260,7 @@ function mergeServiceRows(baseRows, enrichedRows) {
     merged.set(row.name, {
       ...(identityChanged ? {} : previous || {}),
       ...row,
+      metadataOnly: false,
       controllerSummaryLoaded: true,
       enrichmentUnavailable: false,
     });
@@ -267,34 +268,47 @@ function mergeServiceRows(baseRows, enrichedRows) {
   return Array.from(merged.values());
 }
 
-function mergeReplicaSummaryRows(baseRows, summaries) {
-  const merged = new Map((baseRows || []).map((row) => [row.name, row]));
+function mergeReplicaSummaryRows(
+  baseRows,
+  summaries,
+  identityAuthoritative = false
+) {
+  const previousByName = new Map(
+    (baseRows || []).map((row) => [row.name, row])
+  );
+  const merged = identityAuthoritative ? new Map() : new Map(previousByName);
   (summaries || []).forEach((summary) => {
-    const previous = merged.get(summary.name);
+    let previous = previousByName.get(summary.name);
     // New servers attach persisted lifecycle metadata to this direct
     // PostgreSQL projection, so it can own first paint without waiting for
     // controller transport. Older servers remain replica-only and are still
     // buffered until an identity-bearing controller row exists.
     if (!previous && !summary.persistedMetadataLoaded) return;
+    if (identityAuthoritative && !summary.serviceHash) return;
     if (
-      previous?.serviceHash &&
-      summary.serviceHash &&
-      previous.serviceHash !== summary.serviceHash
+      previous &&
+      (identityAuthoritative
+        ? previous.serviceHash !== summary.serviceHash
+        : previous.serviceHash &&
+          summary.serviceHash &&
+          previous.serviceHash !== summary.serviceHash)
     ) {
-      return;
+      if (!identityAuthoritative) return;
+      previous = undefined;
     }
-    const liveReplicaFields = previous?.controllerSummaryLoaded
-      ? {
-          replicaUnit: previous.replicaUnit,
-          replicaStatusCounts: previous.replicaStatusCounts,
-          replicasReady: previous.replicasReady,
-          replicasTotal: previous.replicasTotal,
-          replicasFailed: previous.replicasFailed,
-          physicalReplicasReady: previous.physicalReplicasReady,
-          physicalReplicasTotal: previous.physicalReplicasTotal,
-          physicalReplicasFailed: previous.physicalReplicasFailed,
-        }
-      : {};
+    const liveReplicaFields =
+      !identityAuthoritative && previous?.controllerSummaryLoaded
+        ? {
+            replicaUnit: previous.replicaUnit,
+            replicaStatusCounts: previous.replicaStatusCounts,
+            replicasReady: previous.replicasReady,
+            replicasTotal: previous.replicasTotal,
+            replicasFailed: previous.replicasFailed,
+            physicalReplicasReady: previous.physicalReplicasReady,
+            physicalReplicasTotal: previous.physicalReplicasTotal,
+            physicalReplicasFailed: previous.physicalReplicasFailed,
+          }
+        : {};
     merged.set(summary.name, {
       ...(previous || {}),
       ...summary,
@@ -333,6 +347,24 @@ function clearDirectReplicaSummary(rows) {
       });
     }
     return cleared;
+  });
+}
+
+function markControllerEnrichmentPending(rows) {
+  return (rows || []).map((row) => {
+    const pending = {
+      ...row,
+      metadataOnly: true,
+      controllerSummaryLoaded: false,
+      enrichmentUnavailable: false,
+    };
+    // These fields have no PostgreSQL authority in the compact summary. Do
+    // not present a prior controller observation as fresh while its successor
+    // is pending or after it fails.
+    delete pending.endpoint;
+    delete pending.targetReplicas;
+    delete pending.loadBalancingPolicy;
+    return pending;
   });
 }
 
@@ -488,97 +520,74 @@ export function ServicesTable({
   const [pageSize, setPageSize] = useState(10);
   const requestVersionRef = useRef(0);
   const activeRequestRef = useRef(null);
+  const controllerVersionRef = useRef(0);
+  const controllerRequestRef = useRef(null);
+  // null means the direct endpoint has not yet proven whether it can carry
+  // persisted service identity. Old servers need the controller request to
+  // own the compatibility paint, while current servers can refresh direct
+  // state independently and fence stale controller enrichment.
+  const directIdentityCapabilityRef = useRef(null);
   const replicaSummariesRef = useRef([]);
+  const replicaSummaryIdentityAuthoritativeRef = useRef(false);
 
-  const runFetch = useCallback(
-    async (requestVersion) => {
-      const isCurrentRequest = () =>
-        requestVersionRef.current === requestVersion;
-
-      setLoading(true);
-      // All projections are independent. Metadata paints identity, the direct
-      // persisted projection paints replica health, and the controller summary
-      // remains authoritative for live targets, request pressure, and endpoints.
-      const metadataPromise = dashboardCache
-        .get(getServices, SERVICE_METADATA_ARGS)
-        .then((metadataResponse) => {
-          if (!isCurrentRequest()) return;
-          setData((previous) => {
-            const metadataRows = mergeMetadataWithPrevious(
-              metadataResponse.services || [],
-              previous
-            );
-            return mergeReplicaSummaryRows(
-              metadataRows,
-              replicaSummariesRef.current
-            );
-          });
-          setControllerStopped(metadataResponse.controllerStopped || false);
-          setIsInitialLoad(false);
-        });
-      const summaryPromise = dashboardCache
-        .get(getServices, SERVICE_SUMMARY_ARGS)
-        .then((servicesResponse) => {
-          if (!isCurrentRequest()) return;
-          setData((previous) => {
-            const liveRows = mergeServiceRows(
-              previous,
-              servicesResponse.services || []
-            );
-            return mergeReplicaSummaryRows(
-              liveRows,
-              replicaSummariesRef.current
-            );
-          });
-          setControllerStopped(servicesResponse.controllerStopped || false);
-          setIsInitialLoad(false);
-          if (onFetched) {
-            onFetched(new Date());
-          }
-        });
-      const replicaSummaryPromise = dashboardCache
-        .get(getServiceReplicaSummaries, SERVICE_REPLICA_SUMMARY_ARGS)
-        .then((response) => {
-          if (!isCurrentRequest()) return;
-          if (response.legacyFallback) {
-            replicaSummariesRef.current = [];
-            setData(clearDirectReplicaSummary);
-            return;
-          }
-          replicaSummariesRef.current = response.summaries || [];
-          setData((previous) =>
-            mergeReplicaSummaryRows(previous, response.summaries || [])
+  const startControllerEnrichment = useCallback(() => {
+    if (controllerRequestRef.current !== null) {
+      return controllerRequestRef.current;
+    }
+    const controllerVersion = controllerVersionRef.current + 1;
+    controllerVersionRef.current = controllerVersion;
+    const owner = {
+      version: controllerVersion,
+      promise: null,
+      summaryObservedAt: null,
+    };
+    const isCurrentControllerRequest = () =>
+      controllerVersionRef.current === controllerVersion;
+    const metadataPromise = dashboardCache
+      .get(getServices, SERVICE_METADATA_ARGS)
+      .then((metadataResponse) => {
+        if (!isCurrentControllerRequest()) return;
+        setData((previous) => {
+          const metadataRows = mergeMetadataWithPrevious(
+            metadataResponse.services || [],
+            previous
           );
-          if (response.available && response.serviceMetadataIncluded) {
-            // The direct snapshot is the first useful paint. Controller-backed
-            // endpoints and live autoscaler fields continue loading behind
-            // their per-cell placeholders.
-            setLoading(false);
-            setIsInitialLoad(false);
-            if (onFetched) {
-              onFetched(new Date());
-            }
-          }
+          return mergeReplicaSummaryRows(
+            metadataRows,
+            replicaSummariesRef.current,
+            replicaSummaryIdentityAuthoritativeRef.current
+          );
         });
-
-      const [metadataResult, summaryResult, replicaSummaryResult] =
-        await Promise.allSettled([
-          metadataPromise,
-          summaryPromise,
-          replicaSummaryPromise,
-        ]);
-      if (!isCurrentRequest()) return;
-      if (metadataResult.status === 'rejected') {
-        console.error(
-          'Failed to fetch service metadata:',
-          metadataResult.reason
-        );
-      }
-      if (summaryResult.status === 'rejected') {
-        console.error(
-          'Failed to fetch service summaries:',
-          summaryResult.reason
-        );
+        setControllerStopped(metadataResponse.controllerStopped || false);
+        setIsInitialLoad(false);
+      })
+      .catch((error) => {
+        if (isCurrentControllerRequest()) {
+          console.error('Failed to fetch service metadata:', error);
+        }
+      });
+    const summaryPromise = dashboardCache
+      .get(getServices, SERVICE_SUMMARY_ARGS)
+      .then((servicesResponse) => {
+        if (!isCurrentControllerRequest()) return;
+        setData((previous) => {
+          const liveRows = mergeServiceRows(
+            previous,
+            servicesResponse.services || []
+          );
+          return mergeReplicaSummaryRows(
+            liveRows,
+            replicaSummariesRef.current,
+            replicaSummaryIdentityAuthoritativeRef.current
+          );
+        });
+        setControllerStopped(servicesResponse.controllerStopped || false);
+        setIsInitialLoad(false);
+        owner.summaryObservedAt = Date.now();
+      })
+      .catch((error) => {
+        if (!isCurrentControllerRequest()) return;
+        console.error('Failed to fetch service summaries:', error);
         setData((previous) =>
           previous.map((service) =>
             service.metadataOnly
@@ -586,30 +595,165 @@ export function ServicesTable({
               : service
           )
         );
+      });
+    let controllerPromise;
+    controllerPromise = Promise.allSettled([
+      metadataPromise,
+      summaryPromise,
+    ]).finally(() => {
+      if (controllerRequestRef.current === owner) {
+        controllerRequestRef.current = null;
       }
-      if (replicaSummaryResult.status === 'rejected') {
-        console.error(
-          'Failed to fetch persisted replica summaries:',
-          replicaSummaryResult.reason
-        );
-        setData((previous) =>
-          previous.map((service) => ({
-            ...service,
-            replicaSummaryUnavailable: true,
-          }))
-        );
+    });
+    owner.promise = controllerPromise;
+    controllerRequestRef.current = owner;
+    return owner;
+  }, []);
+
+  const runFetch = useCallback(
+    (requestVersion, kind) => {
+      const isCurrentRequest = () =>
+        requestVersionRef.current === requestVersion;
+
+      setLoading(true);
+      // Persisted state owns first paint and refresh completion. Controller
+      // metadata and endpoint/target fields are optional enrichment with a
+      // separate singleflight, so a stalled controller cannot suppress direct
+      // refreshes.
+      if (directIdentityCapabilityRef.current === true) {
+        setData(markControllerEnrichmentPending);
       }
-      setLoading(false);
-      setIsInitialLoad(false);
+      if (
+        (kind === 'manual' || kind === 'visibility') &&
+        directIdentityCapabilityRef.current === true
+      ) {
+        // A freshness boundary invalidates the old enrichment response, but
+        // does not start a second controller request while the first is hung.
+        controllerVersionRef.current += 1;
+      }
+      const controllerRequest = startControllerEnrichment();
+      // Persisted identity is the authoritative freshness boundary. Bypass
+      // stale-while-revalidate semantics so a failed read is surfaced instead
+      // of repeatedly relabeling an old snapshot as current.
+      dashboardCache.invalidate(
+        getServiceReplicaSummaries,
+        SERVICE_REPLICA_SUMMARY_ARGS
+      );
+      const replicaSummaryPromise = dashboardCache
+        .get(getServiceReplicaSummaries, SERVICE_REPLICA_SUMMARY_ARGS)
+        .then((response) => {
+          if (!isCurrentRequest()) return true;
+          if (response.legacyFallback) {
+            directIdentityCapabilityRef.current = false;
+            replicaSummaryIdentityAuthoritativeRef.current = false;
+            replicaSummariesRef.current = [];
+            setData(clearDirectReplicaSummary);
+            return false;
+          }
+          replicaSummariesRef.current = response.summaries || [];
+          if (response.available && response.serviceMetadataIncluded) {
+            directIdentityCapabilityRef.current = true;
+            replicaSummaryIdentityAuthoritativeRef.current = true;
+            setData((previous) =>
+              mergeReplicaSummaryRows(previous, response.summaries || [], true)
+            );
+            // The direct snapshot is the first useful paint. Controller-backed
+            // endpoints and live autoscaler fields continue loading behind
+            // their per-cell placeholders.
+            setLoading(false);
+            setIsInitialLoad(false);
+            if (onFetched && Number.isFinite(response.observedAt)) {
+              onFetched(new Date(response.observedAt * 1000));
+            }
+            return true;
+          }
+          directIdentityCapabilityRef.current = false;
+          replicaSummaryIdentityAuthoritativeRef.current = false;
+          setData((previous) =>
+            mergeReplicaSummaryRows(previous, response.summaries || [])
+          );
+          return false;
+        })
+        .catch((error) => {
+          if (!isCurrentRequest()) return true;
+          const directIdentityWasProven =
+            directIdentityCapabilityRef.current === true;
+          if (!directIdentityWasProven) {
+            directIdentityCapabilityRef.current = false;
+          }
+          console.error('Failed to fetch persisted replica summaries:', error);
+          setData((previous) =>
+            previous.map((service) => ({
+              ...service,
+              replicaSummaryUnavailable: true,
+            }))
+          );
+          // A transport failure cannot revoke a capability already proved by
+          // this mounted server. Keep the last authoritative identity and let
+          // the persisted refresh owner settle so a later retry remains live.
+          return directIdentityWasProven;
+        })
+        .then(async (directOwnsFirstPaint) => {
+          // An old/non-consolidated server cannot supply persisted service
+          // identity. Keep the initial/refresh owner pending until the
+          // controller compatibility projection settles instead of briefly
+          // painting an authoritative-looking empty list.
+          if (!directOwnsFirstPaint) {
+            let compatibilityControllerRequest = controllerRequest;
+            await compatibilityControllerRequest.promise;
+            if (
+              isCurrentRequest() &&
+              directIdentityCapabilityRef.current !== true &&
+              compatibilityControllerRequest.version !==
+                controllerVersionRef.current
+            ) {
+              // A rolling old-server/non-consolidated response may arrive
+              // after a modern direct refresh fenced the prior controller
+              // enrichment. Once that sole stale request settles, start
+              // exactly one compatibility successor so the list can paint.
+              compatibilityControllerRequest = startControllerEnrichment();
+              await compatibilityControllerRequest.promise;
+            }
+            if (
+              isCurrentRequest() &&
+              directIdentityCapabilityRef.current !== true &&
+              Number.isFinite(
+                compatibilityControllerRequest.summaryObservedAt
+              ) &&
+              onFetched
+            ) {
+              // Only the compatibility path may use controller completion as
+              // its freshness boundary. A modern persisted snapshot carries
+              // its own server observation time and cannot be relabelled by a
+              // late controller response.
+              onFetched(
+                new Date(compatibilityControllerRequest.summaryObservedAt)
+              );
+            }
+          }
+        })
+        .finally(() => {
+          if (!isCurrentRequest()) return;
+          setLoading(false);
+          setIsInitialLoad(false);
+        });
+      return replicaSummaryPromise;
     },
-    [setLoading, onFetched]
+    [setLoading, onFetched, startControllerEnrichment]
   );
 
   const fetchData = useCallback(
     ({ kind = 'automatic' } = {}) => {
       const activeRequest = activeRequestRef.current;
       if (activeRequest !== null) {
+        // Until the direct projection has proved it carries service identity,
+        // the active request may be the old-server compatibility owner. Reuse
+        // it even for a manual/visibility refresh so we do not fence the only
+        // response capable of painting the service list.
+        const compatibilityReadOwnsRefresh =
+          directIdentityCapabilityRef.current !== true;
         const shouldReuse =
+          compatibilityReadOwnsRefresh ||
           kind === 'automatic' ||
           activeRequest.kind === kind ||
           (kind === 'visibility' && activeRequest.kind === 'manual');
@@ -620,7 +764,7 @@ export function ServicesTable({
 
       const requestVersion = requestVersionRef.current + 1;
       requestVersionRef.current = requestVersion;
-      const request = runFetch(requestVersion);
+      const request = runFetch(requestVersion, kind);
       const owner = { kind, promise: request };
       activeRequestRef.current = owner;
       return request.finally(() => {
@@ -681,7 +825,11 @@ export function ServicesTable({
     void fetchData();
     return () => {
       requestVersionRef.current += 1;
+      controllerVersionRef.current += 1;
       activeRequestRef.current = null;
+      controllerRequestRef.current = null;
+      directIdentityCapabilityRef.current = null;
+      replicaSummaryIdentityAuthoritativeRef.current = false;
     };
   }, [fetchData]);
 

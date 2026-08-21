@@ -8,13 +8,22 @@ import fastapi
 from fastapi.testclient import TestClient
 import pytest
 
+from sky import models
 from sky.serve import serve_dashboard
 from sky.serve.server import server
 from sky.server import constants as server_constants
+from sky.users import rbac
 
 
-def _client() -> TestClient:
+def _client(auth_user: models.User | None = None) -> TestClient:
     app = fastapi.FastAPI()
+
+    @app.middleware('http')
+    async def _request_context(request, call_next):
+        request.state.auth_user = auth_user
+        request.state.request_id = 'request-id'
+        return await call_next(request)
+
     app.include_router(server.router, prefix='/serve')
     return TestClient(app)
 
@@ -290,6 +299,198 @@ def test_replica_summaries_report_non_consolidated_capability():
         'summaries': [],
     }
     get_summaries.assert_not_called()
+
+
+@pytest.mark.parametrize('role',
+                         [rbac.RoleName.USER.value, rbac.RoleName.VIEWER.value])
+def test_exact_replica_summary_is_scoped_to_authenticated_owner(role):
+    auth_user = models.User(id='owner-a', name='Owner A')
+    payload = {
+        'available': True,
+        'observed_at': 42.0,
+        'summaries': [{
+            'service_name': 'owned',
+            'service_hash': 'hash-a',
+        }],
+    }
+    with mock.patch.object(server.permission.permission_service,
+                           'get_user_roles',
+                           return_value=[role]), \
+         mock.patch.object(server.serve_state,
+                           'get_service_status_snapshot',
+                           return_value={
+                               'hash': 'hash-a',
+                               'pool': False,
+                           }) as get_snapshot, \
+         mock.patch.object(server.serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(server.serve_dashboard,
+                           'get_replica_summaries',
+                           return_value=payload) as get_summaries:
+        response = _client(auth_user).get('/serve/replica-summaries',
+                                          params={'service_name': 'owned'})
+
+    assert response.status_code == 200
+    assert response.json() == payload
+    get_snapshot.assert_called_once_with('owned', owner_user_id='owner-a')
+    get_summaries.assert_called_once_with(['owned'], 'owner-a')
+
+
+def test_exact_unauthorized_replica_summary_is_indistinguishable_404():
+    auth_user = models.User(id='owner-a', name='Owner A')
+    with mock.patch.object(server.permission.permission_service,
+                           'get_user_roles',
+                           return_value=[rbac.RoleName.USER.value]), \
+         mock.patch.object(server.serve_state,
+                           'get_service_status_snapshot',
+                           return_value=None) as get_snapshot, \
+         mock.patch.object(server.serve_dashboard,
+                           'get_replica_summaries') as get_summaries:
+        response = _client(auth_user).get('/serve/replica-summaries',
+                                          params={'service_name': 'other'})
+
+    assert response.status_code == 404
+    assert response.json() == {'detail': 'Service not found.'}
+    get_snapshot.assert_called_once_with('other', owner_user_id='owner-a')
+    get_summaries.assert_not_called()
+
+
+def test_replica_summary_batch_pushes_owner_scope_into_grouped_query():
+    auth_user = models.User(id='owner-a', name='Owner A')
+    payload = {
+        'available': True,
+        'observed_at': 42.0,
+        'summaries': [{
+            'service_name': 'owned',
+            'service_hash': 'hash-a',
+        }],
+    }
+    with mock.patch.object(server.permission.permission_service,
+                           'get_user_roles',
+                           return_value=[rbac.RoleName.USER.value]), \
+         mock.patch.object(server.serve_state,
+                           'get_service_status_snapshot') as get_snapshot, \
+         mock.patch.object(server.serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(server.serve_dashboard,
+                           'get_replica_summaries',
+                           return_value=payload) as get_summaries:
+        response = _client(auth_user).get('/serve/replica-summaries',
+                                          params=[('service_name', 'owned'),
+                                                  ('service_name', 'other')])
+
+    assert response.status_code == 200
+    assert response.json() == payload
+    get_snapshot.assert_not_called()
+    get_summaries.assert_called_once_with(['owned', 'other'], 'owner-a')
+
+
+def test_admin_replica_summary_read_remains_unrestricted():
+    auth_user = models.User(id='admin-a', name='Admin A')
+    payload = {'available': True, 'observed_at': 42.0, 'summaries': []}
+    with mock.patch.object(server.permission.permission_service,
+                           'get_user_roles',
+                           return_value=[rbac.RoleName.ADMIN.value]), \
+         mock.patch.object(server.serve_state,
+                           'get_service_status_snapshot') as get_snapshot, \
+         mock.patch.object(server.serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(server.serve_dashboard,
+                           'get_replica_summaries',
+                           return_value=payload) as get_summaries:
+        response = _client(auth_user).get('/serve/replica-summaries')
+
+    assert response.status_code == 200
+    get_snapshot.assert_not_called()
+    get_summaries.assert_called_once_with(None)
+
+
+@pytest.mark.parametrize(
+    ('path', 'body'),
+    [('/serve/status', {
+        'service_names': ['owned'],
+        'authorized_owner_user_id': 'owner-b',
+    }),
+     ('/serve/placement', {
+         'service_name': 'owned',
+         'authorized_owner_user_id': 'owner-b',
+     })],
+)
+def test_queued_serve_reads_overwrite_caller_supplied_owner_scope(path, body):
+    auth_user = models.User(id='owner-a', name='Owner A')
+    with mock.patch.object(server.permission.permission_service,
+                           'get_user_roles',
+                           return_value=[rbac.RoleName.VIEWER.value]), \
+         mock.patch.object(server.serve_state,
+                           'get_service_status_snapshot',
+                           return_value={
+                               'hash': 'hash-a',
+                               'pool': False,
+                           }) as get_snapshot, \
+         mock.patch.object(server.executor,
+                           'schedule_request_async',
+                           new_callable=mock.AsyncMock) as schedule:
+        response = _client(auth_user).post(path, json=body)
+
+    assert response.status_code == 200
+    get_snapshot.assert_called_once_with('owned', owner_user_id='owner-a')
+    scheduled_body = schedule.await_args.kwargs['request_body']
+    assert scheduled_body.authorized_owner_user_id == 'owner-a'
+
+
+def test_exact_unauthorized_status_is_404_before_enqueue():
+    auth_user = models.User(id='owner-a', name='Owner A')
+    with mock.patch.object(server.permission.permission_service,
+                           'get_user_roles',
+                           return_value=[rbac.RoleName.USER.value]), \
+         mock.patch.object(server.serve_state,
+                           'get_service_status_snapshot',
+                           return_value=None), \
+         mock.patch.object(server.executor,
+                           'schedule_request_async',
+                           new_callable=mock.AsyncMock) as schedule:
+        response = _client(auth_user).post('/serve/status',
+                                           json={'service_names': ['other']})
+
+    assert response.status_code == 404
+    assert response.json() == {'detail': 'Service not found.'}
+    schedule.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ('path', 'params'),
+    [('/serve/other/demand', {
+        'expected_service_hash': 'hash-other'
+    }), ('/serve/other/history', {
+        'expected_service_hash': 'hash-other'
+    }),
+     ('/serve/other/replicas', {
+         'expected_service_hash': 'hash-other',
+         'scope': 'current_or_uncertain',
+     }), ('/serve/other/pricing', {
+         'expected_service_hash': 'hash-other'
+     })],
+)
+def test_exact_unauthorized_direct_reads_are_indistinguishable_404(
+        path, params):
+    auth_user = models.User(id='owner-a', name='Owner A')
+    with mock.patch.object(server.permission.permission_service,
+                           'get_user_roles',
+                           return_value=[rbac.RoleName.USER.value]), \
+         mock.patch.object(server.serve_state,
+                           'get_service_status_snapshot',
+                           return_value=None) as get_snapshot, \
+         mock.patch.object(server.serve_utils,
+                           'is_consolidation_mode') as consolidation:
+        response = _client(auth_user).get(path, params=params)
+
+    assert response.status_code == 404
+    assert response.json() == {'detail': 'Service not found.'}
+    get_snapshot.assert_called_once_with('other', owner_user_id='owner-a')
+    consolidation.assert_not_called()
 
 
 def test_replica_page_is_bounded_and_avoids_executor():

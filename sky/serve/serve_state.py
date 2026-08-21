@@ -1983,7 +1983,8 @@ def _get_service_from_row(r: 'row.RowMapping') -> dict[str, Any]:
 
 
 def _build_services_with_latest_version_query(
-        service_name: str | None = None) -> sqlalchemy.sql.Select:
+        service_name: str | None = None,
+        owner_user_id: str | None = None) -> sqlalchemy.sql.Select:
     """Build a query joining services with their latest version metadata.
 
     Args:
@@ -2016,6 +2017,8 @@ def _build_services_with_latest_version_query(
             ))
     if service_name is not None:
         query = query.where(services_table.c.name == service_name)
+    if owner_user_id is not None:
+        query = query.where(services_table.c.owner_user_id == owner_user_id)
     return query
 
 
@@ -2080,11 +2083,42 @@ def get_service_names_owned_by_user_id(owner_user_id: str) -> list[str]:
                         services_table.c.name)).scalars())
 
 
-def get_service_from_name(service_name: str) -> dict[str, Any] | None:
+def get_service_hashes_owned_by_user_id(owner_user_id: str,
+                                        service_names: list[str],
+                                        pool: bool) -> dict[str, str]:
+    """Read exact current identities for an authenticated status response.
+
+    The controller status RPC can race with delete/recreate.  Callers use this
+    batched reread after the RPC to prove that each returned record still
+    belongs to the requested owner, mode, and service incarnation.
+    """
+    if not isinstance(owner_user_id, str) or not owner_user_id:
+        raise ValueError('Service owner user ID is invalid.')
+    if not service_names:
+        return {}
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                services_table.c.name, services_table.c.hash).where(
+                    services_table.c.owner_user_id == owner_user_id,
+                    services_table.c.pool == int(pool),
+                    services_table.c.name.in_(service_names))).fetchall()
+    return {
+        str(name): str(service_hash)
+        for name, service_hash in rows
+        if isinstance(service_hash, str) and service_hash
+    }
+
+
+def get_service_from_name(
+        service_name: str,
+        owner_user_id: str | None = None) -> dict[str, Any] | None:
     """Get all existing service records."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        query = _build_services_with_latest_version_query(service_name)
+        query = _build_services_with_latest_version_query(
+            service_name, owner_user_id)
         rows = session.execute(query).fetchall()
     for row in rows:
         return _get_service_from_row(row._mapping)  # pylint: disable=protected-access
@@ -2503,7 +2537,8 @@ def get_service_version_terminal_states(
 
 def get_service_status_snapshot(
         service_name: str,
-        require_version: bool = False) -> dict[str, Any] | None:
+        require_version: bool = False,
+        owner_user_id: str | None = None) -> dict[str, Any] | None:
     """Read the slim status fields used by control and liveness helpers.
 
     Unlike :func:`get_service_from_name`, this helper stays on the
@@ -2535,6 +2570,8 @@ def get_service_status_snapshot(
             services_table.c.active_versions,
             services_table.c.logical_replica_semantics,
         ).where(services_table.c.name == service_name)
+        if owner_user_id is not None:
+            query = query.where(services_table.c.owner_user_id == owner_user_id)
         if require_version:
             query = query.where(sqlalchemy.exists().where(
                 version_specs_table.c.service_name == services_table.c.name))
@@ -3528,7 +3565,8 @@ def get_service_versions(service_name: str) -> list[int]:
 
 
 def get_glob_service_names(service_names: list[str] | None = None,
-                           pool: bool | None = None) -> list[str]:
+                           pool: bool | None = None,
+                           owner_user_id: str | None = None) -> list[str]:
     """Get service names matching the glob patterns.
 
     Args:
@@ -3547,6 +3585,8 @@ def get_glob_service_names(service_names: list[str] | None = None,
         return query.where(services_table.c.pool == int(pool))
 
     query = sqlalchemy.select(services_table.c.name)
+    if owner_user_id is not None:
+        query = query.where(services_table.c.owner_user_id == owner_user_id)
     if service_names is not None:
         if not service_names:
             return []

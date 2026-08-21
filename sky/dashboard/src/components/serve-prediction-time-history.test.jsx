@@ -88,14 +88,14 @@ describe('prediction-time history', () => {
     );
 
     expect(
-      screen.getByText('Completed in range').nextSibling
+      screen.getByText('Recorded terminal observations in range').nextSibling
     ).toHaveTextContent('7');
     expect(screen.getByTestId('prediction-trend')).toHaveTextContent(
       'p50|p95|p99'
     );
     fireEvent.click(screen.getByRole('button', { name: 'Failed' }));
     expect(
-      screen.getByText('Completed in range').nextSibling
+      screen.getByText('Recorded terminal observations in range').nextSibling
     ).toHaveTextContent('1');
     expect(screen.getByTestId('prediction-histogram')).toHaveTextContent(
       '0|0|0|1'
