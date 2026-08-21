@@ -913,11 +913,6 @@ def test_pre_serve056_json_only_replica_is_cleanup_only(
             service_name='svc',
             service_hash=_SERVICE_HASH,
             replica_info=info) is None
-        assert not zero_cost_actuation.committed_intent_matches_replica_in_connection(
-            connection,
-            service_name='svc',
-            service_hash=_SERVICE_HASH,
-            replica_info=info)
         cleanup_intent = (
             zero_cost_actuation.
             cleanup_only_committed_intent_for_replica_in_connection(
@@ -932,11 +927,6 @@ def test_pre_serve056_json_only_replica_is_cleanup_only(
             service_name='svc',
             service_hash=_SERVICE_HASH,
             replica_info=info) is None
-        assert not zero_cost_actuation.committed_intent_matches_replica_in_connection(
-            connection,
-            service_name='svc',
-            service_hash=_SERVICE_HASH,
-            replica_info=info)
         assert (zero_cost_actuation.
                 cleanup_only_committed_intent_for_replica_in_connection(
                     connection,

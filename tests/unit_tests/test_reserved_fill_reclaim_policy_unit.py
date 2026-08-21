@@ -416,99 +416,6 @@ def _install_gate(monkeypatch,
     monkeypatch.setattr(serve_state._db_manager, 'get_engine', lambda: engine)
 
 
-@pytest.mark.parametrize('committed', [True, False])
-def test_new_claim_generation_retains_only_exact_committed_intent(
-        monkeypatch, committed):
-    context = _launch_context()
-    snapshot = _launch_snapshot(context)
-    intent_match = mock.Mock(return_value=committed)
-    monkeypatch.setattr(serve_state.zero_cost_actuation,
-                        'committed_intent_matches_replica_in_connection',
-                        intent_match)
-    _install_gate(monkeypatch, _gate(sequenced=True), claim_generation=8)
-
-    holds = serve_state.reserved_fill_reclaim_launch_authority_holds(
-        _scope(context), _launch_authorization(_scope(context)), context,
-        snapshot)
-
-    assert holds is committed
-    intent_match.assert_called_once()
-    assert intent_match.call_args.kwargs == {
-        'service_name': 'svc',
-        'service_hash': 'incarnation-a',
-        'replica_info': snapshot.durable_replica_info,
-    }
-
-
-def test_new_claim_generation_does_not_require_superseded_edge(monkeypatch):
-    context = _launch_context()
-    snapshot = _launch_snapshot(context)
-    intent_match = mock.Mock(return_value=True)
-    monkeypatch.setattr(serve_state.zero_cost_actuation,
-                        'committed_intent_matches_replica_in_connection',
-                        intent_match)
-    successor_pool_key = broker.make_pool_key(
-        'east-context',
-        'A100',
-        protocol_version=broker.PROTOCOL_V2,
-        physical_cluster_uid='successor-physical-uid')
-    _install_gate(monkeypatch,
-                  _gate(sequenced=True),
-                  claim_generation=8,
-                  edge_rows=[{
-                      'pool_key': successor_pool_key,
-                      'access_context': 'east-context',
-                      'physical_cluster_uid': 'successor-physical-uid',
-                      'gpus_per_replica': 1,
-                      'service_generation': 8,
-                      'accelerator_names': ['a100'],
-                      'worker_projection_sha256_by_accelerator': {
-                          'a100': 'f' * 64,
-                      },
-                  }])
-
-    assert serve_state.reserved_fill_reclaim_launch_authority_holds(
-        _scope(context), _launch_authorization(_scope(context)), context,
-        snapshot)
-    intent_match.assert_called_once()
-
-
-def test_new_claim_generation_rejects_empty_authoritative_set(monkeypatch):
-    context = _launch_context()
-    snapshot = _launch_snapshot(context)
-    intent_match = mock.Mock(return_value=True)
-    monkeypatch.setattr(serve_state.zero_cost_actuation,
-                        'committed_intent_matches_replica_in_connection',
-                        intent_match)
-    _install_gate(monkeypatch,
-                  _gate(sequenced=True),
-                  claim_generation=8,
-                  edge_rows=[])
-
-    assert not serve_state.reserved_fill_reclaim_launch_authority_holds(
-        _scope(context), _launch_authorization(_scope(context)), context,
-        snapshot)
-    intent_match.assert_not_called()
-
-
-def test_original_claim_generation_still_requires_matching_edge(monkeypatch):
-    context = _launch_context()
-    snapshot = _launch_snapshot(context)
-    intent_match = mock.Mock(return_value=True)
-    monkeypatch.setattr(serve_state.zero_cost_actuation,
-                        'committed_intent_matches_replica_in_connection',
-                        intent_match)
-    _install_gate(monkeypatch,
-                  _gate(sequenced=True),
-                  claim_generation=7,
-                  edge_rows=[])
-
-    assert not serve_state.reserved_fill_reclaim_launch_authority_holds(
-        _scope(context), _launch_authorization(_scope(context)), context,
-        snapshot)
-    intent_match.assert_not_called()
-
-
 class _Policy(reclaim.ReservedFillReclaimPolicy):
     """Typed deployment policy with explicit callbacks for one test edge."""
 
@@ -830,10 +737,6 @@ def test_mutable_successor_state_cannot_revoke_committed_provider_epochs(
     monkeypatch.setattr(
         serve_state, 'reserved_fill_reclaim_gate_authority_guard',
         mock.Mock(side_effect=AssertionError('successor gate consulted')))
-    monkeypatch.setattr(
-        serve_state, 'reserved_fill_reclaim_launch_authority_holds',
-        mock.Mock(side_effect=AssertionError('successor inventory consulted')))
-
     with provisioner._service_replica_launch_provider_guard():
         pass
     # Model a later Kubernetes readiness/update provider epoch after mutable

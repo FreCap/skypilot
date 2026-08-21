@@ -797,21 +797,6 @@ def committed_intent_for_replica_in_connection(
         return None
 
 
-def committed_intent_matches_replica_in_connection(
-    connection: sqlalchemy.engine.Connection,
-    *,
-    service_name: str,
-    service_hash: str,
-    replica_info: Any,
-) -> bool:
-    """Return whether an exact committed intent still owns one replica."""
-    return committed_intent_for_replica_in_connection(
-        connection,
-        service_name=service_name,
-        service_hash=service_hash,
-        replica_info=replica_info) is not None
-
-
 def cleanup_only_committed_intent_for_replica_in_connection(
     connection: sqlalchemy.engine.Connection,
     *,

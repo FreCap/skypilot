@@ -57,6 +57,48 @@ _PROTOCOL_V2_JSON_FIELDS = (
     _INTENT_LINK,
 )
 
+# Authority-bearing fields read by the replica guard below.  Routine replica
+# status and recovery projections do not change these fields and must not
+# repeat the intent/association graph reads on every UPDATE.
+_REPLICA_AUTHORITY_COLUMNS = (
+    'service_name',
+    'replica_id',
+    'replica_state_version',
+    'version',
+    'cluster_name',
+    'is_spot',
+    'paid_capacity_pool_key',
+    'ordinary_launch_association_id',
+)
+_REPLICA_AUTHORITY_JSON_FIELDS = (
+    'reserved_fill',
+    'is_zero_cost',
+    'is_spot',
+    'paid_capacity_pool_key',
+    _INTENT_LINK,
+    'replica_id',
+    'version',
+    'cluster_name',
+    'replica_record_id',
+    'reserved_fill_pool_key',
+    'reserved_fill_service_generation',
+    'reserved_fill_physical_cluster_uid',
+    'reserved_fill_kubernetes_context',
+    'reserved_fill_allocation_generation',
+    'reserved_fill_allocation_input_sha256',
+    'reserved_fill_allocation_claim_generation',
+    'reserved_fill_reconciliation_gate_generation',
+    'reserved_fill_reclaim_fleet_bundle_sha256',
+    'reserved_fill_reclaim_policy_revision',
+    'reserved_fill_reclaim_provider_inventory_sha256',
+    'reserved_fill_worker_projection_sha256',
+    'reserved_fill_observation_generation',
+    'reserved_fill_observation_sequence',
+    'planned_capacity',
+    'location',
+    'resources_override',
+)
+
 
 def _require_postgresql() -> None:
     if op.get_bind().dialect.name != 'postgresql':
@@ -92,6 +134,16 @@ def _install_replica_guard() -> None:
     protocol_v2_claimed = ' OR\n                   '.join(
         f"NEW.replica_state ->> '{field}' IS NOT NULL"
         for field in _PROTOCOL_V2_JSON_FIELDS)
+    new_authority_projection = ',\n                    '.join(
+        [f'NEW.{field}' for field in _REPLICA_AUTHORITY_COLUMNS] + [
+            f"NEW.replica_state -> '{field}'"
+            for field in _REPLICA_AUTHORITY_JSON_FIELDS
+        ])
+    old_authority_projection = ',\n                    '.join(
+        [f'OLD.{field}' for field in _REPLICA_AUTHORITY_COLUMNS] + [
+            f"OLD.replica_state -> '{field}'"
+            for field in _REPLICA_AUTHORITY_JSON_FIELDS
+        ])
     op.execute(f'''
         CREATE OR REPLACE FUNCTION {_REPLICA_GUARD_FUNCTION}()
         RETURNS trigger LANGUAGE plpgsql AS $function$
@@ -111,6 +163,21 @@ def _install_replica_guard() -> None:
                         OLD.{_INTENT_LINK} THEN
                     RAISE EXCEPTION
                         'replica reserved-fill intent link is initial-insert-only';
+                END IF;
+                IF NEW.{_INTENT_LINK} IS NULL THEN
+                    -- Retained unlinked rows are cleanup-only and have no
+                    -- normalized launch graph to revalidate.
+                    RETURN NEW;
+                END IF;
+                IF ROW(
+                    {new_authority_projection}
+                ) IS NOT DISTINCT FROM ROW(
+                    {old_authority_projection}
+                ) THEN
+                    -- Status/probe/recovery-only writes preserve the exact
+                    -- authority projection validated at INSERT.  Avoid
+                    -- rereading the immutable graph for those hot writes.
+                    RETURN NEW;
                 END IF;
             END IF;
 

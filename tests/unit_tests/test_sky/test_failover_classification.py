@@ -2390,15 +2390,6 @@ def test_reserved_fill_retry_candidate_drift_is_terminal_before_provider(
                         lambda *_: ['user'])
     monkeypatch.setattr(clouds.Kubernetes, 'check_features_are_supported',
                         lambda *_: None)
-    claim = types.SimpleNamespace(request_id=request_id,
-                                  worker_instance_id=str(uuid.uuid4()))
-    monkeypatch.setattr(request_storage, 'active_execution_claim',
-                        lambda: claim)
-    monkeypatch.setattr(
-        ordinary_launch_binding, 'binding_allows_request',
-        lambda actual_association_id, actual_request_id:
-        (actual_association_id == association_id and actual_request_id ==
-         request_id))
 
     def optimize(*args, **kwargs):
         del args, kwargs

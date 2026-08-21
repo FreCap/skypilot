@@ -1248,6 +1248,16 @@ intent/replica/association graph at transaction commit. The scalar link and a
 committed intent are update-immutable, and the foreign key prevents removal of
 a committed intent while its replica remains linked.
 
+The replica trigger keeps status/probe/recovery writes from rereading the
+immutable intent graph. After enforcing scalar-link and non-pool-authorization
+immutability, an UPDATE returns early only when an explicit null-safe tuple of
+every authority-bearing scalar and JSON field is unchanged. It does not compare
+the whole `ReplicaInfo` JSON, whose runtime fields legitimately advance. Any
+authority-projection change falls through to the complete intent and
+association validation; INSERT and deferred graph checks are unchanged. A
+real-PostgreSQL lock test proves a runtime-only update does not read the intent
+table while an authority-field mutation does.
+
 Before commit, admission continues to use the complete mutable chain: the
 current authenticated allocation and claim set, current observation and
 reconciliation gate, current deployment-policy authorization and provider
@@ -2912,10 +2922,14 @@ attestation rather than inferring identity from cached configuration.
 Post-Pod runtime preparation, internal file mounting, Ray/skylet startup,
 workdir and file-mount synchronization, task setup, autostop/hook mutation,
 port reconciliation, and job submission each run under a fresh bounded
-service/policy/fleet guard. Passive Kueue scheduling and readiness waits remain
-outside every guard. A missing guard fails closed; terminal cursor restoration
-and other best-effort reporting cannot replace the typed materialized result.
-Ordinary bound requests retain their existing authority path.
+association/request effect guard, current service guard, fresh provider proof
+against the frozen policy scope, scalar-linked committed-intent guard, and
+exact physical-cluster UID fence. They do not reacquire mutable claim,
+allocation, observation, or fleet-gate authority. Passive Kueue scheduling and
+readiness waits remain outside every guard. A missing guard fails closed;
+terminal cursor restoration and other best-effort reporting cannot replace the
+typed materialized result. Ordinary bound requests retain their existing
+authority path.
 
 The asynchronous request boundary has one exact execution-quiescence protocol.
 Every claimed invocation retains generation, claim token, worker instance,
