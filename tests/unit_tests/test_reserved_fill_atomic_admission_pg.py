@@ -87,10 +87,20 @@ def atomic_database(allocation_engine, monkeypatch):
     profile_digest = ordinary_launch_binding.supported_non_pool_profile_set_digest(
     )
     with allocation_engine.begin() as connection:
+        # The allocation fixture creates a current central-birth service with a
+        # frozen owner.  This fixture specifically exercises a retained
+        # pre-Serve055 service, whose owner starts NULL and is attested once by
+        # the elected controller.  Reproduce that migration input before
+        # restoring the production immutability trigger.
+        connection.execute(
+            sqlalchemy.text('DROP TRIGGER skyserve055_service_owner_guard '
+                            'ON services'))
         connection.execute(
             sqlalchemy.update(serve_state_schema.services_table).
             where(serve_state_schema.services_table.c.name == _SERVICE).values(
                 workspace=_WORKSPACE,
+                owner_user_id=None,
+                owner_user_name=None,
                 lifecycle_epoch=4,
                 controller_port=_CONTROLLER_PORT,
                 controller_incarnation=_CONTROLLER_INCARNATION,
@@ -115,9 +125,16 @@ def atomic_database(allocation_engine, monkeypatch):
                     _CONTROLLER_INCARNATION),
                 reserved_fill_actuation_protocol_version=1))
         connection.execute(
-            sqlalchemy.insert(
-                serve_state_schema.service_lifecycle_fences_table).values(
-                    name=_SERVICE, epoch=4))
+            sqlalchemy.text('CREATE TRIGGER '
+                            'skyserve055_service_owner_guard BEFORE UPDATE OF '
+                            'owner_user_id, owner_user_name ON services FOR '
+                            'EACH ROW EXECUTE FUNCTION '
+                            'skyserve055_guard_service_owner()'))
+        connection.execute(
+            sqlalchemy.update(
+                serve_state_schema.service_lifecycle_fences_table).where(
+                    serve_state_schema.service_lifecycle_fences_table.c.name ==
+                    _SERVICE).values(epoch=4))
         connection.execute(
             sqlalchemy.update(serve_state_schema.version_specs_table).where(
                 serve_state_schema.version_specs_table.c.service_name ==
