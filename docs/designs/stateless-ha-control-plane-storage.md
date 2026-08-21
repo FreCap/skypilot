@@ -112,8 +112,8 @@ reference blocks cutover.
 
 ## Source readiness and gaps
 
-This source audit is against `improvements` at f42d18518 (1.1.1409). Later
-implementation PRs must refresh it after rebasing.
+This source audit is against `improvements` at 008316be2 (two commits after
+1.1.1409). Later implementation PRs must refresh it after rebasing.
 
 Literal EFS removal is not source-ready. The current seams and missing work are:
 
