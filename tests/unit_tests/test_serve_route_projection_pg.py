@@ -668,6 +668,7 @@ def test_publish_refresh_promote_and_provider_free_read(route_database):
     assert (projected.response['route_projection_generation'] ==
             composed.generation)
     assert projected.response['route_projection_sha256'] != first.content_sha256
+    assert len(projected.response['route_occupancy_context_sha256']) == 64
     assert projected.response['route_source_epoch'] == 1
     assert set(projected.response['replica_info']) == {'http://10.0.0.1:8000'}
     assert projected.response['capacity_hint']['decoded'] == 1

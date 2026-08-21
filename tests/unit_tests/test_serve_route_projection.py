@@ -46,6 +46,46 @@ def _build(infos, materials, verified, *, marker=lambda info, url: None):
         retire_route=lambda info: None)
 
 
+def test_occupancy_context_excludes_capacity_but_fences_replica_identity():
+    response = {
+        'service_version': 7,
+        'routing_spec': {
+            'load_balancing_policy_name': 'least_load'
+        },
+        'replica_info': {
+            'http://replica:8080': {
+                'async_occupancy': 'true',
+            }
+        },
+        'capacity_hint': {
+            'warm_retention_target_by_accelerator': {}
+        },
+    }
+    identities = {
+        'http://replica:8080': {
+            'replica_record_id': str(uuid.uuid4()),
+        }
+    }
+    initial = route_projection._occupancy_context_sha256(response, identities)
+
+    changed_capacity = dict(response)
+    changed_capacity['capacity_hint'] = {
+        'warm_retention_target_by_accelerator': {
+            'H200': 30
+        }
+    }
+    assert (route_projection._occupancy_context_sha256(changed_capacity,
+                                                       identities) == initial)
+
+    successor = {
+        'http://replica:8080': {
+            'replica_record_id': str(uuid.uuid4()),
+        }
+    }
+    assert (route_projection._occupancy_context_sha256(response, successor)
+            != initial)
+
+
 def test_builds_existing_full_response_with_private_exact_identity():
     info = _replica(1, 'http://10.0.0.1:8000')
     material = route_projection.ResolvedRouteMaterial('http://10.0.0.1:8000',
