@@ -6,7 +6,7 @@ replica that failed while its version was still the latest is retained
 forever and never re-examined, so records pile up across every later version
 and bury the current version's real failures.
 """
-# pylint: disable=protected-access
+# pylint: disable=protected-access,redefined-outer-name,unused-argument
 import types
 
 import pytest
@@ -38,9 +38,17 @@ def manager(monkeypatch):
     instance.latest_version = 56
     instance._superseded_prune_pending = True
     removed = []
-    instance._remove_replica = (
-        lambda replica_id, record_id: removed.append(replica_id))
+    removed_batches = []
+
+    def _remove_replicas(infos):
+        removed_batches.append([info.replica_id for info in infos])
+        removed.extend(info.replica_id for info in infos)
+
+    instance._remove_replicas = _remove_replicas
+    instance._remove_replica = lambda *_args: pytest.fail(
+        'superseded rows must use the fenced batch helper')
     instance.removed = removed
+    instance.removed_batches = removed_batches
     return instance
 
 
@@ -105,6 +113,7 @@ def test_only_the_superseded_failures_are_removed(manager, monkeypatch):
         _info(8, 40, Status.READY),
     ]
     assert _run(manager, monkeypatch, infos) == [1, 2, 3]
+    assert manager.removed_batches == [[1, 2, 3]]
 
 
 def test_the_sweep_does_not_rescan_on_every_tick(manager, monkeypatch):
