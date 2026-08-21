@@ -120,6 +120,8 @@ _READ_ONLY_HANDLER_NAMES = frozenset({
     'sky.provision.slurm.utils:slurm_node_info',
     'sky.recipes.core:get_recipe',
     'sky.recipes.core:list_recipes',
+    'sky.serve.server.core:authorized_placement',
+    'sky.serve.server.core:authorized_status',
     'sky.serve.server.core:placement',
     'sky.serve.server.core:status',
     'sky.serve.server.core:sync_down_logs',

@@ -5,6 +5,43 @@ import pytest
 
 from sky.serve.server import core
 from sky.server.requests import payloads
+from sky.server.requests import registry
+
+
+@pytest.mark.parametrize(
+    ('public_type', 'legacy_type', 'authorized_type', 'kwargs',
+     'legacy_payload_name'),
+    [
+        (payloads.ServePublicStatusBody, payloads.ServeStatusBody,
+         payloads.ServeAuthorizedStatusBody, {
+             'service_names': ['svc']
+         }, 'sky.server.requests.payloads:ServeStatusBody'),
+        (payloads.ServePublicPlacementBody, payloads.ServePlacementBody,
+         payloads.ServeAuthorizedPlacementBody, {
+             'service_name': 'svc'
+         }, 'sky.server.requests.payloads:ServePlacementBody'),
+    ],
+    ids=['status', 'placement'],
+)
+def test_serve_read_payloads_separate_wire_and_durable_scope(
+        public_type, legacy_type, authorized_type, kwargs, legacy_payload_name):
+    public_body = public_type(**kwargs, authorized_owner_user_id='forged-owner')
+    public_values = public_body.model_dump()
+    assert 'authorized_owner_user_id' not in public_values
+
+    # Both durable models require an explicit nullable scope.  In particular,
+    # a retained row without the field must fail instead of becoming an
+    # unscoped admin read under BasePayload's permissive extra-field policy.
+    for durable_type in (legacy_type, authorized_type):
+        with pytest.raises(ValueError):
+            durable_type(**kwargs)
+    with pytest.raises(ValueError):
+        registry.decode_payload(legacy_payload_name, public_values)
+
+    legacy_body = legacy_type(**kwargs, authorized_owner_user_id=None)
+    encoded_name, encoded_values = registry.encode_payload(legacy_body)
+    assert encoded_name == legacy_payload_name
+    assert encoded_values['authorized_owner_user_id'] is None
 
 
 def test_placement_uses_exact_service_incarnation(monkeypatch):
@@ -79,7 +116,8 @@ def test_placement_rechecks_server_derived_owner_scope(monkeypatch):
     monkeypatch.setattr(core.serve_state, 'get_service_from_name', get_service)
 
     with pytest.raises(ValueError, match='not found'):
-        core.placement('recreated', authorized_owner_user_id='owner-a')
+        core.authorized_placement('recreated',
+                                  authorized_owner_user_id='owner-a')
 
     get_service.assert_called_once_with('recreated', owner_user_id='owner-a')
 
@@ -107,4 +145,4 @@ def test_placement_rechecks_server_derived_owner_scope(monkeypatch):
 }])
 def test_placement_payload_rejects_unbounded_inputs(overrides):
     with pytest.raises(ValueError):
-        payloads.ServePlacementBody(service_name='svc', **overrides)
+        payloads.ServePublicPlacementBody(service_name='svc', **overrides)

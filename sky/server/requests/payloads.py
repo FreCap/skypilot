@@ -308,7 +308,8 @@ class RequestBody(BasePayload):
         if 'entrypoint' not in data:
             data['entrypoint'] = usage_lib.messages.usage.entrypoint or ''
         if 'entrypoint_command' not in data:
-            data['entrypoint_command'] = common_utils.get_pretty_entrypoint_cmd()
+            data['entrypoint_command'] = common_utils.get_pretty_entrypoint_cmd(
+            )
         if 'using_remote_api_server' not in data:
             data['using_remote_api_server'] = not common.is_api_server_local()
         if 'override_skypilot_config' not in data:
@@ -1356,8 +1357,13 @@ class ServeDownloadLogsBody(RequestBody):
     tail: int | None = None
 
 
-class ServeStatusBody(RequestBody):
-    """The request body for the serve status endpoint."""
+class ServePublicStatusBody(RequestBody):
+    """The public wire body for the serve status endpoint.
+
+    Authorization scope is intentionally absent.  Unknown wire fields are
+    ignored by :class:`BasePayload`, so callers cannot choose the durable
+    owner scope that the API server derives after authentication.
+    """
     service_names: str | list[str] | None
     # Skip per-replica info; return cheap replica_status_counts instead.
     # Used by the dashboard for fast list/header rendering at fleet scale.
@@ -1375,13 +1381,26 @@ class ServeStatusBody(RequestBody):
     # Summary responses skip endpoint resolution by default because it requires
     # Kubernetes reads. Dashboard list enrichment opts in after metadata lands.
     include_endpoints: bool = False
-    # Server-derived object scope. The route overwrites any wire value before
-    # enqueueing; authenticated non-admin execution rechecks this owner in SQL.
-    authorized_owner_user_id: str | None = None
 
 
-class ServePlacementBody(RequestBody):
-    """The request body for one service's placement observability."""
+class ServeStatusBody(ServePublicStatusBody):
+    """Legacy durable status body retained for mixed-version workers.
+
+    The stable type name was emitted by API servers before the distinct
+    authorized handler existed.  Its nullable owner field remains required so
+    a new controller cannot silently decode a field-absent row as an unscoped
+    admin read.
+    """
+    authorized_owner_user_id: str | None
+
+
+class ServeAuthorizedStatusBody(ServePublicStatusBody):
+    """Server-owned status scope for the authorized worker handler."""
+    authorized_owner_user_id: str | None
+
+
+class ServePublicPlacementBody(RequestBody):
+    """The public wire body for one service's placement observability."""
     service_name: str
     hours: int = pydantic.Field(default=24, ge=1, le=24)
     limit: int = pydantic.Field(default=50, ge=1, le=100)
@@ -1393,9 +1412,16 @@ class ServePlacementBody(RequestBody):
     # initialized creates a sky.client <-> sky.serve package cycle.
     location_limit: int = pydantic.Field(default=100, ge=1, le=100)
     location_offset: int = pydantic.Field(default=0, ge=0, le=100_000)
-    # Server-derived object scope. The route overwrites any wire value before
-    # enqueueing so a same-name successor cannot cross a tenant boundary.
-    authorized_owner_user_id: str | None = None
+
+
+class ServePlacementBody(ServePublicPlacementBody):
+    """Legacy durable placement body retained for mixed-version workers."""
+    authorized_owner_user_id: str | None
+
+
+class ServeAuthorizedPlacementBody(ServePublicPlacementBody):
+    """Server-owned placement scope for the authorized worker handler."""
+    authorized_owner_user_id: str | None
 
 
 class RealtimeGpuAvailabilityRequestBody(RequestBody):

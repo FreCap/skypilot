@@ -317,6 +317,32 @@ def status(
                        **kwargs)
 
 
+def authorized_status(
+    service_names: str | list[str] | None = None,
+    summary_only: bool = False,
+    include_target_num_replicas: bool | None = None,
+    history_hours: int | None = None,
+    metadata_only: bool = False,
+    include_endpoints: bool = False,
+    *,
+    authorized_owner_user_id: str | None,
+) -> list[dict[str, Any]]:
+    """Execute status with the authorization scope derived by the API server.
+
+    The distinct durable handler name is a worker-capability fence: an older
+    controller cannot claim and accidentally execute this request unscoped.
+    """
+    return status(
+        service_names=service_names,
+        summary_only=summary_only,
+        include_target_num_replicas=include_target_num_replicas,
+        history_hours=history_hours,
+        metadata_only=metadata_only,
+        include_endpoints=include_endpoints,
+        authorized_owner_user_id=authorized_owner_user_id,
+    )
+
+
 @usage_lib.entrypoint
 def placement(
         service_name: str,
@@ -380,6 +406,31 @@ def placement(
         'capacity_hints': capacity_hints,
         'history': history,
     }
+
+
+def authorized_placement(
+        service_name: str,
+        hours: int = placement_history.RETENTION_HOURS,
+        limit: int = placement_history.DEFAULT_PAGE_SIZE,
+        cursor: str | None = None,
+        location_limit: int = serve_constants.PLACEMENT_STATE_DEFAULT_PAGE_SIZE,
+        location_offset: int = 0,
+        *,
+        authorized_owner_user_id: str | None) -> dict[str, Any]:
+    """Execute placement with the API-server-derived authorization scope.
+
+    Its distinct durable handler name prevents older controllers from
+    claiming a request whose owner field their payload model would discard.
+    """
+    return placement(
+        service_name=service_name,
+        hours=hours,
+        limit=limit,
+        cursor=cursor,
+        location_limit=location_limit,
+        location_offset=location_offset,
+        authorized_owner_user_id=authorized_owner_user_id,
+    )
 
 
 ServiceComponentOrStr = str | serve_utils.ServiceComponent

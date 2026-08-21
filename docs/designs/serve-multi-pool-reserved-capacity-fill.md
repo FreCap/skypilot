@@ -3,8 +3,9 @@
 Last updated: 2026-08-21
 
 Status: the reserved-capacity allocator and PostgreSQL recovery objective is
-**production-converged**; historical-state cleanup, request telemetry, and the
-independent removal of EFS remain active. Helm revision 479 / release
+**production-converged**, but end-to-end 100% physical backfill is **not yet
+complete**; historical-state cleanup, request telemetry, and the independent
+removal of EFS remain active. Helm revision 479 / release
 `1.1.1410` runs immutable image digest
 `sha256:cc8ff796eb008c2d085f6e0933be7bf00d00c288794e493e57382fcf13ac4d35`
 on two API, two controller, and two executor Pods. All six Pods and both
@@ -23,6 +24,13 @@ intent hydration and no-duplicate recovery. After PR #1638's narrow occupancy
 fence deployed, 100 samples spanning 79 demand generations remained
 fresh/complete with two reporters and zero unknown occupancy.
 
+The current physical observation is 88/96. The remaining eight PHX H200
+Workloads are blocked downstream of the PostgreSQL allocator by Kueue v0.19's
+unreclaimable-preemptor reservation: a priority-31 64-GPU MA gang has 504/512
+GPUs assigned. This does not reopen the allocator or recovery contract, but it
+does prevent claiming complete physical utilization until Kueue admits those
+eight Workloads and the service reaches 96/96.
+
 Release `1.1.1410` includes the complete committed-handoff correction through
 PR #1630, capability-rotation fencing from PR #1635, batch pruning of
 superseded terminal replicas from PR #1636, and stable occupancy across
@@ -35,12 +43,12 @@ The broader initiative is not complete. The retained version-64 inventory
 still contains 958 terminal failed rows and 1,013 rows whose reserved-fill
 intent identity exists only in retained JSON rather than the normalized scalar
 column. PR #1636 cannot prune current-version terminal history until a version
-transition or controlled service recreation supersedes it. PR #1637 implements
-the controller-independent request-count UI and exact post-controller
-authorization contract; it remains under adversarial review and is not yet
-deployed. The PostgreSQL-plus-S3 replacement for EFS is an independent major
-workstream. Neither remaining workstream is required for the already-converged
-allocation result.
+transition or controlled service recreation supersedes it. PR #1637 merged the
+controller-independent request-count UI, but its mixed-version authorization
+repair remains undeployed. The PostgreSQL-plus-S3 replacement for EFS is an
+independent major workstream. These do not reopen the converged PostgreSQL
+allocation contract; the separate Kueue admission block still prevents the
+end-to-end 100% physical-backfill claim.
 
 ## Qualification history
 
@@ -343,12 +351,13 @@ four are true.
 
 ### Controller-independent dashboard read boundary
 
-Status: implemented in PR #1637 and under adversarial review; not yet merged,
-deployed, or production-proven. Review corrections require exact post-RPC
-name/hash authorization, exact modern controller-enrichment identity, a fresh
-persisted list read, one queued post-boundary identity refresh, authoritative
-clearing of unavailable demand metrics, and snapshot-relative terminal-report
-age wording.
+Status: PR #1637 is merged at `75debe4e3`, but is not deployed or
+production-proven. Post-merge mixed-version review found that its shared public
+and durable payload names could let a new controller discard the owner scope
+from an old API-server row. Deployment is gated on the surgical fix-forward:
+scope-less public wire bodies, retained legacy durable bodies with a required
+nullable owner, and distinct authorized handler identities that fence older
+workers.
 
 The services list and one-service detail identity load from the existing
 PostgreSQL-backed `GET /serve/replica-summaries` projection. Persisted replica,

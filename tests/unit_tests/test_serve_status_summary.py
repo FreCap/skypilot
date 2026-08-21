@@ -700,7 +700,7 @@ class TestServeStatusBodyDefault:
     def test_summary_only_defaults_false(self):
         # Old clients omit the field entirely; the server must default
         # to the full payload.
-        body = payloads.ServeStatusBody(service_names=None)
+        body = payloads.ServePublicStatusBody(service_names=None)
         assert body.summary_only is False
         assert body.metadata_only is False
         assert body.include_target_num_replicas is None

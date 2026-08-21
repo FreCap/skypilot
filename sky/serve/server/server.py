@@ -558,10 +558,9 @@ async def terminate_replica(
 @router.post('/status')
 async def status(
     request: fastapi.Request,
-    status_body: payloads.ServeStatusBody,
+    status_body: payloads.ServePublicStatusBody,
 ) -> None:
     owner_user_id = await _service_read_owner_user_id(request)
-    status_body.authorized_owner_user_id = owner_user_id
     requested_names = status_body.service_names
     if isinstance(requested_names, str):
         requested_names = [requested_names]
@@ -569,11 +568,15 @@ async def status(
             len(requested_names) == 1 and
             not glob.has_magic(requested_names[0])):
         await _require_readable_service(requested_names[0], owner_user_id)
+    authorized_body = payloads.ServeAuthorizedStatusBody(
+        **status_body.model_dump(),
+        authorized_owner_user_id=owner_user_id,
+    )
     await executor.schedule_request_async(
         request_id=request.state.request_id,
         request_name=request_names.RequestName.SERVE_STATUS,
-        request_body=status_body,
-        func=core.status,
+        request_body=authorized_body,
+        func=core.authorized_status,
         schedule_type=api_requests.ScheduleType.SHORT,
         request_cluster_name=common.SKY_SERVE_CONTROLLER_NAME,
         auth_user=request.state.auth_user,
@@ -583,18 +586,21 @@ async def status(
 @router.post('/placement')
 async def placement(
     request: fastapi.Request,
-    placement_body: payloads.ServePlacementBody,
+    placement_body: payloads.ServePublicPlacementBody,
 ) -> None:
     owner_user_id = await _service_read_owner_user_id(request)
     if owner_user_id is not None:
         await _require_readable_service(placement_body.service_name,
                                         owner_user_id)
-    placement_body.authorized_owner_user_id = owner_user_id
+    authorized_body = payloads.ServeAuthorizedPlacementBody(
+        **placement_body.model_dump(),
+        authorized_owner_user_id=owner_user_id,
+    )
     await executor.schedule_request_async(
         request_id=request.state.request_id,
         request_name=request_names.RequestName.SERVE_PLACEMENT,
-        request_body=placement_body,
-        func=core.placement,
+        request_body=authorized_body,
+        func=core.authorized_placement,
         schedule_type=api_requests.ScheduleType.SHORT,
         auth_user=request.state.auth_user,
     )

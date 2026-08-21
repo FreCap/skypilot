@@ -491,6 +491,66 @@ def _controller_request(
     )
 
 
+def _legacy_serve_status_request(request_id: str) -> requests.Request:
+    return requests.Request(
+        request_id=request_id,
+        name='serve.status',
+        entrypoint=serve_core.status,
+        request_body=payloads.ServeStatusBody(
+            service_names=['owned'], authorized_owner_user_id='owner-a'),
+        status=requests.RequestStatus.PENDING,
+        created_at=time.time(),
+        user_id='owner-a',
+        schedule_type=requests.ScheduleType.SHORT,
+        should_enqueue=True,
+    )
+
+
+def _legacy_serve_placement_request(request_id: str) -> requests.Request:
+    return requests.Request(
+        request_id=request_id,
+        name='serve.placement',
+        entrypoint=serve_core.placement,
+        request_body=payloads.ServePlacementBody(
+            service_name='owned', authorized_owner_user_id='owner-a'),
+        status=requests.RequestStatus.PENDING,
+        created_at=time.time(),
+        user_id='owner-a',
+        schedule_type=requests.ScheduleType.SHORT,
+        should_enqueue=True,
+    )
+
+
+def _authorized_serve_status_request(request_id: str) -> requests.Request:
+    return requests.Request(
+        request_id=request_id,
+        name='serve.status',
+        entrypoint=serve_core.authorized_status,
+        request_body=payloads.ServeAuthorizedStatusBody(
+            service_names=['owned'], authorized_owner_user_id='owner-a'),
+        status=requests.RequestStatus.PENDING,
+        created_at=time.time(),
+        user_id='owner-a',
+        schedule_type=requests.ScheduleType.SHORT,
+        should_enqueue=True,
+    )
+
+
+def _authorized_serve_placement_request(request_id: str) -> requests.Request:
+    return requests.Request(
+        request_id=request_id,
+        name='serve.placement',
+        entrypoint=serve_core.authorized_placement,
+        request_body=payloads.ServeAuthorizedPlacementBody(
+            service_name='owned', authorized_owner_user_id='owner-a'),
+        status=requests.RequestStatus.PENDING,
+        created_at=time.time(),
+        user_id='owner-a',
+        schedule_type=requests.ScheduleType.SHORT,
+        should_enqueue=True,
+    )
+
+
 def _event_request(
     request_id: str,
     *,
@@ -4853,6 +4913,110 @@ def test_role_scoped_queues_isolate_normal_and_controller_claims(
         leader.release()
 
 
+@pytest.mark.parametrize(
+    ('request_factory', 'legacy_handler', 'authorized_handler', 'body_type'),
+    [
+        (_authorized_serve_status_request, serve_core.status,
+         serve_core.authorized_status, payloads.ServeAuthorizedStatusBody),
+        (_authorized_serve_placement_request, serve_core.placement,
+         serve_core.authorized_placement,
+         payloads.ServeAuthorizedPlacementBody),
+    ],
+    ids=['status', 'placement'],
+)
+def test_old_controller_cannot_claim_authorized_serve_read(
+        request_database, monkeypatch, request_factory, legacy_handler,
+        authorized_handler, body_type):
+    """New API rows wait for a worker that understands their scope."""
+    engine, fixture_backend = request_database
+    leader = _controller_leader(engine, monkeypatch, str(uuid.uuid4()))
+    try:
+        request = request_factory(
+            f'authorized-serve-{body_type.__name__.lower()}-capability')
+        assert asyncio.run(fixture_backend.create_if_not_exists_async(request))
+
+        legacy_handler_name = registry.registration_for_handler(
+            legacy_handler).name
+        legacy_queue = request_postgres.PostgresQueueBackend(
+            'short',
+            execution_classes=frozenset(
+                {registry.ExecutionClass.CONTROLLER.value}),
+            controller_generation=leader.generation,
+            supported_handler_names=frozenset({legacy_handler_name}),
+        )
+        assert legacy_queue.get() is None
+        persisted = request_postgres.PostgresRequestBackend().get_request(
+            request.request_id)
+        assert persisted is not None
+        assert persisted.status is requests.RequestStatus.PENDING
+        assert type(persisted.request_body) is body_type
+        assert persisted.request_body.authorized_owner_user_id == 'owner-a'
+
+        authorized_handler_name = registry.registration_for_handler(
+            authorized_handler).name
+        authorized_queue = request_postgres.PostgresQueueBackend(
+            'short',
+            execution_classes=frozenset(
+                {registry.ExecutionClass.CONTROLLER.value}),
+            controller_generation=leader.generation,
+            supported_handler_names=frozenset({authorized_handler_name}),
+        )
+        claimed = authorized_queue.get()
+        assert claimed is not None
+        assert claimed.request_id == request.request_id
+    finally:
+        leader.release()
+
+
+@pytest.mark.parametrize(
+    ('request_factory', 'legacy_handler', 'body_type', 'payload_name'),
+    [
+        (_legacy_serve_status_request, serve_core.status,
+         payloads.ServeStatusBody,
+         'sky.server.requests.payloads:ServeStatusBody'),
+        (_legacy_serve_placement_request, serve_core.placement,
+         payloads.ServePlacementBody,
+         'sky.server.requests.payloads:ServePlacementBody'),
+    ],
+    ids=['status', 'placement'],
+)
+def test_new_controller_claims_legacy_scoped_serve_read(
+        request_database, monkeypatch, request_factory, legacy_handler,
+        body_type, payload_name):
+    """Old API rows retain their scope when claimed by a new worker."""
+    engine, fixture_backend = request_database
+    leader = _controller_leader(engine, monkeypatch, str(uuid.uuid4()))
+    try:
+        request = request_factory(
+            f'legacy-serve-{body_type.__name__.lower()}-capability')
+        durable_values = request.durable_values()
+        assert durable_values['payload_type'] == payload_name
+        assert durable_values['payload_json'][
+            'authorized_owner_user_id'] == 'owner-a'
+        assert asyncio.run(fixture_backend.create_if_not_exists_async(request))
+
+        legacy_handler_name = registry.registration_for_handler(
+            legacy_handler).name
+        legacy_queue = request_postgres.PostgresQueueBackend(
+            'short',
+            execution_classes=frozenset(
+                {registry.ExecutionClass.CONTROLLER.value}),
+            controller_generation=leader.generation,
+            supported_handler_names=frozenset({legacy_handler_name}),
+        )
+        claimed = legacy_queue.get()
+        assert claimed is not None
+        assert claimed.request_id == request.request_id
+        restored = fixture_backend.get_request(claimed.request_id)
+        assert restored is not None
+        assert type(restored.request_body) is body_type
+        assert restored.request_body.authorized_owner_user_id == 'owner-a'
+        assert restored.request_body.to_kwargs(
+        )['authorized_owner_user_id'] == 'owner-a'
+    finally:
+        leader.release()
+
+
 def test_all_mode_mixed_queue_fences_only_controller_claims(
         request_database, monkeypatch):
     engine, fixture_backend = request_database
@@ -7020,6 +7184,10 @@ def test_registry_owns_controller_classes_and_replay_policies():
     jobs_launch = registry.registration_for_handler(managed_jobs_core.launch)
     jobs_queue = registry.registration_for_handler(managed_jobs_core.queue)
     serve_status = registry.registration_for_handler(serve_core.status)
+    authorized_serve_status = registry.registration_for_handler(
+        serve_core.authorized_status)
+    authorized_serve_placement = registry.registration_for_handler(
+        serve_core.authorized_placement)
     normal_read = registry.registration_for_handler(core.enabled_clouds)
     bound_launch = registry.registration_for_handler(
         ordinary_launch_request.launch)
@@ -7033,6 +7201,14 @@ def test_registry_owns_controller_classes_and_replay_policies():
     assert jobs_queue.replay_policy is registry.ReplayPolicy.READ_ONLY
     assert serve_status.execution_class is registry.ExecutionClass.CONTROLLER
     assert serve_status.replay_policy is registry.ReplayPolicy.READ_ONLY
+    assert (authorized_serve_status.execution_class
+            is registry.ExecutionClass.CONTROLLER)
+    assert authorized_serve_status.replay_policy is registry.ReplayPolicy.READ_ONLY
+    assert (authorized_serve_placement.execution_class
+            is registry.ExecutionClass.CONTROLLER)
+    assert (authorized_serve_placement.replay_policy
+            is registry.ReplayPolicy.READ_ONLY)
+    assert authorized_serve_status.name != serve_status.name
     assert normal_read.execution_class is registry.ExecutionClass.NORMAL
     assert normal_read.replay_policy is registry.ReplayPolicy.READ_ONLY
     assert bound_launch.name == (

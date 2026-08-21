@@ -10,8 +10,10 @@ import pytest
 
 from sky import models
 from sky.serve import serve_dashboard
+from sky.serve.server import core as serve_core
 from sky.serve.server import server
 from sky.server import constants as server_constants
+from sky.server.requests import payloads
 from sky.users import rbac
 
 
@@ -409,17 +411,21 @@ def test_admin_replica_summary_read_remains_unrestricted():
 
 
 @pytest.mark.parametrize(
-    ('path', 'body'),
-    [('/serve/status', {
-        'service_names': ['owned'],
-        'authorized_owner_user_id': 'owner-b',
-    }),
-     ('/serve/placement', {
-         'service_name': 'owned',
-         'authorized_owner_user_id': 'owner-b',
-     })],
+    ('path', 'body', 'scheduled_body_type', 'scheduled_handler'),
+    [
+        ('/serve/status', {
+            'service_names': ['owned'],
+            'authorized_owner_user_id': 'owner-b',
+        }, payloads.ServeAuthorizedStatusBody, serve_core.authorized_status),
+        ('/serve/placement', {
+            'service_name': 'owned',
+            'authorized_owner_user_id': 'owner-b',
+        }, payloads.ServeAuthorizedPlacementBody,
+         serve_core.authorized_placement),
+    ],
 )
-def test_queued_serve_reads_overwrite_caller_supplied_owner_scope(path, body):
+def test_queued_serve_reads_use_server_owned_worker_capability(
+        path, body, scheduled_body_type, scheduled_handler):
     auth_user = models.User(id='owner-a', name='Owner A')
     with mock.patch.object(server.permission.permission_service,
                            'get_user_roles',
@@ -438,7 +444,9 @@ def test_queued_serve_reads_overwrite_caller_supplied_owner_scope(path, body):
     assert response.status_code == 200
     get_snapshot.assert_called_once_with('owned', owner_user_id='owner-a')
     scheduled_body = schedule.await_args.kwargs['request_body']
+    assert type(scheduled_body) is scheduled_body_type
     assert scheduled_body.authorized_owner_user_id == 'owner-a'
+    assert schedule.await_args.kwargs['func'] is scheduled_handler
 
 
 def test_exact_unauthorized_status_is_404_before_enqueue():

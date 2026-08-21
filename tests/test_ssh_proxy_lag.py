@@ -970,7 +970,8 @@ async def test_endpoint_serve_status(monitor, mock_request,
     async def test_func():
         try:
             from sky.serve.server import server as serve_server
-            body = payloads.ServeStatusBody(env_vars={})
+            body = payloads.ServePublicStatusBody(service_names=None,
+                                                  env_vars={})
             await serve_server.status(mock_request, body)
         except:
             pass
