@@ -131,6 +131,11 @@ tests:
           content:
             name: SKYPILOT_API_SERVER_ROLE
             value: executor
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: IS_SKYPILOT_SERVER
+            value: "true"
       - notContains:
           path: spec.template.spec.containers[0].env
           content:
@@ -149,6 +154,11 @@ tests:
           content:
             name: SKYPILOT_SERVER_CONFIG_MODE
             value: postgres
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
+            value: verify
       - notMatchRegex:
           path: spec.template.spec.containers[0].args[2]
           pattern: "config_tmp|/root/.sky/config.yaml"
@@ -186,6 +196,7 @@ tests:
               secretKeyRef:
                 name: external-db
                 key: connection_string
+
       - equal:
           path: spec.template.spec.containers[0].readinessProbe.httpGet.path
           value: /readyz
@@ -228,6 +239,18 @@ tests:
           content:
             name: metrics
             containerPort: 9090
+
+  - it: should reserve the pre-import server identity marker
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      executorService.extraEnvs:
+        - name: IS_SKYPILOT_SERVER
+          value: "false"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "IS_SKYPILOT_SERVER" is duplicated or reserved by the chart'
 
   - it: should expose and annotate executor multiprocess metrics
     set:

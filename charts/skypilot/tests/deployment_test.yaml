@@ -253,6 +253,15 @@ tests:
       - failedTemplate:
           errorMessage: 'environment variable "SKYPILOT_SERVER_SERVE_CONTROLLER_HOLD" is duplicated or reserved by the chart'
 
+  - it: should reserve the pre-import server identity marker
+    set:
+      apiService.extraEnvs:
+        - name: IS_SKYPILOT_SERVER
+          value: "false"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'environment variable "IS_SKYPILOT_SERVER" is duplicated or reserved by the chart'
+
   - it: should prefix gcp credentials init container image with the global registry override
     set:
       global.imageRegistry: registry.example.com/custom
@@ -385,6 +394,11 @@ tests:
           content:
             name: SKYPILOT_API_SERVER_ROLE
             value: api
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: IS_SKYPILOT_SERVER
+            value: "true"
       - notContains:
           path: spec.template.spec.containers[0].env
           content:
@@ -403,6 +417,11 @@ tests:
           content:
             name: SKYPILOT_SERVER_CONFIG_MODE
             value: postgres
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_STATE_DB_MIGRATION_MODE
+            value: verify
       - notMatchRegex:
           path: spec.template.spec.containers[0].args[2]
           pattern: "config_tmp|initialize_configmap_sync_on_startup"
@@ -2006,10 +2025,11 @@ tests:
             value: "x"
       # The four HA role and identity variables extend the prior baseline.
       # The chart-owned quiescence guard and Serve hold extend the baseline.
-      # A duplicate POD_IP would push the count to 21.
+      # The pre-import server marker adds one chart-owned variable.
+      # A duplicate POD_IP would push the count to 22.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 20
+          count: 21
 
   - it: should not duplicate POD_IP env when global.extraEnvs already provides it
     set:
@@ -2021,10 +2041,11 @@ tests:
     asserts:
       # The four HA role and identity variables extend the prior baseline.
       # The chart-owned quiescence guard and Serve hold extend the baseline.
-      # A duplicate POD_IP would push the count to 20.
+      # The pre-import server marker adds one chart-owned variable.
+      # A duplicate POD_IP would push the count to 21.
       - lengthEqual:
           path: spec.template.spec.containers[0].env
-          count: 19
+          count: 20
 
   - it: should allow custom GCP workload identity env when native credentials are disabled
     set:
