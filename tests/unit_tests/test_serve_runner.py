@@ -284,6 +284,7 @@ class TestStatusDelegatesToRunner:
             self):
         records = [{
             'name': 'owned-a',
+            'hash': 'hash-owned-a',
             'load_balancer_port': None,
             'tls_encrypted': False,
         }]
@@ -298,10 +299,10 @@ class TestStatusDelegatesToRunner:
                 mock.patch.object(serve_status.serve_state,
                                   'get_glob_service_names',
                                   return_value=['owned-a']))
-            get_owned_names = stack.enter_context(
+            get_owned_hashes = stack.enter_context(
                 mock.patch.object(serve_status.serve_state,
-                                  'get_service_names_owned_by_user_id',
-                                  return_value=['owned-a']))
+                                  'get_service_hashes_owned_by_user_id',
+                                  return_value={'owned-a': 'hash-owned-a'}))
             result = impl.status(
                 service_names=['owned-*', 'other-*'],
                 pool=False,
@@ -311,7 +312,7 @@ class TestStatusDelegatesToRunner:
         get_names.assert_called_once_with(['owned-*', 'other-*'],
                                           pool=False,
                                           owner_user_id='owner-a')
-        get_owned_names.assert_called_once_with('owner-a')
+        get_owned_hashes.assert_called_once_with('owner-a', ['owned-a'], False)
         assert runner.get_service_status.call_args.kwargs['service_names'] == [
             'owned-a'
         ]
@@ -322,6 +323,7 @@ class TestStatusDelegatesToRunner:
         runner = mock.Mock()
         runner.get_service_status.return_value = [{
             'name': 'recreated',
+            'hash': 'hash-old',
             'load_balancer_port': None,
             'tls_encrypted': False,
         }]
@@ -334,17 +336,76 @@ class TestStatusDelegatesToRunner:
                 mock.patch.object(serve_status.serve_state,
                                   'get_glob_service_names',
                                   return_value=['recreated']))
-            get_owned_names = stack.enter_context(
+            get_owned_hashes = stack.enter_context(
                 mock.patch.object(serve_status.serve_state,
-                                  'get_service_names_owned_by_user_id',
-                                  return_value=[]))
+                                  'get_service_hashes_owned_by_user_id',
+                                  return_value={}))
             result = impl.status(
                 service_names=['recreated'],
                 pool=False,
                 authorized_owner_user_id='owner-a',
             )
 
-        get_owned_names.assert_called_once_with('owner-a')
+        get_owned_hashes.assert_called_once_with('owner-a', ['recreated'],
+                                                 False)
+        assert result == []
+
+    def test_authenticated_scope_drops_stale_same_owner_incarnation(self):
+        runner = mock.Mock()
+        runner.get_service_status.return_value = [{
+            'name': 'recreated',
+            'hash': 'hash-old',
+            'load_balancer_port': None,
+            'tls_encrypted': False,
+        }]
+        serve_runner.register(runner)
+
+        with contextlib.ExitStack() as stack:
+            for patcher in self._common_patches():
+                stack.enter_context(patcher)
+            stack.enter_context(
+                mock.patch.object(serve_status.serve_state,
+                                  'get_glob_service_names',
+                                  return_value=['recreated']))
+            stack.enter_context(
+                mock.patch.object(serve_status.serve_state,
+                                  'get_service_hashes_owned_by_user_id',
+                                  return_value={'recreated': 'hash-new'}))
+            result = impl.status(
+                service_names=['recreated'],
+                pool=False,
+                authorized_owner_user_id='owner-a',
+            )
+
+        assert result == []
+
+    def test_authenticated_scope_drops_hashless_controller_record(self):
+        runner = mock.Mock()
+        runner.get_service_status.return_value = [{
+            'name': 'recreated',
+            'hash': None,
+            'load_balancer_port': None,
+            'tls_encrypted': False,
+        }]
+        serve_runner.register(runner)
+
+        with contextlib.ExitStack() as stack:
+            for patcher in self._common_patches():
+                stack.enter_context(patcher)
+            stack.enter_context(
+                mock.patch.object(serve_status.serve_state,
+                                  'get_glob_service_names',
+                                  return_value=['recreated']))
+            stack.enter_context(
+                mock.patch.object(serve_status.serve_state,
+                                  'get_service_hashes_owned_by_user_id',
+                                  return_value={'recreated': 'hash-current'}))
+            result = impl.status(
+                service_names=['recreated'],
+                pool=False,
+                authorized_owner_user_id='owner-a',
+            )
+
         assert result == []
 
     def test_empty_authenticated_owner_scope_skips_controller(self):

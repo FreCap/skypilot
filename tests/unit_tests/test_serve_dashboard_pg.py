@@ -222,6 +222,12 @@ def test_dashboard_reads_apply_owner_scope_before_selection_and_aggregation(
                                              owner_user_id='owner-a') is None
     assert serve_state.get_glob_service_names(
         ['*'], pool=False, owner_user_id='owner-a') == ['owned']
+    assert serve_state.get_service_hashes_owned_by_user_id(
+        'owner-a', ['owned', 'other', 'unattributed'], pool=False) == {
+            'owned': 'hash-owned'
+        }
+    assert serve_state.get_service_hashes_owned_by_user_id('owner-a', ['owned'],
+                                                           pool=True) == {}
 
     with pytest.raises(serve_dashboard.ServiceNotFoundError):
         serve_dashboard.get_replica_page(

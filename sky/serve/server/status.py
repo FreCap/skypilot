@@ -174,16 +174,27 @@ def status(
     service_records = serve_runner.current().get_service_status(**runner_kwargs)
     if authorized_owner_user_id is not None:
         # The controller call can outlive a delete/recreate of the same service
-        # name.  Re-read exact current ownership before returning enrichment so
-        # a successor owned by another tenant is omitted even if it appeared
-        # after the pre-controller wildcard expansion.
-        current_owned_names = set(
-            serve_state.get_service_names_owned_by_user_id(
-                authorized_owner_user_id))
-        service_records = [
-            record for record in service_records
-            if record.get('name') in current_owned_names
+        # name. Re-read exact current identity before returning enrichment so
+        # stale records from a prior incarnation or tenant cannot be attached
+        # to the successor after the pre-controller wildcard expansion.
+        returned_names = [
+            name for record in service_records
+            if isinstance((name := record.get('name')), str)
         ]
+        current_owned_hashes = (serve_state.get_service_hashes_owned_by_user_id(
+            authorized_owner_user_id, returned_names, pool))
+        current_records = []
+        for record in service_records:
+            name = record.get('name')
+            service_hash = record.get('hash')
+            if not isinstance(name, str):
+                continue
+            if not isinstance(service_hash, str) or not service_hash:
+                continue
+            if service_hash != current_owned_hashes.get(name):
+                continue
+            current_records.append(record)
+        service_records = current_records
 
     # Keep summary-only requests on the cheap DB-only path: callers that opt
     # out of replica detail should not pay an extra per-service Kubernetes

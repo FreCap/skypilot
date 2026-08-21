@@ -308,8 +308,7 @@ class RequestBody(BasePayload):
         if 'entrypoint' not in data:
             data['entrypoint'] = usage_lib.messages.usage.entrypoint or ''
         if 'entrypoint_command' not in data:
-            data['entrypoint_command'] = common_utils.get_pretty_entrypoint_cmd(
-            )
+            data['entrypoint_command'] = common_utils.get_pretty_entrypoint_cmd()
         if 'using_remote_api_server' not in data:
             data['using_remote_api_server'] = not common.is_api_server_local()
         if 'override_skypilot_config' not in data:

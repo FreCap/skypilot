@@ -99,7 +99,7 @@ async function flushFetches(rounds = 4) {
   }
 }
 
-function StatefulServicesTable({ refreshDataRef }) {
+function StatefulServicesTable({ refreshDataRef, onFetched }) {
   const [loading, setLoading] = React.useState(false);
   return (
     <ServicesTable
@@ -107,6 +107,7 @@ function StatefulServicesTable({ refreshDataRef }) {
       loading={loading}
       setLoading={setLoading}
       refreshDataRef={refreshDataRef}
+      onFetched={onFetched}
     />
   );
 }
@@ -135,6 +136,10 @@ describe('Services fetch wiring', () => {
       [getServices, [{ summaryOnly: true, includeEndpoints: true }]],
       [getServiceReplicaSummaries, [{}]],
     ]);
+    expect(dashboardCache.invalidate).toHaveBeenCalledWith(
+      getServiceReplicaSummaries,
+      [{}]
+    );
   });
 
   it('keeps legacy first paint pending until controller metadata settles', async () => {
@@ -410,6 +415,67 @@ describe('Services fetch wiring', () => {
     expect(screen.queryByText('1/1')).not.toBeInTheDocument();
   });
 
+  it('does not attach hashless controller enrichment to modern identity', async () => {
+    const liveSummary = deferred();
+    const replicaSummary = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce({
+        services: [
+          {
+            ...SERVICES_RESPONSE.services[0],
+            serviceHash: null,
+            endpoint: 'https://stale-hashless.example.test',
+            metadataOnly: true,
+          },
+        ],
+      })
+      .mockReturnValueOnce(liveSummary.promise)
+      .mockReturnValueOnce(replicaSummary.promise);
+
+    render(<Services />);
+    await act(async () => {
+      replicaSummary.resolve({
+        available: true,
+        serviceMetadataIncluded: true,
+        summaries: [
+          {
+            name: 'boltz-l4-fleet',
+            serviceHash: 'hash-current',
+            persistedMetadataLoaded: true,
+            status: 'READY',
+            replicasReady: 9,
+            replicasTotal: 9,
+            pastAttemptCount: 0,
+          },
+        ],
+      });
+      await replicaSummary.promise;
+    });
+
+    expect(screen.getByText('9/9')).toBeInTheDocument();
+    expect(
+      screen.queryByText('https://stale-hashless.example.test')
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      liveSummary.resolve({
+        services: [
+          {
+            ...SERVICES_RESPONSE.services[0],
+            serviceHash: null,
+            endpoint: 'https://late-hashless.example.test',
+            summaryOnly: true,
+          },
+        ],
+      });
+      await liveSummary.promise;
+    });
+    expect(screen.getByText('9/9')).toBeInTheDocument();
+    expect(
+      screen.queryByText('https://late-hashless.example.test')
+    ).not.toBeInTheDocument();
+  });
+
   it('does not resurrect a service absent from authoritative persisted identity', async () => {
     const liveSummary = deferred();
     dashboardCache.get
@@ -682,6 +748,7 @@ describe('Services fetch wiring', () => {
       expect(dashboardCache.invalidate.mock.calls).toEqual([
         [getServices, [{ summaryOnly: true, includeEndpoints: true }]],
         [getServices, [{ metadataOnly: true }]],
+        [getServiceReplicaSummaries, [{}]],
         [getServiceReplicaSummaries, [{}]],
       ]);
       await flushFetches();
@@ -972,9 +1039,18 @@ describe('Services fetch wiring', () => {
     const nextLiveSummary = deferred();
     const refreshDataRef = { current: null };
     const consoleError = jest.spyOn(console, 'error').mockImplementation();
+    const currentControllerResponse = {
+      ...SERVICES_RESPONSE,
+      services: [
+        {
+          ...SERVICES_RESPONSE.services[0],
+          serviceHash: 'hash-boltz-l4-fleet',
+        },
+      ],
+    };
     dashboardCache.get
-      .mockResolvedValueOnce(SERVICES_RESPONSE)
-      .mockResolvedValueOnce(SERVICES_RESPONSE)
+      .mockResolvedValueOnce(currentControllerResponse)
+      .mockResolvedValueOnce(currentControllerResponse)
       .mockResolvedValueOnce(persistedResponseFor('boltz-l4-fleet'))
       .mockReturnValueOnce(nextMetadata.promise)
       .mockReturnValueOnce(nextLiveSummary.promise)
@@ -1000,6 +1076,52 @@ describe('Services fetch wiring', () => {
     expect(screen.getByLabelText('Endpoint')).toHaveTextContent('Unavailable');
     expect(screen.getByText('1/1')).toBeInTheDocument();
     consoleError.mockRestore();
+  });
+
+  it('does not let a late controller response relabel persisted freshness', async () => {
+    const controllerMetadata = deferred();
+    const controllerSummary = deferred();
+    const refreshDataRef = { current: null };
+    const onFetched = jest.fn();
+    const consoleError = jest.spyOn(console, 'error').mockImplementation();
+    dashboardCache.get
+      .mockReturnValueOnce(controllerMetadata.promise)
+      .mockReturnValueOnce(controllerSummary.promise)
+      .mockResolvedValueOnce({
+        ...persistedResponseFor('boltz-l4-fleet'),
+        observedAt: 1234,
+      });
+
+    try {
+      render(
+        <StatefulServicesTable
+          refreshDataRef={refreshDataRef}
+          onFetched={onFetched}
+        />
+      );
+      expect(await screen.findByText('boltz-l4-fleet')).toBeInTheDocument();
+      expect(onFetched).toHaveBeenCalledTimes(1);
+      expect(onFetched).toHaveBeenLastCalledWith(new Date(1234 * 1000));
+
+      dashboardCache.get.mockRejectedValueOnce(
+        new Error('persisted refresh failed')
+      );
+      await act(async () => refreshDataRef.current());
+      expect(onFetched).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        controllerMetadata.resolve(SERVICES_RESPONSE);
+        controllerSummary.resolve(SERVICES_RESPONSE);
+        await Promise.all([
+          controllerMetadata.promise,
+          controllerSummary.promise,
+        ]);
+      });
+      expect(onFetched).toHaveBeenCalledTimes(1);
+      expect(onFetched).toHaveBeenLastCalledWith(new Date(1234 * 1000));
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it('starts one compatibility successor after a rolling legacy response', async () => {

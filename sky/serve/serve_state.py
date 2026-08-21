@@ -2083,6 +2083,34 @@ def get_service_names_owned_by_user_id(owner_user_id: str) -> list[str]:
                         services_table.c.name)).scalars())
 
 
+def get_service_hashes_owned_by_user_id(owner_user_id: str,
+                                        service_names: list[str],
+                                        pool: bool) -> dict[str, str]:
+    """Read exact current identities for an authenticated status response.
+
+    The controller status RPC can race with delete/recreate.  Callers use this
+    batched reread after the RPC to prove that each returned record still
+    belongs to the requested owner, mode, and service incarnation.
+    """
+    if not isinstance(owner_user_id, str) or not owner_user_id:
+        raise ValueError('Service owner user ID is invalid.')
+    if not service_names:
+        return {}
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                services_table.c.name, services_table.c.hash).where(
+                    services_table.c.owner_user_id == owner_user_id,
+                    services_table.c.pool == int(pool),
+                    services_table.c.name.in_(service_names))).fetchall()
+    return {
+        str(name): str(service_hash)
+        for name, service_hash in rows
+        if isinstance(service_hash, str) and service_hash
+    }
+
+
 def get_service_from_name(
         service_name: str,
         owner_user_id: str | None = None) -> dict[str, Any] | None:

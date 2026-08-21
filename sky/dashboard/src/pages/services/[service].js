@@ -165,17 +165,17 @@ export function useServiceSummaryBootstrap({ serviceName }) {
     routeEpochRef.current += 1;
   }
 
-  const fetchSummary = useCallback(() => {
-    if (!serviceName) {
-      setSummaryLoading(false);
-      return Promise.resolve();
-    }
-    const active = activeRequestRef.current;
-    if (active?.serviceName === serviceName) return active.promise;
-
+  const startSummaryRequest = useCallback(() => {
     const requestVersion = requestVersionRef.current + 1;
     requestVersionRef.current = requestVersion;
     const routeEpoch = routeEpochRef.current;
+    const owner = {
+      serviceName,
+      routeEpoch,
+      requestVersion,
+      promise: null,
+      successorPromise: null,
+    };
     setSummaryLoading(true);
     const isCurrentRequest = () =>
       requestVersionRef.current === requestVersion &&
@@ -223,13 +223,69 @@ export function useServiceSummaryBootstrap({ serviceName }) {
       })
       .finally(() => {
         if (isCurrentRequest()) setSummaryLoading(false);
-        if (activeRequestRef.current?.promise === requestPromise) {
+        if (activeRequestRef.current === owner) {
           activeRequestRef.current = null;
         }
       });
-    activeRequestRef.current = { serviceName, promise: requestPromise };
+    owner.promise = requestPromise;
+    activeRequestRef.current = owner;
     return requestPromise;
   }, [serviceName]);
+
+  const fetchSummary = useCallback(
+    ({ requireFresh = false } = {}) => {
+      if (!serviceName) {
+        setSummaryLoading(false);
+        return Promise.resolve();
+      }
+      const active = activeRequestRef.current;
+      const currentRouteEpoch = routeEpochRef.current;
+      if (
+        active?.serviceName !== serviceName ||
+        active?.routeEpoch !== currentRouteEpoch
+      ) {
+        return startSummaryRequest();
+      }
+      if (!requireFresh) return active.promise;
+      if (!active.successorPromise) {
+        // A refresh triggered by an election/hash mismatch must observe work
+        // that started after that boundary. Queue exactly one successor while
+        // preserving singleflight for concurrent explicit refreshes.
+        const boundaryRouteEpoch = active.routeEpoch;
+        const boundaryRequestVersion = active.requestVersion;
+        active.successorPromise = active.promise
+          .catch(() => undefined)
+          .then(() => {
+            if (
+              identityRef.current !== serviceName ||
+              renderedServiceNameRef.current !== serviceName
+            ) {
+              return undefined;
+            }
+            if (
+              routeEpochRef.current !== boundaryRouteEpoch ||
+              requestVersionRef.current !== boundaryRequestVersion
+            ) {
+              // A later route incarnation or request already crossed this
+              // freshness boundary. Reuse that exact current-route owner when
+              // it is still running; never resurrect this retired successor
+              // during an A-B-A navigation cycle.
+              const current = activeRequestRef.current;
+              if (
+                current?.serviceName === serviceName &&
+                current?.routeEpoch === routeEpochRef.current
+              ) {
+                return current.promise;
+              }
+              return undefined;
+            }
+            return startSummaryRequest();
+          });
+      }
+      return active.successorPromise;
+    },
+    [serviceName, startSummaryRequest]
+  );
 
   useEffect(() => {
     identityRef.current = serviceName || null;
@@ -242,13 +298,18 @@ export function useServiceSummaryBootstrap({ serviceName }) {
     if (!serviceName) return undefined;
     void fetchSummary();
     return () => {
+      identityRef.current = null;
       requestVersionRef.current += 1;
       activeRequestRef.current = null;
     };
   }, [fetchSummary, serviceName]);
 
-  const refreshSummary = useCallback(() => fetchSummary(), [fetchSummary]);
-  useVisibleRefreshInterval(Boolean(serviceName), 60 * 1000, refreshSummary);
+  const refreshSummary = useCallback(
+    () => fetchSummary({ requireFresh: true }),
+    [fetchSummary]
+  );
+  const pollSummary = useCallback(() => fetchSummary(), [fetchSummary]);
+  useVisibleRefreshInterval(Boolean(serviceName), 60 * 1000, pollSummary);
 
   const ownsResolvedRoute =
     resolvedServiceName === serviceName &&
@@ -2105,9 +2166,11 @@ function ServiceDetails() {
     const anchoredHash = serviceData.serviceHash;
     const ownsIdentity = (candidate) =>
       candidate?.name === serviceName &&
-      (!anchoredHash ||
-        !candidate.serviceHash ||
-        candidate.serviceHash === anchoredHash);
+      (legacyFallback
+        ? !anchoredHash ||
+          !candidate.serviceHash ||
+          candidate.serviceHash === anchoredHash
+        : Boolean(anchoredHash) && candidate.serviceHash === anchoredHash);
     const persistedSummary = ownsIdentity(replicaData.replicaSummary)
       ? replicaData.replicaSummary
       : null;
@@ -2173,31 +2236,21 @@ function ServiceDetails() {
             directDemand.pendingZeroCostActuationCount ?? null,
         }
       : {};
-    const directDemandMetrics =
-      directDemand &&
-      [
-        directDemand.recentRequestCount,
-        directDemand.requestRate,
-        directDemand.inFlightRequests,
-        directDemand.confirmedInFlightRequests,
-        directDemand.unknownInFlightReplicaCount,
-        directDemand.requestQueueDepth,
-        directDemand.rejectedRequests,
-      ].some((value) => value != null)
-        ? {
-            recentRequestCount: directDemand.recentRequestCount ?? null,
-            requestWindowSeconds: directDemand.requestWindowSeconds ?? null,
-            requestRate: directDemand.requestRate ?? null,
-            inFlightRequests: directDemand.inFlightRequests ?? null,
-            confirmedInFlightRequests:
-              directDemand.confirmedInFlightRequests ?? null,
-            unknownInFlightReplicaCount:
-              directDemand.unknownInFlightReplicaCount ?? null,
-            requestQueueDepth: directDemand.requestQueueDepth ?? null,
-            rejectedRequests: directDemand.rejectedRequests ?? null,
-            recentRejectedRequests: directDemand.recentRejectedRequests ?? null,
-          }
-        : {};
+    const directDemandMetrics = directDemand
+      ? {
+          recentRequestCount: directDemand.recentRequestCount ?? null,
+          requestWindowSeconds: directDemand.requestWindowSeconds ?? null,
+          requestRate: directDemand.requestRate ?? null,
+          inFlightRequests: directDemand.inFlightRequests ?? null,
+          confirmedInFlightRequests:
+            directDemand.confirmedInFlightRequests ?? null,
+          unknownInFlightReplicaCount:
+            directDemand.unknownInFlightReplicaCount ?? null,
+          requestQueueDepth: directDemand.requestQueueDepth ?? null,
+          rejectedRequests: directDemand.rejectedRequests ?? null,
+          recentRejectedRequests: directDemand.recentRejectedRequests ?? null,
+        }
+      : {};
     const enriched = {
       ...serviceData,
       ...(liveSummary || {}),
@@ -2247,6 +2300,7 @@ function ServiceDetails() {
     replicaData,
     serviceData,
     serviceName,
+    legacyFallback,
   ]);
   const isRouteLoading =
     !router.isReady ||
@@ -2772,9 +2826,9 @@ export function ServiceDetailCard({
     requestDetails.push(
       latestTerminalObservationReportAgeSeconds == null
         ? 'latest terminal-observation report time unavailable'
-        : `latest terminal-observation report ${Math.round(
+        : `latest terminal-observation report was ${Math.round(
             latestTerminalObservationReportAgeSeconds
-          )}s ago`
+          )}s old at this history snapshot`
     );
   }
   if (serviceData.requestQueueDepth != null) {

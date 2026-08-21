@@ -284,10 +284,14 @@ function mergeReplicaSummaryRows(
     // controller transport. Older servers remain replica-only and are still
     // buffered until an identity-bearing controller row exists.
     if (!previous && !summary.persistedMetadataLoaded) return;
+    if (identityAuthoritative && !summary.serviceHash) return;
     if (
-      previous?.serviceHash &&
-      summary.serviceHash &&
-      previous.serviceHash !== summary.serviceHash
+      previous &&
+      (identityAuthoritative
+        ? previous.serviceHash !== summary.serviceHash
+        : previous.serviceHash &&
+          summary.serviceHash &&
+          previous.serviceHash !== summary.serviceHash)
     ) {
       if (!identityAuthoritative) return;
       previous = undefined;
@@ -532,6 +536,11 @@ export function ServicesTable({
     }
     const controllerVersion = controllerVersionRef.current + 1;
     controllerVersionRef.current = controllerVersion;
+    const owner = {
+      version: controllerVersion,
+      promise: null,
+      summaryObservedAt: null,
+    };
     const isCurrentControllerRequest = () =>
       controllerVersionRef.current === controllerVersion;
     const metadataPromise = dashboardCache
@@ -574,9 +583,7 @@ export function ServicesTable({
         });
         setControllerStopped(servicesResponse.controllerStopped || false);
         setIsInitialLoad(false);
-        if (onFetched) {
-          onFetched(new Date());
-        }
+        owner.summaryObservedAt = Date.now();
       })
       .catch((error) => {
         if (!isCurrentControllerRequest()) return;
@@ -589,7 +596,6 @@ export function ServicesTable({
           )
         );
       });
-    const owner = { version: controllerVersion, promise: null };
     let controllerPromise;
     controllerPromise = Promise.allSettled([
       metadataPromise,
@@ -602,7 +608,7 @@ export function ServicesTable({
     owner.promise = controllerPromise;
     controllerRequestRef.current = owner;
     return owner;
-  }, [onFetched]);
+  }, []);
 
   const runFetch = useCallback(
     (requestVersion, kind) => {
@@ -626,6 +632,13 @@ export function ServicesTable({
         controllerVersionRef.current += 1;
       }
       const controllerRequest = startControllerEnrichment();
+      // Persisted identity is the authoritative freshness boundary. Bypass
+      // stale-while-revalidate semantics so a failed read is surfaced instead
+      // of repeatedly relabeling an old snapshot as current.
+      dashboardCache.invalidate(
+        getServiceReplicaSummaries,
+        SERVICE_REPLICA_SUMMARY_ARGS
+      );
       const replicaSummaryPromise = dashboardCache
         .get(getServiceReplicaSummaries, SERVICE_REPLICA_SUMMARY_ARGS)
         .then((response) => {
@@ -649,8 +662,8 @@ export function ServicesTable({
             // their per-cell placeholders.
             setLoading(false);
             setIsInitialLoad(false);
-            if (onFetched) {
-              onFetched(new Date());
+            if (onFetched && Number.isFinite(response.observedAt)) {
+              onFetched(new Date(response.observedAt * 1000));
             }
             return true;
           }
@@ -686,17 +699,36 @@ export function ServicesTable({
           // controller compatibility projection settles instead of briefly
           // painting an authoritative-looking empty list.
           if (!directOwnsFirstPaint) {
-            await controllerRequest.promise;
+            let compatibilityControllerRequest = controllerRequest;
+            await compatibilityControllerRequest.promise;
             if (
               isCurrentRequest() &&
               directIdentityCapabilityRef.current !== true &&
-              controllerRequest.version !== controllerVersionRef.current
+              compatibilityControllerRequest.version !==
+                controllerVersionRef.current
             ) {
               // A rolling old-server/non-consolidated response may arrive
               // after a modern direct refresh fenced the prior controller
               // enrichment. Once that sole stale request settles, start
               // exactly one compatibility successor so the list can paint.
-              await startControllerEnrichment().promise;
+              compatibilityControllerRequest = startControllerEnrichment();
+              await compatibilityControllerRequest.promise;
+            }
+            if (
+              isCurrentRequest() &&
+              directIdentityCapabilityRef.current !== true &&
+              Number.isFinite(
+                compatibilityControllerRequest.summaryObservedAt
+              ) &&
+              onFetched
+            ) {
+              // Only the compatibility path may use controller completion as
+              // its freshness boundary. A modern persisted snapshot carries
+              // its own server observation time and cannot be relabelled by a
+              // late controller response.
+              onFetched(
+                new Date(compatibilityControllerRequest.summaryObservedAt)
+              );
             }
           }
         })
