@@ -3134,6 +3134,42 @@ def _validate_profile_authority_in_connection(
             'Non-pool planner authorization changed before provider effect.')
 
 
+def _validate_committed_reserved_fill_profile_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    replica: Mapping[str, Any],
+    expected: NonPoolLaunchProfile,
+) -> None:
+    """Validate the frozen Serve056 handoff without mutable planner reads."""
+    if (expected.kind is not NonPoolLaunchProfileKind.RESERVED_FILL or
+            expected.authorization_kind
+            is not NonPoolLaunchAuthorizationKind.RESERVED_FILL_ALLOCATION or
+            service.get('reserved_fill_actuation_mode')
+            != zero_cost_actuation.ActuationMode.DURABLE_INTENT.value):
+        raise OrdinaryLaunchBindingConflict(
+            'Reserved-fill provider effect has no durable intent profile.')
+    info = _locked_replica_info(replica)
+    scalar_key = replica.get('reserved_fill_intent_idempotency_key')
+    if (not isinstance(scalar_key, str) or
+            expected.authorization_reference != f'reserved-fill:{scalar_key}' or
+            expected.authorization_generation
+            != info.reserved_fill_allocation_generation or
+            info.reserved_fill_intent_idempotency_key != scalar_key):
+        raise OrdinaryLaunchBindingConflict(
+            'Reserved-fill profile lost its normalized committed-intent '
+            'edge.')
+    intent = zero_cost_actuation.committed_intent_for_replica_in_connection(
+        connection,
+        service_name=str(service['name']),
+        service_hash=str(service['hash']),
+        replica_info=info)
+    if (intent is None or intent.idempotency_key != scalar_key or
+            expected.authorization_generation != intent.allocation_generation):
+        raise OrdinaryLaunchBindingConflict(
+            'Reserved-fill provider effect lost its immutable committed '
+            'handoff.')
+
+
 def _validate_reserved_fill_cleanup_profile_in_connection(
     connection: sqlalchemy.engine.Connection,
     service: Mapping[str, Any],
@@ -4038,8 +4074,12 @@ def validate_effect_authority_in_connection(
                           context,
                           require_launch_authorized=True)
     if isinstance(context, BoundNonPoolLaunchContext):
-        _validate_profile_authority_in_connection(connection, service, replica,
-                                                  context.profile)
+        if context.profile.kind is NonPoolLaunchProfileKind.RESERVED_FILL:
+            _validate_committed_reserved_fill_profile_in_connection(
+                connection, service, replica, context.profile)
+        else:
+            _validate_profile_authority_in_connection(connection, service,
+                                                      replica, context.profile)
         if launch_context is None:
             raise OrdinaryLaunchBindingConflict(
                 'Generic provider effect has no immutable launch context.')

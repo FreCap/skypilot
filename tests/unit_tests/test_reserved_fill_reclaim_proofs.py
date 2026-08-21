@@ -368,9 +368,9 @@ def test_serve054_schema_is_postgresql_only_and_bounded(proof_engine,
     config = migration_utils.get_alembic_config(proof_engine,
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
-    assert scripts.get_heads() == ['055']
+    assert scripts.get_heads() == ['056']
     assert scripts.get_revision('054').down_revision == '053'
-    assert migration_utils.SERVE_VERSION == '055'
+    assert migration_utils.SERVE_VERSION == '056'
     inspector = sqlalchemy.inspect(proof_engine)
     assert (proof_schema.serve_reserved_fill_reclaim_provider_proofs_table.name
             in inspector.get_table_names())
@@ -444,7 +444,7 @@ def test_serve054_is_forward_only(proof_engine):
     with pytest.raises(RuntimeError, match='forward-only'):
         alembic_command.downgrade(config, '053')
     assert migration_utils.get_current_alembic_revision(
-        proof_engine, migration_utils.SERVE_DB_NAME) == '055'
+        proof_engine, migration_utils.SERVE_DB_NAME) == '056'
     assert (proof_schema.serve_reserved_fill_reclaim_provider_proofs_table.name
             in sqlalchemy.inspect(proof_engine).get_table_names())
 

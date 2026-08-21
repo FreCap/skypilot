@@ -82,7 +82,10 @@ _POST_SERVE038_FUTURE_COLUMNS = {
         'owner_user_id',
         'owner_user_name',
     }),
-    _REPLICAS: frozenset({'ordinary_launch_association_id'}),
+    _REPLICAS: frozenset({
+        'ordinary_launch_association_id',
+        'reserved_fill_intent_idempotency_key',
+    }),
 }
 
 _POST_SERVE038_FUTURE_CHECKS = {

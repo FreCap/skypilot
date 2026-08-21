@@ -1,9 +1,7 @@
 """Non-PostgreSQL tests for terminal reserved-fill reclaim enforcement."""
 # pylint: disable=protected-access,unexpected-keyword-arg
 
-import concurrent.futures
 import contextlib
-import threading
 import time
 import types
 from unittest import mock
@@ -719,85 +717,161 @@ def test_policy_bound_terminal_fence_requires_admitted_allocation_provenance(
             fence, durable)
 
 
-def test_base_v2_fence_is_accepted_only_while_gate_is_legacy(monkeypatch):
-    context = _launch_context(policy_bound=False)
+def test_committed_provider_guard_uses_only_frozen_handoff_and_physical_uid(
+        monkeypatch):
+    context = _launch_context()
     provisioner = _provisioner(context)
-    global_guard = mock.Mock(return_value=contextlib.nullcontext())
-    owner_entries = []
+    events = []
 
     @contextlib.contextmanager
     def _owner_guard():
-        owner_entries.append('enter')
+        events.append('service-enter')
         yield _launch_snapshot(context)
+        events.append('service-exit')
 
-    monkeypatch.setattr(serve_state,
-                        'reserved_fill_reclaim_gate_authority_guard',
-                        global_guard)
+    @contextlib.contextmanager
+    def _physical_guard(kubernetes_context, physical_cluster_uid):
+        assert kubernetes_context == 'phx-context'
+        assert physical_cluster_uid == 'physical-uid'
+        events.append('physical-enter')
+        yield
+        events.append('physical-exit')
+
+    def _committed_authority(launch_context, launch_snapshot):
+        assert launch_context is context
+        assert launch_snapshot == _launch_snapshot(context)
+        events.append('committed-authority')
+        return True
+
     monkeypatch.setattr(provisioner,
                         '_service_replica_launch_provider_owner_guard',
                         _owner_guard)
-    require_policy = mock.Mock()
-    monkeypatch.setattr(reclaim, 'require_unique_policy', require_policy)
+    monkeypatch.setattr(serve_state,
+                        'reserved_fill_committed_launch_authority_holds',
+                        _committed_authority)
+    monkeypatch.setattr(backend.kubernetes_adaptor,
+                        'physical_cluster_uid_fence', _physical_guard)
+    monkeypatch.setattr(
+        reclaim, 'require_unique_policy',
+        mock.Mock(side_effect=AssertionError('postcommit policy callback')))
+    monkeypatch.setattr(
+        serve_state, 'reserved_fill_reclaim_gate_authority_guard',
+        mock.Mock(side_effect=AssertionError('postcommit global gate')))
 
-    _install_gate(monkeypatch, _gate(sequenced=False))
     with provisioner._service_replica_launch_provider_guard():
-        owner_entries.append('provider')
+        events.append('provider')
 
-    assert owner_entries == ['enter', 'provider']
-    require_policy.assert_not_called()
-
-    owner_entries.clear()
-    _install_gate(monkeypatch, _gate(sequenced=True))
-    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
-                       match='authority changed'):
-        with provisioner._service_replica_launch_provider_guard():
-            owner_entries.append('provider')
-
-    assert owner_entries == ['enter']
-    require_policy.assert_not_called()
+    assert events == [
+        'service-enter',
+        'committed-authority',
+        'physical-enter',
+        'provider',
+        'physical-exit',
+        'service-exit',
+    ]
 
 
-def test_legacy_fill_request_cannot_bypass_sequenced_global_gate(monkeypatch):
-    context = _legacy_launch_context()
+def test_mutable_successor_state_cannot_revoke_committed_provider_epochs(
+        monkeypatch):
+    context = _launch_context()
     provisioner = _provisioner(context)
-    global_entries = []
     snapshot = _launch_snapshot(context)
-
-    @contextlib.contextmanager
-    def _owner_guard():
-        yield snapshot
-
-    @contextlib.contextmanager
-    def _global_guard(*, shared):
-        assert shared
-        global_entries.append('enter')
-        yield object()
+    authority = mock.Mock(return_value=True)
+    physical_entries = []
 
     monkeypatch.setattr(provisioner,
                         '_service_replica_launch_provider_owner_guard',
-                        _owner_guard)
+                        lambda: contextlib.nullcontext(snapshot))
     monkeypatch.setattr(serve_state,
-                        'reserved_fill_reclaim_gate_authority_guard',
-                        _global_guard)
-    require_policy = mock.Mock()
-    monkeypatch.setattr(reclaim, 'require_unique_policy', require_policy)
+                        'reserved_fill_committed_launch_authority_holds',
+                        authority)
 
-    _install_gate(monkeypatch, _gate(sequenced=False))
+    @contextlib.contextmanager
+    def _physical_guard(kubernetes_context, physical_cluster_uid):
+        physical_entries.append((kubernetes_context, physical_cluster_uid))
+        yield
+
+    monkeypatch.setattr(backend.kubernetes_adaptor,
+                        'physical_cluster_uid_fence', _physical_guard)
+    # These are the old mutable successor authorities. A post-create
+    # with-guard/pass seam must never consult any of them.
+    monkeypatch.setattr(
+        reclaim, 'require_unique_policy',
+        mock.Mock(side_effect=AssertionError('successor policy consulted')))
+    monkeypatch.setattr(
+        serve_state, 'reserved_fill_reclaim_gate_authority_guard',
+        mock.Mock(side_effect=AssertionError('successor gate consulted')))
+    monkeypatch.setattr(
+        serve_state, 'reserved_fill_reclaim_launch_authority_holds',
+        mock.Mock(side_effect=AssertionError('successor inventory consulted')))
+
     with provisioner._service_replica_launch_provider_guard():
-        global_entries.append('provider')
-    assert global_entries == ['enter', 'provider']
+        pass
+    # Model a later Kubernetes readiness/update provider epoch after mutable
+    # allocation, claim, observation, and policy publications have advanced.
+    with provisioner._service_replica_launch_provider_guard():
+        pass
 
-    global_entries.clear()
-    _install_gate(monkeypatch, _gate(sequenced=True))
+    assert authority.call_count == 2
+    assert physical_entries == [('phx-context', 'physical-uid')] * 2
+
+
+def test_physical_uid_retarget_fails_before_provider_effect(monkeypatch):
+    context = _launch_context()
+    provisioner = _provisioner(context)
+    snapshot = _launch_snapshot(context)
+    provider_ran = False
+
+    monkeypatch.setattr(provisioner,
+                        '_service_replica_launch_provider_owner_guard',
+                        lambda: contextlib.nullcontext(snapshot))
+    monkeypatch.setattr(serve_state,
+                        'reserved_fill_committed_launch_authority_holds',
+                        lambda *_args: True)
+
+    @contextlib.contextmanager
+    def _retargeted_physical_guard(_context, _uid):
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'context alias was retargeted')
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(backend.kubernetes_adaptor,
+                        'physical_cluster_uid_fence',
+                        _retargeted_physical_guard)
+
     with pytest.raises(exceptions.ReservedFillLaunchFenceError,
-                       match='authority changed'):
+                       match='committed reserved-fill handoff'):
         with provisioner._service_replica_launch_provider_guard():
-            global_entries.append('provider')
-    assert global_entries == ['enter']
-    require_policy.assert_not_called()
+            provider_ran = True
+
+    assert not provider_ran
 
 
-def test_ordinary_zero_cost_replica_does_not_enter_reclaim_gate(monkeypatch):
+def test_lost_committed_service_authority_fails_before_physical_effect(
+        monkeypatch):
+    context = _launch_context()
+    provisioner = _provisioner(context)
+    snapshot = _launch_snapshot(context)
+    physical_guard = mock.Mock()
+
+    monkeypatch.setattr(provisioner,
+                        '_service_replica_launch_provider_owner_guard',
+                        lambda: contextlib.nullcontext(snapshot))
+    monkeypatch.setattr(serve_state,
+                        'reserved_fill_committed_launch_authority_holds',
+                        lambda *_args: False)
+    monkeypatch.setattr(backend.kubernetes_adaptor,
+                        'physical_cluster_uid_fence', physical_guard)
+
+    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
+                       match='committed intent no longer authorizes'):
+        with provisioner._service_replica_launch_provider_guard():
+            pytest.fail('provider body must not run')
+
+    physical_guard.assert_not_called()
+
+
+def test_ordinary_zero_cost_replica_needs_no_reserved_fill_handoff(monkeypatch):
     context = _legacy_launch_context()
     provisioner = _provisioner(context)
     ordinary_zero_cost = types.SimpleNamespace(reserved_fill=False,
@@ -806,391 +880,33 @@ def test_ordinary_zero_cost_replica_does_not_enter_reclaim_gate(monkeypatch):
     monkeypatch.setattr(provisioner,
                         '_service_replica_launch_provider_owner_guard',
                         lambda: contextlib.nullcontext(snapshot))
-    global_guard = mock.Mock()
-    require_policy = mock.Mock()
+    committed = mock.Mock()
+    physical = mock.Mock()
     monkeypatch.setattr(serve_state,
-                        'reserved_fill_reclaim_gate_authority_guard',
-                        global_guard)
-    monkeypatch.setattr(reclaim, 'require_unique_policy', require_policy)
-    provider_ran = False
+                        'reserved_fill_committed_launch_authority_holds',
+                        committed)
+    monkeypatch.setattr(backend.kubernetes_adaptor,
+                        'physical_cluster_uid_fence', physical)
 
     with provisioner._service_replica_launch_provider_guard():
-        provider_ran = True
+        pass
 
-    assert provider_ran
-    global_guard.assert_not_called()
-    require_policy.assert_not_called()
-
-
-def test_durable_row_mismatch_fails_inside_global_guard_before_policy(
-        monkeypatch):
-    context = _launch_context()
-    provisioner = _provisioner(context)
-    durable = _durable_replica(context)
-    durable.reserved_fill_service_generation += 1
-    snapshot = serve_state.ServiceReplicaLaunchFenceSnapshot(durable)
-    owner_guard = mock.Mock(return_value=contextlib.nullcontext(snapshot))
-    require_policy = mock.Mock()
-    global_guard = mock.Mock(return_value=contextlib.nullcontext())
-    monkeypatch.setattr(provisioner,
-                        '_service_replica_launch_provider_owner_guard',
-                        owner_guard)
-    monkeypatch.setattr(reclaim, 'require_unique_policy', require_policy)
-    monkeypatch.setattr(serve_state,
-                        'reserved_fill_reclaim_gate_authority_guard',
-                        global_guard)
-
-    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
-                       match='durable replica row'):
-        with provisioner._service_replica_launch_provider_guard():
-            pytest.fail('provider body must not run')
-
-    owner_guard.assert_called_once_with()
-    require_policy.assert_not_called()
-    global_guard.assert_called_once_with(shared=True)
-
-
-def test_terminal_policy_identity_mismatch_precedes_ticket_and_provider(
-        monkeypatch):
-    context = _launch_context()
-    provisioner = _provisioner(context)
-    authorize_launch = mock.Mock()
-    policy = _Policy(authorize_launch,
-                     identity=_identity(
-                         fleet_digest=_OTHER_FLEET_DIGEST,
-                         inventory_digest=_OTHER_INVENTORY_DIGEST))
-    owner_guard = mock.Mock(
-        return_value=contextlib.nullcontext(_launch_snapshot(context)))
-    global_guard = mock.Mock(return_value=contextlib.nullcontext())
-    monkeypatch.setattr(reclaim, 'require_unique_policy', lambda: policy)
-    monkeypatch.setattr(provisioner,
-                        '_service_replica_launch_provider_owner_guard',
-                        owner_guard)
-    monkeypatch.setattr(serve_state,
-                        'reserved_fill_reclaim_gate_authority_guard',
-                        global_guard)
-    provider_ran = False
-
-    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
-                       match='policy refused'):
-        with provisioner._service_replica_launch_provider_guard():
-            provider_ran = True
-
-    assert not provider_ran
-    owner_guard.assert_called_once_with()
-    authorize_launch.assert_not_called()
-    global_guard.assert_called_once_with(shared=True)
-
-
-def test_service_and_global_guards_precede_policy_authorization(monkeypatch):
-    context = _launch_context()
-    provisioner = _provisioner(context)
-    expected_scope = _scope(context)
-    events = []
-
-    def _authorize(scope, *, expected_identity, expected_gate_generation,
-                   deadline_monotonic):
-        events.append('policy')
-        assert deadline_monotonic > time.monotonic()
-        assert scope == expected_scope
-        assert expected_identity == _identity()
-        assert expected_gate_generation == _GATE_GENERATION
-        return _launch_authorization(scope)
-
-    @contextlib.contextmanager
-    def _global_guard(*, shared):
-        assert shared
-        events.append('global-enter')
-        yield
-        events.append('global-exit')
-
-    @contextlib.contextmanager
-    def _owner_guard():
-        events.append('service-enter')
-        yield _launch_snapshot(context)
-        events.append('service-exit')
-
-    monkeypatch.setattr(reclaim, 'require_unique_policy',
-                        lambda: _Policy(_authorize))
-    monkeypatch.setattr(serve_state,
-                        'reserved_fill_reclaim_gate_authority_guard',
-                        _global_guard)
-    monkeypatch.setattr(
-        serve_state, 'reserved_fill_reclaim_launch_authority_holds',
-        lambda scope, authorization, launch_context, launch_snapshot: events.
-        append('recheck') or (scope == expected_scope and authorization is
-                              not None and launch_snapshot is not None))
-    monkeypatch.setattr(provisioner,
-                        '_service_replica_launch_provider_owner_guard',
-                        _owner_guard)
-
-    with provisioner._service_replica_launch_provider_guard():
-        events.append('provider')
-
-    assert events == [
-        'service-enter', 'global-enter', 'policy', 'recheck', 'provider',
-        'global-exit', 'service-exit'
-    ]
-
-
-def test_provider_guard_rejects_ticket_without_terminal_entry_budget(
-        monkeypatch):
-    context = _launch_context()
-    provisioner = _provisioner(context)
-    expected_scope = _scope(context)
-    remaining = reclaim.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS / 2
-    completed = (time.monotonic() -
-                 (reclaim.AUTHORIZATION_MAX_AGE_SECONDS - remaining))
-    authorization = _launch_authorization(expected_scope,
-                                          completed_monotonic=completed)
-    policy = _Policy(mock.Mock(return_value=authorization))
-    terminal_recheck = mock.Mock(return_value=True)
-
-    monkeypatch.setattr(reclaim, 'require_unique_policy', lambda: policy)
-    monkeypatch.setattr(
-        serve_state, 'reserved_fill_reclaim_gate_authority_guard',
-        lambda *, shared: contextlib.nullcontext() if shared else None)
-    monkeypatch.setattr(serve_state,
-                        'reserved_fill_reclaim_launch_authority_holds',
-                        terminal_recheck)
-    monkeypatch.setattr(
-        provisioner, '_service_replica_launch_provider_owner_guard',
-        lambda: contextlib.nullcontext(_launch_snapshot(context)))
-
-    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
-                       match='policy refused'):
-        with provisioner._service_replica_launch_provider_guard():
-            pytest.fail('provider ran with an expiring authorization')
-
-    policy._authorize_launch.assert_called_once()
-    terminal_recheck.assert_not_called()
-
-
-def test_delayed_global_gate_acquisition_precedes_ticket_mint(monkeypatch):
-    context = _launch_context()
-    provisioner = _provisioner(context)
-    expected_scope = _scope(context)
-    gate_wait_started = threading.Event()
-    release_gate = threading.Event()
-    authorization_started = threading.Event()
-    events = []
-
-    def _authorize(scope, **_kwargs):
-        assert release_gate.is_set()
-        events.append('policy')
-        authorization_started.set()
-        return _launch_authorization(scope)
-
-    @contextlib.contextmanager
-    def _delayed_global_guard(*, shared):
-        assert shared
-        events.append('global-wait')
-        gate_wait_started.set()
-        assert release_gate.wait(timeout=2)
-        events.append('global-enter')
-        yield object()
-        events.append('global-exit')
-
-    monkeypatch.setattr(reclaim, 'require_unique_policy',
-                        lambda: _Policy(_authorize))
-    monkeypatch.setattr(serve_state,
-                        'reserved_fill_reclaim_gate_authority_guard',
-                        _delayed_global_guard)
-    monkeypatch.setattr(
-        serve_state, 'reserved_fill_reclaim_launch_authority_holds',
-        lambda scope, authorization, launch_context, launch_snapshot: scope ==
-        expected_scope and authorization is not None and launch_snapshot is
-        not None)
-    monkeypatch.setattr(
-        provisioner, '_service_replica_launch_provider_owner_guard',
-        lambda: contextlib.nullcontext(_launch_snapshot(context)))
-
-    def _run_provider_guard():
-        with provisioner._service_replica_launch_provider_guard():
-            events.append('provider')
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        guarded = executor.submit(_run_provider_guard)
-        assert gate_wait_started.wait(timeout=2)
-        assert not authorization_started.wait(timeout=0.1)
-        release_gate.set()
-        guarded.result(timeout=2)
-
-    assert events == [
-        'global-wait', 'global-enter', 'policy', 'provider', 'global-exit'
-    ]
-
-
-def test_failed_service_authority_mints_no_policy_ticket_or_global_guard(
-        monkeypatch):
-    context = _launch_context()
-    provisioner = _provisioner(context)
-    require_policy = mock.Mock()
-    global_guard = mock.Mock()
-
-    class _FailedOwnerGuard:
-
-        def __enter__(self):
-            raise exceptions.ServeReplicaLaunchFenceError('service superseded')
-
-        def __exit__(self, *_args):
-            return False
-
-    monkeypatch.setattr(provisioner,
-                        '_service_replica_launch_provider_owner_guard',
-                        _FailedOwnerGuard)
-    monkeypatch.setattr(reclaim, 'require_unique_policy', require_policy)
-    monkeypatch.setattr(serve_state,
-                        'reserved_fill_reclaim_gate_authority_guard',
-                        global_guard)
-
-    with pytest.raises(exceptions.ServeReplicaLaunchFenceError,
-                       match='service superseded'):
-        with provisioner._service_replica_launch_provider_guard():
-            pytest.fail('provider body must not run')
-
-    require_policy.assert_not_called()
-    global_guard.assert_not_called()
-
-
-@pytest.mark.parametrize('ticket_kind', ['missing-policy', 'stale', 'mismatch'])
-def test_invalid_policy_ticket_fails_inside_global_guard_before_provider(
-        monkeypatch, ticket_kind):
-    context = _launch_context()
-    provisioner = _provisioner(context)
-    expected_scope = _scope(context)
-    global_guard = mock.Mock(return_value=contextlib.nullcontext())
-    owner_guard = mock.Mock(
-        return_value=contextlib.nullcontext(_launch_snapshot(context)))
-    if ticket_kind == 'missing-policy':
-        policy_result = mock.Mock(
-            side_effect=reclaim.ReclaimAttestationError('no policy'))
-    elif ticket_kind == 'stale':
-        ticket = _launch_authorization(
-            expected_scope,
-            completed_monotonic=(time.monotonic() -
-                                 reclaim.AUTHORIZATION_MAX_AGE_SECONDS - 1))
-        policy_result = mock.Mock(
-            return_value=_Policy(lambda _scope, **_kwargs: ticket))
-    else:
-        ticket = _launch_authorization(
-            expected_scope,
-            identity=_identity(fleet_digest=_OTHER_FLEET_DIGEST,
-                               inventory_digest=_OTHER_INVENTORY_DIGEST))
-        policy_result = mock.Mock(
-            return_value=_Policy(lambda _scope, **_kwargs: ticket))
-    monkeypatch.setattr(reclaim, 'require_unique_policy', policy_result)
-    monkeypatch.setattr(serve_state,
-                        'reserved_fill_reclaim_gate_authority_guard',
-                        global_guard)
-    monkeypatch.setattr(provisioner,
-                        '_service_replica_launch_provider_owner_guard',
-                        owner_guard)
-    provider_ran = False
-
-    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
-                       match='policy refused'):
-        with provisioner._service_replica_launch_provider_guard():
-            provider_ran = True
-
-    assert not provider_ran
-    global_guard.assert_called_once_with(shared=True)
-    owner_guard.assert_called_once_with()
-
-
-def test_tampered_fence_identity_fails_locked_gate_recheck_before_provider(
-        monkeypatch):
-    context = _launch_context(fleet_digest=_OTHER_FLEET_DIGEST,
-                              inventory_digest=_OTHER_INVENTORY_DIGEST)
-    provisioner = _provisioner(context)
-    tampered_identity = _identity(fleet_digest=_OTHER_FLEET_DIGEST,
-                                  inventory_digest=_OTHER_INVENTORY_DIGEST)
-
-    def _authorize(scope, *, expected_identity, expected_gate_generation,
-                   deadline_monotonic):
-        assert deadline_monotonic > time.monotonic()
-        assert expected_identity == tampered_identity
-        return _launch_authorization(scope,
-                                     identity=tampered_identity,
-                                     gate_generation=expected_gate_generation)
-
-    monkeypatch.setattr(reclaim, 'require_unique_policy',
-                        lambda: _Policy(_authorize, identity=tampered_identity))
-    monkeypatch.setattr(
-        serve_state, 'reserved_fill_reclaim_gate_authority_guard',
-        lambda *, shared: contextlib.nullcontext() if shared else None)
-    owner_guard = mock.Mock(
-        return_value=contextlib.nullcontext(_launch_snapshot(context)))
-    monkeypatch.setattr(provisioner,
-                        '_service_replica_launch_provider_owner_guard',
-                        owner_guard)
-    _install_gate(monkeypatch, _gate(sequenced=True, identity=_identity()))
-    provider_ran = False
-
-    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
-                       match='authority'):
-        with provisioner._service_replica_launch_provider_guard():
-            provider_ran = True
-
-    assert not provider_ran
-    owner_guard.assert_called_once_with()
-
-
-def test_missing_terminal_provider_receipt_fails_before_provider(monkeypatch):
-    context = _launch_context()
-    provisioner = _provisioner(context)
-
-    def _authorize(scope, **_kwargs):
-        return _launch_authorization(scope)
-
-    monkeypatch.setattr(reclaim, 'require_unique_policy',
-                        lambda: _Policy(_authorize))
-    monkeypatch.setattr(
-        serve_state, 'reserved_fill_reclaim_gate_authority_guard',
-        lambda *, shared: contextlib.nullcontext() if shared else None)
-    owner_guard = mock.Mock(
-        return_value=contextlib.nullcontext(_launch_snapshot(context)))
-    monkeypatch.setattr(provisioner,
-                        '_service_replica_launch_provider_owner_guard',
-                        owner_guard)
-    _install_gate(monkeypatch, _gate(sequenced=True))
-    receipt_guard = mock.Mock(return_value=False)
-    monkeypatch.setattr(reserved_fill_reclaim_proofs,
-                        'provider_proof_reference_holds_in_connection',
-                        receipt_guard)
-    provider_ran = False
-
-    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
-                       match='authority'):
-        with provisioner._service_replica_launch_provider_guard():
-            provider_ran = True
-
-    assert not provider_ran
-    receipt_guard.assert_called_once()
-    owner_guard.assert_called_once_with()
+    committed.assert_not_called()
+    physical.assert_not_called()
 
 
 def test_provider_exception_classification_is_preserved(monkeypatch):
     context = _launch_context()
     provisioner = _provisioner(context)
-    expected_scope = _scope(context)
-
-    def _authorize(scope, **_kwargs):
-        return _launch_authorization(scope)
-
-    monkeypatch.setattr(reclaim, 'require_unique_policy',
-                        lambda: _Policy(_authorize))
-    monkeypatch.setattr(
-        serve_state, 'reserved_fill_reclaim_gate_authority_guard',
-        lambda *, shared: contextlib.nullcontext() if shared else None)
-    monkeypatch.setattr(
-        serve_state, 'reserved_fill_reclaim_launch_authority_holds',
-        lambda scope, authorization, launch_context, launch_snapshot: scope ==
-        expected_scope and authorization is not None and launch_snapshot is
-        not None)
     monkeypatch.setattr(
         provisioner, '_service_replica_launch_provider_owner_guard',
         lambda: contextlib.nullcontext(_launch_snapshot(context)))
+    monkeypatch.setattr(serve_state,
+                        'reserved_fill_committed_launch_authority_holds',
+                        lambda *_args: True)
+    monkeypatch.setattr(backend.kubernetes_adaptor,
+                        'physical_cluster_uid_fence',
+                        lambda *_args: contextlib.nullcontext())
     provider_error = provision_common.ProvisionerError(
         'provider capacity classification')
 
@@ -1199,48 +915,6 @@ def test_provider_exception_classification_is_preserved(monkeypatch):
             raise provider_error
 
     assert exc_info.value is provider_error
-
-
-@pytest.mark.parametrize('loss_point', ['before', 'during-proof', 'after'])
-def test_lost_global_guard_never_reports_an_authorized_provider_effect(
-        monkeypatch, loss_point):
-    context = _launch_context()
-    provisioner = _provisioner(context)
-    expected_scope = _scope(context)
-
-    monkeypatch.setattr(
-        reclaim, 'require_unique_policy',
-        lambda: _Policy(lambda scope, **_kwargs: _launch_authorization(scope)))
-    monkeypatch.setattr(
-        serve_state, 'reserved_fill_reclaim_gate_authority_guard',
-        lambda *, shared: contextlib.nullcontext(object()) if shared else None)
-    if loss_point == 'before':
-        validity = [False]
-    elif loss_point == 'during-proof':
-        validity = [True, False]
-    else:
-        validity = [True, True, False]
-    monkeypatch.setattr(serve_state,
-                        'reserved_fill_reclaim_gate_authority_guard_is_valid',
-                        lambda _: validity.pop(0))
-    monkeypatch.setattr(
-        serve_state, 'reserved_fill_reclaim_launch_authority_holds',
-        lambda scope, authorization, launch_context, launch_snapshot: scope ==
-        expected_scope and authorization is not None and launch_snapshot is
-        not None)
-    owner_guard = mock.Mock(
-        return_value=contextlib.nullcontext(_launch_snapshot(context)))
-    monkeypatch.setattr(provisioner,
-                        '_service_replica_launch_provider_owner_guard',
-                        owner_guard)
-    provider_ran = False
-
-    with pytest.raises(exceptions.ReservedFillLaunchFenceError, match='guard'):
-        with provisioner._service_replica_launch_provider_guard():
-            provider_ran = True
-
-    assert provider_ran is (loss_point == 'after')
-    owner_guard.assert_called_once_with()
 
 
 def _claim_edge() -> dict[str, object]:

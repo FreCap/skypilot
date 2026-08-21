@@ -59,7 +59,10 @@ _POST_REVISION_001_COLUMNS = {
         'owner_user_id',
         'owner_user_name',
     }),
-    'replicas': frozenset({'ordinary_launch_association_id'}),
+    'replicas': frozenset({
+        'ordinary_launch_association_id',
+        'reserved_fill_intent_idempotency_key',
+    }),
     'paid_capacity_claims': frozenset({
         'capacity_plan_generation',
         'capacity_plan_sha256',

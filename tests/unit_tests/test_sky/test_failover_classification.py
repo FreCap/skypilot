@@ -1190,15 +1190,30 @@ def _configure_reserved_fill_kubernetes_attempt(tmp_path,
         'H200',
         protocol_version=reserved_capacity_broker.PROTOCOL_V2,
         physical_cluster_uid='physical-uid')
-    provisioner._extra_launch_context = (
-        reserved_capacity.make_protocol_v2_launch_fence(
-            pool_key=pool_key,
-            service_generation=7,
-            service_version=3,
-            physical_cluster_uid='physical-uid',
-            kubernetes_context='phx-context',
-            accelerator='H200',
-            accelerator_count=1))
+    launch_context = reserved_capacity.make_protocol_v2_launch_fence(
+        pool_key=pool_key,
+        service_generation=7,
+        service_version=3,
+        physical_cluster_uid='physical-uid',
+        kubernetes_context='phx-context',
+        accelerator='H200',
+        accelerator_count=1)
+    launch_context, association_id, request_id = _bound_reserved_fill_context(
+        launch_context)
+    provisioner._extra_launch_context = launch_context
+
+    # Protocol-v2 provider retries are generic bound non-pool requests.  Keep
+    # this provider-focused harness on that complete production envelope so
+    # its passive preflight reaches the behavior each test is exercising.
+    claim = types.SimpleNamespace(request_id=request_id,
+                                  worker_instance_id=str(uuid.uuid4()))
+    monkeypatch.setattr(request_storage, 'active_execution_claim',
+                        lambda: claim)
+    monkeypatch.setattr(
+        ordinary_launch_binding, 'binding_allows_request',
+        lambda actual_association_id, actual_request_id:
+        (actual_association_id == association_id and actual_request_id ==
+         request_id))
 
     deploy_variables = clouds.DO.make_deploy_resources_variables
     monkeypatch.setattr(clouds.Kubernetes, 'make_deploy_resources_variables',
@@ -1758,7 +1773,7 @@ def test_reserved_fill_retry_preflight_is_passive_but_bulk_has_active_guard(
             durable_replica_info=mock.sentinel.durable_replica)
 
     @contextlib.contextmanager
-    def reclaim_guard(_snapshot):
+    def committed_guard(_snapshot):
         assert active
         yield
 
@@ -1767,8 +1782,8 @@ def test_reserved_fill_retry_preflight_is_passive_but_bulk_has_active_guard(
     monkeypatch.setattr(ordinary_launch_binding,
                         'require_active_provider_effect_authorization',
                         require_active)
-    monkeypatch.setattr(provisioner, '_reserved_fill_reclaim_provider_guard',
-                        reclaim_guard)
+    monkeypatch.setattr(provisioner, '_reserved_fill_committed_provider_guard',
+                        committed_guard)
     monkeypatch.setattr(provider_phase, 'provider_phase',
                         lambda _mode: contextlib.nullcontext())
 
@@ -2329,6 +2344,8 @@ def test_reserved_fill_retry_candidate_drift_is_terminal_before_provider(
         kubernetes_context='phx-context',
         accelerator='H200',
         accelerator_count=1)
+    launch_context, association_id, request_id = _bound_reserved_fill_context(
+        launch_context)
     task = mock.Mock()
     task.is_controller_task.return_value = False
     task.num_nodes = 1
@@ -2359,6 +2376,15 @@ def test_reserved_fill_retry_candidate_drift_is_terminal_before_provider(
         side_effect=exceptions.ResourcesUnavailableError(
             'first exact attempt unavailable'))
     monkeypatch.setattr(provisioner, '_retry_zones', provider_attempt)
+    claim = types.SimpleNamespace(request_id=request_id,
+                                  worker_instance_id=str(uuid.uuid4()))
+    monkeypatch.setattr(request_storage, 'active_execution_claim',
+                        lambda: claim)
+    monkeypatch.setattr(
+        ordinary_launch_binding, 'binding_allows_request',
+        lambda actual_association_id, actual_request_id:
+        (actual_association_id == association_id and actual_request_id ==
+         request_id))
     monkeypatch.setattr(clouds.Kubernetes, 'get_identity_from_context_name',
                         lambda *_: ['user'])
     monkeypatch.setattr(clouds.Kubernetes, 'check_features_are_supported',

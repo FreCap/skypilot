@@ -385,6 +385,12 @@ replicas_table = sqlalchemy.Table(
         'non_pool_launch_authorization',
         sqlalchemy.JSON(none_as_null=True).with_variant(
             postgresql.JSONB(none_as_null=True), 'postgresql')),
+    # Serve056's normalized authority edge. ReplicaInfo keeps the same key as
+    # a checked projection, but provider authorization reads this scalar and
+    # follows its PostgreSQL foreign key to one immutable COMMITTED intent.
+    sqlalchemy.Column('reserved_fill_intent_idempotency_key',
+                      sqlalchemy.Text,
+                      server_default=None),
     # These columns are initialized and mutated only by typed resource-action
     # transitions.  Generic ReplicaInfo persistence deliberately omits them.
     # sqlalchemy.Uuid is native UUID on PostgreSQL and a portable CHAR-backed

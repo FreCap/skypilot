@@ -4,6 +4,7 @@
 
 import concurrent.futures
 import contextlib
+import copy
 import dataclasses
 import os
 import threading
@@ -16,11 +17,14 @@ from alembic import script as alembic_script
 import pytest
 import sqlalchemy
 from test_reserved_fill_allocation_pg import _commit_evidence
+from test_reserved_fill_allocation_pg import _CONTEXT
 from test_reserved_fill_allocation_pg import _OWNER
+from test_reserved_fill_allocation_pg import _POOL_KEY
 from test_reserved_fill_allocation_pg import _publish_current_allocation
 from test_reserved_fill_allocation_pg import _SERVICE
 from test_reserved_fill_allocation_pg import _SERVICE_HASH
 from test_reserved_fill_allocation_pg import _typed_fill_replica
+from test_reserved_fill_allocation_pg import _UID
 from test_reserved_fill_allocation_pg import allocation_engine  # noqa: F401
 from test_reserved_fill_allocation_pg import observation_engine  # noqa: F401
 from test_reserved_fill_allocation_pg import pg_server  # noqa: F401
@@ -32,6 +36,7 @@ from sky.serve import constants as serve_constants
 from sky.serve import controller_transport
 from sky.serve import ordinary_launch_binding
 from sky.serve import pool_capacity_observation
+from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
 from sky.serve import reserved_fill_reclaim_attestation
@@ -82,10 +87,20 @@ def atomic_database(allocation_engine, monkeypatch):
     profile_digest = ordinary_launch_binding.supported_non_pool_profile_set_digest(
     )
     with allocation_engine.begin() as connection:
+        # The allocation fixture creates a current central-birth service with a
+        # frozen owner.  This fixture specifically exercises a retained
+        # pre-Serve055 service, whose owner starts NULL and is attested once by
+        # the elected controller.  Reproduce that migration input before
+        # restoring the production immutability trigger.
+        connection.execute(
+            sqlalchemy.text('DROP TRIGGER skyserve055_service_owner_guard '
+                            'ON services'))
         connection.execute(
             sqlalchemy.update(serve_state_schema.services_table).
             where(serve_state_schema.services_table.c.name == _SERVICE).values(
                 workspace=_WORKSPACE,
+                owner_user_id=None,
+                owner_user_name=None,
                 lifecycle_epoch=4,
                 controller_port=_CONTROLLER_PORT,
                 controller_incarnation=_CONTROLLER_INCARNATION,
@@ -110,9 +125,16 @@ def atomic_database(allocation_engine, monkeypatch):
                     _CONTROLLER_INCARNATION),
                 reserved_fill_actuation_protocol_version=1))
         connection.execute(
-            sqlalchemy.insert(
-                serve_state_schema.service_lifecycle_fences_table).values(
-                    name=_SERVICE, epoch=4))
+            sqlalchemy.text('CREATE TRIGGER '
+                            'skyserve055_service_owner_guard BEFORE UPDATE OF '
+                            'owner_user_id, owner_user_name ON services FOR '
+                            'EACH ROW EXECUTE FUNCTION '
+                            'skyserve055_guard_service_owner()'))
+        connection.execute(
+            sqlalchemy.update(
+                serve_state_schema.service_lifecycle_fences_table).where(
+                    serve_state_schema.service_lifecycle_fences_table.c.name ==
+                    _SERVICE).values(epoch=4))
         connection.execute(
             sqlalchemy.update(serve_state_schema.version_specs_table).where(
                 serve_state_schema.version_specs_table.c.service_name ==
@@ -150,11 +172,17 @@ def _authority():
             ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
 
 
-def _atomic_specs(engine, count=1):
+def _atomic_specs(engine, count=1, *, image_id=None):
     authority = _authority()
     serve_state.attest_service_owner_user_id(authority, _CREATOR_ID,
                                              _CREATOR_NAME)
     _, snapshot = _commit_evidence(engine)
+    if image_id is not None:
+        snapshot = dataclasses.replace(
+            snapshot,
+            locations=tuple(
+                dataclasses.replace(location, image_id=(('docker', image_id),))
+                for location in snapshot.locations))
     allocation = _publish_current_allocation(engine, snapshot)
     owner_fingerprint = controller_transport.make_controller_owner_fingerprint(
         _SERVICE_HASH, _OWNER[0], _OWNER[1], _CONTROLLER_PORT)
@@ -190,6 +218,9 @@ def _atomic_specs(engine, count=1):
                                    allocation,
                                    card=intent.accelerator,
                                    intent_key=intent.idempotency_key)
+        selected_location = intent.allowed_locations[0].to_location()
+        info.location = selected_location.to_pickleable()
+        info.resources_override = selected_location.to_dict()
         launch_context = {
             serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: _SERVICE,
             serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: _SERVICE_HASH,
@@ -231,8 +262,8 @@ def _atomic_specs(engine, count=1):
     return tuple(specs)
 
 
-def _atomic_spec(engine):
-    return _atomic_specs(engine)[0]
+def _atomic_spec(engine, **kwargs):
+    return _atomic_specs(engine, **kwargs)[0]
 
 
 def _suffix_counts(connection):
@@ -247,6 +278,52 @@ def _suffix_counts(connection):
         connection.execute(
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
                 table)).scalar_one() for table in tables)
+
+
+def _commit_intent_and_build_replica_row(connection, spec):
+    info = spec.replica_info
+    zero_cost_actuation.commit_lease_in_connection(connection,
+                                                   spec.actuation_lease,
+                                                   service_name=_SERVICE,
+                                                   replica_id=info.replica_id,
+                                                   replica_record_id=uuid.UUID(
+                                                       info.replica_record_id),
+                                                   replica_info=info)
+    values = serve_state._reserved_fill_replica_row_values(
+        _SERVICE,
+        info.replica_id,
+        info,
+        pool_key=info.reserved_fill_pool_key,
+        expected_protocol_version=2)
+    assert values is not None
+    return values
+
+
+def _committed_launch_context(spec):
+    intent = spec.actuation_lease.intent
+    context = {
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: _SERVICE,
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: _SERVICE_HASH,
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY:
+            intent.service_version,
+    }
+    context.update(
+        reserved_capacity.make_protocol_v2_launch_fence(
+            pool_key=intent.pool_key,
+            service_generation=intent.service_generation,
+            service_version=intent.service_version,
+            physical_cluster_uid=intent.physical_cluster_uid,
+            kubernetes_context=intent.allowed_locations[0].region,
+            accelerator=intent.accelerator,
+            accelerator_count=intent.accelerator_count,
+            reconciliation_gate_generation=(
+                intent.reconciliation_gate_generation),
+            reclaim_fleet_bundle_sha256=intent.reclaim_fleet_bundle_sha256,
+            reclaim_policy_revision=intent.reclaim_policy_revision,
+            reclaim_provider_inventory_sha256=(
+                intent.reclaim_provider_inventory_sha256),
+            worker_projection_sha256=intent.worker_projection_sha256))
+    return context
 
 
 def _owner_tuple(engine):
@@ -280,18 +357,19 @@ def _use_real_broker(monkeypatch, engine):
                         get_postgres_lock)
 
 
-def test_serve055_lineage_and_sqlite_ceiling() -> None:
+def test_serve056_lineage_and_sqlite_ceiling() -> None:
     sqlite = sqlalchemy.create_engine('sqlite://')
     config = migration_utils.get_alembic_config(sqlite,
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['055']
+    assert scripts.get_heads() == ['056']
+    assert scripts.get_revision('056').down_revision == '055'
     assert scripts.get_revision('055').down_revision == '054'
-    assert migration_utils.SERVE_VERSION == '055'
+    assert migration_utils.SERVE_VERSION == '056'
     assert migration_utils.serve_target_version(sqlite) == '037'
     with pytest.raises(RuntimeError, match='PostgreSQL-only'):
-        alembic_command.upgrade(config, '055')
+        alembic_command.upgrade(config, '056')
 
 
 def test_retained_serve054_row_migrates_null_and_055_is_forward_only(
@@ -376,6 +454,75 @@ def test_retained_serve054_row_migrates_null_and_055_is_forward_only(
         column['name'] for column in sqlalchemy.inspect(
             observation_engine).get_columns('services')
     }
+
+
+def test_serve056_retains_json_only_rows_but_rejects_new_old_writer_rows(
+        observation_engine) -> None:
+    config = migration_utils.get_alembic_config(observation_engine,
+                                                migration_utils.SERVE_DB_NAME)
+    global_user_state_schema.user_table.create(observation_engine,
+                                               checkfirst=True)
+    alembic_command.upgrade(config, '055')
+    legacy_state = {
+        'replica_id': 1,
+        'cluster_name': 'retained-fill-1',
+        'version': 1,
+        'replica_record_id': str(uuid.uuid4()),
+        'reserved_fill': True,
+        'reserved_fill_service_generation': 3,
+        'reserved_fill_intent_idempotency_key': 'a' * 64,
+    }
+    with observation_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.services_table).values(
+                name='retained-fill',
+                workspace=_WORKSPACE,
+                status='READY',
+                hash='retained-fill-hash',
+                resource_scope='retained-fill-hash',
+                current_version=1,
+                active_versions='[1]',
+                pool=0))
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                service_name='retained-fill',
+                replica_id=1,
+                replica_state_version=1,
+                status='PROVISIONING',
+                version=1,
+                cluster_name='retained-fill-1',
+                is_spot=False,
+                replica_state=legacy_state))
+
+    alembic_command.upgrade(config, '056')
+    with observation_engine.begin() as connection:
+        retained = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                'retained-fill')).mappings().one()
+        assert retained['reserved_fill_intent_idempotency_key'] is None
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                'retained-fill').values(status='FAILED'))
+
+    new_state = dict(legacy_state,
+                     replica_id=2,
+                     cluster_name='retained-fill-2',
+                     replica_record_id=str(uuid.uuid4()))
+    with pytest.raises(sqlalchemy.exc.DBAPIError,
+                       match='requires a committed intent link'):
+        with observation_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                    service_name='retained-fill',
+                    replica_id=2,
+                    replica_state_version=1,
+                    status='PROVISIONING',
+                    version=1,
+                    cluster_name='retained-fill-2',
+                    is_spot=False,
+                    replica_state=new_state))
 
 
 def test_not_null_owner_schema_ends_global_user_deletion_transition(
@@ -636,6 +783,95 @@ def test_atomic_fill_rejects_caller_assigned_event_sequence(
         assert _suffix_counts(connection) == (0, 0, 0, 0, 0)
 
 
+def test_committed_intent_and_linked_replica_cannot_commit_without_association(
+        atomic_database) -> None:
+    spec = _atomic_spec(atomic_database)
+
+    with pytest.raises(sqlalchemy.exc.DBAPIError,
+                       match='lacks its exact (replica|association) handoff'):
+        with atomic_database.begin() as connection:
+            values = _commit_intent_and_build_replica_row(connection, spec)
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.replicas_table).values(**values))
+
+    with atomic_database.connect() as connection:
+        assert _suffix_counts(connection) == (0, 0, 0, 0, 0)
+        assert connection.execute(
+            sqlalchemy.select(zero_cost_actuation_schema.
+                              serve_zero_cost_actuation_intents_table.c.state)
+        ).scalar_one() == zero_cost_actuation.IntentState.ACTUATING.value
+
+
+@pytest.mark.parametrize('tamper', ('card', 'count', 'context', 'zone'))
+def test_database_rejects_committed_replica_location_tamper(
+        atomic_database, tamper) -> None:
+    spec = _atomic_spec(atomic_database)
+
+    with pytest.raises(sqlalchemy.exc.DBAPIError,
+                       match='does not exactly match an allowed committed'):
+        with atomic_database.begin() as connection:
+            values = _commit_intent_and_build_replica_row(connection, spec)
+            state = copy.deepcopy(values['replica_state'])
+            location = state['location']
+            override = state['resources_override']
+            if tamper == 'card':
+                location['accelerators'] = {'tampered-card': 1}
+                override['accelerators'] = {'tampered-card': 1}
+            elif tamper == 'count':
+                card = next(iter(location['accelerators']))
+                location['accelerators'] = {card: 2}
+                override['accelerators'] = {card: 2}
+            elif tamper == 'context':
+                location['region'] = 'retargeted-context'
+                override['region'] = 'retargeted-context'
+            else:
+                location['zone'] = 'retargeted-zone'
+                override['zone'] = 'retargeted-zone'
+            values['replica_state'] = state
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.replicas_table).values(**values))
+
+    with atomic_database.connect() as connection:
+        assert _suffix_counts(connection) == (0, 0, 0, 0, 0)
+        assert connection.execute(
+            sqlalchemy.select(zero_cost_actuation_schema.
+                              serve_zero_cost_actuation_intents_table.c.state)
+        ).scalar_one() == zero_cost_actuation.IntentState.ACTUATING.value
+
+
+def test_database_rejects_null_current_capability_tuple(
+        atomic_database) -> None:
+    spec = _atomic_spec(atomic_database)
+
+    with pytest.raises(sqlalchemy.exc.DBAPIError,
+                       match='lost its committed service owner'):
+        with atomic_database.begin() as connection:
+            values = _commit_intent_and_build_replica_row(connection, spec)
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    _SERVICE).values(
+                        ordinary_launch_binding_epoch=_BINDING_EPOCH + 1,
+                        non_pool_launch_binding_capable=False,
+                        non_pool_launch_controller_incarnation=None,
+                        non_pool_launch_binding_protocol_version=None,
+                        non_pool_launch_capability_profile_set_digest=None,
+                        non_pool_launch_capability_cohort_epoch=None,
+                        non_pool_launch_receipt_protocol_version=None))
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.replicas_table).values(**values))
+
+    with atomic_database.connect() as connection:
+        assert _suffix_counts(connection) == (0, 0, 0, 0, 0)
+        assert connection.execute(
+            sqlalchemy.select(zero_cost_actuation_schema.
+                              serve_zero_cost_actuation_intents_table.c.state)
+        ).scalar_one() == zero_cost_actuation.IntentState.ACTUATING.value
+
+
 def test_inner_commit_is_savepoint_and_outer_rollback_removes_full_suffix(
         atomic_database) -> None:
     spec = _atomic_spec(atomic_database)
@@ -885,6 +1121,30 @@ def test_outer_commit_publishes_sequences_and_hydrates_exact_request(
     assert spec.replica_info.zero_cost_materialization_sequence is None
     with atomic_database.connect() as connection:
         assert _suffix_counts(connection) == (1, 1, 1, 1, 1)
+        replica = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == _SERVICE,
+                serve_state_schema.replicas_table.c.replica_id ==
+                receipt.replica_id)).mappings().one()
+        assert (replica['reserved_fill_intent_idempotency_key'] ==
+                spec.actuation_lease.intent.idempotency_key)
+        assert (replica['replica_state']['reserved_fill_intent_idempotency_key']
+                == replica['reserved_fill_intent_idempotency_key'])
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id ==
+                  replica['ordinary_launch_association_id'])).mappings().one()
+        assert association['authorization_reference'] == (
+            'reserved-fill:' + spec.actuation_lease.intent.idempotency_key)
+        assert association['authorization_generation'] == (
+            spec.actuation_lease.intent.allocation_generation)
+        assert zero_cost_actuation.committed_intent_for_replica_in_connection(
+            connection,
+            service_name=_SERVICE,
+            service_hash=_SERVICE_HASH,
+            replica_info=staged.persisted_info) == spec.actuation_lease.intent
         stored = connection.execute(
             sqlalchemy.select(request_postgres.REQUESTS).where(
                 request_postgres.REQUESTS.c.request_id ==
@@ -907,6 +1167,33 @@ def test_outer_commit_publishes_sequences_and_hydrates_exact_request(
         receipt.request_id, 'different-owner', _WORKSPACE)
     assert not ordinary_launch_binding.reserved_fill_binding_authorizes_workspace(
         receipt.request_id, _CREATOR_ID, 'different-workspace')
+
+
+def test_serve056_accepts_live_intent_and_replica_image_id_encodings(
+        atomic_database) -> None:
+    image = 'docker:registry.example/boltz@sha256:' + 'e' * 64
+    spec = _atomic_spec(atomic_database, image_id=image)
+
+    _, receipt = reserved_fill_admission._transaction(spec,
+                                                      7,
+                                                      require_existing=False)
+
+    with atomic_database.connect() as connection:
+        intent_locations = connection.execute(
+            sqlalchemy.select(zero_cost_actuation_schema.
+                              serve_zero_cost_actuation_intents_table.c.
+                              allowed_locations)).scalar_one()
+        replica_state = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.replica_state).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    _SERVICE, serve_state_schema.replicas_table.c.replica_id ==
+                    receipt.replica_id)).scalar_one()
+    assert intent_locations[0]['image_id'] == {'docker': image}
+    assert replica_state['location']['image_id'] == [['docker', image]]
+    assert replica_state['resources_override']['image_id'] == [[
+        'docker', image
+    ]]
 
 
 def test_provider_cleanup_uses_committed_intent_gate_after_gate_advances(
@@ -968,18 +1255,128 @@ def test_provider_cleanup_uses_committed_intent_gate_after_gate_advances(
                 match='planner authorization changed'):
             ordinary_launch_binding._validate_profile_authority_in_connection(
                 connection, service, replica, context.profile)
-        connection.execute(
-            sqlalchemy.delete(zero_cost_actuation_schema.
-                              serve_zero_cost_actuation_intents_table).
-            where(
-                zero_cost_actuation_schema.
-                serve_zero_cost_actuation_intents_table.c.intent_idempotency_key
-                == spec.replica_info.reserved_fill_intent_idempotency_key))
         with pytest.raises(
-                ordinary_launch_binding.OrdinaryLaunchBindingConflict,
-                match='lost its exact committed intent'):
-            ordinary_launch_binding._validate_reserved_fill_cleanup_profile_in_connection(
-                connection, service, replica, context.profile)
+                sqlalchemy.exc.IntegrityError), connection.begin_nested():
+            connection.execute(
+                sqlalchemy.delete(
+                    zero_cost_actuation_schema.
+                    serve_zero_cost_actuation_intents_table).where(
+                        zero_cost_actuation_schema.
+                        serve_zero_cost_actuation_intents_table.c.
+                        intent_idempotency_key ==
+                        spec.replica_info.reserved_fill_intent_idempotency_key))
+        ordinary_launch_binding._validate_reserved_fill_cleanup_profile_in_connection(
+            connection, service, replica, context.profile)
+
+
+def test_postcommit_launch_authority_ignores_mutable_successor_state(
+        atomic_database) -> None:
+    spec = _atomic_spec(atomic_database)
+    staged, _ = reserved_fill_admission._transaction(spec,
+                                                     7,
+                                                     require_existing=False)
+    launch_context = _committed_launch_context(spec)
+    snapshot = serve_state.ServiceReplicaLaunchFenceSnapshot(
+        staged.persisted_info)
+    assert serve_state.reserved_fill_committed_launch_authority_holds(
+        launch_context, snapshot)
+
+    # Publish a newer observation and policy/gate generation, then withdraw
+    # the current claim/allocation projection entirely. These are precommit
+    # planner authorities; none may revoke an already committed provider
+    # handoff.
+    repository = pool_capacity_observation.PoolCapacityObservationRepository(
+        atomic_database)
+    observation_lease = repository.begin_observation(
+        pool_key=_POOL_KEY,
+        physical_cluster_uid=_UID,
+        accelerator_names=('a100-80gb', 'h200'),
+        access_context=_CONTEXT,
+        lease_duration_seconds=60,
+        authority_horizon_seconds=600)
+    repository.complete_success(
+        observation_lease,
+        pool_capacity_observation.PoolCapacitySuccess.from_counts(
+            2, {
+                'a100-80gb': 1,
+                'h200': 1,
+            }),
+        access_context=observation_lease.access_context)
+    before = repository.read_reconciliation_gate()
+    assert before.reclaim_policy_identity is not None
+    successor_identity = dataclasses.replace(
+        before.reclaim_policy_identity,
+        policy_revision=before.reclaim_policy_identity.policy_revision +
+        '-successor')
+    evidence = reserved_fill_reclaim_attestation.ReclaimEnforcementEvidence(
+        contract=(reserved_fill_reclaim_attestation.ReclaimEnforcementContract.
+                  GLOBAL_FLEET_CLAIM_ADMISSION_AND_LAUNCH_FENCES_V2),
+        fleet_bundle_sha256=successor_identity.fleet_bundle_sha256,
+        policy_revision=successor_identity.policy_revision,
+        provider_inventory_sha256=(
+            successor_identity.provider_inventory_sha256),
+        claimed_contexts=repository.read_activation_claim_scope(),
+        completed_monotonic=time.monotonic())
+    successor_receipt = reserved_fill_reclaim_attestation.activation_receipt(
+        evidence,
+        writer_image_digest='sha256:' + 'f' * 64,
+        writer_deployment_generation='successor',
+        writer_deployment_uid='successor-deployment-uid',
+        writer_pod_inventory_count=1,
+        writer_pod_inventory_sha256='9' * 64)
+    assert repository.authorize_sequenced_reconciliation(
+        expected_generation=before.generation,
+        receipt=successor_receipt).changed
+    with atomic_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(
+                serve_state_schema.reserved_fill_pool_claims_table).where(
+                    serve_state_schema.reserved_fill_pool_claims_table.c.
+                    service_name == _SERVICE))
+        connection.execute(
+            sqlalchemy.delete(
+                serve_state_schema.reserved_fill_service_claim_sets_table).
+            where(serve_state_schema.reserved_fill_service_claim_sets_table.c.
+                  service_name == _SERVICE))
+
+    assert serve_state.reserved_fill_committed_launch_authority_holds(
+        launch_context, snapshot)
+
+
+@pytest.mark.parametrize('revocation', ('lifecycle', 'version', 'capability'))
+def test_postcommit_launch_authority_still_honors_service_owner_revocation(
+        atomic_database, revocation) -> None:
+    spec = _atomic_spec(atomic_database)
+    staged, _ = reserved_fill_admission._transaction(spec,
+                                                     7,
+                                                     require_existing=False)
+    launch_context = _committed_launch_context(spec)
+    snapshot = serve_state.ServiceReplicaLaunchFenceSnapshot(
+        staged.persisted_info)
+    assert serve_state.reserved_fill_committed_launch_authority_holds(
+        launch_context, snapshot)
+
+    if revocation == 'lifecycle':
+        table = serve_state_schema.service_lifecycle_fences_table
+        where = table.c.name == _SERVICE
+        values = {'epoch': 5}
+    elif revocation == 'version':
+        table = serve_state_schema.services_table
+        where = table.c.name == _SERVICE
+        values = {'current_version': 2}
+    else:
+        table = serve_state_schema.services_table
+        where = table.c.name == _SERVICE
+        values = {
+            'reserved_fill_actuation_mode':
+                zero_cost_actuation.ActuationMode.DIRECT_REPLICA.value
+        }
+    with atomic_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(table).where(where).values(**values))
+
+    assert not serve_state.reserved_fill_committed_launch_authority_holds(
+        launch_context, snapshot)
 
 
 def test_workspace_authority_requires_durable_intent(atomic_database) -> None:
