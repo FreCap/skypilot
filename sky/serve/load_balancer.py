@@ -319,6 +319,10 @@ class SkyServeLoadBalancer:
         # remain all-null on the legacy controller-proxy path.
         self._route_projection_generation: int | None = None
         self._route_projection_sha256: str | None = None
+        # Narrow durable-route identity used only to fence occupancy samples.
+        # Unlike the full projection digest, it excludes volatile capacity
+        # hints that do not change any backend or occupancy contract.
+        self._route_occupancy_context_sha256: str | None = None
         self._route_source_epoch: int | None = None
         # Strong references to owned background tasks (the event loop only
         # holds weak references to tasks).
@@ -3481,6 +3485,7 @@ class SkyServeLoadBalancer:
         service_version: int | None = None
         route_projection_generation: int | None = None
         route_projection_sha256: str | None = None
+        route_occupancy_context_sha256: str | None = None
         route_source_epoch: int | None = None
 
         # Read the purpose-specific ring fresh for every sync. The primary is
@@ -3656,6 +3661,18 @@ class SkyServeLoadBalancer:
                             route_projection_generation = projection_fields[0]
                             route_projection_sha256 = projection_fields[1]
                             route_source_epoch = projection_fields[2]
+                        raw_occupancy_context = response_json.get(
+                            'route_occupancy_context_sha256')
+                        if raw_occupancy_context is not None:
+                            if (route_projection_generation is None or
+                                    not isinstance(raw_occupancy_context, str)
+                                    or re.fullmatch(
+                                        r'[0-9a-f]{64}',
+                                        raw_occupancy_context) is None):
+                                raise ValueError(
+                                    'Route occupancy context is malformed.')
+                            route_occupancy_context_sha256 = (
+                                raw_occupancy_context)
                         ready_replica_urls = list(replica_info.keys())
                         break
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -3696,16 +3713,25 @@ class SkyServeLoadBalancer:
                     self._last_sync_time = time.monotonic()
                     return
                 with self._client_pool_lock:
+                    next_route_occupancy_fence = (
+                        ('occupancy_context', route_occupancy_context_sha256)
+                        if route_occupancy_context_sha256 is not None else
+                        ('projection', route_projection_generation,
+                         route_projection_sha256))
+                    current_route_occupancy_fence = (
+                        ('occupancy_context',
+                         self._route_occupancy_context_sha256)
+                        if self._route_occupancy_context_sha256 is not None else
+                        ('projection', self._route_projection_generation,
+                         self._route_projection_sha256))
                     next_occupancy_context = (
                         service_version,
-                        route_projection_generation,
-                        route_projection_sha256,
+                        next_route_occupancy_fence,
                         route_source_epoch,
                     )
                     current_occupancy_context = (
                         self._routing_version,
-                        self._route_projection_generation,
-                        self._route_projection_sha256,
+                        current_route_occupancy_fence,
                         self._route_source_epoch,
                     )
                     if next_occupancy_context != current_occupancy_context:
@@ -3846,6 +3872,8 @@ class SkyServeLoadBalancer:
                     self._route_projection_generation = (
                         route_projection_generation)
                     self._route_projection_sha256 = route_projection_sha256
+                    self._route_occupancy_context_sha256 = (
+                        route_occupancy_context_sha256)
                     self._route_source_epoch = route_source_epoch
                 for replica_url, client in client_to_close:
                     # Fire-and-forget: a drain can legitimately take as long

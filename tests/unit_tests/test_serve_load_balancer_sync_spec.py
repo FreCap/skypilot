@@ -543,6 +543,60 @@ def test_projected_route_fence_change_invalidates_same_url_occupancy(
     assert lb._ha_role_payload()['occupancy_sampled_urls'] == [url]
 
 
+def test_capacity_only_projection_change_preserves_same_url_occupancy(
+        monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(constants.LB_POD_UID_ENV_VAR, 'lb-pod-uid-a')
+    lb = _make_lb()
+    url = 'http://replica:8080'
+
+    def _sync_body(generation, projection_digest, occupancy_digest):
+        return {
+            'replica_info': {
+                url: {
+                    'gpu_type': 'L4',
+                    'gpu_count': '1',
+                    'async_occupancy': 'true',
+                }
+            },
+            'num_ready_replicas': 1,
+            'routing_spec': {
+                'load_balancing_policy_name': 'least_load',
+            },
+            'service_version': 7,
+            'route_projection_generation': generation,
+            'route_projection_sha256': projection_digest,
+            'route_occupancy_context_sha256': occupancy_digest,
+            'route_source_epoch': 3,
+        }
+
+    _run_one_sync(lb, _sync_body(11, 'a' * 64, 'c' * 64))
+    with lb._client_pool_lock:
+        sample_epoch = lb._occupancy_role_epoch
+        lb._occupancy_dispatch_generation[url] = 4
+        lb._occupancy_sample_generation[url] = 4
+        lb._occupancy_sample_time[url] = time.monotonic()
+        lb._occupancy_sample_role_epoch[url] = sample_epoch
+        lb._occupancy_current_round_sampled_urls = {url}
+        lb._replica_occupancy[url] = 0
+        lb._replica_total_slots[url] = 1
+        lb._replica_free_slots[url] = 1
+
+    # A capacity-only publication advances the full projection fence while
+    # preserving the route/replica identity that owns occupancy evidence.
+    _run_one_sync(lb, _sync_body(12, 'b' * 64, 'c' * 64))
+    assert lb._occupancy_role_epoch == sample_epoch
+    assert lb._route_projection_generation == 12
+    assert lb._route_projection_sha256 == 'b' * 64
+    assert lb._ha_role_payload()['occupancy_sampled_urls'] == [url]
+
+    # Reusing the URL for a different durable identity changes the narrow
+    # context and still fails closed until a post-transition probe completes.
+    _run_one_sync(lb, _sync_body(13, 'd' * 64, 'e' * 64))
+    assert lb._occupancy_role_epoch == sample_epoch + 1
+    assert lb._ha_role_payload()['occupancy_sampled_urls'] == []
+    assert lb._ha_role_payload()['unknown_in_flight_urls'] == [url]
+
+
 def test_partial_projected_route_fence_is_rejected_without_advancing():
     lb = _make_lb()
 
@@ -556,6 +610,24 @@ def test_partial_projected_route_fence_is_rejected_without_advancing():
                 },
                 'service_version': 7,
                 'route_projection_generation': 1,
+            })
+
+    assert lb._routing_version is None
+    assert lb._route_projection_generation is None
+
+    with pytest.raises(ValueError, match='occupancy context is malformed'):
+        _run_one_sync(
+            lb, {
+                'replica_info': {},
+                'num_ready_replicas': 0,
+                'routing_spec': {
+                    'load_balancing_policy_name': 'least_load',
+                },
+                'service_version': 7,
+                'route_projection_generation': 1,
+                'route_projection_sha256': 'a' * 64,
+                'route_occupancy_context_sha256': 'not-a-digest',
+                'route_source_epoch': 1,
             })
 
     assert lb._routing_version is None
