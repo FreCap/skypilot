@@ -424,8 +424,15 @@ operational table, is the 35-day evidence authority.
   `before-hook-creation`. Release-managed, least-privilege RBAC permits the
   verifier to read only the exact role Deployments. Tests cover retry, failure,
   TTL cleanup, and uninstall residue. In guarded HA, every migration, seed, and
-  verifier Job must read and validate the committed storage mode and generation
-  before it mutates durable state; Helm hook annotations are not an exemption.
+  verifier Job that runs after storage-authority initialization must read and
+  validate the committed storage mode and generation before it mutates durable
+  state; Helm hook annotations are not an exemption. The only initialization
+  exceptions are D2's inert schema creation, which creates no authority row,
+  and the explicit receipt/CAS-backed `initialize-legacy` or D8 empty-database
+  S3 bootstrap operations that create the first authority row. Each exception
+  validates the release-projected external fence and its documented
+  installation preconditions; every subsequent Job validates the committed
+  PostgreSQL row.
 - API and worker pods run in verify-only migration mode.
 - New schema revisions are additive during the expand phase.
 - A release may read both the old and new representation while mixed versions
