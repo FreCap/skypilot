@@ -8,6 +8,7 @@ that the launch path pins to zero-cost ACTIVE locations (skipping entirely
 when none is available -- fill must never spill to paid capacity).
 """
 # pylint: disable=protected-access
+import concurrent.futures
 import contextlib
 import dataclasses
 import threading
@@ -120,6 +121,29 @@ def _replica(replica_id,
     info.get_spot_location.return_value = (
         spot_placer.Location.from_pickleable(location_key))
     return info
+
+
+class _DeterministicPollerWake:
+    """Advance a fake monotonic clock and deliver selected early wakes."""
+
+    def __init__(self, wake_times, on_advance=None):
+        self.now = 0.0
+        self._wake_times = list(wake_times)
+        self._on_advance = on_advance
+
+    def monotonic(self):
+        return self.now
+
+    def wait(self, timeout):
+        target = self.now + timeout
+        woke = bool(self._wake_times and self._wake_times[0] <= target + 1e-9)
+        self.now = self._wake_times.pop(0) if woke else target
+        if self._on_advance is not None:
+            self._on_advance(self.now)
+        return woke
+
+    def clear(self):
+        return None
 
 
 def _feed(autoscaler, free_slots, keys=(_K8S_KEY,), timestamp=None, polls=2):
@@ -1064,6 +1088,249 @@ class TestRelaxedZeroCostMatching(unittest.TestCase):
             self.autoscaler._replica_on_zero_cost_location(other_region))
 
 
+class TestReclaimProviderProofRenewer(unittest.TestCase):
+    """Independent receipt renewal is exact, bounded, and supervised."""
+
+    def test_inactive_gate_performs_no_policy_work(self):
+        repository = mock.Mock()
+        repository.read_reconciliation_gate.return_value = types.SimpleNamespace(
+            sequenced_active=False)
+        with mock.patch.object(
+                reserved_capacity.pool_capacity_observation,
+                'PoolCapacityObservationRepository',
+                return_value=repository), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_unique_policy') as require_policy:
+            self.assertFalse(
+                reserved_capacity.renew_reclaim_provider_proofs_once(
+                    time.monotonic() + 1))
+        require_policy.assert_not_called()
+
+    def test_active_gate_renews_exact_identity_and_generation(self):
+        identity = mock.sentinel.identity
+        repository = mock.Mock()
+        repository.read_reconciliation_gate.return_value = types.SimpleNamespace(
+            sequenced_active=True,
+            reclaim_policy_identity=identity,
+            generation=19)
+        policy = mock.Mock()
+        policy.renew_provider_proofs.return_value = True
+        deadline = time.monotonic() + 1
+        with mock.patch.object(
+                reserved_capacity.pool_capacity_observation,
+                'PoolCapacityObservationRepository',
+                return_value=repository), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_unique_policy',
+                 return_value=policy), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_exact_policy_identity') as require_identity:
+            self.assertTrue(
+                reserved_capacity.renew_reclaim_provider_proofs_once(deadline))
+
+        require_identity.assert_called_once_with(policy, identity)
+        policy.renew_provider_proofs.assert_called_once_with(
+            expected_identity=identity,
+            expected_gate_generation=19,
+            deadline_monotonic=deadline)
+
+    def test_active_gate_rejects_untyped_publication_result(self):
+        repository = mock.Mock()
+        repository.read_reconciliation_gate.return_value = types.SimpleNamespace(
+            sequenced_active=True,
+            reclaim_policy_identity=mock.sentinel.identity,
+            generation=19)
+        policy = mock.Mock()
+        policy.renew_provider_proofs.return_value = None
+        with mock.patch.object(
+                reserved_capacity.pool_capacity_observation,
+                'PoolCapacityObservationRepository',
+                return_value=repository), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_unique_policy',
+                 return_value=policy), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_exact_policy_identity'):
+            with self.assertRaisesRegex(
+                    reserved_capacity.reserved_fill_reclaim_attestation.
+                    ReclaimAttestationError, 'untyped publication'):
+                reserved_capacity.renew_reclaim_provider_proofs_once(
+                    time.monotonic() + 1)
+
+    def test_boundary_passes_one_absolute_provider_deadline(self):
+        executor = mock.Mock()
+        future = executor.submit.return_value
+        future.result.return_value = True
+        started = time.monotonic()
+
+        self.assertTrue(
+            reserved_capacity._renew_reclaim_provider_proofs_in_boundary(
+                executor))
+
+        operation, deadline = executor.submit.call_args.args
+        self.assertIs(operation,
+                      reserved_capacity.renew_reclaim_provider_proofs_once)
+        self.assertGreater(deadline, started)
+        self.assertLessEqual(
+            deadline - started,
+            reserved_capacity.reserved_fill_reclaim_attestation.
+            PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS + 0.01)
+        future.request_cancel.assert_not_called()
+
+    def test_boundary_timeout_cancels_and_requires_drain_result(self):
+        executor = mock.Mock()
+        future = executor.submit.return_value
+        future.done.return_value = False
+        future.result.side_effect = (
+            concurrent.futures.TimeoutError(),
+            concurrent.futures.CancelledError(),
+        )
+
+        with self.assertRaisesRegex(
+                reserved_capacity.reserved_fill_reclaim_attestation.
+                ReclaimAttestationError, 'bounded process lifetime'):
+            reserved_capacity._renew_reclaim_provider_proofs_in_boundary(
+                executor)
+
+        future.request_cancel.assert_called_once_with()
+        self.assertEqual(future.result.call_count, 2)
+        provider_timeout = future.result.call_args_list[0].kwargs['timeout']
+        drain_timeout = future.result.call_args_list[1].kwargs['timeout']
+        self.assertLessEqual(
+            provider_timeout,
+            reserved_capacity.reserved_fill_reclaim_attestation.
+            PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
+        self.assertEqual(
+            drain_timeout,
+            reserved_capacity._RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
+
+    def test_boundary_missing_drain_poison_is_controller_terminal(self):
+        callback = mock.Mock()
+        executor = mock.Mock()
+        executor.poisoned = False
+        future = executor.submit.return_value
+        future.done.return_value = False
+        future.result.side_effect = concurrent.futures.TimeoutError()
+
+        def poison(error):
+            executor.poisoned = True
+            callback(error)
+
+        executor._poison.side_effect = poison
+        with self.assertRaisesRegex(
+                reserved_capacity.request_process.AmbiguousBoundaryError,
+                'cannot prove its process family absent') as captured:
+            reserved_capacity._renew_reclaim_provider_proofs_in_boundary(
+                executor)
+
+        ambiguity = captured.exception
+        future.request_cancel.assert_called_once_with()
+        executor._poison.assert_called_once_with(ambiguity)
+        callback.assert_called_once_with(ambiguity)
+        self.assertTrue(executor.poisoned)
+        self.assertIsInstance(
+            ambiguity.__cause__,
+            reserved_capacity.request_process.BoundaryExecutionError)
+        self.assertIn('without a process-family drain result',
+                      str(ambiguity.__cause__))
+
+    def test_completed_handler_timeout_does_not_poison_boundary(self):
+        executor = mock.Mock()
+        future = executor.submit.return_value
+        future.done.return_value = True
+        future.result.side_effect = concurrent.futures.TimeoutError(
+            'handler timeout')
+
+        with self.assertRaisesRegex(
+                reserved_capacity.reserved_fill_reclaim_attestation.
+                ReclaimAttestationError, 'bounded process lifetime'):
+            reserved_capacity._renew_reclaim_provider_proofs_in_boundary(
+                executor)
+
+        future.request_cancel.assert_not_called()
+        executor._poison.assert_not_called()
+        self.assertEqual(future.result.call_count, 1)
+
+    def test_loop_publishes_wakeup_and_shuts_down_boundary(self):
+        stop = mock.Mock()
+        stop.is_set.return_value = False
+        stop.wait.return_value = True
+        notify = mock.Mock()
+        on_ambiguous = mock.Mock()
+        executor = mock.Mock()
+        with mock.patch.object(
+                reserved_capacity.request_process,
+                'DisposableExecutor',
+                return_value=executor) as executor_factory, \
+             mock.patch.object(
+                 reserved_capacity,
+                 '_renew_reclaim_provider_proofs_in_boundary',
+                 return_value=True) as renew:
+            reserved_capacity.reclaim_provider_proof_renewer_loop(
+                stop_event=stop,
+                is_enabled=lambda: True,
+                notify_fresh=notify,
+                on_ambiguous_boundary=on_ambiguous)
+
+        executor_factory.assert_called_once_with(
+            max_workers=1, on_ambiguous_boundary=on_ambiguous)
+        renew.assert_called_once_with(executor)
+        notify.assert_called_once_with()
+        stop.wait.assert_called_once_with(
+            reserved_capacity.reserved_fill_reclaim_attestation.
+            PROVIDER_PROOF_RENEW_INTERVAL_SECONDS)
+        executor.shutdown.assert_called_once_with(
+            timeout=reserved_capacity.
+            _RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
+
+    def test_loop_does_not_wake_poller_for_cached_receipts(self):
+        stop = mock.Mock()
+        stop.is_set.return_value = False
+        stop.wait.return_value = True
+        notify = mock.Mock()
+        executor = mock.Mock()
+        with mock.patch.object(
+                reserved_capacity.request_process,
+                'DisposableExecutor',
+                return_value=executor), \
+             mock.patch.object(
+                 reserved_capacity,
+                 '_renew_reclaim_provider_proofs_in_boundary',
+                 return_value=False):
+            reserved_capacity.reclaim_provider_proof_renewer_loop(
+                stop_event=stop, is_enabled=lambda: True, notify_fresh=notify)
+
+        notify.assert_not_called()
+
+    def test_ambiguous_boundary_restarts_complete_supervised_loop(self):
+        stop = mock.Mock()
+        stop.is_set.return_value = False
+        executor = mock.Mock()
+        ambiguity = reserved_capacity.request_process.AmbiguousBoundaryError(
+            'unproven family')
+        with mock.patch.object(
+                reserved_capacity.request_process,
+                'DisposableExecutor',
+                return_value=executor), \
+             mock.patch.object(
+                 reserved_capacity,
+                 '_renew_reclaim_provider_proofs_in_boundary',
+                 side_effect=ambiguity):
+            with self.assertRaises(
+                    reserved_capacity.request_process.AmbiguousBoundaryError):
+                reserved_capacity.reclaim_provider_proof_renewer_loop(
+                    stop_event=stop, is_enabled=lambda: True)
+
+        executor.shutdown.assert_called_once_with(
+            timeout=reserved_capacity.
+            _RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
+
+
 class TestPollerFlagOff(unittest.TestCase):
     """Poller skips the expensive query when the live flag is off."""
 
@@ -1081,6 +1348,106 @@ class TestPollerFlagOff(unittest.TestCase):
                                       stop_event=stop_event)
 
         placer.zero_cost_locations.assert_not_called()
+
+    def test_claim_boundary_owns_controller_ambiguity_callback(self):
+        autoscaler = _make_autoscaler(fill=True)
+        placer = mock.Mock()
+        stop_event = threading.Event()
+        stop_event.set()
+        callback = mock.Mock()
+        executor = mock.Mock()
+
+        with mock.patch.object(reserved_capacity.request_process,
+                               'DisposableExecutor',
+                               return_value=executor) as factory:
+            reserved_capacity.poller_loop(lambda: autoscaler,
+                                          lambda: placer,
+                                          service_name='svc',
+                                          stop_event=stop_event,
+                                          on_ambiguous_boundary=callback)
+
+        factory.assert_called_once_with(max_workers=1,
+                                        on_ambiguous_boundary=callback)
+        executor.shutdown.assert_called_once_with(
+            timeout=reserved_capacity.
+            _RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
+
+    def test_repeated_wakes_preserve_the_fixed_rate_tick(self):
+
+        class _Stop(BaseException):
+            pass
+
+        clock = _DeterministicPollerWake((1.0, 2.0, 3.0))
+        autoscaler = _make_autoscaler(fill=True)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = []
+        cycle_times = []
+
+        def _cycle(*_args, **_kwargs):
+            cycle_times.append(clock.now)
+            if len(cycle_times) == 5:
+                raise _Stop
+
+        with mock.patch.object(reserved_capacity.time,
+                               'monotonic',
+                               side_effect=clock.monotonic), \
+             mock.patch.object(reserved_capacity,
+                               'poll_interval_seconds',
+                               return_value=10.0), \
+             mock.patch.object(reserved_capacity,
+                               '_standalone_cycle',
+                               side_effect=_cycle):
+            with self.assertRaises(_Stop):
+                reserved_capacity.poller_loop(lambda: autoscaler,
+                                              lambda: placer,
+                                              wake_event=clock)
+
+        self.assertEqual(cycle_times, [0.0, 1.0, 2.0, 3.0, 10.0])
+
+    def test_repeated_wakes_do_not_extend_claim_withdrawal_horizon(self):
+
+        class _Stop(BaseException):
+            pass
+
+        autoscaler = _make_autoscaler(fill=True)
+
+        def _disable_after_wakes(now):
+            if now >= 4.0:
+                autoscaler.reserved_capacity_fill = False
+
+        clock = _DeterministicPollerWake((1.0, 2.0, 3.0),
+                                         on_advance=_disable_after_wakes)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = []
+        withdrawal_times = []
+
+        def _remove_claim(*_args, **_kwargs):
+            withdrawal_times.append(clock.now)
+            raise _Stop
+
+        with mock.patch.object(reserved_capacity.time,
+                               'monotonic',
+                               side_effect=clock.monotonic), \
+             mock.patch.object(reserved_capacity,
+                               'poll_interval_seconds',
+                               return_value=10.0), \
+             mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'get_protocol_version',
+                               return_value=(reserved_capacity_broker.
+                                             PROTOCOL_V1)), \
+             mock.patch.object(reserved_capacity,
+                               '_broker_cycle'), \
+             mock.patch.object(reserved_capacity.reserved_capacity_broker,
+                               'remove_claim',
+                               side_effect=_remove_claim):
+            with self.assertRaises(_Stop):
+                reserved_capacity.poller_loop(lambda: autoscaler,
+                                              lambda: placer,
+                                              service_name='svc',
+                                              wake_event=clock)
+
+        self.assertEqual(withdrawal_times, [10.0])
+        self.assertLessEqual(withdrawal_times[0], 10.0)
 
     def test_complete_cycle_is_serialized_with_update_epoch(self):
         autoscaler = _make_autoscaler(fill=True)

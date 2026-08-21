@@ -18,6 +18,10 @@ class AwsAttestationError(RuntimeError):
     """AWS could not prove the exact code-owned provider inventory."""
 
 
+class AwsAttestationNonconformanceError(AwsAttestationError):
+    """Complete AWS reads disproved the expected reclaim inventory."""
+
+
 @dataclasses.dataclass(frozen=True)
 class PodIdentityProof:
     """Safe machine-readable result of one exact association read."""
@@ -167,7 +171,7 @@ def _require_cluster(response: object, expected: Mapping[str, Any]) -> None:
     if (cluster.get('name') != expected['cluster_name'] or
             cluster.get('arn') != expected['cluster_arn'] or
             cluster.get('status') != 'ACTIVE'):
-        raise AwsAttestationError(
+        raise AwsAttestationNonconformanceError(
             'EKS did not return the exact active cluster inventory.')
 
 
@@ -224,12 +228,12 @@ def validate_pod_identity_inventory(
     """Validate exact absence or one exact association from fresh AWS reads."""
     if expected_role_arn is None:
         if associations or described_association is not None:
-            raise AwsAttestationError(
+            raise AwsAttestationNonconformanceError(
                 'The identity-free worker partition has a Pod Identity '
                 'association.')
         return
     if len(associations) != 1 or described_association is None:
-        raise AwsAttestationError(
+        raise AwsAttestationNonconformanceError(
             'The worker partition does not have exactly one Pod Identity '
             'association.')
     summary = associations[0]
@@ -250,7 +254,7 @@ def validate_pod_identity_inventory(
             described_association.get('roleArn') != expected_role_arn or
             described_association.get('targetRoleArn') not in (None, '') or
             described_association.get('ownerArn') != summary.get('ownerArn')):
-        raise AwsAttestationError(
+        raise AwsAttestationNonconformanceError(
             'EKS returned an unexpected Pod Identity association.')
 
 

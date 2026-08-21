@@ -32,6 +32,16 @@ POLICY_REVISION_MAX_BYTES: Final = 1024
 RECLAIM_PROVIDER_CONTEXT_MAX_BYTES: Final = 1024
 AUTHORIZATION_MAX_AGE_SECONDS: Final = 5.0
 POLICY_OPERATION_TIMEOUT_SECONDS: Final = 5.0
+# Provider inventory is observed independently of a launch.  Keep its
+# database read, external refresh, and durable freshness budgets distinct from
+# the short-lived exact-scope authorization above.
+PROVIDER_PROOF_READ_TIMEOUT_SECONDS: Final = 2.0
+PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS: Final = 5.0
+PROVIDER_PROOF_MAX_AGE_SECONDS: Final = 30.0
+PROVIDER_PROOF_RENEW_INTERVAL_SECONDS: Final = 3.0
+PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS: Final = 20.0
+PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS: Final = 5.0
+PROVIDER_PROOF_REFRESH_JITTER_BUDGET_SECONDS: Final = 1.0
 # A launch receipt must retain this much of its five-second freshness window
 # when the policy hands it back.  The caller still has to decode and validate
 # the ticket and enter the multi-statement terminal PostgreSQL authority read.
@@ -40,9 +50,26 @@ POLICY_OPERATION_TIMEOUT_SECONDS: Final = 5.0
 # that is already too close to that fail-closed boundary.
 LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS: Final = 2.0
 
+if (PROVIDER_PROOF_MAX_AGE_SECONDS <= PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS
+        or PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS
+        <= PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS):
+    raise RuntimeError('The provider-proof freshness horizons are invalid.')
+if (PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS -
+        PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS
+        <= 2 * PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS +
+        PROVIDER_PROOF_RENEW_INTERVAL_SECONDS +
+        PROVIDER_PROOF_REFRESH_JITTER_BUDGET_SECONDS):
+    raise RuntimeError('The provider-proof renewal margin must preserve the '
+                       'consumer horizon across one failed refresh, one '
+                       'interval, one complete retry, and jitter.')
+
 
 class ReclaimAttestationError(RuntimeError):
     """The deployment could not prove or enforce its reclaim contract."""
+
+
+class ReclaimProviderNonconformanceError(ReclaimAttestationError):
+    """A completed provider observation disproved the reclaim contract."""
 
 
 class ReclaimEnforcementContract(str, enum.Enum):
@@ -511,9 +538,9 @@ class ReclaimLaunchAuthorization:
                 reference.kubernetes_context != self.scope.kubernetes_context):
             raise ValueError('Launch provider-proof reference does not match '
                              'the authorization scope.')
-        if completed != reference.completed_monotonic:
-            raise ValueError('Launch completion must equal the context-wide '
-                             'provider-proof completion.')
+        if completed < reference.completed_monotonic:
+            raise ValueError('Launch authorization cannot predate its '
+                             'context-wide provider proof.')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -654,6 +681,17 @@ class ReservedFillReclaimPolicy(abc.ABC):
         deadline_monotonic: float,
     ) -> ReclaimClaimAuthorization:
         """Authorize one exact claim set before the absolute deadline."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def renew_provider_proofs(
+        self,
+        *,
+        expected_identity: ReclaimPolicyIdentity,
+        expected_gate_generation: int,
+        deadline_monotonic: float,
+    ) -> bool:
+        """Renew context proofs; return whether fresh publication was seen."""
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -804,6 +842,11 @@ def require_exact_evidence(
 def new_policy_operation_deadline() -> float:
     """Return the absolute deadline every deployment policy must honor."""
     return time.monotonic() + POLICY_OPERATION_TIMEOUT_SECONDS
+
+
+def new_provider_proof_read_deadline() -> float:
+    """Return the shorter PostgreSQL-only receipt-consumer deadline."""
+    return time.monotonic() + PROVIDER_PROOF_READ_TIMEOUT_SECONDS
 
 
 def require_policy_operation_completed(deadline_monotonic: float) -> None:

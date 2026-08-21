@@ -69,6 +69,7 @@ from sky.serve import spot_placer
 from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state
 from sky.serve import zero_cost_actuation
+from sky.server.requests import process as request_process
 from sky.skylet import constants
 from sky.utils import common_utils
 from sky.utils import context as sky_context
@@ -670,6 +671,8 @@ class SkyServeController:
         self._reserved_capacity_fill_enabled: bool = bool(
             service_spec.reserved_capacity_fill)
         self._reserved_capacity_poller_started: bool = False
+        self._reserved_fill_reclaim_renewer_started: bool = False
+        self._reserved_capacity_poller_wake = threading.Event()
         # update_service handlers run in FastAPI's threadpool, so two
         # concurrent fill-enabling updates could both observe the
         # started flag as False; the lock makes start-once atomic.
@@ -4306,6 +4309,21 @@ class SkyServeController:
     def _get_update_reconciler_stop(self) -> threading.Event:
         return self._update_reconciler_stop
 
+    def _handle_reclaim_proof_boundary_ambiguity(
+            self, error: request_process.AmbiguousBoundaryError) -> None:
+        """Fail this controller child after losing provider-family proof."""
+        logger.critical(
+            'Reserved-fill provider renewal lost exact process-family proof; '
+            'fencing this controller for supervised replacement: '
+            f'{common_utils.format_exception(error)}')
+        try:
+            self._fence_actuation_for_update_recovery()
+        finally:
+            # The supervisor's five-second thread restart backoff is longer
+            # than this termination delay, so no replacement renewal lane can
+            # start in the same process after an ambiguous family survives.
+            self._schedule_supervised_recovery()
+
     def _fence_actuation_for_update_recovery(self) -> None:
         """Irreversibly stop this partial child from changing fleet state."""
         self._update_recovery_required = True
@@ -5334,6 +5352,24 @@ class SkyServeController:
             if self._reserved_capacity_poller_started:
                 return
             self._reserved_capacity_poller_started = True
+            wake_event = getattr(self, '_reserved_capacity_poller_wake', None)
+            if not isinstance(wake_event, threading.Event):
+                wake_event = threading.Event()
+                self._reserved_capacity_poller_wake = wake_event
+            if not getattr(self, '_reserved_fill_reclaim_renewer_started',
+                           False):
+                self._reserved_fill_reclaim_renewer_started = True
+                thread_utils.start_supervised_thread(
+                    lambda: reserved_capacity.
+                    reclaim_provider_proof_renewer_loop(
+                        stop_event=self._get_actuation_stop(),
+                        is_enabled=lambda: bool(self._autoscaler.
+                                                reserved_capacity_fill),
+                        notify_fresh=wake_event.set,
+                        on_ambiguous_boundary=(
+                            self._handle_reclaim_proof_boundary_ambiguity)),
+                    'reserved-fill-reclaim-proof-renewer',
+                    stop_event=self._get_actuation_stop())
         thread_utils.start_supervised_thread(
             lambda: reserved_capacity.poller_loop(
                 lambda: self._autoscaler,
@@ -5346,7 +5382,10 @@ class SkyServeController:
                 get_actuation_generation=self.get_actuation_generation,
                 actuation_generation_is_current=(
                     self.actuation_generation_is_current),
-                notify_reconcile=self._notify_scale_reconcile),
+                notify_reconcile=self._notify_scale_reconcile,
+                wake_event=wake_event,
+                on_ambiguous_boundary=(
+                    self._handle_reclaim_proof_boundary_ambiguity)),
             'reserved-capacity-poller',
             stop_event=self._get_actuation_stop())
 

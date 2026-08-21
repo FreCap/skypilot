@@ -33,6 +33,17 @@ from sky.serve import reserved_fill_reclaim_attestation as reclaim
 from sky.serve import reserved_fill_reclaim_proofs as reclaim_proofs
 
 
+def _wait_for_no_thread(prefix: str, timeout: float = 1) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(
+                thread.name.startswith(prefix)
+                for thread in threading.enumerate()):
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def _bundle_document() -> dict:
     return json.loads(
         (_POLICY_PROJECT / 'src' / 'boltz_reserved_fill_reclaim_policy' /
@@ -55,11 +66,24 @@ def _managed_provider_context(document: dict) -> dict:
         if context['kueue_enforcement'] is not None)
 
 
-def _quota(context: dict, prefix: str, flavor_name: str,
-           resource_name: str) -> dict:
+def _cluster_queue_contract(context: dict, name: str) -> dict:
     admission = context['kueue_admission']
     assert admission is not None
-    for group in admission['queues'][f'{prefix}_resource_groups']:
+    return next(queue for queue in admission['queues']['cluster_queues']
+                if queue['name'] == name)
+
+
+def _quota_profile(context: dict, queue_name: str) -> list[dict]:
+    admission = context['kueue_admission']
+    assert admission is not None
+    queues = admission['queues']
+    queue = _cluster_queue_contract(context, queue_name)
+    return queues['quota_profiles'][queue['quota_profile']]
+
+
+def _quota(context: dict, queue_name: str, flavor_name: str,
+           resource_name: str) -> dict:
+    for group in _quota_profile(context, queue_name):
         for flavor in group['flavors']:
             if flavor['name'] != flavor_name:
                 continue
@@ -67,7 +91,7 @@ def _quota(context: dict, prefix: str, flavor_name: str,
                 if resource['resource_name'] == resource_name:
                     return resource
     raise AssertionError(
-        f'No {prefix} quota for {flavor_name}/{resource_name}.')
+        f'No {queue_name} quota for {flavor_name}/{resource_name}.')
 
 
 def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
@@ -83,8 +107,32 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
     assert phx['kueue_admission']['local_queue_name'] == 'be'
     assert phx['kueue_admission']['queues'][
         'inference_cluster_queue'] == 'skypilot-be'
-    assert phx['kueue_admission']['workload_priority_class_name'] == 'be-ls'
-    assert phx['kueue_admission']['workload_priority_value'] == 12
+    assert (phx['kueue_admission']['workload_priority_class_name'] ==
+            'skypilot-reserved-fill')
+    assert phx['kueue_admission']['workload_priority_value'] == -1000
+    assert phx['priority_class'] == {
+        'name': 'rescluster-k8s-prod-east1-preemptible-inference-low',
+        'preemption_policy': 'Never',
+        'value': -1000,
+    }
+    assert phx['kueue_admission']['queues']['cohorts'] == [{
+        'name': 'research-workloads',
+        'parent_name': 'shared-pool',
+    }, {
+        'name': 'shared-pool',
+        'parent_name': None,
+    }]
+    assert {
+        queue['name']
+        for queue in phx['kueue_admission']['queues']['cluster_queues']
+    } == {
+        'skypilot-be', 'skypilot-wa', 'hyperpod-ns-research-clusterqueue',
+        'research-ha', 'research-ma', 'research-wa', 'research-be'
+    }
+    for queue in phx['kueue_admission']['queues']['cluster_queues']:
+        if queue['cohort_name'] == 'research-workloads':
+            assert queue['preemption']['borrow_within_cohort'] == 'Never'
+            assert queue['preemption']['reclaim_within_cohort'] == 'Any'
     assert east['scheduler_name'] == 'gpu-binpack-scheduler'
     assert phx['scheduler_name'] == 'default-scheduler'
     assert east['accelerators']['a100-80gb'] == {
@@ -102,13 +150,15 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
     ]
     assert bundle.policy_revision == (
         f'boltz-reserved-fill-reclaim-policy/{POLICY_REVISION}')
-    assert POLICY_REVISION == '1.1.1386'
-    assert _quota(phx, 'inference', 'ml.p5e.48xlarge',
+    assert POLICY_REVISION == '1.1.1416'
+    assert _quota(phx, 'skypilot-be', 'ml.p5e.48xlarge',
                   'cpu')['borrowing_limit'] == '12100'
-    assert _quota(phx, 'inference', 'ml.p5e.48xlarge',
+    assert _quota(phx, 'skypilot-be', 'ml.p5e.48xlarge',
                   'memory')['borrowing_limit'] == '120Ti'
-    assert _quota(phx, 'research', 'ml.p5e.48xlarge',
-                  'nvidia.com/gpu')['borrowing_limit'] == '512'
+    assert _quota(phx, 'research-ma', 'ml.p5e.48xlarge',
+                  'nvidia.com/gpu')['nominal_quota'] == '448'
+    assert _quota(phx, 'research-wa', 'ml.p5e.48xlarge',
+                  'nvidia.com/gpu')['nominal_quota'] == '64'
 
 
 def test_bundle_hashes_are_domain_separated_and_order_independent():
@@ -121,8 +171,9 @@ def test_bundle_hashes_are_domain_separated_and_order_independent():
         admission = context['kueue_admission']
         if admission is None:
             continue
-        for prefix in ('inference', 'research'):
-            groups = admission['queues'][f'{prefix}_resource_groups']
+        admission['queues']['cohorts'].reverse()
+        admission['queues']['cluster_queues'].reverse()
+        for groups in admission['queues']['quota_profiles'].values():
             groups.reverse()
             for group in groups:
                 group['covered_resources'].reverse()
@@ -146,12 +197,18 @@ def test_bundle_hashes_are_domain_separated_and_order_independent():
         b'boltz-reserved-fill/provider/v4\x00' + provider_bytes).hexdigest()
     assert first.provider_inventory_sha256 != hashlib.sha256(
         b'boltz-reserved-fill/provider/v3\x00' + provider_bytes).hexdigest()
+    fleet_bytes = bundle_lib._canonical_bytes(
+        bundle_lib._normalized_section(document['fleet']))
+    assert first.fleet_bundle_sha256 == hashlib.sha256(
+        b'boltz-reserved-fill/fleet/v5\x00' + fleet_bytes).hexdigest()
+    assert first.fleet_bundle_sha256 != hashlib.sha256(
+        b'boltz-reserved-fill/fleet/v4\x00' + fleet_bytes).hexdigest()
 
 
 def test_bundle_rejects_duplicate_keys_unknown_keys_and_unsafe_quota():
     with pytest.raises(bundle_lib.BundleValidationError, match='Duplicate'):
         bundle_lib.parse_bundle_bytes(
-            b'{"schema_version":5,"schema_version":5}')
+            b'{"schema_version":6,"schema_version":6}')
 
     document = _bundle_document()
     document['unknown'] = True
@@ -161,7 +218,7 @@ def test_bundle_rejects_duplicate_keys_unknown_keys_and_unsafe_quota():
 
     document = _bundle_document()
     context = _managed_document_context(document)
-    _quota(context, 'inference', 'ml.p5e.48xlarge',
+    _quota(context, 'skypilot-be', 'ml.p5e.48xlarge',
            'nvidia.com/gpu')['nominal_quota'] = '1'
     with pytest.raises(bundle_lib.BundleValidationError, match='zero-nominal'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
@@ -177,7 +234,7 @@ def test_bundle_rejects_duplicate_keys_unknown_keys_and_unsafe_quota():
 def test_bundle_requires_exact_worker_fit_cpu_and_memory_in_gpu_group():
     document = _bundle_document()
     context = _managed_document_context(document)
-    group = context['kueue_admission']['queues']['inference_resource_groups'][0]
+    group = _quota_profile(context, 'skypilot-be')[0]
     group['covered_resources'].remove('cpu')
     for flavor in group['flavors']:
         flavor['resources'] = [
@@ -190,7 +247,7 @@ def test_bundle_requires_exact_worker_fit_cpu_and_memory_in_gpu_group():
 
     document = _bundle_document()
     context = _managed_document_context(document)
-    _quota(context, 'inference', 'ml.p5e.48xlarge',
+    _quota(context, 'skypilot-be', 'ml.p5e.48xlarge',
            'cpu')['borrowing_limit'] = '2047'
     with pytest.raises(bundle_lib.BundleValidationError,
                        match='cannot fit the reviewed workers'):
@@ -198,7 +255,7 @@ def test_bundle_requires_exact_worker_fit_cpu_and_memory_in_gpu_group():
 
     document = _bundle_document()
     context = _managed_document_context(document)
-    group = context['kueue_admission']['queues']['inference_resource_groups'][0]
+    group = _quota_profile(context, 'skypilot-be')[0]
     memory_flavors = []
     for flavor in group['flavors']:
         memory = next(resource for resource in flavor['resources']
@@ -209,7 +266,7 @@ def test_bundle_requires_exact_worker_fit_cpu_and_memory_in_gpu_group():
             'resources': [memory],
         })
     group['covered_resources'].remove('memory')
-    context['kueue_admission']['queues']['inference_resource_groups'].append({
+    _quota_profile(context, 'skypilot-be').append({
         'covered_resources': ['memory'],
         'flavors': memory_flavors,
     })
@@ -218,14 +275,14 @@ def test_bundle_requires_exact_worker_fit_cpu_and_memory_in_gpu_group():
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
 
-def test_bundle_bounds_each_inference_resource_by_paired_research_capacity():
+def test_bundle_requires_research_nominal_sum_to_equal_physical_capacity():
     document = _bundle_document()
     context = _managed_document_context(document)
-    _quota(context, 'research', 'ml.p5e.48xlarge',
-           'memory')['borrowing_limit'] = '8000Gi'
+    _quota(context, 'research-ma', 'ml.p5e.48xlarge',
+           'memory')['nominal_quota'] = '8000Gi'
 
     with pytest.raises(bundle_lib.BundleValidationError,
-                       match='bounded by the paired research queue'):
+                       match='research nominal quota'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
 
@@ -234,21 +291,46 @@ def test_bundle_allows_ancillary_resources_but_rejects_unclaimed_gpu_flavor():
 
     document = _bundle_document()
     context = _managed_document_context(document)
-    _quota(context, 'inference', 'ml.m6i.4xlarge',
+    _quota(context, 'skypilot-be', 'ml.m6i.4xlarge',
            'nvidia.com/gpu')['borrowing_limit'] = '1'
     with pytest.raises(bundle_lib.BundleValidationError,
-                       match='positive borrowed GPU flavors'):
+                       match='positive fill GPU quotas'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
 
 def test_bundle_rejects_fractional_gpu_borrowing():
     document = _bundle_document()
     context = _managed_document_context(document)
-    _quota(context, 'inference', 'ml.p5e.48xlarge',
+    _quota(context, 'skypilot-be', 'ml.p5e.48xlarge',
            'nvidia.com/gpu')['borrowing_limit'] = '511.5'
 
     with pytest.raises(bundle_lib.BundleValidationError,
                        match='positive integral borrowed GPU'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+
+@pytest.mark.parametrize('mutation,match', [
+    (lambda context: context['kueue_admission']['queues']['cluster_queues'].pop(
+    ), 'exact reviewed queue set'),
+    (lambda context: _cluster_queue_contract(context, 'skypilot-wa').
+     __setitem__('cohort_name', 'research-workloads'),
+     'exact reviewed queue contract'),
+    (lambda context: context['kueue_admission']['queues']['cohorts'][1].
+     __setitem__('parent_name', 'research-workloads'), 'directly below'),
+    (lambda context: _cluster_queue_contract(context, 'research-be')[
+        'preemption'].__setitem__('borrow_within_cohort', 'LowerPriority'),
+     'without borrowing through sibling nominal floors'),
+    (lambda context: context['kueue_admission'].__setitem__(
+        'workload_priority_class_name', 'be-ls'), 'exact reviewed independent'),
+    (lambda context: context['priority_class'].__setitem__('value', 12),
+     'exact server-owned'),
+])
+def test_bundle_requires_exact_hierarchical_kueue_contract(mutation, match):
+    document = _bundle_document()
+    context = _managed_document_context(document)
+    mutation(context)
+
+    with pytest.raises(bundle_lib.BundleValidationError, match=match):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
 
@@ -483,9 +565,27 @@ def _fake_attest(policy: policy_lib.BoltzReservedFillReclaimPolicy):
     return attest
 
 
+def _fake_receipt_read(policy: policy_lib.BoltzReservedFillReclaimPolicy):
+
+    def read(context_name, identity, gate_generation, _deadline):
+        completed = time.monotonic()
+        return (_context_proof(policy._bundle.fleet_context(context_name),
+                               policy._bundle.provider_context(context_name)),
+                reclaim.ReclaimProviderProofReference(
+                    receipt_nonce='c' * 64,
+                    proof_sha256='d' * 64,
+                    identity=identity,
+                    gate_generation=gate_generation,
+                    kubernetes_context=context_name,
+                    completed_monotonic=completed))
+
+    return read
+
+
 def test_two_arbitrary_services_share_one_canonical_claim_path(monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
-    monkeypatch.setattr(policy, '_attest_contexts', _fake_attest(policy))
+    monkeypatch.setattr(policy, '_read_launch_context',
+                        _fake_receipt_read(policy))
     monkeypatch.setattr(policy, '_emit_proof', mock.Mock())
     context = policy._bundle.fleet_context('phx_research_cluster_eks')
     identity = policy.policy_identity()
@@ -509,12 +609,13 @@ def test_two_arbitrary_services_share_one_canonical_claim_path(monkeypatch):
 def test_unchanged_policy_authorizes_current_service_version_refresh(
         monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
-    monkeypatch.setattr(policy, '_attest_contexts', _fake_attest(policy))
+    monkeypatch.setattr(policy, '_read_launch_context',
+                        _fake_receipt_read(policy))
     monkeypatch.setattr(policy, '_emit_proof', mock.Mock())
     context = policy._bundle.fleet_context('phx_research_cluster_eks')
     identity = policy.policy_identity()
     assert identity.policy_revision == (
-        'boltz-reserved-fill-reclaim-policy/1.1.1386')
+        'boltz-reserved-fill-reclaim-policy/1.1.1416')
 
     authorizations = []
     for service_version in (63, 64):
@@ -589,7 +690,8 @@ def test_unmanaged_context_cannot_claim_with_forged_admission(monkeypatch):
 
 def test_unmanaged_context_accepts_exact_scheduler_admission(monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
-    monkeypatch.setattr(policy, '_attest_contexts', _fake_attest(policy))
+    monkeypatch.setattr(policy, '_read_launch_context',
+                        _fake_receipt_read(policy))
     monkeypatch.setattr(policy, '_emit_proof', mock.Mock())
     context = policy._bundle.fleet_context('prod_research_cluster_eks')
     edge = _edge(context, 'a100')
@@ -847,6 +949,70 @@ def test_provider_domains_and_contexts_start_concurrently(monkeypatch):
 
     assert set(proofs) == set(policy._bundle.contexts)
     assert set(oldest_completions) == set(policy._bundle.contexts)
+
+
+def test_completed_negative_wins_over_indeterminate_peer(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    context_name = 'phx_research_cluster_eks'
+    peer_started = threading.Event()
+    release_peer = threading.Event()
+
+    def provider_job(_context_name, domain, _deadline, _cancellation):
+        if domain == 'aws':
+            peer_started.set()
+            # Model synchronous DNS/libpq-style code that ignores both its
+            # deadline and cooperative cancellation. The enclosing disposable
+            # renewal boundary owns termination after durable invalidation.
+            assert release_peer.wait(timeout=5)
+            raise RuntimeError('late indeterminate AWS transport')
+        assert peer_started.wait(timeout=1)
+        raise kubernetes_attestation.KubernetesAttestationNonconformanceError(
+            'complete Kubernetes mismatch')
+
+    monkeypatch.setattr(policy, '_provider_job', provider_job)
+    started = time.monotonic()
+    try:
+        with pytest.raises(reclaim.ReclaimProviderNonconformanceError,
+                           match='nonconforming'):
+            policy._attest_contexts((context_name,), time.monotonic() + 5)
+        assert time.monotonic() - started < 1
+    finally:
+        release_peer.set()
+    assert _wait_for_no_thread('boltz-reclaim-attest')
+
+
+def test_renewal_context_negative_wins_over_never_returning_peer(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    contexts = policy._bundle.contexts
+    assert len(contexts) == 2
+    peer_started = threading.Event()
+    release_peer = threading.Event()
+
+    class _Repository:
+
+        def renew(self, *, kubernetes_context, **_kwargs):
+            if kubernetes_context == contexts[0]:
+                peer_started.set()
+                assert release_peer.wait(timeout=5)
+                raise RuntimeError('late indeterminate context transport')
+            assert peer_started.wait(timeout=1)
+            raise reclaim.ReclaimProviderNonconformanceError(
+                'committed exact context invalidation')
+
+    monkeypatch.setattr(reclaim_proofs, 'ReclaimProviderProofRepository',
+                        _Repository)
+    started = time.monotonic()
+    try:
+        with pytest.raises(reclaim.ReclaimProviderNonconformanceError,
+                           match='committed exact context invalidation'):
+            policy.renew_provider_proofs(
+                expected_identity=policy.policy_identity(),
+                expected_gate_generation=7,
+                deadline_monotonic=time.monotonic() + 5)
+        assert time.monotonic() - started < 1
+    finally:
+        release_peer.set()
+    assert _wait_for_no_thread('boltz-reclaim-renew')
 
 
 def test_kubernetes_provider_uses_the_exact_assumed_audit_session(monkeypatch):
@@ -1204,30 +1370,37 @@ def _active_object(name: str, spec: dict, namespace: str | None = None) -> dict:
     }
 
 
-def _queue_object(context: dict, *, inference: bool) -> dict:
+def _queue_object(context: dict, name: str) -> dict:
     admission = context['kueue_admission']
     assert admission is not None
     queues = admission['queues']
-    prefix = 'inference' if inference else 'research'
-    resource_groups = queues[f'{prefix}_resource_groups']
+    contract = _cluster_queue_contract(context, name)
+    resource_groups = queues['quota_profiles'][contract['quota_profile']]
     spec = {
-        'cohortName': queues['cohort'],
+        'cohortName': contract['cohort_name'],
+        'fairSharing': {
+            'weight': contract['fair_sharing_weight'],
+        },
+        'flavorFungibility': {
+            'whenCanBorrow': contract['flavor_fungibility']['when_can_borrow'],
+            'whenCanPreempt': contract['flavor_fungibility']
+                              ['when_can_preempt'],
+        },
         'namespaceSelector': {
             'matchLabels': {
-                'kubernetes.io/metadata.name':
-                    (context['namespace']
-                     if inference else queues['research_namespace'])
+                'kubernetes.io/metadata.name': contract['namespace'],
             }
         },
         'preemption': {
             'borrowWithinCohort': {
-                'policy': queues[f'{prefix}_preemption']['borrow_within_cohort']
+                'policy': contract['preemption']['borrow_within_cohort']
             },
-            'reclaimWithinCohort': queues[f'{prefix}_preemption']
+            'reclaimWithinCohort': contract['preemption']
                                    ['reclaim_within_cohort'],
-            'withinClusterQueue': queues[f'{prefix}_preemption']
+            'withinClusterQueue': contract['preemption']
                                   ['within_cluster_queue'],
         },
+        'queueingStrategy': contract['queueing_strategy'],
         'stopPolicy': 'None',
         'resourceGroups': [{
             'coveredResources': copy.deepcopy(group['covered_resources']),
@@ -1241,8 +1414,18 @@ def _queue_object(context: dict, *, inference: bool) -> dict:
             } for flavor in group['flavors']],
         } for group in resource_groups],
     }
-    name = queues[f'{prefix}_cluster_queue']
     return _active_object(name, spec)
+
+
+def _cohort_object(name: str, parent_name: str | None) -> dict:
+    return {
+        'metadata': {
+            'name': name,
+        },
+        'spec': None if parent_name is None else {
+            'parentName': parent_name,
+        },
+    }
 
 
 def _deployment(contract: dict, image_key: str) -> dict:
@@ -1319,6 +1502,14 @@ def _pod_webhook_configuration(contract: dict, controller: dict, *,
     }
 
 
+def _snapshot_node_labels(provider: dict, node: dict) -> dict:
+    flavor = next(flavor for flavor in provider['resource_flavors']
+                  if flavor['name'] == node['flavor'])
+    labels = copy.deepcopy(flavor['node_labels'])
+    labels[node['product_label_key']] = node['product_label_value']
+    return labels
+
+
 def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
     namespace = context['namespace']
     kueue_admission = context['kueue_admission']
@@ -1328,6 +1519,14 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
     controller = enforcement['controller']
     webhooks = enforcement['webhooks']
     queues = kueue_admission['queues']
+    cohort_inventory = [
+        _cohort_object(cohort['name'], cohort['parent_name'])
+        for cohort in queues['cohorts']
+    ]
+    cluster_queue_inventory = [
+        _queue_object(context, queue['name'])
+        for queue in queues['cluster_queues']
+    ]
     snapshot = {
         'namespace': {
             'metadata': {
@@ -1360,13 +1559,14 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
             },
             'value': kueue_admission['workload_priority_value'],
         },
+        'workload_priority_pod_class': None,
         'local_queue': _active_object(
             kueue_admission['local_queue_name'], {
                 'clusterQueue': queues['inference_cluster_queue'],
                 'stopPolicy': 'None',
             }, namespace),
-        'inference_cluster_queue': _queue_object(context, inference=True),
-        'research_cluster_queue': _queue_object(context, inference=False),
+        'cohort_inventory': cohort_inventory,
+        'cluster_queue_inventory': cluster_queue_inventory,
         'resource_flavors': {
             flavor['name']: {
                 'metadata': {
@@ -1383,12 +1583,7 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
                 'items': [{
                     'metadata': {
                         'name': f"initializing-{node['flavor']}",
-                        'labels': {
-                            node['selector_label_key']:
-                                node['selector_label_value'],
-                            node['product_label_key']:
-                                node['product_label_value'],
-                        },
+                        'labels': _snapshot_node_labels(provider, node),
                     },
                     'status': {
                         'capacity': {
@@ -1428,6 +1623,41 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
     if provider['scheduler'] is not None:
         snapshot['scheduler'] = _deployment(provider['scheduler'], 'containers')
     return snapshot
+
+
+def _snapshot_cohort(snapshot: dict, name: str) -> dict:
+    return next(item for item in snapshot['cohort_inventory']
+                if item['metadata']['name'] == name)
+
+
+def _snapshot_cluster_queue(snapshot: dict, name: str) -> dict:
+    return next(item for item in snapshot['cluster_queue_inventory']
+                if item['metadata']['name'] == name)
+
+
+def _membership_cluster_queue(name: str, cohort_name: str) -> dict:
+    return {
+        'metadata': {
+            'name': name,
+        },
+        'spec': {
+            'cohortName': cohort_name,
+        },
+    }
+
+
+def _remove_snapshot_cluster_queue(snapshot: dict, name: str) -> None:
+    snapshot['cluster_queue_inventory'] = [
+        item for item in snapshot['cluster_queue_inventory']
+        if item['metadata']['name'] != name
+    ]
+
+
+def _remove_snapshot_cohort(snapshot: dict, name: str) -> None:
+    snapshot['cohort_inventory'] = [
+        item for item in snapshot['cohort_inventory']
+        if item['metadata']['name'] != name
+    ]
 
 
 def _unmanaged_kubernetes_snapshot(context: dict, provider: dict) -> dict:
@@ -1474,12 +1704,7 @@ def _unmanaged_kubernetes_snapshot(context: dict, provider: dict) -> dict:
                 'items': [{
                     'metadata': {
                         'name': f"initializing-{node['flavor']}",
-                        'labels': {
-                            node['selector_label_key']:
-                                node['selector_label_value'],
-                            node['product_label_key']:
-                                node['product_label_value'],
-                        },
+                        'labels': _snapshot_node_labels(provider, node),
                     },
                     'status': {
                         'capacity': {
@@ -1517,8 +1742,9 @@ def test_kubernetes_snapshot_proves_unmanaged_context_without_kueue_reads():
     snapshot = _unmanaged_kubernetes_snapshot(context, provider)
     snapshot['resource_flavors']['ml.p4d.24xlarge']['spec'][
         'topologyName'] = 'wrong'
-    with pytest.raises(kubernetes_attestation.KubernetesAttestationError,
-                       match='topology'):
+    with pytest.raises(
+            kubernetes_attestation.KubernetesAttestationNonconformanceError,
+            match='topology'):
         kubernetes_attestation.validate_snapshot(context, provider, snapshot)
 
 
@@ -1545,6 +1771,161 @@ def test_kubernetes_snapshot_proves_exact_reclaim_topology():
         product_label_value='NVIDIA-H200',
         resource_name='nvidia.com/gpu',
         capacity_per_node=8),)
+
+
+def test_kubernetes_node_list_selector_uses_all_resource_flavor_labels():
+    bundle = bundle_lib.load_embedded_bundle()
+    provider = bundle.provider_context('phx_research_cluster_eks')
+
+    selector = kubernetes_attestation._resource_flavor_node_selector(
+        provider, 'ml.p5e.48xlarge')
+
+    assert selector == ('beta.kubernetes.io/instance-type=ml.p5e.48xlarge,'
+                        'node.kubernetes.io/instance-type=ml.p5e.48xlarge,'
+                        'sagemaker.amazonaws.com/compute-type=hyperpod')
+
+
+@pytest.mark.parametrize('extra', [
+    ('cluster_queue_inventory',
+     _membership_cluster_queue('foreign-root-member', 'shared-pool')),
+    ('cohort_inventory',
+     _cohort_object('foreign-child-cohort', 'research-workloads')),
+    ('cluster_queue_inventory',
+     _membership_cluster_queue('foreign-child-member', 'research-workloads')),
+])
+def test_kubernetes_snapshot_rejects_unreviewed_governed_members(extra):
+    bundle = bundle_lib.load_embedded_bundle()
+    context = bundle.fleet_context('phx_research_cluster_eks')
+    provider = bundle.provider_context('phx_research_cluster_eks')
+    snapshot = _kubernetes_snapshot(context, provider)
+    inventory_name, item = extra
+    snapshot[inventory_name].append(copy.deepcopy(item))
+
+    with pytest.raises(
+            kubernetes_attestation.KubernetesAttestationNonconformanceError,
+            match='joins the governed Kueue subtree'):
+        kubernetes_attestation.validate_snapshot(context, provider, snapshot)
+
+
+def test_kubernetes_snapshot_allows_unrelated_kueue_subtree():
+    bundle = bundle_lib.load_embedded_bundle()
+    context = bundle.fleet_context('phx_research_cluster_eks')
+    provider = bundle.provider_context('phx_research_cluster_eks')
+    snapshot = _kubernetes_snapshot(context, provider)
+    snapshot['cohort_inventory'].append(_cohort_object('unrelated-root', None))
+    snapshot['cohort_inventory'].append(
+        _cohort_object('unrelated-child', 'unrelated-root'))
+    snapshot['cluster_queue_inventory'].append(
+        _membership_cluster_queue('unrelated-member', 'unrelated-child'))
+
+    proof = kubernetes_attestation.validate_snapshot(context, provider,
+                                                     snapshot)
+
+    assert proof.kueue_managed
+    assert proof.cluster_queue_name == 'skypilot-be'
+
+
+def test_paginated_kueue_inventory_exposes_later_governed_member():
+    bundle = bundle_lib.load_embedded_bundle()
+    context = bundle.fleet_context('phx_research_cluster_eks')
+    provider = bundle.provider_context('phx_research_cluster_eks')
+    snapshot = _kubernetes_snapshot(context, provider)
+    calls = []
+
+    class CustomObjects:
+        """Return a complete inventory split across two pages."""
+
+        def list_cluster_custom_object(self, **kwargs):
+            calls.append(kwargs)
+            if '_continue' not in kwargs:
+                return {
+                    'items': copy.deepcopy(snapshot['cluster_queue_inventory']),
+                    'metadata': {
+                        'continue': 'second-page',
+                    },
+                }
+            assert kwargs['_continue'] == 'second-page'
+            return {
+                'items': [
+                    _membership_cluster_queue('late-foreign-member',
+                                              'shared-pool')
+                ],
+                'metadata': {
+                    'continue': '',
+                },
+            }
+
+    snapshot['cluster_queue_inventory'] = (
+        kubernetes_attestation._list_kueue_objects(
+            CustomObjects(),
+            plural='clusterqueues',
+            deadline_monotonic=time.monotonic() + 5,
+            cancellation=threading.Event()))
+
+    assert len(calls) == 2
+    assert calls[0]['_limit'] == kubernetes_attestation._KUEUE_LIST_PAGE_LIMIT
+    with pytest.raises(
+            kubernetes_attestation.KubernetesAttestationNonconformanceError,
+            match='late-foreign-member'):
+        kubernetes_attestation.validate_snapshot(context, provider, snapshot)
+
+
+@pytest.mark.parametrize('continuation', ['repeat', 17])
+def test_kueue_inventory_rejects_invalid_pagination(continuation):
+    calls = 0
+
+    class CustomObjects:
+        """Return the same configured continuation for every page."""
+
+        def list_cluster_custom_object(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            del kwargs
+            return {
+                'items': [],
+                'metadata': {
+                    'continue': continuation,
+                },
+            }
+
+    with pytest.raises(
+            kubernetes_attestation.KubernetesAttestationIndeterminateError,
+            match='pagination'):
+        kubernetes_attestation._list_kueue_objects(
+            CustomObjects(),
+            plural='cohorts',
+            deadline_monotonic=time.monotonic() + 5,
+            cancellation=threading.Event())
+    assert calls == (2 if continuation == 'repeat' else 1)
+
+
+def test_kueue_inventory_rejects_page_cap_exhaustion(monkeypatch):
+    calls = 0
+
+    class CustomObjects:
+        """Never finish the paginated inventory."""
+
+        def list_cluster_custom_object(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            del kwargs
+            return {
+                'items': [],
+                'metadata': {
+                    'continue': f'page-{calls}',
+                },
+            }
+
+    monkeypatch.setattr(kubernetes_attestation, '_KUEUE_LIST_MAX_PAGES', 2)
+    with pytest.raises(
+            kubernetes_attestation.KubernetesAttestationIndeterminateError,
+            match='bounded'):
+        kubernetes_attestation._list_kueue_objects(
+            CustomObjects(),
+            plural='cohorts',
+            deadline_monotonic=time.monotonic() + 5,
+            cancellation=threading.Event())
+    assert calls == 2
 
 
 def test_kubernetes_snapshot_ignores_platform_admission_policy_objects():
@@ -1576,7 +1957,8 @@ def test_kubernetes_snapshot_ignores_platform_admission_policy_objects():
 
 
 def _remove_inference_quota_atom(snapshot: dict, resource_name: str) -> None:
-    group = snapshot['inference_cluster_queue']['spec']['resourceGroups'][0]
+    group = _snapshot_cluster_queue(snapshot,
+                                    'skypilot-be')['spec']['resourceGroups'][0]
     flavor = group['flavors'][0]
     flavor['resources'] = [
         resource for resource in flavor['resources']
@@ -1586,14 +1968,22 @@ def _remove_inference_quota_atom(snapshot: dict, resource_name: str) -> None:
 
 def _set_inference_borrowing(snapshot: dict, resource_name: str,
                              quantity: str) -> None:
-    group = snapshot['inference_cluster_queue']['spec']['resourceGroups'][0]
+    _set_queue_quota(snapshot, 'skypilot-be', resource_name, 'borrowingLimit',
+                     quantity)
+
+
+def _set_queue_quota(snapshot: dict, queue_name: str, resource_name: str,
+                     quota_name: str, quantity: str) -> None:
+    group = _snapshot_cluster_queue(snapshot,
+                                    queue_name)['spec']['resourceGroups'][0]
     resource = next(resource for resource in group['flavors'][0]['resources']
                     if resource['name'] == resource_name)
-    resource['borrowingLimit'] = quantity
+    resource[quota_name] = quantity
 
 
 def _move_inference_memory_to_another_group(snapshot: dict) -> None:
-    groups = snapshot['inference_cluster_queue']['spec']['resourceGroups']
+    groups = _snapshot_cluster_queue(snapshot,
+                                     'skypilot-be')['spec']['resourceGroups']
     group = groups[0]
     flavor = group['flavors'][0]
     memory = next(resource for resource in flavor['resources']
@@ -1610,7 +2000,8 @@ def _move_inference_memory_to_another_group(snapshot: dict) -> None:
 
 
 def _add_inference_quota_atom(snapshot: dict) -> None:
-    group = snapshot['inference_cluster_queue']['spec']['resourceGroups'][0]
+    group = _snapshot_cluster_queue(snapshot,
+                                    'skypilot-be')['spec']['resourceGroups'][0]
     group['coveredResources'].append('example.com/unreviewed')
     group['flavors'][0]['resources'].append({
         'name': 'example.com/unreviewed',
@@ -1620,7 +2011,8 @@ def _add_inference_quota_atom(snapshot: dict) -> None:
 
 
 def _add_inference_resource_group(snapshot: dict) -> None:
-    groups = snapshot['inference_cluster_queue']['spec']['resourceGroups']
+    groups = _snapshot_cluster_queue(snapshot,
+                                     'skypilot-be')['spec']['resourceGroups']
     groups.append({
         'coveredResources': ['example.com/unreviewed'],
         'flavors': [{
@@ -1635,13 +2027,14 @@ def _add_inference_resource_group(snapshot: dict) -> None:
 
 
 def _duplicate_inference_resource_group(snapshot: dict) -> None:
-    groups = snapshot['inference_cluster_queue']['spec']['resourceGroups']
+    groups = _snapshot_cluster_queue(snapshot,
+                                     'skypilot-be')['spec']['resourceGroups']
     groups.append(copy.deepcopy(groups[0]))
 
 
 def _duplicate_inference_quota_atom(snapshot: dict) -> None:
-    flavor = snapshot['inference_cluster_queue']['spec']['resourceGroups'][0][
-        'flavors'][0]
+    flavor = _snapshot_cluster_queue(
+        snapshot, 'skypilot-be')['spec']['resourceGroups'][0]['flavors'][0]
     flavor['resources'].append(copy.deepcopy(flavor['resources'][0]))
 
 
@@ -1651,6 +2044,11 @@ def _duplicate_inference_quota_atom(snapshot: dict) -> None:
     (lambda snapshot: snapshot['resource_flavors']['ml.p5e.48xlarge']['spec']
      ['nodeLabels'].__setitem__('beta.kubernetes.io/instance-type', 'ml.wrong'),
      'instance selector'),
+    (lambda snapshot: snapshot['resource_flavors']['ml.p5e.48xlarge']['spec'][
+        'nodeLabels'].__setitem__('example.com/unreviewed', 'true'),
+     'exact reviewed'),
+    (lambda snapshot: snapshot['resource_flavors']['ml.p5e.48xlarge']['spec'].
+     __setitem__('nodeTaints', []), 'exact reviewed'),
     (lambda snapshot: snapshot['resource_flavors']['ml.p5e.48xlarge']['spec'].
      __setitem__('topologyName', 'wrong'), 'topology'),
     (lambda snapshot: snapshot['nodes'][
@@ -1660,12 +2058,37 @@ def _duplicate_inference_quota_atom(snapshot: dict) -> None:
      ['capacity'].__setitem__('nvidia.com/gpu', '4'), 'GPU product'),
     (lambda snapshot: snapshot['local_queue']['spec'].__setitem__(
         'clusterQueue', 'wrong'), 'LocalQueue target'),
+    (lambda snapshot: snapshot['workload_priority_class'].__setitem__(
+        'value', 12), 'WorkloadPriorityClass reclaim contract'),
+    (lambda snapshot: snapshot.__setitem__('workload_priority_pod_class', {}),
+     'workload-only priority'),
+    (lambda snapshot: _snapshot_cohort(snapshot, 'research-workloads')['spec'].
+     __setitem__('parentName', 'wrong'), 'exact reviewed parent'),
+    (lambda snapshot: _remove_snapshot_cohort(snapshot, 'research-workloads'),
+     'missing reviewed objects'),
+    (lambda snapshot: _remove_snapshot_cluster_queue(snapshot, 'research-be'),
+     'missing reviewed objects'),
+    (lambda snapshot: _snapshot_cluster_queue(snapshot, 'skypilot-wa')['spec'][
+        'preemption'].__setitem__('reclaimWithinCohort', 'Any'),
+     'reviewed reclaim contract'),
+    (lambda snapshot: _snapshot_cluster_queue(snapshot, 'research-ma')[
+        'spec'].__setitem__('queueingStrategy', 'BestEffortFIFO'),
+     'reviewed reclaim contract'),
+    (lambda snapshot: _snapshot_cluster_queue(snapshot, 'skypilot-be')['spec'][
+        'fairSharing'].__setitem__('weight', '1'), 'reviewed reclaim contract'),
+    (lambda snapshot: _snapshot_cluster_queue(snapshot, 'skypilot-be')['spec'][
+        'flavorFungibility'].__setitem__('whenCanBorrow', 'Borrow'),
+     'reviewed reclaim contract'),
+    (lambda snapshot: _set_queue_quota(snapshot, 'research-ma',
+                                       'nvidia.com/gpu', 'nominalQuota', '447'),
+     'reviewed reclaim contract'),
     (lambda snapshot: snapshot['kueue_config']['data'].__setitem__(
         'controller_manager_config.yaml',
         'integrations:\n  frameworks:\n  - pod\nfeatureGates: {}\n'),
      'required feature gate'),
-    (lambda snapshot: snapshot['research_cluster_queue']['spec']['preemption'].
-     __setitem__('reclaimWithinCohort', 'Never'), 'reclaim contract'),
+    (lambda snapshot: _snapshot_cluster_queue(snapshot, 'research-ma')['spec'][
+        'preemption'].__setitem__('reclaimWithinCohort', 'Never'),
+     'reclaim contract'),
     (lambda snapshot: _remove_inference_quota_atom(snapshot, 'cpu'),
      'exact resource group'),
     (lambda snapshot: _remove_inference_quota_atom(snapshot, 'memory'),
@@ -1679,8 +2102,8 @@ def _duplicate_inference_quota_atom(snapshot: dict) -> None:
     (_add_inference_resource_group, 'reclaim contract'),
     (_duplicate_inference_resource_group, 'overlapping resource groups'),
     (_duplicate_inference_quota_atom, 'duplicate quota atoms'),
-    (lambda snapshot: snapshot['inference_cluster_queue']['spec'].__setitem__(
-        'resourceGroups', []), 'reclaim contract'),
+    (lambda snapshot: _snapshot_cluster_queue(snapshot, 'skypilot-be')['spec'].
+     __setitem__('resourceGroups', []), 'reclaim contract'),
     (lambda snapshot: snapshot['validating_webhook']['webhooks'][0].__setitem__(
         'rules', []), 'Pod admission contract'),
     (lambda snapshot: snapshot['validating_webhook']['webhooks'][0]['rules'][0].
@@ -1703,8 +2126,9 @@ def test_kubernetes_snapshot_fails_closed_on_drift(mutation, match):
     snapshot = _kubernetes_snapshot(context, provider)
     mutation(snapshot)
 
-    with pytest.raises(kubernetes_attestation.KubernetesAttestationError,
-                       match=match):
+    with pytest.raises(
+            kubernetes_attestation.KubernetesAttestationNonconformanceError,
+            match=match):
         kubernetes_attestation.validate_snapshot(context, provider, snapshot)
 
 
@@ -1727,21 +2151,65 @@ def test_kubernetes_snapshot_requires_a_non_deleting_node(nodes):
     snapshot = _kubernetes_snapshot(context, provider)
     snapshot['nodes']['ml.p5e.48xlarge']['items'] = nodes
 
-    with pytest.raises(kubernetes_attestation.KubernetesAttestationError,
-                       match='no non-deleting Node'):
+    with pytest.raises(
+            kubernetes_attestation.KubernetesAttestationNonconformanceError,
+            match='no non-deleting Node'):
         kubernetes_attestation.validate_snapshot(context, provider, snapshot)
 
 
-def test_kubernetes_snapshot_rejects_node_selector_mismatch():
+def test_kubernetes_snapshot_requires_complete_node_selector_match():
     bundle = bundle_lib.load_embedded_bundle()
     context = bundle.fleet_context('phx_research_cluster_eks')
     provider = bundle.provider_context('phx_research_cluster_eks')
     snapshot = _kubernetes_snapshot(context, provider)
-    snapshot['nodes']['ml.p5e.48xlarge']['items'][0]['metadata']['labels'][
-        'beta.kubernetes.io/instance-type'] = 'ml.wrong'
+    del snapshot['nodes']['ml.p5e.48xlarge']['items'][0]['metadata']['labels'][
+        'sagemaker.amazonaws.com/compute-type']
 
-    with pytest.raises(kubernetes_attestation.KubernetesAttestationError,
-                       match='instance selector'):
+    with pytest.raises(
+            kubernetes_attestation.KubernetesAttestationNonconformanceError,
+            match='complete reviewed ResourceFlavor instance selector'):
+        kubernetes_attestation.validate_snapshot(context, provider, snapshot)
+
+
+def test_kubernetes_snapshot_keeps_malformed_response_indeterminate():
+    bundle = bundle_lib.load_embedded_bundle()
+    context = bundle.fleet_context('phx_research_cluster_eks')
+    provider = bundle.provider_context('phx_research_cluster_eks')
+    snapshot = _kubernetes_snapshot(context, provider)
+    _snapshot_cluster_queue(snapshot, 'skypilot-be')['spec'] = None
+
+    with pytest.raises(
+            kubernetes_attestation.KubernetesAttestationIndeterminateError,
+            match='invalid skypilot-be ClusterQueue membership spec data'):
+        kubernetes_attestation.validate_snapshot(context, provider, snapshot)
+
+
+@pytest.mark.parametrize('mutation', [
+    lambda snapshot: snapshot['cluster_queue_inventory'].append(
+        copy.deepcopy(snapshot['cluster_queue_inventory'][0])),
+    lambda snapshot: snapshot['cohort_inventory'][0]['metadata'].pop('name'),
+    lambda snapshot: snapshot['cohort_inventory'].append({
+        'metadata': {
+            'name': 'unclassifiable-cohort'
+        },
+        'spec': [],
+    }),
+    lambda snapshot: snapshot['cluster_queue_inventory'].append({
+        'metadata': {
+            'name': 'unclassifiable-queue'
+        },
+        'spec': [],
+    }),
+])
+def test_kubernetes_snapshot_keeps_malformed_membership_indeterminate(mutation):
+    bundle = bundle_lib.load_embedded_bundle()
+    context = bundle.fleet_context('phx_research_cluster_eks')
+    provider = bundle.provider_context('phx_research_cluster_eks')
+    snapshot = _kubernetes_snapshot(context, provider)
+    mutation(snapshot)
+
+    with pytest.raises(
+            kubernetes_attestation.KubernetesAttestationIndeterminateError):
         kubernetes_attestation.validate_snapshot(context, provider, snapshot)
 
 

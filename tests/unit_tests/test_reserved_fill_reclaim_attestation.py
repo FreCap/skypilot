@@ -52,6 +52,11 @@ class _Policy(attestation.ReservedFillReclaimPolicy):
         del deadline_monotonic
         raise NotImplementedError
 
+    def renew_provider_proofs(self, *, expected_identity,
+                              expected_gate_generation, deadline_monotonic):
+        del expected_identity, expected_gate_generation, deadline_monotonic
+        raise NotImplementedError
+
     def authorize_launch(self, scope, *, expected_identity,
                          expected_gate_generation, deadline_monotonic):
         del scope, expected_identity, expected_gate_generation
@@ -185,8 +190,7 @@ def test_launch_authorization_handoff_requires_minimum_remaining_freshness(
                 attestation.LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS))
 
 
-@pytest.mark.parametrize('mismatch',
-                         ('identity', 'gate', 'context', 'completion'))
+@pytest.mark.parametrize('mismatch', ('identity', 'gate', 'context'))
 def test_launch_authorization_rejects_provider_proof_reference_mismatch(
         mismatch: str) -> None:
     identity = attestation.ReclaimPolicyIdentity(
@@ -211,10 +215,6 @@ def test_launch_authorization_rejects_provider_proof_reference_mismatch(
         authorization_gate = 8
     elif mismatch == 'context':
         scope = _launch_scope('secondary')
-    else:
-        assert mismatch == 'completion'
-        completed_monotonic = 10.1
-
     with pytest.raises(ValueError, match='reference|completion'):
         attestation.ReclaimLaunchAuthorization(
             identity=authorization_identity,
@@ -222,6 +222,30 @@ def test_launch_authorization_rejects_provider_proof_reference_mismatch(
             scope=scope,
             provider_proof_reference=reference,
             completed_monotonic=completed_monotonic)
+
+
+def test_launch_authorization_is_newer_than_provider_observation() -> None:
+    identity = attestation.ReclaimPolicyIdentity(
+        fleet_bundle_sha256='a' * 64,
+        policy_revision='bundle-policy-v1',
+        provider_inventory_sha256='b' * 64)
+    reference = attestation.ReclaimProviderProofReference(
+        receipt_nonce='c' * 64,
+        proof_sha256='d' * 64,
+        identity=identity,
+        gate_generation=7,
+        kubernetes_context='research',
+        completed_monotonic=10.0)
+    authorization = attestation.ReclaimLaunchAuthorization(
+        identity=identity,
+        gate_generation=7,
+        scope=_launch_scope(),
+        provider_proof_reference=reference,
+        completed_monotonic=10.1)
+    assert authorization.completed_monotonic > (
+        authorization.provider_proof_reference.completed_monotonic)
+    with pytest.raises(ValueError, match='cannot predate'):
+        dataclasses.replace(authorization, completed_monotonic=9.9)
 
 
 def test_projected_admission_rejects_invalid_pod_identity_role() -> None:

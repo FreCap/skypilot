@@ -38,6 +38,7 @@ import binascii
 from collections.abc import Callable
 from collections.abc import Mapping
 from collections.abc import Sequence
+import concurrent.futures
 import contextlib
 import dataclasses
 import hashlib
@@ -60,6 +61,7 @@ from sky.serve import reserved_capacity_allocation
 from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import serve_state
 from sky.server.requests import postgres as request_postgres
+from sky.server.requests import process as request_process
 from sky.utils import common_utils
 from sky.utils import locks
 from sky.utils.db import migration_utils
@@ -120,6 +122,8 @@ _WRITER_INSTANCE_STALE_AFTER_SECONDS = 20
 _HELM_INSTANCE_LABEL = 'app.kubernetes.io/instance'
 _MIGRATION_COMPONENT_LABEL = 'app.kubernetes.io/component'
 _MIGRATION_COMPONENT = 'database-migration'
+_RECLAIM_CLAIM_BOUNDARY_DRAIN_TIMEOUT_SECONDS = 10.0
+_RECLAIM_CLAIM_BOUNDARY_TIMEOUT_SECONDS = 5.0
 
 
 class ProtocolV2ActivationError(RuntimeError):
@@ -1889,6 +1893,141 @@ def _prune_claims(protocol_version: int, expired_before: float) -> list[Any]:
     return serve_state.prune_reserved_fill_claims(expired_before)
 
 
+def _authorize_reclaim_claim_set_handler(
+    scope: reserved_fill_reclaim_attestation.ReclaimClaimSetScope,
+    expected_identity: (
+        reserved_fill_reclaim_attestation.ReclaimPolicyIdentity),
+    expected_gate_generation: int,
+) -> reserved_fill_reclaim_attestation.ReclaimClaimAuthorization:
+    """Authorize one complete claim inside a disposable child process."""
+    # Start the PostgreSQL-only operation clock in the final handler, after
+    # spawn/import bootstrap. Process startup remains separately bounded by
+    # DisposableExecutor and cannot consume the receipt-read horizon.
+    deadline_monotonic = (
+        reserved_fill_reclaim_attestation.new_provider_proof_read_deadline())
+    policy = reserved_fill_reclaim_attestation.require_unique_policy()
+    reserved_fill_reclaim_attestation.require_exact_policy_identity(
+        policy, expected_identity)
+    authorization = policy.authorize_claim_set(
+        scope,
+        expected_identity=expected_identity,
+        expected_gate_generation=expected_gate_generation,
+        deadline_monotonic=deadline_monotonic)
+    reserved_fill_reclaim_attestation.require_policy_operation_completed(
+        deadline_monotonic)
+    reserved_fill_reclaim_attestation.require_exact_claim_authorization(
+        authorization,
+        expected_identity=expected_identity,
+        expected_gate_generation=expected_gate_generation,
+        expected_scope=scope)
+    return authorization
+
+
+def _execute_claim_authorization_in_boundary(
+    executor: request_process.DisposableExecutor,
+    operation: Callable[..., Any],
+    args: tuple[Any, ...],
+    timeout_seconds: float,
+) -> Any:
+    """Run one claim read and prove its complete process family absent."""
+    if (not math.isfinite(timeout_seconds) or timeout_seconds <= 0):
+        raise ValueError('Claim authorization timeout must be positive.')
+    if executor.max_workers != 1:
+        raise ValueError('Claim authorization requires one finite owned lane.')
+    future = executor.submit(operation, *args)
+    deadline_monotonic = time.monotonic() + timeout_seconds
+
+    def _require_lane_released() -> None:
+        release_deadline = (time.monotonic() +
+                            _RECLAIM_CLAIM_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
+        while not executor.has_idle_workers():
+            if executor.poisoned:
+                raise request_process.AmbiguousBoundaryError(
+                    'Reclaim claim authorization lost process-family proof.')
+            if time.monotonic() >= release_deadline:
+                release_error = request_process.BoundaryExecutionError(
+                    'Reclaim claim authorization drained its process family '
+                    'but did not release the owned executor lane.')
+                ambiguity = request_process.AmbiguousBoundaryError(
+                    'Reclaim claim authorization cannot prove reusable '
+                    'single-lane ownership.')
+                ambiguity.__cause__ = release_error
+                # Poisoning synchronously invokes the controller's fail-stop
+                # callback. Merely raising here would be swallowed by legacy
+                # direct callers or could let a thread supervisor create a new
+                # lane in the same controller process.
+                executor._poison(ambiguity)  # pylint: disable=protected-access
+                raise ambiguity
+            time.sleep(0.01)
+
+    try:
+        remaining = deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise concurrent.futures.TimeoutError
+        result = future.result(timeout=remaining)
+    except concurrent.futures.TimeoutError as timeout_error:
+        # A completed child may itself report TimeoutError. InvocationFuture
+        # completes only after its guardian authenticated a drained family, so
+        # cancellation is required only while the invocation is still live.
+        if not future.done():
+            future.request_cancel()
+            try:
+                future.result(
+                    timeout=_RECLAIM_CLAIM_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
+            except concurrent.futures.TimeoutError as drain_error:
+                if not future.done():
+                    boundary_error = request_process.BoundaryExecutionError(
+                        'Reclaim claim authorization timed out without a '
+                        'process-family drain result.')
+                    boundary_error.__cause__ = drain_error
+                    ambiguity = request_process.AmbiguousBoundaryError(
+                        'Reclaim claim authorization cannot prove its process '
+                        'family absent after cancellation.')
+                    ambiguity.__cause__ = boundary_error
+                    # A missing drain result is a controller-lifetime failure,
+                    # not a retryable claim error. Poisoning synchronously
+                    # invokes the controller fail-stop callback and prevents
+                    # this finite lane from accepting another invocation.
+                    executor._poison(  # pylint: disable=protected-access
+                        ambiguity)
+                    raise ambiguity from boundary_error
+            except Exception:  # pylint: disable=broad-except
+                # Cancellation or the handler's original failure is expected
+                # after the authenticated result proves its family absent.
+                pass
+        _require_lane_released()
+        raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
+            'Reclaim claim authorization exceeded its bounded process '
+            'lifetime.') from timeout_error
+    except Exception:
+        _require_lane_released()
+        raise
+    _require_lane_released()
+    reserved_fill_reclaim_attestation.require_policy_operation_completed(
+        deadline_monotonic)
+    return result
+
+
+def _authorize_reclaim_claim_set_in_boundary(
+    executor: request_process.DisposableExecutor,
+    scope: reserved_fill_reclaim_attestation.ReclaimClaimSetScope,
+    expected_identity: (
+        reserved_fill_reclaim_attestation.ReclaimPolicyIdentity),
+    expected_gate_generation: int,
+) -> reserved_fill_reclaim_attestation.ReclaimClaimAuthorization:
+    """Return a parent-revalidated authorization from one owned boundary."""
+    authorization = _execute_claim_authorization_in_boundary(
+        executor, _authorize_reclaim_claim_set_handler,
+        (scope, expected_identity, expected_gate_generation),
+        _RECLAIM_CLAIM_BOUNDARY_TIMEOUT_SECONDS)
+    reserved_fill_reclaim_attestation.require_exact_claim_authorization(
+        authorization,
+        expected_identity=expected_identity,
+        expected_gate_generation=expected_gate_generation,
+        expected_scope=scope)
+    return authorization
+
+
 def replace_claim_set(
     service_name: str,
     *,
@@ -1899,6 +2038,8 @@ def replace_claim_set(
     edges: Sequence[dict[str, Any]],
     expected_service_hash: str | None,
     expected_controller_owner: tuple[int | None, str | None] | None = None,
+    claim_authorization_executor: request_process.DisposableExecutor |
+    None = None,
 ) -> int | None:
     """Atomically heartbeat one complete authoritative protocol-v2 set.
 
@@ -2048,23 +2189,29 @@ def replace_claim_set(
             if reclaim_identity is None:
                 raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
                     'Sequenced reconciliation has no reclaim-policy identity.')
-            policy = reserved_fill_reclaim_attestation.require_unique_policy()
-            (reserved_fill_reclaim_attestation.require_exact_policy_identity)(
-                policy, reclaim_identity)
-            policy_deadline = (reserved_fill_reclaim_attestation.
-                               new_policy_operation_deadline())
-            claim_authorization = policy.authorize_claim_set(
-                claim_scope,
-                expected_identity=reclaim_identity,
-                expected_gate_generation=gate.generation,
-                deadline_monotonic=policy_deadline)
-            (reserved_fill_reclaim_attestation.
-             require_policy_operation_completed)(policy_deadline)
-            (reserved_fill_reclaim_attestation.require_exact_claim_authorization
-            )(claim_authorization,
-              expected_identity=reclaim_identity,
-              expected_gate_generation=gate.generation,
-              expected_scope=claim_scope)
+            executor = claim_authorization_executor
+            owned_executor = None
+            if executor is None:
+                owned_executor = request_process.DisposableExecutor(
+                    max_workers=1)
+                executor = owned_executor
+            try:
+                claim_authorization = (
+                    _authorize_reclaim_claim_set_in_boundary)(executor,
+                                                              claim_scope,
+                                                              reclaim_identity,
+                                                              gate.generation)
+            finally:
+                if owned_executor is not None:
+                    owned_executor.shutdown(
+                        timeout=(_RECLAIM_CLAIM_BOUNDARY_DRAIN_TIMEOUT_SECONDS))
+    except (request_process.AmbiguousBoundaryError,
+            request_process.BoundaryShutdownPendingError):
+        _clear_service_cache(service_name)
+        # The persistent production lane is now poisoned. Propagate through
+        # the poller so its supervisor cannot begin another claim read while
+        # the controller's fail-stop callback fences this process.
+        raise
     except Exception as error:  # pylint: disable=broad-except
         _clear_service_cache(service_name)
         logger.error(
