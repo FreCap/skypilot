@@ -1274,7 +1274,7 @@ def test_heterogenous_gpu_detection():
          mock.patch('sky.provision.kubernetes.utils.check_credentials', return_value=[True]), \
          mock.patch('sky.provision.kubernetes.utils.detect_accelerator_resource', return_value=True), \
          mock.patch('sky.provision.kubernetes.utils.detect_gpu_label_formatter', return_value=[utils.GKELabelFormatter(), None]), \
-         mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes', return_value=[mock_node1, mock_node2]), \
+         mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes_uncached', return_value=[mock_node1, mock_node2]), \
          mock.patch('sky.provision.kubernetes.utils.get_allocated_resources_by_node', return_value=({mock_node1.metadata.name: 1, mock_node2.metadata.name: 0}, {}, {}, None, {})), \
          mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key', return_value='nvidia.com/gpu'):
 
@@ -1284,6 +1284,50 @@ def test_heterogenous_gpu_detection():
             (f'Keys of counts ({list(counts.keys())}), capacity ({list(capacity.keys())}), '
              f'and available ({list(available.keys())}) must be the same.')
         assert available == {'H100': 1}
+
+
+def test_realtime_gpu_detection_observes_uncordon_without_cache_clear():
+    """Realtime availability must not retain request-cached node state."""
+
+    def make_node(*, cordoned: bool):
+        node = mock.MagicMock()
+        node.metadata.name = 'gpu-node'
+        node.metadata.labels = {
+            'cloud.google.com/gke-accelerator': 'nvidia-h100-80gb',
+        }
+        node.status.allocatable = {'nvidia.com/gpu': '8'}
+        node.is_ready.return_value = True
+        node.is_cordoned.return_value = cordoned
+        node.get_taints.return_value = []
+        return node
+
+    cached_cordoned_node = make_node(cordoned=True)
+    realtime_cordoned_node = make_node(cordoned=True)
+    uncordoned_node = make_node(cordoned=False)
+    with mock.patch('sky.clouds.cloud_in_iterable', return_value=True), \
+         mock.patch('sky.provision.kubernetes.utils.check_credentials', return_value=[True]), \
+         mock.patch('sky.provision.kubernetes.utils.detect_accelerator_resource', return_value=True), \
+         mock.patch('sky.provision.kubernetes.utils.detect_gpu_label_formatter', return_value=[utils.GKELabelFormatter(), None]), \
+         mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes_uncached', side_effect=[[cached_cordoned_node], [realtime_cordoned_node], [uncordoned_node]]) as get_nodes, \
+         mock.patch('sky.provision.kubernetes.utils.get_allocated_gpu_qty_by_node', return_value=collections.defaultdict(int)), \
+         mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key', return_value='nvidia.com/gpu'):
+        cached_nodes = utils.get_kubernetes_nodes(context='test-context')
+        _, _, cordoned_available = (
+            kubernetes_catalog.list_accelerators_realtime(
+                True, None, 'test-context', None))
+        _, _, uncordoned_available = (
+            kubernetes_catalog.list_accelerators_realtime(
+                True, None, 'test-context', None))
+
+        # The request cache intentionally remains stale; realtime reads must
+        # bypass it rather than globally clearing unrelated request state.
+        assert utils.get_kubernetes_nodes(
+            context='test-context') is cached_nodes
+
+    assert cordoned_available == {'H100': 0}
+    assert uncordoned_available == {'H100': 8}
+    assert cached_nodes == [cached_cordoned_node]
+    assert get_nodes.call_count == 3
 
 
 def test_low_priority_pod_filtering():
