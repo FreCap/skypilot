@@ -3129,6 +3129,7 @@ def reserved_fill_reclaim_launch_authority_holds(
                     type(current_service_generation) is not int or
                     current_service_generation < fence.service_generation or
                     current_service_generation > protocol['claim_generation'] or
+                    not edge_rows or
                     len(edge_rows) != claim_set['edge_count'] or
                     any(edge['service_generation'] != current_service_generation
                         for edge in edge_rows)):

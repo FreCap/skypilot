@@ -449,15 +449,48 @@ def test_new_claim_generation_does_not_require_superseded_edge(monkeypatch):
     monkeypatch.setattr(serve_state.zero_cost_actuation,
                         'committed_intent_matches_replica_in_connection',
                         intent_match)
+    successor_pool_key = broker.make_pool_key(
+        'east-context',
+        'A100',
+        protocol_version=broker.PROTOCOL_V2,
+        physical_cluster_uid='successor-physical-uid')
     _install_gate(monkeypatch,
                   _gate(sequenced=True),
                   claim_generation=8,
-                  edge_rows=[])
+                  edge_rows=[{
+                      'pool_key': successor_pool_key,
+                      'access_context': 'east-context',
+                      'physical_cluster_uid': 'successor-physical-uid',
+                      'gpus_per_replica': 1,
+                      'service_generation': 8,
+                      'accelerator_names': ['a100'],
+                      'worker_projection_sha256_by_accelerator': {
+                          'a100': 'f' * 64,
+                      },
+                  }])
 
     assert serve_state.reserved_fill_reclaim_launch_authority_holds(
         _scope(context), _launch_authorization(_scope(context)), context,
         snapshot)
     intent_match.assert_called_once()
+
+
+def test_new_claim_generation_rejects_empty_authoritative_set(monkeypatch):
+    context = _launch_context()
+    snapshot = _launch_snapshot(context)
+    intent_match = mock.Mock(return_value=True)
+    monkeypatch.setattr(serve_state.zero_cost_actuation,
+                        'committed_intent_matches_replica_in_connection',
+                        intent_match)
+    _install_gate(monkeypatch,
+                  _gate(sequenced=True),
+                  claim_generation=8,
+                  edge_rows=[])
+
+    assert not serve_state.reserved_fill_reclaim_launch_authority_holds(
+        _scope(context), _launch_authorization(_scope(context)), context,
+        snapshot)
+    intent_match.assert_not_called()
 
 
 def test_original_claim_generation_still_requires_matching_edge(monkeypatch):
