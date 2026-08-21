@@ -73,6 +73,7 @@ def test_current_version_failures_are_kept(manager, monkeypatch):
     """The operator must still see why the version they run is failing."""
     assert _run(manager, monkeypatch,
                 [_info(1, 56, Status.FAILED_PROVISION)]) == []
+    assert not manager._superseded_prune_pending
 
 
 @pytest.mark.parametrize('status', [Status.FAILED_CLEANUP, Status.UNKNOWN])
@@ -130,6 +131,56 @@ def test_the_sweep_does_not_rescan_on_every_tick(manager, monkeypatch):
     manager._prune_superseded_failed_replicas()
     assert scans['n'] == 1
     assert manager.removed == [1]
+
+
+def test_inventory_failure_keeps_the_sweep_armed(manager, monkeypatch):
+    """A transient inventory read cannot consume the version-edge signal."""
+    infos = [_info(1, 40, Status.FAILED_PROVISION)]
+    attempts = iter([RuntimeError('transient inventory failure'), infos])
+
+    def _read(name):
+        del name
+        result = next(attempts)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(serve_state, 'get_replica_infos', _read)
+    with pytest.raises(RuntimeError, match='transient inventory failure'):
+        manager._prune_superseded_failed_replicas()
+    assert manager._superseded_prune_pending
+
+    manager._prune_superseded_failed_replicas()
+    assert manager.removed == [1]
+    assert not manager._superseded_prune_pending
+
+
+def test_batch_failure_keeps_the_entire_sweep_retryable(manager, monkeypatch):
+    """A failed transaction retries the same eligible batch on the next tick."""
+    infos = [
+        _info(2, 40, Status.FAILED_INITIAL_DELAY),
+        _info(1, 40, Status.FAILED_PROVISION),
+    ]
+    monkeypatch.setattr(serve_state, 'get_replica_infos', lambda name: infos)
+    batches = []
+
+    def _remove(infos_to_remove):
+        replica_ids = [info.replica_id for info in infos_to_remove]
+        batches.append(replica_ids)
+        if len(batches) == 1:
+            raise RuntimeError('transient batch failure')
+        manager.removed.extend(replica_ids)
+
+    manager._remove_replicas = _remove
+    with pytest.raises(RuntimeError, match='transient batch failure'):
+        manager._prune_superseded_failed_replicas()
+    assert manager._superseded_prune_pending
+    assert manager.removed == []
+
+    manager._prune_superseded_failed_replicas()
+    assert batches == [[1, 2], [1, 2]]
+    assert manager.removed == [1, 2]
+    assert not manager._superseded_prune_pending
 
 
 def test_a_version_transition_rearms_the_sweep(manager, monkeypatch):

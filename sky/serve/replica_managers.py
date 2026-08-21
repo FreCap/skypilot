@@ -12967,7 +12967,6 @@ class SkyPilotReplicaManager(ReplicaManager):
         """
         if not self._superseded_prune_pending:
             return
-        self._superseded_prune_pending = False
         latest_version = self.latest_version
         prunable_infos: list[ReplicaInfo] = []
         for info in serve_state.get_replica_infos(self._service_name):
@@ -12980,9 +12979,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 continue
             prunable_infos.append(info)
         if not prunable_infos:
+            self._superseded_prune_pending = False
             return
         prunable_infos.sort(key=lambda info: info.replica_id)
         self._remove_replicas(prunable_infos)
+        self._superseded_prune_pending = False
         superseded_versions = sorted({info.version for info in prunable_infos})
         logger.info(
             f'Removed {len(prunable_infos)} superseded failed replicas from '
