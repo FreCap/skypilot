@@ -6070,19 +6070,21 @@ def provider_presence_cleanup_authority_in_connection(
     return dict(association), info
 
 
-def projected_provider_absence_cleanup_authority_in_connection(
+def projected_provider_absence_retirement_authority_in_connection(
     connection: sqlalchemy.engine.Connection,
     service_name: str,
     replica_id: int,
     replica_record_id: str,
 ) -> tuple[dict[str, Any], Any]:
-    """Validate restart-safe removal after exact ABSENT already committed.
+    """Validate the shared restart-safe ABSENT retirement authority.
 
     The association is settled and its replica pointer is deliberately gone,
     so the live reduction validator cannot address it.  This history readback
     accepts only the one protocol-v2 reserved-fill tombstone whose canonical
     provider ABSENT proof postdates executor quiescence.  It grants replica-row
-    removal only; no provider operation can be authorized from this state.
+    retirement validation only; no provider operation can be authorized from
+    this state.  Callers must separately require either the durable immediate
+    cleanup marker or an equally narrow terminal retirement policy.
     """
     _require_postgres(connection)
     service_name = _nonempty(service_name, 'service_name')
@@ -6164,9 +6166,6 @@ def projected_provider_absence_cleanup_authority_in_connection(
         raise OrdinaryLaunchBindingConflict(
             'Projected provider absence history is not exact and complete.')
     info = _locked_replica_info(replica)
-    if not replica_has_provider_present_cleanup_marker(info):
-        raise OrdinaryLaunchBindingConflict(
-            'Projected provider absence lost its durable cleanup marker.')
     expected_payload, expected_digest = _reserved_fill_provider_evidence(
         association, info, ProviderEvidence.ABSENT)
     if (association['provider_evidence_payload'] != expected_payload or
@@ -6174,6 +6173,22 @@ def projected_provider_absence_cleanup_authority_in_connection(
         raise OrdinaryLaunchBindingConflict(
             'Projected provider absence evidence is not canonical.')
     return dict(association), info
+
+
+def projected_provider_absence_cleanup_authority_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+) -> tuple[dict[str, Any], Any]:
+    """Validate restart-safe immediate cleanup after committed ABSENT."""
+    association, info = (
+        projected_provider_absence_retirement_authority_in_connection(
+            connection, service_name, replica_id, replica_record_id))
+    if not replica_has_provider_present_cleanup_marker(info):
+        raise OrdinaryLaunchBindingConflict(
+            'Projected provider absence lost its durable cleanup marker.')
+    return association, info
 
 
 def project_provider_absence_in_connection(

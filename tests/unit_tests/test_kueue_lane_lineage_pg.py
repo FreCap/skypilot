@@ -528,6 +528,8 @@ def _install_retirable_materialized_graph(
     *,
     intent_key: str,
     replica_id: int,
+    cleanup_marker: bool = True,
+    effect_phase: str | None = None,
 ) -> tuple[uuid.UUID, uuid.UUID, str]:
     """Install the exact terminal, quiesced, provider-absent delete graph."""
     identity = _identity()
@@ -572,11 +574,20 @@ def _install_retirable_materialized_graph(
     info.zero_cost_admission_sequence = replica_id
     info.is_zero_cost = True
     info.planned_capacity = 1
-    info.status_property.sky_launch_status = (
-        common_utils.ProcessStatus.INTERRUPTED)
-    info.status_property.sky_down_status = common_utils.ProcessStatus.SCHEDULED
-    info.status_property.is_scale_down = True
-    info.status_property.drain_cap_seconds = 0
+    if cleanup_marker:
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.INTERRUPTED)
+        info.status_property.sky_down_status = (
+            common_utils.ProcessStatus.SCHEDULED)
+        info.status_property.is_scale_down = True
+        info.status_property.drain_cap_seconds = 0
+    else:
+        # Production lifecycle 84 retained this terminal pre-job shape.  It is
+        # provider-clean but deliberately not the immediate-cleanup marker.
+        info.status_property.sky_launch_status = common_utils.ProcessStatus.FAILED
+        info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+        info.status_property.is_scale_down = False
+        info.status_property.drain_cap_seconds = None
 
     associations = ordinary_launch_binding.ordinary_launch_associations_table
     replicas = serve_state_schema.replicas_table
@@ -607,6 +618,10 @@ def _install_retirable_materialized_graph(
         connection.execute(
             sqlalchemy.update(associations).
             where(associations.c.association_id == association_id).values(
+                **({} if effect_phase is None else {
+                    'effect_phase': effect_phase,
+                    'effect_phase_changed_at': now,
+                }),
                 resolution=ordinary_launch_binding.Resolution.PROJECTED.value,
                 reconciliation_outcome=ordinary_launch_binding.
                 ReconciliationOutcome.PROJECTED.value,
@@ -2251,6 +2266,281 @@ def test_whole_service_retires_pre_serve057_provider_absence_without_admission(
                     ordinary_launch_binding.ordinary_launch_associations_table.
                     c.association_id == association_id)).scalar_one()
         assert retained == record_id
+
+
+@pytest.mark.parametrize('retain_pending_admission', (False, True))
+def test_whole_service_retires_marker_free_pre_job_provider_absence(
+        admission_database, monkeypatch, retain_pending_admission) -> None:
+    """Retire the exact pre-job shape observed in production lifecycle 84."""
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, _ = _install_retirable_materialized_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        cleanup_marker=False,
+        effect_phase='PROVIDER_IO')
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _set_physical_provider_evidence(
+        admission_database, association_id,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
+    if not retain_pending_admission:
+        _delete_kueue_admission(admission_database, key)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+
+    provider_phase = mock.Mock(
+        side_effect=AssertionError('pre-job replay attempted provider phase'))
+    provider_probe = mock.Mock(
+        side_effect=AssertionError('pre-job replay attempted provider read'))
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        provider_phase)
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        provider_probe)
+    assert kueue_lane_observer.project_exact_pod_absence_after_teardown(
+        _SERVICE, 1, record_id)
+    provider_phase.assert_not_called()
+    provider_probe.assert_not_called()
+
+    assert serve_state.remove_service_completely(
+        _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+    _assert_retired_graph(admission_database,
+                          intent_keys=(key,),
+                          replica_ids=(1,),
+                          association_ids=(association_id,))
+
+
+def test_whole_service_rejects_pre_job_admission_with_pod_materialization(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, _ = _install_retirable_materialized_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        cleanup_marker=False,
+        effect_phase='PROVIDER_IO')
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _set_physical_provider_evidence(
+        admission_database, association_id,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
+    identity = _identity()
+    receipt = _receipt(kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED,
+                       key,
+                       record_id,
+                       identity=identity,
+                       phase='Running',
+                       workload_name='worker-1',
+                       unconstrained_topology='true')
+    admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    with admission_database.begin() as connection:
+        observed_at = _postgres_now(connection)
+        connection.execute(
+            sqlalchemy.update(admissions).where(
+                admissions.c.intent_idempotency_key == key).values(
+                    state=kueue_lane_lineage.KueueAdmissionState.
+                    POLICY_ADMITTED.value,
+                    pod_namespace='skypilot',
+                    pod_name='worker-1',
+                    pod_uid='pod-uid-1',
+                    pod_receipt=receipt,
+                    pod_receipt_sha256=_receipt_digest(connection, receipt),
+                    observed_at=observed_at,
+                    valid_until=None,
+                    admitted_at=observed_at,
+                    updated_at=observed_at))
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+
+    before = _admissionless_graph_snapshot(admission_database, association_id)
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
+                       match='live or mismatched admission authority'):
+        serve_state.remove_service_completely(
+            _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+    assert _admissionless_graph_snapshot(admission_database,
+                                         association_id) == before
+
+
+def test_pre_job_absence_rejects_foreign_admission_for_same_replica(
+        admission_database, monkeypatch) -> None:
+    """A stale admission cannot hide behind a different intent/record pair."""
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, _ = _install_retirable_materialized_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        cleanup_marker=False,
+        effect_phase='PROVIDER_IO')
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _set_physical_provider_evidence(
+        admission_database, association_id,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
+
+    foreign_key = _canonical_intent_key(ordinal=1,
+                                        observation_sequence=1,
+                                        ordinary_zero_cost_admission_sequence=1)
+    _insert_intent(admission_database,
+                   foreign_key,
+                   ordinal=1,
+                   observation_sequence=1,
+                   ordinary_zero_cost_admission_sequence=1)
+    admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    with admission_database.begin() as connection:
+        connection.exec_driver_sql(
+            f'ALTER TABLE {admissions.name} DISABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.update(admissions).where(
+                admissions.c.intent_idempotency_key == key).values(
+                    intent_idempotency_key=foreign_key,
+                    replica_record_id=uuid.uuid4(),
+                    updated_at=sqlalchemy.func.clock_timestamp()))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {admissions.name} ENABLE TRIGGER USER')
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+
+    provider_phase = mock.Mock(side_effect=AssertionError(
+        'foreign admission attempted provider phase'))
+    provider_probe = mock.Mock(
+        side_effect=AssertionError('foreign admission attempted provider read'))
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        provider_phase)
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        provider_probe)
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict):
+        kueue_lane_observer.project_exact_pod_absence_after_teardown(
+            _SERVICE, 1, record_id)
+    provider_phase.assert_not_called()
+    provider_probe.assert_not_called()
+
+
+@pytest.mark.parametrize(('column', 'value'),
+                         (('cluster_name', 'foreign'), ('status', 'READY')))
+def test_pre_job_absence_rejects_divergent_replica_scalar(
+        admission_database, monkeypatch, column, value) -> None:
+    """Scalar indexes cannot contradict the versioned replica authority."""
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, _ = _install_retirable_materialized_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        cleanup_marker=False,
+        effect_phase='PROVIDER_IO')
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _set_physical_provider_evidence(
+        admission_database, association_id,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
+    _delete_kueue_admission(admission_database, key)
+    replicas = serve_state_schema.replicas_table
+    with admission_database.begin() as connection:
+        connection.exec_driver_sql(
+            f'ALTER TABLE {replicas.name} DISABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.update(replicas).where(
+                replicas.c.service_name == _SERVICE,
+                replicas.c.replica_id == 1).values(**{column: value}))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {replicas.name} ENABLE TRIGGER USER')
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+
+    provider_phase = mock.Mock(side_effect=AssertionError(
+        'divergent replica attempted provider phase'))
+    provider_probe = mock.Mock(
+        side_effect=AssertionError('divergent replica attempted provider read'))
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        provider_phase)
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        provider_probe)
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
+                       match='canonical provider-absence authority'):
+        kueue_lane_observer.project_exact_pod_absence_after_teardown(
+            _SERVICE, 1, record_id)
+    provider_phase.assert_not_called()
+    provider_probe.assert_not_called()
+
+
+def test_whole_service_rejects_live_replica_with_pre_job_absence(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, _ = _install_retirable_materialized_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        cleanup_marker=False,
+        effect_phase='PROVIDER_IO')
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _set_physical_provider_evidence(
+        admission_database, association_id,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
+    _delete_kueue_admission(admission_database, key)
+    replicas = serve_state_schema.replicas_table
+    with admission_database.begin() as connection:
+        replica = connection.execute(
+            sqlalchemy.select(replicas).where(
+                replicas.c.service_name == _SERVICE,
+                replicas.c.replica_id == 1)).mappings().one()
+        info = serve_state.decode_replica_state_for_authority(
+            replica['replica_state_version'], replica['replica_state'])
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        info.status_property.sky_down_status = None
+        info.status_property.service_ready_now = True
+        connection.exec_driver_sql(
+            f'ALTER TABLE {replicas.name} DISABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.update(replicas).where(
+                replicas.c.service_name == _SERVICE,
+                replicas.c.replica_id == 1).values(
+                    **serve_state._replica_row_values(  # pylint: disable=protected-access
+                        _SERVICE, 1, info)))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {replicas.name} ENABLE TRIGGER USER')
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+
+    provider_phase = mock.Mock(
+        side_effect=AssertionError('invalid replay attempted provider phase'))
+    provider_probe = mock.Mock(
+        side_effect=AssertionError('invalid replay attempted provider read'))
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        provider_phase)
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        provider_probe)
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
+                       match='live or materialized replica state'):
+        kueue_lane_observer.project_exact_pod_absence_after_teardown(
+            _SERVICE, 1, record_id)
+    provider_phase.assert_not_called()
+    provider_probe.assert_not_called()
 
 
 @pytest.mark.parametrize('intent_state', ('GRANTED', 'RETRYABLE', 'ACTUATING'))
