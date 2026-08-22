@@ -104,8 +104,8 @@ separate PostgreSQL idempotency/completeness contract described below.
 Kueue remains the sole authority for whether PHX capacity is currently
 admissible. SkyPilot must neither duplicate its queue algorithm nor treat raw
 physical free capacity as an admission promise. This follow-up is a separate
-SkyPilot release after `1.1.1430`. Its design is **not frozen and must not be
-implemented** until all of the closure gates below pass adversarial review:
+SkyPilot release after `1.1.1430`. The contract below was frozen after final
+adversarial review on 2026-08-22 and is approved for implementation:
 
 1. The bound applies only to an immutable worker projection whose declared
    scheduling authority is Kueue. East has `kueue_admission: null` and retains
@@ -123,17 +123,22 @@ implemented** until all of the closure gates below pass adversarial review:
    the unresolved-domain digest and checked columns, monotonic lane generation,
    exact incarnation/version/pool/projection identity, state, intent key,
    nullable replica ID and record UUID, provider cluster generation, nullable
-   Pod namespace/name/UID, observed/admitted timestamps, and nullable paid
-   handoff, paid replica, reprobe, and backoff facts. A partial unique index
+   Pod namespace/name/UID, `observed_at`, `valid_until`, `admitted_at`, and
+   nullable paid handoff, paid replica, reprobe, and backoff facts. A partial
+   unique index
    permits one `current` row per unresolved domain; another partial unique
    index permits one current lane to reference a paid replica record UUID.
    Non-current `POLICY_ADMITTED` rows and their immutable Pod receipts remain
    available for every live initializing replica, so demand accounting joins
    each row by its intent key instead of trusting aggregate `ReplicaStatus`.
+   Serve057 creates this table and its indexes as the next linear Serve schema
+   head. The already-planned nullable-owner cleanup moves intact to Serve058;
+   it cannot consume Serve057 before the fill/no-paid production horizon on
+   which that cleanup is gated.
 3. `grant_plan()` remains provider-free. With the service row and exact
    unresolved domain locked, no row or a `REPROBE_READY` row may atomically
    insert exactly one new intent and current `INTENT_PENDING` lineage. A fresh
-   `POLICY_ADMITTED` current row may be made non-current while exactly one
+   exact current `POLICY_ADMITTED` row may be made non-current while exactly one
    successor intent/current row is inserted in the same transaction. Replay
    plus new intents in one plan obey the same bound. Every other state and any
    derived `UNKNOWN` condition admits none. A lost acknowledgement therefore
@@ -158,17 +163,30 @@ implemented** until all of the closure gates below pass adversarial review:
    advances monotonically to `POLICY_ADMITTED` and notifies reconciliation
    immediately. It never calls the Node-reading full attester. Restart
    adoption must reattest the exact current object; a reusable name alone has
-   no authority.
+   no authority. While the gate is present, each exact observation callback
+   obtains `observed_at` from PostgreSQL `clock_timestamp()` and sets
+   `valid_until = observed_at + 15 seconds`; the existing two-second Pod wait
+   loop renews the same CAS receipt at least every five seconds, without using
+   caller wall time. A missing callback, read failure, or DB failure cannot
+   extend validity.
 6. Accounting has three explicit positive classes. Every live intent and every
    row lacking cleanup proof remains a **physical debit** for the broker and
-   hard service ceiling. Fresh exact `POD_WAITING` is demand supply zero and
-   may hand off to paid through the protocol below. Fresh exact
-   `POLICY_ADMITTED` is demand-committed future supply; `READY` is actual
-   serving supply. `UNKNOWN` is neither asserted as supply nor treated as
-   known waiting: it blocks a successor and revokes all paid authority until
-   exact re-observation or normalized provider-absence cleanup. Existing
-   autoscaler code that counts every nonterminal provisioning row as demand
-   supply must be split accordingly before activation.
+   hard service ceiling. `POD_WAITING` is usable only while PostgreSQL time is
+   strictly before its `valid_until`; it is demand supply zero and may hand off
+   to paid through the protocol below. Expiry derives `UNKNOWN`. Every paid
+   authority publication, claim, and provider-effect validation joins the
+   current lane rows against PostgreSQL time; observing expiry atomically
+   publishes/records a newer paid revocation and rejects the claim or effect.
+   Thus no timer or process-local cache can preserve paid authority past a lost
+   observer. The Pod-UID-bound `POLICY_ADMITTED` receipt is a monotonic positive
+   fact and does not expire merely because observation stops; it is
+   demand-committed future supply until ordinary provider-down/cleanup evidence
+   supersedes it. `READY` is actual serving supply. `UNKNOWN` is neither
+   asserted as supply nor treated as known waiting: it blocks a successor and
+   all paid authority until exact re-observation or normalized provider-absence
+   cleanup. Existing autoscaler code that counts every nonterminal
+   provisioning row as demand supply must be split accordingly before
+   activation.
 7. Ordinary provider-free fill admission may retain its current pre-demand
    ordering; it cannot publish paid authority. Fresh authenticated demand must
    be read before a `PAID_HANDOFF` transition. If that demand needs the final
@@ -191,11 +209,15 @@ implemented** until all of the closure gates below pass adversarial review:
    live intent, replica, Pod, or paid record. A timed-out gated reprobe enters
    `PAID_HANDOFF`, increments its attempt, and computes an exponential
    next-probe bound; successful cleanup and a fresh paid claim enter
-   `PAID_OCCUPIED`. Natural headroom or bounded dwell plus an exact idle paid
-   victim may move `PAID_OCCUPIED` to `REPROBE_DRAINING`; cleanup advances it
-   to `REPROBE_READY`. Busy paid replicas are never disrupted merely to probe,
-   and the hard `max_replicas` physical ceiling is never exceeded. An all-busy
-   service at the ceiling waits for natural headroom.
+   `PAID_OCCUPIED`. Natural hard-max headroom releases only the lane's paid
+   association and advances directly from `PAID_OCCUPIED` to
+   `REPROBE_READY`; the ordinary paid replica remains live while the free slot
+   probes, and normal paid-residual reconciliation may drain it only after
+   reserved admission succeeds. Only a no-headroom lane whose dwell elapsed
+   and whose exact paid victim is idle enters `REPROBE_DRAINING`. Busy paid
+   replicas are never disrupted merely to probe, and the hard `max_replicas`
+   physical ceiling is never exceeded. An all-busy service at the ceiling
+   waits for natural headroom.
 9. Status and the service dashboard report exact raw physical free, exact
    assigned/admitted/waiting units, freshness, and the bounded fact that the
    next identical unit is policy-waiting. One gated sentinel is not used to
@@ -1233,7 +1255,7 @@ existing direct-Helm split-role topology:
    ClusterQueue, workload priority, Pod priority, service account, scheduler,
    TAS assignment, accelerator, and physical cluster identity. Prove paid
    residual starts only for genuinely uncovered demand.
-6. Author and cross-link the required Serve057 cleanup draft before the feature
+6. Author and cross-link the required Serve058 cleanup draft before the feature
    merges. Only after the transition horizon may it merge. It removes the
    nullable owner-attestation transition, not the generalized non-pool path or
    the closed historical cleanup stacks. The offline migration is forward-only
@@ -1781,7 +1803,7 @@ While either owner column is missing or nullable, deletion of every
 non-internal user is temporarily unavailable. A per-user or `NULL` census is
 not sufficient: an old in-flight writer can insert a nullable service after
 that read without acquiring the owner foreign-key lock. This schema-derived
-global guard is the transition's deliberately conservative behavior. Serve057
+global guard is the transition's deliberately conservative behavior. Serve058
 removes it only after both columns become `NOT NULL`, the zero-`NULL` and
 no-old-writer gates pass, and the foreign key can serialize every future
 service creation against exact user deletion.
@@ -1814,7 +1836,7 @@ association, request, queue, and pin. Deferred constraints validate the final
 bidirectional graph; they do not make a historical JSON key authoritative or
 permit a second write order. The cleanup-only scalar-`NULL` resolver is the
 single isolated transition branch and is removed at its documented horizon
-gate. Serve057 remains the distinct, horizon-gated owner-column `NOT NULL`
+gate. Serve058 remains the distinct, horizon-gated owner-column `NOT NULL`
 cleanup; the migrations are not combined.
 
 Only a complete commit may install an adopter for the returned request ID. It
@@ -1845,7 +1867,7 @@ RESTRICT` foreign key, and a PostgreSQL trigger that permits the one `NULL` ->
 tuple attestation but makes the tuple immutable thereafter. It is
 PostgreSQL-only, forward-only, and adds no table or SQLite path. The API user
 deletion guard rejects every non-internal deletion while either owner column
-is missing or nullable. In the later Serve057 owner-cleanup steady state,
+is missing or nullable. In the later Serve058 owner-cleanup steady state,
 exact-owner listing
 reports owned services before deletion and the foreign key is the race-closing
 authority if service creation wins concurrently.
@@ -1871,10 +1893,10 @@ ordinary, or caller-crafted requests fall through to ordinary owner RBAC, and
 the final provider guard still revalidates the binding before provider I/O.
 The request body is only a query-scope hint and never authorization authority.
 
-Separately, the pre-existing Serve057 owner-column cleanup branch is planned as
+Separately, the pre-existing Serve058 owner-column cleanup branch is planned as
 `fix/serve-atomic-fill-admission-cleanup`, but has not yet been authored or
 opened. It is not the historical-digest verifier cleanup stack introduced
-above. Its only steady-state change is Serve057: after the transition gates
+above. Its only steady-state change is Serve058: after the transition gates
 below, make both owner columns `NOT NULL`, remove the application
 `NULL`-attestation controller branch, and retire its transition-only
 observability/tests. The database must retain the existing owner-immutability
@@ -1892,7 +1914,7 @@ complete 180-second authority, full stale-writer/quiescence, controller-child
 restart, controller-Pod takeover, large multi-pool fill, ordinary-traffic, and
 no-paid-spill gates all pass. Real-PostgreSQL savepoint, rollback, lock-order,
 lost-ACK/read-failure, restart-adoption, current-user-name, owner-FK race, and
-source-no-fallback tests must also pass. Serve057 then validates zero `NULL`
+source-no-fallback tests must also pass. Serve058 then validates zero `NULL`
 tuples in its migration transaction before applying `NOT NULL`; its final-state
 suite must prove the application one-shot branch and transition-only artifacts
 are physically absent and direct SQL cannot mutate one non-null owner tuple to
@@ -4354,7 +4376,7 @@ either case.
 | 2g | Production full reserved backfill | **Active and incomplete.** Platform PR #8652 is merged. The former version-64 graph and its 71-row delete-order blocker were removed by the deployed teardown successors. Canonical lifecycle 84/version 1 is `READY` after consolidated-HA recovery on revision 502 with no EFS/PV/PVC runtime dependency, and Platform PR #8824 has activated only the existing SkyPilot queues. The deployment singleton is proven; policy revision `1.1.1430`, generation+1 reauthorization, policy-admission feedback, exact free-capacity convergence, nonzero-demand no-paid proof, live proof of the already-implemented current-request telemetry, and the full production horizon remain open. Exact completed logical requests are a separate PostgreSQL idempotency/completeness feature, not a prerequisite for honest processing/queued/in-flight status. |
 | 2h | Atomic reserved-fill replica/request admission | Merged in PR #1626 and deployed on Helm revision 473 / release `1.1.1401`. One atomic-admission module owns the root PostgreSQL transaction and savepoint; the manager only prepares immutable server-local input before it and starts the returned request reducer after commit. Serve055 adds the owner audit tuple, user FK, and retained-row one-shot transition. The deployed pending-first/global-pending/cleanup-unproven accounting correctly avoided duplicate replacement capacity. The remaining postcommit mutable-authority rejection is owned by phase 2i, not by another admission path or infrastructure change. |
 | 2i | Serve056 committed reserved-fill provider handoff and cohort rotation | PR #1629 merged at `1642ca2e3` as the scalar-schema precursor; PR #1632 restored adoption and corrective PR #1630 supplied the complete committed-handoff contract. That source is deployed through release `1.1.1410` and inherited by revision 489. Draft cleanup PR #1633 remains gated on the final zero-legacy census and production horizon. No EFS, KubeRay, Terraform/Terragrunt, platform runtime pin, or alternate provider path is added. |
-| 3a | Stacked Serve055 owner-transition cleanup after the production horizon | The required `fix/serve-atomic-fill-admission-cleanup` branch adds Serve057 `NOT NULL` owner columns and removes only the application one-shot `NULL` attestation branch, the schema-derived temporary global user-deletion guard, and transition-only observability/tests. It retains or atomically simplifies the permanent database owner-immutability trigger. Its draft PR must be cross-linked and remains blocked on a complete capable cohort, zero `NULL` tuples, no old writers, backups, and the complete stale/HA production horizon. |
+| 3a | Stacked Serve055 owner-transition cleanup after the production horizon | The required `fix/serve-atomic-fill-admission-cleanup` branch adds Serve058 `NOT NULL` owner columns and removes only the application one-shot `NULL` attestation branch, the schema-derived temporary global user-deletion guard, and transition-only observability/tests. It retains or atomically simplifies the permanent database owner-immutability trigger. Its draft PR must be cross-linked and remains blocked on a complete capable cohort, zero `NULL` tuples, no old writers, backups, and the complete stale/HA production horizon. |
 | 3b | Stacked Serve056 scalar-`NULL` cleanup bridge removal | Draft PR #1633 is stacked on and cross-linked from #1630, replacing automatically closed draft #1631. It removes only the cleanup-only JSON resolver and its transition tests after zero scalar-`NULL` protocol-v2 replicas, zero unsettled scalar-`NULL` provider-effect associations, and zero scalar-`NULL` cleanup-unproven markers persist through the complete stale/quiescence/provider-reprobe horizon. It cannot merge earlier. Closed PRs #1506/#1510 are not revived. |
 
 Durable acceptance atomically binds rows to the existing asynchronous launch
@@ -4426,11 +4448,11 @@ display-name change neither breaks exact hydration nor gets reverted by a
 launch. Serve055 rejects every non-internal user deletion while the schema can
 still admit a `NULL` owner tuple. After the complete capable cohort, zero
 `NULL` tuples, no old writers, database backups, and the full stale/HA horizon
-are proven, the stacked Serve057 cleanup makes both columns `NOT NULL` and
+are proven, the stacked Serve058 cleanup makes both columns `NOT NULL` and
 deletes the global deletion guard, application one-shot attestation branch,
 and transition-only artifacts. In that steady state, user deletion first
 reports the names of owned services and the foreign key serializes the
-concurrent delete-versus-service-create race. Serve057 retains or atomically
+concurrent delete-versus-service-create race. Serve058 retains or atomically
 replaces the database trigger with permanent non-null tuple immutability and
 proves direct SQL owner replacement still fails.
 
@@ -4925,9 +4947,9 @@ to create zero-cost compute automatically; observing that effect is required.
 The reserved-fill ordering source gate uses a fresh authenticated allocation
 with unavailable load-balancer demand. A non-Kueue/East lane must accept its
 exact fill deficit concurrently. A Kueue/PHX unresolved domain must accept one
-intent, then accept exactly one successor only after a durable fresh admitted
-receipt; an unresolved or unknown domain accepts none. Each accepted case
-returns and notifies before attempting the demand read and invokes no paid,
+intent, then accept exactly one successor only after a durable monotonic
+admitted receipt; an unresolved or unknown domain accepts none. Each accepted
+case returns and notifies before attempting the demand read and invokes no paid,
 target, retirement, scale-up/down, or provider path. A case with no new intent
 continues to the unavailable demand read and proves that all paid and
 destructive actuation remains blocked. Source inspection must show one
@@ -4935,11 +4957,14 @@ sequenced fill-admission call site and one injected Pod-observation callback,
 not a second controller-side admission observer.
 
 The production rollout gate repeats revision 471's route/report churn while a
-fresh allocation has positive feed. Every granted compatible slot must become
-either a durable intent or a correctly attributed row even when demand is
-temporarily unavailable; replay and controller restart must create no duplicate
-intent. Only after those debits are visible may a fresh demand snapshot publish
-a paid residual. Verify immediately, at +10, +30, and through the complete
+fresh allocation has positive feed. East/non-Kueue materializes every granted
+compatible slot as a durable intent or correctly attributed row even when
+demand is temporarily unavailable. PHX/Kueue materializes one unresolved
+sentinel, then one successor per monotonic admitted receipt; the rest of an
+N-sized raw grant remains a typed policy-waiting residual rather than rows.
+Replay and controller restart create no duplicate intent. Only after those
+debits and admission facts are visible may a fresh demand snapshot publish a
+paid residual. Verify immediately, at +10, +30, and through the complete
 stale/quiescence horizon that no paid claim, provider effect, or retirement was
 authorized by an unknown demand snapshot.
 
@@ -5769,7 +5794,7 @@ legacy activation.
   evidence, east/PHX/generic/no-paid proofs, and the full 180-second
   stale-authority/quiescence horizon are complete; then remove the v1/v2/v3
   projection readers through that stacked cleanup.
-- [ ] Open the cross-linked Serve057 cleanup and, only after a complete capable
+- [ ] Open the cross-linked Serve058 cleanup and, only after a complete capable
   cohort, zero nullable owner tuples, no old writers, backups, and the full
   stale/HA production horizon, make service owner columns `NOT NULL` and remove
   the one-shot attestation transition.
