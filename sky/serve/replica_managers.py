@@ -175,6 +175,12 @@ _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS = 15
 # bounds only rate-limit provider calls while an outage persists.
 _FAILED_CLEANUP_RETRY_BASE_SECONDS = 60
 _FAILED_CLEANUP_RETRY_MAX_SECONDS = 15 * 60
+# Kubernetes accepts a force-delete before its object necessarily disappears
+# from subsequent reads.  Protocol-v2 teardown must bridge that propagation
+# window before publishing exact provider absence, without holding the provider
+# phase gate while it waits.
+_POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS = 90
+_POST_TEARDOWN_ABSENCE_POLL_SECONDS = 1
 _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS = 30
 _NON_POOL_RECONCILIATION_RETRY_MAX_SECONDS = 15 * 60
 _MAX_CONCURRENT_NON_POOL_RECONCILIATIONS_PER_SERVICE = 16
@@ -2119,6 +2125,59 @@ class _ReplicaDrainTracker:
 
 # TODO(tian): Combine this with
 # sky/spot/recovery_strategy.py::terminate_cluster
+def _wait_for_post_teardown_physical_absence(
+    cluster_name: str,
+    cleanup_fence: reserved_capacity.ProtocolV2CleanupFence,
+    continue_guard: Callable[[], bool] | None,
+) -> None:
+    """Wait for one successful protocol-v2 down to become observable.
+
+    Kubernetes deletion is asynchronous even with a zero grace period.  Each
+    uncached provider read gets its own short provider phase and immutable
+    physical-cluster fence; the gate is released before the next poll sleeps.
+    Only ABSENT completes teardown.  PRESENT, an unreadable/retargeted context,
+    or ownership loss remains fail closed.
+    """
+    deadline = time.monotonic() + _POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS
+    last_presence = reserved_capacity.PhysicalReplicaPresence.UNPROVEN
+    while True:
+        if continue_guard is not None and not continue_guard():
+            raise RuntimeError(
+                f'Refusing to confirm termination of {cluster_name!r} after '
+                'service lifecycle ownership was lost.')
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.V2_FENCED,
+                    timeout_seconds=remaining):
+                last_presence = (
+                    reserved_capacity.probe_physical_replica_presence(
+                        cleanup_fence, cluster_name, use_cache=False))
+        except exceptions.ProviderPhaseTimeoutError as error:
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                f'Cannot prove protocol-v2 cleanup for {cluster_name!r}: '
+                'timed out waiting to observe post-teardown provider '
+                'absence.') from error
+
+        # Ownership can change during a provider read.  Recheck before
+        # accepting its result as cleanup authority.
+        if continue_guard is not None and not continue_guard():
+            raise RuntimeError(
+                f'Refusing to confirm termination of {cluster_name!r} after '
+                'service lifecycle ownership was lost.')
+        if last_presence is reserved_capacity.PhysicalReplicaPresence.ABSENT:
+            return
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                f'Cannot prove protocol-v2 cleanup for {cluster_name!r}: '
+                'post-teardown provider presence remained '
+                f'{last_presence.value.lower()} for '
+                f'{_POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS} seconds.')
+        time.sleep(min(_POST_TEARDOWN_ABSENCE_POLL_SECONDS, remaining))
+
+
 @context.contextual
 def terminate_cluster(
     cluster_name: str,
@@ -2247,8 +2306,7 @@ def terminate_cluster(
                         core.down(cluster_name,
                                   _expected_cluster_hash=expected_cluster_hash,
                                   _continue_guard=continue_guard)
-            logger.info(f'Replica cluster {cluster_name} terminated.')
-            return
+            break
         except exceptions.ClusterDoesNotExist as error:
             if cleanup_fence is not None:
                 raise exceptions.KubernetesPhysicalClusterIdentityError(
@@ -2290,6 +2348,11 @@ def terminate_cluster(
                 f'Details: {common_utils.format_exception(e)}')
             logger.error(f'  Traceback: {traceback.format_exc()}')
             time.sleep(gap_seconds)
+
+    if cleanup_fence is not None:
+        _wait_for_post_teardown_physical_absence(cluster_name, cleanup_fence,
+                                                 continue_guard)
+    logger.info(f'Replica cluster {cluster_name} terminated.')
 
 
 def terminate_bound_non_pool_provider_present_cluster(

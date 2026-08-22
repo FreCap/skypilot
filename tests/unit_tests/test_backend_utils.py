@@ -31,6 +31,7 @@ from sky.provision import ray_commands
 from sky.provision.kubernetes import pod_spec as kubernetes_pod_spec
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.resources import Resources
+from sky.utils import command_runner
 from sky.utils import common
 from sky.utils import common_utils
 from sky.utils import controller_utils
@@ -425,9 +426,9 @@ def _builtin_kubernetes_writer_kwargs(monkeypatch, tmp_path, test_name):
     }, output_path)
 
 
-def _projected_h200_worker_v5():
+def _projected_h200_worker_v4():
     return {
-        'projection_version': 5,
+        'projection_version': 4,
         'candidate_id': 'kubernetes-0000',
         'kubernetes_context': 'test-context',
         'namespace': 'inference',
@@ -450,12 +451,21 @@ def _projected_h200_worker_v5():
         'kueue_admission': None,
         'provision_timeout': -1,
         'scratch': {
-            'kind': 'memory',
-            'mount_path': '/tmp',
-            'volume_name': 'skypilot-serve-worker-tmp',
-            'size_limit_bytes': 20 * 1024**3,
+            'kind': 'none',
         },
     }
+
+
+def _projected_h200_worker_v5_memory():
+    projection = _projected_h200_worker_v4()
+    projection['projection_version'] = 5
+    projection['scratch'] = {
+        'kind': 'memory',
+        'mount_path': '/tmp',
+        'volume_name': 'skypilot-serve-worker-tmp',
+        'size_limit_bytes': 20 * 1024**3,
+    }
+    return projection
 
 
 def test_builtin_kubernetes_writer_preserves_fill_template_facade(
@@ -518,7 +528,7 @@ def test_projected_serve_worker_suppresses_all_static_credential_mounts(
     writer_kwargs['to_provision'] = Resources(
         cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
     writer_kwargs['worker_placement_projections'] = [
-        _projected_h200_worker_v5()
+        _projected_h200_worker_v4()
     ]
     original_fill_template = common_utils.fill_template
     rendered_variables = {}
@@ -552,8 +562,6 @@ def test_projected_serve_worker_suppresses_all_static_credential_mounts(
         'serve_worker_expected_runtime_bootstrap_sha256'] == (
             kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(
                 pod_spec))
-    assert 'serve_worker_expected_runtime_environment' not in rendered[
-        'provider']
     assert pod_spec['affinity']['nodeAffinity'][
         'requiredDuringSchedulingIgnoredDuringExecution']['nodeSelectorTerms'][
             0]['matchExpressions'][-1] == {
@@ -563,14 +571,6 @@ def test_projected_serve_worker_suppresses_all_static_credential_mounts(
             }
     assert ray_node['resources']['requests']['nvidia.com/gpu'] == 1
     assert ray_node['resources']['limits']['nvidia.com/gpu'] == 1
-    runtime_environment = {
-        entry['name']: entry.get('value') for entry in ray_node['env'] if
-        entry['name'] in kubernetes_pod_spec.SERVE_WORKER_RUNTIME_ENV_VAR_NAMES
-    }
-    assert runtime_environment == {
-        'SKY_RUNTIME_DIR': '/tmp',
-        'UV_CACHE_DIR': '/tmp/uv-cache',
-    }
     assert pod_spec['restartPolicy'] == 'Never'
     assert ray_node['startupProbe']['failureThreshold'] == 900
     assert ray_node['readinessProbe']['failureThreshold'] == 1
@@ -656,7 +656,7 @@ def test_projected_worker_persists_authenticated_bootstrap_through_finalizer(
     writer_kwargs['to_provision'] = Resources(
         cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
     writer_kwargs['worker_placement_projections'] = [
-        _projected_h200_worker_v5()
+        _projected_h200_worker_v4()
     ]
     writer_kwargs['dryrun'] = False
 
@@ -698,6 +698,11 @@ def test_projected_worker_persists_authenticated_bootstrap_through_finalizer(
     assert persisted['cluster_name'] == 'display'
     assert 'skypilot:ssh_public_key_content' not in runtime_script
     assert public_key in runtime_script
+    assert len(runtime_script.encode('utf-8')) == 39363
+    assert hashlib.sha256(runtime_script.encode('utf-8')).hexdigest() == (
+        '69bc9ab023e8a5ee164d3603f1bdae2fe318e2fc5a128139fcd063da87451704')
+    assert expected_bootstrap_sha256 == (
+        'b51e7c955e4abffc39c2d882672e2142822f44f2c050a0b3db58db57a7d83c2a')
     assert expected_bootstrap_sha256 == (
         kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
 
@@ -722,12 +727,70 @@ def test_projected_worker_persists_authenticated_bootstrap_through_finalizer(
         kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
             finalized['spec'],
             rewrite=False,
-            expected_bootstrap_sha256=expected_bootstrap_sha256,
-            expected_runtime_environment={
-                'SKY_RUNTIME_DIR': '/tmp',
-                'UV_CACHE_DIR': '/tmp/uv-cache',
-            }))
+            expected_bootstrap_sha256=expected_bootstrap_sha256))
     assert contract.matches
+
+
+def test_projected_v5_bootstrap_env_is_inherited_by_fresh_kubectl_exec(
+        monkeypatch, tmp_path):
+    writer_kwargs, _ = _builtin_kubernetes_writer_kwargs(
+        monkeypatch, tmp_path, 'projected-v5-bootstrap-environment')
+    writer_kwargs['to_provision'] = Resources(
+        cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
+    writer_kwargs['worker_placement_projections'] = [
+        _projected_h200_worker_v5_memory()
+    ]
+
+    result = backend_utils.write_cluster_config(**writer_kwargs)
+
+    rendered = yaml_utils.read_yaml(result['ray'])
+    pod_spec = rendered['available_node_types']['ray_head_default'][
+        'node_config']['spec']
+    ray_node = next(container for container in pod_spec['containers']
+                    if container['name'] == 'ray-node')
+    expected = kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENVIRONMENT
+    observed = {
+        entry['name']: entry['value']
+        for entry in ray_node['env']
+        if entry['name'] in expected
+    }
+    assert observed == expected
+
+    script = ray_node['args'][0]
+    runcmd_boundary = script.index(
+        '# Execute user-provided post-provision runcmd')
+    bootstrap_marker = script.index(
+        kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENV_MARKER)
+    bootstrap_end = script.index('# Helper function to conditionally use sudo')
+    assert runcmd_boundary < bootstrap_marker < bootstrap_end
+    for key, value in expected.items():
+        assert script.count(f'export {key}={json.dumps(value)}') == 1
+    assert rendered['provider'][
+        'serve_worker_expected_runtime_bootstrap_sha256'] == (
+            kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(
+                pod_spec))
+
+    # Kubernetes gives every independent exec process the container's Pod env.
+    # SkyPilot setup uses a fresh /bin/bash -c and intentionally adds no
+    # process-local prefix that could redirect these three paths to rootfs.
+    run_with_log = mock.Mock(return_value=0)
+    monkeypatch.setattr(command_runner.log_lib, 'run_with_log', run_with_log)
+    runner = command_runner.KubernetesCommandRunner(
+        (('inference', 'test-context'), 'projected-worker'),
+        container='ray-node')
+    monkeypatch.setattr(runner, '_resolve_kubectl_target', lambda:
+                        (None, 'test-context', True))
+    check = ' && '.join(f'test "${key}" = {json.dumps(value)}'
+                        for key, value in expected.items())
+
+    assert runner.run(check, stream_logs=False) == 0
+
+    fresh_exec = run_with_log.call_args.args[0]
+    assert 'kubectl exec' in fresh_exec
+    assert '-c ray-node -- /bin/bash -c' in fresh_exec
+    for key in expected:
+        assert f'${key}' in fresh_exec
+        assert f'export {key}=' not in fresh_exec
 
 
 def test_generic_kubernetes_runtime_has_no_projected_readiness_contract(
@@ -786,7 +849,7 @@ def test_builtin_kubernetes_writer_preserves_replacement_renderer_authority(
                              'templates' / template_ref)
         source_bytes = template_path.read_bytes()
         assert hashlib.sha256(source_bytes).hexdigest() == (
-            '0a0475194589c7f50501da7a5b267e8d59f28a669f9470aef46a3502c66b5392')
+            '974b81b5b5fb9776bdd8103f8f040d599fec3c0439423a6f6f13f415542f9175')
         source = source_bytes.decode('utf-8')
         assert '{{ skypilot_kubernetes_node_config_fragment_v1 }}\n' not in source
         rendered = common_utils.jinja2.Template(source).render(**variables)

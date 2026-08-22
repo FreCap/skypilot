@@ -943,7 +943,9 @@ def _enforce_worker_scratch_on_pod_spec(
 
 
 def _projected_worker_runtime_bootstrap_sha256_for_cluster_yaml(
-        cluster_yaml: dict[str, Any]) -> str:
+    cluster_yaml: dict[str, Any],
+    expected_bootstrap_environment: dict[str, str],
+) -> str:
     """Freeze the one canonical bootstrap shared by projected node types."""
     node_types = cluster_yaml.get('available_node_types')
     if not isinstance(node_types, dict) or not node_types:
@@ -960,6 +962,8 @@ def _projected_worker_runtime_bootstrap_sha256_for_cluster_yaml(
             node_config = node_type.get('node_config')
             pod_spec = (node_config.get('spec') if isinstance(
                 node_config, dict) else None)
+            k8s_pod_spec.validate_projected_worker_bootstrap_environment(
+                pod_spec, expected_bootstrap_environment)
             digests.add(
                 k8s_pod_spec.projected_worker_runtime_bootstrap_sha256(
                     pod_spec))
@@ -973,18 +977,14 @@ def _projected_worker_runtime_bootstrap_sha256_for_cluster_yaml(
 
 
 def _enforce_worker_runtime_readiness_on_pod_spec(
-    pod_spec: dict[str, Any],
-    expected_bootstrap_sha256: str,
-    expected_runtime_environment: dict[str, str] | None,
-) -> None:
+        pod_spec: dict[str, Any], expected_bootstrap_sha256: str) -> None:
     """Install and attest the projected worker bootstrap-ready contract."""
     try:
         contract = (
             k8s_pod_spec.enforce_projected_worker_runtime_readiness_contract(
                 pod_spec,
                 rewrite=True,
-                expected_bootstrap_sha256=expected_bootstrap_sha256,
-                expected_runtime_environment=expected_runtime_environment))
+                expected_bootstrap_sha256=expected_bootstrap_sha256))
     except k8s_pod_spec.ProjectedRuntimeReadinessContractError as error:
         raise exceptions.InvalidCloudConfigs(str(error)) from error
     if not contract.matches:
@@ -1095,7 +1095,7 @@ def _enforce_worker_projection_on_kubernetes_yaml(
     cache = projection['cache']
     cache_env = kubernetes_identity.cache_environment(projection)
     scratch_env = kubernetes_identity.scratch_environment(projection)
-    runtime_env = kubernetes_identity.runtime_environment(projection)
+    bootstrap_env = kubernetes_identity.bootstrap_environment(projection)
     for node_type in cluster_yaml['available_node_types'].values():
         node_config = node_type['node_config']
         if has_strict_admission:
@@ -1218,32 +1218,6 @@ def _enforce_worker_projection_on_kubernetes_yaml(
                 'ray-node container.')
 
         containers = pod_spec['containers']
-        if runtime_env is not None:
-            for container_field in ('containers', 'initContainers',
-                                    'ephemeralContainers'):
-                scoped_containers = pod_spec.get(container_field, [])
-                if scoped_containers is None:
-                    continue
-                if (not isinstance(scoped_containers, list) or
-                        any(not isinstance(container, dict)
-                            for container in scoped_containers)):
-                    raise exceptions.InvalidCloudConfigs(
-                        'Projected SkyServe Kubernetes '
-                        f'{container_field} must be a list of mappings.')
-                for scoped_container in scoped_containers:
-                    scoped_env = scoped_container.get('env')
-                    if scoped_env is None:
-                        continue
-                    if (not isinstance(scoped_env, list) or
-                            any(not isinstance(entry, dict)
-                                for entry in scoped_env)):
-                        raise exceptions.InvalidCloudConfigs(
-                            'Projected SkyServe Kubernetes env must be a list '
-                            'of mappings.')
-                    scoped_container['env'] = [
-                        entry for entry in scoped_env if entry.get('name')
-                        not in kubernetes_identity.WORKER_RUNTIME_ENV_VAR_NAMES
-                    ]
         for container in containers:
             env = [
                 entry for entry in container.setdefault('env', [])
@@ -1253,9 +1227,7 @@ def _enforce_worker_projection_on_kubernetes_yaml(
                 (not has_projected_scratch or
                  entry.get('name') != kubernetes_identity.SCRATCH_ENV_VAR and
                  not str(entry.get('name', '')).startswith(
-                     kubernetes_identity.SCRATCH_ENV_PREFIX)) and
-                (runtime_env is None or entry.get('name') not in
-                 kubernetes_identity.WORKER_RUNTIME_ENV_VAR_NAMES)
+                     kubernetes_identity.SCRATCH_ENV_PREFIX))
             ]
             container['env'] = env
             if container.get('name') != 'ray-node':
@@ -1268,11 +1240,6 @@ def _enforce_worker_projection_on_kubernetes_yaml(
                 'name': key,
                 'value': value
             } for key, value in scratch_env.items())
-            if runtime_env is not None:
-                env.extend({
-                    'name': key,
-                    'value': value
-                } for key, value in sorted(runtime_env.items()))
             if cache['kind'] == 'node_local':
                 mounts = [
                     mount for mount in container.setdefault('volumeMounts', [])
@@ -1303,8 +1270,13 @@ def _enforce_worker_projection_on_kubernetes_yaml(
             _enforce_worker_scratch_on_pod_spec(pod_spec, projection['scratch'])
         if has_projected_runtime_readiness:
             assert isinstance(expected_runtime_bootstrap_sha256, str)
+            try:
+                k8s_pod_spec.validate_projected_worker_bootstrap_environment(
+                    pod_spec, bootstrap_env)
+            except k8s_pod_spec.ProjectedRuntimeReadinessContractError as error:
+                raise exceptions.InvalidCloudConfigs(str(error)) from error
             _enforce_worker_runtime_readiness_on_pod_spec(
-                pod_spec, expected_runtime_bootstrap_sha256, runtime_env)
+                pod_spec, expected_runtime_bootstrap_sha256)
 
 
 def _finalize_authenticated_worker_projection_on_kubernetes_yaml(
@@ -1315,9 +1287,11 @@ def _finalize_authenticated_worker_projection_on_kubernetes_yaml(
     if not k8s_pod_spec.serve_worker_projection_protocol_has_runtime_readiness(
             projection_version):
         return False
+    bootstrap_environment = kubernetes_identity.bootstrap_environment(
+        projection)
     authenticated_bootstrap_sha256 = (
         _projected_worker_runtime_bootstrap_sha256_for_cluster_yaml(
-            cluster_yaml))
+            cluster_yaml, bootstrap_environment))
     _enforce_worker_projection_on_kubernetes_yaml(
         cluster_yaml,
         projection,
@@ -2012,7 +1986,9 @@ def write_cluster_config(
             # bootstrap instead of trusting code that was merged afterward.
             expected_runtime_bootstrap_sha256 = (
                 _projected_worker_runtime_bootstrap_sha256_for_cluster_yaml(
-                    cluster_yaml_obj))
+                    cluster_yaml_obj,
+                    kubernetes_identity.bootstrap_environment(
+                        worker_projection)))
         combined_yaml_obj = kubernetes_utils.combine_pod_config_fields_and_metadata(
             cluster_yaml_obj,
             cluster_config_overrides=cluster_config_overrides,

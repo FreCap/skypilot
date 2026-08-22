@@ -57,9 +57,9 @@ _WORKER_KUEUE_ADMISSION_KEYS = frozenset(
     {'local_queue_name', 'workload_priority_class_name'})
 _WORKER_V2_KEYS = (_WORKER_V1_KEYS | frozenset(
     {'projection_version', 'kueue_admission', 'scheduler_name'}))
-_WORKER_V3_V4_V5_KEYS = (_WORKER_V2_KEYS |
-                         frozenset({'provision_timeout', 'scratch'}))
-_WORKER_V3_V4_V5_PROTOCOL_VERSIONS = frozenset({3, 4, 5})
+_WORKER_V3_V5_KEYS = (_WORKER_V2_KEYS |
+                      frozenset({'provision_timeout', 'scratch'}))
+_WORKER_V3_V5_PROTOCOL_VERSIONS = frozenset({3, 4, 5})
 _ACCELERATOR_SCHEDULING_KEYS = frozenset(
     {'label_key', 'label_values', 'resource_key'})
 _MAX_ACCELERATOR_LABEL_VALUES = 16
@@ -126,8 +126,6 @@ WORKER_SCRATCH_MOUNT_PATH = (
     kubernetes_pod_spec.SERVE_WORKER_SCRATCH_MOUNT_PATH)
 WORKER_SCRATCH_VOLUME_NAME = (
     kubernetes_pod_spec.SERVE_WORKER_SCRATCH_VOLUME_NAME)
-WORKER_RUNTIME_ENV_VAR_NAMES = (
-    kubernetes_pod_spec.SERVE_WORKER_RUNTIME_ENV_VAR_NAMES)
 
 
 def worker_scratch_mount_path_collides(value: object) -> bool:
@@ -428,11 +426,10 @@ def worker_projection_protocol_version(projection: Mapping[str, Any]) -> int:
     Protocol v1 intentionally has no discriminator.  Its old exact key set is
     the only implicit-v1 shape accepted during the ordinary-launch transition.
     Protocol v2 remains an isolated decoder for already-committed rows.
-    Protocols v3, v4, and v5 intentionally share one closed key set: v3
-    retains its historical Running-only provisioning semantics, v4 requires
-    UID-bound runtime readiness, and v5 additionally routes base-runtime
-    writes to projected scratch.  New rows carry the explicit v5
-    discriminator.
+    Protocols v3-v5 intentionally share one closed key set: v3 retains its
+    historical Running-only provisioning semantics, v4 requires UID-bound
+    runtime readiness, and v5 also binds bootstrap writes to projected
+    memory-backed scratch. New rows carry the explicit v5 discriminator.
     """
     if not isinstance(projection, Mapping):
         raise ValueError('Worker placement projection must be a mapping.')
@@ -445,10 +442,10 @@ def worker_projection_protocol_version(projection: Mapping[str, Any]) -> int:
             raise ValueError('Worker placement projection_version must be '
                              'exactly 2 for the protocol-v2 key set.')
         return 2
-    if keys == _WORKER_V3_V4_V5_KEYS:
+    if keys == _WORKER_V3_V5_KEYS:
         projection_version = projection['projection_version']
         if (type(projection_version) is not int or
-                projection_version not in _WORKER_V3_V4_V5_PROTOCOL_VERSIONS):
+                projection_version not in _WORKER_V3_V5_PROTOCOL_VERSIONS):
             raise ValueError('Worker placement projection_version must be '
                              'exactly 3, 4, or 5 for the '
                              'protocol-v3/v4/v5 key set.')
@@ -457,7 +454,7 @@ def worker_projection_protocol_version(projection: Mapping[str, Any]) -> int:
         'Worker placement projection must contain exactly the protocol-v1 '
         f'keys {sorted(_WORKER_V1_KEYS)!r} or protocol-v2 keys '
         f'{sorted(_WORKER_V2_KEYS)!r} or protocol-v3/v4/v5 keys '
-        f'{sorted(_WORKER_V3_V4_V5_KEYS)!r}.')
+        f'{sorted(_WORKER_V3_V5_KEYS)!r}.')
 
 
 def worker_projection_has_strict_admission(
@@ -479,14 +476,6 @@ def worker_projection_has_provision_timeout(
     """Whether a frozen projection owns terminal provisioning wait."""
     return (kubernetes_pod_spec.
             serve_worker_projection_protocol_has_provision_timeout)(
-                worker_projection_protocol_version(projection))
-
-
-def worker_projection_owns_scratch_runtime(
-        projection: Mapping[str, Any]) -> bool:
-    """Whether the frozen projection owns base-runtime storage routing."""
-    return (kubernetes_pod_spec.
-            serve_worker_projection_protocol_owns_scratch_runtime)(
                 worker_projection_protocol_version(projection))
 
 
@@ -516,7 +505,7 @@ def validate_worker_placement_projections(
 ) -> list[dict[str, Any]] | None:
     """Strictly validate and copy homogeneous worker projections.
 
-    V1 through v4 are isolated compatibility decoders for historical launches.
+    V1 and v2 are isolated compatibility decoders for historical launches.
     Callers that require one exact persisted representation set
     ``require_protocol_version`` rather than accepting any supported shape.
     """
@@ -1386,7 +1375,7 @@ def cache_environment(projection: dict[str, Any]) -> dict[str, str]:
 
 
 def scratch_environment(projection: dict[str, Any]) -> dict[str, str]:
-    """Return server-owned runtime scratch environment for a v3+ worker."""
+    """Return server-owned runtime scratch environment for one v3-v5 worker."""
     if not kubernetes_pod_spec.serve_worker_projection_protocol_has_scratch(
             worker_projection_protocol_version(projection)):
         return {}
@@ -1400,13 +1389,15 @@ def scratch_environment(projection: dict[str, Any]) -> dict[str, str]:
     return env
 
 
-def runtime_environment(projection: dict[str, Any]) -> dict[str, str] | None:
-    """Return v5-owned base-runtime storage environment, if applicable."""
-    protocol_version = worker_projection_protocol_version(projection)
-    scratch = (projection['scratch']
-               if worker_projection_has_scratch(projection) else None)
-    return kubernetes_pod_spec.projected_worker_runtime_environment(
-        protocol_version, scratch)
+def bootstrap_environment(projection: dict[str, Any]) -> dict[str, str]:
+    """Return server-owned scratch paths for one protocol-v5 bootstrap."""
+    projection_version = worker_projection_protocol_version(projection)
+    scratch: object = {'kind': 'none'}
+    if kubernetes_pod_spec.serve_worker_projection_protocol_has_scratch(
+            projection_version):
+        scratch = projection['scratch']
+    return kubernetes_pod_spec.projected_worker_bootstrap_environment(
+        projection_version, scratch)
 
 
 def controller_cache_environment(projection: dict[str, Any]) -> dict[str, str]:
