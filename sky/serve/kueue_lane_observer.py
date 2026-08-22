@@ -58,13 +58,21 @@ def project_exact_pod_absence_after_teardown(
     engine = serve_state_schema.get_database_engine()
     repository = kueue_lane_lineage.KueueAdmissionRepository(engine)
     with engine.connect() as connection:
-        target = repository.load_exact_pod_absence_probe_target_in_connection(
+        decision = repository.load_exact_pod_absence_probe_target_in_connection(
             connection,
             service_name=service_name,
             replica_id=replica_id,
             replica_record_id=record_uuid)
-    if target is None:
-        return False
+    decision.validate()
+    if decision.state is (
+            kueue_lane_lineage.PhysicalAbsenceLoadState.ALREADY_PROVEN):
+        return True
+    if decision.state is (
+            kueue_lane_lineage.PhysicalAbsenceLoadState.NOT_APPLICABLE):
+        return project_admissionless_physical_absence_after_teardown(
+            service_name, replica_id, record_uuid)
+    target = decision.target
+    assert target is not None
 
     try:
         with provider_phase.provider_phase(
@@ -113,6 +121,82 @@ def project_exact_pod_absence_after_teardown(
             connection,
             target,
             provider_read_started_at=provider_read_started_at)
+    return True
+
+
+def project_admissionless_physical_absence_after_teardown(
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str | uuid.UUID,
+) -> bool:
+    """Record physical absence for a teardown-fenced missing admission.
+
+    Scheduler-admitted East replicas return ``False``. A Kueue-bound replica
+    may enter this path only after whole-service teardown has revoked every
+    provider writer. The physical read is uncached and spans no SQL lock.
+    """
+    service_name = _nonempty(service_name, 'service_name')
+    replica_id = _positive_int(replica_id, 'replica_id')
+    try:
+        record_uuid = (replica_record_id if
+                       isinstance(replica_record_id, uuid.UUID) else uuid.UUID(
+                           str(replica_record_id)))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError('replica_record_id must be a UUID.') from error
+
+    engine = serve_state_schema.get_database_engine()
+    repository = kueue_lane_lineage.KueueAdmissionRepository(engine)
+    with engine.connect() as connection:
+        decision = (
+            repository.
+            load_admissionless_physical_absence_probe_target_in_connection(
+                connection,
+                service_name=service_name,
+                replica_id=replica_id,
+                replica_record_id=record_uuid))
+    decision.validate()
+    if decision.state is (
+            kueue_lane_lineage.PhysicalAbsenceLoadState.NOT_APPLICABLE):
+        return False
+    if decision.state is (
+            kueue_lane_lineage.PhysicalAbsenceLoadState.ALREADY_PROVEN):
+        return True
+    target = decision.target
+    assert target is not None
+
+    cleanup_fence = reserved_capacity.ProtocolV2CleanupFence(
+        kubernetes_context=target.identity.kubernetes_context,
+        physical_cluster_uid=target.identity.physical_cluster_uid)
+    try:
+        with provider_phase.provider_phase(
+                provider_phase.ProviderPhaseMode.V2_FENCED):
+            with kubernetes_adaptor.physical_cluster_uid_fence(
+                    cleanup_fence.kubernetes_context,
+                    cleanup_fence.physical_cluster_uid):
+                with engine.connect() as connection:
+                    provider_read_started_at = connection.execute(
+                        sqlalchemy.select(
+                            sqlalchemy.func.clock_timestamp())).scalar_one()
+                presence = reserved_capacity.probe_physical_replica_presence(
+                    cleanup_fence, target.cluster_name, use_cache=False)
+                if presence is not (
+                        reserved_capacity.PhysicalReplicaPresence.ABSENT):
+                    raise kueue_lane_lineage.KueueAdmissionConflict(
+                        'Admissionless physical replica is '
+                        f'{presence.value}; provider absence is unproven.')
+    except kueue_lane_lineage.KueueAdmissionConflict:
+        raise
+    except Exception as error:  # pylint: disable=broad-except
+        raise kueue_lane_lineage.KueueAdmissionConflict(
+            'Admissionless physical absence is UNKNOWN because its provider '
+            'identity could not be proved.') from error
+
+    with engine.begin() as connection:
+        (repository.
+         record_admissionless_physical_absence_after_teardown_in_connection)(
+             connection,
+             target,
+             provider_read_started_at=provider_read_started_at)
     return True
 
 

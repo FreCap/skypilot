@@ -7,6 +7,7 @@ import datetime
 import threading
 import time
 import types
+from unittest import mock
 import uuid
 
 from alembic import command as alembic_command
@@ -18,13 +19,17 @@ from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
 from sky.adaptors import kubernetes as kubernetes_adaptor
+from sky.serve import capacity_admission
 from sky.serve import kubernetes_identity
 from sky.serve import kueue_lane_lineage
 from sky.serve import kueue_lane_lineage_schema
 from sky.serve import kueue_lane_observer
 from sky.serve import ordinary_launch_binding
+from sky.serve import pool_capacity_observation_schema
 from sky.serve import replica_managers
+from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
+from sky.serve import reserved_fill_planner
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import service
@@ -173,6 +178,46 @@ def _intent_values(intent_key: str, **overrides) -> dict:
     return values
 
 
+def _canonical_intent_key(**overrides) -> str:
+    """Build the exact deterministic key for ``_intent_values`` authority."""
+    values = _intent_values('0' * 64, **overrides)
+    locations = tuple(
+        reserved_fill_planner.LocationSnapshot.from_pickleable(location)
+        for location in values['allowed_locations'])
+    intent = reserved_fill_planner.FillIntent.create(
+        ordinal=values['ordinal'],
+        protocol_version=values['protocol_version'],
+        policy_revision=values['policy_revision'],
+        reconcile_generation=values['reconcile_generation'],
+        allocation_generation=values['allocation_generation'],
+        allocation_input_sha256=values['allocation_input_sha256'],
+        allocation_claim_generation=values['allocation_claim_generation'],
+        reconciliation_gate_generation=values['reconciliation_gate_generation'],
+        reclaim_fleet_bundle_sha256=values['reclaim_fleet_bundle_sha256'],
+        reclaim_policy_revision=values['reclaim_policy_revision'],
+        reclaim_provider_inventory_sha256=values[
+            'reclaim_provider_inventory_sha256'],
+        service_incarnation=values['service_hash'],
+        service_version=values['service_version'],
+        controller_owner=values['controller_owner'],
+        service_generation=values['service_generation'],
+        pool_key=values['pool_key'],
+        pool_epoch=values['pool_epoch'],
+        physical_cluster_uid=values['physical_cluster_uid'],
+        worker_projection_sha256=values['worker_projection_sha256'],
+        observation_generation=values['observation_generation'],
+        observation_sequence=values['observation_sequence'],
+        ordinary_zero_cost_admission_sequence=values[
+            'ordinary_zero_cost_admission_sequence'],
+        valid_until=values['valid_until_epoch'],
+        accelerator=values['accelerator'],
+        accelerator_count=values['accelerator_count'],
+        capacity_unit=reserved_fill_planner.FillCapacityUnit(
+            values['capacity_unit']),
+        allowed_locations=locations)
+    return intent.idempotency_key
+
+
 @pytest.fixture
 def admission_database(empty_postgres):
     config = migration_utils.get_alembic_config(empty_postgres,
@@ -206,6 +251,12 @@ def admission_database(empty_postgres):
                 ordinary_launch_binding_capable=True,
                 ordinary_launch_binding_mode='bound',
                 ordinary_launch_binding_epoch=1,
+                demand_source_mode='DURABLE_FEED',
+                demand_source_epoch=1,
+                demand_authority_capable=True,
+                demand_authority_controller_incarnation=incarnation,
+                demand_authority_protocol_version=(
+                    capacity_admission.PROTOCOL_VERSION),
                 reserved_fill_actuation_mode='DURABLE_INTENT',
                 reserved_fill_actuation_epoch=1,
                 reserved_fill_actuation_capable=True,
@@ -224,6 +275,14 @@ def admission_database(empty_postgres):
                 worker_placement_projections=[
                     _WORKER_PROJECTION, _EAST_WORKER_PROJECTION
                 ]))
+        assert ordinary_launch_binding.promote_non_pool_launch_service_in_connection(
+            connection,
+            service_name=_SERVICE,
+            controller_incarnation=incarnation,
+            controller_owner_epoch=1,
+            expected_binding_epoch=1,
+            participant_barrier_passed=lambda _connection: True,
+            legacy_requests_drained=lambda _connection: True) == 2
     return empty_postgres
 
 
@@ -338,6 +397,9 @@ def _install_materialized_graph(
             serve_state_schema.services_table.c.controller_incarnation).where(
                 serve_state_schema.services_table.c.name ==
                 _SERVICE)).scalar_one()
+    intent_row = connection.execute(
+        sqlalchemy.select(intents).where(
+            intents.c.intent_idempotency_key == intent_key)).mappings().one()
     profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
         ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
         authorization_reference=f'reserved-fill:{intent_key}',
@@ -364,10 +426,12 @@ def _install_materialized_graph(
     info.reserved_fill_reclaim_provider_inventory_sha256 = 'c' * 64
     info.reserved_fill_worker_projection_sha256 = _PROJECTION
     info.reserved_fill_observation_generation = 1
-    info.reserved_fill_observation_sequence = replica_id
+    info.reserved_fill_observation_sequence = int(
+        intent_row['observation_sequence'])
     info.reserved_fill_intent_idempotency_key = intent_key
     info.zero_cost_admission_sequence = replica_id
     info.is_zero_cost = True
+    info.planned_capacity = 1
     connection.execute(
         sqlalchemy.insert(associations).values(
             association_id=association_id,
@@ -377,7 +441,7 @@ def _install_materialized_graph(
             service_hash=_SERVICE_HASH,
             service_workspace='workspace-a',
             service_lifecycle_epoch=_LIFECYCLE_EPOCH,
-            service_binding_epoch=1,
+            service_binding_epoch=2,
             service_version=_SERVICE_VERSION,
             replica_id=replica_id,
             replica_record_id=record_id,
@@ -396,8 +460,11 @@ def _install_materialized_graph(
             profile_kind='RESERVED_FILL',
             profile_version=1,
             profile_digest=profile.digest,
-            capability_cohort_epoch=1,
-            capability_profile_set_digest='c' * 64,
+            capability_cohort_epoch=(
+                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+            capability_profile_set_digest=(
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            ),
             receipt_protocol_version=1,
             authorization_kind=profile.authorization_kind.value,
             authorization_reference=profile.authorization_reference,
@@ -467,8 +534,8 @@ def _install_retirable_materialized_graph(
     _insert_intent(engine,
                    intent_key,
                    ordinal=replica_id - 1,
-                   observation_sequence=replica_id,
-                   ordinary_zero_cost_admission_sequence=replica_id)
+                   observation_sequence=replica_id - 1,
+                   ordinary_zero_cost_admission_sequence=replica_id - 1)
     with engine.begin() as connection:
         repository.insert_intent_pending_in_connection(connection, identity,
                                                        intent_key)
@@ -500,10 +567,11 @@ def _install_retirable_materialized_graph(
     info.reserved_fill_reclaim_provider_inventory_sha256 = 'c' * 64
     info.reserved_fill_worker_projection_sha256 = _PROJECTION
     info.reserved_fill_observation_generation = 1
-    info.reserved_fill_observation_sequence = 1
+    info.reserved_fill_observation_sequence = replica_id - 1
     info.reserved_fill_intent_idempotency_key = intent_key
     info.zero_cost_admission_sequence = replica_id
     info.is_zero_cost = True
+    info.planned_capacity = 1
     info.status_property.sky_launch_status = (
         common_utils.ProcessStatus.INTERRUPTED)
     info.status_property.sky_down_status = common_utils.ProcessStatus.SCHEDULED
@@ -613,16 +681,22 @@ def _install_normal_admitted_teardown_graph(
     launch_status: common_utils.ProcessStatus = common_utils.ProcessStatus.
     SUCCEEDED,
     projection_owner: str = 'manager',
+    observation_sequence: int | None = None,
+    ordinary_zero_cost_admission_sequence: int | None = None,
 ) -> tuple[uuid.UUID, uuid.UUID, str]:
     """Run the production projector for a launch with one admitted Pod."""
     if projection_owner not in ('manager', 'service'):
         raise ValueError('projection_owner must be manager or service.')
     identity = _identity()
+    ordinary_high_water = (0 if ordinary_zero_cost_admission_sequence is None
+                           else ordinary_zero_cost_admission_sequence)
+    observation_high_water = (0 if observation_sequence is None else
+                              observation_sequence)
     _insert_intent(engine,
                    intent_key,
                    ordinal=replica_id - 1,
-                   observation_sequence=replica_id,
-                   ordinary_zero_cost_admission_sequence=replica_id)
+                   observation_sequence=observation_high_water,
+                   ordinary_zero_cost_admission_sequence=ordinary_high_water)
     with engine.begin() as connection:
         repository.insert_intent_pending_in_connection(connection, identity,
                                                        intent_key)
@@ -676,10 +750,11 @@ def _install_normal_admitted_teardown_graph(
     info.reserved_fill_reclaim_provider_inventory_sha256 = 'c' * 64
     info.reserved_fill_worker_projection_sha256 = _PROJECTION
     info.reserved_fill_observation_generation = 1
-    info.reserved_fill_observation_sequence = replica_id
+    info.reserved_fill_observation_sequence = observation_high_water
     info.reserved_fill_intent_idempotency_key = intent_key
     info.zero_cost_admission_sequence = replica_id
     info.is_zero_cost = True
+    info.planned_capacity = 1
     info.status_property.sky_launch_status = launch_status
     info.status_property.sky_down_status = down_status
     info.status_property.is_scale_down = is_scale_down
@@ -815,6 +890,151 @@ def _install_normal_admitted_teardown_graph(
     return record_id, association_id, request_id
 
 
+def _install_canonical_cleanup_profile_authority(
+    engine: sqlalchemy.engine.Engine,
+    *,
+    intent_key: str,
+    replica_id: int,
+    association_id: uuid.UUID,
+) -> None:
+    """Replace the generic fixture profile with production fill authority."""
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    requests = request_postgres_schema.REQUESTS
+    replicas = serve_state_schema.replicas_table
+    services = serve_state_schema.services_table
+    protocol = pool_capacity_observation_schema.protocol_state_sequence_table
+    observations = (
+        pool_capacity_observation_schema.demand_capacity_observations_v2_table)
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    with engine.begin() as connection:
+        now = _postgres_now(connection)
+        now_epoch = now.timestamp()
+        intent_row = connection.execute(
+            sqlalchemy.select(intents).where(intents.c.intent_idempotency_key ==
+                                             intent_key)).mappings().one()
+        connection.execute(
+            sqlalchemy.update(protocol).where(protocol.c.id == 1).values(
+                protocol_version=2,
+                zero_cost_admission_sequence=sqlalchemy.func.greatest(
+                    protocol.c.zero_cost_admission_sequence, replica_id),
+                ordinary_zero_cost_admission_sequence=sqlalchemy.func.greatest(
+                    protocol.c.ordinary_zero_cost_admission_sequence,
+                    replica_id),
+                reconciliation_gate_state=(
+                    pool_capacity_observation_schema.SEQUENCED_ACTIVE),
+                reconciliation_gate_generation=1,
+                reclaim_fleet_bundle_sha256='b' * 64,
+                reclaim_policy_revision='reclaim-v1',
+                reclaim_provider_inventory_sha256='c' * 64,
+                reclaim_claim_scope_count=0,
+                reclaim_claim_scope_sha256='d' * 64,
+                reclaim_evidence_sha256='e' * 64,
+                reclaim_authorized_at=now_epoch,
+                image_digest='sha256:' + 'f' * 64,
+                deployment_generation='fixture-deployment-1',
+                deployment_uid='fixture-deployment-uid-1',
+                pod_inventory_count=1,
+                pod_inventory_sha256='1' * 64))
+        observation_payload = {
+            'fixture': 'canonical-reserved-fill-cleanup',
+            'intent_idempotency_key': intent_key,
+        }
+        connection.execute(
+            sqlalchemy.insert(observations).values(
+                context=f'{_CONTEXT}-cleanup-{replica_id}',
+                snapshot_time=now_epoch,
+                completed_at=now_epoch,
+                availability='AVAILABLE',
+                pool_key=_POOL_KEY,
+                physical_cluster_uid=_PHYSICAL_UID,
+                accelerator_names=[_ACCELERATOR],
+                access_context=_CONTEXT,
+                observation_generation=int(
+                    intent_row['observation_generation']),
+                lease_token=uuid.uuid4(),
+                lease_expires_at=now_epoch + 60,
+                observation_sequence=int(intent_row['observation_sequence']),
+                ordinary_admission_sequence=int(
+                    intent_row['ordinary_zero_cost_admission_sequence']),
+                materialization_sequence=0,
+                observation_status=pool_capacity_observation_schema.SUCCESS,
+                payload=observation_payload,
+                payload_sha256=_receipt_digest(connection, observation_payload),
+                observed_at=now_epoch,
+                valid_until=now_epoch + 60,
+                published_at=now_epoch))
+        service_row = connection.execute(
+            sqlalchemy.select(services).where(
+                services.c.name == _SERVICE)).mappings().one()
+        replica_row = connection.execute(
+            sqlalchemy.select(replicas).where(
+                replicas.c.service_name == _SERVICE,
+                replicas.c.replica_id == replica_id)).mappings().one()
+        info = serve_state.decode_replica_state_for_authority(
+            replica_row['replica_state_version'], replica_row['replica_state'])
+        payload = ordinary_launch_binding._reserved_fill_cleanup_payload(  # pylint: disable=protected-access
+            connection, service_row, info)
+        profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+            authorization_reference=f'reserved-fill:{intent_key}',
+            authorization_generation=1,
+            authorization_payload=payload)
+        connection.exec_driver_sql(
+            f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
+        connection.exec_driver_sql(
+            f'ALTER TABLE {requests.name} DISABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.update(associations).where(
+                associations.c.association_id == association_id).values(
+                    profile_digest=profile.digest,
+                    authorization_kind=profile.authorization_kind.value,
+                    authorization_reference=profile.authorization_reference,
+                    authorization_generation=profile.authorization_generation,
+                    authorization_digest=profile.authorization_digest,
+                    updated_at=now))
+        connection.execute(
+            sqlalchemy.update(requests).where(
+                requests.c.ordinary_launch_association_id ==
+                association_id).values(profile_digest=profile.digest,
+                                       updated_at=now))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {requests.name} ENABLE TRIGGER USER')
+        connection.exec_driver_sql(
+            f'ALTER TABLE {associations.name} ENABLE TRIGGER USER')
+
+
+def _stamp_canonical_materialization_receipt(
+    engine: sqlalchemy.engine.Engine,
+    *,
+    replica_id: int,
+) -> None:
+    """Advance the post-profile materialization sequence as production does."""
+    replicas = serve_state_schema.replicas_table
+    protocol = pool_capacity_observation_schema.protocol_state_sequence_table
+    with engine.begin() as connection:
+        row = connection.execute(
+            sqlalchemy.select(replicas).where(
+                replicas.c.service_name == _SERVICE,
+                replicas.c.replica_id == replica_id)).mappings().one()
+        info = serve_state.decode_replica_state_for_authority(
+            row['replica_state_version'], row['replica_state'])
+        info.zero_cost_materialization_sequence = replica_id
+        connection.exec_driver_sql(
+            f'ALTER TABLE {replicas.name} DISABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.update(replicas).where(
+                replicas.c.service_name == _SERVICE,
+                replicas.c.replica_id == replica_id).values(
+                    **serve_state._replica_row_values(  # pylint: disable=protected-access
+                        _SERVICE, replica_id, info)))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {replicas.name} ENABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.update(protocol).where(protocol.c.id == 1).values(
+                zero_cost_materialization_sequence=sqlalchemy.func.greatest(
+                    protocol.c.zero_cost_materialization_sequence, replica_id)))
+
+
 def _configure_serve_state_for_kueue_retirement(
     monkeypatch: pytest.MonkeyPatch,
     engine: sqlalchemy.engine.Engine,
@@ -832,6 +1052,108 @@ def _mark_service_shutting_down(engine: sqlalchemy.engine.Engine) -> None:
         _SERVICE, _SERVICE_HASH, (1, '10.0.0.1'))
     assert result.disposition == (
         ordinary_launch_binding.ServiceTeardownDisposition.MARKED_BOUND)
+
+
+def _claim_restricted_teardown_owner(
+) -> ordinary_launch_binding.ControllerBindingAuthority:
+    authority = ordinary_launch_binding.claim_controller_incarnation(
+        _SERVICE,
+        _SERVICE_HASH, (1, '10.0.0.1'),
+        uuid.uuid4(),
+        new_parent_owner=(1, '10.0.0.1'),
+        expected_status=serve_state.ServiceStatus.SHUTTING_DOWN)
+    assert authority is not None
+    return authority
+
+
+def _delete_kueue_admission(engine: sqlalchemy.engine.Engine,
+                            intent_key: str) -> dict:
+    admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    with engine.begin() as connection:
+        deleted = connection.execute(
+            sqlalchemy.delete(admissions).where(
+                admissions.c.intent_idempotency_key == intent_key).returning(
+                    *admissions.c)).mappings().one()
+    return dict(deleted)
+
+
+def _set_physical_provider_evidence(
+    engine: sqlalchemy.engine.Engine,
+    association_id: uuid.UUID,
+    evidence: ordinary_launch_binding.ProviderEvidence,
+    *,
+    cluster_name: str | None = None,
+    observed_before_quiescence: bool = False,
+) -> None:
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    replicas = serve_state_schema.replicas_table
+    with engine.begin() as connection:
+        association = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.association_id ==
+                association_id)).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(replicas).where(
+                replicas.c.service_name == _SERVICE, replicas.c.replica_id ==
+                association['replica_id'])).mappings().one()
+        info = serve_state.decode_replica_state_for_authority(
+            replica['replica_state_version'], replica['replica_state'])
+        if cluster_name is not None:
+            info.cluster_name = cluster_name
+        payload, digest = (
+            ordinary_launch_binding._reserved_fill_provider_evidence(  # pylint: disable=protected-access
+                association, info, evidence))
+        observed_at = _postgres_now(connection)
+        if observed_before_quiescence:
+            observed_at = (association['execution_quiesced_at'] -
+                           datetime.timedelta(seconds=1))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.update(associations).where(
+                associations.c.association_id == association_id).values(
+                    provider_evidence=evidence.value,
+                    provider_evidence_observed_at=observed_at,
+                    provider_evidence_payload=payload,
+                    provider_evidence_digest=digest,
+                    updated_at=sqlalchemy.func.clock_timestamp()))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {associations.name} ENABLE TRIGGER USER')
+
+
+def _admissionless_graph_snapshot(
+    engine: sqlalchemy.engine.Engine,
+    association_id: uuid.UUID,
+) -> dict[str, object]:
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with engine.connect() as connection:
+        return {
+            'service': connection.execute(
+                sqlalchemy.select(serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name == _SERVICE)
+            ).mappings().one(),
+            'replicas': tuple(
+                connection.execute(
+                    sqlalchemy.select(serve_state_schema.replicas_table).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        _SERVICE)).mappings().all()),
+            'intents': tuple(
+                connection.execute(
+                    sqlalchemy.select(
+                        zero_cost_actuation_schema.
+                        serve_zero_cost_actuation_intents_table).where(
+                            zero_cost_actuation_schema.
+                            serve_zero_cost_actuation_intents_table.c.
+                            service_name == _SERVICE)).mappings().all()),
+            'association': connection.execute(
+                sqlalchemy.select(associations).where(
+                    associations.c.association_id == association_id)
+            ).mappings().one(),
+            'admission_count': connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    kueue_lane_lineage_schema.serve_kueue_admissions_table)
+            ).scalar_one(),
+        }
 
 
 def _assert_retired_graph(
@@ -911,8 +1233,8 @@ def test_normal_admitted_teardown_exact_pod_404_retires_replica(
         def read_namespaced_pod(self, *_args, **_kwargs):
             raise kubernetes_adaptor.api_exception()(status=404)
 
-    monkeypatch.setattr(kubernetes_adaptor, 'core_api',
-                        lambda _context: _MissingPodApi())
+    core_api = mock.Mock(return_value=_MissingPodApi())
+    monkeypatch.setattr(kubernetes_adaptor, 'core_api', core_api)
 
     assert kueue_lane_observer.project_exact_pod_absence_after_teardown(
         _SERVICE, 1, record_id)
@@ -931,6 +1253,12 @@ def test_normal_admitted_teardown_exact_pod_404_retires_replica(
             'name': 'worker-1',
             'uid': 'pod-uid-1',
         }
+    core_api.reset_mock()
+    core_api.side_effect = AssertionError(
+        'durable exact-Pod absence replay attempted provider I/O')
+    assert kueue_lane_observer.project_exact_pod_absence_after_teardown(
+        _SERVICE, 1, record_id)
+    core_api.assert_not_called()
     assert serve_state.remove_replica(_SERVICE,
                                       1,
                                       expected_service_hash=_SERVICE_HASH,
@@ -1002,12 +1330,15 @@ def test_post_job_terminal_launch_exact_pod_absence_remains_retirable(
         launch_status=launch_status)
     _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
     with admission_database.connect() as connection:
-        target = repository.load_exact_pod_absence_probe_target_in_connection(
+        decision = repository.load_exact_pod_absence_probe_target_in_connection(
             connection,
             service_name=_SERVICE,
             replica_id=1,
             replica_record_id=record_id)
-        assert target is not None
+        assert decision.state is (
+            kueue_lane_lineage.PhysicalAbsenceLoadState.NEEDS_PROBE)
+        assert decision.target is not None
+        target = decision.target
     with admission_database.begin() as connection:
         repository.record_exact_pod_absence_after_normal_teardown_in_connection(
             connection,
@@ -1037,6 +1368,7 @@ def test_missing_cluster_record_whole_service_uses_exact_pod_404_with_no_down_st
         down_status=None)
     _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
     _mark_service_shutting_down(admission_database)
+    teardown_owner = _claim_restricted_teardown_owner()
     # Normal request GC may run long before a live replica is retired.  The
     # projected association is the durable copied terminal/quiescence receipt.
     with admission_database.begin() as connection:
@@ -1044,18 +1376,32 @@ def test_missing_cluster_record_whole_service_uses_exact_pod_404_with_no_down_st
             sqlalchemy.delete(request_postgres_schema.REQUESTS).where(
                 request_postgres_schema.REQUESTS.c.
                 ordinary_launch_association_id == association_id))
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        lambda _mode: contextlib.nullcontext())
+    monkeypatch.setattr(kubernetes_adaptor, 'physical_cluster_uid_fence',
+                        lambda *_args, **_kwargs: contextlib.nullcontext())
+
+    class _MissingPodApi:
+
+        def read_namespaced_pod(self, *_args, **_kwargs):
+            raise kubernetes_adaptor.api_exception()(status=404)
+
+    monkeypatch.setattr(kubernetes_adaptor, 'core_api',
+                        lambda _context: _MissingPodApi())
+    assert kueue_lane_observer.project_exact_pod_absence_after_teardown(
+        _SERVICE, 1, record_id)
+
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
     with admission_database.connect() as connection:
-        target = repository.load_exact_pod_absence_probe_target_in_connection(
-            connection,
-            service_name=_SERVICE,
-            replica_id=1,
-            replica_record_id=record_id)
-        assert target is not None
-    with admission_database.begin() as connection:
-        repository.record_exact_pod_absence_after_normal_teardown_in_connection(
-            connection,
-            target,
-            provider_read_started_at=_postgres_now(connection))
+        association_owner = connection.execute(
+            sqlalchemy.select(associations.c.owner_controller_incarnation,
+                              associations.c.owner_controller_epoch).where(
+                                  associations.c.association_id ==
+                                  association_id)).mappings().one()
+    assert association_owner['owner_controller_incarnation'] == (
+        teardown_owner.controller_incarnation)
+    assert association_owner['owner_controller_epoch'] == (
+        teardown_owner.controller_owner_epoch)
 
     assert serve_state.remove_service_completely(
         _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
@@ -1274,6 +1620,580 @@ def test_serve_state_missing_kueue_admission_fails_closed_without_mutation(
                 serve_zero_cost_actuation_intents_table)).scalar_one() == 1
 
 
+def test_live_east_missing_admission_fallback_is_not_applicable(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, _ = _install_normal_admitted_teardown_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        is_scale_down=True,
+        down_status=common_utils.ProcessStatus.SCHEDULED,
+        observation_sequence=0,
+        ordinary_zero_cost_admission_sequence=0)
+    _delete_kueue_admission(admission_database, key)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    # The immutable worker projection is the scheduler authority: ``None``
+    # classifies the ordinary East path, which owns no Kueue admission row.
+    monkeypatch.setattr(
+        zero_cost_actuation,
+        'kueue_admission_identity_for_locked_intent_in_connection',
+        lambda _connection, _intent: None)
+    provider_probe = mock.Mock()
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        provider_probe)
+
+    assert not kueue_lane_observer.project_exact_pod_absence_after_teardown(
+        _SERVICE, 1, record_id)
+    provider_probe.assert_not_called()
+    snapshot = _admissionless_graph_snapshot(admission_database, association_id)
+    assert snapshot['service']['status'] == 'READY'
+    assert snapshot['association']['provider_evidence'] == 'NOT_QUERIED'
+    assert snapshot['admission_count'] == 0
+
+
+@pytest.mark.parametrize('retain_request', (True, False))
+def test_whole_service_teardown_retires_provider_absent_admissionless_graph(
+        admission_database, monkeypatch, retain_request) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, _ = _install_normal_admitted_teardown_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        is_scale_down=False,
+        down_status=None,
+        observation_sequence=0,
+        ordinary_zero_cost_admission_sequence=0)
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _stamp_canonical_materialization_receipt(admission_database, replica_id=1)
+    _delete_kueue_admission(admission_database, key)
+    if not retain_request:
+        with admission_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.delete(request_postgres_schema.REQUESTS).where(
+                    request_postgres_schema.REQUESTS.c.
+                    ordinary_launch_association_id == association_id))
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+    teardown_owner = _claim_restricted_teardown_owner()
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        lambda _mode: contextlib.nullcontext())
+    monkeypatch.setattr(kubernetes_adaptor, 'physical_cluster_uid_fence',
+                        lambda *_args, **_kwargs: contextlib.nullcontext())
+    probe = mock.Mock(
+        return_value=reserved_capacity.PhysicalReplicaPresence.ABSENT)
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        probe)
+    assert (kueue_lane_observer.
+            project_admissionless_physical_absence_after_teardown(
+                _SERVICE, 1, record_id))
+    probe.assert_called_once_with(reserved_capacity.ProtocolV2CleanupFence(
+        kubernetes_context=_CONTEXT, physical_cluster_uid=_PHYSICAL_UID),
+                                  f'{_SERVICE}-1',
+                                  use_cache=False)
+
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with admission_database.connect() as connection:
+        evidence = connection.execute(
+            sqlalchemy.select(associations.c.provider_evidence,
+                              associations.c.provider_evidence_observed_at,
+                              associations.c.execution_quiesced_at,
+                              associations.c.provider_evidence_payload).where(
+                                  associations.c.association_id ==
+                                  association_id)).mappings().one()
+        assert evidence['provider_evidence'] == 'ABSENT'
+        assert (evidence['provider_evidence_observed_at']
+                >= evidence['execution_quiesced_at'])
+        assert evidence['provider_evidence_payload'] == {
+            'association_id': str(association_id),
+            'cluster_name': f'{_SERVICE}-1',
+            'kubernetes_context': _CONTEXT,
+            'physical_cluster_uid': _PHYSICAL_UID,
+            'probe_contract': 'kubernetes-physical-replica-presence-v1',
+            'profile_kind': 'RESERVED_FILL',
+            'replica_record_id': str(record_id),
+            'result': 'ABSENT',
+        }
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                kueue_lane_lineage_schema.serve_kueue_admissions_table)
+        ).scalar_one() == 0
+        association_owner = connection.execute(
+            sqlalchemy.select(associations.c.owner_controller_incarnation,
+                              associations.c.owner_controller_epoch).where(
+                                  associations.c.association_id ==
+                                  association_id)).mappings().one()
+        assert association_owner['owner_controller_incarnation'] == (
+            teardown_owner.controller_incarnation)
+        assert association_owner['owner_controller_epoch'] == (
+            teardown_owner.controller_owner_epoch)
+
+    probe.reset_mock()
+    probe.side_effect = AssertionError(
+        'durable admissionless absence replay attempted provider I/O')
+    assert (kueue_lane_observer.
+            project_admissionless_physical_absence_after_teardown(
+                _SERVICE, 1, record_id))
+    probe.assert_not_called()
+
+    assert serve_state.remove_service_completely(
+        _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+    _assert_retired_graph(admission_database,
+                          intent_keys=(key,),
+                          replica_ids=(1,),
+                          association_ids=(association_id,))
+    with admission_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table)).scalar_one() == 0
+
+
+def test_admissionless_probe_and_retirement_share_exact_row_validator(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, _ = _install_normal_admitted_teardown_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        is_scale_down=False,
+        down_status=None,
+        observation_sequence=0,
+        ordinary_zero_cost_admission_sequence=0)
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _stamp_canonical_materialization_receipt(admission_database, replica_id=1)
+    _delete_kueue_admission(admission_database, key)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+    _set_physical_provider_evidence(
+        admission_database, association_id,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
+
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    requests = request_postgres_schema.REQUESTS
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    with admission_database.connect() as connection:
+        lifecycle_epoch = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.service_lifecycle_fences_table.c.epoch).
+            where(serve_state_schema.service_lifecycle_fences_table.c.name ==
+                  _SERVICE)).scalar_one()
+        service_row = dict(
+            connection.execute(
+                sqlalchemy.select(serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    _SERVICE)).mappings().one())
+        intent_row = dict(
+            connection.execute(
+                sqlalchemy.select(intents).where(
+                    intents.c.intent_idempotency_key == key)).mappings().one())
+        replica_row = dict(
+            connection.execute(
+                sqlalchemy.select(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    _SERVICE, serve_state_schema.replicas_table.c.replica_id ==
+                    1)).mappings().one())
+        association_row = dict(
+            connection.execute(
+                sqlalchemy.select(associations).where(
+                    associations.c.association_id ==
+                    association_id)).mappings().one())
+        request_row = dict(
+            connection.execute(
+                sqlalchemy.select(requests).where(
+                    requests.c.ordinary_launch_association_id ==
+                    association_id)).mappings().one())
+
+        common = {
+            'lifecycle_epoch': lifecycle_epoch,
+            'service': service_row,
+            'intent': intent_row,
+            'identity': _identity(),
+            'intent_idempotency_key': key,
+            'replica': replica_row,
+            'association': association_row,
+            'request': request_row,
+            'replica_id': 1,
+            'replica_record_id': record_id,
+        }
+        validator = getattr(
+            kueue_lane_lineage,
+            '_validate_admissionless_retirement_rows_in_connection')
+        graph = validator(connection, **common)
+        assert graph.provider_absence_state is (
+            kueue_lane_lineage.PhysicalAbsenceLoadState.ALREADY_PROVEN)
+
+        invalid_rows = []
+        for field, value in (('service_hash', 'replacement-service'),
+                             ('service_lifecycle_epoch', _LIFECYCLE_EPOCH + 1),
+                             ('service_version',
+                              _SERVICE_VERSION + 1), ('projected_at', None)):
+            changed = dict(association_row)
+            changed[field] = value
+            invalid_rows.append({'association': changed})
+        changed_association = dict(association_row)
+        changed_association['terminal_cause'] = ''
+        changed_request = dict(request_row)
+        changed_request['terminal_cause'] = ''
+        invalid_rows.append({
+            'association': changed_association,
+            'request': changed_request,
+        })
+        changed_replica = dict(replica_row)
+        changed_state = dict(changed_replica['replica_state'])
+        changed_state['reserved_fill_intent_idempotency_key'] = '0' * 64
+        changed_replica['replica_state'] = changed_state
+        invalid_rows.append({'replica': changed_replica})
+        changed_request = dict(request_row)
+        changed_request['profile_digest'] = '0' * 64
+        invalid_rows.append({'request': changed_request})
+
+        for changes in invalid_rows:
+            arguments = dict(common)
+            arguments.update(changes)
+            with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict):
+                validator(connection, **arguments)
+
+
+def test_admissionless_absence_publication_expires_after_slow_update(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, _ = _install_normal_admitted_teardown_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        is_scale_down=False,
+        down_status=None,
+        observation_sequence=0,
+        ordinary_zero_cost_admission_sequence=0)
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _stamp_canonical_materialization_receipt(admission_database, replica_id=1)
+    _delete_kueue_admission(admission_database, key)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+    with admission_database.connect() as connection:
+        decision = (
+            repository.
+            load_admissionless_physical_absence_probe_target_in_connection(
+                connection,
+                service_name=_SERVICE,
+                replica_id=1,
+                replica_record_id=record_id))
+    assert decision.state is (
+        kueue_lane_lineage.PhysicalAbsenceLoadState.NEEDS_PROBE)
+    assert decision.target is not None
+    target = decision.target
+
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with admission_database.begin() as connection:
+        connection.exec_driver_sql(
+            'CREATE FUNCTION delay_admissionless_absence() RETURNS trigger '
+            'LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1.1); RETURN NEW; '
+            'END $$')
+        connection.exec_driver_sql(
+            f'CREATE TRIGGER delay_admissionless_absence BEFORE UPDATE OF '
+            f'provider_evidence ON {associations.name} FOR EACH ROW WHEN '
+            "(NEW.provider_evidence = 'ABSENT') EXECUTE FUNCTION "
+            'delay_admissionless_absence()')
+    monkeypatch.setattr(kueue_lane_lineage, 'WAITING_OBSERVATION_TTL_SECONDS',
+                        1)
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
+                       match='expired during database publication'):
+        with admission_database.begin() as connection:
+            repository.record_admissionless_physical_absence_after_teardown_in_connection(
+                connection,
+                target,
+                provider_read_started_at=_postgres_now(connection))
+
+    with admission_database.connect() as connection:
+        evidence = connection.execute(
+            sqlalchemy.select(associations.c.provider_evidence).where(
+                associations.c.association_id == association_id)).scalar_one()
+    assert evidence == 'NOT_QUERIED'
+
+
+@pytest.mark.parametrize('concurrent_change', ('admission', 'generation'))
+def test_admissionless_absence_revalidates_after_unlocked_provider_read(
+        admission_database, monkeypatch, concurrent_change) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, _ = _install_normal_admitted_teardown_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        is_scale_down=False,
+        down_status=None,
+        observation_sequence=0,
+        ordinary_zero_cost_admission_sequence=0)
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _stamp_canonical_materialization_receipt(admission_database, replica_id=1)
+    deleted_admission = _delete_kueue_admission(admission_database, key)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+    with admission_database.connect() as connection:
+        decision = (
+            repository.
+            load_admissionless_physical_absence_probe_target_in_connection(
+                connection,
+                service_name=_SERVICE,
+                replica_id=1,
+                replica_record_id=record_id))
+        provider_read_started_at = _postgres_now(connection)
+    assert decision.state is (
+        kueue_lane_lineage.PhysicalAbsenceLoadState.NEEDS_PROBE)
+    assert decision.target is not None
+
+    admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with admission_database.begin() as connection:
+        if concurrent_change == 'admission':
+            connection.exec_driver_sql(
+                f'ALTER TABLE {admissions.name} DISABLE TRIGGER USER')
+            connection.execute(
+                sqlalchemy.insert(admissions).values(**deleted_admission))
+            connection.exec_driver_sql(
+                f'ALTER TABLE {admissions.name} ENABLE TRIGGER USER')
+        else:
+            connection.exec_driver_sql(
+                f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
+            connection.execute(
+                sqlalchemy.update(associations).where(
+                    associations.c.association_id == association_id).values(
+                        launch_generation=associations.c.launch_generation + 1,
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+            connection.exec_driver_sql(
+                f'ALTER TABLE {associations.name} ENABLE TRIGGER USER')
+
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict):
+        with admission_database.begin() as connection:
+            (repository.
+             record_admissionless_physical_absence_after_teardown_in_connection
+            )(connection,
+              decision.target,
+              provider_read_started_at=provider_read_started_at)
+
+    with admission_database.connect() as connection:
+        evidence = connection.execute(
+            sqlalchemy.select(associations.c.provider_evidence).where(
+                associations.c.association_id == association_id)).scalar_one()
+    assert evidence == 'NOT_QUERIED'
+
+
+@pytest.mark.parametrize('invalid_evidence', (
+    'not-queried',
+    'present',
+    'mismatched-envelope',
+    'pre-quiescence',
+    'profile-digest',
+    'self-consistent-forged-profile',
+    'request-mismatch',
+    'queued-request',
+    'retention-pin',
+    'paid-claim',
+))
+def test_whole_service_admissionless_retirement_requires_exact_absence(
+        admission_database, monkeypatch, invalid_evidence) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, request_id = (
+        _install_normal_admitted_teardown_graph(
+            admission_database,
+            repository,
+            intent_key=key,
+            replica_id=1,
+            is_scale_down=False,
+            down_status=None,
+            observation_sequence=0,
+            ordinary_zero_cost_admission_sequence=0))
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _stamp_canonical_materialization_receipt(admission_database, replica_id=1)
+    _delete_kueue_admission(admission_database, key)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+
+    if invalid_evidence == 'present':
+        _set_physical_provider_evidence(
+            admission_database, association_id,
+            ordinary_launch_binding.ProviderEvidence.PRESENT)
+    elif invalid_evidence == 'mismatched-envelope':
+        _set_physical_provider_evidence(
+            admission_database,
+            association_id,
+            ordinary_launch_binding.ProviderEvidence.ABSENT,
+            cluster_name='replacement-cluster')
+    elif invalid_evidence == 'pre-quiescence':
+        _set_physical_provider_evidence(
+            admission_database,
+            association_id,
+            ordinary_launch_binding.ProviderEvidence.ABSENT,
+            observed_before_quiescence=True)
+    elif invalid_evidence == 'profile-digest':
+        associations = (
+            ordinary_launch_binding.ordinary_launch_associations_table)
+        with admission_database.begin() as connection:
+            connection.exec_driver_sql(
+                f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
+            connection.execute(
+                sqlalchemy.update(associations).where(
+                    associations.c.association_id == association_id).values(
+                        profile_digest='0' * 64,
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+            connection.exec_driver_sql(
+                f'ALTER TABLE {associations.name} ENABLE TRIGGER USER')
+        _set_physical_provider_evidence(
+            admission_database, association_id,
+            ordinary_launch_binding.ProviderEvidence.ABSENT)
+    elif invalid_evidence == 'self-consistent-forged-profile':
+        associations = (
+            ordinary_launch_binding.ordinary_launch_associations_table)
+        requests = request_postgres_schema.REQUESTS
+        with admission_database.begin() as connection:
+            service_row = connection.execute(
+                sqlalchemy.select(serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    _SERVICE)).mappings().one()
+            replica_row = connection.execute(
+                sqlalchemy.select(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    _SERVICE, serve_state_schema.replicas_table.c.replica_id ==
+                    1)).mappings().one()
+            info = serve_state.decode_replica_state_for_authority(
+                replica_row['replica_state_version'],
+                replica_row['replica_state'])
+            forged_payload = (
+                ordinary_launch_binding._reserved_fill_cleanup_payload(  # pylint: disable=protected-access
+                    connection, service_row, info))
+            forged_payload['worker_projection_sha256'] = '9' * 64
+            forged_profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+                ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+                authorization_reference=f'reserved-fill:{key}',
+                authorization_generation=1,
+                authorization_payload=forged_payload)
+            connection.exec_driver_sql(
+                f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
+            connection.exec_driver_sql(
+                f'ALTER TABLE {requests.name} DISABLE TRIGGER USER')
+            connection.execute(
+                sqlalchemy.update(associations).where(
+                    associations.c.association_id == association_id).values(
+                        profile_digest=forged_profile.digest,
+                        authorization_digest=(
+                            forged_profile.authorization_digest),
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+            connection.execute(
+                sqlalchemy.update(requests).where(
+                    requests.c.request_id == request_id).values(
+                        profile_digest=forged_profile.digest,
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+            connection.exec_driver_sql(
+                f'ALTER TABLE {requests.name} ENABLE TRIGGER USER')
+            connection.exec_driver_sql(
+                f'ALTER TABLE {associations.name} ENABLE TRIGGER USER')
+        _set_physical_provider_evidence(
+            admission_database, association_id,
+            ordinary_launch_binding.ProviderEvidence.ABSENT)
+    elif invalid_evidence == 'request-mismatch':
+        requests = request_postgres_schema.REQUESTS
+        with admission_database.begin() as connection:
+            connection.exec_driver_sql(
+                f'ALTER TABLE {requests.name} DISABLE TRIGGER USER')
+            connection.execute(
+                sqlalchemy.update(requests).where(
+                    requests.c.request_id == request_id).values(
+                        terminal_cause='explicit_cancel',
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+            connection.exec_driver_sql(
+                f'ALTER TABLE {requests.name} ENABLE TRIGGER USER')
+        _set_physical_provider_evidence(
+            admission_database, association_id,
+            ordinary_launch_binding.ProviderEvidence.ABSENT)
+    elif invalid_evidence == 'queued-request':
+        with admission_database.begin() as connection:
+            now = _postgres_now(connection)
+            connection.execute(
+                sqlalchemy.insert(request_postgres_schema.QUEUE).values(
+                    request_id=request_id,
+                    schedule_type='short',
+                    priority=0,
+                    available_at=now,
+                    enqueued_at=now,
+                    ignore_return_value=True,
+                    retryable=False,
+                    precondition_attempts=0,
+                    delivery_state='queued',
+                    updated_at=now))
+        _set_physical_provider_evidence(
+            admission_database, association_id,
+            ordinary_launch_binding.ProviderEvidence.ABSENT)
+    elif invalid_evidence == 'retention-pin':
+        with admission_database.begin() as connection:
+            request_postgres.insert_request_retention_pin_in_transaction(
+                connection, request_id, 'reserved-fill-test.v1', association_id)
+        _set_physical_provider_evidence(
+            admission_database, association_id,
+            ordinary_launch_binding.ProviderEvidence.ABSENT)
+    elif invalid_evidence == 'paid-claim':
+        with admission_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_pools_table).values(
+                        pool_key='forbidden-paid-pool',
+                        current_limit=1,
+                        successes_since_resize=0,
+                        updated_at=time.time()))
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_claims_table).values(
+                        service_name=_SERVICE,
+                        service_hash=_SERVICE_HASH,
+                        replica_id=1,
+                        pool_key='forbidden-paid-pool',
+                        priority=1,
+                        claimed_at=time.time()))
+        _set_physical_provider_evidence(
+            admission_database, association_id,
+            ordinary_launch_binding.ProviderEvidence.ABSENT)
+
+    before = _admissionless_graph_snapshot(admission_database, association_id)
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict):
+        serve_state.remove_service_completely(
+            _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+    assert _admissionless_graph_snapshot(admission_database,
+                                         association_id) == before
+    assert before['admission_count'] == 0
+    assert before['replicas'][0]['replica_state']['replica_record_id'] == str(
+        record_id)
+
+
 def test_serve_state_whole_service_teardown_retires_exact_graph(
         admission_database, monkeypatch) -> None:
     repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
@@ -1293,6 +2213,44 @@ def test_serve_state_whole_service_teardown_retires_exact_graph(
         assert connection.execute(
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
                 serve_state_schema.services_table)).scalar_one() == 0
+
+
+def test_whole_service_retires_pre_serve057_provider_absence_without_admission(
+        admission_database, monkeypatch) -> None:
+    """Keep the pre-job tombstone path for retained pre-Serve057 replicas."""
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, _ = _install_retirable_materialized_graph(
+        admission_database, repository, intent_key=key, replica_id=1)
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _set_physical_provider_evidence(
+        admission_database, association_id,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
+    _delete_kueue_admission(admission_database, key)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+
+    assert serve_state.remove_service_completely(
+        _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+    _assert_retired_graph(admission_database,
+                          intent_keys=(key,),
+                          replica_ids=(1,),
+                          association_ids=(association_id,))
+    with admission_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table)).scalar_one() == 0
+        retained = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table.c.
+                replica_record_id).where(
+                    ordinary_launch_binding.ordinary_launch_associations_table.
+                    c.association_id == association_id)).scalar_one()
+        assert retained == record_id
 
 
 @pytest.mark.parametrize('intent_state', ('GRANTED', 'RETRYABLE', 'ACTUATING'))
@@ -1870,8 +2828,8 @@ def test_expired_provider_free_terminal_cleanup_requires_locked_exact_graph(
         connection.exec_driver_sql(
             f'ALTER TABLE {replicas.name} ENABLE TRIGGER USER')
     with admission_database.begin() as connection:
-        assert repository.prelock_provider_free_terminal_admissions_in_connection(
-            connection, _SERVICE, _SERVICE_HASH) == ()
+        assert not repository.prelock_provider_free_terminal_admissions_in_connection(
+            connection, _SERVICE, _SERVICE_HASH)
         assert repository.get_for_intent_in_connection(
             connection, _SERVICE, predecessor_key) is not None
     with admission_database.begin() as connection:

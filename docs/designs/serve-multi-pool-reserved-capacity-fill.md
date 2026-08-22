@@ -2,22 +2,28 @@
 
 Last updated: 2026-08-22
 
-Status: the atomic reserved-capacity allocator and PostgreSQL recovery
-boundary are deployed, but end-to-end reserved backfill is **not yet
-production-converged**. The recreated `boltz-l4-fleet` is lifecycle 84,
-version 1, and was `READY` after consolidated HA recovery on release
-`1.1.1429`. Helm revision 505 now runs all six uniform 1.1.1430
-API/controller/executor Pods under the proven Serve controller hold. The
-canonical API-Pod command attested the exact writer/provider cohort and
-advanced policy generation 9 to 10. Renewal and singleton takeover
-qualification passed: after deleting the exact prior singleton owner under
-hold, the standby acquired controller generation 147 and the sole renewal
-singleton; eight samples over 93 seconds (more than three 30-second receipt
-lifetimes) kept both East and PHX proofs 2--11 seconds old, with no renewal
-failure, ambiguous boundary, parked owner, or Pod restart. The service child is
-intentionally not
-re-adopted under that hold. Its control-plane state has no EFS, PV, or PVC
-dependency.
+Status: the atomic reserved-capacity allocator, PostgreSQL recovery boundary,
+and Serve057 policy-admission feedback are deployed, but end-to-end reserved
+backfill is **not yet production-converged**. PR #1659 merged at
+`8af84f99fa4b1a16fbe184c463fac98e0e93847b`; release `1.1.1431` runs that
+exact commit and immutable image digest
+`sha256:5686da239b0db6e81071806029cc43b5d0f85fd3e6bf9f997b2515baa9f04bc0`
+on all six API/controller/executor Pods. Helm revision 508 has released the
+Serve controller hold, the
+consolidated controller has re-adopted `boltz-l4-fleet`, and both external-load-
+balancer slots have converged to the same release. The control plane remains
+PostgreSQL-authoritative with Helm storage disabled and has no EFS, PV, or PVC
+correctness dependency.
+
+That activation exposed one teardown contract gap before the intended clean
+recreation. Every retained lifecycle-84 replica was committed before Serve057
+and therefore legitimately has no `serve_kueue_admissions` row; Serve057
+deliberately performs no backfill. Its strict retirement path nevertheless
+classifies each immutable PHX projection as Kueue-bound and rejects the missing
+row even after normal provider cleanup. This blocks fenced service deletion; it
+does not indicate Kueue scarcity, paid-capacity demand, or a reason to mutate
+shared queue policy. The corrective contract below must be merged and deployed
+before normal teardown/recreation continues.
 SkyPilot PR #1650's provider proof and flat-PHX attester, PR #1651 and its
 teardown successors, and PR #1655's projected-worker finalization are all in
 that deployed image. Live readback proves Platform PR #8824 released both
@@ -65,17 +71,23 @@ foreign-key collision are incident history, not current service state. The
 canonical fresh service has since been recreated on PostgreSQL authority with
 no EFS correctness or runtime dependency.
 
-That lifecycle is not yet a clean final graph. A read-only PostgreSQL census on
-2026-08-22 found 280 retained replica rows: 150 `FAILED_PROVISION`, 58
-`PENDING`, 67 `READY`, and five `SHUTTING_DOWN`; all are non-Spot. Its intent
-ledger has 355 `COMMITTED` and 1,988 `TERMINAL` rows, while paid-capacity claims
-remain zero. The live PHX provider independently has 37 Running fleet Pods,
-which demonstrates why row status alone cannot adjudicate this retained graph.
-The controller hold deliberately freezes further convergence. Serve057 must be
-deployed first, then the test-only service must follow normal fenced teardown
-and same-name recreation so quiescence/provider evidence--not manual SQL
-deletion--owns every removal. The recreated lifecycle is the production-proof
-subject; these retained counts are a baseline, not accepted steady state.
+That lifecycle is not yet a clean final graph. A read-only PostgreSQL census at
+2026-08-22 13:00 UTC found 266 retained, entirely non-Spot replicas: 150
+`FAILED_PROVISION`, 46 `FAILED_CLEANUP`, 55 `READY`, and 15 `SHUTTING_DOWN`.
+The exact protocol-v2 associations comprise 197 projected provider-`ABSENT`
+pre-job rows, 14 ambiguous provider-`PRESENT` pre-job rows, and 55 projected
+post-job rows whose provider evidence is `NOT_QUERIED`. Every row retains its
+frozen profile, positive admission sequence, and exact successful capacity
+observation; the 55 post-job rows also retain their independent materialization
+sequence. The intent ledger has 355 `COMMITTED` and 1,988 `TERMINAL` rows,
+while Kueue admissions and paid-capacity claims are both zero. The released
+controller has already reduced the earlier 280-row census, but final normal
+teardown still fails closed on the pre-Serve057 missing-admission boundary.
+After the corrective deployment, the test-only service must follow normal
+fenced teardown and same-name recreation so quiescence/provider evidence--not
+manual SQL deletion--owns every removal. The recreated lifecycle is the
+production-proof subject; these retained counts are a baseline, not accepted
+steady state.
 
 Revision 501 dark verification proved the corrected deployment singleton was
 unique and renewed east and PHX repeatedly for more than two receipt
@@ -100,13 +112,18 @@ That expiry was the blocker corrected and dark-qualified by the deployed
 `1.1.1430` writer described above; it is not an open Serve057 prerequisite.
 Fresh PHX readback also resolves the apparent free-H200 discrepancy. All seven
 ClusterQueues are current and Active in the unchanged flat `shared-pool`.
-Readback on 2026-08-22 shows all 64 H200 nodes Ready with 512 allocatable GPUs;
+Readback on 2026-08-22 showed all 64 H200 nodes Ready with 512 allocatable GPUs;
 Kueue reserves 503 GPUs, including 37 admitted and Running `skypilot-be`
 Workloads. Every LocalQueue reports zero pending Workloads, including
 `research-ma`, and both SkyPilot ClusterQueues are Active/Ready. The remaining
-nine GPUs are therefore **currently policy-admissible free capacity**. They are
-idle because the SkyPilot Serve controller is intentionally held while
-Serve057 is qualified, not because Kueue is withholding them. The earlier
+nine GPUs were therefore **policy-admissible free capacity at that readback**.
+The Serve controller hold has since been released, so the earlier held-
+controller explanation is no longer current. The retained pre-Serve057
+lifecycle is not a valid final fill proof: its admissionless teardown graph
+cannot complete the normal clean cut required to exercise Serve057 from birth.
+After the corrective retirement deployment and clean recreation, a fresh
+capacity/Workload census must establish whether every then-admissible GPU
+converges; no stale nine-GPU snapshot is accepted as that proof. The earlier
 32-GPU `research-ma` head-of-line gang was a transient production observation
 and is no longer present. A later higher-priority research request may again
 make some raw free GPUs policy-withheld under the unchanged
@@ -117,8 +134,9 @@ LocalQueue `be`, WorkloadPriorityClass `be-lt` (numeric 11), Pod priority
 
 That evidence does **not** authorize a shared Kueue change. The steady-state
 occupancy contract is 100% of healthy, compatible, **policy-admissible** reserved
-capacity; PHX currently has nine such free GPUs, and filling those nine after
-Serve057 activation is an explicit production gate. Raw physical free and
+capacity; PHX had nine such free GPUs in the cited readback, and filling every
+freshly observed admissible unit after corrected clean recreation is an
+explicit production gate. Raw physical free and
 `physically_free_but_policy_withheld` must be reported separately, and the
 first associated gated Workload must prevent misleading additional assignable
 capacity without implementing a second SkyPilot-side Kueue simulator. Making
@@ -128,22 +146,24 @@ reserved backfill, live proof of current-request telemetry, and the
 immediate/+10/+30/full-horizon production proofs remain open. The deployed
 `1.1.1430` writer is already fix-forward authorized at generation 10; its
 pre-Serve057 renewal and singleton-takeover gate is complete. Serve057 must now
-be merged, deployed under the controller hold, activated by evidence-backed
-service recreation, and proven until every genuinely healthy, compatible,
-policy-admissible free-capacity observation converges to zero. Exact completed
-logical requests require the separate PostgreSQL idempotency/completeness
-contract described below.
+be treated as merged and deployed. The corrective admissionless-retirement
+contract must now be merged and deployed under a short controller hold, after
+which normal evidence-backed teardown and a Serve057-native recreation must be
+proven until every genuinely healthy, compatible, policy-admissible free-
+capacity observation converges to zero. Exact completed logical requests
+require the separate PostgreSQL idempotency/completeness contract described
+below.
 
 ## Policy-admission feedback and bounded fill
 
 Status: this revised contract replaces the source-only seven-state
 paid-handoff/reprobe proposal, which was never deployed. Its exact three-state,
-bounded-batch, and exact-card surge contract is source-qualified after the
-refreshed adversarial review; merge, deployment, activation, and production
-proof remain open. Draft feature PR #1659 carries the frozen implementation;
-required draft cleanup PR #1660 is stacked on and cross-linked from #1659.
-The source-stack gate is complete; feature merge, deployment, activation, and
-production proof remain open. The steady state deliberately has one narrow
+bounded-batch, and exact-card surge contract is merged in PR #1659 and deployed
+as release `1.1.1431` / Helm revision 508. Required cleanup PR #1660 remains
+draft, stacked, cross-linked, and blocked on the production gates. Activation
+on a lifecycle born with this contract and the complete production proof remain
+open; the retained lifecycle-84 graph predates its admission rows and is not
+backfilled. The steady state deliberately has one narrow
 PostgreSQL admission relation, three states, the existing durable request retry
 mechanism, and the ordinary READY-aware paid-retirement path. The non-authoritative HTTP
 wakeup was deleted, and one frozen provider-owned runtime object now carries
@@ -185,8 +205,9 @@ depended on nor changed by this implementation.
 
 ### One durable admission relation
 
-Serve057 creates PostgreSQL table `serve_kueue_admissions`. The earlier
-source-only Serve057 shape is replaced in place because it was never deployed.
+Serve057's three-state PostgreSQL table `serve_kueue_admissions` is deployed.
+The superseded seven-state draft was replaced before PR #1659 merged and was
+never deployed.
 There is no legacy backfill: boltz-l4-fleet is test-only and is normally
 fenced, torn down with provider evidence, and recreated. The additive central
 schema still deploys through the normal PostgreSQL migration mechanism.
@@ -480,8 +501,110 @@ none.
 
 Whole-service teardown uses the same evidence and delete order. Generic
 replica deletion is allowed only when immutable projection positively proves
-the non-Kueue/East path; a Kueue replica with missing admission state fails
-closed. Structural restrictive foreign keys plus a schema-presence-aware
+the non-Kueue/East path. A Kueue replica with missing admission state remains
+UNKNOWN and fails closed for live admission, materialization, ordinary
+scale-down, paid-capacity accounting, and provider-present cleanup.
+
+There is one permanent provider-free exception at the irreversible whole-
+service teardown boundary. Only while the exact current lifecycle is
+`SHUTTING_DOWN` or retrying `FAILED_CLEANUP`, a missing admission may be retired
+after all of the following are re-proved: the service hash/lifecycle/owner;
+the immutable COMMITTED intent, replica-record UUID, provider generation, and
+single protocol-v2 association; a terminal launch generation and copied
+execution-quiescence receipt; no request queue row, retention pin, or paid
+claim; and a fresh uncached physical-UID-fenced provider read that began after
+quiescence and found the exact cluster name ABSENT. The provider read occurs
+outside database locks. Its PostgreSQL-clock start token and canonical physical
+absence envelope are then persisted on the association, and the complete graph
+is locked and revalidated before the replica and intent are deleted atomically.
+`PRESENT`, `UNPROVEN`, expired evidence, a concurrent materialization or
+successor, or any identity mismatch retains the graph. No admission row is
+synthesized or backfilled.
+
+The missing-admission proof authenticates the complete immutable
+`RESERVED_FILL/v1` association profile; the association cannot authenticate
+itself with an arbitrary digest. The committed intent stores the observation's
+all-zero-cost admission high-water, while atomic admission assigns a later
+replica sequence, so a canonical typed-fill row requires
+`replica.zero_cost_admission_sequence > intent.observation_sequence`. Admission
+and first-successful materialization are independent PostgreSQL event streams:
+each positive marker is validated only against its own durable singleton
+high-water and the two markers are never ordered against each other. The
+association profile was frozen before provider I/O with
+`materialization_sequence = null`. Cleanup therefore first validates any
+current non-null materialization receipt against the materialization
+high-water, then reconstructs the immutable profile with only that field reset
+to null before recomputing its digest. This preserves a valid row such as the
+second of two admissions when only that second launch materializes, whose
+persisted event tuple is `(admission=2, materialization=1)`.
+
+The execution-quiescence receipt is also the provider-effect linearization
+fence: it proves every execution generation authorized for that association is
+terminal and no launch handler survives the sampled absence. Entering whole-
+service teardown has already irrevocably revoked new grants and materialization
+for the monotonic, never-reused `service_lifecycle_fences.epoch`;
+`FAILED_CLEANUP` is a retry state inside that same revocation fence and cannot
+return to live admission. Every admission or provider writer revalidates the
+unchanged lifecycle and non-teardown service state immediately before provider
+effect and is bound to that epoch, service hash, intent, association launch
+generation, and replica-record UUID. No later provider operation may reuse
+those values.
+The final transaction locks the service and intent parents before checking the
+replica, association, request/queue/pin, and admission children. Admission and
+successor writers use the same parent lock order, and restrictive foreign keys
+prevent a phantom child from committing while its locked parent is retired.
+Immediately before consuming the admissionless proof, the transaction queries
+and locks that exact admission key again and requires the result to contain
+zero rows.
+
+The canonical physical-absence envelope binds the association UUID, replica-
+record UUID, exact cluster name, Kubernetes context, physical-cluster UID,
+reserved-fill profile digest, and `ABSENT` result; the locked surrounding graph
+additionally binds the provider launch generation. The provider observer holds
+the physical-UID fence and accepts only the Kubernetes provider's authoritative,
+complete read-after-delete inventory contract; a provider without equivalent
+consistency cannot use this path. An auth failure, timeout, partial or non-
+authoritative Pod inventory, missing ownership annotation, or ambiguous/
+replaced identity is `UNPROVEN`, never absence. The PostgreSQL timestamp records
+when the uncached read began; it must be no earlier than quiescence, and the
+provider read, locked graph revalidation, and evidence-publication statement
+must finish before that start token's bounded deadline. The publication update
+tests the deadline in PostgreSQL and rechecks the database clock after the
+write. A commit may finish later only while that same transaction continues to
+hold the complete lifecycle/service/intent/replica/association graph locks; no
+provider or admission writer can cross that interval, so commit latency cannot
+invalidate the observation or create new launch authority.
+Whole-service teardown claims a fresh restricted reducer incarnation before
+cleanup. Settled `PROJECTED` associations intentionally do not move during the
+generic takeover, so either ABSENT publication atomically adopts the locked
+current service owner tuple and advances the association owner revision in the
+same evidence statement. The Serve047 trigger therefore sees one exact current
+owner; there is no ownerless evidence write or separate rebind window.
+Once stamped under the unchanged terminal lifecycle fence, ABSENT is monotonic
+and does not expire: the temporary freshness bound applies before publication,
+not to the resulting terminal receipt. If a request row still exists it must be
+the unique terminal, finished, execution-quiesced row for the same association,
+generation, and capability tuple; duplicates, a surviving lease, or any field
+mismatch retain the graph.
+Both exact-Pod and admissionless loaders return the same closed decision set:
+`NOT_APPLICABLE`, `NEEDS_PROBE`, or `ALREADY_PROVEN`. A restart or lost
+acknowledgement that reads canonical durable ABSENT returns `ALREADY_PROVEN`
+without another provider call; malformed or conflicting retained evidence
+still fails closed. This keeps a temporary provider outage after the committed
+receipt from reopening terminal uncertainty.
+
+Deletion retains the association tombstone for its ordinary 60-day audit
+period and retains the monotonically advanced service lifecycle fence after the
+service row is gone. Those durable tombstones, non-reused UUIDs/generations,
+and the same-name lifecycle increment prevent import, recovery, or an ABA
+successor from recreating the retired authority.
+
+This is not a gate-9, lifecycle-84, or service-name exception. Once exact
+provider absence and executor quiescence are durable, a missing admission no
+longer owns capacity or mutation authority; the same recovery invariant safely
+handles a future corrupted missing-lineage row without baking incident history
+into teardown. Every path before that terminal boundary remains strict.
+Structural restrictive foreign keys plus a schema-presence-aware
 association-GC selection predicate prevent deletion while an admission row
 references the graph. GC excludes those association IDs before forming its
 bounded delete batch, so one protected Kueue association cannot roll back
@@ -504,16 +627,17 @@ aggregate requests in the last hour and terminal prediction observations; it
 is not an exact completed-logical-request ledger. Exact completed request
 idempotency/completeness remains the separate contract called out in this
 document and is not required to answer how many requests are processing now.
-This release must deploy and production-prove the current telemetry path; it
-must not add a second counter path.
+The corrective successor must preserve the deployed telemetry path and
+production-prove it; it must not add a second counter path.
 
-The controller hold permits schema migration, exact read-only reconstruction,
-and fail-closed qualification. Live behavior is activated only after
-evidence-backed teardown/recreation of the test-only service on the canonical
-`min_replicas: 0`, no-EFS projection and release of the hold. Rollback before
-activation is Helm rollback under hold. After admission rows exist, rollback is
-one-way/fix-forward because an older controller cannot interpret their
-authority.
+For the corrective successor, a short Serve-controller hold permits schema
+migration, exact read-only reconstruction, and fail-closed qualification.
+After held qualification, release the hold, wait for PostgreSQL re-adoption,
+then perform normal evidence-backed teardown and recreation of the test-only
+service on the canonical `min_replicas: 0`, no-EFS projection. Repair any
+failed qualification or deployment with another schema-compatible Helm fix-
+forward; do not downgrade. Once admission rows exist, older controllers cannot
+interpret their authority.
 
 Required real-PostgreSQL and focused unit/integration tests cover concurrent
 same-domain and same-plan grants, including a full authenticated same-domain
@@ -539,7 +663,17 @@ headroom; exact-victim READY drain and crash/restart; busy paid traffic
 preservation; both exact
 absence authorities; association settlement/delete order; restrictive-FK and
 60-day GC behavior; update and service teardown; unchanged East batch fill;
-and dashboard/request-telemetry freshness.
+and dashboard/request-telemetry freshness. The provider-free missing-admission
+contract additionally proves that whole-service teardown accepts only a fresh,
+uncached, physical-UID-fenced ABSENT observation begun after exact execution
+quiescence. Negative tests retain the complete graph for a live service,
+ordinary scale-down, `PRESENT`/`UNPROVEN`, expired or pre-quiescence evidence,
+queue/pin/paid authority, wrong service hash/lifecycle/replica-record/provider
+generation, a malformed frozen profile, and a concurrent admission or
+successor. A production-shaped atomic regression commits two typed fills,
+materializes only the second, and proves that `(admission=2,
+materialization=1)` still authenticates the unchanged admission-time cleanup
+profile.
 
 Production proof runs immediately, at +10 and +30 minutes, and through a full
 stale/quiescence interval. It must show every healthy compatible
@@ -551,15 +685,15 @@ latency, restart recovery, and fresh request counts.
 
 ## Qualification history
 
-Current production truth at this design revision is Helm 505, release
-`1.1.1430`, commit `c6ba4b7e7e639dbd58f665711e8af96436e67392`, Serve056,
-API015, controller hold enabled, and policy generation 10 reauthorized to the
-1.1.1430 identity. The deployment-owned renewal owner also passed a controlled
-HA takeover: controller generation 147 acquired the singleton after exact owner
-deletion, while eight observations over 93 seconds kept both contexts at 2--11
-seconds age with no failure or restart. Serve057 and the three-state admission
-implementation are still being rewritten in the target worktree; they are not
-merged, deployed, or activated.
+Current production truth at this design revision is Helm 508, release
+`1.1.1431`, exact commit
+`8af84f99fa4b1a16fbe184c463fac98e0e93847b`, Serve057, and a released
+controller hold. The deployment-owned renewal owner previously passed a
+controlled HA takeover and the consolidated controller has now re-adopted
+lifecycle 84. All six writers and both load-balancer slots run the same image
+digest. The three-state admission schema is present, but the retained
+pre-Serve057 lifecycle owns zero admission rows and cannot finish normal
+teardown until the provider-free missing-admission correction is deployed.
 
 Helm revision 489 / release `1.1.1423` deployed merged PR #1651 at
 `e883af27b986aee2bb5ae715dec99f308298356a` on the complete control-plane
@@ -834,27 +968,23 @@ service recovered on the consolidated HA controller. The SkyPilot queues are
 active through Platform PR #8824, and no EFS/PV/PVC is a runtime or correctness
 dependency. Policy revision `1.1.1430` is merged, deployed as Helm revision
 505, reauthorized at generation 10, and qualified through the deployment-owned
-renewal/takeover horizon. The current change is the Serve057 policy-admission
-feedback correction in draft PR #1659. Production readback, not source state,
-establishes the live authority facts above.
+renewal/takeover horizon. Serve057 policy-admission feedback is merged and
+deployed through PR #1659, release `1.1.1431`, and Helm revision 508.
+Production readback, not source state, establishes the live authority facts
+above. The current corrective change closes only the provider-free whole-
+service retirement gap and does not change admission, placement, Kueue policy,
+or paid-capacity behavior.
 
 Remaining work, in exact order:
 
-1. The exact Serve057 source/design, including durable Pod lineage, Kueue-only
-   lane scope, split physical/demand accounting, and restart-safe
-   reserved-first paid suppression, is qualified in draft PR #1659. Required
-   draft cleanup PR #1660 is source-qualified, stacked on #1659, and
-   cross-linked; it remains blocked on the production cleanup gates below.
-2. Direct-Helm deploy the Serve057 successor image under the existing hold with
-   `--reuse-values`. Read back one uniform API/controller/executor digest and
-   preserve the deployed flat Kueue topology; do not add a Cohort, priority
-   class, scheduler, EFS authority, Terraform/Terragrunt change, or platform
-   runtime pin. While held, prove schema,
-   exact read-only reconstruction, and fail-closed behavior; do not claim live
-   Pod-admission evidence because the service controller is intentionally not
-   running.
-3. Lift the Serve controller hold after the held deployment qualifies, wait
-   for PostgreSQL re-adoption, and immediately use normal fenced teardown to
+1. Merge, direct-Helm deploy, and source/live qualify the provider-free whole-
+   service retirement correction on top of merged PR #1659. Preserve the flat
+   Kueue topology; do not add a Cohort, priority class, scheduler, EFS
+   authority, Terraform/Terragrunt change, platform runtime pin, admission
+   backfill, or manual row repair. Keep cleanup PR #1660 separate and draft
+   until the production cleanup gates below pass.
+2. After the corrected deployment re-adopts the service, immediately use
+   normal fenced teardown to
    remove this test-only service's existing multi-row gated/failed history.
    The lifecycle API deliberately rejects `serve down`, `serve up`, and
    `serve update` while the hold is active, so teardown or recreation under the
@@ -872,26 +1002,26 @@ Remaining work, in exact order:
    durable `controller_ip`; require owner epoch/IP/PID advancement and service
    `READY`. Finally prove a post-TTL worker bootstrap completes its later
    guarded read without `POST_EFFECT_AMBIGUOUS`.
-4. Prove automatic backfill across every compatible
+3. Prove automatic backfill across every compatible
    free pool. The performance gate remains 80--90 H200 workloads submitted
    within a few minutes with concurrent initialization and cross-pool
    independence.
-5. Prove each fresh reserved grant is committed before paid residual is
+4. Prove each fresh reserved grant is committed before paid residual is
    calculated. No new paid/Spot launch may occur while fresh policy-admitted
    compatible reserved capacity covers demand, or while admission evidence is
    unknown. Fresh exact policy-waiting capacity is not serving supply;
    genuinely uncovered demand may receive one fresh
    paid residual and existing paid capacity must drain and terminate normally.
-6. Verify dashboard processing, queued, in-flight, rejected, and freshness
+5. Verify dashboard processing, queued, in-flight, rejected, and freshness
    fields remain available during controller restart and provider stalls.
    Expose exact completed HTTP exchanges only under an explicit completeness
    contract; exact model-job completion remains gated on an at-least-once
    worker callback plus PostgreSQL idempotency ledger. Prove controller and Pod
    takeover recover solely from PostgreSQL.
-7. Repeat capacity, paid-spill, historical-state, telemetry, and takeover
+6. Repeat capacity, paid-spill, historical-state, telemetry, and takeover
    checks immediately, at +10, at +30, and through the full stale/quiescence
-   horizon. Only then merge stacked deletion-only cleanup for compatibility
-   decoders and transition artifacts.
+   horizon. Only then merge the separate deletion-only cleanup for
+   compatibility decoders and transition artifacts.
 
 Historical recovery record: PR #1614 reconstructed the exact frozen
 committed-intent profile for nine provider-present associations, and draft
@@ -911,9 +1041,10 @@ ReplicaSets that still mention the retired claim are deletion-only cleanup
 debt; they are not read by the live path and must be removed after the
 production horizon without reintroducing storage authority.
 
-Completion means Serve057 and its cleanup stack are merged as their gates
-allow, the exact feature image is live and reauthorized, the final authorities
-are durably active, `boltz-l4-fleet` automatically
+Completion means Serve057 and the corrective retirement contract are deployed,
+its separate cleanup follows only after its gates allow, the exact feature
+image is live and reauthorized, the final authorities are durably active,
+`boltz-l4-fleet` automatically
 materializes 100% of fresh compatible free capacity, paid residual and drain
 behavior are correct, dashboard request totals are fresh and non-null, restart
 takeover succeeds without RWX/EFS, and every immediate/+10/+30/full-horizon
@@ -1539,21 +1670,20 @@ activation is repaired by deploying a successor image and authorizing one new
 gate generation through the same command and transaction used for first
 activation. The prior generation then fails closed.
 
-The remaining rollout is one SkyPilot fix-forward stack deployed through the
-existing direct-Helm split-role topology. Its completed precursor was policy
-revision `1.1.1430`: Helm revision 505, generation 10, and the repeated east/
-PHX renewal plus deployment-proof-daemon takeover horizon all passed under the
-Serve controller hold.
+The remaining rollout is one surgical SkyPilot corrective PR deployed through
+the existing direct-Helm split-role topology. Its completed precursors are
+policy revision `1.1.1430` and Serve057: Helm revisions 505 and 508, generation
+10, repeated east/PHX renewal, deployment-proof-daemon takeover, exact writer-
+cohort convergence, and release of the Serve controller hold have passed.
 
-1. Required draft cleanup PR #1660 is cross-linked from #1659 and remains
-   blocked on the production cleanup gates below. Merge and deploy the
-   SkyPilot-only Serve057 policy-admission feedback correction on one successor
-   image while the same
-   hold remains active. Reauthorize the exact successor writer cohort through
-   the canonical generation-fenced command. Under the hold, prove only the
-   PostgreSQL schema, exact read-only reconstruction, and fail-closed source
-   behavior; the service controller cannot execute `grant_plan()`, so this is
-   not live Pod-admission evidence. This step changes no shared Kueue,
+1. Keep required cleanup PR #1660 draft and blocked on the production cleanup
+   gates below. Merge and deploy the SkyPilot-only provider-free admissionless-
+   retirement correction on one successor image under a short controller hold.
+   Reauthorize the exact successor writer cohort through the canonical
+   generation-fenced command. Under the hold, prove only schema/source
+   compatibility and the fail-closed reconstruction/retirement boundaries; the
+   service controller cannot execute `grant_plan()`, so this is not live Pod-
+   admission evidence. This step changes no shared Kueue,
    Terraform/Terragrunt, RBAC, Helm value, or service definition.
 2. Because this installation is test-only, do not backfill its existing
    multi-row gated and failed history or delete database rows directly. The new
@@ -4726,7 +4856,7 @@ either case.
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537, deployed, and active through lifecycle 84/version 1 at `DURABLE_INTENT` epoch 1. Full busy-lane/no-row and throughput production evidence remains part of phase 2g. |
 | 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged, deployed, and active for lifecycle 84/version 1: one controller fence, routing linearization lock, and PostgreSQL transaction own the live `DURABLE_FEED`/`DURABLE_INTENT` pair. Draft cleanup PR #1556 removes deprecated separate surfaces and unsupported demand demotion only after the documented horizon. |
 | 2f | Promoted capacity-authority controller takeover | PR #1562 is merged and deployed. Revision 502 proved one consolidated-HA recovery with the bound/demand/fill pair preserved and fresh route evidence restored from PostgreSQL; revision 505 then proved takeover of the deployment-owned renewal singleton. A true service-controller takeover after Serve057 activation, one post-TTL worker bootstrap, and the full stale horizon remain production gates; no schema, chart, provider, or platform change is required. |
-| 2g | Production full reserved backfill | **Active and incomplete.** Platform PR #8652 is merged. The former version-64 graph and its 71-row delete-order blocker were removed by the deployed teardown successors. Canonical lifecycle 84/version 1 is `READY` after consolidated-HA recovery on revision 502 with no EFS/PV/PVC runtime dependency, and Platform PR #8824 has activated only the existing SkyPilot queues. The deployment singleton, policy revision `1.1.1430`, Helm revision 505, generation-10 reauthorization, and the renewal/takeover horizon are proven. Serve057 policy-admission feedback is source-qualified in draft PR #1659, and source-qualified draft cleanup PR #1660 is stacked and cross-linked; feature merge, deployment, and activation remain open. Exact free-capacity convergence, nonzero-demand no-paid proof, live proof of the already-implemented current-request telemetry, and the full production horizon remain open. Exact completed logical requests are a separate PostgreSQL idempotency/completeness feature, not a prerequisite for honest processing/queued/in-flight status. |
+| 2g | Production full reserved backfill | **Active and incomplete.** Platform PR #8652 is merged. The former version-64 graph and its 71-row delete-order blocker were removed by the deployed teardown successors. Canonical lifecycle 84/version 1 is `READY` after consolidated-HA recovery on revision 502 with no EFS/PV/PVC runtime dependency, and Platform PR #8824 has activated only the existing SkyPilot queues. The deployment singleton, policy revision `1.1.1430`, generation-10 reauthorization, and the renewal/takeover horizon are proven. Serve057 policy-admission feedback is merged in PR #1659 and deployed as release `1.1.1431` / Helm revision 508 on the exact writer cohort with the hold released; cleanup PR #1660 remains draft and gated. The corrective provider-free admissionless-retirement PR, a clean Serve057-native recreation, exact free-capacity convergence, nonzero-demand no-paid proof, live proof of the already-implemented current-request telemetry, and the full production horizon remain open. Exact completed logical requests are a separate PostgreSQL idempotency/completeness feature, not a prerequisite for honest processing/queued/in-flight status. |
 | 2h | Atomic reserved-fill replica/request admission | Merged in PR #1626 and deployed on Helm revision 473 / release `1.1.1401`. One atomic-admission module owns the root PostgreSQL transaction and savepoint; the manager only prepares immutable server-local input before it and starts the returned request reducer after commit. Serve055 adds the owner audit tuple, user FK, and retained-row one-shot transition. The deployed pending-first/global-pending/cleanup-unproven accounting correctly avoided duplicate replacement capacity. The remaining postcommit mutable-authority rejection is owned by phase 2i, not by another admission path or infrastructure change. |
 | 2i | Serve056 committed reserved-fill provider handoff and cohort rotation | PR #1629 merged at `1642ca2e3` as the scalar-schema precursor; PR #1632 restored adoption and corrective PR #1630 supplied the complete committed-handoff contract. That source is deployed through release `1.1.1410` and inherited by revision 489. Draft cleanup PR #1633 remains gated on the final zero-legacy census and production horizon. No EFS, KubeRay, Terraform/Terragrunt, platform runtime pin, or alternate provider path is added. |
 | 3a | Stacked Serve055 owner-transition cleanup after the production horizon | The required `fix/serve-atomic-fill-admission-cleanup` branch adds PostgreSQL-only Serve058 `NOT NULL` owner columns and removes only the application one-shot `NULL` attestation branch, the schema-derived temporary global user-deletion guard, and transition-only observability/tests. The dialect-neutral SQLAlchemy model remains nullable for the separately supported controller-local SQLite/Serve037 path. Serve058 verifies or reinstalls the permanent PostgreSQL owner FK and owner-immutability trigger in the same migration. Draft PR #1660 is stacked on and cross-linked from #1659; it remains blocked on a complete capable cohort, zero `NULL` tuples, no old writers, backups, and the complete stale/HA production horizon. |
@@ -6145,10 +6275,11 @@ legacy activation.
   renewal plus deployment-proof-daemon takeover passed through more than two
   receipt lifetimes.
 
-- [ ] After Serve057 is deployed and the hold is released, prove a true
-  service-controller takeover after PostgreSQL re-adoption. Then prove a worker
-  bootstrap lasting longer than one receipt lifetime completes its guarded
-  read without `POST_EFFECT_AMBIGUOUS`.
+- [ ] Deploy the corrective admissionless-retirement contract, complete normal
+  fenced teardown, and recreate one clean Serve057-native lifecycle. Prove a
+  true service-controller takeover after PostgreSQL re-adoption. Then prove a
+  worker bootstrap lasting longer than one receipt lifetime completes its
+  guarded read without `POST_EFFECT_AMBIGUOUS`.
 
 - [x] Merge and direct-Helm deploy the single pre-demand PostgreSQL fill
   admission. Its final end-to-end no-paid/no-provider/no-retirement horizon is

@@ -2255,12 +2255,15 @@ def _zero_cost_sequence_payload(
     materialization_sequence = info.zero_cost_materialization_sequence
     current_admission = row['zero_cost_admission_sequence']
     current_materialization = row['zero_cost_materialization_sequence']
+    # Admission and successful materialization are independent event streams.
+    # Authenticate each replica marker only against its own durable high-water;
+    # their numeric values have no cross-stream ordering relationship.
     if (type(admission_sequence) is not int or admission_sequence < 1 or
             type(current_admission) is not int or
             current_admission < admission_sequence or
         (materialization_sequence is not None and
          (type(materialization_sequence) is not int or materialization_sequence
-          < admission_sequence or type(current_materialization) is not int or
+          < 1 or type(current_materialization) is not int or
           current_materialization < materialization_sequence))):
         raise OrdinaryLaunchBindingConflict(
             'Zero-cost profile has stale or malformed sequencer authority.')
@@ -2522,9 +2525,15 @@ def _reserved_fill_cleanup_payload(
         raise OrdinaryLaunchBindingConflict(
             'Provider-present cleanup lost its committed observation '
             'evidence.')
+    sequence = _zero_cost_sequence_payload(connection, info)
+    # The association profile is frozen by admission before provider launch.
+    # A successful projection later stamps ReplicaInfo's independent
+    # materialization sequence, but that post-effect receipt cannot rewrite the
+    # already-bound profile. Validate the current monotonic receipt above, then
+    # reconstruct the admission-time payload with no materialization yet.
+    sequence = {**sequence, 'materialization_sequence': None}
     sequence = _freeze_reserved_fill_sequence_gate(info,
-                                                   _zero_cost_sequence_payload(
-                                                       connection, info),
+                                                   sequence,
                                                    committed_intent=intent)
     return {
         'allocation_input_sha256': intent.allocation_input_sha256,
@@ -3281,6 +3290,45 @@ def _validate_reserved_fill_cleanup_profile_in_connection(
         raise OrdinaryLaunchBindingConflict(
             'Provider-present cleanup no longer matches its frozen admission '
             'authority.')
+
+
+def validate_reserved_fill_cleanup_association_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    replica: Mapping[str, Any],
+    association: Mapping[str, Any],
+) -> NonPoolLaunchProfile:
+    """Authenticate one frozen reserved-fill association for cleanup only.
+
+    This grants no provider or admission authority.  It is the public cleanup
+    boundary for consumers that must prove a retained association's complete
+    protocol, capability, profile, authorization, and committed-intent tuple
+    after its request row may have been garbage-collected.
+    """
+    _require_postgres(connection)
+    if not all(
+            isinstance(row, Mapping)
+            for row in (service, replica, association)):
+        raise TypeError('Cleanup association authority requires mapped rows.')
+    try:
+        context = bound_context_from_association(association)
+    except (OrdinaryLaunchBindingConflict, TypeError, ValueError) as error:
+        raise OrdinaryLaunchBindingConflict(
+            'Reserved-fill cleanup association is malformed.') from error
+    if (not isinstance(context, BoundNonPoolLaunchContext) or
+            association.get('binding_protocol_version')
+            != NON_POOL_BINDING_PROTOCOL_VERSION or
+            context.profile.kind is not NonPoolLaunchProfileKind.RESERVED_FILL):
+        raise OrdinaryLaunchBindingConflict(
+            'Cleanup association is not an exact reserved-fill profile.')
+    _validate_generic_capability(
+        service,
+        capability_cohort_epoch=context.capability_cohort_epoch,
+        capability_profile_set_digest=context.capability_profile_set_digest,
+        receipt_protocol_version=context.receipt_protocol_version)
+    _validate_reserved_fill_cleanup_profile_in_connection(
+        connection, service, replica, context.profile)
+    return context.profile
 
 
 def _validate_profile_execution_context(
