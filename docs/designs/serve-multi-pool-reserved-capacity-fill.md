@@ -140,7 +140,9 @@ Status: this revised contract replaces the source-only seven-state
 paid-handoff/reprobe proposal, which was never deployed. Its exact three-state,
 bounded-batch, and exact-card surge contract is source-qualified after the
 refreshed adversarial review; merge, deployment, activation, and production
-proof remain open. The steady state deliberately has one narrow PostgreSQL
+proof remain open. Draft feature PR #1659 carries the frozen implementation;
+its required Serve058 cleanup draft must be cross-linked before #1659 becomes
+mergeable. The steady state deliberately has one narrow PostgreSQL
 admission relation, three states, the existing durable request retry mechanism,
 and the ordinary READY-aware paid-retirement path. The non-authoritative HTTP
 wakeup was deleted, and one frozen provider-owned runtime object now carries
@@ -832,16 +834,15 @@ active through Platform PR #8824, and no EFS/PV/PVC is a runtime or correctness
 dependency. Policy revision `1.1.1430` is merged, deployed as Helm revision
 505, reauthorized at generation 10, and qualified through the deployment-owned
 renewal/takeover horizon. The current change is the Serve057 policy-admission
-feedback correction. Production readback, not source state, establishes the
-live authority facts above.
+feedback correction in draft PR #1659. Production readback, not source state,
+establishes the live authority facts above.
 
 Remaining work, in exact order:
 
-1. Finish and qualify the exact Serve057 source/design only after its durable
-   Pod lineage, Kueue-only lane scope, split physical/demand accounting, and
-   restart-safe reserved-first paid-suppression transaction pass adversarial
-   review. Author and cross-link the required Serve058 cleanup draft before
-   Serve057 merges.
+1. The exact Serve057 source/design, including durable Pod lineage, Kueue-only
+   lane scope, split physical/demand accounting, and restart-safe
+   reserved-first paid suppression, is qualified in draft PR #1659. Author and
+   cross-link the required Serve058 cleanup draft before Serve057 merges.
 2. Direct-Helm deploy the Serve057 successor image under the existing hold with
    `--reuse-values`. Read back one uniform API/controller/executor digest and
    preserve the deployed flat Kueue topology; do not add a Cohort, priority
@@ -4722,7 +4723,7 @@ either case.
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537, deployed, and active through lifecycle 84/version 1 at `DURABLE_INTENT` epoch 1. Full busy-lane/no-row and throughput production evidence remains part of phase 2g. |
 | 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged, deployed, and active for lifecycle 84/version 1: one controller fence, routing linearization lock, and PostgreSQL transaction own the live `DURABLE_FEED`/`DURABLE_INTENT` pair. Draft cleanup PR #1556 removes deprecated separate surfaces and unsupported demand demotion only after the documented horizon. |
 | 2f | Promoted capacity-authority controller takeover | PR #1562 is merged and deployed. Revision 502 proved one consolidated-HA recovery with the bound/demand/fill pair preserved and fresh route evidence restored from PostgreSQL; revision 505 then proved takeover of the deployment-owned renewal singleton. A true service-controller takeover after Serve057 activation, one post-TTL worker bootstrap, and the full stale horizon remain production gates; no schema, chart, provider, or platform change is required. |
-| 2g | Production full reserved backfill | **Active and incomplete.** Platform PR #8652 is merged. The former version-64 graph and its 71-row delete-order blocker were removed by the deployed teardown successors. Canonical lifecycle 84/version 1 is `READY` after consolidated-HA recovery on revision 502 with no EFS/PV/PVC runtime dependency, and Platform PR #8824 has activated only the existing SkyPilot queues. The deployment singleton, policy revision `1.1.1430`, Helm revision 505, generation-10 reauthorization, and the renewal/takeover horizon are proven. Serve057 policy-admission feedback is the current open implementation/deployment gate; exact free-capacity convergence, nonzero-demand no-paid proof, live proof of the already-implemented current-request telemetry, and the full production horizon remain open. Exact completed logical requests are a separate PostgreSQL idempotency/completeness feature, not a prerequisite for honest processing/queued/in-flight status. |
+| 2g | Production full reserved backfill | **Active and incomplete.** Platform PR #8652 is merged. The former version-64 graph and its 71-row delete-order blocker were removed by the deployed teardown successors. Canonical lifecycle 84/version 1 is `READY` after consolidated-HA recovery on revision 502 with no EFS/PV/PVC runtime dependency, and Platform PR #8824 has activated only the existing SkyPilot queues. The deployment singleton, policy revision `1.1.1430`, Helm revision 505, generation-10 reauthorization, and the renewal/takeover horizon are proven. Serve057 policy-admission feedback is source-qualified in draft PR #1659; its cleanup cross-link, merge, deployment, and activation remain open. Exact free-capacity convergence, nonzero-demand no-paid proof, live proof of the already-implemented current-request telemetry, and the full production horizon remain open. Exact completed logical requests are a separate PostgreSQL idempotency/completeness feature, not a prerequisite for honest processing/queued/in-flight status. |
 | 2h | Atomic reserved-fill replica/request admission | Merged in PR #1626 and deployed on Helm revision 473 / release `1.1.1401`. One atomic-admission module owns the root PostgreSQL transaction and savepoint; the manager only prepares immutable server-local input before it and starts the returned request reducer after commit. Serve055 adds the owner audit tuple, user FK, and retained-row one-shot transition. The deployed pending-first/global-pending/cleanup-unproven accounting correctly avoided duplicate replacement capacity. The remaining postcommit mutable-authority rejection is owned by phase 2i, not by another admission path or infrastructure change. |
 | 2i | Serve056 committed reserved-fill provider handoff and cohort rotation | PR #1629 merged at `1642ca2e3` as the scalar-schema precursor; PR #1632 restored adoption and corrective PR #1630 supplied the complete committed-handoff contract. That source is deployed through release `1.1.1410` and inherited by revision 489. Draft cleanup PR #1633 remains gated on the final zero-legacy census and production horizon. No EFS, KubeRay, Terraform/Terragrunt, platform runtime pin, or alternate provider path is added. |
 | 3a | Stacked Serve055 owner-transition cleanup after the production horizon | The required `fix/serve-atomic-fill-admission-cleanup` branch adds PostgreSQL-only Serve058 `NOT NULL` owner columns and removes only the application one-shot `NULL` attestation branch, the schema-derived temporary global user-deletion guard, and transition-only observability/tests. The dialect-neutral SQLAlchemy model remains nullable for the separately supported controller-local SQLite/Serve037 path. Serve058 verifies or reinstalls the permanent PostgreSQL owner FK and owner-immutability trigger in the same migration. Its draft PR must be cross-linked and remains blocked on a complete capable cohort, zero `NULL` tuples, no old writers, backups, and the complete stale/HA production horizon. |
