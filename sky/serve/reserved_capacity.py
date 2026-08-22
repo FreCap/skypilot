@@ -66,10 +66,10 @@ logger = sky_logging.init_logger(__name__)
 ReservedFillLaunchFenceError = exceptions.ReservedFillLaunchFenceError
 
 # Provider SDK calls are not guaranteed to honor Python thread cancellation.
-# The provider operation establishes its own five-second deadline inside the
-# handler, after disposable-process startup.  This separate parent boundary
-# covers handler startup, result transport, and family convergence without
-# extending that provider/DB operation budget.
+# The provider operation establishes its own eight-second deadline inside the
+# handler.  One separate absolute parent deadline covers process admission,
+# handler execution, result transport, guardian reap, and executor-lane
+# release without extending that provider/DB operation budget.
 _RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS = (
     reserved_fill_reclaim_attestation.
     PROVIDER_PROOF_REFRESH_BOUNDARY_LIFETIME_SECONDS)
@@ -2866,9 +2866,8 @@ def renew_reclaim_provider_proofs_once(
         deadline_monotonic: float | None = None) -> bool:
     """Renew the current sequenced gate's provider facts, if active."""
     if deadline_monotonic is None:
-        deadline_monotonic = (time.monotonic() +
-                              reserved_fill_reclaim_attestation.
-                              PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
+        deadline_monotonic = (reserved_fill_reclaim_attestation.
+                              new_provider_proof_operation_deadline())
     repository = pool_capacity_observation.PoolCapacityObservationRepository()
     gate = repository.read_reconciliation_gate()
     if not gate.sequenced_active:
@@ -2895,51 +2894,128 @@ def renew_reclaim_provider_proofs_once(
 def renew_reclaim_provider_proofs_in_boundary(
         executor: request_process.DisposableExecutor) -> bool:
     """Run one provider refresh behind a bounded process-family proof."""
-    # The provider/DB operation establishes its own deadline in the child.
-    # DisposableExecutor submission is synchronous through guardian startup
-    # and admission, so a parent-created child deadline would incorrectly
-    # charge that process overhead to the five-second provider contract.
-    future = executor.submit(renew_reclaim_provider_proofs_once)
+    boundary_deadline = (time.monotonic() +
+                         _RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS)
     try:
-        result = future.result(
-            timeout=_RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS)
-        if type(result) is not bool:
-            raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
-                'Reclaim-provider renewal returned an untyped result.')
-        return result
-    except concurrent.futures.TimeoutError as timeout_error:
-        # Do not start another proof while an uncooperative SDK call could
-        # still publish. The guardian must first prove the complete invocation
-        # family absent.
-        if not future.done():
-            future.request_cancel()
-            try:
-                future.result(
-                    timeout=_RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
-            except concurrent.futures.TimeoutError as drain_error:
-                if not future.done():
-                    boundary_error = request_process.BoundaryExecutionError(
-                        'Reclaim-provider renewal timed out without a '
-                        'process-family drain result.')
-                    boundary_error.__cause__ = drain_error
-                    ambiguity = request_process.AmbiguousBoundaryError(
-                        'Reclaim-provider renewal cannot prove its process '
-                        'family absent after cancellation.')
-                    ambiguity.__cause__ = boundary_error
-                    # A second renewal cannot start while the first family
-                    # is unproved. Poisoning makes this executor permanently
-                    # unavailable; the deployment renewal event catches this
-                    # typed ambiguity and parks its singleton owner.
-                    executor._poison(  # pylint: disable=protected-access
-                        ambiguity)
-                    raise ambiguity from boundary_error
-            except Exception:  # pylint: disable=broad-except
-                # Cancellation or the handler's original failure is expected
-                # once the authenticated result proves the family absent.
-                pass
+        future = executor.submit(renew_reclaim_provider_proofs_once,
+                                 admission_deadline_monotonic=boundary_deadline)
+    except TimeoutError as timeout_error:
         raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
             'Reclaim-provider renewal exceeded its bounded process '
-            'lifetime.') from timeout_error
+            'lifetime during admission.') from timeout_error
+    try:
+        remaining = boundary_deadline - time.monotonic()
+        if remaining <= 0:
+            raise concurrent.futures.TimeoutError
+        result = future.result(timeout=remaining)
+    except concurrent.futures.TimeoutError as timeout_error:
+        _raise_reclaim_provider_boundary_timeout(executor, future,
+                                                 timeout_error)
+    except request_process.AmbiguousBoundaryError:
+        # The monitor has already poisoned this lane because it cannot prove
+        # the complete process family absent. Preserve that terminal signal
+        # immediately; waiting for a late lane-release event must not relabel
+        # it as an ordinary provider timeout.
+        raise
+    except BaseException:
+        # A handler failure is safe to expose only after its monitor has reaped
+        # the guardian and returned the executor lane.  Otherwise a caller
+        # could begin a second provider publication alongside an unproved
+        # first family.
+        remaining = boundary_deadline - time.monotonic()
+        if (remaining <= 0 or
+                not future.wait_for_boundary_release(timeout=remaining) or
+                time.monotonic() >= boundary_deadline):
+            _raise_reclaim_provider_boundary_timeout(
+                executor, future,
+                concurrent.futures.TimeoutError(
+                    'Handler failed without an in-horizon lane release.'))
+        raise
+    if time.monotonic() >= boundary_deadline:
+        _raise_reclaim_provider_boundary_timeout(
+            executor, future,
+            concurrent.futures.TimeoutError(
+                'Handler result crossed the process lifetime.'))
+    remaining = boundary_deadline - time.monotonic()
+    if (remaining <= 0 or
+            not future.wait_for_boundary_release(timeout=remaining) or
+            time.monotonic() >= boundary_deadline):
+        _raise_reclaim_provider_boundary_timeout(
+            executor, future,
+            concurrent.futures.TimeoutError(
+                'Executor lane was not released inside the process lifetime.'))
+    if type(result) is not bool:
+        raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
+            'Reclaim-provider renewal returned an untyped result.')
+    return result
+
+
+def _raise_reclaim_provider_boundary_timeout(
+        executor: request_process.DisposableExecutor,
+        future: request_process.InvocationFuture,
+        timeout_error: concurrent.futures.TimeoutError) -> typing.NoReturn:
+    """Drain one failed renewal boundary or permanently poison its lane."""
+    # A failed round has a separate bounded cleanup budget.  Result convergence
+    # and guardian/lane release share that one budget rather than each receiving
+    # a fresh timeout.
+    drain_deadline = (time.monotonic() +
+                      _RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
+    if not future.done():
+        future.request_cancel()
+        try:
+            remaining = max(0.0, drain_deadline - time.monotonic())
+            future.result(timeout=remaining)
+        except concurrent.futures.TimeoutError as drain_error:
+            if not future.done():
+                boundary_error = request_process.BoundaryExecutionError(
+                    'Reclaim-provider renewal timed out without a '
+                    'process-family drain result.')
+                boundary_error.__cause__ = drain_error
+                ambiguity = request_process.AmbiguousBoundaryError(
+                    'Reclaim-provider renewal cannot prove its process '
+                    'family absent after cancellation.')
+                ambiguity.__cause__ = boundary_error
+                # A second renewal cannot start while the first family is
+                # unproved.  Poisoning parks the singleton owner until a new
+                # deployment process takes over.
+                executor._poison(  # pylint: disable=protected-access
+                    ambiguity)
+                raise ambiguity from boundary_error
+            # The monitor can publish its result between result(timeout) and
+            # done(). Re-read that already-completed result without blocking
+            # so a terminal ambiguity is never flattened into the generic
+            # timeout returned below.
+            try:
+                future.result(timeout=0)
+            except request_process.AmbiguousBoundaryError:
+                raise
+            except Exception:  # pylint: disable=broad-except
+                pass
+        except request_process.AmbiguousBoundaryError:
+            # The monitor already proved this executor unsafe and poisoned its
+            # lane.  Preserve the typed failure so the deployment renewal
+            # owner parks immediately under its retained singleton session.
+            raise
+        except Exception:  # pylint: disable=broad-except
+            # Cancellation or the handler's original failure is expected once
+            # its authenticated result proves the family absent.
+            pass
+    remaining = max(0.0, drain_deadline - time.monotonic())
+    if not future.wait_for_boundary_release(timeout=remaining):
+        boundary_error = request_process.BoundaryExecutionError(
+            'Reclaim-provider renewal produced no executor-lane release proof '
+            'after its boundary result.')
+        boundary_error.__cause__ = timeout_error
+        ambiguity = request_process.AmbiguousBoundaryError(
+            'Reclaim-provider renewal cannot prove its guardian reaped after '
+            'the bounded process lifetime.')
+        ambiguity.__cause__ = boundary_error
+        executor._poison(  # pylint: disable=protected-access
+            ambiguity)
+        raise ambiguity from boundary_error
+    raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
+        'Reclaim-provider renewal exceeded its bounded process lifetime.'
+    ) from timeout_error
 
 
 def shutdown_reclaim_provider_proof_boundary(

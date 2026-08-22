@@ -531,13 +531,83 @@ def test_pre_ready_inner_hang_is_cancelled_and_reaped_boundedly(monkeypatch):
     monkeypatch.setattr(process, '_SPAWN_CONTEXT',
                         process.multiprocessing.get_context('fork'))
     monkeypatch.setattr(process, '_inner_warden_main', hanging_inner_warden)
-    monkeypatch.setattr(process, '_BOUNDARY_START_TIMEOUT_SECONDS', 0.2)
     monkeypatch.setattr(process, '_BOUNDARY_START_CLEANUP_TIMEOUT_SECONDS', 2)
 
     started_at = time.monotonic()
     with pytest.raises(TimeoutError, match='did not become ready'):
-        executor.submit(dummy_task)
+        executor.submit(dummy_task,
+                        admission_deadline_monotonic=time.monotonic() + 0.2)
     assert time.monotonic() - started_at < 5
+    assert not executor.poisoned
+    assert not executor.workers
+    assert executor.available_slots() == 1
+    executor.shutdown()
+
+
+@pytest.mark.parametrize('deadline', [True, float('nan'), float('inf')])
+def test_invalid_admission_deadline_consumes_no_capacity(deadline):
+    executor = DisposableExecutor(max_workers=1)
+    expected = TypeError if deadline is True else ValueError
+    with pytest.raises(expected):
+        executor.submit(dummy_task, admission_deadline_monotonic=deadline)
+    assert executor.available_slots() == 1
+    executor.shutdown()
+
+
+def test_expired_or_delayed_admission_deadline_consumes_no_capacity():
+    executor = DisposableExecutor(max_workers=1)
+    with pytest.raises(TimeoutError, match='already expired'):
+        executor.submit(dummy_task,
+                        admission_deadline_monotonic=time.monotonic() - 1)
+    with pytest.raises(ValueError, match='admission_gated'):
+        executor.submit(dummy_task,
+                        admission_gated=True,
+                        admission_deadline_monotonic=time.monotonic() + 1)
+    with pytest.raises(ValueError, match='receipt_required'):
+        executor.submit(dummy_task,
+                        receipt_required=True,
+                        admission_deadline_monotonic=time.monotonic() + 1)
+    assert executor.available_slots() == 1
+    executor.shutdown()
+
+
+def test_reserved_deadline_receipt_rejection_preserves_reservation():
+    executor = BurstableExecutor(garanteed_workers=1)
+    reservation = executor.try_reserve_idle_worker()
+    assert reservation is not None
+    try:
+        with pytest.raises(ValueError, match='receipt_required'):
+            executor.submit_reserved(
+                reservation,
+                dummy_task,
+                receipt_required=True,
+                admission_deadline_monotonic=time.monotonic() + 10)
+        assert executor.try_reserve_idle_worker() is None
+        assert executor.submit_reserved(reservation,
+                                        dummy_task).result(timeout=20)
+    finally:
+        executor.shutdown()
+
+
+def test_deadline_crossing_during_admission_releases_executor_lane(monkeypatch):
+    executor = DisposableExecutor(max_workers=1)
+    monkeypatch.setattr(process, '_SPAWN_CONTEXT',
+                        process.multiprocessing.get_context('fork'))
+    original_admit = process.InvocationFuture.admit
+    admission_deadline = time.monotonic() + 0.2
+
+    def cross_deadline_after_admission(future):
+        original_admit(future)
+        remaining = admission_deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining + 0.02)
+
+    monkeypatch.setattr(process.InvocationFuture, 'admit',
+                        cross_deadline_after_admission)
+    with pytest.raises(TimeoutError, match='during admission'):
+        executor.submit(dummy_task,
+                        admission_deadline_monotonic=admission_deadline)
+
     assert not executor.poisoned
     assert not executor.workers
     assert executor.available_slots() == 1
@@ -859,6 +929,46 @@ def test_boundary_result_envelope_rejects_wrong_authentication_token():
         sender_connection.close()
         monitor.join(timeout=2)
     assert not monitor.is_alive()
+
+
+def test_authenticated_result_without_guardian_reap_releases_as_ambiguity():
+    poison_errors = []
+    executor = DisposableExecutor(max_workers=1,
+                                  on_ambiguous_boundary=poison_errors.append)
+    monitor_connection, sender_connection = process.multiprocessing.Pipe(
+        duplex=True)
+    identity = process.ProcessIdentity(424243, 102)
+    future = process.InvocationFuture(identity, monitor_connection, False,
+                                      'expected-token')
+    assert future.set_running_or_notify_cancel()
+    guardian = unittest.mock.Mock(pid=identity.pid, exitcode=None)
+    record = process._InvocationRecord(guardian, future)
+    monitor = threading.Thread(target=executor._monitor_boundary,
+                               args=(record, monitor_connection))
+    record.monitor = monitor
+    monitor.start()
+    result = process.BoundaryResult(
+        identity,
+        process.InvocationOutcome(process.InvocationOutcomeKind.SUCCEEDED,
+                                  value='authenticated'))
+    try:
+        sender_connection.send(
+            process._BoundaryEnvelope('expected-token', process._Event.RESULT,
+                                      result))
+        assert future.result(timeout=2) == 'authenticated'
+        assert sender_connection.recv() is process._Command.RECEIPT
+    finally:
+        sender_connection.close()
+        monitor.join(timeout=2)
+
+    assert not monitor.is_alive()
+    assert executor.poisoned
+    assert len(poison_errors) == 1
+    with pytest.raises(process.AmbiguousBoundaryError) as captured:
+        future.wait_for_boundary_release(timeout=0)
+    assert captured.value is poison_errors[0]
+    guardian.join.assert_called_once_with(
+        timeout=process._PROCESS_REAP_PROOF_TIMEOUT_SECONDS)
 
 
 def test_shutdown_is_bounded_and_retryable_until_receipt_acknowledged():

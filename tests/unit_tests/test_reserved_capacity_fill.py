@@ -1218,30 +1218,48 @@ class TestReclaimProviderProofRenewer(unittest.TestCase):
         executor = mock.Mock()
         future = executor.submit.return_value
         future.result.return_value = True
+        future.wait_for_boundary_release.return_value = True
+        started_at = time.monotonic()
 
         self.assertTrue(
             reserved_capacity.renew_reclaim_provider_proofs_in_boundary(
                 executor))
 
-        executor.submit.assert_called_once_with(
-            reserved_capacity.renew_reclaim_provider_proofs_once)
-        future.result.assert_called_once_with(
-            timeout=reserved_capacity.
-            _RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS)
+        executor.submit.assert_called_once()
+        submit = executor.submit.call_args
+        self.assertEqual(
+            submit.args,
+            (reserved_capacity.renew_reclaim_provider_proofs_once,))
+        admission_deadline = submit.kwargs['admission_deadline_monotonic']
+        completed_at = time.monotonic()
+        self.assertGreaterEqual(
+            admission_deadline, started_at +
+            reserved_capacity._RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS)
+        self.assertLessEqual(
+            admission_deadline, completed_at +
+            reserved_capacity._RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS)
+        result_timeout = future.result.call_args.kwargs['timeout']
+        self.assertGreater(result_timeout, 0)
+        self.assertLessEqual(
+            result_timeout,
+            reserved_capacity._RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS)
+        future.wait_for_boundary_release.assert_called_once()
+        self.assertGreater(
+            future.wait_for_boundary_release.call_args.kwargs['timeout'], 0)
         self.assertGreater(
             reserved_capacity._RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS,
             reserved_capacity.reserved_fill_reclaim_attestation.
             PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
         reclaim = reserved_capacity.reserved_fill_reclaim_attestation
         self.assertGreater(
-            reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS -
+            reclaim.PROVIDER_PROOF_MAX_AGE_SECONDS -
             reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS,
+            2 * reclaim.PROVIDER_PROOF_REFRESH_BOUNDARY_LIFETIME_SECONDS +
             reclaim.PROVIDER_PROOF_RENEW_INTERVAL_SECONDS +
-            reclaim.PROVIDER_PROOF_REFRESH_BOUNDARY_LIFETIME_SECONDS +
             reclaim.PROVIDER_PROOF_REFRESH_JITTER_BUDGET_SECONDS)
         future.request_cancel.assert_not_called()
 
-    def test_real_boundary_does_not_charge_startup_to_provider_deadline(self):
+    def test_real_boundary_charges_startup_to_outer_not_provider_deadline(self):
         executor = reserved_capacity.request_process.DisposableExecutor(
             max_workers=1,
             initializer=_provider_startup_regression_initializer,
@@ -1271,7 +1289,11 @@ class TestReclaimProviderProofRenewer(unittest.TestCase):
             try:
                 with mock.patch.object(
                         reserved_capacity,
-                        '_RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS', 1.0), \
+                        # Give production-style spawn/import enough room to
+                        # enter the deliberately hanging provider operation.
+                        # This test owns post-admission family drain; separate
+                        # tests own pre-admission deadline cleanup.
+                        '_RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS', 15.0), \
                      mock.patch.object(
                          reserved_capacity,
                          'renew_reclaim_provider_proofs_once', operation):
@@ -1319,10 +1341,12 @@ class TestReclaimProviderProofRenewer(unittest.TestCase):
         self.assertEqual(future.result.call_count, 2)
         boundary_lifetime = future.result.call_args_list[0].kwargs['timeout']
         drain_timeout = future.result.call_args_list[1].kwargs['timeout']
-        self.assertEqual(
+        self.assertGreater(boundary_lifetime, 0)
+        self.assertLessEqual(
             boundary_lifetime,
             reserved_capacity._RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS)
-        self.assertEqual(
+        self.assertGreater(drain_timeout, 0)
+        self.assertLessEqual(
             drain_timeout,
             reserved_capacity._RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
 
@@ -1353,6 +1377,66 @@ class TestReclaimProviderProofRenewer(unittest.TestCase):
         self.assertIn('without a process-family drain result',
                       str(ambiguity.__cause__))
 
+    def test_monitor_ambiguity_during_timeout_drain_propagates_immediately(
+            self):
+        executor = mock.Mock()
+        future = executor.submit.return_value
+        ambiguity = reserved_capacity.request_process.AmbiguousBoundaryError(
+            'monitor cannot prove family absence')
+        future.done.return_value = False
+        future.result.side_effect = (
+            concurrent.futures.TimeoutError(),
+            ambiguity,
+        )
+
+        with self.assertRaises(reserved_capacity.request_process.
+                               AmbiguousBoundaryError) as captured:
+            reserved_capacity.renew_reclaim_provider_proofs_in_boundary(
+                executor)
+
+        self.assertIs(captured.exception, ambiguity)
+        future.request_cancel.assert_called_once_with()
+        future.wait_for_boundary_release.assert_not_called()
+
+    def test_monitor_ambiguity_winning_drain_timeout_race_is_preserved(self):
+        executor = mock.Mock()
+        future = executor.submit.return_value
+        ambiguity = reserved_capacity.request_process.AmbiguousBoundaryError(
+            'monitor completed as the drain timed out')
+        future.done.side_effect = (False, True)
+        future.result.side_effect = (
+            concurrent.futures.TimeoutError(),
+            concurrent.futures.TimeoutError(),
+            ambiguity,
+        )
+
+        with self.assertRaises(reserved_capacity.request_process.
+                               AmbiguousBoundaryError) as captured:
+            reserved_capacity.renew_reclaim_provider_proofs_in_boundary(
+                executor)
+
+        self.assertIs(captured.exception, ambiguity)
+        self.assertEqual(future.result.call_count, 3)
+        self.assertEqual(future.result.call_args_list[-1].kwargs['timeout'], 0)
+        future.wait_for_boundary_release.assert_not_called()
+
+    def test_outer_monitor_ambiguity_never_waits_for_late_lane_release(self):
+        executor = mock.Mock()
+        future = executor.submit.return_value
+        ambiguity = reserved_capacity.request_process.AmbiguousBoundaryError(
+            'outer result is terminally ambiguous')
+        future.result.side_effect = ambiguity
+        future.wait_for_boundary_release.return_value = False
+
+        with self.assertRaises(reserved_capacity.request_process.
+                               AmbiguousBoundaryError) as captured:
+            reserved_capacity.renew_reclaim_provider_proofs_in_boundary(
+                executor)
+
+        self.assertIs(captured.exception, ambiguity)
+        future.wait_for_boundary_release.assert_not_called()
+        executor._poison.assert_not_called()
+
     def test_completed_handler_timeout_does_not_poison_boundary(self):
         executor = mock.Mock()
         future = executor.submit.return_value
@@ -1369,6 +1453,52 @@ class TestReclaimProviderProofRenewer(unittest.TestCase):
         future.request_cancel.assert_not_called()
         executor._poison.assert_not_called()
         self.assertEqual(future.result.call_count, 1)
+        future.wait_for_boundary_release.assert_called_once()
+
+    def test_handler_failure_waits_for_lane_release_before_propagating(self):
+        executor = mock.Mock()
+        future = executor.submit.return_value
+        handler_error = RuntimeError('provider rejected proof')
+        future.result.side_effect = handler_error
+        future.wait_for_boundary_release.return_value = True
+
+        with self.assertRaisesRegex(RuntimeError, 'provider rejected proof'):
+            reserved_capacity.renew_reclaim_provider_proofs_in_boundary(
+                executor)
+
+        future.wait_for_boundary_release.assert_called_once()
+        executor._poison.assert_not_called()
+
+    def test_completed_result_without_lane_release_poison_is_terminal(self):
+        executor = mock.Mock()
+        future = executor.submit.return_value
+        future.result.return_value = True
+        future.done.return_value = True
+        future.wait_for_boundary_release.return_value = False
+
+        with self.assertRaisesRegex(
+                reserved_capacity.request_process.AmbiguousBoundaryError,
+                'cannot prove its guardian reaped') as captured:
+            reserved_capacity.renew_reclaim_provider_proofs_in_boundary(
+                executor)
+
+        executor._poison.assert_called_once_with(captured.exception)
+        self.assertEqual(future.wait_for_boundary_release.call_count, 2)
+
+    def test_success_result_with_ambiguous_release_never_returns_success(self):
+        executor = mock.Mock()
+        future = executor.submit.return_value
+        ambiguity = reserved_capacity.request_process.AmbiguousBoundaryError(
+            'authenticated result has no guardian-reap proof')
+        future.result.return_value = True
+        future.wait_for_boundary_release.side_effect = ambiguity
+
+        with self.assertRaises(reserved_capacity.request_process.
+                               AmbiguousBoundaryError) as captured:
+            reserved_capacity.renew_reclaim_provider_proofs_in_boundary(
+                executor)
+
+        self.assertIs(captured.exception, ambiguity)
 
     def test_shutdown_uses_boundary_drain_budget(self):
         executor = mock.Mock()
@@ -1407,6 +1537,7 @@ class TestPollerFlagOff(unittest.TestCase):
         with mock.patch.object(reserved_capacity.request_process,
                                'DisposableExecutor',
                                return_value=executor) as factory:
+            # pylint: disable-next=unexpected-keyword-arg
             reserved_capacity.poller_loop(lambda: autoscaler,
                                           lambda: placer,
                                           service_name='svc',

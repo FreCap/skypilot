@@ -265,8 +265,8 @@ def _attest_reclaim_enforcement(
         policy = reserved_fill_reclaim_attestation.require_unique_policy()
         local_identity = (
             reserved_fill_reclaim_attestation.require_policy_identity(policy))
-        deadline = (
-            reserved_fill_reclaim_attestation.new_policy_operation_deadline())
+        deadline = (reserved_fill_reclaim_attestation.
+                    new_provider_proof_operation_deadline())
         evidence = policy.attest_activation(
             claimed_contexts,
             writer_image_digest=writer_attestation.image_digest,

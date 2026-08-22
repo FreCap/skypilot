@@ -13,6 +13,7 @@ import dataclasses
 import enum
 import errno
 import logging
+import math
 import multiprocessing
 from multiprocessing import connection as multiprocessing_connection
 from multiprocessing import process as multiprocessing_process
@@ -50,6 +51,31 @@ _PIDFD_SYSCALLS = {
     'x86_64': (424, 434),
     'aarch64': (424, 434),
 }
+
+
+def _require_admission_deadline(deadline_monotonic: float | None, *,
+                                admission_gated: bool,
+                                receipt_required: bool) -> float | None:
+    """Validate one optional automatic-admission deadline before capacity."""
+    if deadline_monotonic is None:
+        return None
+    if (isinstance(deadline_monotonic, bool) or
+            not isinstance(deadline_monotonic, (int, float))):
+        raise TypeError('admission_deadline_monotonic must be a number.')
+    deadline = float(deadline_monotonic)
+    if not math.isfinite(deadline):
+        raise ValueError('admission_deadline_monotonic must be finite.')
+    if admission_gated:
+        raise ValueError('An automatic-admission deadline cannot be combined '
+                         'with admission_gated=True.')
+    if receipt_required:
+        raise ValueError(
+            'admission_deadline_monotonic cannot be combined with '
+            'receipt_required: a deadline failure after admission has no '
+            'caller-owned Future that can durably acknowledge effects.')
+    if time.monotonic() >= deadline:
+        raise TimeoutError('Invocation admission deadline already expired.')
+    return deadline
 
 
 class InvocationOutcomeKind(enum.Enum):
@@ -998,10 +1024,28 @@ class InvocationFuture(concurrent.futures.Future):
         self._cancel_requested = False
         self._receipt_acknowledged = False
         self._boundary_result: BoundaryResult | None = None
+        self._boundary_released = threading.Event()
+        self._boundary_release_error: AmbiguousBoundaryError | None = None
 
     @property
     def boundary_result(self) -> BoundaryResult | None:
         return self._boundary_result
+
+    def wait_for_boundary_release(self, timeout: float | None = None) -> bool:
+        """Wait until the guardian is reaped and its executor lane is free."""
+        released = self._boundary_released.wait(timeout)
+        if not released:
+            return False
+        if self._boundary_release_error is not None:
+            raise self._boundary_release_error
+        return True
+
+    def _publish_boundary_release(self,
+                                  error: AmbiguousBoundaryError | None = None
+                                 ) -> None:
+        """Publish the monitor's exact lane-release proof or ambiguity."""
+        self._boundary_release_error = error
+        self._boundary_released.set()
 
     def admit(self) -> None:
         """Permit handler effects after durable guardian publication."""
@@ -1031,19 +1075,35 @@ class InvocationFuture(concurrent.futures.Future):
                 return
             if self._boundary_result is None:
                 raise RuntimeError('Boundary result is not available yet.')
-            try:
-                self._control.send(_Command.RECEIPT)
-            except (BrokenPipeError, EOFError, OSError):
-                # A proven BoundaryResult already establishes family absence.
-                # Losing the lifetime pipe after the caller made the receipt
-                # durable cannot invalidate that proof or wedge its monitor.
-                pass
-            self._receipt_acknowledged = True
+            self._acknowledge_receipt_locked()
+
+    def _acknowledge_receipt_locked(self) -> None:
+        """Send one receipt while holding ``_control_lock``."""
+        if self._receipt_acknowledged:
+            return
+        try:
+            self._control.send(_Command.RECEIPT)
+        except (BrokenPipeError, EOFError, OSError):
+            # A proven BoundaryResult already establishes family absence.
+            # Losing the lifetime pipe after the caller made the receipt
+            # durable cannot invalidate that proof or wedge its monitor.
+            pass
+        self._receipt_acknowledged = True
+
+    def _make_self_acknowledging(self) -> None:
+        """Waive caller receipt ownership without racing result publication."""
+        with self._control_lock:
+            self._receipt_required = False
+            if self._boundary_result is not None:
+                self._acknowledge_receipt_locked()
 
     def _publish_boundary_result(self, result: BoundaryResult) -> None:
-        if self._boundary_result is not None:
-            return
-        self._boundary_result = result
+        with self._control_lock:
+            if self._boundary_result is not None:
+                return
+            self._boundary_result = result
+            if not self._receipt_required:
+                self._acknowledge_receipt_locked()
         outcome = result.outcome
         if outcome.kind is InvocationOutcomeKind.SUCCEEDED:
             self.set_result(outcome.value)
@@ -1125,13 +1185,20 @@ class DisposableExecutor:
             except BaseException:  # noqa: ASYNC103  # pylint: disable=broad-except
                 logger.exception('Ambiguous-boundary termination hook failed.')
 
-    def _claim_start_slot(self) -> None:
+    def _claim_start_slot(self,
+                          admission_deadline_monotonic: float | None = None
+                         ) -> None:
         """Atomically convert available capacity into a starting invocation."""
         with self._start_condition:
             self._raise_if_poisoned_locked()
             if self._shutdown:
                 raise RuntimeError(
                     'Cannot submit task after executor shutdown.')
+            if (admission_deadline_monotonic is not None and
+                    time.monotonic() >= admission_deadline_monotonic):
+                raise TimeoutError(
+                    'Invocation admission deadline expired before capacity '
+                    'claim.')
             if (self.max_workers is not None and
                     len(self.workers) + self._starting_workers
                     >= self.max_workers):
@@ -1145,6 +1212,7 @@ class DisposableExecutor:
         result_seen = False
         receive_error: BaseException | None = None
         connection_closed = False
+        release_error: AmbiguousBoundaryError | None = None
         try:
             while True:
                 payload = None
@@ -1180,8 +1248,6 @@ class DisposableExecutor:
                         result_seen = True
                         record.future._publish_boundary_result(  # pylint: disable=protected-access
                             result)
-                        if not record.future._receipt_required:  # pylint: disable=protected-access
-                            record.future.acknowledge_receipt()
             try:
                 record.guardian.join(
                     timeout=_PROCESS_REAP_PROOF_TIMEOUT_SECONDS)
@@ -1198,6 +1264,7 @@ class DisposableExecutor:
                     'boundary proof or complete lifetime proof '
                     f'(exit code {record.guardian.exitcode}).')
                 ambiguity_error.__cause__ = receive_error
+                release_error = ambiguity_error
                 self._poison(ambiguity_error)
                 if not record.future.done():
                     record.future.set_exception(ambiguity_error)
@@ -1210,6 +1277,8 @@ class DisposableExecutor:
                     self.workers.pop(pid, None)
                     self._invocations.pop(pid, None)
                     self._start_condition.notify_all()
+            record.future._publish_boundary_release(  # pylint: disable=protected-access
+                release_error)
 
     def _cleanup_unregistered_start(
             self, guardian: multiprocessing_process.BaseProcess,
@@ -1282,15 +1351,22 @@ class DisposableExecutor:
                admission_gated: bool = False,
                receipt_required: bool = False,
                capability_fd: int | None = None,
+               admission_deadline_monotonic: float | None = None,
                **kwargs: Any) -> InvocationFuture:
         """Start one boundary; optionally leave handler effects unadmitted."""
-        self._claim_start_slot()
-        return self._submit_claimed(fn,
-                                    *args,
-                                    admission_gated=admission_gated,
-                                    receipt_required=receipt_required,
-                                    capability_fd=capability_fd,
-                                    **kwargs)
+        admission_deadline_monotonic = _require_admission_deadline(
+            admission_deadline_monotonic,
+            admission_gated=admission_gated,
+            receipt_required=receipt_required)
+        self._claim_start_slot(admission_deadline_monotonic)
+        return self._submit_claimed(
+            fn,
+            *args,
+            admission_gated=admission_gated,
+            receipt_required=receipt_required,
+            capability_fd=capability_fd,
+            admission_deadline_monotonic=(admission_deadline_monotonic),
+            **kwargs)
 
     def _submit_claimed(self,
                         fn: Callable,
@@ -1298,6 +1374,7 @@ class DisposableExecutor:
                         admission_gated: bool = False,
                         receipt_required: bool = False,
                         capability_fd: int | None = None,
+                        admission_deadline_monotonic: float | None = None,
                         **kwargs: Any) -> InvocationFuture:
         """Start a boundary after this executor already owns one start slot."""
         parent_connection = None
@@ -1316,6 +1393,11 @@ class DisposableExecutor:
             invocation_payload = _serialize_invocation(fn, self._initializer,
                                                        self._initargs, args,
                                                        kwargs)
+            if (admission_deadline_monotonic is not None and
+                    time.monotonic() >= admission_deadline_monotonic):
+                raise TimeoutError(
+                    'Invocation admission deadline expired during '
+                    'serialization.')
             parent_connection, guardian_connection = multiprocessing.Pipe(
                 duplex=True)
             guardian = _SPAWN_CONTEXT.Process(
@@ -1339,9 +1421,20 @@ class DisposableExecutor:
                 raise BoundaryExecutionError(
                     'Invocation guardian vanished before its process birth '
                     'identity could be observed.') from e
-            if not parent_connection.poll(_BOUNDARY_START_TIMEOUT_SECONDS):
+            startup_timeout = float(_BOUNDARY_START_TIMEOUT_SECONDS)
+            if admission_deadline_monotonic is not None:
+                remaining = admission_deadline_monotonic - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        'Invocation admission deadline expired before ready.')
+                startup_timeout = min(startup_timeout, remaining)
+            if not parent_connection.poll(startup_timeout):
                 raise TimeoutError('Invocation guardian did not become ready.')
             ready = parent_connection.recv()
+            if (admission_deadline_monotonic is not None and
+                    time.monotonic() >= admission_deadline_monotonic):
+                raise TimeoutError(
+                    'Invocation admission deadline expired after ready.')
             if (isinstance(ready, _BoundaryEnvelope) and
                     ready.token == boundary_token and
                     ready.event is _Event.RESULT and
@@ -1395,18 +1488,40 @@ class DisposableExecutor:
             if monitor_start_error is not None:
                 # No caller owns this accepted boundary yet.  Cancel it before
                 # admission and synchronously run the same result/reap owner.
+                future._make_self_acknowledging()  # pylint: disable=protected-access
                 future.request_cancel()
-                future._receipt_required = False  # pylint: disable=protected-access
                 self._monitor_boundary(record, parent_connection)
                 raise monitor_start_error
             if not admission_gated:
                 try:
+                    if (admission_deadline_monotonic is not None and
+                            time.monotonic() >= admission_deadline_monotonic):
+                        raise TimeoutError(
+                            'Invocation admission deadline expired before '
+                            'admission.')
                     future.admit()
-                except BaseException:
+                    if (admission_deadline_monotonic is not None and
+                            time.monotonic() >= admission_deadline_monotonic):
+                        future.request_cancel()
+                        raise TimeoutError(
+                            'Invocation admission deadline expired during '
+                            'admission.')
+                except BaseException as admission_error:
                     # The monitor owns the accepted boundary, but no caller owns
-                    # its Future yet.  Make it self-acknowledging and cancel it.
-                    future._receipt_required = False  # pylint: disable=protected-access
+                    # its Future yet.  Make it self-acknowledging, cancel it,
+                    # and synchronously prove lane release before exposing the
+                    # admission failure.  Otherwise a deadline crossing inside
+                    # ``admit()`` could leave an unobservable live boundary.
+                    future._make_self_acknowledging()  # pylint: disable=protected-access
                     future.request_cancel()
+                    release_timeout = (_BOUNDARY_START_CLEANUP_TIMEOUT_SECONDS +
+                                       _PROCESS_REAP_PROOF_TIMEOUT_SECONDS)
+                    if not future.wait_for_boundary_release(release_timeout):
+                        ambiguity = AmbiguousBoundaryError(
+                            'Invocation automatic admission failed without '
+                            'guardian-reap and executor-lane-release proof.')
+                        self._poison(ambiguity)
+                        raise ambiguity from admission_error
                     raise
             return future
         except BaseException as submit_error:
@@ -1635,7 +1750,12 @@ class BurstableExecutor:
                         admission_gated: bool = False,
                         receipt_required: bool = False,
                         capability_fd: int | None = None,
+                        admission_deadline_monotonic: float | None = None,
                         **kwargs: Any) -> InvocationFuture:
+        admission_deadline_monotonic = _require_admission_deadline(
+            admission_deadline_monotonic,
+            admission_gated=admission_gated,
+            receipt_required=receipt_required)
         with self._reservation_lock:
             self._raise_if_poisoned_locked()
             if self._shutdown:
@@ -1648,7 +1768,8 @@ class BurstableExecutor:
             # Convert the facade reservation into the lane's starting-capacity
             # claim before exposing that slot to another reservation attempt.
             # This operation acquires no process resources.
-            lane_executor._claim_start_slot()  # pylint: disable=protected-access
+            lane_executor._claim_start_slot(  # pylint: disable=protected-access
+                admission_deadline_monotonic)
         # Process startup is deliberately outside the reservation lock.  The
         # opaque reservation and corresponding lane capacity were both claimed
         # atomically above.
@@ -1658,6 +1779,7 @@ class BurstableExecutor:
             admission_gated=admission_gated,
             receipt_required=receipt_required,
             capability_fd=capability_fd,
+            admission_deadline_monotonic=admission_deadline_monotonic,
             **kwargs)
 
     def shutdown(self,

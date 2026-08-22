@@ -328,16 +328,19 @@ def test_async_ambiguity_keeps_poisoned_owner_and_blocks_successor(
 
 @pytest.mark.skipif(not sys.platform.startswith('linux'),
                     reason='requires Linux process identities and signals')
-def test_post_result_reap_ambiguity_parks_on_next_tick(monkeypatch):
-    """Late monitor poison after success cannot replace the retained lane."""
+def test_post_result_reap_ambiguity_parks_immediately(monkeypatch):
+    """The active renewal receives late reap ambiguity and parks its lane."""
     executor = request_process.DisposableExecutor(max_workers=1)
     future = executor.submit(_successful_renewal, receipt_required=True)
     guardian = future.guardian_identity
     inner = _wait_for_direct_child(guardian)
     parked = threading.Event()
+    wait_started = threading.Event()
     release_test_park = threading.Event()
+    park_errors = []
 
-    def park(_error):
+    def park(error):
+        park_errors.append(error)
         parked.set()
         assert release_test_park.wait(timeout=20)
 
@@ -350,12 +353,6 @@ def test_post_result_reap_ambiguity_parks_on_next_tick(monkeypatch):
         # still finish its receipt path; only the local guardian-reap proof is
         # made unavailable to the monitor.
         record.guardian = mock.Mock(pid=guardian.pid, exitcode=None)
-        request_process._send_exact_signal(guardian, signal.SIGKILL)
-        future.acknowledge_receipt()
-        assert _wait_until(lambda: executor.poisoned)
-        assert future.result() is True
-        assert _wait_until(lambda: not executor.workers)
-        real_guardian.join(timeout=20)
 
         monkeypatch.setattr(daemons, '_reserved_fill_reclaim_proof_executor',
                             executor)
@@ -364,16 +361,36 @@ def test_post_result_reap_ambiguity_parks_on_next_tick(monkeypatch):
         monkeypatch.setattr(request_process, 'DisposableExecutor', constructor)
         monkeypatch.setattr(daemons, '_park_reclaim_provider_proof_owner', park)
         monkeypatch.setattr(daemons.time, 'sleep', mock.Mock())
+        submit = mock.Mock(return_value=future)
+        monkeypatch.setattr(executor, 'submit', submit)
+        real_wait_for_release = future.wait_for_boundary_release
+
+        def wait_for_release(timeout=None):
+            wait_started.set()
+            return real_wait_for_release(timeout)
+
+        monkeypatch.setattr(future, 'wait_for_boundary_release',
+                            wait_for_release)
         event_thread = threading.Thread(
             target=daemons.reserved_fill_reclaim_proof_renewal_event,
             name='test-post-result-renewal-owner',
             daemon=True)
         event_thread.start()
 
+        assert wait_started.wait(timeout=20)
+        request_process._send_exact_signal(guardian, signal.SIGKILL)
+        future.acknowledge_receipt()
         assert parked.wait(timeout=20)
         assert event_thread.is_alive()
+        assert executor.poisoned
+        assert future.result() is True
+        assert _wait_until(lambda: not executor.workers)
+        real_guardian.join(timeout=20)
         assert daemons._reserved_fill_reclaim_proof_executor is executor
         constructor.assert_not_called()
+        submit.assert_called_once()
+        assert len(park_errors) == 1
+        assert park_errors[0] is future._boundary_release_error
         release_test_park.set()
         event_thread.join(timeout=20)
         assert not event_thread.is_alive()

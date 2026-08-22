@@ -175,9 +175,20 @@ def _require_cluster(response: object, expected: Mapping[str, Any]) -> None:
             'EKS did not return the exact active cluster inventory.')
 
 
+def _eks_client(session: Any, *, region: str, deadline_monotonic: float,
+                cancellation: threading.Event) -> Any:
+    """Create one EKS client bounded to the remaining absolute horizon."""
+    timeout = _client_timeout(deadline_monotonic, cancellation)
+    config = aws_adaptor.botocore_config().Config(
+        connect_timeout=timeout,
+        read_timeout=timeout,
+        retries={'total_max_attempts': 1})
+    return session.client('eks', region_name=region, config=config)
+
+
 def _list_associations(
-        eks: Any, *, cluster_name: str, namespace: str, service_account: str,
-        deadline_monotonic: float,
+        session: Any, *, region: str, cluster_name: str, namespace: str,
+        service_account: str, deadline_monotonic: float,
         cancellation: threading.Event) -> list[Mapping[str, Any]]:
     associations: list[Mapping[str, Any]] = []
     next_token: str | None = None
@@ -192,6 +203,10 @@ def _list_associations(
         }
         if next_token is not None:
             request['nextToken'] = next_token
+        eks = _eks_client(session,
+                          region=region,
+                          deadline_monotonic=deadline_monotonic,
+                          cancellation=cancellation)
         response = eks.list_pod_identity_associations(**request)
         if not isinstance(response, Mapping):
             raise AwsAttestationError(
@@ -271,18 +286,15 @@ def attest_pod_identity(
     session = session_cache.session(eks_contract['audit_role_arn'],
                                     eks_contract['region'], deadline_monotonic,
                                     cancellation)
-    timeout = _client_timeout(deadline_monotonic, cancellation)
-    config = aws_adaptor.botocore_config().Config(
-        connect_timeout=timeout,
-        read_timeout=timeout,
-        retries={'total_max_attempts': 1})
-    eks = session.client('eks',
-                         region_name=eks_contract['region'],
-                         config=config)
+    eks = _eks_client(session,
+                      region=eks_contract['region'],
+                      deadline_monotonic=deadline_monotonic,
+                      cancellation=cancellation)
     _require_cluster(eks.describe_cluster(name=eks_contract['cluster_name']),
                      eks_contract)
     associations = _list_associations(
-        eks,
+        session,
+        region=eks_contract['region'],
         cluster_name=eks_contract['cluster_name'],
         namespace=fleet_context['namespace'],
         service_account=fleet_context['service_account_name'],
@@ -302,6 +314,10 @@ def attest_pod_identity(
         if not isinstance(association_id, str) or not association_id:
             raise AwsAttestationError(
                 'EKS returned an invalid Pod Identity association ID.')
+        eks = _eks_client(session,
+                          region=eks_contract['region'],
+                          deadline_monotonic=deadline_monotonic,
+                          cancellation=cancellation)
         response = eks.describe_pod_identity_association(
             clusterName=eks_contract['cluster_name'],
             associationId=association_id)

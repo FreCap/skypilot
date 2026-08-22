@@ -86,6 +86,15 @@ def _client_timeout(deadline_monotonic: float,
     return min(1.0, remaining / 3)
 
 
+def _request_timeout(
+    deadline_monotonic: float,
+    cancellation: threading.Event,
+) -> tuple[float, float]:
+    """Return the generated client's explicit connect/read timeout pair."""
+    timeout = _client_timeout(deadline_monotonic, cancellation)
+    return timeout, timeout
+
+
 def _eks_bearer_token(audit_session: Any, *, region: str, cluster_name: str,
                       deadline_monotonic: float,
                       cancellation: threading.Event) -> str:
@@ -238,6 +247,10 @@ def _audit_api_client(
         }],
     }
     configuration = kubernetes_adaptor.kubernetes.client.Configuration()
+    # The generated client otherwise installs urllib3's default retry policy.
+    # Every provider-proof read is a single attempt bounded by the exact
+    # absolute deadline; the next daemon round owns retry.
+    configuration.retries = 0
     loader = kubernetes_adaptor.kubernetes.config.kube_config.KubeConfigLoader(
         config_dict=config_document,
         active_context=context_name,
@@ -259,11 +272,19 @@ def _audit_api_client(
             close()
 
 
-def _require_physical_cluster_uid(client: Any, expected_uid: str) -> None:
+def _require_physical_cluster_uid(
+    client: Any,
+    expected_uid: str,
+    *,
+    deadline_monotonic: float,
+    cancellation: threading.Event,
+) -> None:
     try:
         namespace = kubernetes_adaptor.kubernetes.client.CoreV1Api(
-            api_client=client).read_namespace(
-                'kube-system', _request_timeout=kubernetes_adaptor.API_TIMEOUT)
+            api_client=client).read_namespace('kube-system',
+                                              _request_timeout=_request_timeout(
+                                                  deadline_monotonic,
+                                                  cancellation))
     except kubernetes_adaptor.api_exception() as error:
         if getattr(error, 'status', None) == 404:
             raise KubernetesAttestationNonconformanceError(
@@ -937,6 +958,8 @@ def _get_kueue_object(custom: Any,
                       *,
                       plural: str,
                       name: str,
+                      deadline_monotonic: float,
+                      cancellation: threading.Event,
                       namespace: str | None = None) -> Mapping[str, Any]:
     last_error: Exception | None = None
     for version in _KUEUE_API_VERSIONS:
@@ -947,14 +970,16 @@ def _get_kueue_object(custom: Any,
                     version=version,
                     plural=plural,
                     name=name,
-                    _request_timeout=kubernetes_adaptor.API_TIMEOUT)
+                    _request_timeout=_request_timeout(deadline_monotonic,
+                                                      cancellation))
             return custom.get_namespaced_custom_object(
                 group=_KUEUE_GROUP,
                 version=version,
                 namespace=namespace,
                 plural=plural,
                 name=name,
-                _request_timeout=kubernetes_adaptor.API_TIMEOUT)
+                _request_timeout=_request_timeout(deadline_monotonic,
+                                                  cancellation))
         except kubernetes_adaptor.api_exception() as error:
             last_error = error
             if getattr(error, 'status', None) != 404:
@@ -981,7 +1006,8 @@ def _list_kueue_objects(custom: Any, *, plural: str, deadline_monotonic: float,
                 'version': version,
                 'plural': plural,
                 'limit': _KUEUE_LIST_PAGE_LIMIT,
-                '_request_timeout': kubernetes_adaptor.API_TIMEOUT,
+                '_request_timeout': _request_timeout(deadline_monotonic,
+                                                     cancellation),
             }
             if continuation is not None:
                 kwargs['_continue'] = continuation
@@ -1047,7 +1073,10 @@ def attest_context(fleet_context: Mapping[str,
                                audit_session,
                                deadline_monotonic=deadline_monotonic,
                                cancellation=cancellation) as client:
-            _require_physical_cluster_uid(client, expected_uid)
+            _require_physical_cluster_uid(client,
+                                          expected_uid,
+                                          deadline_monotonic=deadline_monotonic,
+                                          cancellation=cancellation)
             core = kubernetes_adaptor.kubernetes.client.CoreV1Api(
                 api_client=client)
             custom = kubernetes_adaptor.kubernetes.client.CustomObjectsApi(
@@ -1063,25 +1092,31 @@ def attest_context(fleet_context: Mapping[str,
                     client,
                     _read_required(lambda: core.read_namespace(
                         namespace,
-                        _request_timeout=kubernetes_adaptor.API_TIMEOUT),
+                        _request_timeout=_request_timeout(
+                            deadline_monotonic, cancellation)),
                                    subject=f'Namespace {namespace!r}')),
                 'service_account': _serialized(
                     client,
                     _read_required(lambda: core.read_namespaced_service_account(
                         fleet_context['service_account_name'],
                         namespace,
-                        _request_timeout=kubernetes_adaptor.API_TIMEOUT),
+                        _request_timeout=_request_timeout(
+                            deadline_monotonic, cancellation)),
                                    subject='ServiceAccount')),
                 'priority_class': _serialized(
                     client,
                     _read_required(lambda: scheduling.read_priority_class(
                         fleet_context['priority_class']['name'],
-                        _request_timeout=kubernetes_adaptor.API_TIMEOUT),
+                        _request_timeout=_request_timeout(
+                            deadline_monotonic, cancellation)),
                                    subject='Pod PriorityClass')),
                 'resource_flavors': {
-                    flavor['name']: _get_kueue_object(custom,
-                                                      plural='resourceflavors',
-                                                      name=flavor['name'])
+                    flavor['name']: _get_kueue_object(
+                        custom,
+                        plural='resourceflavors',
+                        name=flavor['name'],
+                        deadline_monotonic=(deadline_monotonic),
+                        cancellation=(cancellation))
                     for flavor in provider_context['resource_flavors']
                 },
                 'nodes': {
@@ -1090,7 +1125,8 @@ def attest_context(fleet_context: Mapping[str,
                         core.list_node(
                             label_selector=_resource_flavor_node_selector(
                                 provider_context, node['flavor']),
-                            _request_timeout=kubernetes_adaptor.API_TIMEOUT))
+                            _request_timeout=_request_timeout(
+                                deadline_monotonic, cancellation)))
                     for node in provider_context['node_inventory']
                 },
             }
@@ -1100,7 +1136,8 @@ def attest_context(fleet_context: Mapping[str,
                     _read_required(lambda: apps.read_namespaced_deployment(
                         scheduler['deployment'],
                         scheduler['namespace'],
-                        _request_timeout=kubernetes_adaptor.API_TIMEOUT),
+                        _request_timeout=_request_timeout(
+                            deadline_monotonic, cancellation)),
                                    subject='scheduler Deployment'))
             raw_kueue_admission = fleet_context['kueue_admission']
             if raw_kueue_admission is not None:
@@ -1118,11 +1155,15 @@ def attest_context(fleet_context: Mapping[str,
                     'workload_priority_class': _get_kueue_object(
                         custom,
                         plural='workloadpriorityclasses',
-                        name=(kueue_admission['workload_priority_class_name'])),
+                        name=(kueue_admission['workload_priority_class_name']),
+                        deadline_monotonic=deadline_monotonic,
+                        cancellation=cancellation),
                     'local_queue': _get_kueue_object(
                         custom,
                         plural='localqueues',
                         name=kueue_admission['local_queue_name'],
+                        deadline_monotonic=deadline_monotonic,
+                        cancellation=cancellation,
                         namespace=namespace),
                     'cohort_inventory': _list_kueue_objects(
                         custom,
@@ -1139,14 +1180,16 @@ def attest_context(fleet_context: Mapping[str,
                         _read_required(lambda: apps.read_namespaced_deployment(
                             controller['deployment'],
                             controller['namespace'],
-                            _request_timeout=(kubernetes_adaptor.API_TIMEOUT)),
+                            _request_timeout=_request_timeout(
+                                deadline_monotonic, cancellation)),
                                        subject='Kueue controller Deployment')),
                     'kueue_config': _serialized(
                         client,
                         _read_required(lambda: core.read_namespaced_config_map(
                             controller['config_map'],
                             controller['namespace'],
-                            _request_timeout=(kubernetes_adaptor.API_TIMEOUT)),
+                            _request_timeout=_request_timeout(
+                                deadline_monotonic, cancellation)),
                                        subject='Kueue controller ConfigMap')),
                     'validating_webhook': _serialized(
                         client,
@@ -1154,8 +1197,8 @@ def attest_context(fleet_context: Mapping[str,
                             lambda: admission_api.
                             read_validating_webhook_configuration(
                                 webhooks['validating']['configuration_name'],
-                                _request_timeout=(kubernetes_adaptor.API_TIMEOUT
-                                                 )),
+                                _request_timeout=_request_timeout(
+                                    deadline_monotonic, cancellation)),
                             subject='Kueue validating webhook')),
                     'mutating_webhook': _serialized(
                         client,
@@ -1163,8 +1206,8 @@ def attest_context(fleet_context: Mapping[str,
                             lambda: admission_api.
                             read_mutating_webhook_configuration(
                                 webhooks['mutating']['configuration_name'],
-                                _request_timeout=(kubernetes_adaptor.API_TIMEOUT
-                                                 )),
+                                _request_timeout=_request_timeout(
+                                    deadline_monotonic, cancellation)),
                             subject='Kueue mutating webhook')),
                 })
             proof = validate_snapshot(fleet_context, provider_context, snapshot)

@@ -655,7 +655,7 @@ def test_repository_preserves_url_options_and_installs_named_metrics(
             'application_name': 'skypilot-reclaim-proof',
             'options': ('-c geqo=off -c statement_timeout=200ms '
                         '-c lock_timeout=200ms '
-                        '-c idle_in_transaction_session_timeout=6000ms'),
+                        '-c idle_in_transaction_session_timeout=9000ms'),
         }
     finally:
         repository._proof_engine.dispose()
@@ -1347,12 +1347,17 @@ def test_physical_close_crossing_deadline_denies_but_receipt_is_reusable(
                 c.receipt_nonce)).scalar_one()
 
     # A result crossing the boundary after commit/physical close denies this
-    # caller but does not make the exact server-committed row unsafe to reuse.
-    unexpected_provider = mock.Mock()
-    reused = repository.renew(**kwargs,
-                              deadline_monotonic=time.monotonic() + 5,
-                              prove=unexpected_provider)
-    unexpected_provider.assert_not_called()
+    # caller but does not make the exact server-committed row unsafe for a
+    # read-only launch consumer. Proactive renewal must still perform fresh
+    # provider I/O; only get_fresh() may reuse an already-published receipt.
+    reused = repository.get_fresh(
+        identity=kwargs['identity'],
+        gate_generation=kwargs['gate_generation'],
+        kubernetes_context=kwargs['kubernetes_context'],
+        deadline_monotonic=time.monotonic() + 5,
+        validate=kwargs['validate'],
+        minimum_remaining_seconds=(
+            reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS))
     assert reused.reference.receipt_nonce == persisted_nonce
 
 
@@ -1381,11 +1386,14 @@ def test_lost_commit_ack_denies_current_but_later_reuses_receipt(
                          prove=provider)
     provider.assert_called_once()
     monkeypatch.setattr(repository, '_commit', original_commit)
-    unexpected_provider = mock.Mock()
-    reused = repository.renew(**kwargs,
-                              deadline_monotonic=time.monotonic() + 5,
-                              prove=unexpected_provider)
-    unexpected_provider.assert_not_called()
+    reused = repository.get_fresh(
+        identity=kwargs['identity'],
+        gate_generation=kwargs['gate_generation'],
+        kubernetes_context=kwargs['kubernetes_context'],
+        deadline_monotonic=time.monotonic() + 5,
+        validate=kwargs['validate'],
+        minimum_remaining_seconds=(
+            reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS))
     with proof_engine.connect() as connection:
         assert reused.reference.receipt_nonce == connection.execute(
             sqlalchemy.select(
@@ -1459,6 +1467,7 @@ def test_renewal_runs_provider_io_and_launch_only_reads_receipt(
     repository_threads = []
     launch_read_threads = []
     provider_threads = []
+    launch_caller_thread = threading.current_thread().name
 
     def _repository_factory():
         construction_threads.append(threading.current_thread().name)
@@ -1471,8 +1480,6 @@ def test_renewal_runs_provider_io_and_launch_only_reads_receipt(
 
     def _get_fresh(**kwargs):
         launch_read_threads.append(threading.current_thread().name)
-        assert threading.current_thread().name.startswith(
-            'boltz-reclaim-launch')
         return original_get_fresh(**kwargs)
 
     def _provider_job(context_name, domain, _deadline, _cancellation):
@@ -1491,7 +1498,7 @@ def test_renewal_runs_provider_io_and_launch_only_reads_receipt(
         expected_identity=policy.policy_identity(),
         expected_gate_generation=_GATE_GENERATION,
         deadline_monotonic=time.monotonic() + 5)
-    assert not policy.renew_provider_proofs(
+    assert policy.renew_provider_proofs(
         expected_identity=policy.policy_identity(),
         expected_gate_generation=_GATE_GENERATION,
         deadline_monotonic=time.monotonic() + 5)
@@ -1501,13 +1508,12 @@ def test_renewal_runs_provider_io_and_launch_only_reads_receipt(
                             deadline_monotonic=time.monotonic() + 5)
 
     assert len(construction_threads) == 3
-    assert all(not name.startswith('boltz-reclaim-launch')
-               for name in construction_threads[:2])
-    assert construction_threads[2].startswith('boltz-reclaim-launch')
+    assert construction_threads == [launch_caller_thread] * 3
     assert len(repository_threads) == 2 * len(policy._bundle.contexts)
-    assert len(launch_read_threads) == 1
-    assert len(provider_threads) == len(policy._bundle.contexts) * 2
-    assert _wait_for_no_thread('boltz-reclaim-launch')
+    assert launch_read_threads == [launch_caller_thread]
+    # Each of the two proactive rounds proves both AWS and Kubernetes for
+    # every context. The subsequent launch performs no provider I/O.
+    assert len(provider_threads) == len(policy._bundle.contexts) * 2 * 2
 
 
 def test_context_receipt_uses_oldest_asymmetric_domain_completion(
@@ -1724,9 +1730,10 @@ def test_multiprocess_renewers_share_receipt_and_launch_reads(
                         """)).scalar_one()
                     deadline_value.value = (
                         time.monotonic() +
-                        reclaim.POLICY_OPERATION_TIMEOUT_SECONDS)
-                    wave_started = (deadline_value.value -
-                                    reclaim.POLICY_OPERATION_TIMEOUT_SECONDS)
+                        reclaim.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
+                    wave_started = (
+                        deadline_value.value -
+                        reclaim.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
                     start_event.set()
                     with concurrent.futures.ThreadPoolExecutor(
                             max_workers=2) as barrier_executor:
@@ -1820,7 +1827,8 @@ def test_multiprocess_renewers_share_receipt_and_launch_reads(
     assert len({result[0] for result in results}) == 1
     assert all(result[1] for result in results)
     assert all(result[4] for result in results)
-    assert max(result[2] for result in results) < 5
+    assert max(result[2] for result in results) < (
+        reclaim.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
     pressure_metrics = {
         'workers': worker_count,
         'max_elapsed_seconds': max(result[2] for result in results),
@@ -1944,6 +1952,187 @@ def test_aged_identical_receipt_refreshes_once_without_revoking_reference(
             expected_physical_cluster_uid='physical-cluster-uid')
 
 
+def test_renewal_refreshes_a_fresh_receipt(proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    calls = 0
+
+    def prove():
+        nonlocal calls
+        calls += 1
+        return _proof_candidate()
+
+    common = {
+        'identity': _identity(),
+        'gate_generation': _GATE_GENERATION,
+        'kubernetes_context': _CONTEXT,
+        'prove': prove,
+        'validate': _accept_payload,
+    }
+    repository.renew(**common, deadline_monotonic=time.monotonic() + 5)
+    refreshed = repository.renew(
+        **common,
+        deadline_monotonic=time.monotonic() + 5,
+        minimum_remaining_seconds=(
+            reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS))
+
+    assert calls == 2
+    assert refreshed.publication_observed
+    assert refreshed.has_remaining(
+        reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS)
+
+
+def test_slow_renewal_publication_hands_off_with_its_reserve(proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    calls = 0
+
+    def prove():
+        nonlocal calls
+        calls += 1
+        oldest_completed = time.monotonic()
+        time.sleep(0.08)
+        return _proof_candidate(oldest_completed_monotonic=oldest_completed)
+
+    common = {
+        'identity': _identity(),
+        'gate_generation': _GATE_GENERATION,
+        'kubernetes_context': _CONTEXT,
+        'prove': prove,
+        'validate': _accept_payload,
+    }
+    repository.renew(**common, deadline_monotonic=time.monotonic() + 5)
+    with proof_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                UPDATE serve_reserved_fill_reclaim_provider_proofs
+                SET completed_at = clock_timestamp() - INTERVAL '1 second'
+            """))
+
+    handoff_remaining = 27.0
+    refreshed = repository.renew(**common,
+                                 deadline_monotonic=time.monotonic() + 5,
+                                 minimum_remaining_seconds=handoff_remaining)
+
+    assert calls == 2
+    assert refreshed.publication_observed
+    assert refreshed.has_remaining(handoff_remaining)
+
+
+def test_renewal_loser_waits_for_a_newer_publication(proof_engine):
+    leader_repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    loser_repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    leader_entered = threading.Event()
+    release_leader = threading.Event()
+    provider_calls = 0
+    common = {
+        'identity': _identity(),
+        'gate_generation': _GATE_GENERATION,
+        'kubernetes_context': _CONTEXT,
+        'validate': _accept_payload,
+    }
+    leader_repository.renew(**common,
+                            deadline_monotonic=time.monotonic() + 5,
+                            prove=_proof_candidate)
+    with proof_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                UPDATE serve_reserved_fill_reclaim_provider_proofs
+                SET completed_at = clock_timestamp()
+                    - INTERVAL '0.5 seconds'
+            """))
+
+    handoff_remaining = 20.0
+
+    def leader_proof():
+        nonlocal provider_calls
+        provider_calls += 1
+        oldest_completed = time.monotonic()
+        leader_entered.set()
+        assert release_leader.wait(timeout=3)
+        return _proof_candidate(oldest_completed_monotonic=oldest_completed)
+
+    def unexpected_loser_proof():
+        raise AssertionError('The losing waiter must not run provider I/O.')
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        leader = executor.submit(leader_repository.renew,
+                                 **common,
+                                 deadline_monotonic=time.monotonic() + 5,
+                                 prove=leader_proof,
+                                 minimum_remaining_seconds=handoff_remaining)
+        assert leader_entered.wait(timeout=2)
+        loser = executor.submit(loser_repository.renew,
+                                **common,
+                                deadline_monotonic=time.monotonic() + 5,
+                                prove=unexpected_loser_proof,
+                                minimum_remaining_seconds=handoff_remaining)
+        # The pre-refresh receipt still satisfies the smaller handoff reserve.
+        # A waiter must nevertheless outlive that exact database completion,
+        # rather than mistaking its own reread for the elected publication.
+        time.sleep(0.7)
+        assert not loser.done()
+        release_leader.set()
+        leader_receipt = leader.result(timeout=2)
+        loser_receipt = loser.result(timeout=2)
+
+    assert provider_calls == 1
+    assert leader_receipt.completed_at == loser_receipt.completed_at
+    assert leader_receipt.has_remaining(handoff_remaining)
+
+
+def test_renewer_accepts_commit_between_read_and_election(
+        proof_engine, monkeypatch):
+    leader_repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    contender_repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    first_read_completed = threading.Event()
+    release_first_read = threading.Event()
+    original_read = contender_repository._read
+    transaction_reads = 0
+    common = {
+        'identity': _identity(),
+        'gate_generation': _GATE_GENERATION,
+        'kubernetes_context': _CONTEXT,
+        'validate': _accept_payload,
+        'minimum_remaining_seconds': 20.0,
+    }
+    leader_repository.renew(**common,
+                            deadline_monotonic=time.monotonic() + 5,
+                            prove=_proof_candidate)
+
+    def pause_after_first_transaction_read(**kwargs):
+        nonlocal transaction_reads
+        result = original_read(**kwargs)
+        if kwargs.get('connection') is not None:
+            transaction_reads += 1
+            if transaction_reads == 1:
+                first_read_completed.set()
+                assert release_first_read.wait(timeout=3)
+        return result
+
+    monkeypatch.setattr(contender_repository, '_read',
+                        pause_after_first_transaction_read)
+
+    def unexpected_contender_proof():
+        raise AssertionError(
+            'The contender must accept the intervening publication.')
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        contender = executor.submit(contender_repository.renew,
+                                    **common,
+                                    deadline_monotonic=time.monotonic() + 5,
+                                    prove=unexpected_contender_proof)
+        assert first_read_completed.wait(timeout=2)
+        leader_receipt = leader_repository.renew(
+            **common,
+            deadline_monotonic=time.monotonic() + 5,
+            prove=_proof_candidate)
+        release_first_read.set()
+        contender_receipt = contender.result(timeout=2)
+
+    assert transaction_reads == 2
+    assert contender_receipt.publication_observed
+    assert contender_receipt.completed_at == leader_receipt.completed_at
+
+
 def test_receipt_without_terminal_guard_reserve_is_refreshed(proof_engine):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
     calls = 0
@@ -1985,7 +2174,7 @@ def test_receipt_without_terminal_guard_reserve_is_refreshed(proof_engine):
             expected_physical_cluster_uid='physical-cluster-uid')
 
 
-def test_concurrent_launches_refresh_before_delayed_terminal_guard(
+def test_daemon_refreshes_before_concurrent_launch_terminal_guards(
         proof_engine):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
     calls = 0
@@ -2019,13 +2208,23 @@ def test_concurrent_launches_refresh_before_delayed_terminal_guard(
                         old_handoff_remaining)
             })
 
+    # Provider I/O belongs to the renewal daemon. Launches consume only the
+    # exact durable receipt after that proactive refresh has completed.
+    repository.renew(**common, deadline_monotonic=time.monotonic() + 5)
+
     launch_count = 10
     handoff_barrier = threading.Barrier(launch_count)
     terminal_entry_delay = old_handoff_remaining + 0.1
 
     def launch():
-        receipt = repository.renew(**common,
-                                   deadline_monotonic=time.monotonic() + 5)
+        receipt = repository.get_fresh(
+            identity=common['identity'],
+            gate_generation=common['gate_generation'],
+            kubernetes_context=common['kubernetes_context'],
+            deadline_monotonic=time.monotonic() + 5,
+            validate=common['validate'],
+            minimum_remaining_seconds=(
+                reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS))
         handoff_barrier.wait(timeout=5)
         time.sleep(terminal_entry_delay)
         with proof_engine.begin() as connection:
@@ -2040,8 +2239,9 @@ def test_concurrent_launches_refresh_before_delayed_terminal_guard(
         results = tuple(executor.map(lambda _: launch(), range(launch_count)))
 
     # The old 0.5-second handoff reserve reused the aged receipt and every
-    # delayed terminal guard failed.  The shared minimum-remaining contract
-    # elects one refresh before any launch receives its reference.
+    # delayed terminal guard failed. The daemon's proactive refresh plus the
+    # shared minimum-remaining read contract keeps every launch reference
+    # valid without doing provider I/O on a launch thread.
     assert calls == 2
     assert {nonce for nonce, _ in results} == {seeded.reference.receipt_nonce}
     assert all(holds for _, holds in results)
@@ -2137,7 +2337,10 @@ def test_connection_close_cannot_consume_terminal_guard_reserve(proof_engine):
         sqlalchemy.event.remove(repository._proof_engine, 'close',
                                 delay_first_physical_close)
 
-    assert proof_calls_at_close[0] == 0
+    # Proactive renewal always proves before publishing/closing. It cannot
+    # accidentally reuse the old near-expiry receipt merely because that row
+    # was still fresh at election time.
+    assert proof_calls_at_close[0] == 1
     assert prove_calls == 1
     assert refreshed.has_terminal_guard_reserve
 
@@ -2269,7 +2472,7 @@ def test_leader_transaction_uses_live_idle_timeout_and_holds_xact_lock(
                         state == 'idle in transaction' and advisory_locks == 1):
                     break
             time.sleep(0.01)
-        assert leader['idle_timeout'] == '6s'
+        assert leader['idle_timeout'] == '9s'
         assert application_name == 'skypilot-reclaim-proof-owner'
         assert state == 'idle in transaction'
         assert advisory_locks == 1

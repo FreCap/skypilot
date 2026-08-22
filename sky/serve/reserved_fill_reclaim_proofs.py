@@ -39,16 +39,16 @@ _RECEIPT_POLL_MAX_SECONDS = 1.0
 _DATABASE_CONNECT_TIMEOUT_SECONDS = 1
 _DATABASE_STATEMENT_TIMEOUT_MILLISECONDS = 200
 _DATABASE_SOCKET_TIMEOUT_MILLISECONDS = 200
-_DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS = 6000
+_DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS = 9000
 _PROVIDER_PUBLICATION_RESERVE_SECONDS = 0.5
 _DATABASE_APPLICATION_NAME = 'skypilot-reclaim-proof'
 _DATABASE_OWNER_APPLICATION_NAME = 'skypilot-reclaim-proof-owner'
 _PROVIDER_PROOF_MAX_JSON_DEPTH = 32
 
 if (_DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS
-        <= reclaim.POLICY_OPERATION_TIMEOUT_SECONDS * 1000):
+        <= reclaim.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS * 1000):
     raise RuntimeError('The provider-proof idle transaction timeout must cover '
-                       'the complete outer policy horizon.')
+                       'the complete provider-refresh horizon.')
 
 
 class ReclaimProviderProofError(RuntimeError):
@@ -123,6 +123,14 @@ class ReclaimProviderProofReceipt:
         # physical connection close, and every other local handoff delay.
         return self.has_remaining(
             reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ReclaimProviderProofElection:
+    """One election result and the receipt a losing waiter must outlive."""
+
+    selected: ReclaimProviderProofReceipt | None
+    wait_for_completed_after: datetime.datetime | None
 
 
 def _require_deadline(deadline_monotonic: float) -> float:
@@ -620,6 +628,7 @@ class ReclaimProviderProofRepository:
         deadline: float,
         validate: Callable[[Mapping[str, Any]], bool],
         minimum_remaining_seconds: float,
+        completed_after: datetime.datetime | None,
     ) -> ReclaimProviderProofReceipt:
         """Wait locally for one owner; never enter a lock-handoff convoy."""
 
@@ -652,9 +661,11 @@ class ReclaimProviderProofRepository:
             except ReclaimProviderProofError:
                 waiting = None
             _remaining_wait()
-            if (waiting is not None and self._payload_is_accepted(
-                    waiting.proof_payload, validate) and
-                    waiting.has_remaining(minimum_remaining_seconds)):
+            if (waiting is not None and
+                (completed_after is None or
+                 waiting.completed_at > completed_after) and
+                    self._payload_is_accepted(waiting.proof_payload, validate)
+                    and waiting.has_remaining(minimum_remaining_seconds)):
                 _remaining_wait()
                 return dataclasses.replace(waiting, publication_observed=True)
             poll_seconds = min(_RECEIPT_POLL_MAX_SECONDS, poll_seconds * 2)
@@ -669,10 +680,11 @@ class ReclaimProviderProofRepository:
         prove: Callable[[], ReclaimProviderProofCandidate],
         validate: Callable[[Mapping[str, Any]], bool],
         minimum_remaining_seconds: float,
-    ) -> ReclaimProviderProofReceipt | None:
+    ) -> _ReclaimProviderProofElection:
         """Use one transaction for exact read, election, and publication."""
         _require_deadline(deadline)
         selected: ReclaimProviderProofReceipt | None = None
+        wait_for_completed_after: datetime.datetime | None = None
         publish = False
         with self._proof_engine.connect() as connection:
             transaction = connection.begin()
@@ -683,108 +695,113 @@ class ReclaimProviderProofRepository:
                     kubernetes_context=kubernetes_context,
                     deadline=deadline,
                     connection=connection)
-                if (receipt is not None and self._payload_is_accepted(
-                        receipt.proof_payload, validate) and
-                        receipt.has_remaining(minimum_remaining_seconds)):
-                    selected = receipt
-                else:
-                    _require_deadline(deadline)
-                    acquired = connection.execute(
+                if receipt is not None:
+                    wait_for_completed_after = receipt.completed_at
+                _require_deadline(deadline)
+                acquired = connection.execute(
+                    sqlalchemy.text(
+                        'SELECT pg_catalog.pg_try_advisory_xact_lock('
+                        ':lock_key)'),
+                    {
+                        'lock_key': postgres_lock.postgres_lock_key(
+                            self._authority_lock_id(identity, gate_generation,
+                                                    kubernetes_context))
+                    }).scalar_one()
+                if type(acquired) is not bool:
+                    raise ReclaimProviderProofError(
+                        'The provider proof election result is malformed.')
+                _require_deadline(deadline)
+                if acquired:
+                    owner_application_name = connection.execute(
                         sqlalchemy.text(
-                            'SELECT pg_catalog.pg_try_advisory_xact_lock('
-                            ':lock_key)'), {
-                                'lock_key': postgres_lock.postgres_lock_key(
-                                    self._authority_lock_id(
-                                        identity, gate_generation,
-                                        kubernetes_context))
-                            }).scalar_one()
-                    if type(acquired) is not bool:
+                            'SELECT pg_catalog.set_config('
+                            "'application_name', :application_name, true)"),
+                        {
+                            'application_name': _DATABASE_OWNER_APPLICATION_NAME
+                        }).scalar_one()
+                    if owner_application_name != (
+                            _DATABASE_OWNER_APPLICATION_NAME):
                         raise ReclaimProviderProofError(
-                            'The provider proof election result is malformed.')
+                            'The provider proof owner phase is '
+                            'indeterminate.')
                     _require_deadline(deadline)
-                    if acquired:
-                        owner_application_name = connection.execute(
-                            sqlalchemy.text(
-                                'SELECT pg_catalog.set_config('
-                                "'application_name', :application_name, true)"),
-                            {
-                                'application_name': _DATABASE_OWNER_APPLICATION_NAME
-                            }).scalar_one()
-                        if owner_application_name != (
-                                _DATABASE_OWNER_APPLICATION_NAME):
+                    # READ COMMITTED reread closes a prior-owner commit
+                    # between the first read and the nonblocking election.
+                    existing, database_anchor, local_anchor = self._read(
+                        identity=identity,
+                        gate_generation=gate_generation,
+                        kubernetes_context=kubernetes_context,
+                        deadline=deadline,
+                        connection=connection)
+                    existing_is_accepted = False
+                    observed_new_publication = False
+                    if existing is not None:
+                        existing_is_accepted = (
+                            self._payload_is_accepted(existing.proof_payload,
+                                                      validate) and
+                            existing.has_remaining(minimum_remaining_seconds))
+                        observed_new_publication = (
+                            existing_is_accepted and
+                            (wait_for_completed_after is None or
+                             existing.completed_at > wait_for_completed_after))
+                    if (existing is not None and existing_is_accepted and
+                            observed_new_publication):
+                        # Another owner published between these two READ
+                        # COMMITTED statements. This caller may share that
+                        # exact completion instead of repeating provider
+                        # I/O.
+                        selected = dataclasses.replace(
+                            existing, publication_observed=True)
+                    else:
+                        provider_deadline = provider_proof_deadline(deadline)
+                        try:
+                            candidate = prove()
+                        except reclaim.ReclaimProviderNonconformanceError as error:
+                            self._invalidate_exact_authority(
+                                connection,
+                                identity=identity,
+                                gate_generation=gate_generation,
+                                kubernetes_context=kubernetes_context)
+                            # The deletion is the fail-closed publication
+                            # of this completed negative observation.
+                            self._commit(transaction)
+                            raise error
+                        proof_returned = time.monotonic()
+                        if proof_returned >= provider_deadline:
                             raise ReclaimProviderProofError(
-                                'The provider proof owner phase is '
-                                'indeterminate.')
-                        _require_deadline(deadline)
-                        # READ COMMITTED reread closes a prior-owner commit
-                        # between the first read and the nonblocking election.
-                        existing, database_anchor, local_anchor = self._read(
+                                'The provider proof consumed its reserved '
+                                'publication horizon.')
+                        if not isinstance(candidate,
+                                          ReclaimProviderProofCandidate):
+                            raise ReclaimProviderProofError(
+                                'The provider proof candidate is untyped.')
+                        oldest_completed = float(
+                            candidate.oldest_completed_monotonic)
+                        if (oldest_completed < local_anchor or
+                                oldest_completed > proof_returned):
+                            raise ReclaimProviderProofError(
+                                'The provider proof completion time is '
+                                'outside its exact execution interval.')
+                        proof_payload, proof_sha256 = canonical_proof_payload(
+                            candidate.proof_payload)
+                        if not self._payload_is_accepted(
+                                proof_payload, validate):
+                            raise ReclaimProviderProofError(
+                                'The fresh provider proof payload is not '
+                                'exact.')
+                        completed_at = database_anchor + datetime.timedelta(
+                            seconds=oldest_completed - local_anchor)
+                        selected = self._publish(
+                            connection=connection,
                             identity=identity,
                             gate_generation=gate_generation,
                             kubernetes_context=kubernetes_context,
-                            deadline=deadline,
-                            connection=connection)
-                        if (existing is not None and self._payload_is_accepted(
-                                existing.proof_payload, validate) and
-                                existing.has_remaining(
-                                    minimum_remaining_seconds)):
-                            # The first read could not use this authority and
-                            # the post-election reread can. Freshness cannot
-                            # improve with elapsed time, so a committed
-                            # publication was observed between the two reads.
-                            selected = dataclasses.replace(
-                                existing, publication_observed=True)
-                        else:
-                            provider_deadline = provider_proof_deadline(
-                                deadline)
-                            try:
-                                candidate = prove()
-                            except reclaim.ReclaimProviderNonconformanceError as error:
-                                self._invalidate_exact_authority(
-                                    connection,
-                                    identity=identity,
-                                    gate_generation=gate_generation,
-                                    kubernetes_context=kubernetes_context)
-                                # The deletion is the fail-closed publication
-                                # of this completed negative observation.
-                                self._commit(transaction)
-                                raise error
-                            proof_returned = time.monotonic()
-                            if proof_returned >= provider_deadline:
-                                raise ReclaimProviderProofError(
-                                    'The provider proof consumed its reserved '
-                                    'publication horizon.')
-                            if not isinstance(candidate,
-                                              ReclaimProviderProofCandidate):
-                                raise ReclaimProviderProofError(
-                                    'The provider proof candidate is untyped.')
-                            oldest_completed = float(
-                                candidate.oldest_completed_monotonic)
-                            if (oldest_completed < local_anchor or
-                                    oldest_completed > proof_returned):
-                                raise ReclaimProviderProofError(
-                                    'The provider proof completion time is '
-                                    'outside its exact execution interval.')
-                            proof_payload, proof_sha256 = canonical_proof_payload(
-                                candidate.proof_payload)
-                            if not self._payload_is_accepted(
-                                    proof_payload, validate):
-                                raise ReclaimProviderProofError(
-                                    'The fresh provider proof payload is not '
-                                    'exact.')
-                            completed_at = database_anchor + datetime.timedelta(
-                                seconds=oldest_completed - local_anchor)
-                            selected = self._publish(
-                                connection=connection,
-                                identity=identity,
-                                gate_generation=gate_generation,
-                                kubernetes_context=kubernetes_context,
-                                proof_payload=proof_payload,
-                                proof_sha256=proof_sha256,
-                                completed_at=completed_at,
-                                deadline=deadline)
-                            publish = True
-                            _require_deadline(deadline)
+                            proof_payload=proof_payload,
+                            proof_sha256=proof_sha256,
+                            completed_at=completed_at,
+                            deadline=deadline)
+                        publish = True
+                        _require_deadline(deadline)
                 if publish:
                     self._commit(transaction)
                 else:
@@ -801,7 +818,11 @@ class ReclaimProviderProofRepository:
         _require_deadline(deadline)
         if publish and selected is not None:
             selected = dataclasses.replace(selected, publication_observed=True)
-        return selected
+        if selected is not None:
+            wait_for_completed_after = None
+        return _ReclaimProviderProofElection(
+            selected=selected,
+            wait_for_completed_after=wait_for_completed_after)
 
     def get_fresh(
         self,
@@ -839,7 +860,13 @@ class ReclaimProviderProofRepository:
         minimum_remaining_seconds: float = (
             reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS),
     ) -> ReclaimProviderProofReceipt:
-        """Proactively renew one receipt under exact durable authority."""
+        """Proactively renew one receipt under exact durable authority.
+
+        Every caller proves or observes a concurrent database completion newer
+        than the receipt it first read. This prevents a cached row or an
+        identical-proof stable nonce from masquerading as the elected
+        publication. Read-only consumers use ``get_fresh()`` instead.
+        """
         deadline = _require_deadline(deadline_monotonic)
         initial_remaining = deadline - time.monotonic()
         initial_jitter = min(_INITIAL_JITTER_MAX_SECONDS,
@@ -848,7 +875,7 @@ class ReclaimProviderProofRepository:
             time.sleep(initial_jitter * secrets.randbelow(1024) / 1024)
         publication_observed = False
         while True:
-            selected = self._read_elect_and_maybe_publish(
+            election = self._read_elect_and_maybe_publish(
                 identity=identity,
                 gate_generation=gate_generation,
                 kubernetes_context=kubernetes_context,
@@ -856,6 +883,7 @@ class ReclaimProviderProofRepository:
                 prove=prove,
                 validate=validate,
                 minimum_remaining_seconds=minimum_remaining_seconds)
+            selected = election.selected
             _require_deadline(deadline)
             if selected is None:
                 # A loser does not reacquire while the elected owner is still
@@ -867,7 +895,8 @@ class ReclaimProviderProofRepository:
                     kubernetes_context=kubernetes_context,
                     deadline=deadline,
                     validate=validate,
-                    minimum_remaining_seconds=minimum_remaining_seconds)
+                    minimum_remaining_seconds=minimum_remaining_seconds,
+                    completed_after=election.wait_for_completed_after)
                 _require_deadline(deadline)
             publication_observed = (publication_observed or
                                     selected.publication_observed)

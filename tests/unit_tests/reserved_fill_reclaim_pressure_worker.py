@@ -231,7 +231,7 @@ def multiprocess_proof_renewal_and_launch_read(
     deadline = float(deadline_value.value)
     if not math.isfinite(deadline) or deadline <= 0:
         raise AssertionError('The parent did not publish a wave deadline.')
-    wave_start = deadline - reclaim.POLICY_OPERATION_TIMEOUT_SECONDS
+    wave_start = (deadline - reclaim.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
     started = time.monotonic()
     with mock.patch.object(policy_lib.reserved_fill_reclaim_proofs,
                            'ReclaimProviderProofRepository',
