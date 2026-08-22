@@ -445,13 +445,29 @@ class ReclaimProviderProofRepository:
         return receipt, database_now
 
     @staticmethod
-    def _lock_live_gate(
+    def _require_live_gate(
         connection: sqlalchemy.engine.Connection,
         *,
         identity: reclaim.ReclaimPolicyIdentity,
         gate_generation: int,
     ) -> None:
-        """Fence publication to the exact live gate until transaction end."""
+        """Revalidate the exact live gate without joining its writer mutex.
+
+        Proof rows are generation- and policy-identity-bound.  Every receipt
+        read and terminal provider guard joins the row to the currently live
+        gate, so a concurrent gate rotation makes an old-generation
+        publication unusable even when that publication commits later.
+
+        Taking a row lock here would add no provider-effect protection: this
+        transaction closes before any effect starts.  It would, however,
+        queue the deployment-wide proof renewer behind every zero-cost event
+        sequencer writer.  A large launch wave can keep that queue occupied
+        beyond the receipt lifetime and deadlock its own progress.  Use the
+        fresh READ COMMITTED statement snapshot as a publication eligibility
+        predicate instead.  This is not a commit fence: a later rotation may
+        leave an inert old-generation proof row, which current-gate consumer
+        joins reject.
+        """
         gate = observation_schema.protocol_state_sequence_table
         row = connection.execute(
             sqlalchemy.select(gate.c.id).where(
@@ -463,11 +479,10 @@ class ReclaimProviderProofRepository:
                 identity.fleet_bundle_sha256,
                 gate.c.reclaim_policy_revision == identity.policy_revision,
                 gate.c.reclaim_provider_inventory_sha256 ==
-                identity.provider_inventory_sha256).with_for_update(
-                    read=True)).one_or_none()
+                identity.provider_inventory_sha256)).one_or_none()
         if row is None:
             raise ReclaimProviderProofError(
-                'The provider proof authority lost its live gate fence.')
+                'The provider proof authority is not the live sequenced gate.')
 
     def _read(
         self,
@@ -531,12 +546,12 @@ class ReclaimProviderProofRepository:
         deadline: float,
     ) -> ReclaimProviderProofReceipt:
         table = (proof_schema.serve_reserved_fill_reclaim_provider_proofs_table)
-        # Hold the current protocol row in share mode across publication. A
-        # reauthorization cannot advance the gate between this predicate and
-        # commit, and an obsolete observer cannot refresh its old generation.
-        self._lock_live_gate(connection,
-                             identity=identity,
-                             gate_generation=gate_generation)
+        # Revalidate without joining the global zero-cost sequencer mutex.
+        # The exact generation/identity on this row and on every consumer make
+        # a publication that loses a concurrent gate rotation inert.
+        self._require_live_gate(connection,
+                                identity=identity,
+                                gate_generation=gate_generation)
         receipt_nonce = secrets.token_hex(32)
         values = {
             'receipt_nonce': receipt_nonce,
@@ -618,9 +633,12 @@ class ReclaimProviderProofRepository:
         kubernetes_context: str,
     ) -> None:
         """Delete a positive receipt after observed nonconformance."""
-        self._lock_live_gate(connection,
-                             identity=identity,
-                             gate_generation=gate_generation)
+        # An invalidation is scoped to the old exact generation and identity;
+        # a concurrent gate rotation cannot make this delete affect its
+        # successor authority.
+        self._require_live_gate(connection,
+                                identity=identity,
+                                gate_generation=gate_generation)
         table = proof_schema.serve_reserved_fill_reclaim_provider_proofs_table
         connection.execute(
             sqlalchemy.delete(table).where(

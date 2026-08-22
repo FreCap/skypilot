@@ -1269,7 +1269,8 @@ def test_persisted_kueue_pod_create_helper_refuses_before_409(monkeypatch):
     core_api.delete_namespaced_pod.assert_not_called()
 
 
-def test_v4_create_pods_waits_for_runtime_ready_before_final_read(monkeypatch):
+def test_current_projection_create_pods_waits_for_runtime_ready_before_final_read(
+        monkeypatch):
     cluster_on_cloud = 'test-v4-runtime-ready-order'
     head_name = f'{cluster_on_cloud}-head'
     expected_uid = f'uid-{head_name}'

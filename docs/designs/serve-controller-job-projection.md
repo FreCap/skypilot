@@ -1,20 +1,20 @@
 # Persisted SkyServe Controller and Worker Placement Projection
 
-**Status:** PR #1671 is merged and deployed as release `1.1.1442` / Helm
-revision 555 under the controller hold. Every API server, Serve controller, and
-executor runs image digest
-`sha256:db39067ee5ad4638aee46d42870ecc6d27851ac94c1ee5a935c6be1e34878d26`;
-storage is disabled and `boltz-l4-fleet` is absent. A concurrent revision-552
-hold release created 22 protocol-v5/cohort-4 launch graphs before the complete
-PR #1671 cohort took over. Supported evidence-backed teardown made every graph
-terminal and execution-quiesced and removed every current service, replica,
-intent, Pod, and Workload without manual database deletion. Because releases
+**Status:** PRs #1671 and #1673 are merged and deployed as release `1.1.1443`
+/ Helm revision 558. Every API server, Serve controller, and executor runs
+image digest
+`sha256:f0bcc4a5b82dddc52e5283ffec0e8ccc2b4131fdb745db1a608b3ddf54502e1b`;
+storage is disabled and test-only `boltz-l4-fleet` lifecycle 91 is active in a
+zero-demand reserved-fill wave. A concurrent revision-552 hold release created
+22 protocol-v5/cohort-4 launch graphs before the complete PR #1671 cohort took
+over. Supported evidence-backed teardown made every graph terminal and
+execution-quiesced without manual database deletion. Because releases
 `1.1.1440` and `1.1.1442` used the same protocol-v5 projection discriminator
 for different bootstrap semantics, protocol v5 is now historical cleanup-only.
 The sole next-write contract is protocol v6 with capability cohort 6; its
 source patch and focused qualification are complete on the successor branch,
-while merge, immutable release publication, deployment, and production
-verification remain pending.
+while merge, immutable release publication, held deployment, clean service
+recreation, and production verification remain pending.
 **Last updated:** 2026-08-22
 
 ## Goals
@@ -1007,15 +1007,17 @@ for this rollout.
 
 ## Open gates
 
-- Keep release `1.1.1442` / Helm revision 555 under the controller hold. The
-  exact image is homogeneous, storage is disabled, executor sizing is proven,
-  and no service or current provider state exists.
+- Release `1.1.1443` / Helm revision 558 is homogeneous with storage disabled
+  and proven executor sizing. Re-establish the controller hold before the v6
+  rollout; active lifecycle 91 is test-only and must not grant v5 new-effect
+  authority across the cohort rotation.
 - Merge, publish, and direct-Helm deploy the reviewed protocol-v6/cohort-6
   source under the hold. The focused source suite proves terminal
   old-v5/cohort-4 evidence remains inspectable, corrected-v5/cohort-5 can be
   inspected and settled, and neither historical cohort can start or replay
-  provider effects; only exact-current v6/cohort-6 can admit new work. Keep the deployment held
-  until every API/controller/executor reports one exact image digest.
+  provider effects; only exact-current v6/cohort-6 can admit new work. Keep the
+  deployment held until every API/controller/executor reports one exact image
+  digest.
 - The distinct east controller workspace/context/namespace/service account is
   configured and applied. Verify a fresh admitted controller Job's identity,
   64 GiB ephemeral-storage request, 80 GiB limit, and
