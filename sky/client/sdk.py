@@ -886,6 +886,7 @@ def _prepared_launch_request_in_current_context(
     _include_credentials: bool = False,
     _target_api_version: int | None = None,
     _server_side_only: bool = False,
+    _server_side_workspace: str | None = None,
 ) -> Iterator[PreparedLaunchRequest]:
     """Yields a frozen launch while its preparation context remains active.
 
@@ -986,6 +987,7 @@ def _prepared_launch_request_in_current_context(
             _include_credentials,
             _target_api_version,
             _server_side_only,
+            _server_side_workspace,
         )
         yield prepared_request
 
@@ -1072,21 +1074,9 @@ def prepare_launch_request_for_server_controller(
                 _is_launched_by_sky_serve_controller=True,
                 _extra_launch_context=extra_launch_context,
                 _target_api_version=server_constants.API_VERSION,
-                _server_side_only=True) as prepared_request:
-        launch_body = prepared_request.body
-        if launch_body.override_skypilot_config_path is not None:
-            raise ValueError(
-                'Server controller launches cannot use a mutable config path.')
-        override_config = dict(launch_body.override_skypilot_config or {})
-        configured_workspace = override_config.get('active_workspace')
-        if (configured_workspace is not None and
-                configured_workspace != workspace):
-            raise ValueError('Server controller launch workspace conflicts '
-                             'with its service workspace.')
-        override_config['active_workspace'] = workspace
-        launch_body.override_skypilot_config = override_config
-        return PreparedLaunchRequest(
-            submitted_bytes=_canonical_launch_body_bytes(launch_body))
+                _server_side_only=True,
+                _server_side_workspace=workspace) as prepared_request:
+        return prepared_request
 
 
 def _freeze_launch_request(
@@ -1113,6 +1103,7 @@ def _freeze_launch_request(
     _include_credentials: bool = False,
     _target_api_version: int | None = None,
     _server_side_only: bool = False,
+    _server_side_workspace: str | None = None,
 ) -> PreparedLaunchRequest:
     """Freezes a launch DAG after high-level policy and option preparation."""
 
@@ -1123,6 +1114,13 @@ def _freeze_launch_request(
         _validate_dag_locally(dag,
                               workdir_only=False,
                               remote_api_version=_target_api_version)
+        if not isinstance(_server_side_workspace,
+                          str) or not _server_side_workspace:
+            raise ValueError(
+                'Server-side launch preparation requires a workspace.')
+    elif _server_side_workspace is not None:
+        raise ValueError(
+            'A server-side workspace requires server-side preparation.')
     else:
         validate(dag, admin_policy_request_options=request_options)
     # The flags have been applied to the task YAML and the backward
@@ -1218,7 +1216,9 @@ def _freeze_launch_request(
         'entrypoint': '',
         'entrypoint_command': '',
         'using_remote_api_server': False,
-        'override_skypilot_config': {},
+        'override_skypilot_config': {
+            'active_workspace': _server_side_workspace,
+        },
         'override_skypilot_config_path': None,
         'client_api_version': server_constants.API_VERSION,
     } if _server_side_only else {})

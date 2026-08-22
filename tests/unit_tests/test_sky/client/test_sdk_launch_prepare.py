@@ -163,7 +163,8 @@ def test_direct_prepare_preserves_launch_client_boundaries(
 
 def test_server_controller_prepare_is_local_and_uses_current_api(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    forbidden = mock.Mock(side_effect=AssertionError('ambient I/O is forbidden'))
+    forbidden = mock.Mock(
+        side_effect=AssertionError('ambient I/O is forbidden'))
     upload = mock.Mock(side_effect=AssertionError('upload is forbidden'))
     remote_version = mock.Mock(
         side_effect=AssertionError('remote version lookup is forbidden'))
@@ -175,8 +176,8 @@ def test_server_controller_prepare_is_local_and_uses_current_api(
                         'apply_and_use_config_in_current_request', forbidden)
     monkeypatch.setattr(sdk.client_common, 'upload_mounts_to_api_server',
                         upload)
-    monkeypatch.setattr(sdk.client_common.server_common,
-                        'is_api_server_local', forbidden)
+    monkeypatch.setattr(sdk.client_common.server_common, 'is_api_server_local',
+                        forbidden)
     monkeypatch.setattr(sdk.payloads.common, 'is_api_server_local', forbidden)
     monkeypatch.setattr(sdk.payloads, 'request_body_env_vars', forbidden)
     monkeypatch.setattr(sdk.payloads,
@@ -207,8 +208,28 @@ def test_server_controller_prepare_is_local_and_uses_current_api(
     assert prepared.body.extra_launch_context == {'service_name': 'svc'}
 
 
-@pytest.mark.parametrize('local_input', ('workdir', 'file_mount', 'mapping',
-                                         'storage', 'tls'))
+def test_server_controller_workspace_is_frozen_without_body_reencoding(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Workspace is part of the first immutable request, not a patched view."""
+    monkeypatch.setattr(sdk.client_common, 'validate_no_local_inputs',
+                        lambda _dag: None)
+    body_access = mock.PropertyMock(
+        side_effect=AssertionError('prepared body must not be decoded'))
+
+    with mock.patch.object(sdk.PreparedLaunchRequest, 'body', body_access):
+        prepared = sdk.prepare_launch_request_for_server_controller(
+            sky.Task(run='echo hello'), 'reserved-fill-1', workspace='research')
+
+    payload = json.loads(prepared.submitted_bytes)
+    assert payload['override_skypilot_config'] == {
+        'active_workspace': 'research'
+    }
+    assert payload['override_skypilot_config_path'] is None
+    body_access.assert_not_called()
+
+
+@pytest.mark.parametrize('local_input',
+                         ('workdir', 'file_mount', 'mapping', 'storage', 'tls'))
 def test_server_controller_prepare_rejects_local_inputs_before_http(
         monkeypatch: pytest.MonkeyPatch, tmp_path, local_input: str) -> None:
     monkeypatch.setattr(

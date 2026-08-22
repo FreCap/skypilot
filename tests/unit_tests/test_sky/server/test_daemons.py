@@ -84,6 +84,7 @@ def test_reclaim_proof_daemon_owns_renewal_during_controller_hold(monkeypatch):
                         'renew_reclaim_provider_proofs_in_boundary', renew)
     sleep = mock.Mock()
     monkeypatch.setattr(daemons.time, 'sleep', sleep)
+    monkeypatch.setattr(daemons.time, 'monotonic', lambda: 100.0)
 
     daemons.reserved_fill_reclaim_proof_renewal_event()
 
@@ -91,6 +92,40 @@ def test_reclaim_proof_daemon_owns_renewal_during_controller_hold(monkeypatch):
     renew.assert_called_once_with(executor)
     sleep.assert_called_once_with(
         reserved_capacity.reserved_fill_reclaim_attestation.
+        PROVIDER_PROOF_RENEW_INTERVAL_SECONDS)
+
+
+@pytest.mark.parametrize(('renewal_seconds', 'expected_sleep_seconds'),
+                         ((1.25, 1.75), (4.0, 0.0)))
+def test_reclaim_proof_daemon_keeps_fixed_rate_cadence(monkeypatch,
+                                                       renewal_seconds,
+                                                       expected_sleep_seconds):
+    monkeypatch.setattr(daemons, '_reserved_fill_reclaim_proof_executor', None)
+    executor = mock.Mock()
+    monkeypatch.setattr(request_process, 'DisposableExecutor',
+                        mock.Mock(return_value=executor))
+    clock = [100.0]
+
+    def renew(_executor):
+        assert _executor is executor
+        clock[0] += renewal_seconds
+
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(reserved_capacity,
+                        'renew_reclaim_provider_proofs_in_boundary', renew)
+    monkeypatch.setattr(daemons.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(daemons.time, 'sleep', sleep)
+
+    daemons.reserved_fill_reclaim_proof_renewal_event()
+
+    assert sleeps == [expected_sleep_seconds]
+    assert clock[0] == 100.0 + max(
+        renewal_seconds, reserved_capacity.reserved_fill_reclaim_attestation.
         PROVIDER_PROOF_RENEW_INTERVAL_SECONDS)
 
 
@@ -125,6 +160,7 @@ def test_reclaim_proof_daemon_renews_beyond_receipt_ttl(monkeypatch):
         elapsed += interval
 
     monkeypatch.setattr(daemons.time, 'sleep', advance)
+    monkeypatch.setattr(daemons.time, 'monotonic', lambda: elapsed)
     interval = (reserved_capacity.reserved_fill_reclaim_attestation.
                 PROVIDER_PROOF_RENEW_INTERVAL_SECONDS)
     iterations = int(reserved_capacity.reserved_fill_reclaim_attestation.

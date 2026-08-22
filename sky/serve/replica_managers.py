@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
 import contextlib
+import copy
 import dataclasses
 import enum
 import functools
@@ -198,6 +199,16 @@ _RESERVED_FILL_PHYSICAL_PREFLIGHT_TIMEOUT_SECONDS = 45
 _RESERVED_FILL_PHYSICAL_PREFLIGHT_RELEASE_TIMEOUT_SECONDS = 1
 _ZERO_COST_ACTUATION_LEASE_SECONDS = 90
 _ZERO_COST_ACTUATION_POLL_SECONDS = 1
+# Bound each lane's synchronous provider/admission work while retaining
+# immediate durable rescheduling between waves. This matches SkyServe's
+# historical per-service launch parallelism and prevents one physical pool
+# from holding the manager mutex for a large repository safety-limit batch.
+_ZERO_COST_ACTUATION_QUANTUM = 4
+# The current version plus two recently used recovery versions. Older
+# versions remain recoverable from their immutable PostgreSQL YAML/spec rows;
+# bounding parsed templates prevents a long-lived service from accumulating a
+# Task object for every historical update.
+_SERVICE_VERSION_TASK_TEMPLATE_CACHE_SIZE = 3
 # Sentinel for drain registration's optional pre-resolved replica URL. ``None``
 # is a real batched result: the cluster has no resolvable endpoint and the
 # bounded deadline must remain the only completion path.
@@ -638,6 +649,7 @@ def _build_replica_launch_task(
     exact_resources_override: bool,
     authoritative_service_spec: 'service_spec.SkyServiceSpec | None',
     service_name: str | None,
+    task_template: task_lib.Task | None = None,
 ) -> task_lib.Task:
     """Build the exact pre-policy task submitted by a replica launch.
 
@@ -646,7 +658,14 @@ def _build_replica_launch_task(
     controller-side environment or security-group change fail closed through
     the backend's post-policy rematch instead of silently widening recovery.
     """
-    task = load_task_with_service_spec(yaml_content, authoritative_service_spec)
+    task = (copy.deepcopy(task_template)
+            if task_template is not None else load_task_with_service_spec(
+                yaml_content, authoritative_service_spec))
+    # The original user YAML is retained in the immutable service-version row
+    # for status/display. Embedding the same text in every executable replica
+    # request duplicates a potentially large payload and has no execution
+    # semantics; keep only the structured task fields in controller launches.
+    task._user_specified_yaml = None  # pylint: disable=protected-access
     if resources_override is not None:
         resources = task.resources
         if exact_resources_override:
@@ -1118,6 +1137,7 @@ def launch_cluster(
     cleanup_continue_guard: Callable[[], bool] | None = None,
     launch_fence: dict[str, Any] | None = None,
     service_spec: 'service_spec.SkyServiceSpec | None' = None,
+    task_template: task_lib.Task | None = None,
     workspace: str | None = None,
     service_name: str | None = None,
     system_recovery_launch_context: dict[str, Any] | None = None,
@@ -1170,7 +1190,8 @@ def launch_cluster(
             resources_override,
             exact_resources_override=exact_resources_override,
             authoritative_service_spec=service_spec,
-            service_name=service_name)
+            service_name=service_name,
+            task_template=task_template)
 
         logger.info(f'Launching replica (id: {replica_id}) cluster '
                     f'{cluster_name} with resources: {task.resources}')
@@ -2318,9 +2339,11 @@ def terminate_cluster_with_kueue_absence_receipt(
 def _get_resources_ports(
     yaml_content: str,
     service_spec: 'service_spec.SkyServiceSpec | None' = None,
+    task_template: task_lib.Task | None = None,
 ) -> str:
     """Get the replica ingress port from the service or its resources."""
-    task = load_task_with_service_spec(yaml_content, service_spec)
+    task = (task_template if task_template is not None else
+            load_task_with_service_spec(yaml_content, service_spec))
     # Already checked all ports are valid in sky.serve.core.up
     assert task.resources, task
     assert task.service is not None, task
@@ -2382,16 +2405,19 @@ def validate_service_update_preflight(
 
 
 def _should_use_spot(
-        yaml_content: str,
-        resource_override: dict[str, Any] | None,
-        service_spec: 'service_spec.SkyServiceSpec | None' = None) -> bool:
+    yaml_content: str,
+    resource_override: dict[str, Any] | None,
+    service_spec: 'service_spec.SkyServiceSpec | None' = None,
+    task_template: task_lib.Task | None = None,
+) -> bool:
     """Get whether the task should use spot."""
     if resource_override is not None:
         use_spot_override = resource_override.get('use_spot')
         if use_spot_override is not None:
             assert isinstance(use_spot_override, bool)
             return use_spot_override
-    task = load_task_with_service_spec(yaml_content, service_spec)
+    task = (task_template if task_template is not None else
+            load_task_with_service_spec(yaml_content, service_spec))
     spot_use_resources = [
         resources for resources in task.resources if resources.use_spot
     ]
@@ -3461,6 +3487,9 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _initialize_skypilot_process_state(self) -> None:
         """Initialize SkyPilot-specific process state without external I/O."""
         self._version_specs: dict[int, service_spec.SkyServiceSpec] = {}
+        # Service versions are immutable. Parse each version once, then clone
+        # its Task for launch-specific resource/env mutation.
+        self._version_task_templates: dict[int, task_lib.Task] = {}
         self._uses_logical_replicas = False
         self._default_planned_capacity: int | None = None
         self._logical_exact_accelerator_shapes: dict[str, int] = {}
@@ -4345,13 +4374,16 @@ class SkyPilotReplicaManager(ReplicaManager):
         if spec is None:
             raise ValueError('service spec not found for bound launch '
                              f'recovery of version {info.version}')
+        task_template = self._task_template_for_version(info.version,
+                                                        yaml_content, spec)
         recovery_task = _build_replica_launch_task(
             yaml_content,
             info.replica_id,
             info.resources_override,
             exact_resources_override=info.get_spot_location() is not None,
             authoritative_service_spec=spec,
-            service_name=self._service_name)
+            service_name=self._service_name,
+            task_template=task_template)
         recovery_cloud = next(iter(recovery_task.resources)).cloud
         _, reduce_bound, cancel_bound = self._bound_ordinary_launch_callbacks(
             info, recovery_cloud, initial_reduction=reduction)
@@ -5691,6 +5723,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         self.yaml_content: str = yaml_content
         task = load_task_with_service_spec(self.yaml_content, spec)
         self._version_specs = {version: spec}
+        self._version_task_templates = {version: task}
         self._uses_logical_replicas = spec.uses_logical_replicas is True
         self._default_planned_capacity = _uniform_whole_gpu_capacity(
             task.resources)
@@ -6589,6 +6622,35 @@ class SkyPilotReplicaManager(ReplicaManager):
     # Replica management functions #
     ################################
 
+    def _task_template_for_version(
+        self,
+        version: int,
+        yaml_content: str,
+        spec: 'service_spec.SkyServiceSpec',
+    ) -> task_lib.Task:
+        """Return the immutable parsed task template for one version.
+
+        The caller holds ``self.lock``. Service-version YAML and specs are
+        immutable, so recovery can safely populate an old version lazily and
+        every executable task can deepcopy this shared parse result.
+        """
+        task = self._version_task_templates.get(version)
+        if task is None:
+            task = load_task_with_service_spec(yaml_content, spec)
+        self._cache_task_template(version, task)
+        return task
+
+    def _cache_task_template(self, version: int, task: task_lib.Task) -> None:
+        """Retain a bounded current-plus-recovery Task parse cache."""
+        self._version_task_templates.pop(version, None)
+        self._version_task_templates[version] = task
+        while (len(self._version_task_templates)
+               > _SERVICE_VERSION_TASK_TEMPLATE_CACHE_SIZE):
+            for cached_version in tuple(self._version_task_templates):
+                if cached_version != self.latest_version:
+                    self._version_task_templates.pop(cached_version)
+                    break
+
     # We don't need to add lock here since every caller of this function
     # will acquire the lock.
     def _launch_replica(
@@ -6859,8 +6921,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             if launch_spec is None:
                 raise ValueError(f'Version {launch_version} not found.')
             version_specs[launch_version] = launch_spec
+        launch_task_template = self._task_template_for_version(
+            launch_version, launch_yaml_content, launch_spec)
         use_spot = _should_use_spot(launch_yaml_content, resources_override,
-                                    launch_spec)
+                                    launch_spec, launch_task_template)
         retry_until_up = True
         location = None
         placer_owns_kubernetes_fallback = (
@@ -7500,7 +7564,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     resources_override,
                     exact_resources_override=location is not None,
                     authoritative_service_spec=launch_spec,
-                    service_name=self._service_name)
+                    service_name=self._service_name,
+                    task_template=launch_task_template)
                 if not _task_is_known_non_aws(candidate_task):
                     workspace = self._workspace
                     with skypilot_config.local_active_workspace_ctx(workspace):
@@ -7571,7 +7636,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'System-OOM recovery candidate resolution failed closed; '
                     f'launching replica {replica_id} ordinarily: '
                     f'{common_utils.format_exception(e)}')
-        replica_port = _get_resources_ports(launch_yaml_content, launch_spec)
+        replica_port = _get_resources_ports(launch_yaml_content, launch_spec,
+                                            launch_task_template)
 
         planned_capacity = 1
         if self._uses_logical_replicas:
@@ -7723,6 +7789,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'cleanup_continue_guard': self._service_is_cleanup_authorized,
                 'launch_fence': effective_launch_fence,
                 'service_spec': launch_spec,
+                'task_template': launch_task_template,
                 'service_name': self._service_name,
                 'workspace': self._workspace,
                 'frozen_controller_config': frozen_controller_config,
@@ -7739,7 +7806,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     resources_override,
                     exact_resources_override=location is not None,
                     authoritative_service_spec=launch_spec,
-                    service_name=self._service_name)
+                    service_name=self._service_name,
+                    task_template=launch_task_template)
                 bound_cloud = next(iter(bound_task.resources)).cloud
                 base_launch_fence = launch_fence
                 if (generic_profile_kind == ordinary_launch_binding.
@@ -9048,7 +9116,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 pool_key=pool_key,
                 owner=self._zero_cost_actuation_executor_id,
                 lease_seconds=_ZERO_COST_ACTUATION_LEASE_SECONDS,
-                max_leases=(zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE))
+                max_leases=_ZERO_COST_ACTUATION_QUANTUM)
             if not leases:
                 return
             actionable: list[zero_cost_actuation.IntentLease] = []
@@ -9259,11 +9327,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'Committed zero-cost admission for pool %s is ambiguous '
                         'after physical-preflight release failed: %s', pool_key,
                         common_utils.format_exception(error))
-            # Do not impose the one-second poll delay between bounded waves.
-            # The dispatcher rechecks durable work and still owns at most one
-            # active executor thread for this pool.
-            if (submitted_count > 0 and len(leases)
-                    == zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE):
+            # Release this lane before waking the dispatcher.  Signalling while
+            # the current SafeThread remains registered races with the
+            # dispatcher's is_alive() filter: it can consume the wakeup, retain
+            # this almost-finished thread, and impose the one-second poll delay
+            # before the next bounded wave.  All provider and graph work is
+            # complete at this point, so removing only our exact thread hands
+            # actuation ownership to the next wave without overlapping work.
+            if (submitted_count > 0 and
+                    len(leases) == _ZERO_COST_ACTUATION_QUANTUM):
+                current_thread = threading.current_thread()
+                with self._zero_cost_actuation_lane_lock:
+                    if (self._zero_cost_actuation_lanes.get(pool_key)
+                            is current_thread):
+                        del self._zero_cost_actuation_lanes[pool_key]
                 self._zero_cost_actuation_event.set()
 
     def _zero_cost_actuation_dispatcher(self) -> None:
@@ -10132,7 +10209,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         return (uses_task_default and _should_use_spot(
             self.yaml_content,
             resource_override=None,
-            service_spec=self._version_specs.get(self.latest_version)))
+            service_spec=self._version_specs.get(self.latest_version),
+            task_template=self._version_task_templates.get(
+                self.latest_version)))
 
     def _paid_service_envelope_blocks_launch(
             self, budget: paid_capacity.LaunchBudget | None,
@@ -16704,6 +16783,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         self.yaml_content = new_yaml_content
         self._uses_logical_replicas = new_uses_logical_replicas
         self._version_specs[version] = spec
+        self._cache_task_template(version, new_task)
         self._default_planned_capacity = new_default_planned_capacity
         self._logical_exact_accelerator_shapes = (
             new_logical_exact_accelerator_shapes)

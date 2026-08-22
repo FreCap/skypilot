@@ -438,8 +438,20 @@ def test_durable_pool_executor_materializes_one_bounded_shared_preflight_wave(
     manager._zero_cost_actuation_executor_id = (  # pylint: disable=protected-access
         mock.sentinel.executor_id)
     manager._scale_reconciliation_event = threading.Event()  # pylint: disable=protected-access
-    manager._zero_cost_actuation_event = threading.Event()  # pylint: disable=protected-access
-    plan = _plan((_snapshot('east-context', 'uid-east', 3),))
+    plan = _plan((_snapshot('east-context', 'uid-east',
+                            replica_managers._ZERO_COST_ACTUATION_QUANTUM),))
+    pool_key = plan.intents[0].pool_key
+    lane_event = mock.Mock(spec=threading.Event)
+    manager._zero_cost_actuation_event = lane_event  # pylint: disable=protected-access
+    manager._zero_cost_actuation_lane_lock = threading.Lock()  # pylint: disable=protected-access
+    manager._zero_cost_actuation_lanes = {  # pylint: disable=protected-access
+        pool_key: threading.current_thread()
+    }
+
+    def assert_lane_released_before_signal() -> None:
+        assert pool_key not in manager._zero_cost_actuation_lanes  # pylint: disable=protected-access
+
+    lane_event.set.side_effect = assert_lane_released_before_signal
     leases = tuple(SimpleNamespace(intent=intent) for intent in plan.intents)
     repository = mock.Mock()
     repository.lease_batch.return_value = leases
@@ -474,21 +486,23 @@ def test_durable_pool_executor_materializes_one_bounded_shared_preflight_wave(
                     manager,
                     '_scale_up_one_locked',
                     side_effect=materialize) as scale_one:
-        manager._actuate_zero_cost_pool(plan.intents[0].pool_key)
+        manager._actuate_zero_cost_pool(pool_key)
 
     repository.lease_batch.assert_called_once_with(
         service_name='svc',
-        pool_key=plan.intents[0].pool_key,
+        pool_key=pool_key,
         owner=mock.sentinel.executor_id,
         lease_seconds=mock.ANY,
-        max_leases=zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE)
+        max_leases=replica_managers._ZERO_COST_ACTUATION_QUANTUM)
     start_preflights.assert_called_once_with(
         tuple(intent for intent in plan.intents), mock.sentinel.admission,
         'workspace-a')
     release.assert_called_once_with(preflights)
-    assert scale_one.call_count == 3
+    assert scale_one.call_count == replica_managers._ZERO_COST_ACTUATION_QUANTUM
     repository.release_retryable.assert_not_called()
     repository.terminate.assert_not_called()
+    lane_event.set.assert_called_once_with()
+    assert pool_key not in manager._zero_cost_actuation_lanes  # pylint: disable=protected-access
 
 
 def test_durable_pool_executor_continues_after_per_intent_ambiguity() -> None:

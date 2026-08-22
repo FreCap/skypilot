@@ -463,6 +463,7 @@ def reserved_fill_reclaim_proof_renewal_event() -> None:
     from sky.serve import reserved_capacity
     from sky.server.requests import process as request_process
 
+    renewal_started = time.monotonic()
     try:
         global _reserved_fill_reclaim_proof_executor
         if _reserved_fill_reclaim_proof_executor is None:
@@ -481,8 +482,16 @@ def reserved_fill_reclaim_proof_renewal_event() -> None:
         logger.error('Reserved-fill reclaim-proof renewal failed closed: '
                      f'{common_utils.format_exception(error)}')
     finally:
-        time.sleep(reserved_capacity.reserved_fill_reclaim_attestation.
-                   PROVIDER_PROOF_RENEW_INTERVAL_SECONDS)
+        # Keep the configured cadence start-to-start.  Sleeping for the full
+        # interval after provider I/O makes each publication gap equal to the
+        # provider latency *plus* the interval, which can needlessly consume
+        # the proof's admission-ready reserve.  A zero-second sleep is still
+        # intentional when a round overruns: it yields before run_event()
+        # starts the next bounded provider operation.
+        interval = (reserved_capacity.reserved_fill_reclaim_attestation.
+                    PROVIDER_PROOF_RENEW_INTERVAL_SECONDS)
+        elapsed = max(0.0, time.monotonic() - renewal_started)
+        time.sleep(max(0.0, interval - elapsed))
 
 
 def should_skip_reserved_fill_reclaim_proof_renewal() -> bool:

@@ -1014,7 +1014,8 @@ class Kubernetes(clouds.Cloud):
                     f'DWS is only supported in GKE, but the autoscaler type '
                     f'for context {context} is {autoscaler_type}')
 
-        # Timeout for resource provisioning. Protocols v3/v4 freeze this value
+        # Timeout for resource provisioning. Protocols v3/v4/v5 freeze this
+        # value
         # in the server-owned candidate at version commit. The terminal launch
         # must not re-resolve ambient API-server or task configuration.
         # Historical v1/v2 launches retain their exact launch-time behavior.
