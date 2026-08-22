@@ -179,7 +179,7 @@ class KueueAdmissionRow:
     updated_at: datetime.datetime
 
     @classmethod
-    def from_mapping(cls, row: Mapping[str, Any]) -> 'KueueAdmissionRow':
+    def from_mapping(cls, row: Mapping[str, Any]) -> KueueAdmissionRow:
         values = {column.name: row[column.name] for column in _ADMISSIONS.c}
         values['state'] = KueueAdmissionState(values['state'])
         return cls(**values)

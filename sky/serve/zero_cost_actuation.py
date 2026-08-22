@@ -1696,11 +1696,11 @@ class ZeroCostActuationRepository:
                             kueue_lane_lineage.KueueAdmissionState(
                                 admission.state)
                             if admission is not None else None)
-                        if ((state in {
+                        if (state in {
                                 IntentState.GRANTED, IntentState.ACTUATING,
                                 IntentState.RETRYABLE
                         } and admission_state is not kueue_lane_lineage.
-                             KueueAdmissionState.INTENT_PENDING)):
+                             KueueAdmissionState.INTENT_PENDING):
                             deferred.append(
                                 reserved_fill_planner.DeferredFillIntent(
                                     intent,
