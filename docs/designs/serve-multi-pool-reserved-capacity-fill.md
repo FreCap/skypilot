@@ -669,6 +669,30 @@ the non-Kueue/East path. A Kueue replica with missing admission state remains
 UNKNOWN and fails closed for live admission, materialization, ordinary
 scale-down, paid-capacity accounting, and provider-present cleanup.
 
+Kubernetes accepting `core.down` is not yet provider absence: even a zero-grace
+delete can leave the Pod visible while API deletion and Kueue finalization
+propagate. For a protocol-v2 cleanup fence only, successful down therefore
+enters one bounded post-delete observation loop before either the bound
+association projector or exact Kueue-Pod projector runs. Every iteration
+rechecks the lifecycle owner, acquires a fresh `V2_FENCED` provider phase,
+performs an uncached physical-UID-fenced Pod inventory, releases the provider
+phase, and only then sleeps. Ownership is rechecked after the provider read so
+a stale owner cannot consume a concurrent `ABSENT` result. Only `ABSENT`
+continues to durable projection. `PRESENT`, `UNPROVEN` (including provider
+failure or a retargeted/replaced physical cluster), provider-phase timeout, or
+ownership loss retains the cleanup graph and capacity debit. The deadline does
+not reissue the already successful down, and replay of an already committed
+absence remains idempotent through the existing durable projector. Legacy and
+non-Kubernetes cleanup are unchanged.
+
+The lifecycle-89 production teardown on 2026-08-22 exposed this propagation
+window: all provider Pods and Kueue Workloads disappeared, but ten East
+replicas that completed `INIT -> UP` during teardown and the three admitted PHX
+replicas reached the one-shot projector before their deletes were observable.
+They were correctly retained but forced a later supported purge. The bounded
+read-after-delete wait removes that false `FAILED_CLEANUP` classification
+without weakening absence evidence or changing Kueue policy.
+
 There is one permanent provider-free exception at the irreversible whole-
 service teardown boundary. Only while the exact current lifecycle is
 `SHUTTING_DOWN` or retrying `FAILED_CLEANUP`, a missing admission may be retired

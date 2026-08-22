@@ -874,7 +874,7 @@ def _cleanup(
                     logger.info(
                         f'Replica {info.replica_id} terminated successfully.')
                 else:
-                    _set_to_failed_cleanup(info)
+                    _set_to_failed_cleanup(info, t.format_exc)
         if info2thr:
             time.sleep(3)
 

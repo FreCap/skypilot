@@ -342,17 +342,21 @@ def test_provider_present_down_requires_fresh_post_down_absence():
                                    generic=True)
     info = types.SimpleNamespace(cluster_name='svc-3')
     projector = mock.Mock()
+    events = []
     observation = (
         replica_managers.non_pool_launch_reconciliation.ProviderObservation(
             ordinary_launch_binding.ProviderEvidence.ABSENT, {
                 'result': 'ABSENT',
             }))
     with mock.patch.object(replica_managers,
-                           'terminate_cluster') as terminate, \
+                           'terminate_cluster',
+                           side_effect=lambda *_args, **_kwargs: events.append(
+                               'down')) as terminate, \
          mock.patch.object(
              replica_managers.non_pool_launch_reconciliation,
              'reconcile',
-             return_value=observation) as reconcile:
+             side_effect=lambda *_args, **_kwargs: events.append(
+                 'bound-projection') or observation) as reconcile:
         replica_managers.terminate_bound_non_pool_provider_present_cluster(
             context,
             info,
@@ -372,15 +376,20 @@ def test_provider_present_down_requires_fresh_post_down_absence():
                                       authority,
                                       projector,
                                       force_provider_read=True)
+    assert events == ['down', 'bound-projection']
 
 
-def test_provider_present_down_quarantines_non_absent_readback():
+@pytest.mark.parametrize('evidence', [
+    ordinary_launch_binding.ProviderEvidence.UNKNOWN,
+    ordinary_launch_binding.ProviderEvidence.REPLACED,
+])
+def test_provider_present_down_quarantines_non_absent_readback(evidence):
     context = _bound_non_pool_context(
         ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
     observation = (
         replica_managers.non_pool_launch_reconciliation.ProviderObservation(
-            ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
-                'result': 'UNKNOWN',
+            evidence, {
+                'result': evidence.value,
             }))
     with mock.patch.object(replica_managers, 'terminate_cluster'), \
          mock.patch.object(
@@ -395,6 +404,34 @@ def test_provider_present_down_quarantines_non_absent_readback():
                                binding_epoch=2,
                                generic=True), mock.Mock(), 'svc-3',
             '/tmp/replica.log')
+
+
+def test_kueue_absence_projection_runs_only_after_fenced_down():
+    events = []
+    with mock.patch.object(
+            replica_managers,
+            'terminate_cluster',
+            side_effect=lambda *_args, **_kwargs: events.append(
+                'down')) as terminate, \
+         mock.patch.object(
+             replica_managers.kueue_lane_observer,
+             'project_exact_pod_absence_after_teardown',
+             side_effect=lambda *_args: events.append(
+                 'kueue-projection')) as project:
+        replica_managers.terminate_cluster_with_kueue_absence_receipt(
+            'svc',
+            3,
+            '00000000-0000-4000-8000-000000000003',
+            'svc-3',
+            '/tmp/replica.log',
+            cleanup_fence=mock.sentinel.cleanup_fence)
+
+    terminate.assert_called_once_with('svc-3',
+                                      '/tmp/replica.log',
+                                      cleanup_fence=mock.sentinel.cleanup_fence)
+    project.assert_called_once_with('svc', 3,
+                                    '00000000-0000-4000-8000-000000000003')
+    assert events == ['down', 'kueue-projection']
 
 
 def _physical_service_spec_mock() -> mock.Mock:
@@ -2653,6 +2690,153 @@ def _protocol_v2_handle(info, context='phx'):
     handle.launched_resources = mock.Mock(cloud=clouds.Kubernetes(),
                                           region=context)
     return handle
+
+
+def _protocol_v2_cleanup_record(cluster_name='svc-1'):
+    info = types.SimpleNamespace(cluster_name=cluster_name)
+    fence = replica_managers.reserved_capacity.ProtocolV2CleanupFence(
+        kubernetes_context='phx', physical_cluster_uid='phx-uid')
+    return fence, {
+        'name': cluster_name,
+        'workspace': None,
+        'cluster_hash': 'cluster-generation',
+        'handle': _protocol_v2_handle(info),
+    }
+
+
+def test_protocol_v2_down_waits_for_uncached_physical_absence(tmp_path):
+    cluster_name = 'svc-1'
+    fence, cluster_record = _protocol_v2_cleanup_record(cluster_name)
+    guard = mock.Mock(return_value=True)
+    presences = iter([
+        replica_managers.reserved_capacity.PhysicalReplicaPresence.PRESENT,
+        replica_managers.reserved_capacity.PhysicalReplicaPresence.UNPROVEN,
+        replica_managers.reserved_capacity.PhysicalReplicaPresence.ABSENT,
+    ])
+    events = []
+    phase_number = 0
+
+    @contextlib.contextmanager
+    def _provider_phase(mode, **_kwargs):
+        nonlocal phase_number
+        assert mode is replica_managers.provider_phase.ProviderPhaseMode.V2_FENCED
+        phase_number += 1
+        current_phase = phase_number
+        events.append(f'phase-{current_phase}-enter')
+        try:
+            yield mock.sentinel.phase_admission
+        finally:
+            events.append(f'phase-{current_phase}-exit')
+
+    def _probe(actual_fence, actual_cluster_name, *, use_cache):
+        assert actual_fence == fence
+        assert actual_cluster_name == cluster_name
+        assert use_cache is False
+        presence = next(presences)
+        events.append(f'probe-{presence.value}')
+        return presence
+
+    with mock.patch.object(replica_managers.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=cluster_record), \
+         mock.patch.object(replica_managers.provider_phase,
+                           'provider_phase',
+                           side_effect=_provider_phase), \
+         mock.patch.object(
+             replica_managers.kubernetes_adaptor,
+             'physical_cluster_uid_fence',
+             return_value=contextlib.nullcontext()), \
+         mock.patch.object(
+             replica_managers.reserved_capacity,
+             'probe_physical_replica_presence', side_effect=_probe) as probe, \
+         mock.patch.object(replica_managers,
+                           '_POST_TEARDOWN_ABSENCE_POLL_SECONDS', 0), \
+         mock.patch('sky.core.down',
+                    side_effect=lambda *_args, **_kwargs: events.append(
+                        'down')) as core_down:
+        replica_managers.terminate_cluster(cluster_name,
+                                           str(tmp_path / 'replica.log'),
+                                           continue_guard=guard,
+                                           cleanup_fence=fence)
+
+    assert events == [
+        'phase-1-enter', 'down', 'phase-1-exit', 'phase-2-enter',
+        'probe-PRESENT', 'phase-2-exit', 'phase-3-enter', 'probe-UNPROVEN',
+        'phase-3-exit', 'phase-4-enter', 'probe-ABSENT', 'phase-4-exit'
+    ]
+    core_down.assert_called_once_with(
+        cluster_name,
+        _expected_cluster_hash='cluster-generation',
+        _continue_guard=guard)
+    assert probe.call_count == 3
+    # Once before down, then before and after every provider observation.
+    assert guard.call_count == 7
+
+
+def test_protocol_v2_down_retains_perpetual_present_uncertainty(tmp_path):
+    cluster_name = 'svc-1'
+    fence, cluster_record = _protocol_v2_cleanup_record(cluster_name)
+    guard = mock.Mock(return_value=True)
+    with mock.patch.object(replica_managers.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=cluster_record), \
+         mock.patch.object(replica_managers.provider_phase,
+                           'provider_phase',
+                           return_value=contextlib.nullcontext()), \
+         mock.patch.object(
+             replica_managers.kubernetes_adaptor,
+             'physical_cluster_uid_fence',
+             return_value=contextlib.nullcontext()), \
+         mock.patch.object(
+             replica_managers.reserved_capacity,
+             'probe_physical_replica_presence',
+             return_value=(replica_managers.reserved_capacity.
+                           PhysicalReplicaPresence.PRESENT)) as probe, \
+         mock.patch.object(replica_managers,
+                           '_POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS', 0), \
+         mock.patch('sky.core.down') as core_down, \
+         pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='remained present'):
+        replica_managers.terminate_cluster(cluster_name,
+                                           str(tmp_path / 'replica.log'),
+                                           continue_guard=guard,
+                                           cleanup_fence=fence)
+
+    core_down.assert_called_once()
+    probe.assert_called_once_with(fence, cluster_name, use_cache=False)
+
+
+def test_protocol_v2_down_rejects_absence_after_owner_loss(tmp_path):
+    cluster_name = 'svc-1'
+    fence, cluster_record = _protocol_v2_cleanup_record(cluster_name)
+    # Down starts under the owner, the provider read starts under the owner,
+    # and the post-read recheck observes takeover.
+    guard = mock.Mock(side_effect=[True, True, False])
+    with mock.patch.object(replica_managers.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=cluster_record), \
+         mock.patch.object(replica_managers.provider_phase,
+                           'provider_phase',
+                           return_value=contextlib.nullcontext()), \
+         mock.patch.object(
+             replica_managers.kubernetes_adaptor,
+             'physical_cluster_uid_fence',
+             return_value=contextlib.nullcontext()), \
+         mock.patch.object(
+             replica_managers.reserved_capacity,
+             'probe_physical_replica_presence',
+             return_value=(replica_managers.reserved_capacity.
+                           PhysicalReplicaPresence.ABSENT)) as probe, \
+         mock.patch('sky.core.down') as core_down, \
+         pytest.raises(RuntimeError, match='ownership was lost'):
+        replica_managers.terminate_cluster(cluster_name,
+                                           str(tmp_path / 'replica.log'),
+                                           continue_guard=guard,
+                                           cleanup_fence=fence)
+
+    core_down.assert_called_once()
+    probe.assert_called_once_with(fence, cluster_name, use_cache=False)
+    assert guard.call_count == 3
 
 
 def test_probe_url_v2_group_reuses_one_outer_physical_fence():

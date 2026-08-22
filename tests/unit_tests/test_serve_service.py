@@ -2190,6 +2190,70 @@ def test_cleanup_skips_tail_sleep_after_final_start_failure():
     remove.assert_not_called()
 
 
+def test_cleanup_logs_captured_teardown_failure_before_retaining_replica():
+
+    class CompletedFailedThread:
+
+        def __init__(self, **_):
+            self.format_exc = (
+                'KubernetesPhysicalClusterIdentityError: provider remained '
+                'present')
+            self.started = False
+
+        def is_alive(self):
+            return False
+
+        def start(self):
+            self.started = True
+
+        def join(self):
+            assert self.started
+
+    replica = mock.Mock(
+        replica_id=1,
+        replica_record_id='00000000-0000-4000-8000-000000000001',
+        cluster_name='svc-a-r1',
+        status_property=mock.Mock(
+            sky_launch_status=service.common_utils.ProcessStatus.SUCCEEDED,
+            sky_down_status=service.common_utils.ProcessStatus.SCHEDULED))
+    lifecycle_lock = mock.Mock(epoch=31)
+    with mock.patch.object(serve_state,
+                           'get_replica_infos', return_value=[replica]), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name', return_value=None), \
+         mock.patch.object(serve_state,
+                           'service_owner_matches', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'get_service_lifecycle_epoch', return_value=31), \
+         mock.patch.object(service.serve_utils,
+                           'get_existing_replica_cluster_names',
+                           return_value={'svc-a-r1'}), \
+         mock.patch.object(
+             serve_state,
+             'get_replica_resource_action_identities',
+             return_value={1: None}), \
+         mock.patch.object(serve_state,
+                           'add_or_update_replica', return_value=True), \
+         mock.patch.object(serve_state, 'remove_replica') as remove, \
+         mock.patch.object(service.controller_utils,
+                           'can_terminate', return_value=True), \
+         mock.patch.object(service.thread_utils,
+                           'SafeThread', CompletedFailedThread), \
+         mock.patch.object(service.time, 'sleep'), \
+         mock.patch.object(service,
+                           'cleanup_storage_intents', return_value=True), \
+         mock.patch.object(service.logger, 'error') as log_error:
+        failed = service._cleanup('svc', True, 'incarnation-a', 4242,
+                                  '10.4.7.7', lifecycle_lock)
+
+    assert failed
+    remove.assert_not_called()
+    assert any('provider remained present' in call.args[0]
+               for call in log_error.call_args_list)
+
+
 def test_cleanup_cluster_inventory_uncertainty_keeps_replica_rows():
     replica = mock.Mock(replica_id=1, cluster_name='svc-a-r1')
     lifecycle_lock = mock.Mock(epoch=31)
