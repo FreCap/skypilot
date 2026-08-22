@@ -3708,9 +3708,11 @@ Three time domains are deliberately separate:
 - one elected provider refresh has its own eight-second timeout; and
 - a positive receipt has a 30-second maximum age on the PostgreSQL clock.
 
-The observer sleeps three seconds between rounds and forcibly refreshes every
-context in every round; it never lets a still-fresh cached context skip behind
-a slower peer. East and PHX provider proofs start concurrently, use independent
+The observer targets a three-second fixed rate between round starts and
+forcibly refreshes every context in every round; provider-operation time is
+deducted from the next delay, and an overrun yields without adding another
+three-second gap. It never lets a still-fresh cached context skip behind a
+slower peer. East and PHX provider proofs start concurrently, use independent
 context transactions/receipts/cancellation events, and share only the one
 authenticated process-family survivor boundary. A successful publication must
 retain the existing 20-second renewal handoff reserve. An identical proof keeps
