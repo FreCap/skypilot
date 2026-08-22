@@ -9327,11 +9327,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'Committed zero-cost admission for pool %s is ambiguous '
                         'after physical-preflight release failed: %s', pool_key,
                         common_utils.format_exception(error))
-            # Do not impose the one-second poll delay between bounded waves.
-            # The dispatcher rechecks durable work and still owns at most one
-            # active executor thread for this pool.
+            # Release this lane before waking the dispatcher.  Signalling while
+            # the current SafeThread remains registered races with the
+            # dispatcher's is_alive() filter: it can consume the wakeup, retain
+            # this almost-finished thread, and impose the one-second poll delay
+            # before the next bounded wave.  All provider and graph work is
+            # complete at this point, so removing only our exact thread hands
+            # actuation ownership to the next wave without overlapping work.
             if (submitted_count > 0 and
                     len(leases) == _ZERO_COST_ACTUATION_QUANTUM):
+                current_thread = threading.current_thread()
+                with self._zero_cost_actuation_lane_lock:
+                    if (self._zero_cost_actuation_lanes.get(pool_key)
+                            is current_thread):
+                        del self._zero_cost_actuation_lanes[pool_key]
                 self._zero_cost_actuation_event.set()
 
     def _zero_cost_actuation_dispatcher(self) -> None:

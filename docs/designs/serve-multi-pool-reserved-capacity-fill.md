@@ -416,11 +416,15 @@ intent keeps its own owner, generation, and expiry. The executor opens one V2
 provider-phase admission and one deduplicated physical-UID capture for that
 quantum, then commits each exact intent/replica/request graph independently
 under the existing manager serialization. Each committed graph immediately
-starts the ordinary bound-request adopter, so provider work remains
-asynchronous and Pods initialize concurrently. A full four-item turn
-immediately re-signals durable work before yielding, which bounds cross-pool
-head-of-line blocking without changing the repository safety ceiling or
-introducing another scheduler. A definite failure releases or terminalizes
+starts the ordinary bound-request adopter, but the adopter does not execute
+the launch: actual provider work begins only when the generic request executor
+leases that durable request. The held rollout therefore supplies the matching
+generic long-worker capacity described below. A full four-item turn releases
+its exact pool lane before re-signalling durable work, which prevents a
+completed-but-still-live thread from consuming the wakeup and imposing the
+one-second dispatcher poll. This bounds cross-pool head-of-line blocking
+without changing the repository safety ceiling or introducing another
+scheduler. A definite failure releases or terminalizes
 only that intent; an ambiguous commit preserves only that exact graph and does
 not cancel later members. The capture is released after the last member is
 staged, without waiting for Pod scheduling or readiness. Different pools
@@ -1117,18 +1121,20 @@ dependency. Policy revision `1.1.1430` is merged, deployed as Helm revision
 505, reauthorized at generation 10, and qualified through the deployment-owned
 renewal/takeover horizon. Serve057 policy-admission feedback is merged and
 deployed through PR #1659, release `1.1.1431`, and Helm revision 508.
-PRs #1663--#1666 and release `1.1.1436` / Helm revision 523 subsequently closed
-the provider-free whole-service retirement gap, normally purged lifecycle 84,
-created and exercised lifecycle 85, and normally purged it after the executor
-incident. Production readback, not source state, establishes the live authority
-facts above. The service is now absent. Pending PR #1667 changes only the exact
-v2 execution capsule and retry boundary; it does not change admission,
-placement, Kueue policy, paid-capacity behavior, schema, or infrastructure.
+PRs #1663--#1669 subsequently closed the provider-free whole-service
+retirement gap, exact-request replay, proof-readiness, and selected-context
+deserialization defects. Production readback, not source state, establishes
+the live authority facts above. Lifecycle 89 is now normally purged and the
+service is absent. PR #1670 plus protocol v5 change only SkyPilot manager,
+request-executor, and projected-worker runtime behavior; they do not change
+admission policy, task placement, Kueue, paid-residual accounting, shared
+infrastructure, or database schema.
 
 Remaining work, in exact order:
 
-1. Finish adversarial review of protocol v5, merge it, publish one immutable
-   image/chart release, and direct-Helm deploy the exact
+1. Merge the reviewed PR #1670 manager-throughput correction and protocol v5
+   as one source cohort, publish one immutable image/chart release, and
+   direct-Helm deploy the exact
    API/controller/executor cohort under the hold. Preserve the flat Kueue
    topology; do not add a Cohort, priority class, scheduler, EFS authority,
    Terraform/Terragrunt change, platform runtime pin, admission backfill, or
@@ -1173,7 +1179,7 @@ committed-intent profile for nine provider-present associations, and draft
 cleanup PR #1615 removed its enumerated historical-digest verifier after the
 documented horizon. Those rows are not the cause of the revision-470 incident;
 the former cold-controller retirement shelter is deployed and exercised. The
-current gate is PR #1667's exact execution/retry correction followed by a clean
+current gate is the combined PR #1670/protocol-v5 release followed by clean
 service recreation and production convergence.
 
 Explicit exclusions: EFS/RWX is neither authority nor a correctness fallback;
@@ -1190,10 +1196,9 @@ debt; they are not read by the live path and must be removed after the
 production horizon without reintroducing storage authority.
 
 Completion means Serve057 and the corrective retirement contract remain
-deployed, PR #1667's exact no-optimizer execution image is live and
+deployed, the combined manager-throughput/protocol-v5 image is live and
 reauthorized, its separate cleanup follows only after its gates allow, the
-final authorities are durably active,
-`boltz-l4-fleet` automatically
+final authorities are durably active, `boltz-l4-fleet` automatically
 materializes 100% of fresh compatible free capacity, paid residual and drain
 behavior are correct, dashboard request totals are fresh and non-null, restart
 takeover succeeds without RWX/EFS, and every immediate/+10/+30/full-horizon
@@ -1206,8 +1211,8 @@ four are true.
 Status: PR #1637 is merged at `75debe4e3`, and its mixed-version scope repair
 PR #1641 is merged at `77b653d42`; both are present in the deployed
 release-`1.1.1423` source. End-to-end production proof remains open: the clean
-service recreated after PR #1667 must show fresh, non-null request activity
-through controller restart and provider-stall horizons. The deployed contract uses scope-less
+successor service must show fresh, non-null request activity through controller
+restart and provider-stall horizons. The deployed contract uses scope-less
 public wire bodies, retained legacy durable bodies with a required nullable
 owner, and distinct authorized handler identities that fence older workers.
 
@@ -6482,7 +6487,7 @@ route, autoscaler, or sibling-pool progress.
    sequence after activation;
 7. ordinary traffic, no-paid-spill, `max_replicas`, two-context concurrency,
    and the deployment-owned Kueue reclaim contract pass; and
-8. every active service version uses worker projection protocol v4 and no
+8. every active service version uses worker projection protocol v5 and no
    ordinary launch has consumed the v1 decoder for one complete 180-second
    authority horizon; and
 9. after one complete controller-fleet rollout, no non-`INACTIVE`, non-`DONE`
