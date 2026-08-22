@@ -698,6 +698,11 @@ def test_projected_worker_persists_authenticated_bootstrap_through_finalizer(
     assert persisted['cluster_name'] == 'display'
     assert 'skypilot:ssh_public_key_content' not in runtime_script
     assert public_key in runtime_script
+    assert len(runtime_script.encode('utf-8')) == 39363
+    assert hashlib.sha256(runtime_script.encode('utf-8')).hexdigest() == (
+        '69bc9ab023e8a5ee164d3603f1bdae2fe318e2fc5a128139fcd063da87451704')
+    assert expected_bootstrap_sha256 == (
+        'b51e7c955e4abffc39c2d882672e2142822f44f2c050a0b3db58db57a7d83c2a')
     assert expected_bootstrap_sha256 == (
         kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
 
@@ -844,7 +849,7 @@ def test_builtin_kubernetes_writer_preserves_replacement_renderer_authority(
                              'templates' / template_ref)
         source_bytes = template_path.read_bytes()
         assert hashlib.sha256(source_bytes).hexdigest() == (
-            'f1f0b602b8ffe4948d9c655cadf216238ee9c26d71b788d73eed0f5da4078676')
+            '974b81b5b5fb9776bdd8103f8f040d599fec3c0439423a6f6f13f415542f9175')
         source = source_bytes.decode('utf-8')
         assert '{{ skypilot_kubernetes_node_config_fragment_v1 }}\n' not in source
         rendered = common_utils.jinja2.Template(source).render(**variables)
