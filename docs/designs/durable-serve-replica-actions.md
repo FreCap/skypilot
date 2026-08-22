@@ -980,7 +980,14 @@ version, owner, and request fences. Advancing the lifecycle epoch for such an
 operation is invalid: the epoch is part of every unresolved association's
 immutable controller identity
 and would otherwise make both the update and later evidence reduction
-impossible. Destructive lifecycle ownership continues to mint a fresh epoch.
+impossible. Normal down of the current service incarnation follows the same
+retention rule: while holding the name-scoped advisory lock it publishes
+`SHUTTING_DOWN` as the irreversible launch fence and preserves the lifecycle
+epoch carried by unresolved associations and cleanup evidence. A fresh service
+birth, including same-name rebirth after the prior service row is gone, mints
+the next durable lifecycle epoch. Controller takeover separately rotates the
+controller incarnation and owner epoch and transfers unresolved association
+ownership; it does not rewrite their lifecycle epoch.
 
 ### Pre-I/O fence
 

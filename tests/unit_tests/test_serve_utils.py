@@ -2985,7 +2985,7 @@ def test_all_down_uses_controller_distributed_lifecycle_fence(tmp_path):
         message = serve_utils.terminate_services(None, purge=False, pool=False)
 
     assert 'scheduled to be terminated' in message
-    get_lock.assert_called_once_with('svc')
+    get_lock.assert_called_once_with('svc', advance_epoch=False)
     get_status.assert_called_once()  # initial classification only
     set_status.assert_called_once_with('svc',
                                        'incarnation-a',

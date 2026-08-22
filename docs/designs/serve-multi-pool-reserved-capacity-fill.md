@@ -593,6 +593,14 @@ without another provider call; malformed or conflicting retained evidence
 still fails closed. This keeps a temporary provider outage after the committed
 receipt from reopening terminal uncertainty.
 
+Normal down of an existing incarnation retains that incarnation's lifecycle
+epoch while holding the name-scoped PostgreSQL advisory lock and atomically
+publishing `SHUTTING_DOWN`; it does not rewrite immutable admission-time
+association provenance. Fresh service birth or same-name rebirth advances the
+durable lifecycle fence. Controller takeover is orthogonal: it rotates the
+controller incarnation and owner epoch and transfers unresolved association
+ownership without changing their lifecycle epoch.
+
 Deletion retains the association tombstone for its ordinary 60-day audit
 period and retains the monotonically advanced service lifecycle fence after the
 service row is gone. Those durable tombstones, non-reused UUIDs/generations,
