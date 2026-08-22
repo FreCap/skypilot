@@ -55,8 +55,9 @@ request and limit 48 GiB, retains four CPUs and the multiplier of 16, and
 yields an exact 64 workers per replica and 192 aggregate slots. Reducing each
 API Pod's memory request from 96 GiB to 56 GiB, while retaining its 110 GiB
 limit, makes that reservation fit the existing three hub nodes without
-changing any shared infrastructure. Live API use before rollout is about
-3.8 GiB; 56 GiB also leaves approximately 6.5 GiB of request headroom when the
+changing any shared infrastructure. Each live API Pod used about 3.8 GiB at the
+2026-08-22 21:07 UTC pre-rollout observation; 56 GiB also leaves approximately
+6.5 GiB of request headroom when the
 topology constraint forces the first 48 GiB executor replacement onto the node
 holding the first replacement API Pod. The rollout is deliberately two held
 Helm revisions: first change only the API request and wait for 2/2 Ready, then
@@ -1199,8 +1200,9 @@ committed-intent profile for nine provider-present associations, and draft
 cleanup PR #1615 removed its enumerated historical-digest verifier after the
 documented horizon. Those rows are not the cause of the revision-470 incident;
 the former cold-controller retirement shelter is deployed and exercised. The
-current gate is the combined PR #1670/protocol-v5 release followed by clean
-service recreation and production convergence.
+current gate is the two-stage held resource rollout, exact executor-capacity
+proof, generation-22 authorization, clean service recreation, and production
+convergence.
 
 Explicit exclusions: EFS/RWX is neither authority nor a correctness fallback;
 KubeRay is not part of this Serve path; no Terraform or Terragrunt expansion is
@@ -4290,9 +4292,10 @@ correctly published only eight workers per executor despite the 48 GiB cgroup
 limit. The corrected contract makes request equal limit on the executor. To fit
 three such reservations on the existing hub, a first held Helm revision lowers
 only each API Pod's memory request from 96 GiB to 56 GiB while retaining the
-110 GiB limit and waits for 2/2 Ready. Live API use is approximately 3.8 GiB;
-the 56 GiB request leaves about 6.5 GiB of request headroom when the executor's
-topology constraint forces its first replacement onto the same node. Only then
+110 GiB limit and waits for 2/2 Ready. Each live API Pod used approximately
+3.8 GiB at the 2026-08-22 21:07 UTC pre-rollout observation; the 56 GiB request
+leaves about 6.5 GiB of request headroom when the executor's topology
+constraint forces its first replacement onto the same node. Only then
 does a second held revision raise the executor request from 8 GiB to 48 GiB and
 wait for 3/3 Ready. Current API use is observed separately before rollout. The
 stages are mandatory:
