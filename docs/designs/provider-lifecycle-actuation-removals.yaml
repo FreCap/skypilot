@@ -17496,10 +17496,10 @@ artifacts:
     operation: direct_worker_teardown_admission
   runtime_affecting: true
   locators:
-  - kind: python_ast_pattern
+  - kind: python_call_within
     path: sky/serve/service.py
-    symbol: _cleanup
-    pattern: replica_managers.terminate_cluster
+    symbol: _terminate_replica_cluster_for_service_cleanup
+    call: replica_managers.terminate_cluster_with_kueue_absence_receipt
   - kind: python_call_within
     path: sky/serve/service.py
     symbol: _cleanup
@@ -17531,7 +17531,7 @@ artifacts:
   - kind: python_call_within
     path: sky/serve/serve_utils.py
     symbol: _terminate_failed_services_locked
-    call: replica_managers.terminate_cluster
+    call: service_lib._terminate_replica_cluster_for_service_cleanup
   - kind: python_call_within
     path: sky/serve/serve_utils.py
     symbol: _terminate_failed_services_locked
