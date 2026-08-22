@@ -81,9 +81,11 @@ def _read_guardian_ready(stream) -> tuple[int, int, int]:
 @pytest.mark.asyncio
 async def test_runtime_daemon_inventory_and_skip_evaluated_once(monkeypatch):
     first = mock.Mock(id='first-daemon',
-                      should_skip=mock.Mock(return_value=False))
+                      should_skip=mock.Mock(return_value=False),
+                      fail_stop_on_unexpected_exit=True)
     second = mock.Mock(id='second-daemon',
-                       should_skip=mock.Mock(return_value=True))
+                       should_skip=mock.Mock(return_value=True),
+                       fail_stop_on_unexpected_exit=False)
     background = mock.Mock()
     singleton_task = mock.sentinel.singleton_task
     singleton = mock.Mock(return_value=singleton_task)
@@ -119,7 +121,7 @@ async def test_runtime_daemon_inventory_and_skip_evaluated_once(monkeypatch):
     second.should_skip.assert_called_once_with()
     singleton.assert_called_once_with('internal-daemon:first-daemon', mock.ANY)
     daemon_factory = singleton.call_args.args[1]
-    assert daemon_factory.args[-1] == _CONTROLLER_OWNER
+    assert daemon_factory.args[-2:] == (_CONTROLLER_OWNER, True)
     background.create_task.assert_called_once_with(singleton_task)
 
 
@@ -188,6 +190,117 @@ async def test_unexpected_exit_restarts_with_bounded_backoff(
         assert _CONTROLLER_OWNER[0] not in spawn_call.kwargs['env'].values()
         assert (str(_CONTROLLER_OWNER[1])
                 not in spawn_call.kwargs['env'].values())
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'),
+                    reason='requires Linux process groups')
+@pytest.mark.asyncio
+async def test_fail_stop_daemon_exit_never_admits_same_pod_successor(
+        monkeypatch, tmp_path):
+    ready_path = tmp_path / 'fail-stop-daemon-pids'
+    child_script = ('import signal,time; '
+                    'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                    'time.sleep(300)')
+    daemon_script = f'''\
+import os
+import pathlib
+import subprocess
+import sys
+import time
+child = subprocess.Popen([sys.executable, '-c', {child_script!r}],
+                         start_new_session=True)
+pathlib.Path(sys.argv[1]).write_text(f'{{os.getpid()}} {{child.pid}}',
+                                     encoding='utf-8')
+time.sleep(300)
+'''
+    real_create = asyncio.create_subprocess_exec
+    launched = []
+
+    async def create_fail_stop_daemon(*_args, **_kwargs):
+        process = await real_create(sys.executable,
+                                    '-c',
+                                    daemon_script,
+                                    str(ready_path),
+                                    stdout=asyncio.subprocess.DEVNULL,
+                                    stderr=asyncio.subprocess.DEVNULL,
+                                    start_new_session=True)
+        launched.append(process)
+        return process
+
+    monkeypatch.setattr(runtime.asyncio, 'create_subprocess_exec',
+                        create_fail_stop_daemon)
+    monkeypatch.setattr(runtime.server_constants, 'REQUEST_LOG_PATH_PREFIX',
+                        str(tmp_path))
+    supervisor = asyncio.create_task(
+        runtime._supervise_runtime_daemon(
+            'fail-stop-daemon', {}, 1, os.getpid(),
+            runtime._executor_process_start_time_ticks(os.getpid()),
+            controller_capability.generate(), _CONTROLLER_OWNER, True))
+    daemon_pid = None
+    detached_child_pid = None
+    try:
+        deadline = time.monotonic() + 20
+        while not ready_path.exists() and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert ready_path.exists()
+        daemon_pid, detached_child_pid = map(
+            int,
+            ready_path.read_text(encoding='utf-8').split())
+
+        os.kill(daemon_pid, signal.SIGKILL)
+        await asyncio.wait_for(launched[0].wait(), timeout=20)
+        # Give the generic restart delay enough time to launch a successor if
+        # this daemon were not fail-stop. Its separate-session child proves a
+        # process-group drain is not complete family absence.
+        await asyncio.sleep(1.5)
+        assert len(launched) == 1
+        assert not supervisor.done()
+        os.kill(detached_child_pid, 0)
+
+        supervisor.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await supervisor
+        assert len(launched) == 1
+    finally:
+        if not supervisor.done():
+            supervisor.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await supervisor
+        if daemon_pid is not None:
+            try:
+                os.kill(daemon_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if detached_child_pid is not None:
+            try:
+                os.kill(detached_child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.asyncio
+async def test_fail_stop_daemon_supervisor_exception_never_restarts(
+        monkeypatch, tmp_path):
+    process = mock.AsyncMock(pid=11)
+    process.wait.side_effect = RuntimeError('wait failed')
+    create = mock.AsyncMock(return_value=process)
+    terminate = mock.AsyncMock(side_effect=RuntimeError('drain failed'))
+    park = mock.AsyncMock(side_effect=asyncio.CancelledError())
+    monkeypatch.setattr(runtime.asyncio, 'create_subprocess_exec', create)
+    monkeypatch.setattr(runtime, '_terminate_runtime_daemon_process', terminate)
+    monkeypatch.setattr(runtime, '_park_failed_runtime_daemon_owner', park)
+    monkeypatch.setattr(runtime.server_constants, 'REQUEST_LOG_PATH_PREFIX',
+                        str(tmp_path))
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime._supervise_runtime_daemon(
+            'fail-stop-daemon', {}, 1, 1, 2, controller_capability.generate(),
+            _CONTROLLER_OWNER, True)
+
+    create.assert_awaited_once()
+    terminate.assert_awaited_once_with(process)
+    park.assert_awaited_once()
+    assert 'drain failure' in park.await_args.args[1]
 
 
 @pytest.mark.skipif(not sys.platform.startswith('linux'),
@@ -587,7 +700,6 @@ def test_runtime_daemon_capability_produces_nested_headers_without_leak(
     """A daemon receives authority, while its environment/argv never do."""
     capability = controller_capability.generate()
     instance_id = '12345678-1234-4abc-9234-56789abcdef0'
-    parent_ticks = runtime._executor_process_start_time_ticks(os.getpid())
     repository_root = pathlib.Path(runtime.__file__).resolve().parents[2]
     capability_fd = runtime._open_capability_transport(capability)
     script = '''\

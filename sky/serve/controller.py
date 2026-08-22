@@ -672,8 +672,6 @@ class SkyServeController:
         self._reserved_capacity_fill_enabled: bool = bool(
             service_spec.reserved_capacity_fill)
         self._reserved_capacity_poller_started: bool = False
-        self._reserved_fill_reclaim_renewer_started: bool = False
-        self._reserved_capacity_poller_wake = threading.Event()
         # update_service handlers run in FastAPI's threadpool, so two
         # concurrent fill-enabling updates could both observe the
         # started flag as False; the lock makes start-once atomic.
@@ -5358,24 +5356,6 @@ class SkyServeController:
             if self._reserved_capacity_poller_started:
                 return
             self._reserved_capacity_poller_started = True
-            wake_event = getattr(self, '_reserved_capacity_poller_wake', None)
-            if not isinstance(wake_event, threading.Event):
-                wake_event = threading.Event()
-                self._reserved_capacity_poller_wake = wake_event
-            if not getattr(self, '_reserved_fill_reclaim_renewer_started',
-                           False):
-                self._reserved_fill_reclaim_renewer_started = True
-                thread_utils.start_supervised_thread(
-                    lambda: reserved_capacity.
-                    reclaim_provider_proof_renewer_loop(
-                        stop_event=self._get_actuation_stop(),
-                        is_enabled=lambda: bool(self._autoscaler.
-                                                reserved_capacity_fill),
-                        notify_fresh=wake_event.set,
-                        on_ambiguous_boundary=(
-                            self._handle_reclaim_proof_boundary_ambiguity)),
-                    'reserved-fill-reclaim-proof-renewer',
-                    stop_event=self._get_actuation_stop())
         thread_utils.start_supervised_thread(
             lambda: reserved_capacity.poller_loop(
                 lambda: self._autoscaler,
@@ -5389,7 +5369,6 @@ class SkyServeController:
                 actuation_generation_is_current=(
                     self.actuation_generation_is_current),
                 notify_reconcile=self._notify_scale_reconcile,
-                wake_event=wake_event,
                 on_ambiguous_boundary=(
                     self._handle_reclaim_proof_boundary_ambiguity)),
             'reserved-capacity-poller',

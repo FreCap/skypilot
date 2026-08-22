@@ -636,6 +636,16 @@ async def _terminate_runtime_daemon_process(
     await _wait_runtime_daemon_process_group_gone(process_group_id)
 
 
+async def _park_failed_runtime_daemon_owner(daemon_id: str,
+                                            detail: str) -> None:
+    """Retain singleton ownership without admitting a same-Pod successor."""
+    logger.critical(
+        f'Runtime daemon {daemon_id} lost restart-safe process-family proof '
+        f'({detail}); retaining its singleton without replacement until full '
+        'controller Pod recycle.')
+    await asyncio.Event().wait()
+
+
 def _prepare_runtime_daemon_paths(
         daemon_id: str) -> tuple[pathlib.Path, pathlib.Path]:
     """Resolve and create filesystem paths used by a runtime daemon."""
@@ -646,11 +656,15 @@ def _prepare_runtime_daemon_paths(
     return runner_dir, log_dir / f'{daemon_id}.log'
 
 
-async def _supervise_runtime_daemon(daemon_id: str, clean_env: dict[str, str],
-                                    max_db_connections: int, parent_pid: int,
-                                    parent_start_time_ticks: int,
-                                    origin_capability: str,
-                                    controller_owner: tuple[str, int]) -> None:
+async def _supervise_runtime_daemon(
+        daemon_id: str,
+        clean_env: dict[str, str],
+        max_db_connections: int,
+        parent_pid: int,
+        parent_start_time_ticks: int,
+        origin_capability: str,
+        controller_owner: tuple[str, int],
+        fail_stop_on_unexpected_exit: bool = False) -> None:
     """Supervise one blocking maintenance loop in its own process group."""
     runner_dir, log_path = await asyncio.to_thread(
         _prepare_runtime_daemon_paths, daemon_id)
@@ -698,6 +712,15 @@ async def _supervise_runtime_daemon(daemon_id: str, clean_env: dict[str, str],
             # The entrypoint is perpetual.  Any return, including zero, is
             # unexpected and must converge through the same restart path.
             await _terminate_runtime_daemon_process(process)
+            if fail_stop_on_unexpected_exit:
+                # This daemon may own DisposableExecutor descendants that lead
+                # separate sessions. Its process-group drain is not proof that
+                # those descendants are absent, so a same-Pod successor is
+                # forbidden. Retain this coroutine (and therefore its outer
+                # distributed-singleton session) until controller ownership is
+                # cancelled and the complete Pod/container is recycled.
+                await _park_failed_runtime_daemon_owner(
+                    daemon_id, f'unexpected exit code {return_code}')
             logger.error(f'Runtime daemon {daemon_id} exited unexpectedly '
                          f'with code {return_code}; restarting in '
                          f'{restart_delay} seconds.')
@@ -714,6 +737,18 @@ async def _supervise_runtime_daemon(daemon_id: str, clean_env: dict[str, str],
             if capability_fd is not None:
                 os.close(capability_fd)
             if process is not None:
+                if fail_stop_on_unexpected_exit:
+                    try:
+                        await _terminate_runtime_daemon_process(process)
+                    except Exception as drain_error:  # pylint: disable=broad-except
+                        await _park_failed_runtime_daemon_owner(
+                            daemon_id, 'supervisor failure '
+                            f'{common_utils.format_exception(e)}; drain '
+                            f'failure {common_utils.format_exception(drain_error)}'
+                        )
+                    await _park_failed_runtime_daemon_owner(
+                        daemon_id, 'supervisor failure '
+                        f'{common_utils.format_exception(e)}')
                 await _terminate_runtime_daemon_process(process)
             logger.exception(f'Runtime daemon {daemon_id} supervisor failed: '
                              f'{e}; restarting in {restart_delay} seconds.')
@@ -766,6 +801,7 @@ async def _register_runtime_daemons_async(
             parent_start_time_ticks,
             origin_capability,
             controller_owner,
+            daemon.fail_stop_on_unexpected_exit,
         )
         background.create_task(
             _singleton_task(f'internal-daemon:{daemon.id}', task_factory))
