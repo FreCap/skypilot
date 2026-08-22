@@ -531,6 +531,17 @@ def test_policy_operation_deadline_is_absolute_and_fail_closed(
         attestation.require_policy_operation_completed(deadline)
 
 
+def test_provider_proof_operation_has_its_distinct_refresh_deadline(
+        monkeypatch) -> None:
+    monkeypatch.setattr(attestation.time, 'monotonic', lambda: 10.0)
+
+    deadline = attestation.new_provider_proof_operation_deadline()
+
+    assert deadline == (10.0 +
+                        attestation.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS)
+    assert deadline > 10.0 + attestation.POLICY_OPERATION_TIMEOUT_SECONDS
+
+
 def test_policy_revision_uses_the_same_utf8_bound_as_serve045() -> None:
     attestation.ReclaimPolicyIdentity(fleet_bundle_sha256='a' * 64,
                                       policy_revision='x' *

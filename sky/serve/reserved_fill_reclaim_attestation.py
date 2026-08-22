@@ -36,8 +36,8 @@ POLICY_OPERATION_TIMEOUT_SECONDS: Final = 5.0
 # database read, external refresh, and durable freshness budgets distinct from
 # the short-lived exact-scope authorization above.
 PROVIDER_PROOF_READ_TIMEOUT_SECONDS: Final = 2.0
-PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS: Final = 5.0
-PROVIDER_PROOF_REFRESH_BOUNDARY_LIFETIME_SECONDS: Final = 8.0
+PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS: Final = 8.0
+PROVIDER_PROOF_REFRESH_BOUNDARY_LIFETIME_SECONDS: Final = 10.0
 PROVIDER_PROOF_MAX_AGE_SECONDS: Final = 30.0
 PROVIDER_PROOF_RENEW_INTERVAL_SECONDS: Final = 3.0
 PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS: Final = 20.0
@@ -55,14 +55,14 @@ if (PROVIDER_PROOF_MAX_AGE_SECONDS <= PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS
         or PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS
         <= PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS):
     raise RuntimeError('The provider-proof freshness horizons are invalid.')
-if (PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS -
+if (PROVIDER_PROOF_MAX_AGE_SECONDS -
         PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS
-        <= PROVIDER_PROOF_RENEW_INTERVAL_SECONDS +
-        PROVIDER_PROOF_REFRESH_BOUNDARY_LIFETIME_SECONDS +
+        <= 2 * PROVIDER_PROOF_REFRESH_BOUNDARY_LIFETIME_SECONDS +
+        PROVIDER_PROOF_RENEW_INTERVAL_SECONDS +
         PROVIDER_PROOF_REFRESH_JITTER_BUDGET_SECONDS):
-    raise RuntimeError('The provider-proof renewal margin must preserve the '
-                       'consumer horizon across threshold detection, one '
-                       'successful process boundary, and jitter.')
+    raise RuntimeError('The provider-proof publication cadence must preserve '
+                       'the consumer horizon across two complete process '
+                       'boundaries, one daemon interval, and jitter.')
 
 
 class ReclaimAttestationError(RuntimeError):
@@ -843,6 +843,11 @@ def require_exact_evidence(
 def new_policy_operation_deadline() -> float:
     """Return the absolute deadline every deployment policy must honor."""
     return time.monotonic() + POLICY_OPERATION_TIMEOUT_SECONDS
+
+
+def new_provider_proof_operation_deadline() -> float:
+    """Return the deadline for a complete external provider proof."""
+    return time.monotonic() + PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS
 
 
 def new_provider_proof_read_deadline() -> float:

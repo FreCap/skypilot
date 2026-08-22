@@ -156,7 +156,7 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
     ]
     assert bundle.policy_revision == (
         f'boltz-reserved-fill-reclaim-policy/{POLICY_REVISION}')
-    assert POLICY_REVISION == '1.1.1425'
+    assert POLICY_REVISION == '1.1.1430'
     assert _quota(phx, 'skypilot-be', 'ml.p5e.48xlarge',
                   'cpu')['borrowing_limit'] == '12100'
     assert _quota(phx, 'skypilot-be', 'ml.p5e.48xlarge',
@@ -626,7 +626,7 @@ def test_unchanged_policy_authorizes_current_service_version_refresh(
     context = policy._bundle.fleet_context('phx_research_cluster_eks')
     identity = policy.policy_identity()
     assert identity.policy_revision == (
-        'boltz-reserved-fill-reclaim-policy/1.1.1425')
+        'boltz-reserved-fill-reclaim-policy/1.1.1430')
 
     authorizations = []
     for service_version in (63, 64):
@@ -1026,6 +1026,41 @@ def test_renewal_context_negative_wins_over_never_returning_peer(monkeypatch):
     assert _wait_for_no_thread('boltz-reclaim-renew')
 
 
+def test_renewal_uses_distinct_refresh_and_handoff_reserves(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    calls = []
+
+    class _Repository:
+        """Capture one proof renewal call per physical context."""
+
+        def renew(self, **kwargs):
+            calls.append(kwargs)
+            context_name = kwargs['kubernetes_context']
+            context = policy._bundle.fleet_context(context_name)
+            provider = policy._bundle.provider_context(context_name)
+            proof = _context_proof(context, provider)
+            payload, _ = reclaim_proofs.canonical_proof_payload({
+                'aws': dataclasses.asdict(proof.aws),
+                'kubernetes': dataclasses.asdict(proof.kubernetes),
+            })
+            return types.SimpleNamespace(proof_payload=payload,
+                                         publication_observed=False)
+
+    monkeypatch.setattr(reclaim_proofs, 'ReclaimProviderProofRepository',
+                        _Repository)
+
+    assert not policy.renew_provider_proofs(
+        expected_identity=policy.policy_identity(),
+        expected_gate_generation=7,
+        deadline_monotonic=time.monotonic() + 5)
+
+    assert {call['kubernetes_context'] for call in calls
+           } == set(policy._bundle.contexts)
+    assert all(call['minimum_remaining_seconds'] ==
+               reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS
+               for call in calls)
+
+
 def test_kubernetes_provider_uses_the_exact_assumed_audit_session(monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
     context_name = 'phx_research_cluster_eks'
@@ -1232,6 +1267,7 @@ def test_audit_api_client_uses_exact_eks_connection_and_scrubs_credentials(
         }
         assert captured['document']['users'][0]['user'] == {}
         assert client.configuration.api_key == {'authorization': 'secret-token'}
+        assert client.configuration.retries == 0
 
     assert client.closed
     assert client.configuration.api_key == {}
@@ -1304,14 +1340,61 @@ def test_aws_pagination_rejects_token_cycles():
             del kwargs
             return {'associations': [], 'nextToken': 'cycle'}
 
+    class Session:
+
+        @staticmethod
+        def client(*_args, **_kwargs):
+            return Eks()
+
     with pytest.raises(aws_attestation.AwsAttestationError, match='pagination'):
-        aws_attestation._list_associations(Eks(),
+        aws_attestation._list_associations(Session(),
+                                           region='us-east-1',
                                            cluster_name='cluster',
                                            namespace='inference',
                                            service_account='worker',
                                            deadline_monotonic=time.monotonic() +
                                            5,
                                            cancellation=threading.Event())
+
+
+def test_aws_pagination_recomputes_client_timeout_per_page(monkeypatch):
+    pages = iter(({
+        'associations': [],
+        'nextToken': 'next',
+    }, {
+        'associations': [],
+    }))
+    configured_timeouts = []
+    timeouts = iter((0.9, 0.4))
+    monkeypatch.setattr(aws_attestation, '_client_timeout',
+                        lambda *_args: next(timeouts))
+
+    class Eks:
+
+        @staticmethod
+        def list_pod_identity_associations(**_kwargs):
+            return next(pages)
+
+    class Session:
+
+        @staticmethod
+        def client(_service, *, region_name, config):
+            assert region_name == 'us-east-1'
+            configured_timeouts.append(
+                (config.connect_timeout, config.read_timeout))
+            return Eks()
+
+    associations = aws_attestation._list_associations(
+        Session(),
+        region='us-east-1',
+        cluster_name='cluster',
+        namespace='inference',
+        service_account='worker',
+        deadline_monotonic=time.monotonic() + 5,
+        cancellation=threading.Event())
+
+    assert not associations
+    assert configured_timeouts == [(0.9, 0.9), (0.4, 0.4)]
 
 
 def test_audit_session_cache_coalesces_concurrent_assume_role():
@@ -1823,12 +1906,15 @@ def test_kubernetes_snapshot_allows_unrelated_kueue_subtree():
     assert proof.cluster_queue_name == 'skypilot-be'
 
 
-def test_paginated_kueue_inventory_exposes_later_governed_member():
+def test_paginated_kueue_inventory_exposes_later_governed_member(monkeypatch):
     bundle = bundle_lib.load_embedded_bundle()
     context = bundle.fleet_context('phx_research_cluster_eks')
     provider = bundle.provider_context('phx_research_cluster_eks')
     snapshot = _kubernetes_snapshot(context, provider)
     calls = []
+    timeouts = iter(((0.9, 0.9), (0.4, 0.4)))
+    monkeypatch.setattr(kubernetes_attestation, '_request_timeout',
+                        lambda *_args: next(timeouts))
 
     class CustomObjects:
         """Return a complete inventory split across two pages."""
@@ -1862,10 +1948,65 @@ def test_paginated_kueue_inventory_exposes_later_governed_member():
 
     assert len(calls) == 2
     assert calls[0]['limit'] == kubernetes_attestation._KUEUE_LIST_PAGE_LIMIT
+    assert [call['_request_timeout'] for call in calls] == [(0.9, 0.9),
+                                                            (0.4, 0.4)]
     with pytest.raises(
             kubernetes_attestation.KubernetesAttestationNonconformanceError,
             match='late-foreign-member'):
         kubernetes_attestation.validate_snapshot(context, provider, snapshot)
+
+
+def test_kueue_version_fallback_recomputes_remaining_timeout(monkeypatch):
+    calls = []
+    timeouts = iter(((0.8, 0.8), (0.3, 0.3)))
+    monkeypatch.setattr(kubernetes_attestation, '_request_timeout',
+                        lambda *_args: next(timeouts))
+    not_found = kubernetes_attestation.kubernetes_adaptor.api_exception()(
+        status=404)
+
+    class CustomObjects:
+
+        @staticmethod
+        def get_cluster_custom_object(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise not_found
+            return {'metadata': {'name': kwargs['name']}}
+
+    result = kubernetes_attestation._get_kueue_object(
+        CustomObjects(),
+        plural='resourceflavors',
+        name='exact-flavor',
+        deadline_monotonic=time.monotonic() + 5,
+        cancellation=threading.Event())
+
+    assert result == {'metadata': {'name': 'exact-flavor'}}
+    assert [call['version'] for call in calls] == ['v1beta2', 'v1beta1']
+    assert [call['_request_timeout'] for call in calls] == [(0.8, 0.8),
+                                                            (0.3, 0.3)]
+
+
+def test_generated_kubernetes_client_receives_real_bounded_timeout():
+    """Exercise the generated REST layer, which ignores float timeouts."""
+    client_lib = kubernetes_attestation.kubernetes_adaptor.kubernetes.client
+    configuration = client_lib.Configuration()
+    configuration.retries = 0
+    rest_client = client_lib.rest.RESTClientObject(configuration)
+    response = types.SimpleNamespace(status=200)
+    with mock.patch.object(rest_client.pool_manager,
+                           'request',
+                           return_value=response) as request:
+        result = rest_client.request('GET',
+                                     'https://exact.eks.example/api/v1/nodes',
+                                     _preload_content=False,
+                                     _request_timeout=(0.7, 0.4))
+
+    assert result is response
+    timeout = request.call_args.kwargs['timeout']
+    assert timeout.connect_timeout == 0.7
+    assert timeout.read_timeout == 0.4
+    retries = rest_client.pool_manager.connection_pool_kw['retries']
+    assert retries.total == 0
 
 
 def test_kueue_inventory_uses_real_client_pagination_contract():
