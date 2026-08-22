@@ -19,6 +19,11 @@ production state is **no `boltz-l4-fleet` service**, zero replica rows, zero
 live associations or requests, and zero fleet Pods or Kueue Workloads in East
 or PHX. This clean absence is deliberate while one SkyPilot-only throughput
 correction is merged and deployed; no Kueue or platform mutation is required.
+Before purge, lifecycle 89 reached 13/13 Ready East A100, 12/12 Ready East
+A100-80GB, and 3/3 Ready PHX H200 replicas. Every PHX Workload SkyPilot
+submitted was admitted by the unchanged `be -> skypilot-be`, `be-lt=11`, Pod
+priority `-1000`/`Never` contract; no fleet Workload was pending. That bounded
+sample proves the admission identity, not full-capacity convergence.
 The obsolete unmounted `skypilot-state-rwx` PVC, its retained PV, and its sole
 EFS access point were confirmed absent from Helm ownership and then removed;
 `storage.enabled=false` remains and the Terraform-managed shared filesystem was
@@ -28,7 +33,17 @@ PR #1670 is merged and deployed dark under that hold. Its bounded four-item
 manager handoff is retained exactly, but this intermediate release is
 superseded and is not eligible for hold release or service recreation.
 Revisions 550 and 551 changed only SkyPilot API/executor resource requests
-under the same hold and digest; they created no service or provider state.
+under the same hold and digest. Revision 550 reduced each API request from 96
+GiB to 56 GiB while retaining its 110 GiB limit and reached 2/2 Ready.
+Revision 551 made each executor's 48 GiB request equal its 48 GiB limit and
+reached 3/3 Ready. These reservations created no service or provider state and
+grant no GPU authority. All three executors then reported exact downward-API
+`51539607552`-byte input and startup with 64 long workers. Each had 51 current
+PIDs against a 152018 limit, roughly 246--251 MB current memory, zero memory
+event/OOM counters, and its node reported Ready with no MemoryPressure,
+DiskPressure, or PIDPressure. The successor must reproduce this dark proof;
+bounded queue latency and PostgreSQL connection behavior remain activation
+gates.
 Fix-forward PR #1671 replaces its first protocol-v5 runtime-storage
 implementation with the narrower memory-scratch bootstrap contract and adds
 the post-teardown physical-absence fence described below.
@@ -1207,7 +1222,10 @@ Remaining work, in exact order:
    API/controller/executor cohort under the hold. Preserve the flat Kueue
    topology; do not add a Cohort, priority class, scheduler, EFS authority,
    Terraform/Terragrunt change, platform runtime pin, admission backfill, or
-   manual row repair.
+   manual row repair. Re-prove the staged API/executor reservations on the
+   successor and require every executor's downward API, runtime calculation,
+   and startup log to report a 48 GiB memory input and 64 long workers before
+   releasing any service controller.
 2. After the complete corrected cohort is live, recreate the already-absent
    test-only service from the canonical `min_replicas: 0`, zero-floor, no-EFS
    YAML. Same-name recreation preserves the logical `boltz-l4-fleet` name but
@@ -1246,8 +1264,8 @@ committed-intent profile for nine provider-present associations, and draft
 cleanup PR #1615 removed its enumerated historical-digest verifier after the
 documented horizon. Those rows are not the cause of the revision-470 incident;
 the former cold-controller retirement shelter is deployed and exercised. The
-current gate is the complete PR #1671 release followed by clean
-service recreation and production convergence.
+current gate is the complete PR #1671 release, exact executor-capacity proof,
+clean service recreation, and production convergence.
 
 Explicit exclusions: EFS/RWX is neither authority nor a correctness fallback;
 KubeRay is not part of this Serve path; no Terraform or Terragrunt expansion is
@@ -2786,8 +2804,11 @@ one-way Pod-materialization transition.
 Durable state is not authority merely because another SkyPilot version wrote
 it. A runtime advertises the bounded protocol versions it can decode and the
 single actuation version it can write. The current release and its two
-immediate predecessors must retain read, status, recovery, and normal teardown
-support for rows inside that declared window. Only a runtime whose actuation
+immediate predecessors are the long-term target for read, status, recovery, and
+normal teardown support inside the declared window. The current generic
+capability fence guarantees only the immediately adjacent cohort; N-2
+settlement remains an explicit implementation and qualification gate. Only a
+runtime whose actuation
 capability exactly covers the durable gate may allocate or call a provider;
 unknown newer state and malformed older state fail closed without making
 teardown unavailable. New durable shapes therefore land additively, keep their
@@ -2798,12 +2819,13 @@ An immutable Serve child projection carries no ambient central PostgreSQL
 config identity from its parent. Provider observations re-prove their exact
 Kubernetes context, physical UID, credentials, RBAC, and deadline in the child;
 they do not treat a parent version's config receipt or process environment as
-delegated central authority. The current realtime-catalog correction changes no
-durable encoding or capability number, so current, N-1, and N-2 readers retain
-their existing behavior while the fully converged writer cohort adopts the
-correct provider-read boundary. The current rollout still requires one exact
-writer digest before actuation is reauthorized; mixed-release read
-compatibility is not permission for mixed writers.
+delegated central authority. The current realtime-catalog correction changes
+no durable encoding or capability number, so every reader already supported by
+its declared cohort retains its existing behavior while the fully converged
+writer cohort adopts the correct provider-read boundary. This statement does
+not expand the current N-1 settlement window. The current rollout still
+requires one exact writer digest before actuation is reauthorized;
+mixed-release read compatibility is not permission for mixed writers.
 
 ### 1. Provider-free observation ledger
 
@@ -4304,6 +4326,41 @@ scripts carry no v5 marker. Protocol v5 rotates the generic non-pool capability
 cohort to epoch 5: a complete epoch-5 cohort may write, while epoch 4 is
 settlement-only. This extension changes no projection payload shape, database
 schema, Kueue object, task resource, or platform configuration.
+
+The memory `emptyDir` size is a hard per-Pod limit, not a reservation; actual
+tmpfs pages count as Pod memory. Moving the approximately 598 MB runtime, 649
+MB uv cache, and 95 MB uv-managed Python tree there trades unbounded duplicated
+nodefs consumption for bounded, reclaimable Pod memory and leaves only the
+approximately 55 MB uv executable beneath `$HOME/.local/bin`. Bootstrap does
+not delete the uv cache because later exact-wheel setup consumes it; early
+deletion would increase retry work without lowering concurrent-install peak
+memory. The production gate therefore observes Pod/node memory and pressure at
+one-Pod and full-wave scale.
+
+Lifecycle 89 also exposed a control-plane execution ceiling after PostgreSQL
+had already authorized durable zero-cost intents. A 48 GiB executor limit with
+an 8 GiB request made the chart's downward API publish only eight long-request
+workers per executor. Held revisions 550 and 551 staged the SkyPilot-only
+resource correction: API requests are 56 GiB with 110 GiB limits, and three
+executors now request and limit 48 GiB with four CPUs and
+`SKYPILOT_LONG_WORKER_CPU_MULTIPLIER=16`. The intended result is 64 long workers
+per executor and 192 aggregate slots under the existing Serve launch ceiling.
+This is only an execution bound after PostgreSQL admission; it cannot grant a
+GPU, bypass Kueue, or introduce a second fill path. Before activation, dark
+verification must prove the exact downward-API input, runtime/startup counts,
+node scheduling headroom, cgroup `pids.current`/`pids.max`, memory/OOM and
+`PIDPressure`, PostgreSQL connections, and bounded queue latency. A later
+steady-state improvement may publish executor capacity dynamically, but must
+preserve the single PostgreSQL-authorized launch path.
+
+The two-step order was required because simultaneous API and executor surge
+Pods could exceed the only initially roomy hub node even though the final
+aggregate reservation fits. At the 2026-08-22 21:07 UTC pre-rollout
+observation, each API Pod used about 3.8 GiB; the 56 GiB request left about 6.5
+GiB of request headroom for the first topology-constrained executor
+replacement. The target process topology is 64 long plus 68 short workers per
+executor before launch subprocesses, which is why activation still requires
+the PIDs, memory/OOM, PostgreSQL-connection, and queue-latency proof.
 
 Pre-Pod auxiliary bootstrap and object-storage construction cannot occupy a
 reserved accelerator slot and remain outside the reclaim guard. The successful
@@ -6528,6 +6585,28 @@ canary. If it fails, fix the feature or cleanup branch forward; do not reopen
 legacy activation.
 
 ## Open gates
+
+- [ ] Merge PR #1671 and deploy one homogeneous successor under the hold.
+  Verify its exact image digest, protocol/cohort 5, provider-proof process, and
+  the staged SkyPilot-only API/executor resource contract before release. The
+  intermediate release `1.1.1440` is not an activation candidate.
+
+- [ ] Prove all three successor executors receive the exact 48 GiB downward-API
+  input, publish 64 long-request workers each, and remain healthy for memory,
+  OOM, PIDs, PostgreSQL connections, and queue latency. Then prove one v5
+  canary keeps runtime/cache/Python trees on the bounded memory `emptyDir`,
+  rootfs growth bounded, and node DiskPressure/MemoryPressure absent. No shared
+  Kueue or platform object may change.
+
+- [x] Normally purge lifecycle 89 with supported evidence-backed teardown.
+  PostgreSQL has zero current service, replica, association, request, and
+  zero-cost-intent rows, and East/PHX have zero fleet Pods or Workloads.
+
+- [ ] Reauthorize only the complete exact successor cohort and recreate the
+  canonical service. At one synchronized denominator, prove a submitted worker
+  for every East scheduler-fit slot and every PHX slot Kueue admits, account
+  separately for Kueue-queued/withheld raw capacity, and prove zero paid claims
+  or Spot launches while reserved capacity covers demand.
 
 - [x] Merge and deploy the deployment-owned provider-proof singleton in PRs
   #1656/#1657 and release `1.1.1429`; revision 501 proved it dark through more
