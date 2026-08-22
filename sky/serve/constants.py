@@ -868,12 +868,12 @@ RESERVED_FILL_LEASE_TTL_INTERVALS = 5
 RESERVED_FILL_STICKY_FEED_INTERVALS = 2
 # Consecutive phantom observations (successful realtime query reporting NO
 # labeled nodes for the claimed GPU) required before the broker rejects a
-# pool's claims. kubernetes_catalog returns empty dicts without raising on
-# credential/cache/label-formatter failures, so a single "phantom" reading
-# can be a transient kube-apiserver blip masquerading as a successful
-# observation; deleting every claim on one reading turns that blip into a
-# pool-wide fill outage. Suspect rounds feed 0 (conservative) but keep the
-# claims; only a persistent phantom (this many rounds in a row) rejects.
+# pool's claims. Exact-context credential, RBAC, transport, and provider-read
+# failures raise into BLACKOUT; an empty result is a topology/label
+# observation. It can still reflect transient node or label propagation, so
+# deleting every claim on one reading would turn that blip into a pool-wide
+# fill outage. Suspect rounds feed 0 (conservative) but keep the claims; only a
+# persistent phantom (this many rounds in a row) rejects.
 RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS = 3
 # Upper bound on reserved_capacity_fill.weight. isfinite alone is not
 # enough: 1e308 is finite yet overflows remaining*weight / sum(weights) in
