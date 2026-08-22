@@ -1012,11 +1012,22 @@ class RetryingVmProvisioner:
                 )(policy, identity)
                 deadline = (reserved_fill_reclaim_attestation.
                             new_provider_proof_read_deadline())
-                authorization = policy.authorize_launch(
-                    scope,
-                    expected_identity=identity,
-                    expected_gate_generation=gate_generation,
-                    deadline_monotonic=deadline)
+                try:
+                    authorization = policy.authorize_launch(
+                        scope,
+                        expected_identity=identity,
+                        expected_gate_generation=gate_generation,
+                        deadline_monotonic=deadline)
+                except (reserved_fill_reclaim_attestation.
+                        ReclaimProviderProofUnavailableError) as error:
+                    raise exceptions.ReservedFillProviderProofPausedError(
+                        'A fresh exact reserved-fill provider proof is '
+                        'temporarily unavailable.',
+                        'SkyPilot retained the exact launch and will retry '
+                        'after the deployment proof renewer runs.',
+                        retry_wait_seconds=math.ceil(
+                            reserved_fill_reclaim_attestation.
+                            PROVIDER_PROOF_RENEW_INTERVAL_SECONDS)) from error
                 (reserved_fill_reclaim_attestation.
                  require_policy_operation_completed)(deadline)
                 (reserved_fill_reclaim_attestation.
@@ -1028,6 +1039,8 @@ class RetryingVmProvisioner:
                      minimum_remaining_seconds=(
                          reserved_fill_reclaim_attestation.
                          LAUNCH_AUTHORIZATION_MIN_REMAINING_SECONDS))
+            except exceptions.ReservedFillProviderProofPausedError:
+                raise
             except Exception as error:  # pylint: disable=broad-except
                 raise reserved_capacity.ReservedFillLaunchFenceError(
                     'Deployment reclaim policy refused the committed '
@@ -1047,6 +1060,12 @@ class RetryingVmProvisioner:
                     fence.kubernetes_context, fence.physical_cluster_uid):
                 provider_started = True
                 yield
+        except exceptions.ReservedFillProviderProofPausedError as error:
+            if provider_started:
+                raise reserved_capacity.ReservedFillLaunchFenceError(
+                    'Reserved-fill provider execution cannot pause after its '
+                    'provider effect began.') from error
+            raise
         except reserved_capacity.ReservedFillLaunchFenceError:
             raise
         except Exception as error:

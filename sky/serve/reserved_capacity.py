@@ -110,7 +110,8 @@ def raise_protocol_v2_materialized_launch_error(error: Exception, *,
     failover or broad teardown is no longer safe. The durable replica row and
     physical-UID fence are the only cleanup authority.
     """
-    if isinstance(error, (exceptions.ReservedFillLaunchFenceError,
+    if isinstance(error, (exceptions.ReservedFillProviderProofPausedError,
+                          exceptions.ReservedFillLaunchFenceError,
                           exceptions.ServeReplicaLaunchFenceError,
                           exceptions.KubernetesPhysicalClusterIdentityError)):
         raise error

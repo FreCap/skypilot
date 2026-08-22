@@ -1069,6 +1069,16 @@ class ExecutionPausedError(ExecutionRetryableError):
                                  self.continue_condition))
 
 
+class ReservedFillProviderProofPausedError(ExecutionPausedError):
+    """Pause reserved fill before an effect while its proof is unavailable.
+
+    Only the committed reserved-fill provider guard may create this signal,
+    before entering its physical-cluster fence and yielding to provider code.
+    The dedicated type lets post-Pod boundaries retain exact resources without
+    weakening ambiguity handling for generic pauses or provider failures.
+    """
+
+
 class ExecutionPoolFullError(Exception):
     """Raised when the execution pool is full."""
 

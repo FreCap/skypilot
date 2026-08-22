@@ -52,10 +52,25 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
     def _require_deadline(deadline_monotonic: float) -> None:
         if (isinstance(deadline_monotonic, bool) or
                 not isinstance(deadline_monotonic, (int, float)) or
-                not math.isfinite(float(deadline_monotonic)) or
-                time.monotonic() >= deadline_monotonic):
+                not math.isfinite(float(deadline_monotonic))):
             raise reclaim.ReclaimAttestationError(
                 'The Boltz reclaim-policy deadline is invalid or expired.')
+        if time.monotonic() >= deadline_monotonic:
+            raise reclaim.ReclaimAttestationError(
+                'The Boltz reclaim-policy deadline is invalid or expired.')
+
+    @staticmethod
+    def _require_launch_deadline(deadline_monotonic: float) -> None:
+        """Keep malformed launch bounds permanent and exhaustion transient."""
+        if (isinstance(deadline_monotonic, bool) or
+                not isinstance(deadline_monotonic, (int, float)) or
+                not math.isfinite(float(deadline_monotonic))):
+            raise reclaim.ReclaimAttestationError(
+                'The Boltz reclaim-policy deadline is invalid or expired.')
+        if time.monotonic() >= deadline_monotonic:
+            raise reclaim.ReclaimProviderProofUnavailableError(
+                'The fresh exact reclaim-provider receipt expired before '
+                'launch authorization completed.')
 
     def _require_identity(
         self,
@@ -554,10 +569,10 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         deadline_monotonic: float,
     ) -> tuple[_ContextProof, reclaim.ReclaimProviderProofReference]:
         """Read one receipt inside the launch handler's disposable boundary."""
-        self._require_deadline(deadline_monotonic)
+        self._require_launch_deadline(deadline_monotonic)
+        repository = (
+            reserved_fill_reclaim_proofs.ReclaimProviderProofRepository)()
         try:
-            repository = (
-                reserved_fill_reclaim_proofs.ReclaimProviderProofRepository)()
             receipt = repository.get_fresh(
                 identity=identity,
                 gate_generation=gate_generation,
@@ -567,11 +582,16 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                     context_name, summary),
                 minimum_remaining_seconds=(
                     reclaim.PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS))
-            self._require_deadline(deadline_monotonic)
-        except Exception:
-            raise reclaim.ReclaimAttestationError(
+        except (reserved_fill_reclaim_proofs.
+                ReclaimProviderProofUnavailableError) as error:
+            raise reclaim.ReclaimProviderProofUnavailableError(
                 'The Boltz deployment has no fresh exact reclaim-provider '
-                'receipt for this launch.') from None
+                'receipt for this launch.') from error
+        except reserved_fill_reclaim_proofs.ReclaimProviderProofError as error:
+            raise reclaim.ReclaimAttestationError(
+                'The Boltz deployment reclaim-provider receipt is invalid '
+                'for this launch.') from error
+        self._require_launch_deadline(deadline_monotonic)
         proof = self._decode_context_proof_summary(receipt.proof_payload,
                                                    context_name=context_name)
         return proof, receipt.reference
@@ -821,7 +841,7 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         expected_gate_generation: int,
         deadline_monotonic: float,
     ) -> reclaim.ReclaimLaunchAuthorization:
-        self._require_deadline(deadline_monotonic)
+        self._require_launch_deadline(deadline_monotonic)
         self._require_identity(expected_identity, expected_gate_generation)
         if not isinstance(scope, reclaim.ReclaimLaunchScope):
             raise reclaim.ReclaimAttestationError(
@@ -839,7 +859,7 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
             scope.kubernetes_context, expected_identity,
             expected_gate_generation, deadline_monotonic)
         completed = time.monotonic()
-        self._require_deadline(deadline_monotonic)
+        self._require_launch_deadline(deadline_monotonic)
         authorization = reclaim.ReclaimLaunchAuthorization(
             identity=self.policy_identity(),
             gate_generation=expected_gate_generation,

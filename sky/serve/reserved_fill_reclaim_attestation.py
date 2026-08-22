@@ -69,6 +69,15 @@ class ReclaimAttestationError(RuntimeError):
     """The deployment could not prove or enforce its reclaim contract."""
 
 
+class ReclaimProviderProofUnavailableError(ReclaimAttestationError):
+    """A fresh exact provider proof is temporarily unavailable.
+
+    Deployment policies may raise this only before authorizing a provider
+    effect.  Policy nonconformance, malformed evidence, and authority drift
+    must remain ordinary :class:`ReclaimAttestationError` failures.
+    """
+
+
 class ReclaimProviderNonconformanceError(ReclaimAttestationError):
     """A completed provider observation disproved the reclaim contract."""
 

@@ -2362,6 +2362,57 @@ async def test_durable_retry_uses_atomic_delayed_handoff(
     request_queue.put.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_durable_provider_proof_pause_uses_atomic_delayed_handoff(
+        isolated_database, monkeypatch):
+    """A typed proof pause releases its exact claim without local waiting."""
+    request_id = 'test-durable-provider-proof-pause'
+    request = requests_lib.Request(
+        request_id=request_id,
+        name='test-request',
+        entrypoint=_dummy_entrypoint_for_retry_test,
+        request_body=payloads.RequestBody(),
+        status=requests_lib.RequestStatus.RUNNING,
+        created_at=time.time(),
+        user_id='test-user',
+        retryable=False,
+    )
+    await requests_lib.create_if_not_exists_async(request)
+    request_queue = mock.Mock()
+    monkeypatch.setattr(executor, '_get_queue', lambda _: request_queue)
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.LONG,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    handoff = mock.Mock(return_value=True)
+    converge = mock.Mock(return_value=True)
+    monkeypatch.setattr(worker, '_handoff_execution_retry', handoff)
+    monkeypatch.setattr(worker, '_converge_execution_completion', converge)
+    future = concurrent.futures.Future()
+    future.set_exception(
+        exceptions.ReservedFillProviderProofPausedError(
+            'proof unavailable',
+            hint='retry after renewal',
+            retry_wait_seconds=3))
+    claimed = executor.queue_base.QueueItem(request_id,
+                                            False,
+                                            False,
+                                            execution_generation=7,
+                                            claim_token='exact-claim')
+
+    worker.handle_task_result(future, claimed)
+
+    claim = executor.request_storage.ExecutionClaim(request_id, 7,
+                                                    'exact-claim', None)
+    handoff.assert_called_once()
+    assert handoff.call_args.args[0] == claim
+    assert handoff.call_args.args[2] == 3
+    assert 'retrying in 3s' in handoff.call_args.args[1]
+    converge.assert_not_called()
+    request_queue.put.assert_not_called()
+
+
 def test_parent_completion_retries_until_receipt_is_durable(monkeypatch):
     worker = executor.RequestWorker(
         schedule_type=requests_lib.ScheduleType.LONG,

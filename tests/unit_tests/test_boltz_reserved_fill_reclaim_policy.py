@@ -452,6 +452,22 @@ def _edge(context: dict, accelerator: str = 'h200') -> reclaim.ReclaimClaimEdge:
         projected_admissions=(admission,))
 
 
+def _launch_scope(
+    policy: policy_lib.BoltzReservedFillReclaimPolicy,
+) -> reclaim.ReclaimLaunchScope:
+    context = policy._bundle.fleet_context('phx_research_cluster_eks')
+    return reclaim.ReclaimLaunchScope(
+        service_name='service',
+        service_version=1,
+        pool_key=json.dumps(['v2', context['physical_cluster_uid'], 'h200']),
+        service_generation=1,
+        physical_cluster_uid=context['physical_cluster_uid'],
+        kubernetes_context=context['kubernetes_context'],
+        accelerator='h200',
+        accelerator_count=1,
+        projected_admission=_admission(context, 'h200'))
+
+
 def _claim(context: dict,
            accelerator: str,
            *,
@@ -858,6 +874,104 @@ def test_launch_rejects_accelerator_scheduling_mismatch(monkeypatch):
                                 expected_gate_generation=1,
                                 deadline_monotonic=time.monotonic() + 5)
     provider_calls.assert_not_called()
+
+
+@pytest.mark.parametrize('deadline', (True, float('nan'), float('inf')))
+def test_launch_malformed_deadline_is_permanent(monkeypatch, deadline):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    receipt_read = mock.Mock()
+    monkeypatch.setattr(policy, '_attest_launch_context', receipt_read)
+
+    with pytest.raises(reclaim.ReclaimAttestationError) as error:
+        policy.authorize_launch(_launch_scope(policy),
+                                expected_identity=policy.policy_identity(),
+                                expected_gate_generation=1,
+                                deadline_monotonic=deadline)
+
+    assert not isinstance(error.value,
+                          reclaim.ReclaimProviderProofUnavailableError)
+    receipt_read.assert_not_called()
+
+
+def test_launch_expired_finite_deadline_is_transient(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    receipt_read = mock.Mock()
+    monkeypatch.setattr(policy, '_attest_launch_context', receipt_read)
+
+    with pytest.raises(reclaim.ReclaimProviderProofUnavailableError):
+        policy.authorize_launch(_launch_scope(policy),
+                                expected_identity=policy.policy_identity(),
+                                expected_gate_generation=1,
+                                deadline_monotonic=time.monotonic() - 1)
+
+    receipt_read.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ('repository_error', 'transient'),
+    ((reclaim_proofs.ReclaimProviderProofUnavailableError('temporarily down'),
+      True),
+     (reclaim_proofs.ReclaimProviderProofError('malformed row'), False)))
+def test_launch_translates_typed_repository_errors(monkeypatch,
+                                                   repository_error, transient):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    repository = mock.Mock()
+    repository.get_fresh.side_effect = repository_error
+    monkeypatch.setattr(reclaim_proofs, 'ReclaimProviderProofRepository',
+                        mock.Mock(return_value=repository))
+
+    with pytest.raises(reclaim.ReclaimAttestationError) as error:
+        policy._read_launch_context('phx_research_cluster_eks',
+                                    policy.policy_identity(), 1,
+                                    time.monotonic() + 5)
+
+    assert isinstance(error.value,
+                      reclaim.ReclaimProviderProofUnavailableError) is transient
+    assert error.value.__cause__ is repository_error
+
+
+def test_launch_receipt_read_deadline_exhaustion_is_transient(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    repository = mock.Mock()
+    repository.get_fresh.return_value = object()
+    monkeypatch.setattr(reclaim_proofs, 'ReclaimProviderProofRepository',
+                        mock.Mock(return_value=repository))
+    monotonic = mock.Mock(side_effect=(100.0, 102.0))
+    monkeypatch.setattr(policy_lib.time, 'monotonic', monotonic)
+
+    with pytest.raises(reclaim.ReclaimProviderProofUnavailableError):
+        policy._read_launch_context('phx_research_cluster_eks',
+                                    policy.policy_identity(), 1, 101.0)
+
+    repository.get_fresh.assert_called_once()
+
+
+def test_launch_post_decode_deadline_exhaustion_is_transient(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    scope = _launch_scope(policy)
+    context = policy._bundle.fleet_context(scope.kubernetes_context)
+    provider = policy._bundle.provider_context(scope.kubernetes_context)
+    reference = reclaim.ReclaimProviderProofReference(
+        receipt_nonce='c' * 64,
+        proof_sha256='d' * 64,
+        identity=policy.policy_identity(),
+        gate_generation=1,
+        kubernetes_context=scope.kubernetes_context,
+        completed_monotonic=99.0)
+    receipt_read = mock.Mock(return_value=(_context_proof(context, provider),
+                                           reference))
+    monkeypatch.setattr(policy, '_attest_launch_context', receipt_read)
+    monkeypatch.setattr(policy, '_emit_proof', mock.Mock())
+    monkeypatch.setattr(policy_lib.time, 'monotonic',
+                        mock.Mock(side_effect=(100.0, 100.5, 102.0)))
+
+    with pytest.raises(reclaim.ReclaimProviderProofUnavailableError):
+        policy.authorize_launch(scope,
+                                expected_identity=policy.policy_identity(),
+                                expected_gate_generation=1,
+                                deadline_monotonic=101.0)
+
+    receipt_read.assert_called_once()
 
 
 def test_bundle_rejects_overlapping_exact_card_contracts():

@@ -69,6 +69,34 @@ _K8S_KEY = {
     'disk_tier': None,
 }
 
+
+class TestProtocolV2MaterializedLaunchErrorBoundary(unittest.TestCase):
+    """Only a certified pre-effect proof pause survives materialization."""
+
+    def test_preserves_reserved_fill_provider_proof_pause(self):
+        pause = exceptions.ReservedFillProviderProofPausedError(
+            'proof unavailable', 'retry after renewal', retry_wait_seconds=3)
+
+        with self.assertRaises(
+                exceptions.ReservedFillProviderProofPausedError) as raised:
+            with reserved_capacity.protocol_v2_materialized_launch_error_boundary(
+                    True, phase='test effect'):
+                raise pause
+
+        self.assertIs(raised.exception, pause)
+
+    def test_generic_pause_remains_terminal_after_materialization(self):
+        pause = exceptions.ExecutionPausedError('generic pause', 'wait', 3)
+
+        with self.assertRaises(
+                exceptions.ReservedFillLaunchFenceError) as raised:
+            with reserved_capacity.protocol_v2_materialized_launch_error_boundary(
+                    True, phase='test effect'):
+                raise pause
+
+        self.assertIs(raised.exception.__cause__, pause)
+
+
 _PROVIDER_STARTUP_REGRESSION_OPERATION_SECONDS = 0.2
 _PROVIDER_STARTUP_REGRESSION_TIMEOUT_SECONDS = 0.3
 
