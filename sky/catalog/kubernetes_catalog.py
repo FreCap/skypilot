@@ -155,12 +155,24 @@ def _list_accelerators(
     #   function from kubernetes_utils.
     del all_regions, require_price  # Unused.
 
-    # First check if Kubernetes is enabled. This ensures k8s python client is
-    # installed. Do not put any k8s-specific logic before this check.
-    enabled_clouds = sky_check.get_cached_enabled_clouds_or_refresh(
-        cloud.CloudCapability.COMPUTE)
-    if not sky_clouds.cloud_in_iterable(sky_clouds.Kubernetes(),
-                                        enabled_clouds):
+    # Realtime reads of an explicit context already perform an exact-context
+    # credential probe below. Keep their first gate policy-only: long-lived
+    # controller children use an immutable, server-issued config projection
+    # and deliberately do not claim the central PostgreSQL config identity
+    # required by a global credential-cache refresh. Non-realtime and implicit-
+    # context catalog reads retain the cached discovery path, including its
+    # package/credential bootstrap behavior.
+    if realtime and region_filter is not None:
+        allowed_clouds = sky_check.get_workspace_allowed_clouds(
+            capability=cloud.CloudCapability.COMPUTE)
+        kubernetes_enabled = any(
+            name.casefold() == 'kubernetes' for name in allowed_clouds)
+    else:
+        enabled_clouds = sky_check.get_cached_enabled_clouds_or_refresh(
+            cloud.CloudCapability.COMPUTE)
+        kubernetes_enabled = sky_clouds.cloud_in_iterable(
+            sky_clouds.Kubernetes(), enabled_clouds)
+    if not kubernetes_enabled:
         return {}, {}, {}
     kubernetes.raise_if_api_call_deadline_exceeded()
 

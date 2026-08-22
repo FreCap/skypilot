@@ -5437,7 +5437,15 @@ def terminate_services(service_names: list[str] | None, purge: bool,
         else:
             # Send the terminate signal to controller.
             expected_service_hash = service_status.get('hash')
-            lifecycle_lock = get_service_lifecycle_lock(service_name)
+            # Unresolved bound associations retain their admission-time
+            # lifecycle epoch as immutable provenance.  Teardown is fenced by
+            # the same name-scoped advisory lock plus the atomic
+            # SHUTTING_DOWN transition, so retain the live epoch here just as
+            # failed-service purge does.  Advancing it before the transition
+            # would make the service and its unresolved associations
+            # inconsistent at the deferred Serve042 commit guard.
+            lifecycle_lock = get_service_lifecycle_lock(service_name,
+                                                        advance_epoch=False)
             with lifecycle_lock:
                 # Re-read under the same distributed lifecycle fence used by
                 # update/apply. This runs on the controller for named and

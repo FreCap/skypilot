@@ -5,6 +5,7 @@
 import copy
 import dataclasses
 import datetime
+import json
 import time
 from unittest import mock
 import uuid
@@ -1439,6 +1440,88 @@ def test_promotion_before_atomic_teardown_returns_bound_authority(
                 serve_state_schema.services_table.c.name ==
                 service_name)).scalar_one()
     assert status == 'SHUTTING_DOWN'
+
+
+def test_normal_down_retains_epoch_with_unresolved_association(
+        binding_database, monkeypatch, tmp_path) -> None:
+    identity, _ = _admit(binding_database)
+    teardown_incarnation = uuid.uuid4()
+    authority = binding.claim_controller_incarnation(
+        'svc',
+        'svc-hash', (123, '10.0.0.2'),
+        teardown_incarnation,
+        new_parent_owner=(456, '10.0.0.9'))
+    assert authority is not None
+    assert authority.controller_owner_epoch == 7
+    record = {
+        'name': 'svc',
+        'status': serve_statuses.ServiceStatus.READY,
+        'pool': False,
+        'hash': 'svc-hash',
+    }
+    monkeypatch.setattr(serve_utils.global_user_state, 'initialize_and_get_db',
+                        lambda: binding_database)
+    monkeypatch.setattr(serve_state, 'get_glob_service_names',
+                        lambda _names, *, pool: ['svc'])
+    monkeypatch.setattr(serve_utils, '_get_service_status',
+                        lambda *_args, **_kwargs: record)
+    monkeypatch.setattr(serve_utils.maintenance, 'is_controller_hold_active',
+                        lambda: False)
+    monkeypatch.setattr(serve_utils.constants, 'SIGNAL_FILE_PATH',
+                        str(tmp_path / '{}.signal'))
+    signal_path = tmp_path / 'svc.signal'
+
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='parent-owned service'):
+        binding.begin_service_teardown_if_owner('svc', 'svc-hash',
+                                                (123, '10.0.0.2'))
+    record['hash'] = 'same-name-stale-hash'
+    stale_message = serve_utils.terminate_services(['svc'],
+                                                   purge=False,
+                                                   pool=False)
+    assert 'changed incarnation before termination' in stale_message
+    assert not signal_path.exists()
+    with binding_database.connect() as connection:
+        status = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table.c.status).where(
+                serve_state_schema.services_table.c.name ==
+                'svc')).scalar_one()
+    assert status == serve_statuses.ServiceStatus.READY.value
+
+    record['hash'] = 'svc-hash'
+    message = serve_utils.terminate_services(['svc'], purge=False, pool=False)
+
+    assert "Service 'svc' is scheduled to be terminated." in message
+    assert json.loads(signal_path.read_text(encoding='utf-8')) == {
+        'signal': serve_utils.UserSignal.TERMINATE.value,
+        'service_hash': 'svc-hash',
+    }
+    with binding_database.connect() as connection:
+        service = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.services_table.c.status,
+                serve_state_schema.services_table.c.lifecycle_epoch).where(
+                    serve_state_schema.services_table.c.name == 'svc')).one()
+        fence_epoch = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.service_lifecycle_fences_table.c.epoch).
+            where(serve_state_schema.service_lifecycle_fences_table.c.name ==
+                  'svc')).scalar_one()
+        association = connection.execute(
+            sqlalchemy.select(
+                binding.ordinary_launch_associations_table.c.resolution,
+                binding.ordinary_launch_associations_table.c.
+                service_lifecycle_epoch,
+                binding.ordinary_launch_associations_table.c.
+                owner_controller_incarnation,
+                binding.ordinary_launch_associations_table.c.
+                owner_controller_epoch).where(
+                    binding.ordinary_launch_associations_table.c.association_id
+                    == identity.association_id)).one()
+    assert service == (serve_statuses.ServiceStatus.SHUTTING_DOWN.value, 4)
+    assert fence_epoch == 4
+    assert association == (binding.Resolution.BOUND.value, 4,
+                           teardown_incarnation, 7)
 
 
 def test_failed_purge_retains_epoch_before_ambiguous_settlement_and_hash_fence(

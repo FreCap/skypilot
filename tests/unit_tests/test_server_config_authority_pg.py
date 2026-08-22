@@ -1,12 +1,14 @@
 """Real-PostgreSQL contracts for guarded-HA server config authority."""
 # pylint: disable=protected-access,redefined-outer-name
 
+import collections
 import concurrent.futures
 import os
 import pathlib
 import subprocess
 import sys
 import threading
+from unittest import mock
 
 import casbin
 import pytest
@@ -18,6 +20,8 @@ from sky import global_user_state
 from sky import global_user_state_schema
 from sky import models
 from sky import skypilot_config
+from sky.catalog import kubernetes_catalog
+from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.skylet import constants
 from sky.users import permission as permission_lib
 from sky.utils import controller_constants
@@ -952,6 +956,80 @@ def test_install_guarded_child_snapshot_reissues_exact_receipt(
     assert all(os.environ[name] == value for name, value in expected.items())
     skypilot_config.reload_config()
     assert skypilot_config.get_nested(('active_workspace',), None) == 'child'
+
+
+def test_guarded_child_realtime_kubernetes_observation_is_policy_only(
+        config_store, monkeypatch, tmp_path):
+    """A projected child observes its exact context without central CAS."""
+    _seed_authority(
+        config_store, {
+            'active_workspace': 'default',
+            'allowed_clouds': ['kubernetes'],
+            'workspaces': {
+                'default': {},
+            },
+        })
+    child_path = tmp_path / 'serve-child.yaml'
+    child_path.write_text(
+        'active_workspace: default\n'
+        'allowed_clouds:\n'
+        '  - kubernetes\n'
+        'workspaces:\n'
+        '  default: {}\n',
+        encoding='utf-8')
+    monkeypatch.setenv(constants.IS_SKYPILOT_SERVE_CONTROLLER, 'true')
+    for name in (
+            skypilot_config.ENV_VAR_SKYPILOT_CONFIG,
+            skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_KIND,
+            skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_PATH,
+            skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_DIGEST,
+            skypilot_config.ENV_VAR_INTERNAL_CONFIG_SNAPSHOT_IDENTITY,
+    ):
+        monkeypatch.setenv(name, 'test-placeholder')
+    child_config = skypilot_config.parse_and_validate_config_file(
+        str(child_path))
+    skypilot_config.install_internal_config_snapshot(child_config,
+                                                     str(child_path))
+    with pytest.raises(RuntimeError,
+                       match='No PostgreSQL server-config identity'):
+        skypilot_config.get_loaded_server_config_identity()
+
+    node = mock.MagicMock()
+    node.metadata.name = 'gpu-node'
+    node.metadata.labels = {
+        'cloud.google.com/gke-accelerator': 'nvidia-h100-80gb',
+    }
+    node.status.allocatable = {'nvidia.com/gpu': '8'}
+    node.is_ready.return_value = True
+    node.is_cordoned.return_value = False
+    node.get_taints.return_value = []
+    monkeypatch.setattr(
+        kubernetes_catalog.sky_check, 'get_cached_enabled_clouds_or_refresh',
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError('realtime observation entered global discovery')))
+    monkeypatch.setattr(kubernetes_utils, 'check_credentials',
+                        lambda *_args, **_kwargs: (True, None))
+    monkeypatch.setattr(kubernetes_utils, 'detect_accelerator_resource',
+                        lambda _context: True)
+    monkeypatch.setattr(
+        kubernetes_utils, 'detect_gpu_label_formatter', lambda _context:
+        (kubernetes_utils.GKELabelFormatter(), None))
+    monkeypatch.setattr(kubernetes_utils, 'get_kubernetes_nodes_uncached',
+                        lambda *, context: [node])
+    monkeypatch.setattr(kubernetes_utils, 'get_allocated_gpu_qty_by_node',
+                        lambda *, context: collections.defaultdict(int))
+    monkeypatch.setattr(kubernetes_utils, 'get_gpu_resource_key',
+                        lambda _context: 'nvidia.com/gpu')
+
+    _, capacity, available = (kubernetes_catalog.list_accelerators_realtime(
+        gpus_only=True,
+        name_filter=None,
+        region_filter='east',
+        quantity_filter=None,
+        require_price=False))
+
+    assert capacity == {'H100': 8}
+    assert available == {'H100': 8}
 
 
 def test_002_migration_backfills_retained_identity(config_store):
