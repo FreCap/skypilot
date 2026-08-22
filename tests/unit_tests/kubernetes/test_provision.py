@@ -85,10 +85,10 @@ def _make_provision_config(count):
 
 
 @pytest.mark.parametrize(('protocol_version', 'scratch', 'message'), [
-    (3, None, 'v3/v4 requires the complete worker scratch'),
+    (3, None, 'v3/v4/v5 requires the complete worker scratch'),
     (2, {
         'kind': 'none'
-    }, 'Only projection protocol v3/v4'),
+    }, 'Only projection protocol v3/v4/v5'),
     (3, {
         'kind': 'memory',
         'size_limit_bytes': 1024,
@@ -111,9 +111,9 @@ def test_create_pods_rejects_invalid_worker_scratch_provider_contract(
 
 
 @pytest.mark.parametrize(('protocol_version', 'bootstrap_sha256', 'message'), [
-    (4, None, 'v4 requires the complete worker runtime bootstrap'),
+    (4, None, 'v4/v5 requires the complete worker runtime bootstrap'),
     (4, 'A' * 64, '64 lowercase hexadecimal'),
-    (3, '0' * 64, 'Only projection protocol v4'),
+    (3, '0' * 64, 'Only projection protocol v4/v5'),
 ])
 def test_create_pods_rejects_invalid_worker_runtime_bootstrap_contract(
         monkeypatch, protocol_version, bootstrap_sha256, message):

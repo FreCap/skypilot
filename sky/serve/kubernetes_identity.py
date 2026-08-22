@@ -57,9 +57,9 @@ _WORKER_KUEUE_ADMISSION_KEYS = frozenset(
     {'local_queue_name', 'workload_priority_class_name'})
 _WORKER_V2_KEYS = (_WORKER_V1_KEYS | frozenset(
     {'projection_version', 'kueue_admission', 'scheduler_name'}))
-_WORKER_V3_V4_KEYS = (_WORKER_V2_KEYS |
+_WORKER_V3_V5_KEYS = (_WORKER_V2_KEYS |
                       frozenset({'provision_timeout', 'scratch'}))
-_WORKER_V3_V4_PROTOCOL_VERSIONS = frozenset({3, 4})
+_WORKER_V3_V5_PROTOCOL_VERSIONS = frozenset({3, 4, 5})
 _ACCELERATOR_SCHEDULING_KEYS = frozenset(
     {'label_key', 'label_values', 'resource_key'})
 _MAX_ACCELERATOR_LABEL_VALUES = 16
@@ -426,10 +426,10 @@ def worker_projection_protocol_version(projection: Mapping[str, Any]) -> int:
     Protocol v1 intentionally has no discriminator.  Its old exact key set is
     the only implicit-v1 shape accepted during the ordinary-launch transition.
     Protocol v2 remains an isolated decoder for already-committed rows.
-    Protocols v3 and v4 intentionally share one closed key set: v3 retains its
-    historical Running-only provisioning semantics, while v4 requires
-    UID-bound runtime readiness.  New rows carry the explicit v4
-    discriminator.
+    Protocols v3-v5 intentionally share one closed key set: v3 retains its
+    historical Running-only provisioning semantics, v4 requires UID-bound
+    runtime readiness, and v5 also binds bootstrap writes to projected
+    memory-backed scratch. New rows carry the explicit v5 discriminator.
     """
     if not isinstance(projection, Mapping):
         raise ValueError('Worker placement projection must be a mapping.')
@@ -442,19 +442,19 @@ def worker_projection_protocol_version(projection: Mapping[str, Any]) -> int:
             raise ValueError('Worker placement projection_version must be '
                              'exactly 2 for the protocol-v2 key set.')
         return 2
-    if keys == _WORKER_V3_V4_KEYS:
+    if keys == _WORKER_V3_V5_KEYS:
         projection_version = projection['projection_version']
         if (type(projection_version) is not int or
-                projection_version not in _WORKER_V3_V4_PROTOCOL_VERSIONS):
+                projection_version not in _WORKER_V3_V5_PROTOCOL_VERSIONS):
             raise ValueError('Worker placement projection_version must be '
-                             'exactly 3 or 4 for the '
-                             'protocol-v3/v4 key set.')
+                             'exactly 3, 4, or 5 for the '
+                             'protocol-v3/v4/v5 key set.')
         return projection_version
     raise ValueError(
         'Worker placement projection must contain exactly the protocol-v1 '
         f'keys {sorted(_WORKER_V1_KEYS)!r} or protocol-v2 keys '
-        f'{sorted(_WORKER_V2_KEYS)!r} or protocol-v3/v4 keys '
-        f'{sorted(_WORKER_V3_V4_KEYS)!r}.')
+        f'{sorted(_WORKER_V2_KEYS)!r} or protocol-v3/v4/v5 keys '
+        f'{sorted(_WORKER_V3_V5_KEYS)!r}.')
 
 
 def worker_projection_has_strict_admission(
@@ -666,7 +666,7 @@ def worker_projection_sha256(projection: Mapping[str, Any]) -> str:
             serve_worker_projection_protocol_has_strict_admission)(
                 worker_projection_protocol_version(validated[0])):
         raise ValueError(
-            'Worker projection digest requires protocol 2, 3, or 4.')
+            'Worker projection digest requires protocol 2, 3, 4, or 5.')
     canonical_json = json.dumps(validated[0],
                                 sort_keys=True,
                                 separators=(',', ':'),
@@ -1375,7 +1375,7 @@ def cache_environment(projection: dict[str, Any]) -> dict[str, str]:
 
 
 def scratch_environment(projection: dict[str, Any]) -> dict[str, str]:
-    """Return server-owned runtime scratch environment for one v3/v4 worker."""
+    """Return server-owned runtime scratch environment for one v3-v5 worker."""
     if not kubernetes_pod_spec.serve_worker_projection_protocol_has_scratch(
             worker_projection_protocol_version(projection)):
         return {}
@@ -1387,6 +1387,17 @@ def scratch_environment(projection: dict[str, Any]) -> dict[str, str]:
     env[f'{SCRATCH_ENV_PREFIX}SIZE_LIMIT_BYTES'] = str(
         scratch['size_limit_bytes'])
     return env
+
+
+def bootstrap_environment(projection: dict[str, Any]) -> dict[str, str]:
+    """Return server-owned scratch paths for one protocol-v5 bootstrap."""
+    projection_version = worker_projection_protocol_version(projection)
+    scratch: object = {'kind': 'none'}
+    if kubernetes_pod_spec.serve_worker_projection_protocol_has_scratch(
+            projection_version):
+        scratch = projection['scratch']
+    return kubernetes_pod_spec.projected_worker_bootstrap_environment(
+        projection_version, scratch)
 
 
 def controller_cache_environment(projection: dict[str, Any]) -> dict[str, str]:

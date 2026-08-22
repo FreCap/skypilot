@@ -817,6 +817,12 @@ class Kubernetes(clouds.Cloud):
             kubernetes_pod_spec.
             serve_worker_projection_protocol_has_runtime_readiness(
                 projection_version))
+        projected_worker_bootstrap_environment: dict[str, str] = {}
+        if worker_placement_projection is not None:
+            projected_worker_bootstrap_environment = (
+                kubernetes_pod_spec.projected_worker_bootstrap_environment(
+                    projection_version,
+                    worker_placement_projection.get('scratch')))
         if projection_version is not None and not has_strict_worker_admission:
             # Protocol v1 has no on-wire marker. An explicit version here is a
             # malformed request rather than a supported v1 projection.
@@ -841,6 +847,7 @@ class Kubernetes(clouds.Cloud):
         # are set separately when the task is run. These env vars are
         # independent of the SkyPilot task to be run.
         k8s_env_vars = {kubernetes.IN_CLUSTER_CONTEXT_NAME_ENV_VAR: context}
+        k8s_env_vars.update(projected_worker_bootstrap_environment)
 
         # Setup GPU/TPU labels and resource keys.
         k8s_acc_label_key = None
@@ -1147,6 +1154,9 @@ class Kubernetes(clouds.Cloud):
             'k8s_namespace': namespace,
             'k8s_host_network': k8s_host_network,
             'k8s_projected_serve_worker_runtime_readiness': has_projected_runtime_readiness,
+            'k8s_projected_worker_bootstrap_environment': projected_worker_bootstrap_environment,
+            'k8s_projected_worker_bootstrap_env_marker':
+                kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENV_MARKER,
             'k8s_projected_worker_runtime_ready_marker':
                 kubernetes_pod_spec.SERVE_WORKER_RUNTIME_READY_MARKER,
         }

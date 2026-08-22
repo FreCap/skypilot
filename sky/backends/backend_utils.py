@@ -943,7 +943,9 @@ def _enforce_worker_scratch_on_pod_spec(
 
 
 def _projected_worker_runtime_bootstrap_sha256_for_cluster_yaml(
-        cluster_yaml: dict[str, Any]) -> str:
+    cluster_yaml: dict[str, Any],
+    expected_bootstrap_environment: dict[str, str],
+) -> str:
     """Freeze the one canonical bootstrap shared by projected node types."""
     node_types = cluster_yaml.get('available_node_types')
     if not isinstance(node_types, dict) or not node_types:
@@ -960,6 +962,8 @@ def _projected_worker_runtime_bootstrap_sha256_for_cluster_yaml(
             node_config = node_type.get('node_config')
             pod_spec = (node_config.get('spec') if isinstance(
                 node_config, dict) else None)
+            k8s_pod_spec.validate_projected_worker_bootstrap_environment(
+                pod_spec, expected_bootstrap_environment)
             digests.add(
                 k8s_pod_spec.projected_worker_runtime_bootstrap_sha256(
                     pod_spec))
@@ -1033,7 +1037,7 @@ def _enforce_worker_projection_on_kubernetes_yaml(
     else:
         if expected_runtime_bootstrap_sha256 is not None:
             raise exceptions.InvalidCloudConfigs(
-                'Only projection protocol v4 may carry a worker runtime '
+                'Only projection protocol v4/v5 may carry a worker runtime '
                 'bootstrap SHA256 contract.')
         cluster_yaml['provider'].pop(
             'serve_worker_expected_runtime_bootstrap_sha256', None)
@@ -1091,6 +1095,7 @@ def _enforce_worker_projection_on_kubernetes_yaml(
     cache = projection['cache']
     cache_env = kubernetes_identity.cache_environment(projection)
     scratch_env = kubernetes_identity.scratch_environment(projection)
+    bootstrap_env = kubernetes_identity.bootstrap_environment(projection)
     for node_type in cluster_yaml['available_node_types'].values():
         node_config = node_type['node_config']
         if has_strict_admission:
@@ -1265,21 +1270,28 @@ def _enforce_worker_projection_on_kubernetes_yaml(
             _enforce_worker_scratch_on_pod_spec(pod_spec, projection['scratch'])
         if has_projected_runtime_readiness:
             assert isinstance(expected_runtime_bootstrap_sha256, str)
+            try:
+                k8s_pod_spec.validate_projected_worker_bootstrap_environment(
+                    pod_spec, bootstrap_env)
+            except k8s_pod_spec.ProjectedRuntimeReadinessContractError as error:
+                raise exceptions.InvalidCloudConfigs(str(error)) from error
             _enforce_worker_runtime_readiness_on_pod_spec(
                 pod_spec, expected_runtime_bootstrap_sha256)
 
 
 def _finalize_authenticated_worker_projection_on_kubernetes_yaml(
         cluster_yaml: dict[str, Any], projection: dict[str, Any]) -> bool:
-    """Freeze the exact v4 bootstrap after trusted SSH-key rendering."""
+    """Freeze the exact v4/v5 bootstrap after trusted SSH-key rendering."""
     projection_version = (
         kubernetes_identity.worker_projection_protocol_version(projection))
     if not k8s_pod_spec.serve_worker_projection_protocol_has_runtime_readiness(
             projection_version):
         return False
+    bootstrap_environment = kubernetes_identity.bootstrap_environment(
+        projection)
     authenticated_bootstrap_sha256 = (
         _projected_worker_runtime_bootstrap_sha256_for_cluster_yaml(
-            cluster_yaml))
+            cluster_yaml, bootstrap_environment))
     _enforce_worker_projection_on_kubernetes_yaml(
         cluster_yaml,
         projection,
@@ -1974,7 +1986,9 @@ def write_cluster_config(
             # bootstrap instead of trusting code that was merged afterward.
             expected_runtime_bootstrap_sha256 = (
                 _projected_worker_runtime_bootstrap_sha256_for_cluster_yaml(
-                    cluster_yaml_obj))
+                    cluster_yaml_obj,
+                    kubernetes_identity.bootstrap_environment(
+                        worker_projection)))
         combined_yaml_obj = kubernetes_utils.combine_pod_config_fields_and_metadata(
             cluster_yaml_obj,
             cluster_config_overrides=cluster_config_overrides,

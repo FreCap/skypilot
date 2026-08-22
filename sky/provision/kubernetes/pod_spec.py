@@ -23,13 +23,21 @@ from sky.utils import config_utils
 
 PodRole = Literal['head', 'worker']
 
-SERVE_WORKER_PROJECTION_PROTOCOL_VERSION = 4
-_SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({1, 2, 3, 4})
-_STRICT_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({2, 3, 4})
-_SCRATCH_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({3, 4})
-_RUNTIME_READY_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({4})
+SERVE_WORKER_PROJECTION_PROTOCOL_VERSION = 5
+_SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
+    {1, 2, 3, 4, 5})
+_STRICT_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({2, 3, 4, 5})
+_SCRATCH_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({3, 4, 5})
+_RUNTIME_READY_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({4, 5})
+_SCRATCH_BOOTSTRAP_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({5})
 SERVE_WORKER_SCRATCH_MOUNT_PATH = '/tmp'
 SERVE_WORKER_SCRATCH_VOLUME_NAME = 'skypilot-serve-worker-tmp'
+SERVE_WORKER_BOOTSTRAP_ENV_MARKER = 'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V5'
+SERVE_WORKER_BOOTSTRAP_ENVIRONMENT = {
+    'SKY_RUNTIME_DIR': '/tmp/.skypilot-runtime/root',
+    'UV_CACHE_DIR': '/tmp/.skypilot-runtime/uv-cache',
+    'UV_PYTHON_INSTALL_DIR': '/tmp/.skypilot-runtime/uv-python',
+}
 SERVE_WORKER_RUNTIME_READY_MARKER = ('/tmp/skypilot-serve-worker-runtime-ready')
 SERVE_WORKER_RUNTIME_READY_POD_UID_ENV_VAR = 'SKYPILOT_POD_UID'
 # The startup probe starts only after image pull and container creation.  This
@@ -114,7 +122,7 @@ def validate_serve_worker_projection_protocol_version(
     if (type(value) is not int or
             value not in _SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS):
         raise ValueError('SkyServe worker projection protocol version must be '
-                         '1, 2, 3, or 4.')
+                         '1, 2, 3, 4, or 5.')
     return value
 
 
@@ -149,8 +157,16 @@ def serve_worker_projection_protocol_has_runtime_readiness(
     return version in _RUNTIME_READY_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS
 
 
+def serve_worker_projection_protocol_has_scratch_bootstrap(
+        value: object) -> bool:
+    """Whether memory scratch owns SkyPilot and uv bootstrap writes."""
+    version = validate_serve_worker_projection_protocol_version(value,
+                                                                allow_none=True)
+    return version in _SCRATCH_BOOTSTRAP_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS
+
+
 def validate_projected_worker_provision_timeout(value: object) -> int:
-    """Validate the closed v3/v4 provisioning-wait contract."""
+    """Validate the closed v3-v5 provisioning-wait contract."""
     if type(value) is not int or value < -1:
         raise ValueError('Projected worker provision_timeout must be -1 or a '
                          'non-negative integer.')
@@ -204,6 +220,23 @@ def validate_projected_worker_scratch(value: object) -> dict[str, object]:
         'mount_path': SERVE_WORKER_SCRATCH_MOUNT_PATH,
         'volume_name': SERVE_WORKER_SCRATCH_VOLUME_NAME,
         'size_limit_bytes': size_limit_bytes,
+    }
+
+
+def projected_worker_bootstrap_environment(
+    projection_version: object,
+    scratch: object,
+) -> dict[str, str]:
+    """Return exact scratch-backed paths for one projection generation."""
+    if not serve_worker_projection_protocol_has_scratch_bootstrap(
+            projection_version):
+        return {}
+    expected_scratch = validate_projected_worker_scratch(scratch)
+    if expected_scratch['kind'] == 'none':
+        return {}
+    return {
+        key: SERVE_WORKER_BOOTSTRAP_ENVIRONMENT[key]
+        for key in sorted(SERVE_WORKER_BOOTSTRAP_ENVIRONMENT)
     }
 
 
@@ -749,12 +782,103 @@ def _projected_worker_runtime_bootstrap_identity(
             'Projected SkyServe worker bootstrap args must contain exactly '
             'one non-empty canonical script.')
     lifecycle = _pod_api_field(runtime, 'lifecycle', 'lifecycle')
-    return {
+    identity: dict[str, object] = {
         'command': list(command),
         'args': list(args),
         'lifecycle': _canonicalize_projected_worker_runtime_bootstrap_value(
             lifecycle, 'ray-node.lifecycle'),
     }
+    if SERVE_WORKER_BOOTSTRAP_ENV_MARKER in args[0]:
+        env = _pod_api_field(runtime, 'env', 'env')
+        if not isinstance(env, (list, tuple)):
+            raise ProjectedRuntimeReadinessContractError(
+                'Projected SkyServe worker scratch bootstrap environment '
+                'must be a list.')
+        owned_environment = []
+        for entry in env:
+            if (_pod_api_field(entry, 'name', 'name')
+                    not in SERVE_WORKER_BOOTSTRAP_ENVIRONMENT):
+                continue
+            owned_environment.append(
+                _canonicalize_projected_worker_runtime_bootstrap_value(
+                    entry, 'ray-node.env[]'))
+        owned_environment.sort(key=lambda entry: json.dumps(
+            entry, sort_keys=True, separators=(',', ':'), ensure_ascii=True))
+        identity['scratch_bootstrap_environment'] = owned_environment
+    return identity
+
+
+def validate_projected_worker_bootstrap_environment(
+    pod_spec: object,
+    expected_environment: object,
+) -> dict[str, str]:
+    """Require exact Pod env and in-script exports for scratch bootstrap."""
+    if not isinstance(expected_environment, Mapping):
+        raise ProjectedRuntimeReadinessContractError(
+            'Projected worker bootstrap environment must be a mapping.')
+    expected = dict(expected_environment)
+    if expected not in ({}, SERVE_WORKER_BOOTSTRAP_ENVIRONMENT):
+        raise ProjectedRuntimeReadinessContractError(
+            'Projected worker bootstrap environment must be empty or the '
+            'exact server-owned scratch paths.')
+    containers = _pod_api_field(pod_spec, 'containers', 'containers')
+    if not isinstance(containers, (list, tuple)):
+        containers = []
+    runtimes = [
+        container for container in containers
+        if _pod_api_field(container, 'name', 'name') == 'ray-node'
+    ]
+    if len(runtimes) != 1:
+        raise ProjectedRuntimeReadinessContractError(
+            'Projected SkyServe Kubernetes Pods must contain exactly one '
+            'ray-node bootstrap producer.')
+    runtime = runtimes[0]
+    args = _pod_api_field(runtime, 'args', 'args')
+    if (not isinstance(args, (list, tuple)) or len(args) != 1 or
+            not isinstance(args[0], str)):
+        raise ProjectedRuntimeReadinessContractError(
+            'Projected SkyServe worker bootstrap args must contain exactly '
+            'one canonical script.')
+    script = args[0]
+    if not expected:
+        if SERVE_WORKER_BOOTSTRAP_ENV_MARKER in script:
+            raise ProjectedRuntimeReadinessContractError(
+                'Historical or scratch-free workers cannot carry the '
+                'protocol-v5 scratch bootstrap marker.')
+        return {}
+    marker_line = f'# {SERVE_WORKER_BOOTSTRAP_ENV_MARKER}'
+    if script.count(marker_line) != 1:
+        raise ProjectedRuntimeReadinessContractError(
+            'Protocol-v5 scratch bootstrap must carry one exact marker.')
+    marker_offset = script.index(marker_line)
+    env = _pod_api_field(runtime, 'env', 'env')
+    if not isinstance(env, (list, tuple)):
+        raise ProjectedRuntimeReadinessContractError(
+            'Protocol-v5 scratch bootstrap environment must be a list.')
+    observed_entries = []
+    for entry in env:
+        if _pod_api_field(entry, 'name', 'name') not in expected:
+            continue
+        observed_entries.append(
+            _canonicalize_projected_worker_runtime_bootstrap_value(
+                entry, 'ray-node.env[]'))
+    observed_entries.sort(key=lambda entry: json.dumps(
+        entry, sort_keys=True, separators=(',', ':'), ensure_ascii=True))
+    expected_entries = [{
+        'name': key,
+        'value': expected[key],
+    } for key in sorted(expected)]
+    if observed_entries != expected_entries:
+        raise ProjectedRuntimeReadinessContractError(
+            'Protocol-v5 scratch bootstrap Pod environment differs from the '
+            'exact server-owned paths.')
+    for key, value in expected.items():
+        export = f'export {key}={json.dumps(value)}'
+        if script.count(export) != 1 or script.index(export) < marker_offset:
+            raise ProjectedRuntimeReadinessContractError(
+                'Protocol-v5 scratch bootstrap script must re-export every '
+                'exact server-owned path once after its post-runcmd marker.')
+    return {key: expected[key] for key in sorted(expected)}
 
 
 def projected_worker_runtime_bootstrap_sha256(pod_spec: object) -> str:

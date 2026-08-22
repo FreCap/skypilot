@@ -246,6 +246,8 @@ def _apply_service_worker_runtime_projection_to_task(
             'placement.')
     has_projected_scratch = (
         kubernetes_identity.worker_projection_has_scratch(projection))
+    bootstrap_environment = kubernetes_identity.bootstrap_environment(
+        projection)
     for task_environment in (task.envs, task.secrets):
         for key in list(task_environment):
             if key == kubernetes_identity.CACHE_ENV_VAR or key.startswith(
@@ -255,9 +257,12 @@ def _apply_service_worker_runtime_projection_to_task(
                   (key == kubernetes_identity.SCRATCH_ENV_VAR or
                    key.startswith(kubernetes_identity.SCRATCH_ENV_PREFIX))):
                 task_environment.pop(key)
+            elif key in bootstrap_environment:
+                task_environment.pop(key)
     task.update_envs({
         **kubernetes_identity.cache_environment(projection),
         **kubernetes_identity.scratch_environment(projection),
+        **bootstrap_environment,
     })
 
 

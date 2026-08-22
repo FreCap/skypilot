@@ -187,7 +187,8 @@ def is_serve_controller_api_request(method: str, path: str) -> bool:
 # require the exact advertised placement_projection_protocol_version; API 79
 # advanced new writes to protocol 3 with typed worker scratch. Protocol 4 uses
 # the same response shape and advances projected workers to UID-bound runtime
-# readiness.
+# readiness. Protocol 5 retains that shape and binds bootstrap write roots to
+# the projected memory-backed scratch contract.
 MIN_SERVE_PLACEMENT_PROJECTION_API_VERSION = 77
 
 # Kubernetes node info includes the SkyServe-attributed subset of preemptible
