@@ -2,6 +2,7 @@
 import atexit
 from collections.abc import Callable
 import dataclasses
+import importlib.metadata
 import os
 import shutil
 import sys
@@ -66,6 +67,7 @@ def _rotate_daemon_log(log_path: str) -> None:
 #
 # Initializing inside run_event, before the override, threads the needle.
 _user_disabled_usage_collection: bool | None = None
+_reserved_fill_reclaim_proof_executor = None
 
 
 def _default_should_skip():
@@ -81,6 +83,7 @@ class RuntimeDaemon:
     event_fn: Callable[[], None]
     default_log_level: str = 'INFO'
     should_skip: Callable[[], bool] = _default_should_skip
+    fail_stop_on_unexpected_exit: bool = False
 
     def refresh_log_level(self) -> int:
         # pylint: disable=import-outside-toplevel
@@ -424,6 +427,95 @@ def expired_token_cleanup_event():
     time.sleep(interval)
 
 
+def _park_reclaim_provider_proof_owner(error: BaseException) -> None:
+    """Retain the poisoned deployment owner after an unproved family."""
+    logger.critical(
+        'Reserved-fill provider renewal lost exact process-family proof; '
+        'parking its PostgreSQL singleton permanently. Recovery requires a '
+        'full controller Pod/container recycle: '
+        f'{error!r}')
+    # The inner warden and handler each lead a separate session, so terminating
+    # only this runtime daemon's process group would not prove their absence.
+    # Keep this process and its poisoned executor alive.  Its supervisor keeps
+    # awaiting this leader under the retained distributed-singleton session.
+    # Never return into retryable RuntimeDaemon.run_event.
+    while True:
+        time.sleep(3600)
+
+
+def _close_reserved_fill_reclaim_proof_executor() -> None:
+    global _reserved_fill_reclaim_proof_executor
+    executor = _reserved_fill_reclaim_proof_executor
+    _reserved_fill_reclaim_proof_executor = None
+    if executor is None:
+        return
+    # pylint: disable=import-outside-toplevel
+    from sky.serve import reserved_capacity
+    reserved_capacity.shutdown_reclaim_provider_proof_boundary(executor)
+
+
+atexit.register(_close_reserved_fill_reclaim_proof_executor)
+
+
+def reserved_fill_reclaim_proof_renewal_event() -> None:
+    """Run one context-wide renewal from the deployment singleton."""
+    # pylint: disable=import-outside-toplevel
+    from sky.serve import reserved_capacity
+    from sky.server.requests import process as request_process
+
+    try:
+        global _reserved_fill_reclaim_proof_executor
+        if _reserved_fill_reclaim_proof_executor is None:
+            _reserved_fill_reclaim_proof_executor = (
+                request_process.DisposableExecutor(max_workers=1))
+        reserved_capacity.renew_reclaim_provider_proofs_in_boundary(
+            _reserved_fill_reclaim_proof_executor)
+    except (request_process.AmbiguousBoundaryError,
+            request_process.BoundaryShutdownPendingError) as error:
+        # No poison callback blocks the boundary monitor: it remains free to
+        # publish its typed failure and close local records independently while
+        # this event owner parks forever. The retained executor can neither
+        # admit work nor be replaced in this process.
+        _park_reclaim_provider_proof_owner(error)
+    except Exception as error:  # pylint: disable=broad-except
+        logger.error('Reserved-fill reclaim-proof renewal failed closed: '
+                     f'{common_utils.format_exception(error)}')
+    finally:
+        time.sleep(reserved_capacity.reserved_fill_reclaim_attestation.
+                   PROVIDER_PROOF_RENEW_INTERVAL_SECONDS)
+
+
+def should_skip_reserved_fill_reclaim_proof_renewal() -> bool:
+    """Select the PostgreSQL daemon when a reclaim policy is installed."""
+    # pylint: disable=import-outside-toplevel
+    from sky.serve import reserved_fill_reclaim_attestation as reclaim
+    from sky.serve import serve_state_schema
+    if serve_state_schema.get_database_engine().dialect.name != 'postgresql':
+        # Sequenced central authority and distributed singleton ownership are
+        # PostgreSQL-only, regardless of which optional packages are present.
+        return True
+    try:
+        discovered = importlib.metadata.entry_points()
+        entries = tuple(
+            discovered.select(group=reclaim.POLICY_ENTRY_POINT_GROUP))
+    except Exception as error:  # pylint: disable=broad-except
+        # Discovery uncertainty is not permission to omit a correctness owner.
+        logger.error('Could not discover the reserved-fill reclaim policy; '
+                     'starting its renewal daemon fail-closed: '
+                     f'{common_utils.format_exception(error)}')
+        return False
+    if entries:
+        # Exactly one entry point is validated inside each active boundary.
+        # Multiple entries must start and fail visibly rather than silently
+        # omitting the only durable renewal owner.
+        return False
+    # Package installation is immutable for one controller leadership term.
+    # A later policy installation therefore requires a rollout, which reruns
+    # this selector before activation. An active gate with a missing package
+    # has no renewable receipt and remains fail closed at every consumer.
+    return True
+
+
 def server_heartbeat_event():
     """Periodically send server-side plugin metrics to Loki."""
     # pylint: disable=import-outside-toplevel
@@ -477,6 +569,12 @@ RUNTIME_DAEMONS = [
         name=request_names.RequestName.REQUEST_DAEMON_POOL_STATUS_REFRESH,
         event_fn=pool_status_refresh_event,
         should_skip=should_skip_pool_status_refresh),
+    RuntimeDaemon(id='reserved-fill-reclaim-proof-renewal-daemon',
+                  name=(request_names.RequestName.
+                        REQUEST_DAEMON_RESERVED_FILL_RECLAIM_PROOF_RENEWAL),
+                  event_fn=reserved_fill_reclaim_proof_renewal_event,
+                  should_skip=should_skip_reserved_fill_reclaim_proof_renewal,
+                  fail_stop_on_unexpected_exit=True),
     RuntimeDaemon(
         id='server-heartbeat-daemon',
         name=request_names.RequestName.REQUEST_DAEMON_SERVER_HEARTBEAT,

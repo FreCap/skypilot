@@ -1,14 +1,64 @@
 """Tests for sky.server.daemons."""
+# pylint: disable=protected-access
 import os
+import pathlib
+import signal
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 from unittest import mock
 
 import pytest
 
 from sky import skypilot_config
 from sky.serve import constants as serve_constants
+from sky.serve import reserved_capacity
+from sky.serve import serve_state_schema
 from sky.server import daemons
+from sky.server.requests import process as request_process
+
+
+def _wait_until(predicate, timeout=20):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _wait_for_direct_child(parent, timeout=20):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for pid in request_process._direct_child_pids(parent.pid):
+            try:
+                return request_process.ProcessIdentity(
+                    pid, request_process._read_process_start_time_ticks(pid))
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        time.sleep(0.02)
+    raise TimeoutError(f'PID {parent.pid} did not publish a direct child')
+
+
+def _stubborn_renewal_family(handler_ready_path, child_pid_path):
+    child = subprocess.Popen(  # pylint: disable=consider-using-with
+        [
+            sys.executable, '-c', 'import signal,time; '
+            'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+            'time.sleep(300)'
+        ],
+        start_new_session=True)
+    pathlib.Path(child_pid_path).write_text(str(child.pid), encoding='utf-8')
+    pathlib.Path(handler_ready_path).touch()
+    del child
+    while True:
+        time.sleep(1)
+
+
+def _successful_renewal():
+    return True
 
 
 def _mock_get_nested(max_bytes):
@@ -21,6 +71,324 @@ def _mock_get_nested(max_bytes):
         return original(keys, default)
 
     return patched
+
+
+def test_reclaim_proof_daemon_owns_renewal_during_controller_hold(monkeypatch):
+    monkeypatch.setenv(serve_constants.SERVE_CONTROLLER_HOLD_ENV_VAR, 'true')
+    monkeypatch.setattr(daemons, '_reserved_fill_reclaim_proof_executor', None)
+    executor = mock.Mock()
+    executor_factory = mock.Mock(return_value=executor)
+    monkeypatch.setattr(request_process, 'DisposableExecutor', executor_factory)
+    renew = mock.Mock()
+    monkeypatch.setattr(reserved_capacity,
+                        'renew_reclaim_provider_proofs_in_boundary', renew)
+    sleep = mock.Mock()
+    monkeypatch.setattr(daemons.time, 'sleep', sleep)
+
+    daemons.reserved_fill_reclaim_proof_renewal_event()
+
+    executor_factory.assert_called_once_with(max_workers=1)
+    renew.assert_called_once_with(executor)
+    sleep.assert_called_once_with(
+        reserved_capacity.reserved_fill_reclaim_attestation.
+        PROVIDER_PROOF_RENEW_INTERVAL_SECONDS)
+
+
+def test_reclaim_proof_daemon_checks_inactive_gate_inside_boundary(monkeypatch):
+    monkeypatch.setattr(daemons, '_reserved_fill_reclaim_proof_executor', None)
+    executor = mock.Mock()
+    executor_factory = mock.Mock(return_value=executor)
+    monkeypatch.setattr(request_process, 'DisposableExecutor', executor_factory)
+    renew = mock.Mock(return_value=False)
+    monkeypatch.setattr(reserved_capacity,
+                        'renew_reclaim_provider_proofs_in_boundary', renew)
+    monkeypatch.setattr(daemons.time, 'sleep', mock.Mock())
+
+    daemons.reserved_fill_reclaim_proof_renewal_event()
+
+    executor_factory.assert_called_once()
+    renew.assert_called_once_with(executor)
+
+
+def test_reclaim_proof_daemon_renews_beyond_receipt_ttl(monkeypatch):
+    monkeypatch.setattr(daemons, '_reserved_fill_reclaim_proof_executor', None)
+    executor = mock.Mock()
+    executor_factory = mock.Mock(return_value=executor)
+    monkeypatch.setattr(request_process, 'DisposableExecutor', executor_factory)
+    renew = mock.Mock()
+    monkeypatch.setattr(reserved_capacity,
+                        'renew_reclaim_provider_proofs_in_boundary', renew)
+    elapsed = 0.0
+
+    def advance(interval):
+        nonlocal elapsed
+        elapsed += interval
+
+    monkeypatch.setattr(daemons.time, 'sleep', advance)
+    interval = (reserved_capacity.reserved_fill_reclaim_attestation.
+                PROVIDER_PROOF_RENEW_INTERVAL_SECONDS)
+    iterations = int(reserved_capacity.reserved_fill_reclaim_attestation.
+                     PROVIDER_PROOF_MAX_AGE_SECONDS / interval) + 1
+
+    for _ in range(iterations):
+        daemons.reserved_fill_reclaim_proof_renewal_event()
+
+    assert elapsed > (reserved_capacity.reserved_fill_reclaim_attestation.
+                      PROVIDER_PROOF_MAX_AGE_SECONDS)
+    assert renew.call_args_list == [mock.call(executor)] * iterations
+    executor_factory.assert_called_once()
+
+
+def test_reclaim_proof_daemon_skips_zero_entrypoint_deployment(monkeypatch):
+    discovered = mock.Mock()
+    discovered.select.return_value = ()
+    monkeypatch.setattr(daemons.importlib.metadata, 'entry_points',
+                        lambda: discovered)
+    engine = mock.Mock()
+    engine.dialect.name = 'postgresql'
+    monkeypatch.setattr(serve_state_schema, 'get_database_engine',
+                        lambda: engine)
+
+    assert daemons.should_skip_reserved_fill_reclaim_proof_renewal()
+
+
+def test_reclaim_proof_daemon_skips_non_postgres_with_policy(monkeypatch):
+    engine = mock.Mock()
+    engine.dialect.name = 'sqlite'
+    monkeypatch.setattr(serve_state_schema, 'get_database_engine',
+                        lambda: engine)
+    discover = mock.Mock(side_effect=pytest.fail)
+    monkeypatch.setattr(daemons.importlib.metadata, 'entry_points', discover)
+
+    assert daemons.should_skip_reserved_fill_reclaim_proof_renewal()
+    discover.assert_not_called()
+
+
+def test_reclaim_proof_daemon_selects_installed_policy(monkeypatch):
+    discovered = mock.Mock()
+    discovered.select.return_value = (mock.sentinel.policy_entrypoint,)
+    monkeypatch.setattr(daemons.importlib.metadata, 'entry_points',
+                        lambda: discovered)
+    engine = mock.Mock()
+    engine.dialect.name = 'postgresql'
+    monkeypatch.setattr(serve_state_schema, 'get_database_engine',
+                        lambda: engine)
+    executor_factory = mock.Mock()
+    monkeypatch.setattr(request_process, 'DisposableExecutor', executor_factory)
+
+    assert not daemons.should_skip_reserved_fill_reclaim_proof_renewal()
+    executor_factory.assert_not_called()
+
+
+def test_reclaim_proof_daemon_discovery_uncertainty_selects(monkeypatch):
+    monkeypatch.setattr(daemons.importlib.metadata, 'entry_points',
+                        mock.Mock(side_effect=RuntimeError('discovery failed')))
+    engine = mock.Mock()
+    engine.dialect.name = 'postgresql'
+    monkeypatch.setattr(serve_state_schema, 'get_database_engine',
+                        lambda: engine)
+
+    assert not daemons.should_skip_reserved_fill_reclaim_proof_renewal()
+
+
+def test_reclaim_proof_daemon_cleanup_drains_retained_boundary(monkeypatch):
+    executor = mock.Mock()
+    shutdown = mock.Mock()
+    monkeypatch.setattr(daemons, '_reserved_fill_reclaim_proof_executor',
+                        executor)
+    monkeypatch.setattr(reserved_capacity,
+                        'shutdown_reclaim_provider_proof_boundary', shutdown)
+
+    daemons._close_reserved_fill_reclaim_proof_executor()
+
+    shutdown.assert_called_once_with(executor)
+    assert daemons._reserved_fill_reclaim_proof_executor is None
+
+
+def test_reclaim_proof_ambiguity_parks_deployment_owner(monkeypatch):
+    park = mock.Mock(side_effect=SystemExit(1))
+    monkeypatch.setattr(daemons.time, 'sleep', park)
+    error = request_process.AmbiguousBoundaryError('unproved family')
+
+    with pytest.raises(SystemExit):
+        daemons._park_reclaim_provider_proof_owner(error)
+
+    park.assert_called_once_with(3600)
+
+
+def test_reclaim_proof_daemon_ambiguity_has_outer_park(monkeypatch):
+    error = request_process.AmbiguousBoundaryError('unproved family')
+    park = mock.Mock(side_effect=SystemExit(1))
+    monkeypatch.setattr(daemons, '_reserved_fill_reclaim_proof_executor', None)
+    monkeypatch.setattr(daemons.time, 'sleep', mock.Mock())
+    monkeypatch.setattr(request_process, 'DisposableExecutor', mock.Mock())
+    monkeypatch.setattr(reserved_capacity,
+                        'renew_reclaim_provider_proofs_in_boundary',
+                        mock.Mock(side_effect=error))
+    monkeypatch.setattr(daemons, '_park_reclaim_provider_proof_owner', park)
+
+    with pytest.raises(SystemExit):
+        daemons.reserved_fill_reclaim_proof_renewal_event()
+
+    park.assert_called_once_with(error)
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'),
+                    reason='requires Linux process identities and signals')
+def test_async_ambiguity_keeps_poisoned_owner_and_blocks_successor(
+        monkeypatch, tmp_path):
+    """A detached provider family cannot trigger an in-Pod replacement."""
+    handler_ready = tmp_path / 'handler-ready'
+    child_pid_path = tmp_path / 'child-pid'
+    executor = request_process.DisposableExecutor(max_workers=1)
+    future = executor.submit(_stubborn_renewal_family,
+                             str(handler_ready),
+                             str(child_pid_path),
+                             receipt_required=True)
+    guardian = future.guardian_identity
+    inner = _wait_for_direct_child(guardian)
+    handler = None
+    child = None
+    parked = threading.Event()
+    release_test_park = threading.Event()
+    park_errors = []
+
+    def park(error):
+        park_errors.append(error)
+        parked.set()
+        assert release_test_park.wait(timeout=20)
+
+    try:
+        assert _wait_until(handler_ready.exists)
+        assert _wait_until(child_pid_path.exists)
+        handler = _wait_for_direct_child(inner)
+        child_pid = int(child_pid_path.read_text(encoding='utf-8'))
+        child = request_process.ProcessIdentity(
+            child_pid,
+            request_process._read_process_start_time_ticks(child_pid))
+
+        # Remove both authenticated owners while the handler and its separate
+        # session child remain live. The monitor must finish poisoning before
+        # the deployment event, rather than parking inside monitor cleanup.
+        request_process._send_exact_signal(guardian, signal.SIGSTOP)
+        request_process._send_exact_signal(inner, signal.SIGSTOP)
+        request_process._send_exact_signal(inner, signal.SIGKILL)
+        request_process._send_exact_signal(guardian, signal.SIGKILL)
+        with pytest.raises(request_process.AmbiguousBoundaryError,
+                           match='without boundary proof'):
+            future.result(timeout=20)
+        assert executor.poisoned
+        assert _wait_until(lambda: not executor.workers)
+        assert request_process._identity_matches(handler)
+        assert request_process._identity_matches(child)
+
+        monkeypatch.setattr(daemons, '_reserved_fill_reclaim_proof_executor',
+                            executor)
+        constructor = mock.Mock(
+            side_effect=AssertionError('must not construct a successor lane'))
+        monkeypatch.setattr(request_process, 'DisposableExecutor', constructor)
+        monkeypatch.setattr(daemons, '_park_reclaim_provider_proof_owner', park)
+        monkeypatch.setattr(daemons.time, 'sleep', mock.Mock())
+        event_thread = threading.Thread(
+            target=daemons.reserved_fill_reclaim_proof_renewal_event,
+            name='test-renewal-owner',
+            daemon=True)
+        event_thread.start()
+
+        assert parked.wait(timeout=20)
+        assert event_thread.is_alive()
+        assert daemons._reserved_fill_reclaim_proof_executor is executor
+        constructor.assert_not_called()
+        assert request_process._identity_matches(handler)
+        assert request_process._identity_matches(child)
+        with pytest.raises(request_process.AmbiguousBoundaryError,
+                           match='poisoned'):
+            executor.submit(bool)
+
+        release_test_park.set()
+        event_thread.join(timeout=20)
+        assert not event_thread.is_alive()
+        assert len(park_errors) == 1
+    finally:
+        release_test_park.set()
+        for identity in (handler, child):
+            if (identity is not None and
+                    request_process._identity_matches(identity)):
+                request_process._send_exact_signal(identity, signal.SIGKILL)
+        if handler is not None:
+            assert _wait_until(
+                lambda: not request_process._identity_matches(handler))
+        if child is not None:
+            assert _wait_until(
+                lambda: not request_process._identity_matches(child))
+        with pytest.raises(request_process.AmbiguousBoundaryError,
+                           match='poisoned'):
+            executor.shutdown(timeout=20)
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'),
+                    reason='requires Linux process identities and signals')
+def test_post_result_reap_ambiguity_parks_on_next_tick(monkeypatch):
+    """Late monitor poison after success cannot replace the retained lane."""
+    executor = request_process.DisposableExecutor(max_workers=1)
+    future = executor.submit(_successful_renewal, receipt_required=True)
+    guardian = future.guardian_identity
+    inner = _wait_for_direct_child(guardian)
+    parked = threading.Event()
+    release_test_park = threading.Event()
+
+    def park(_error):
+        parked.set()
+        assert release_test_park.wait(timeout=20)
+
+    try:
+        assert future.result(timeout=20) is True
+        record = executor._invocations[guardian.pid]
+        real_guardian = record.guardian
+        # Fault-inject a missing parent-side lifetime proof after the typed,
+        # drained result has already become visible. The real inner warden can
+        # still finish its receipt path; only the local guardian-reap proof is
+        # made unavailable to the monitor.
+        record.guardian = mock.Mock(pid=guardian.pid, exitcode=None)
+        request_process._send_exact_signal(guardian, signal.SIGKILL)
+        future.acknowledge_receipt()
+        assert _wait_until(lambda: executor.poisoned)
+        assert future.result() is True
+        assert _wait_until(lambda: not executor.workers)
+        real_guardian.join(timeout=20)
+
+        monkeypatch.setattr(daemons, '_reserved_fill_reclaim_proof_executor',
+                            executor)
+        constructor = mock.Mock(
+            side_effect=AssertionError('must not construct a successor lane'))
+        monkeypatch.setattr(request_process, 'DisposableExecutor', constructor)
+        monkeypatch.setattr(daemons, '_park_reclaim_provider_proof_owner', park)
+        monkeypatch.setattr(daemons.time, 'sleep', mock.Mock())
+        event_thread = threading.Thread(
+            target=daemons.reserved_fill_reclaim_proof_renewal_event,
+            name='test-post-result-renewal-owner',
+            daemon=True)
+        event_thread.start()
+
+        assert parked.wait(timeout=20)
+        assert event_thread.is_alive()
+        assert daemons._reserved_fill_reclaim_proof_executor is executor
+        constructor.assert_not_called()
+        release_test_park.set()
+        event_thread.join(timeout=20)
+        assert not event_thread.is_alive()
+    finally:
+        release_test_park.set()
+        if request_process._identity_matches(guardian):
+            request_process._send_exact_signal(guardian, signal.SIGKILL)
+        if request_process._identity_matches(inner):
+            request_process._send_exact_signal(inner, signal.SIGKILL)
+        assert _wait_until(
+            lambda: not request_process._identity_matches(guardian))
+        assert _wait_until(lambda: not request_process._identity_matches(inner))
+        with pytest.raises(request_process.AmbiguousBoundaryError,
+                           match='poisoned'):
+            executor.shutdown(timeout=20)
 
 
 class TestDaemonLogRotation:

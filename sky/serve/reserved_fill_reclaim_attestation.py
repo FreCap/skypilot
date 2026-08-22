@@ -37,6 +37,7 @@ POLICY_OPERATION_TIMEOUT_SECONDS: Final = 5.0
 # the short-lived exact-scope authorization above.
 PROVIDER_PROOF_READ_TIMEOUT_SECONDS: Final = 2.0
 PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS: Final = 5.0
+PROVIDER_PROOF_REFRESH_BOUNDARY_LIFETIME_SECONDS: Final = 8.0
 PROVIDER_PROOF_MAX_AGE_SECONDS: Final = 30.0
 PROVIDER_PROOF_RENEW_INTERVAL_SECONDS: Final = 3.0
 PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS: Final = 20.0
@@ -56,12 +57,12 @@ if (PROVIDER_PROOF_MAX_AGE_SECONDS <= PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS
     raise RuntimeError('The provider-proof freshness horizons are invalid.')
 if (PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS -
         PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS
-        <= 2 * PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS +
-        PROVIDER_PROOF_RENEW_INTERVAL_SECONDS +
+        <= PROVIDER_PROOF_RENEW_INTERVAL_SECONDS +
+        PROVIDER_PROOF_REFRESH_BOUNDARY_LIFETIME_SECONDS +
         PROVIDER_PROOF_REFRESH_JITTER_BUDGET_SECONDS):
     raise RuntimeError('The provider-proof renewal margin must preserve the '
-                       'consumer horizon across one failed refresh, one '
-                       'interval, one complete retry, and jitter.')
+                       'consumer horizon across threshold detection, one '
+                       'successful process boundary, and jitter.')
 
 
 class ReclaimAttestationError(RuntimeError):

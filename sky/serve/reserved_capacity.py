@@ -70,7 +70,9 @@ ReservedFillLaunchFenceError = exceptions.ReservedFillLaunchFenceError
 # handler, after disposable-process startup.  This separate parent boundary
 # covers handler startup, result transport, and family convergence without
 # extending that provider/DB operation budget.
-_RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS = 8.0
+_RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS = (
+    reserved_fill_reclaim_attestation.
+    PROVIDER_PROOF_REFRESH_BOUNDARY_LIFETIME_SECONDS)
 # Leave enough time after the parent boundary for the disposable invocation
 # guardian to kill and reap the complete process family before another renewal
 # may begin.
@@ -2890,17 +2892,21 @@ def renew_reclaim_provider_proofs_once(
     return observed_fresh_publication
 
 
-def _renew_reclaim_provider_proofs_in_boundary(
+def renew_reclaim_provider_proofs_in_boundary(
         executor: request_process.DisposableExecutor) -> bool:
-    """Run one refresh behind an authenticated process-family drain proof."""
-    # Establish the provider/DB deadline in the child.  DisposableExecutor
-    # submission is synchronous through guardian startup and admission, so a
-    # parent-created provider deadline would incorrectly charge that process
-    # overhead to the five-second provider operation contract.
+    """Run one provider refresh behind a bounded process-family proof."""
+    # The provider/DB operation establishes its own deadline in the child.
+    # DisposableExecutor submission is synchronous through guardian startup
+    # and admission, so a parent-created child deadline would incorrectly
+    # charge that process overhead to the five-second provider contract.
     future = executor.submit(renew_reclaim_provider_proofs_once)
     try:
-        return bool(
-            future.result(timeout=_RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS))
+        result = future.result(
+            timeout=_RECLAIM_PROVIDER_BOUNDARY_LIFETIME_SECONDS)
+        if type(result) is not bool:
+            raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
+                'Reclaim-provider renewal returned an untyped result.')
+        return result
     except concurrent.futures.TimeoutError as timeout_error:
         # Do not start another proof while an uncooperative SDK call could
         # still publish. The guardian must first prove the complete invocation
@@ -2913,17 +2919,17 @@ def _renew_reclaim_provider_proofs_in_boundary(
             except concurrent.futures.TimeoutError as drain_error:
                 if not future.done():
                     boundary_error = request_process.BoundaryExecutionError(
-                        'Reclaim-provider refresh timed out without a '
+                        'Reclaim-provider renewal timed out without a '
                         'process-family drain result.')
                     boundary_error.__cause__ = drain_error
                     ambiguity = request_process.AmbiguousBoundaryError(
-                        'Reclaim-provider refresh cannot prove its process '
+                        'Reclaim-provider renewal cannot prove its process '
                         'family absent after cancellation.')
                     ambiguity.__cause__ = boundary_error
-                    # A second provider reader cannot start while the first
-                    # family is unproved. Poisoning invokes the controller
-                    # fail-stop callback synchronously and makes this executor
-                    # permanently unavailable.
+                    # A second renewal cannot start while the first family
+                    # is unproved. Poisoning makes this executor permanently
+                    # unavailable; the deployment renewal event catches this
+                    # typed ambiguity and parks its singleton owner.
                     executor._poison(  # pylint: disable=protected-access
                         ambiguity)
                     raise ambiguity from boundary_error
@@ -2932,45 +2938,14 @@ def _renew_reclaim_provider_proofs_in_boundary(
                 # once the authenticated result proves the family absent.
                 pass
         raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
-            'Reclaim-provider refresh exceeded its bounded process '
+            'Reclaim-provider renewal exceeded its bounded process '
             'lifetime.') from timeout_error
 
 
-def reclaim_provider_proof_renewer_loop(
-    *,
-    stop_event: threading.Event,
-    is_enabled: Callable[[], bool],
-    notify_fresh: Callable[[], Any] | None = None,
-    on_ambiguous_boundary: Callable[[request_process.AmbiguousBoundaryError],
-                                    None] | None = None,
-) -> None:
-    """Supervise proactive PostgreSQL receipt publication for one controller."""
-    executor = request_process.DisposableExecutor(
-        max_workers=1, on_ambiguous_boundary=on_ambiguous_boundary)
-    try:
-        while not stop_event.is_set():
-            if is_enabled():
-                try:
-                    renewed = _renew_reclaim_provider_proofs_in_boundary(
-                        executor)
-                    if renewed and notify_fresh is not None:
-                        notify_fresh()
-                except (request_process.AmbiguousBoundaryError,
-                        request_process.BoundaryShutdownPendingError):
-                    # Missing family-lifetime proof poisons this observer. Let
-                    # the outer thread supervisor replace the complete loop
-                    # instead of continuing with overlapping provider readers.
-                    raise
-                except Exception as error:  # pylint: disable=broad-except
-                    logger.error('Reserved-fill reclaim-proof renewal failed '
-                                 'closed: '
-                                 f'{common_utils.format_exception(error)}')
-            if stop_event.wait(reserved_fill_reclaim_attestation.
-                               PROVIDER_PROOF_RENEW_INTERVAL_SECONDS):
-                return
-    finally:
-        executor.shutdown(
-            timeout=_RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
+def shutdown_reclaim_provider_proof_boundary(
+        executor: request_process.DisposableExecutor) -> None:
+    """Close the deployment-owned renewal boundary with its drain budget."""
+    executor.shutdown(timeout=_RECLAIM_PROVIDER_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
 
 
 def poller_loop(
@@ -2984,7 +2959,6 @@ def poller_loop(
     get_actuation_generation: Callable[[], int] | None = None,
     actuation_generation_is_current: Callable[[int], bool] | None = None,
     notify_reconcile: Callable[[], Any] | None = None,
-    wake_event: threading.Event | None = None,
     on_ambiguous_boundary: Callable[[request_process.AmbiguousBoundaryError],
                                     None] | None = None,
 ) -> None:
@@ -3022,7 +2996,6 @@ def poller_loop(
                                     if service_name is not None else None)
     last_resolved_specs: tuple[FillPoolSpec, ...] = ()
     deadline = time.monotonic()
-    scheduled_cycle = True
     try:
         while stop_event is None or not stop_event.is_set():
             # The fallback holds the historical broad lock only for callers
@@ -3230,30 +3203,12 @@ def poller_loop(
 
             interval = poll_interval_seconds()
             now = time.monotonic()
-            if scheduled_cycle:
-                deadline = _poller_fixed_rate_deadline(deadline, now, interval)
+            deadline = _poller_fixed_rate_deadline(deadline, now, interval)
             delay = max(0.0, deadline - now)
-            if wake_event is None:
-                if stop_event is None:
-                    time.sleep(delay)
-                elif stop_event.wait(delay):
-                    return
-                scheduled_cycle = True
-            else:
-                while True:
-                    if stop_event is not None and stop_event.is_set():
-                        return
-                    delay = max(0.0, deadline - time.monotonic())
-                    if delay <= 0:
-                        scheduled_cycle = True
-                        break
-                    wait_slice = min(delay, 0.25)
-                    if wake_event.wait(wait_slice):
-                        wake_event.clear()
-                        # Renewal wakeups add observations; they never advance
-                        # the next fixed-rate tick or the withdrawal horizon.
-                        scheduled_cycle = False
-                        break
+            if stop_event is None:
+                time.sleep(delay)
+            elif stop_event.wait(delay):
+                return
     finally:
         if observation_worker is not None:
             observation_worker.close()

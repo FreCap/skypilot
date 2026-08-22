@@ -7863,27 +7863,14 @@ class TestReservedCapacityPollerStart:
         ctrl = self._controller_with(placer)
         with mock.patch.object(controller.thread_utils,
                                'start_supervised_thread') as start_mock, \
-             mock.patch.object(
-                 controller.reserved_capacity,
-                 'reclaim_provider_proof_renewer_loop') as renewer_loop, \
              mock.patch.object(controller.reserved_capacity,
                                'poller_loop') as poller_loop:
             ctrl._start_reserved_capacity_poller_if_needed()
             ctrl._start_reserved_capacity_poller_if_needed()
-            assert start_mock.call_count == 2
+            assert start_mock.call_count == 1
             names = [call.args[1] for call in start_mock.call_args_list]
-            assert names == [
-                'reserved-fill-reclaim-proof-renewer',
-                'reserved-capacity-poller'
-            ]
+            assert names == ['reserved-capacity-poller']
             start_mock.call_args_list[0].args[0]()
-            renewer_loop.assert_called_once()
-            renewer_kwargs = renewer_loop.call_args.kwargs
-            ambiguity_callback = renewer_kwargs['on_ambiguous_boundary']
-            assert ambiguity_callback.__self__ is ctrl
-            assert (ambiguity_callback.__func__
-                    is ctrl._handle_reclaim_proof_boundary_ambiguity.__func__)
-            start_mock.call_args_list[1].args[0]()
             poller_loop.assert_called_once()
             poller_kwargs = poller_loop.call_args.kwargs
             assert (poller_kwargs['actuation_epoch_lock']
@@ -7895,8 +7882,7 @@ class TestReservedCapacityPollerStart:
             poller_kwargs['notify_reconcile']()
             assert (ctrl._scale_reconcile_coordinator.generation ==
                     reconcile_generation + 1)
-            assert (poller_kwargs['wake_event']
-                    is ctrl._reserved_capacity_poller_wake)
+            assert 'wake_event' not in poller_kwargs
             poller_ambiguity_callback = (poller_kwargs['on_ambiguous_boundary'])
             assert poller_ambiguity_callback.__self__ is ctrl
             assert (poller_ambiguity_callback.__func__
