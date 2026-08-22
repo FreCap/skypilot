@@ -1,9 +1,11 @@
 """Race-free child entrypoint for one controller runtime daemon.
 
 This module must remain standard-library-only above ``_run_daemon``.  The
-supervisor invokes it as the top-level module ``internal_daemon_runner`` so
-Python does not import ``sky.__init__`` before the parent-death contract is
-armed and revalidated.
+supervisor invokes this file directly so Python does not import
+``sky.__init__`` before the parent-death contract is armed and revalidated.
+Direct execution also leaves ``__main__.__spec__`` unset, which lets later
+``multiprocessing.spawn`` children reconstruct this entrypoint by its absolute
+path after the temporary bootstrap import path has been removed.
 """
 
 import argparse

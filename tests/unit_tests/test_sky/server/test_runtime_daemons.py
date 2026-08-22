@@ -184,7 +184,10 @@ async def test_unexpected_exit_restarts_with_bounded_backoff(
     assert create.await_count == 2
     assert sleeps == [1, 2]
     for spawn_call in create.await_args_list:
-        assert spawn_call.args[1:4] == ('-S', '-m', 'internal_daemon_runner')
+        assert spawn_call.args[1] == '-S'
+        assert spawn_call.args[2] == str(
+            pathlib.Path(internal_daemon_runner.__file__).resolve())
+        assert spawn_call.args[3] == 'test-daemon'
         assert spawn_call.args[-2:] == (_CONTROLLER_OWNER[0],
                                         str(_CONTROLLER_OWNER[1]))
         assert _CONTROLLER_OWNER[0] not in spawn_call.kwargs['env'].values()
@@ -582,7 +585,6 @@ def test_parent_change_after_prctl_fails_before_daemon_import(monkeypatch):
 def test_runner_module_is_stdlib_first_and_rejects_unknown_id(tmp_path):
     runner_dir = pathlib.Path(internal_daemon_runner.__file__).resolve().parent
     env = dict(os.environ)
-    env['PYTHONPATH'] = str(runner_dir)
     parent_ticks = runtime._executor_process_start_time_ticks(os.getpid())
 
     capability_fd = runtime._open_capability_transport(
@@ -590,7 +592,8 @@ def test_runner_module_is_stdlib_first_and_rejects_unknown_id(tmp_path):
     try:
         completed = subprocess.run(
             [
-                sys.executable, '-S', '-m', 'internal_daemon_runner',
+                sys.executable, '-S',
+                str(runner_dir / 'internal_daemon_runner.py'),
                 'unknown-runtime-daemon',
                 str(os.getpid()),
                 str(parent_ticks), '1',
@@ -654,9 +657,10 @@ def test_runner_installs_capability_before_any_nonstdlib_import(tmp_path):
     ]),
                              encoding='utf-8')
     runner_dir = pathlib.Path(internal_daemon_runner.__file__).resolve().parent
+    repository_root = runner_dir.parents[1]
     env = dict(os.environ)
     env.pop('SKYPILOT_SERVER_CONTROLLER_ORIGIN_CAPABILITY', None)
-    env['PYTHONPATH'] = os.pathsep.join((str(runner_dir), str(tmp_path)))
+    env['PYTHONPATH'] = os.pathsep.join((str(tmp_path), str(repository_root)))
     env['BOOTSTRAP_PROOF_PATH'] = str(proof_path)
     parent_ticks = runtime._executor_process_start_time_ticks(os.getpid())
     capability = controller_capability.generate()
@@ -664,7 +668,8 @@ def test_runner_installs_capability_before_any_nonstdlib_import(tmp_path):
     try:
         completed = subprocess.run(
             [
-                sys.executable, '-S', '-m', 'internal_daemon_runner',
+                sys.executable, '-S',
+                str(runner_dir / 'internal_daemon_runner.py'),
                 'unknown-runtime-daemon',
                 str(os.getpid()),
                 str(parent_ticks), '1',
@@ -691,6 +696,61 @@ def test_runner_installs_capability_before_any_nonstdlib_import(tmp_path):
     assert proof['dumpable'] == 0
     assert proof['raw_capability_in_environment'] is False
     assert capability not in '\x00'.join(proof['argv'])
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'),
+                    reason='requires Linux process groups and prctl')
+def test_runner_can_spawn_boundary_after_bootstrap_path_removal(tmp_path):
+    """The direct-file entrypoint remains reconstructible by spawn children."""
+    proof_path = tmp_path / 'runtime-daemon-spawn-proof'
+    sitecustomize = tmp_path / 'sitecustomize.py'
+    sitecustomize.write_text('\n'.join([
+        'import os',
+        'import pathlib',
+        'import sys',
+        'def _run_daemon(*_args):',
+        '    from sky.server.requests import process',
+        '    executor = process.DisposableExecutor(max_workers=1)',
+        '    future = executor.submit(os.getpid)',
+        '    child_pid = future.result(timeout=10)',
+        '    executor.shutdown(timeout=10)',
+        '    pathlib.Path(os.environ["SPAWN_PROOF_PATH"]).write_text(',
+        '        str(child_pid), encoding="utf-8")',
+        'sys.modules["__main__"]._run_daemon = _run_daemon',
+    ]),
+                             encoding='utf-8')
+    runner_path = pathlib.Path(internal_daemon_runner.__file__).resolve()
+    repository_root = runner_path.parents[2]
+    env = dict(os.environ)
+    env['PYTHONPATH'] = os.pathsep.join((str(tmp_path), str(repository_root)))
+    env['SPAWN_PROOF_PATH'] = str(proof_path)
+    parent_ticks = runtime._executor_process_start_time_ticks(os.getpid())
+    capability_fd = runtime._open_capability_transport(
+        controller_capability.generate())
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable, '-S',
+                str(runner_path), 'spawn-test-daemon',
+                str(os.getpid()),
+                str(parent_ticks), '1',
+                str(capability_fd), _CONTROLLER_OWNER[0],
+                str(_CONTROLLER_OWNER[1])
+            ],
+            env=env,
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            start_new_session=True,
+            pass_fds=(capability_fd,),
+        )
+    finally:
+        os.close(capability_fd)
+
+    assert completed.returncode == 0, completed.stderr
+    assert int(proof_path.read_text(encoding='utf-8')) > 0
 
 
 @pytest.mark.skipif(not sys.platform.startswith('linux'),

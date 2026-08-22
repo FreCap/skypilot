@@ -649,11 +649,12 @@ async def _park_failed_runtime_daemon_owner(daemon_id: str,
 def _prepare_runtime_daemon_paths(
         daemon_id: str) -> tuple[pathlib.Path, pathlib.Path]:
     """Resolve and create filesystem paths used by a runtime daemon."""
-    runner_dir = pathlib.Path(__file__).resolve().parent
+    runner_path = pathlib.Path(__file__).resolve().with_name(
+        'internal_daemon_runner.py')
     log_dir = pathlib.Path(
         server_constants.REQUEST_LOG_PATH_PREFIX).expanduser()
     log_dir.mkdir(parents=True, exist_ok=True)
-    return runner_dir, log_dir / f'{daemon_id}.log'
+    return runner_path, log_dir / f'{daemon_id}.log'
 
 
 async def _supervise_runtime_daemon(
@@ -666,12 +667,9 @@ async def _supervise_runtime_daemon(
         controller_owner: tuple[str, int],
         fail_stop_on_unexpected_exit: bool = False) -> None:
     """Supervise one blocking maintenance loop in its own process group."""
-    runner_dir, log_path = await asyncio.to_thread(
+    runner_path, log_path = await asyncio.to_thread(
         _prepare_runtime_daemon_paths, daemon_id)
     child_env = dict(clean_env)
-    python_path = child_env.get('PYTHONPATH')
-    child_env['PYTHONPATH'] = (str(runner_dir) if not python_path else
-                               f'{runner_dir}{os.pathsep}{python_path}')
     restart_delay = _RUNTIME_DAEMON_RESTART_INITIAL_SECONDS
     while True:
         process: asyncio.subprocess.Process | None = None
@@ -683,8 +681,7 @@ async def _supervise_runtime_daemon(
                     asyncio.create_subprocess_exec(
                         sys.executable,
                         '-S',
-                        '-m',
-                        'internal_daemon_runner',
+                        str(runner_path),
                         daemon_id,
                         str(parent_pid),
                         str(parent_start_time_ticks),
