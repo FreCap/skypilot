@@ -1078,7 +1078,8 @@ POOL_DUMMY_RUN_COMMAND = 'echo "setup done"'
 # This is used as a marker to detect the error in controller logs.
 MAX_NUMBER_OF_SERVICES_REACHED_ERROR = 'Max number of services reached'
 # Serve056 introduced the executor-side provider-effect cohort at epoch 2.
-# Protocol-v2 exact-resource replay rotates it again: every live
-# API/controller/executor participant and every service capability tuple must
-# agree on epoch 3 before a request can use the no-optimizer provider contract.
-NON_POOL_CAPABILITY_COHORT_EPOCH = 3
+# Protocol-v2 exact-resource replay rotated it to epoch 3.  Provider-proof
+# flow control rotates it again: every live API/controller/executor participant
+# and every service capability tuple must agree on epoch 4 before a request can
+# use the durable pre-effect pause and proof-ready atomic admission contract.
+NON_POOL_CAPABILITY_COHORT_EPOCH = 4

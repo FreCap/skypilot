@@ -982,7 +982,8 @@ def provider_proof_admission_ready_in_connection(
             gate_generation=gate_generation,
             kubernetes_context=kubernetes_context,
             local_read_started=local_started,
-            local_read_finished=local_finished)
+            local_read_finished=local_finished,
+            invalid_receipt_as_missing=False)
         # pylint: enable=protected-access
         if receipt is None:
             return False
