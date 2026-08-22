@@ -102,6 +102,12 @@ so decodability never grants replay authority. The correction adds no EFS/PVC,
 schema migration, KubeRay, platform pin, Terraform/Terragrunt resource, task
 resource, or Kueue object/change.
 
+The protocol-v6/cohort-6 source patch is now implemented and focused tests
+cover fresh-write rejection for v1-v5, exact v5 version retry, adjacent-cohort
+cleanup, mixed-fleet refusal, exact-current render/create/adopt fencing, and
+the v5/v6 bootstrap identities. Merge, immutable publication, held Helm
+deployment, service recreation, and production convergence proof remain open.
+
 PHX success is defined exclusively by Simone's unchanged Kueue policy. SkyPilot
 must submit every fresh reserved grant; every Workload that Kueue marks
 `QuotaReserved=True` and `Admitted=True` must map one to one to a durable
@@ -1223,7 +1229,7 @@ shared infrastructure, or database schema.
 
 Remaining work, in exact order:
 
-1. Implement and merge the minimal protocol-v6/cohort-6 discriminator and
+1. Merge the implemented minimal protocol-v6/cohort-6 discriminator and
    exact-current provider-effect gate, publish one immutable image/chart, and
    direct-Helm deploy the exact API/controller/executor cohort under the hold.
    Preserve v1-v5 read/settle/teardown and the flat Kueue

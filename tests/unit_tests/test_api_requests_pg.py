@@ -4018,6 +4018,59 @@ def test_non_pool_cohort_promotion_barrier_blocks_heartbeat_phantoms(
                 supported_payload_versions={}))
 
 
+def test_non_pool_fleet_rejects_recent_previous_cohort_participant(
+        request_database):
+    engine, _ = request_database
+    current_cohort = ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+
+    def _insert(connection, role, cohort):
+        instance_id = uuid.uuid4()
+        handlers = ([non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME]
+                    if role == 'executor' else [])
+        connection.execute(
+            sqlalchemy.insert(request_postgres.SERVER_INSTANCES).values(
+                instance_id=instance_id,
+                role=role,
+                version=f'cohort-{cohort}',
+                started_at=sqlalchemy.func.clock_timestamp(),
+                heartbeat_at=sqlalchemy.func.clock_timestamp(),
+                ready=True,
+                health_detail={},
+                supported_handlers=handlers,
+                supported_payload_versions={},
+                non_pool_launch_binding_capable=True,
+                non_pool_launch_binding_protocol_version=(
+                    ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+                non_pool_launch_capability_profile_set_digest=(
+                    ordinary_launch_binding.
+                    supported_non_pool_profile_set_digest()),
+                non_pool_launch_capability_cohort_epoch=cohort,
+                non_pool_launch_receipt_protocol_version=(
+                    ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)))
+        return instance_id
+
+    with engine.begin() as connection:
+        _insert(connection, 'api', current_cohort)
+        _insert(connection, 'executor', current_cohort)
+        _insert(connection, 'controller', current_cohort)
+    assert request_postgres.non_pool_launch_binding_fleet_capable()
+
+    with engine.begin() as connection:
+        previous = _insert(connection, 'executor', current_cohort - 1)
+    assert not request_postgres.non_pool_launch_binding_fleet_capable()
+
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.SERVER_INSTANCES).where(
+                request_postgres.SERVER_INSTANCES.c.instance_id == previous).
+            values(heartbeat_at=sqlalchemy.func.clock_timestamp() -
+                   datetime.timedelta(seconds=(
+                       request_postgres.
+                       ORDINARY_LAUNCH_BINDING_PARTICIPANT_QUIESCENCE_SECONDS +
+                       1))))
+    assert request_postgres.non_pool_launch_binding_fleet_capable()
+
+
 def test_ordered_capacity_fleet_requires_exact_recent_api015_cohort(
         request_database):
     engine, _ = request_database

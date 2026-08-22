@@ -259,6 +259,8 @@ class ProtocolV2CleanupFence:
 def require_reclaim_worker_projection(
     fence: ProtocolV2LaunchFence,
     projections: list[dict[str, Any]] | None,
+    *,
+    require_current_protocol: bool = False,
 ) -> tuple[dict[str, Any],
            reserved_fill_reclaim_attestation.ReclaimProjectedAdmission]:
     """Select and authenticate the sole v2 projection bound to a reclaim.
@@ -277,7 +279,8 @@ def require_reclaim_worker_projection(
         kubernetes_context=fence.kubernetes_context,
         accelerator=fence.accelerator,
         accelerator_count=fence.accelerator_count,
-        expected_sha256=projection_digest)
+        expected_sha256=projection_digest,
+        require_current_protocol=require_current_protocol)
 
 
 class PhysicalReplicaPresence(enum.Enum):

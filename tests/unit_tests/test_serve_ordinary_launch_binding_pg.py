@@ -21,6 +21,7 @@ from sky import global_user_state_schema
 from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
 from sky.serve import demand_state
+from sky.serve import kubernetes_identity
 from sky.serve import ordinary_launch_binding as binding
 from sky.serve import replica_managers
 from sky.serve import route_projection
@@ -693,6 +694,66 @@ def _generic_controller_authority() -> binding.ControllerBindingAuthority:
             binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
 
 
+def _worker_projection(protocol_version: int) -> dict[str, object]:
+    """Return one strict immutable worker projection for binding tests."""
+    return {
+        'projection_version': protocol_version,
+        'candidate_id': 'kubernetes-0000',
+        'kubernetes_context': 'east',
+        'namespace': 'inference',
+        'service_account_name': 'worker-sa',
+        'priority_class_name': 'preemptible-inference-low',
+        'priority_value': -1000,
+        'preemption_policy': 'Never',
+        'pod_identity_role_arn': None,
+        'accelerator_name': 'H200',
+        'accelerator_count': 1,
+        'accelerator_scheduling': {
+            'label_key': 'nvidia.com/gpu.product',
+            'label_values': ['NVIDIA-H200'],
+            'resource_key': 'nvidia.com/gpu',
+        },
+        'scheduler_name': 'default-scheduler',
+        'kueue_admission': None,
+        'provision_timeout': -1,
+        'cache': {
+            'kind': 'none',
+        },
+        'scratch': {
+            'kind': 'none',
+        },
+    }
+
+
+def _reserved_fill_replica_info() -> replica_managers.ReplicaInfo:
+    """Return one complete reserved-fill record for historical cleanup."""
+    info = replica_managers.ReplicaInfo.from_storage_dict(
+        _stored_replica_state())
+    info.reserved_fill = True
+    info.is_zero_cost = True
+    info.zero_cost_admission_sequence = 1
+    values = {
+        'reserved_fill_pool_key': 'kubernetes/context-a/h200/physical-uid-a/v2',
+        'reserved_fill_service_generation': 7,
+        'reserved_fill_physical_cluster_uid': 'physical-uid-a',
+        'reserved_fill_kubernetes_context': 'context-a',
+        'reserved_fill_allocation_generation': 8,
+        'reserved_fill_allocation_input_sha256': 'a' * 64,
+        'reserved_fill_allocation_claim_generation': 7,
+        'reserved_fill_reconciliation_gate_generation': 9,
+        'reserved_fill_reclaim_fleet_bundle_sha256': 'b' * 64,
+        'reserved_fill_reclaim_policy_revision': 'policy-v1',
+        'reserved_fill_reclaim_provider_inventory_sha256': 'c' * 64,
+        'reserved_fill_worker_projection_sha256': 'd' * 64,
+        'reserved_fill_observation_generation': 10,
+        'reserved_fill_observation_sequence': 0,
+        'reserved_fill_intent_idempotency_key': 'e' * 64,
+    }
+    for field, value in values.items():
+        setattr(info, field, value)
+    return info
+
+
 def _admit_generic_paid(
     database,
 ) -> tuple[binding.NonPoolBindingIdentity, binding.BoundNonPoolLaunchContext,
@@ -763,6 +824,64 @@ def _admit_generic_paid(
             dict(launch_body.extra_launch_context))
 
 
+def _assert_current_paid_provider_effect_is_permitted(database,) -> None:
+    identity, _, launch_context = _admit_generic_paid(database)
+    assert identity.profile.kind is (
+        binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    assert (identity.capability_cohort_epoch ==
+            binding.NON_POOL_CAPABILITY_COHORT_EPOCH)
+    claim = _Claim(identity.request_id, 1, str(uuid.uuid4()), str(uuid.uuid4()))
+
+    with binding.non_pool_provider_effect_guard(
+            launch_context,
+            claim,
+            claim_validator=lambda _connection, _association_id, _claim: True
+    ) as authorization:
+        assert authorization.context.profile.kind is (
+            binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+        assert authorization.guard is not None
+
+    with database.connect() as connection:
+        phase = connection.execute(
+            sqlalchemy.select(
+                binding.ordinary_launch_associations_table.c.effect_phase).
+            where(binding.ordinary_launch_associations_table.c.association_id ==
+                  identity.association_id)).scalar_one()
+    assert phase == binding.EffectPhase.PROVIDER_IO.value
+
+
+def test_current_paid_effect_accepts_unprojected_service_version(
+        binding_database) -> None:
+    with binding_database.connect() as connection:
+        projections = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.version_specs_table.c.
+                worker_placement_projections).where(
+                    serve_state_schema.version_specs_table.c.service_name ==
+                    'svc', serve_state_schema.version_specs_table.c.version ==
+                    2)).scalar_one()
+    assert projections is None
+
+    _assert_current_paid_provider_effect_is_permitted(binding_database)
+
+
+def test_current_paid_effect_accepts_current_worker_projection(
+        binding_database) -> None:
+    current_protocol = (
+        kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
+    assert current_protocol == 6
+    with binding_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 2).values(
+                    worker_placement_projections=[
+                        _worker_projection(current_protocol)
+                    ]))
+
+    _assert_current_paid_provider_effect_is_permitted(binding_database)
+
+
 def test_serve056_previous_cohort_settles_but_cannot_start_provider_effect(
         binding_database, monkeypatch) -> None:
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
@@ -801,6 +920,376 @@ def test_serve056_previous_cohort_settles_but_cannot_start_provider_effect(
             where(binding.ordinary_launch_associations_table.c.association_id ==
                   identity.association_id)).scalar_one()
     assert phase == binding.EffectPhase.NOT_STARTED.value
+
+
+def test_exact_v5_projection_retry_is_idempotent_but_effect_requires_v6(
+        binding_database, monkeypatch) -> None:
+    """A lost-ACK retry survives N-1, but cannot start new provider I/O."""
+    assert kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION == 6
+    with binding_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 2).values(
+                    worker_placement_projections=[_worker_projection(5)]))
+
+    # Reproduce an association durably admitted by the immediately previous
+    # projection renderer. Cohort identity remains current; only the immutable
+    # service-version projection is N-1.
+    with monkeypatch.context() as v5_code:
+        v5_code.setattr(kubernetes_identity,
+                        'PLACEMENT_PROJECTION_PROTOCOL_VERSION', 5)
+        identity, _, launch_context = _admit_generic_paid(binding_database)
+
+    with binding_database.begin() as connection:
+        retry = binding.insert_or_get_locked(connection, identity)
+        association_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                binding.ordinary_launch_associations_table)).scalar_one()
+        persisted_projections = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.version_specs_table.c.
+                worker_placement_projections).where(
+                    serve_state_schema.version_specs_table.c.service_name ==
+                    'svc', serve_state_schema.version_specs_table.c.version ==
+                    2)).scalar_one()
+
+    assert retry.disposition is binding.AdmissionDisposition.EXISTING_EXACT
+    assert retry.association_id == str(identity.association_id)
+    assert retry.launch_generation == 1
+    assert association_count == 1
+    assert persisted_projections[0]['projection_version'] == 5
+
+    claim = _Claim(identity.request_id, 1, str(uuid.uuid4()), str(uuid.uuid4()))
+    entered = False
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='exact current worker projection protocol'):
+        with binding.non_pool_provider_effect_guard(
+                launch_context,
+                claim,
+                claim_validator=lambda _connection, _association_id, _claim:
+                True):
+            entered = True
+    assert not entered
+    with binding_database.connect() as connection:
+        phase = connection.execute(
+            sqlalchemy.select(
+                binding.ordinary_launch_associations_table.c.effect_phase).
+            where(binding.ordinary_launch_associations_table.c.association_id ==
+                  identity.association_id)).scalar_one()
+    assert phase == binding.EffectPhase.NOT_STARTED.value
+
+
+def _reserved_fill_cleanup_rows(
+    service_cohort: int,
+    association_cohort: int,
+) -> tuple[dict[str, object], dict[str, object], dict[str, object],
+           binding.NonPoolLaunchProfile]:
+    profile = binding.NonPoolLaunchProfile.create(
+        binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+        authorization_reference='reserved-fill:intent-a',
+        authorization_generation=7,
+        authorization_payload={
+            'allocation_input_sha256': 'a' * 64,
+            'intent_idempotency_key': 'intent-a',
+        })
+    digest = binding.supported_non_pool_profile_set_digest()
+    service = {
+        'controller_incarnation': _CONTROLLER_ID,
+        'non_pool_launch_binding_capable': True,
+        'non_pool_launch_controller_incarnation': _CONTROLLER_ID,
+        'non_pool_launch_binding_protocol_version':
+            binding.NON_POOL_BINDING_PROTOCOL_VERSION,
+        'non_pool_launch_capability_profile_set_digest': digest,
+        'non_pool_launch_capability_cohort_epoch': service_cohort,
+        'non_pool_launch_receipt_protocol_version':
+            binding.NON_POOL_RECEIPT_PROTOCOL_VERSION,
+    }
+    replica: dict[str, object] = {}
+    association = {
+        'association_id': uuid.uuid4(),
+        'request_id': 'request-a',
+        'service_name': 'svc',
+        'replica_id': 3,
+        'replica_record_id': _RECORD_ID,
+        'launch_generation': 1,
+        'input_digest': 'b' * 64,
+        'binding_protocol_version': binding.NON_POOL_BINDING_PROTOCOL_VERSION,
+        'profile_kind': profile.kind.value,
+        'profile_version': profile.version,
+        'profile_digest': profile.digest,
+        'capability_cohort_epoch': association_cohort,
+        'capability_profile_set_digest': digest,
+        'receipt_protocol_version': binding.NON_POOL_RECEIPT_PROTOCOL_VERSION,
+        'authorization_kind': profile.authorization_kind.value,
+        'authorization_reference': profile.authorization_reference,
+        'authorization_generation': profile.authorization_generation,
+        'authorization_digest': profile.authorization_digest,
+    }
+    return service, replica, association, profile
+
+
+def test_reserved_fill_cleanup_accepts_exact_adjacent_cohort_tuple(
+        binding_database, monkeypatch) -> None:
+    current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    assert current_cohort == 6
+    service, replica, association, expected_profile = (
+        _reserved_fill_cleanup_rows(current_cohort - 1, current_cohort - 1))
+    validated: list[binding.NonPoolLaunchProfile] = []
+
+    def _validate_profile(_connection, observed_service, observed_replica,
+                          profile):
+        assert observed_service is service
+        assert observed_replica is replica
+        validated.append(profile)
+
+    monkeypatch.setattr(
+        binding, '_validate_reserved_fill_cleanup_profile_in_connection',
+        _validate_profile)
+    with binding_database.connect() as connection:
+        result = binding.validate_reserved_fill_cleanup_association_in_connection(
+            connection, service, replica, association)
+
+    assert result == expected_profile
+    assert validated == [expected_profile]
+
+
+def test_adjacent_v5_reserved_fill_graph_settles_provider_absence(
+        binding_database, monkeypatch) -> None:
+    """N-1 state remains reducible but cannot acquire new effect authority."""
+    current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    current_projection = (
+        kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
+    assert (current_cohort, current_projection) == (6, 6)
+    historical_cohort = current_cohort - 1
+    historical_projection = current_projection - 1
+    info = _reserved_fill_replica_info()
+    profile_payload = {'physical_cluster_uid': 'physical-uid-a'}
+    profile = binding.NonPoolLaunchProfile.create(
+        binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+        authorization_reference=(
+            f'reserved-fill:{info.reserved_fill_intent_idempotency_key}'),
+        authorization_generation=info.reserved_fill_allocation_generation,
+        authorization_payload=profile_payload)
+
+    # Reproduce one retained v5 graph using the immediately previous writer.
+    # Its JSON-only intent edge is deliberately cleanup-only after Serve056;
+    # the current binary may decode and settle it, but may never use it to
+    # render or begin provider I/O.
+    with monkeypatch.context() as v5_code:
+        v5_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                        historical_cohort)
+        v5_code.setattr(kubernetes_identity,
+                        'PLACEMENT_PROJECTION_PROTOCOL_VERSION',
+                        historical_projection)
+        v5_code.setattr(binding,
+                        'resolve_non_pool_launch_profile_in_connection',
+                        lambda *_args, **_kwargs: profile)
+        with binding_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status='READY'))
+            assert binding.promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                expected_binding_epoch=5,
+                participant_barrier_passed=lambda _connection: True,
+                legacy_requests_drained=lambda _connection: True) == 6
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.services_table).
+                where(serve_state_schema.services_table.c.name == 'svc').values(
+                    reserved_fill_actuation_mode=(
+                        zero_cost_actuation.ActuationMode.DURABLE_INTENT.value),
+                    reserved_fill_actuation_epoch=1,
+                    reserved_fill_actuation_capable=True,
+                    reserved_fill_actuation_controller_incarnation=(
+                        _CONTROLLER_ID),
+                    reserved_fill_actuation_protocol_version=1))
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                    serve_state_schema.version_specs_table.c.service_name ==
+                    'svc', serve_state_schema.version_specs_table.c.version ==
+                    2).values(worker_placement_projections=[
+                        _worker_projection(historical_projection)
+                    ]))
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status=info.status.value,
+                        paid_capacity_pool_key=None,
+                        replica_state=info.to_storage_dict()))
+
+        launch_body = _body()
+        launch_body.extra_launch_context[binding.BINDING_EPOCH_KEY] = 6
+        intent = binding.parse_unbound_launch_context(
+            launch_body.extra_launch_context)
+        identity = binding.build_non_pool_binding_identity(
+            intent,
+            submission_id=_SUBMISSION_ID,
+            tenant_scope='tenant-a',
+            service_workspace='workspace-a',
+            cluster_name='svc-3',
+            input_digest=binding.canonical_launch_digest(launch_body),
+            profile=profile,
+            capability_cohort_epoch=historical_cohort,
+            capability_profile_set_digest=(
+                binding.supported_non_pool_profile_set_digest()),
+            receipt_protocol_version=(
+                binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
+        with binding_database.begin() as connection:
+            admission = binding.insert_or_get_locked(connection, identity)
+        binding.install_bound_non_pool_context(launch_body, identity,
+                                               admission.launch_generation)
+        context = binding.parse_bound_non_pool_launch_context(
+            launch_body.extra_launch_context)
+
+    monkeypatch.setattr(binding, '_reserved_fill_cleanup_payload',
+                        lambda *_args, **_kwargs: profile_payload)
+    with binding_database.begin() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc')).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id ==
+                3)).mappings().one()
+        association = connection.execute(
+            sqlalchemy.select(binding.ordinary_launch_associations_table).where(
+                binding.ordinary_launch_associations_table.c.association_id ==
+                identity.association_id)).mappings().one()
+        projections = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.version_specs_table.c.
+                worker_placement_projections).where(
+                    serve_state_schema.version_specs_table.c.service_name ==
+                    'svc', serve_state_schema.version_specs_table.c.version ==
+                    2)).scalar_one()
+        assert binding.validate_reserved_fill_cleanup_association_in_connection(
+            connection, service, replica, association) == profile
+        connection.execute(
+            sqlalchemy.update(binding.ordinary_launch_associations_table).where(
+                binding.ordinary_launch_associations_table.c.association_id ==
+                identity.association_id).values(
+                    effect_phase=binding.EffectPhase.PROVIDER_IO.value,
+                    effect_phase_changed_at=(sqlalchemy.func.clock_timestamp()),
+                    owner_revision=(binding.ordinary_launch_associations_table.
+                                    c.owner_revision + 1),
+                    updated_at=sqlalchemy.func.clock_timestamp()))
+    assert projections[0]['projection_version'] == historical_projection
+
+    terminal = binding.TerminalEvidence(status=binding.TerminalStatus.CANCELLED,
+                                        cause='execution_lease_expired',
+                                        execution_generation=1,
+                                        quiescence_required=True,
+                                        quiesced_generation=1,
+                                        quiesced_at=datetime.datetime.now(
+                                            datetime.timezone.utc))
+    with binding_database.begin() as connection:
+        assert binding.record_terminal_in_connection(
+            connection, context,
+            terminal) is (binding.StartupClassification.AMBIGUOUS)
+        association = connection.execute(
+            sqlalchemy.select(binding.ordinary_launch_associations_table).where(
+                binding.ordinary_launch_associations_table.c.association_id ==
+                identity.association_id)).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id ==
+                3)).mappings().one()
+        persisted_info = binding._locked_replica_info(replica)
+        provider_payload, _ = binding._reserved_fill_provider_evidence(
+            association, persisted_info, binding.ProviderEvidence.ABSENT)
+
+    historical_authority = dataclasses.replace(
+        _generic_controller_authority(),
+        non_pool_capability_cohort_epoch=historical_cohort)
+    assert historical_authority.retained_non_pool_settlement_allowed
+    with binding_database.begin() as connection:
+        assert binding.record_non_pool_provider_evidence(
+            connection, context, historical_authority,
+            binding.ProviderEvidence.ABSENT, provider_payload,
+            lambda _connection, _context: terminal)
+
+    # Persist the exact immediate-cleanup marker that the request projector
+    # carries into the provider-absence settlement transaction.
+    with binding_database.begin() as connection:
+        replica = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id ==
+                3).with_for_update()).mappings().one()
+        persisted_info = binding._locked_replica_info(replica)
+        status = persisted_info.status_property
+        status.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
+        status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+        status.service_ready_now = False
+        status.is_scale_down = True
+        status.preempted = False
+        status.purged = False
+        status.failed_spot_availability = False
+        status.drain_cap_seconds = 0
+        status.drain_started_at = None
+        status.wait_for_idle_before_termination = False
+        status.logical_retirement_version = None
+        status.logical_retirement_controller_epoch = None
+        status.logical_retirement_generation = None
+        status.logical_retirement_target_capacity = None
+        status.logical_retirement_confirmed_generation = None
+        status.logical_retirement_bounded_deadline = False
+        status.logical_retirement_committed = False
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id == 3).values(
+                    status=persisted_info.status.value,
+                    sky_down_status=status.sky_down_status.value,
+                    replica_state=persisted_info.to_storage_dict()))
+        assert binding.project_provider_absence_in_connection(
+            connection, context, terminal)
+
+    with binding_database.begin() as connection:
+        association, teardown_info = (
+            binding.projected_provider_absence_cleanup_authority_in_connection(
+                connection, 'svc', 3, str(_RECORD_ID)))
+    assert association['capability_cohort_epoch'] == historical_cohort
+    assert association['resolution'] == binding.Resolution.PROJECTED.value
+    assert teardown_info.status.value == 'SHUTTING_DOWN'
+
+
+@pytest.mark.parametrize(('service_cohort', 'association_cohort'), (
+    (4, 4),
+    (6, 5),
+    (5, 6),
+))
+def test_reserved_fill_cleanup_rejects_older_or_mismatched_cohorts(
+        binding_database, monkeypatch, service_cohort,
+        association_cohort) -> None:
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 6
+    service, replica, association, _ = _reserved_fill_cleanup_rows(
+        service_cohort, association_cohort)
+    profile_validation_called = False
+
+    def _unexpected_profile_validation(*_args):
+        nonlocal profile_validation_called
+        profile_validation_called = True
+
+    monkeypatch.setattr(
+        binding, '_validate_reserved_fill_cleanup_profile_in_connection',
+        _unexpected_profile_validation)
+    with binding_database.connect() as connection:
+        with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                           match='retained generic cleanup cohort'):
+            binding.validate_reserved_fill_cleanup_association_in_connection(
+                connection, service, replica, association)
+    assert not profile_validation_called
 
 
 def test_serve056_previous_cohort_retires_pre_admission_replica(
@@ -870,9 +1359,17 @@ def test_serve056_previous_cohort_retires_pre_admission_replica(
 def test_serve056_previous_cohort_reconciles_ambiguous_provider_action(
         binding_database, monkeypatch) -> None:
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    with binding_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 2).values(
+                    worker_placement_projections=[_worker_projection(5)]))
     with monkeypatch.context() as old_code:
         old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
                          current_cohort - 1)
+        old_code.setattr(kubernetes_identity,
+                         'PLACEMENT_PROJECTION_PROTOCOL_VERSION', 5)
         identity, context, launch_context = _admit_generic_paid(
             binding_database)
         claim = _Claim(identity.request_id, 1, str(uuid.uuid4()),

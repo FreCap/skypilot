@@ -33,6 +33,7 @@ from sky.adaptors import common as adaptors_common
 from sky.serve import capacity_admission
 from sky.serve import capacity_authority
 from sky.serve import constants as serve_constants
+from sky.serve import kubernetes_identity
 from sky.serve import pool_capacity_observation_schema
 from sky.serve import route_projection
 from sky.serve import serve_state
@@ -3212,6 +3213,27 @@ def _validate_generic_capability(
             'Service is not owned by the exact generic launch cohort.')
 
 
+def _validate_retained_generic_cleanup_capability(
+    service: Mapping[str, Any],
+    *,
+    capability_cohort_epoch: int | None,
+    capability_profile_set_digest: str | None,
+    receipt_protocol_version: int | None,
+) -> None:
+    """Accept the exact current or adjacent cohort for cleanup only."""
+    actual = _non_pool_capability_from_service(service)
+    if (actual != (True, NON_POOL_BINDING_PROTOCOL_VERSION,
+                   capability_profile_set_digest, capability_cohort_epoch,
+                   receipt_protocol_version) or capability_profile_set_digest
+            != supported_non_pool_profile_set_digest() or
+            type(capability_cohort_epoch) is not int or capability_cohort_epoch
+            not in (NON_POOL_CAPABILITY_COHORT_EPOCH,
+                    NON_POOL_CAPABILITY_COHORT_EPOCH - 1) or
+            receipt_protocol_version != NON_POOL_RECEIPT_PROTOCOL_VERSION):
+        raise OrdinaryLaunchBindingConflict(
+            'Service is not owned by a retained generic cleanup cohort.')
+
+
 def _validate_profile_authority_in_connection(
     connection: sqlalchemy.engine.Connection,
     service: Mapping[str, Any],
@@ -3321,7 +3343,7 @@ def validate_reserved_fill_cleanup_association_in_connection(
             context.profile.kind is not NonPoolLaunchProfileKind.RESERVED_FILL):
         raise OrdinaryLaunchBindingConflict(
             'Cleanup association is not an exact reserved-fill profile.')
-    _validate_generic_capability(
+    _validate_retained_generic_cleanup_capability(
         service,
         capability_cohort_epoch=context.capability_cohort_epoch,
         capability_profile_set_digest=context.capability_profile_set_digest,
@@ -3522,8 +3544,40 @@ def _validate_admission_target(connection: sqlalchemy.engine.Connection,
                 identity.capability_profile_set_digest),
             receipt_protocol_version=identity.receipt_protocol_version)
         if validate_profile_authority:
+            _require_current_non_pool_worker_projection_in_connection(
+                connection, identity.service_name, identity.service_version)
             _validate_profile_authority_in_connection(connection, service,
                                                       replica, identity.profile)
+
+
+def _require_current_non_pool_worker_projection_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    service_name: str,
+    service_version: int,
+) -> None:
+    """Fence projected non-pool effects to the exact current protocol."""
+    versions = serve_state_schema.version_specs_table
+    row = connection.execute(
+        sqlalchemy.select(versions.c.worker_placement_projections).where(
+            versions.c.service_name == service_name,
+            versions.c.version == service_version,
+            versions.c.yaml_content.isnot(None),
+            versions.c.quarantined_at.is_(None),
+            versions.c.retired_at.is_(None),
+        ).with_for_update(read=True)).mappings().one_or_none()
+    if row is None:
+        raise OrdinaryLaunchBindingConflict(
+            'Non-pool service version is not active and immutable.')
+    try:
+        kubernetes_identity.validate_worker_placement_projections(
+            row['worker_placement_projections'],
+            allow_none=True,
+            require_protocol_version=(
+                kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION))
+    except ValueError as error:
+        raise OrdinaryLaunchBindingConflict(
+            'Projected non-pool admission and provider effects require the '
+            'exact current worker projection protocol.') from error
 
 
 def _admission_from_row(row: Mapping[str, Any],
@@ -4208,6 +4262,9 @@ def validate_effect_authority_in_connection(
                           context,
                           require_launch_authorized=True)
     if isinstance(context, BoundNonPoolLaunchContext):
+        _require_current_non_pool_worker_projection_in_connection(
+            connection, context.service_name,
+            int(association['service_version']))
         if context.profile.kind is NonPoolLaunchProfileKind.RESERVED_FILL:
             _validate_committed_reserved_fill_profile_in_connection(
                 connection, service, replica, context.profile)

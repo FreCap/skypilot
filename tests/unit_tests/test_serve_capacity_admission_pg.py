@@ -41,7 +41,8 @@ pytestmark = pytest.mark.xdist_group(
 
 _URL = 'http://replica:8000'
 _CAPACITY_KUEUE_PROJECTION = {
-    'projection_version': 2,
+    'projection_version':
+        kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION,
     'candidate_id': 'kubernetes-0000',
     'kubernetes_context': 'phx',
     'namespace': 'skypilot',
@@ -63,6 +64,10 @@ _CAPACITY_KUEUE_PROJECTION = {
         'resource_key': 'nvidia.com/gpu',
     },
     'cache': {
+        'kind': 'none',
+    },
+    'provision_timeout': -1,
+    'scratch': {
         'kind': 'none',
     },
 }
@@ -978,8 +983,8 @@ def test_logical_retirement_serializes_with_lifecycle_takeover(
     assert not errors
     assert lifecycle_epochs == [4]
     assert len(retirement_results) == 1
-    assert (retirement_results[0].state
-            is serve_state.LogicalRetirementCommitState.COMMITTED)
+    assert (retirement_results[0].state is
+            serve_state.LogicalRetirementCommitState.COMMITTED)
 
 
 @pytest.mark.parametrize('first', ['report', 'retirement'])

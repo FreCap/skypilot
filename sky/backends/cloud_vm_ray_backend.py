@@ -981,7 +981,7 @@ class RetryingVmProvisioner:
                     serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY)
                 _, projected_admission = (
                     reserved_capacity.require_reclaim_worker_projection(
-                        fence, projections))
+                        fence, projections, require_current_protocol=True))
                 service_name = self._extra_launch_context.get(
                     serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
                 if not isinstance(service_name, str) or not service_name:

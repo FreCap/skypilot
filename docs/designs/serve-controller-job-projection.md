@@ -12,7 +12,9 @@ intent, Pod, and Workload without manual database deletion. Because releases
 `1.1.1440` and `1.1.1442` used the same protocol-v5 projection discriminator
 for different bootstrap semantics, protocol v5 is now historical cleanup-only.
 The sole next-write contract is protocol v6 with capability cohort 6; its
-source, release, and production verification are pending.
+source patch and focused qualification are complete on the successor branch,
+while merge, immutable release publication, deployment, and production
+verification remain pending.
 **Last updated:** 2026-08-22
 
 ## Goals
@@ -1008,10 +1010,11 @@ for this rollout.
 - Keep release `1.1.1442` / Helm revision 555 under the controller hold. The
   exact image is homogeneous, storage is disabled, executor sizing is proven,
   and no service or current provider state exists.
-- Implement, review, merge, publish, and direct-Helm deploy protocol v6/cohort
-  6 under the hold. Prove old-v5/cohort-4 and corrected-v5/cohort-5 fixtures can
-  be inspected and settled but cannot start or replay provider effects, while
-  only exact-current v6/cohort-6 can admit new work. Keep the deployment held
+- Merge, publish, and direct-Helm deploy the reviewed protocol-v6/cohort-6
+  source under the hold. The focused source suite proves terminal
+  old-v5/cohort-4 evidence remains inspectable, corrected-v5/cohort-5 can be
+  inspected and settled, and neither historical cohort can start or replay
+  provider effects; only exact-current v6/cohort-6 can admit new work. Keep the deployment held
   until every API/controller/executor reports one exact image digest.
 - The distinct east controller workspace/context/namespace/service account is
   configured and applied. Verify a fresh admitted controller Job's identity,

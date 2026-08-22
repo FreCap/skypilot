@@ -57,7 +57,8 @@ _POOL_KEY = reserved_capacity_broker.make_pool_key(
     protocol_version=reserved_capacity_broker.PROTOCOL_V2,
     physical_cluster_uid=_PHYSICAL_UID)
 _WORKER_PROJECTION = {
-    'projection_version': 2,
+    'projection_version':
+        kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION,
     'candidate_id': 'kubernetes-0000',
     'kubernetes_context': _CONTEXT,
     'namespace': 'skypilot',
@@ -79,6 +80,10 @@ _WORKER_PROJECTION = {
         'resource_key': 'nvidia.com/gpu',
     },
     'cache': {
+        'kind': 'none',
+    },
+    'provision_timeout': -1,
+    'scratch': {
         'kind': 'none',
     },
 }
@@ -1726,8 +1731,8 @@ def test_whole_service_teardown_retires_provider_absent_admissionless_graph(
                                   associations.c.association_id ==
                                   association_id)).mappings().one()
         assert evidence['provider_evidence'] == 'ABSENT'
-        assert (evidence['provider_evidence_observed_at']
-                >= evidence['execution_quiesced_at'])
+        assert (evidence['provider_evidence_observed_at'] >=
+                evidence['execution_quiesced_at'])
         assert evidence['provider_evidence_payload'] == {
             'association_id': str(association_id),
             'cluster_name': f'{_SERVICE}-1',

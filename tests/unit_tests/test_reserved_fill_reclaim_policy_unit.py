@@ -30,7 +30,8 @@ _GATE_GENERATION = 11
 
 def _worker_projection() -> dict[str, object]:
     return {
-        'projection_version': 2,
+        'projection_version':
+            (kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION),
         'candidate_id': 'kubernetes-0000',
         'kubernetes_context': 'phx-context',
         'namespace': 'inference',
@@ -39,6 +40,7 @@ def _worker_projection() -> dict[str, object]:
         'priority_class_name': 'inference-low',
         'priority_value': -1000,
         'preemption_policy': 'Never',
+        'provision_timeout': -1,
         'kueue_admission': {
             'local_queue_name': 'inference',
             'workload_priority_class_name': 'inference-low',
@@ -53,6 +55,9 @@ def _worker_projection() -> dict[str, object]:
             'resource_key': 'nvidia.com/gpu',
         },
         'cache': {
+            'kind': 'none',
+        },
+        'scratch': {
             'kind': 'none',
         },
     }
