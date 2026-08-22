@@ -396,7 +396,8 @@ class ReservedFillAllocationRepository:
                         row['worker_placement_projections'],
                         access_context=edge['access_context'],
                         accelerator_names=accelerator_names,
-                        accelerator_count=edge['gpus_per_replica']))
+                        accelerator_count=edge['gpus_per_replica'],
+                        require_current_protocol=True))
                 expected_map = (
                     reserved_fill_projection_authority.
                     projection_sha256_by_accelerator(projected_admissions))

@@ -21,6 +21,7 @@ from test_reserved_fill_broker_pg import pg_server as _broker_pg_server
 from sky import clouds
 from sky import exceptions
 from sky import global_user_state_schema
+from sky.serve import kubernetes_identity
 from sky.serve import ordinary_launch_binding
 from sky.serve import pool_capacity_observation as observation
 from sky.serve import pool_capacity_observation_schema as observation_schema
@@ -661,7 +662,8 @@ def test_reconciliation_gate_is_generation_fenced_and_reauthorizable(
 
 def _activation_worker_projection() -> dict[str, object]:
     return {
-        'projection_version': 2,
+        'projection_version':
+            kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION,
         'candidate_id': 'kubernetes-0000',
         'kubernetes_context': 'research-east',
         'namespace': 'default',
@@ -683,6 +685,10 @@ def _activation_worker_projection() -> dict[str, object]:
             'resource_key': 'nvidia.com/gpu',
         },
         'cache': {
+            'kind': 'none',
+        },
+        'provision_timeout': -1,
+        'scratch': {
             'kind': 'none',
         },
     }

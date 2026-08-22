@@ -909,7 +909,11 @@ def _select_worker_projection(
             isinstance(cloud, clouds.SSH)):
         return None
     projection = kubernetes_identity.worker_projection_for_context(
-        projections, region.name, to_provision.accelerators)
+        projections,
+        region.name,
+        to_provision.accelerators,
+        require_protocol_version=(
+            kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION))
     if projection is None:
         raise exceptions.InvalidCloudConfigs(
             'SkyServe Kubernetes placement has no exact immutable worker '
@@ -1006,7 +1010,8 @@ def _enforce_worker_projection_on_kubernetes_yaml(
         validated = kubernetes_identity.validate_worker_placement_projections(
             [projection],
             allow_none=False,
-            require_protocol_version=projection_version)
+            require_protocol_version=(
+                kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION))
     except ValueError as error:
         raise exceptions.InvalidCloudConfigs(str(error)) from error
     assert validated is not None
@@ -1037,7 +1042,7 @@ def _enforce_worker_projection_on_kubernetes_yaml(
     else:
         if expected_runtime_bootstrap_sha256 is not None:
             raise exceptions.InvalidCloudConfigs(
-                'Only projection protocol v4/v5 may carry a worker runtime '
+                'Only projection protocol v4/v5/v6 may carry a worker runtime '
                 'bootstrap SHA256 contract.')
         cluster_yaml['provider'].pop(
             'serve_worker_expected_runtime_bootstrap_sha256', None)
@@ -1281,7 +1286,7 @@ def _enforce_worker_projection_on_kubernetes_yaml(
 
 def _finalize_authenticated_worker_projection_on_kubernetes_yaml(
         cluster_yaml: dict[str, Any], projection: dict[str, Any]) -> bool:
-    """Freeze the exact v4/v5 bootstrap after trusted SSH-key rendering."""
+    """Freeze the exact current bootstrap after trusted SSH-key rendering."""
     projection_version = (
         kubernetes_identity.worker_projection_protocol_version(projection))
     if not k8s_pod_spec.serve_worker_projection_protocol_has_runtime_readiness(

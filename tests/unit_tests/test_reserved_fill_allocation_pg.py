@@ -28,6 +28,7 @@ from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_allocation
 from sky.serve import reserved_fill_planner
 from sky.serve import reserved_fill_reclaim_attestation
+from sky.serve import reserved_fill_reclaim_proofs
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import serve_utils
@@ -65,7 +66,8 @@ def _worker_projection(card: str,
                        context: str = _CONTEXT,
                        count: int = 1) -> dict[str, object]:
     return {
-        'projection_version': 2,
+        'projection_version':
+            (kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION),
         'candidate_id': candidate_id,
         'kubernetes_context': context,
         'namespace': 'default',
@@ -74,6 +76,7 @@ def _worker_projection(card: str,
         'priority_class_name': 'skyserve-preemptible',
         'priority_value': -1000,
         'preemption_policy': 'Never',
+        'provision_timeout': -1,
         'kueue_admission': {
             'local_queue_name': 'skyserve-reserved',
             'workload_priority_class_name': 'skyserve-preemptible',
@@ -88,6 +91,9 @@ def _worker_projection(card: str,
             'resource_key': 'nvidia.com/gpu',
         },
         'cache': {
+            'kind': 'none',
+        },
+        'scratch': {
             'kind': 'none',
         },
     }
@@ -727,7 +733,57 @@ def _grant_durable_plan(
         max_capacity=max_capacity,
         expected_controller_incarnation=controller_incarnation,
         expected_controller_owner_epoch=_CONTROLLER_OWNER_EPOCH)
+    accepted_keys = {
+        item.intent_idempotency_key for item in receipt.accepted
+    }
+    if accepted_keys:
+        _install_fresh_provider_proofs(
+            engine,
+            tuple(intent for intent in plan.intents
+                  if intent.idempotency_key in accepted_keys))
     return repository, receipt
+
+
+def _install_fresh_provider_proofs(
+    engine: sqlalchemy.engine.Engine,
+    intents: tuple[reserved_fill_planner.FillIntent, ...],
+) -> None:
+    """Publish the exact provider-free prerequisite for active test intents."""
+    assert intents
+    first = intents[0]
+    identity = reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
+        fleet_bundle_sha256=first.reclaim_fleet_bundle_sha256,
+        policy_revision=first.reclaim_policy_revision,
+        provider_inventory_sha256=first.reclaim_provider_inventory_sha256)
+    repository = reserved_fill_reclaim_proofs.ReclaimProviderProofRepository(
+        engine)
+    try:
+        authorities = {(intent.allowed_locations[0].region,
+                        intent.physical_cluster_uid) for intent in intents}
+        for context, physical_uid in sorted(authorities):
+            payload = {
+                'aws': {},
+                'kubernetes': {
+                    'physical_cluster_uid': physical_uid,
+                },
+            }
+            repository.renew(
+                identity=identity,
+                gate_generation=first.reconciliation_gate_generation,
+                kubernetes_context=context,
+                deadline_monotonic=(time.monotonic() +
+                                    reserved_fill_reclaim_attestation.
+                                    PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS),
+                prove=lambda payload=payload: reserved_fill_reclaim_proofs.
+                ReclaimProviderProofCandidate(proof_payload=payload,
+                                              oldest_completed_monotonic=time.
+                                              monotonic()),
+                validate=lambda _payload: True,
+                minimum_remaining_seconds=(
+                    reserved_fill_reclaim_attestation.
+                    PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS))
+    finally:
+        repository._proof_engine.dispose()
 
 
 def _lease_next(
@@ -1571,6 +1627,7 @@ def test_durable_intent_handoff_survives_successor_pool_epoch(
         expected_controller_incarnation=controller_incarnation,
         expected_controller_owner_epoch=controller_owner_epoch)
     assert len(receipt.accepted) == 1
+    _install_fresh_provider_proofs(allocation_engine, plan.intents)
     assert zero_cost_actuation.pending_pool_debits(
         snapshot.pool_key,
         engine=allocation_engine) == (zero_cost_actuation.PendingPoolDebit(

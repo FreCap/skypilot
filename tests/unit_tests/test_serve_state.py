@@ -165,7 +165,8 @@ def _config_snapshot(config: bytes,
     return (config, hashlib.sha256(config).hexdigest(), snapshot_character * 64)
 
 
-def _placement_projection_args() -> dict[str, object]:
+def _placement_projection_args(
+        worker_projection_version: int = 6) -> dict[str, object]:
     """Return a complete valid set of immutable placement projections."""
     worker_role = 'arn:aws:iam::123456789012:role/skyserve-worker-east'
     return {
@@ -189,6 +190,7 @@ def _placement_projection_args() -> dict[str, object]:
             'size_limit_bytes': 200,
         },
         'worker_placement_projections': [{
+            'projection_version': worker_projection_version,
             'candidate_id': 'kubernetes-0000',
             'kubernetes_context': 'east',
             'namespace': 'inference',
@@ -204,7 +206,13 @@ def _placement_projection_args() -> dict[str, object]:
                 'label_values': ['NVIDIA-H200'],
                 'resource_key': 'nvidia.com/gpu',
             },
+            'scheduler_name': 'default-scheduler',
+            'kueue_admission': None,
+            'provision_timeout': -1,
             'cache': {
+                'kind': 'none',
+            },
+            'scratch': {
                 'kind': 'none',
             },
         }],
@@ -705,6 +713,9 @@ def _add_minimal_service(name: str,
                          controller_config=None,
                          controller_config_digest=None,
                          controller_config_snapshot_id=None,
+                         controller_job_projection=None,
+                         controller_work_cache=None,
+                         worker_placement_projections=None,
                          owner_user_id=None,
                          owner_user_name=None):
     """Add a service row with all-required-args defaults so individual tests
@@ -736,6 +747,9 @@ def _add_minimal_service(name: str,
         controller_config=controller_config,
         controller_config_digest=controller_config_digest,
         controller_config_snapshot_id=controller_config_snapshot_id,
+        controller_job_projection=controller_job_projection,
+        controller_work_cache=controller_work_cache,
+        worker_placement_projections=worker_placement_projections,
         owner_user_id=owner_user_id,
         owner_user_name=owner_user_name,
     )
@@ -2235,6 +2249,70 @@ def test_identical_projection_retry_is_idempotent_at_db_boundary(
     assert (serve_state.add_or_update_version(
         service_name, 2, _v2_service_spec('rebuilt-on-retry'), yaml_content,
         **copy.deepcopy(projections))
+            is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
+    assert _read_version_row(_mock_serve_db, service_name, 2) == row_before
+
+
+def test_fresh_writes_reject_protocol_v5_worker_projections(_mock_serve_db):
+    projections = _placement_projection_args(worker_projection_version=5)
+    error = 'protocol version 5 does not satisfy required version 6'
+
+    with pytest.raises(ValueError, match=error):
+        _add_minimal_service('svc-v5-registration',
+                             spec=_v2_service_spec('initial'),
+                             **projections)
+    assert _read_row(_mock_serve_db, 'svc-v5-registration') is None
+    assert _read_version_row(_mock_serve_db, 'svc-v5-registration', 1) is None
+
+    service_name = 'svc-v5-version'
+    assert _add_minimal_service(service_name, spec=_v2_service_spec('initial'))
+    assert serve_state.add_version(service_name) == 2
+    placeholder_before = _read_version_row(_mock_serve_db, service_name, 2)
+    with pytest.raises(ValueError, match=error):
+        serve_state.add_or_update_version(service_name, 2,
+                                          _v2_service_spec('placeholder-fill'),
+                                          'yaml: v2', **projections)
+    assert _read_version_row(_mock_serve_db, service_name,
+                             2) == placeholder_before
+
+    with pytest.raises(ValueError, match=error):
+        serve_state.add_or_update_version(service_name, 3,
+                                          _v2_service_spec('direct-insert'),
+                                          'yaml: v3', **projections)
+    assert _read_version_row(_mock_serve_db, service_name, 3) is None
+
+
+def test_identical_protocol_v5_projection_retry_remains_idempotent(
+        _mock_serve_db):
+    service_name = 'svc-v5-projection-retry'
+    yaml_content = 'value: projected'
+    assert _add_minimal_service(service_name, spec=_v2_service_spec('initial'))
+    assert serve_state.add_version(service_name) == 2
+    current_projections = _placement_projection_args()
+    assert (serve_state.add_or_update_version(service_name, 2,
+                                              _v2_service_spec('projected'),
+                                              yaml_content,
+                                              **current_projections)
+            is serve_state.VersionCommitResult.COMMITTED)
+
+    # Simulate a version committed by the immediately previous release.  The
+    # current controller may settle an exact lost-response retry, but must not
+    # grant these historical bytes fresh write or provider authority.
+    protocol_v5_projections = _placement_projection_args(
+        worker_projection_version=5)
+    with orm.Session(_mock_serve_db) as session:
+        session.execute(
+            sqlalchemy.update(serve_state.version_specs_table).where(
+                serve_state.version_specs_table.c.service_name == service_name,
+                serve_state.version_specs_table.c.version == 2).values(
+                    worker_placement_projections=protocol_v5_projections[
+                        'worker_placement_projections']))
+        session.commit()
+    row_before = _read_version_row(_mock_serve_db, service_name, 2)
+
+    assert (serve_state.add_or_update_version(
+        service_name, 2, _v2_service_spec('rebuilt-on-retry'), yaml_content,
+        **protocol_v5_projections)
             is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
     assert _read_version_row(_mock_serve_db, service_name, 2) == row_before
 

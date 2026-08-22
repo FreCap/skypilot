@@ -21,6 +21,7 @@ from sky.serve import kueue_lane_lineage
 from sky.serve import ordinary_launch_binding
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
+from sky.serve import reserved_fill_projection_authority
 from sky.server.requests import request_names
 from sky.utils import common
 from sky.utils import dag_utils
@@ -51,7 +52,10 @@ def _fill_context() -> dict[str, object]:
     return context
 
 
-def _worker_projection(protocol_version: int = 2) -> dict[str, object]:
+def _worker_projection(
+    protocol_version: int = kubernetes_identity.
+    PLACEMENT_PROJECTION_PROTOCOL_VERSION,
+) -> dict[str, object]:
     projection: dict[str, object] = {
         'projection_version': protocol_version,
         'candidate_id': 'kubernetes-0000',
@@ -78,7 +82,7 @@ def _worker_projection(protocol_version: int = 2) -> dict[str, object]:
             'workload_priority_class_name': 'inference-low',
         },
     }
-    if protocol_version == 3:
+    if protocol_version >= 3:
         projection['provision_timeout'] = -1
         projection['scratch'] = {
             'kind': 'memory',
@@ -89,9 +93,12 @@ def _worker_projection(protocol_version: int = 2) -> dict[str, object]:
     return projection
 
 
-def _policy_fill_context() -> dict[str, object]:
+def _policy_fill_context(
+    protocol_version: int = kubernetes_identity.
+    PLACEMENT_PROJECTION_PROTOCOL_VERSION,
+) -> dict[str, object]:
     context = _fill_context()
-    projection = _worker_projection()
+    projection = _worker_projection(protocol_version)
     context.update({
         constants.RESERVED_FILL_LAUNCH_GATE_GENERATION_KEY: 11,
         constants.RESERVED_FILL_LAUNCH_RECLAIM_FLEET_BUNDLE_SHA256_KEY: 'a' *
@@ -430,7 +437,7 @@ def test_execution_parser_preserves_ordinary_and_rejects_external_fill():
             _fill_context(), is_launched_by_sky_serve_controller=False)
 
 
-def test_policy_fill_reloads_and_authenticates_exact_v2_projection():
+def test_policy_fill_reloads_and_authenticates_exact_current_projection():
     context = _policy_fill_context()
     fence = reserved_capacity.parse_protocol_v2_launch_fence(context)
     assert fence is not None and fence.policy_bound
@@ -449,33 +456,24 @@ def test_policy_fill_reloads_and_authenticates_exact_v2_projection():
     ]
 
 
-def test_policy_fill_reloads_and_authenticates_exact_v3_projection():
-    projection = _worker_projection(protocol_version=3)
-    context = _fill_context()
-    context.update({
-        constants.RESERVED_FILL_LAUNCH_GATE_GENERATION_KEY: 11,
-        constants.RESERVED_FILL_LAUNCH_RECLAIM_FLEET_BUNDLE_SHA256_KEY: 'a' *
-                                                                        64,
-        constants.RESERVED_FILL_LAUNCH_RECLAIM_POLICY_REVISION_KEY: 'policy-v2',
-        constants.RESERVED_FILL_LAUNCH_RECLAIM_PROVIDER_INVENTORY_SHA256_KEY:
-            'b' * 64,
-        constants.RESERVED_FILL_LAUNCH_WORKER_PROJECTION_SHA256_KEY:
-            kubernetes_identity.worker_projection_sha256(projection),
-    })
+@pytest.mark.parametrize('protocol_version', [2, 3, 4, 5])
+def test_policy_fill_rejects_historical_projection_before_provider(
+        protocol_version):
+    projection = _worker_projection(protocol_version=protocol_version)
+    context = _policy_fill_context(protocol_version)
     fence = reserved_capacity.parse_protocol_v2_launch_fence(context)
     assert fence is not None and fence.policy_bound
 
     with mock.patch.object(execution.serve_state,
                            'get_placement_projection_record',
                            return_value=(True, None, None, [projection])), \
-         mock.patch.object(execution.serve_state,
-                           'get_placement_catalog',
-                           return_value={'num_nodes': 1}):
+         pytest.raises(exceptions.RequestCancelled,
+                       match='invalid or stale persisted worker admission'):
         execution._load_service_worker_projections(context, fence)
 
-    assert context[constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY] == [
-        projection
-    ]
+    assert constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY not in context
+    assert kubernetes_identity.validate_worker_placement_projections(
+        [projection]) == [projection]
 
 
 def test_worker_projection_versions_cannot_mix_in_one_persisted_record():
@@ -483,6 +481,25 @@ def test_worker_projection_versions_cannot_mix_in_one_persisted_record():
         kubernetes_identity.validate_worker_placement_projections(
             [_worker_projection(2),
              _worker_projection(3)])
+
+
+def test_historical_v5_decodes_but_cannot_publish_reclaim_admission():
+    projection = _worker_projection(5)
+    decoded, _ = (
+        reserved_fill_projection_authority.projected_admission_for_candidate(
+            [projection],
+            kubernetes_context='phx-context',
+            accelerator='H200',
+            accelerator_count=1))
+    assert decoded == projection
+
+    with pytest.raises(ValueError, match='required version 6'):
+        reserved_fill_projection_authority.projected_admissions_for_edge(
+            [projection],
+            access_context='phx-context',
+            accelerator_names=('H200',),
+            accelerator_count=1,
+            require_current_protocol=True)
 
 
 @pytest.mark.parametrize('mutation', ['digest', 'protocol'])

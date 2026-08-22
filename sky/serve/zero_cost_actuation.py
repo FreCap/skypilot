@@ -11,6 +11,7 @@ import uuid
 import sqlalchemy
 
 from sky.serve import controller_transport
+from sky.serve import kubernetes_identity
 from sky.serve import kueue_lane_capacity
 from sky.serve import kueue_lane_lineage
 from sky.serve import kueue_lane_lineage_schema
@@ -417,7 +418,8 @@ def _kueue_lane_identity_from_projection(
                             kubernetes_context=kubernetes_context,
                             accelerator=accelerator,
                             accelerator_count=accelerator_count,
-                            expected_sha256=worker_projection_sha256))
+                            expected_sha256=worker_projection_sha256,
+                            require_current_protocol=True))
     except (IndexError, TypeError, ValueError) as error:
         raise ZeroCostActuationConflict(
             'Durable fill intent no longer resolves its exact worker '
@@ -1640,6 +1642,19 @@ class ZeroCostActuationRepository:
                  connection,
                  service_name=service_name,
                  service_version=plan.intents[0].service_version))
+            try:
+                worker_projections = (
+                    kubernetes_identity.validate_worker_placement_projections(
+                        worker_projections,
+                        allow_none=False,
+                        require_protocol_version=(
+                            kubernetes_identity.
+                            PLACEMENT_PROJECTION_PROTOCOL_VERSION)))
+            except ValueError as error:
+                raise ZeroCostActuationConflict(
+                    'Grant admission requires the exact current worker '
+                    'projection protocol.') from error
+            assert worker_projections is not None
             lane_identities = {
                 intent.idempotency_key:
                     kueue_lane_identity_for_intent_in_connection(

@@ -23,7 +23,9 @@ from typing import TypeVar
 
 import sqlalchemy.exc
 
-from sky.utils import common_utils
+from sky.adaptors import common as adaptors_common
+
+common_utils = adaptors_common.LazyImport('sky.utils.common_utils')
 
 logger = logging.getLogger(__name__)
 

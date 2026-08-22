@@ -813,6 +813,18 @@ def _validated_placement_projections(
     return controller, controller_cache, workers
 
 
+def _require_current_worker_placement_projections_for_write(
+    worker_placement_projections: list[dict[str, Any]] | None,) -> None:
+    """Reject historical worker projections at a fresh version write."""
+    if worker_placement_projections is None:
+        return
+    kubernetes_identity.validate_worker_placement_projections(
+        worker_placement_projections,
+        allow_none=False,
+        require_protocol_version=(
+            kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION))
+
+
 @_with_reserved_fill_broker_lock
 def add_service(
         name: str,
@@ -867,6 +879,8 @@ def add_service(
      worker_placement_projections) = (_validated_placement_projections(
          controller_job_projection, controller_work_cache,
          worker_placement_projections))
+    _require_current_worker_placement_projections_for_write(
+        worker_placement_projections)
     engine = _db_manager.get_engine()
     owner_columns_available = {'owner_user_id', 'owner_user_name'} <= {
         column['name']
@@ -3305,7 +3319,9 @@ def reserved_fill_committed_launch_authority_holds(
                 return False
             _, projected_admission = (
                 reserved_capacity.require_reclaim_worker_projection(
-                    fence, version_row['worker_placement_projections']))
+                    fence,
+                    version_row['worker_placement_projections'],
+                    require_current_protocol=True))
             if (projected_admission.worker_projection_sha256
                     != intent.worker_projection_sha256):
                 return False
@@ -8008,6 +8024,9 @@ def add_or_update_version(
                  existing[5] != submitted_yaml_content)):
                 session.rollback()
                 return VersionCommitResult.CONTENT_CONFLICT
+        else:
+            _require_current_worker_placement_projections_for_write(
+                worker_placement_projections)
         if not identical_retry:
             # A stale candidate cannot elect or alter launch authority, so it
             # must not be held behind an unrelated outgoing admission.  Keep
@@ -10435,13 +10454,15 @@ def reserved_fill_reclaim_projected_admissions(
     access_context: str,
     accelerator_names: typing.Sequence[str],
     accelerator_count: int,
+    require_current_protocol: bool = False,
 ) -> tuple[reserved_fill_reclaim_attestation.ReclaimProjectedAdmission, ...]:
     """Compatibility facade for the one canonical projection adapter."""
     return reserved_fill_projection_authority.projected_admissions_for_edge(
         worker_projections,
         access_context=access_context,
         accelerator_names=accelerator_names,
-        accelerator_count=accelerator_count)
+        accelerator_count=accelerator_count,
+        require_current_protocol=require_current_protocol)
 
 
 def _reserved_fill_projection_digest_map(
@@ -10638,7 +10659,8 @@ def replace_reserved_fill_claim_set(
                             version_row['worker_placement_projections'],
                             access_context=str(edge['access_context']),
                             accelerator_names=raw_names,
-                            accelerator_count=int(edge['gpus_per_replica'])))
+                            accelerator_count=int(edge['gpus_per_replica']),
+                            require_current_protocol=True))
                     if edge['worker_projection_sha256_by_accelerator'] != (
                             _reserved_fill_projection_digest_map(
                                 projected_admissions)):

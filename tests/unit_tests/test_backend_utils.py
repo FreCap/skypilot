@@ -3,6 +3,7 @@
 # pylint: disable=protected-access,unused-argument
 
 import base64
+import copy
 import functools
 import gzip
 import hashlib
@@ -426,9 +427,9 @@ def _builtin_kubernetes_writer_kwargs(monkeypatch, tmp_path, test_name):
     }, output_path)
 
 
-def _projected_h200_worker_v4():
+def _projected_h200_worker(protocol_version=6):
     return {
-        'projection_version': 4,
+        'projection_version': protocol_version,
         'candidate_id': 'kubernetes-0000',
         'kubernetes_context': 'test-context',
         'namespace': 'inference',
@@ -456,9 +457,9 @@ def _projected_h200_worker_v4():
     }
 
 
-def _projected_h200_worker_v5_memory():
-    projection = _projected_h200_worker_v4()
-    projection['projection_version'] = 5
+def _projected_h200_worker_memory(protocol_version):
+    assert protocol_version in (5, 6)
+    projection = _projected_h200_worker(protocol_version)
     projection['scratch'] = {
         'kind': 'memory',
         'mount_path': '/tmp',
@@ -527,9 +528,7 @@ def test_projected_serve_worker_suppresses_all_static_credential_mounts(
     monkeypatch.setenv('CUSTOM_GPU_RESOURCE_KEY', 'mutable.example/gpu')
     writer_kwargs['to_provision'] = Resources(
         cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
-    writer_kwargs['worker_placement_projections'] = [
-        _projected_h200_worker_v4()
-    ]
+    writer_kwargs['worker_placement_projections'] = [_projected_h200_worker()]
     original_fill_template = common_utils.fill_template
     rendered_variables = {}
 
@@ -655,9 +654,7 @@ def test_projected_worker_persists_authenticated_bootstrap_through_finalizer(
         monkeypatch, tmp_path, 'projected-worker-authenticated-bootstrap')
     writer_kwargs['to_provision'] = Resources(
         cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
-    writer_kwargs['worker_placement_projections'] = [
-        _projected_h200_worker_v4()
-    ]
+    writer_kwargs['worker_placement_projections'] = [_projected_h200_worker()]
     writer_kwargs['dryrun'] = False
 
     private_key_path = tmp_path / 'test-key'
@@ -731,14 +728,67 @@ def test_projected_worker_persists_authenticated_bootstrap_through_finalizer(
     assert contract.matches
 
 
-def test_projected_v5_bootstrap_env_is_inherited_by_fresh_kubectl_exec(
-        monkeypatch, tmp_path):
-    writer_kwargs, _ = _builtin_kubernetes_writer_kwargs(
-        monkeypatch, tmp_path, 'projected-v5-bootstrap-environment')
+def test_projected_v5_worker_is_rejected_before_renderer(monkeypatch, tmp_path):
+    writer_kwargs, output_path = _builtin_kubernetes_writer_kwargs(
+        monkeypatch, tmp_path, 'projected-v5-decode-only')
     writer_kwargs['to_provision'] = Resources(
         cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
     writer_kwargs['worker_placement_projections'] = [
-        _projected_h200_worker_v5_memory()
+        _projected_h200_worker_memory(5)
+    ]
+
+    with pytest.raises(ValueError, match='does not satisfy required version 6'):
+        backend_utils.write_cluster_config(**writer_kwargs)
+
+    assert not pathlib.Path(f'{output_path}.tmp').exists()
+
+
+def test_legacy_v5_bootstrap_identity_hash_remains_decode_stable():
+    legacy_marker = 'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V5'
+    environment = [{
+        'name': key,
+        'value': value,
+    } for key, value in sorted(
+        kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENVIRONMENT.items())]
+    script_lines = ['canonical bootstrap', f'# {legacy_marker}']
+    script_lines.extend(
+        f'export {key}={json.dumps(value)}' for key, value in sorted(
+            kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENVIRONMENT.items()))
+    pod_spec = {
+        'containers': [{
+            'name': 'ray-node',
+            'command': ['/bin/bash', '-c', '--'],
+            'args': ['\n'.join(script_lines)],
+            'env': environment,
+        }]
+    }
+
+    assert [entry['name'] for entry in environment
+           ] == ['SKY_RUNTIME_DIR', 'UV_CACHE_DIR', 'UV_PYTHON_INSTALL_DIR']
+    assert (
+        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec)
+        == '52fdadc70b46857dd1a7369c3ef20e808168ba0e2f0eb87cba64806b3d265459')
+    mutated = copy.deepcopy(pod_spec)
+    next(entry for entry in mutated['containers'][0]['env']
+         if entry['name'] == 'UV_CACHE_DIR')['value'] = '/root/.cache/uv'
+    assert (
+        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(mutated)
+        == '8f670f626a292eb2a94440b70aa722761569837aeba69ea2735d22a6198231ed')
+    with pytest.raises(
+            kubernetes_pod_spec.ProjectedRuntimeReadinessContractError,
+            match='Historical'):
+        kubernetes_pod_spec.validate_projected_worker_bootstrap_environment(
+            pod_spec, {})
+
+
+def test_projected_v6_bootstrap_env_is_inherited_by_fresh_kubectl_exec(
+        monkeypatch, tmp_path):
+    writer_kwargs, _ = _builtin_kubernetes_writer_kwargs(
+        monkeypatch, tmp_path, 'projected-v6-bootstrap-environment')
+    writer_kwargs['to_provision'] = Resources(
+        cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
+    writer_kwargs['worker_placement_projections'] = [
+        _projected_h200_worker_memory(6)
     ]
 
     result = backend_utils.write_cluster_config(**writer_kwargs)
@@ -761,10 +811,15 @@ def test_projected_v5_bootstrap_env_is_inherited_by_fresh_kubectl_exec(
         '# Execute user-provided post-provision runcmd')
     bootstrap_marker = script.index(
         kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENV_MARKER)
+    script_lines = script.splitlines()
+    assert script_lines.count(
+        f'# {kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENV_MARKER}') == 1
+    assert not any(marker in script for marker in kubernetes_pod_spec.
+                   SERVE_WORKER_LEGACY_BOOTSTRAP_ENV_MARKERS)
     bootstrap_end = script.index('# Helper function to conditionally use sudo')
     assert runcmd_boundary < bootstrap_marker < bootstrap_end
     for key, value in expected.items():
-        assert script.count(f'export {key}={json.dumps(value)}') == 1
+        assert script_lines.count(f'export {key}={json.dumps(value)}') == 1
     assert rendered['provider'][
         'serve_worker_expected_runtime_bootstrap_sha256'] == (
             kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(
@@ -849,7 +904,7 @@ def test_builtin_kubernetes_writer_preserves_replacement_renderer_authority(
                              'templates' / template_ref)
         source_bytes = template_path.read_bytes()
         assert hashlib.sha256(source_bytes).hexdigest() == (
-            '974b81b5b5fb9776bdd8103f8f040d599fec3c0439423a6f6f13f415542f9175')
+            '92f99cd27a606ad121dbd5786c0dd55f07fa68a00fda5581f9b8b0e0e0e3d6b4')
         source = source_bytes.decode('utf-8')
         assert '{{ skypilot_kubernetes_node_config_fragment_v1 }}\n' not in source
         rendered = common_utils.jinja2.Template(source).render(**variables)

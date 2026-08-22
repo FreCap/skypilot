@@ -1080,7 +1080,8 @@ MAX_NUMBER_OF_SERVICES_REACHED_ERROR = 'Max number of services reached'
 # Serve056 introduced the executor-side provider-effect cohort at epoch 2.
 # Protocol-v2 exact-resource replay rotated it to epoch 3.  Provider-proof
 # flow control rotated it again to epoch 4. Scratch-backed worker bootstrap
-# rotates it to epoch 5: every live API/controller/executor participant and
-# every service capability tuple must agree before any new launch can carry
-# projection protocol v5; the adjacent cohort remains settlement-only.
-NON_POOL_CAPABILITY_COHORT_EPOCH = 5
+# rotated it to epoch 5. Projection-v6 collision repair rotates it to epoch 6:
+# every live API/controller/executor participant and every service capability
+# tuple must agree before any new launch can carry projection protocol v6; the
+# adjacent cohort remains settlement-only.
+NON_POOL_CAPABILITY_COHORT_EPOCH = 6

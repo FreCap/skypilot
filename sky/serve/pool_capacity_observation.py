@@ -917,7 +917,8 @@ class PoolCapacityObservationRepository:
                             version_row['worker_placement_projections'],
                             access_context=edge['access_context'],
                             accelerator_names=names,
-                            accelerator_count=accelerator_count))
+                            accelerator_count=accelerator_count,
+                            require_current_protocol=True))
                     expected_projection_map = (
                         reserved_fill_projection_authority.
                         projection_sha256_by_accelerator(projected_admissions))

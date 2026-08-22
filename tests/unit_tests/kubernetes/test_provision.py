@@ -84,12 +84,47 @@ def _make_provision_config(count):
     )
 
 
+def _configure_current_projection_runtime(config, *, scratch=None):
+    if scratch is None:
+        scratch = {'kind': 'none'}
+    pod_spec = config.node_config['spec']
+    runtime = pod_spec['containers'][0]
+    runtime.setdefault('name', 'ray-node')
+    runtime.setdefault('command', ['/bin/bash', '-c', '--'])
+    if scratch['kind'] == 'memory':
+        lines = [
+            'canonical bootstrap',
+            f'# {instance.pod_spec_lib.SERVE_WORKER_BOOTSTRAP_ENV_MARKER}',
+        ]
+        lines.extend(f'export {key}={json.dumps(value)}' for key, value in
+                     sorted(instance.pod_spec_lib.
+                            SERVE_WORKER_BOOTSTRAP_ENVIRONMENT.items()))
+        runtime['args'] = ['\n'.join(lines)]
+        runtime['env'] = [{
+            'name': key,
+            'value': value,
+        } for key, value in sorted(
+            instance.pod_spec_lib.SERVE_WORKER_BOOTSTRAP_ENVIRONMENT.items())]
+    else:
+        runtime.setdefault('args', ['canonical bootstrap'])
+    bootstrap_sha256 = (instance.pod_spec_lib.
+                        projected_worker_runtime_bootstrap_sha256(pod_spec))
+    readiness = (instance.pod_spec_lib.
+                 enforce_projected_worker_runtime_readiness_contract(
+                     pod_spec,
+                     rewrite=True,
+                     expected_bootstrap_sha256=bootstrap_sha256))
+    assert readiness.matches
+    config.provider_config.update({
+        'serve_worker_projection_protocol_version': 6,
+        'serve_worker_expected_scratch': copy.deepcopy(scratch),
+        'serve_worker_expected_runtime_bootstrap_sha256': bootstrap_sha256,
+    })
+
+
 @pytest.mark.parametrize(('protocol_version', 'scratch', 'message'), [
-    (3, None, 'v3/v4/v5 requires the complete worker scratch'),
-    (2, {
-        'kind': 'none'
-    }, 'Only projection protocol v3/v4/v5'),
-    (3, {
+    (6, None, 'v3/v4/v5/v6 requires the complete worker scratch'),
+    (6, {
         'kind': 'memory',
         'size_limit_bytes': 1024,
     }, 'must be exactly none or memory-backed /tmp'),
@@ -111,9 +146,8 @@ def test_create_pods_rejects_invalid_worker_scratch_provider_contract(
 
 
 @pytest.mark.parametrize(('protocol_version', 'bootstrap_sha256', 'message'), [
-    (4, None, 'v4/v5 requires the complete worker runtime bootstrap'),
-    (4, 'A' * 64, '64 lowercase hexadecimal'),
-    (3, '0' * 64, 'Only projection protocol v4/v5'),
+    (6, None, 'v4/v5/v6 requires the complete worker runtime bootstrap'),
+    (6, 'A' * 64, '64 lowercase hexadecimal'),
 ])
 def test_create_pods_rejects_invalid_worker_runtime_bootstrap_contract(
         monkeypatch, protocol_version, bootstrap_sha256, message):
@@ -135,6 +169,29 @@ def test_create_pods_rejects_invalid_worker_runtime_bootstrap_contract(
 
     with pytest.raises(config_lib.KubernetesError, match=message):
         instance._create_pods('us', 'cluster', 'cluster', config)
+
+
+@pytest.mark.parametrize('protocol_version', [1, 2, 3, 4, 5])
+def test_create_pods_rejects_historical_projection_before_mutation(
+        monkeypatch, protocol_version):
+    monkeypatch.setattr(kubernetes_utils, 'get_namespace_from_config',
+                        lambda *_args, **_kwargs: 'ns')
+    monkeypatch.setattr(kubernetes_utils, 'get_context_from_config',
+                        lambda *_args, **_kwargs: 'ctx')
+    core_api = mock.Mock(side_effect=AssertionError(
+        'historical projections must fail before Kubernetes API access'))
+    monkeypatch.setattr(kubernetes, 'core_api', core_api)
+    config = _make_provision_config(count=1)
+    config.provider_config[
+        'serve_worker_projection_protocol_version'] = protocol_version
+    original_node_config = copy.deepcopy(config.node_config)
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='exact current SkyServe worker projection'):
+        instance._create_pods('us', 'cluster', 'cluster', config)
+
+    assert config.node_config == original_node_config
+    core_api.assert_not_called()
 
 
 def _kueue_lane_identity():
@@ -169,7 +226,6 @@ def _kueue_lane_runtime(
 def _configure_strict_kueue_lane(config: provision_common.ProvisionConfig,
                                  cluster_name_on_cloud: str) -> None:
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 2,
         'kueue_local_queue_name': 'be',
         'kueue_require_managed': True,
         'kueue_workload_priority_class_name': 'skypilot-low',
@@ -183,6 +239,7 @@ def _configure_strict_kueue_lane(config: provision_common.ProvisionConfig,
         'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
         'serve_worker_expected_accelerator_count': 1,
     })
+    _configure_current_projection_runtime(config)
     config.provider_effect_guard_factory = contextlib.nullcontext
     config.kueue_admission_runtime = _kueue_lane_runtime(
         persisted_pod_identity=_kueue_persisted_pod_identity(
@@ -225,10 +282,10 @@ def test_reserved_fill_required_kueue_requires_lane_runtime(monkeypatch):
                         lambda *_args, **_kwargs: 'ctx')
     config = _make_provision_config(count=1)
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 2,
         'kueue_local_queue_name': 'be',
         'kueue_require_managed': True,
     })
+    _configure_current_projection_runtime(config)
     config.provider_effect_guard_factory = contextlib.nullcontext
 
     with pytest.raises(config_lib.KubernetesError,
@@ -276,7 +333,6 @@ def test_create_pods_rejects_finalizer_scratch_drift_before_api_create(
         }],
     }
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 3,
         'serve_worker_expected_priority_class_name': None,
         'serve_worker_expected_priority_value': None,
         'serve_worker_expected_preemption_policy': None,
@@ -293,6 +349,8 @@ def test_create_pods_rejects_finalizer_scratch_drift_before_api_create(
             'size_limit_bytes': 20 * 1024**3,
         },
     })
+    _configure_current_projection_runtime(
+        config, scratch=config.provider_config['serve_worker_expected_scratch'])
 
     with pytest.raises(config_lib.KubernetesError,
                        match='finalized SkyServe worker Pod changed'):
@@ -342,7 +400,7 @@ def test_create_pods_rejects_finalizer_runtime_bootstrap_drift_before_create(
     config = _make_provision_config(count=1)
     config.node_config['spec'] = pod_spec
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 4,
+        'serve_worker_projection_protocol_version': 6,
         'serve_worker_expected_priority_class_name': None,
         'serve_worker_expected_priority_value': None,
         'serve_worker_expected_preemption_policy': None,
@@ -1211,7 +1269,8 @@ def test_persisted_kueue_pod_create_helper_refuses_before_409(monkeypatch):
     core_api.delete_namespaced_pod.assert_not_called()
 
 
-def test_v4_create_pods_waits_for_runtime_ready_before_final_read(monkeypatch):
+def test_current_projection_create_pods_waits_for_runtime_ready_before_final_read(
+        monkeypatch):
     cluster_on_cloud = 'test-v4-runtime-ready-order'
     head_name = f'{cluster_on_cloud}-head'
     expected_uid = f'uid-{head_name}'
@@ -1263,7 +1322,7 @@ def test_v4_create_pods_waits_for_runtime_ready_before_final_read(monkeypatch):
 
     config = _make_provision_config(count=1)
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 4,
+        'serve_worker_projection_protocol_version': 6,
         'serve_worker_expected_priority_class_name': None,
         'serve_worker_expected_priority_value': None,
         'serve_worker_expected_preemption_policy': None,
@@ -1593,6 +1652,10 @@ def test_parallel_create_attests_each_pod_before_sibling_batch_returns(
                         record_attestation('accelerator'))
     monkeypatch.setattr(instance, '_attest_serve_worker_scheduler_and_binding',
                         record_attestation('scheduler'))
+    monkeypatch.setattr(instance, '_attest_serve_worker_scratch',
+                        record_attestation('scratch'))
+    monkeypatch.setattr(instance, '_attest_serve_worker_runtime_readiness',
+                        record_attestation('runtime-readiness'))
 
     def create_pod(_namespace,
                    pod_spec,
@@ -1621,7 +1684,6 @@ def test_parallel_create_attests_each_pod_before_sibling_batch_returns(
     config.provider_config.update({
         'kueue_local_queue_name': 'inference',
         'kueue_workload_priority_class_name': 'inference-low',
-        'serve_worker_projection_protocol_version': 2,
         'serve_worker_expected_priority_class_name': 'inference-low',
         'serve_worker_expected_priority_value': -1000,
         'serve_worker_expected_preemption_policy': 'Never',
@@ -1632,6 +1694,7 @@ def test_parallel_create_attests_each_pod_before_sibling_batch_returns(
         'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
         'serve_worker_expected_accelerator_count': 1,
     })
+    _configure_current_projection_runtime(config)
 
     record = instance._create_pods('us', cluster_on_cloud, cluster_on_cloud,
                                    config)
@@ -1640,7 +1703,7 @@ def test_parallel_create_attests_each_pod_before_sibling_batch_returns(
     assert record.head_instance_id == head_name
     assert [kind for name, kind in events if name == head_name] == [
         'api-response', 'kueue', 'priority', 'service-account', 'accelerator',
-        'scheduler', 'create-return'
+        'scheduler', 'scratch', 'runtime-readiness', 'create-return'
     ]
 
 
@@ -2084,11 +2147,14 @@ def test_required_kueue_adopts_realistic_admitted_running_pod(monkeypatch):
     monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
     monkeypatch.setattr(instance, '_attest_serve_worker_accelerator_scheduling',
                         lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(instance, '_attest_serve_worker_scratch',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(instance, '_attest_serve_worker_runtime_readiness',
+                        lambda *_args, **_kwargs: None)
     config = _make_provision_config(count=1)
     config.provider_config.update({
         'kueue_local_queue_name': 'inference',
         'kueue_workload_priority_class_name': 'inference-low',
-        'serve_worker_projection_protocol_version': 2,
         'serve_worker_expected_priority_class_name': 'inference-low',
         'serve_worker_expected_priority_value': -1000,
         'serve_worker_expected_preemption_policy': 'Never',
@@ -2099,6 +2165,7 @@ def test_required_kueue_adopts_realistic_admitted_running_pod(monkeypatch):
         'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
         'serve_worker_expected_accelerator_count': 1,
     })
+    _configure_current_projection_runtime(config)
 
     record = instance._create_pods('us', cluster_on_cloud, cluster_on_cloud,
                                    config)
@@ -2893,7 +2960,6 @@ def test_required_kueue_rejects_mutated_existing_admitted_pod(
     config.provider_config.update({
         'kueue_local_queue_name': 'inference',
         'kueue_workload_priority_class_name': 'inference-low',
-        'serve_worker_projection_protocol_version': 2,
         'serve_worker_expected_priority_class_name': 'inference-low',
         'serve_worker_expected_priority_value': -1000,
         'serve_worker_expected_preemption_policy': 'Never',
@@ -2904,6 +2970,7 @@ def test_required_kueue_rejects_mutated_existing_admitted_pod(
         'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
         'serve_worker_expected_accelerator_count': 1,
     })
+    _configure_current_projection_runtime(config)
 
     with pytest.raises(config_lib.KubernetesError,
                        match='Kueue admission contract'):

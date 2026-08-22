@@ -2146,7 +2146,8 @@ def replace_claim_set(
                         worker_projections,
                         access_context=str(edge['access_context']),
                         accelerator_names=identity.gpu_names,
-                        accelerator_count=int(edge['gpus_per_replica'])))
+                        accelerator_count=int(edge['gpus_per_replica']),
+                        require_current_protocol=True))
                 edge['worker_projection_sha256_by_accelerator'] = {
                     admission.accelerator: admission.worker_projection_sha256
                     for admission in projected_admissions

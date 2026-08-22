@@ -62,7 +62,8 @@ def _worker_projection(context: str,
     }[context]
     candidate_ordinal = context_ordinal * 2 + int(accelerator_count == 8)
     return {
-        'projection_version': 2,
+        'projection_version':
+            (kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION),
         'candidate_id': f'kubernetes-{candidate_ordinal:04d}',
         'kubernetes_context': context,
         'namespace': 'default',
@@ -71,6 +72,7 @@ def _worker_projection(context: str,
         'priority_class_name': 'skyserve-preemptible',
         'priority_value': -1000,
         'preemption_policy': 'Never',
+        'provision_timeout': -1,
         'kueue_admission': ({
             'local_queue_name': 'be',
             'workload_priority_class_name': 'be-ls',
@@ -84,6 +86,9 @@ def _worker_projection(context: str,
             'resource_key': 'nvidia.com/gpu',
         },
         'cache': {
+            'kind': 'none',
+        },
+        'scratch': {
             'kind': 'none',
         },
     }

@@ -14,16 +14,24 @@ def projected_admission_for_candidate(
     accelerator: str,
     accelerator_count: int,
     expected_sha256: str | None = None,
+    require_current_protocol: bool = False,
 ) -> tuple[dict[str, Any],
            reserved_fill_reclaim_attestation.ReclaimProjectedAdmission]:
     """Select one strict candidate and derive its typed policy view."""
     validated = kubernetes_identity.validate_worker_placement_projections(
-        worker_projections, allow_none=False)
+        worker_projections,
+        allow_none=False,
+        require_protocol_version=(
+            kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION
+            if require_current_protocol else None))
     assert validated is not None
     if not kubernetes_identity.worker_projection_has_strict_admission(
             validated[0]):
-        raise ValueError('Reclaim requires a protocol-v2, protocol-v3, '
-                         'protocol-v4, or protocol-v5 worker projection.')
+        if require_current_protocol:
+            raise ValueError('Reclaim requires the exact current worker '
+                             'projection protocol.')
+        raise ValueError('Reclaim requires a strict worker projection '
+                         'protocol.')
     projection = kubernetes_identity.worker_projection_for_context(
         validated, kubernetes_context, {accelerator: accelerator_count})
     if projection is None:
@@ -43,6 +51,7 @@ def projected_admissions_for_edge(
     access_context: str,
     accelerator_names: Sequence[str],
     accelerator_count: int,
+    require_current_protocol: bool = False,
 ) -> tuple[reserved_fill_reclaim_attestation.ReclaimProjectedAdmission, ...]:
     """Derive the exact sorted policy candidates for one physical edge."""
     if (not isinstance(access_context, str) or not access_context or
@@ -61,7 +70,8 @@ def projected_admissions_for_edge(
             worker_projections,
             kubernetes_context=access_context,
             accelerator=accelerator,
-            accelerator_count=accelerator_count)
+            accelerator_count=accelerator_count,
+            require_current_protocol=require_current_protocol)
         admissions.append(admission)
     return tuple(sorted(admissions))
 

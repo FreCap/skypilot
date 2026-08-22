@@ -498,7 +498,7 @@ def runtime_for_reserved_fill_launch(
     projections = launch_context.get(
         serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY)
     _, admission = reserved_capacity.require_reclaim_worker_projection(
-        fence, projections)
+        fence, projections, require_current_protocol=True)
     if admission.admission_mode is (reserved_fill_reclaim_attestation.
                                     ReclaimAdmissionMode.KUBERNETES_SCHEDULER):
         return None

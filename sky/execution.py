@@ -149,13 +149,15 @@ def _load_service_worker_projections(
             'longer committed.')
     try:
         projections = kubernetes_identity.validate_worker_placement_projections(
-            stored_projections)
+            stored_projections,
+            require_protocol_version=(
+                kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION))
         if (reserved_fill_fence is not None and
                 reserved_fill_fence.policy_bound):
-            # Protocol v2 rows remain launchable only as immutable historical
-            # versions. The reclaim adapter accepts the exact v2/v3 strict
-            # representations and authenticates their stored digest; new
-            # commits are always v3.
+            # Historical projection rows are decode/settle/teardown-only. The
+            # exact-current check above runs before a bound request can reach
+            # provider I/O; the reclaim adapter then authenticates the stored
+            # current projection digest.
             _, admission = reserved_capacity.require_reclaim_worker_projection(
                 reserved_fill_fence, projections)
             if admission.admission_mode is (reserved_fill_reclaim_attestation.
@@ -239,7 +241,11 @@ def _apply_service_worker_runtime_projection_to_task(
             'A projected SkyServe replica launch must pin its Kubernetes '
             'context.')
     projection = kubernetes_identity.worker_projection_for_context(
-        projections, resource.region, resource.accelerators)
+        projections,
+        resource.region,
+        resource.accelerators,
+        require_protocol_version=(
+            kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION))
     if projection is None:
         raise exceptions.RequestCancelled(
             'SkyServe replica launch does not match a frozen worker '
@@ -305,7 +311,7 @@ def _validate_reserved_fill_final_resources(
         return
     try:
         _, admission = reserved_capacity.require_reclaim_worker_projection(
-            fence, worker_projections)
+            fence, worker_projections, require_current_protocol=True)
     except ValueError as error:
         raise reserved_capacity.ReservedFillLaunchFenceError(
             'Reserved-fill launch lost its immutable worker projection.') \
