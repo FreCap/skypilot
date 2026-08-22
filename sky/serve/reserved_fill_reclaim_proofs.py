@@ -402,8 +402,8 @@ class ReclaimProviderProofRepository:
             gate_holds).select_from(
                 anchor.outerjoin(candidates, sqlalchemy.true()))
 
+    @staticmethod
     def _decode_query_row(
-        self,
         row: Mapping[str, Any] | None,
         *,
         identity: reclaim.ReclaimPolicyIdentity,
@@ -936,6 +936,64 @@ class ReclaimProviderProofRepository:
                     selected = dataclasses.replace(selected,
                                                    publication_observed=True)
                 return selected
+
+
+def provider_proof_admission_ready_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    identity: reclaim.ReclaimPolicyIdentity,
+    gate_generation: int,
+    kubernetes_context: str,
+    expected_physical_cluster_uid: str,
+    minimum_remaining_seconds: float = (
+        reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS),
+) -> bool:
+    """Check exact proof readiness before starting durable provider work.
+
+    This is a provider-free flow-control predicate, not provider-effect
+    authority.  It keeps an actuation wave parked while the deployment-owned
+    proof is missing or has entered its renewal reserve.  The launch handler
+    must still obtain a policy-validated exact reference and pass
+    ``provider_proof_reference_holds_in_connection()`` immediately before the
+    concrete provider effect.
+    """
+    if (connection.dialect.name != 'postgresql' or
+            connection.get_isolation_level().upper() != 'READ COMMITTED' or
+            not isinstance(identity, reclaim.ReclaimPolicyIdentity) or
+            type(gate_generation) is not int or gate_generation < 1 or
+            type(kubernetes_context) is not str or not kubernetes_context or
+            type(expected_physical_cluster_uid) is not str or
+            not expected_physical_cluster_uid):
+        return False
+    try:
+        # These are the repository's canonical SQL/decode primitives; reuse
+        # them here so the admission predicate cannot drift from consumers.
+        # pylint: disable=protected-access
+        statement = ReclaimProviderProofRepository._read_statement(
+            identity, gate_generation, kubernetes_context)
+        local_started = time.monotonic()
+        rows = connection.execute(statement).mappings().all()
+        local_finished = time.monotonic()
+        if len(rows) != 1:
+            return False
+        receipt, _ = ReclaimProviderProofRepository._decode_query_row(
+            rows[0],
+            identity=identity,
+            gate_generation=gate_generation,
+            kubernetes_context=kubernetes_context,
+            local_read_started=local_started,
+            local_read_finished=local_finished)
+        # pylint: enable=protected-access
+        if receipt is None:
+            return False
+        kubernetes_summary = receipt.proof_payload.get('kubernetes')
+        return bool(receipt.is_fresh and
+                    receipt.has_remaining(minimum_remaining_seconds) and
+                    isinstance(kubernetes_summary, Mapping) and
+                    kubernetes_summary.get('physical_cluster_uid')
+                    == expected_physical_cluster_uid)
+    except (ReclaimProviderProofError, TypeError, ValueError):
+        return False
 
 
 def provider_proof_reference_holds_in_connection(

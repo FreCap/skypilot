@@ -23,6 +23,9 @@ from sky.serve import pool_capacity_observation_schema
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
+from sky.serve import reserved_fill_reclaim_attestation
+from sky.serve import reserved_fill_reclaim_proof_schema
+from sky.serve import reserved_fill_reclaim_proofs
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import serve_utils
@@ -144,7 +147,7 @@ def _plan(
         allocation_claim_generation=11,
         service_version=service_version,
         ordinary_zero_cost_admission_sequence_high_water=17,
-        reconciliation_gate_generation=29,
+        reconciliation_gate_generation=1,
         reclaim_fleet_bundle_sha256='c' * 64,
         reclaim_policy_revision='reclaim-v1',
         reclaim_provider_inventory_sha256='d' * 64,
@@ -246,6 +249,83 @@ def _grant_plan(
         max_capacity=max_capacity,
         expected_controller_incarnation=controller['controller_incarnation'],
         expected_controller_owner_epoch=controller['controller_owner_epoch'])
+
+
+def _install_fresh_provider_proofs(
+    engine: sqlalchemy.engine.Engine,
+    intents: tuple[reserved_fill_planner.FillIntent, ...],
+) -> None:
+    """Activate the exact test gate and publish provider-free proof receipts."""
+    assert intents
+    first = intents[0]
+    identity = reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
+        fleet_bundle_sha256=first.reclaim_fleet_bundle_sha256,
+        policy_revision=first.reclaim_policy_revision,
+        provider_inventory_sha256=first.reclaim_provider_inventory_sha256)
+    gate = pool_capacity_observation.PoolCapacityObservationRepository(
+        engine).read_reconciliation_gate()
+    if not gate.sequenced_active:
+        evidence = reserved_fill_reclaim_attestation.ReclaimEnforcementEvidence(
+            contract=(
+                reserved_fill_reclaim_attestation.ReclaimEnforcementContract.
+                GLOBAL_FLEET_CLAIM_ADMISSION_AND_LAUNCH_FENCES_V2),
+            fleet_bundle_sha256=identity.fleet_bundle_sha256,
+            policy_revision=identity.policy_revision,
+            provider_inventory_sha256=identity.provider_inventory_sha256,
+            claimed_contexts=(),
+            completed_monotonic=time.monotonic())
+        receipt = reserved_fill_reclaim_attestation.activation_receipt(
+            evidence,
+            writer_image_digest='sha256:' + 'e' * 64,
+            writer_deployment_generation='proof-ready-test',
+            writer_deployment_uid='proof-ready-test-uid',
+            writer_pod_inventory_count=1,
+            writer_pod_inventory_sha256='f' * 64)
+        assert serve_state.set_reserved_fill_protocol_version(
+            serve_state.RESERVED_FILL_PROTOCOL_V2,
+            expected_protocol_version=(serve_state.RESERVED_FILL_PROTOCOL_V1),
+            image_digest='sha256:' + 'e' * 64,
+            deployment_generation='proof-ready-test',
+            deployment_uid='proof-ready-test-uid',
+            pod_inventory_count=1,
+            pod_inventory_sha256='f' * 64)
+        activated = pool_capacity_observation.PoolCapacityObservationRepository(
+            engine).authorize_sequenced_reconciliation(expected_generation=0,
+                                                       receipt=receipt)
+        assert activated.gate.generation == first.reconciliation_gate_generation
+    else:
+        assert gate.generation == first.reconciliation_gate_generation
+        assert gate.reclaim_policy_identity == identity
+
+    repository = reserved_fill_reclaim_proofs.ReclaimProviderProofRepository(
+        engine)
+    try:
+        authorities = {(intent.allowed_locations[0].region,
+                        intent.physical_cluster_uid) for intent in intents}
+        for context, physical_uid in sorted(authorities):
+            payload = {
+                'aws': {},
+                'kubernetes': {
+                    'physical_cluster_uid': physical_uid,
+                },
+            }
+            repository.renew(
+                identity=identity,
+                gate_generation=first.reconciliation_gate_generation,
+                kubernetes_context=context,
+                deadline_monotonic=(time.monotonic() +
+                                    reserved_fill_reclaim_attestation.
+                                    PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS),
+                prove=lambda payload=payload: reserved_fill_reclaim_proofs.
+                ReclaimProviderProofCandidate(proof_payload=payload,
+                                              oldest_completed_monotonic=time.
+                                              monotonic()),
+                validate=lambda _payload: True,
+                minimum_remaining_seconds=(
+                    reserved_fill_reclaim_attestation.
+                    PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS))
+    finally:
+        repository._proof_engine.dispose()
 
 
 def _commit_test_service_version(
@@ -482,6 +562,25 @@ def test_kueue_same_domain_batch_leases_in_three_bounded_waves(
                  physical_uid='uid-phx',
                  kueue=True)
     assert len(_grant_plan(repository, plan, max_capacity=90).accepted) == 90
+    assert not repository.actionable_pool_keys(service_name='svc')
+    assert not repository.lease_batch(service_name='svc',
+                                      pool_key=plan.intents[0].pool_key,
+                                      owner=uuid.uuid4(),
+                                      lease_seconds=30)
+    with actuation_database.connect() as connection:
+        assert set(
+            connection.execute(
+                sqlalchemy.select(zero_cost_actuation_schema.
+                                  serve_zero_cost_actuation_intents_table.c.
+                                  state)).scalars()) == {'GRANTED'}
+        assert set(
+            connection.execute(
+                sqlalchemy.select(
+                    kueue_lane_lineage_schema.serve_kueue_admissions_table.c.
+                    state)).scalars()) == {'INTENT_PENDING'}
+    _install_fresh_provider_proofs(actuation_database, plan.intents)
+    assert repository.actionable_pool_keys(
+        service_name='svc') == (plan.intents[0].pool_key,)
     owner = uuid.uuid4()
 
     waves = tuple(
@@ -496,10 +595,10 @@ def test_kueue_same_domain_batch_leases_in_three_bounded_waves(
     assert {lease.generation for lease in leases} == {1}
     assert [lease.intent.idempotency_key for lease in leases
            ] == sorted(intent.idempotency_key for intent in plan.intents)
-    assert repository.lease_batch(service_name='svc',
-                                  pool_key=plan.intents[0].pool_key,
-                                  owner=owner,
-                                  lease_seconds=30) == ()
+    assert not repository.lease_batch(service_name='svc',
+                                      pool_key=plan.intents[0].pool_key,
+                                      owner=owner,
+                                      lease_seconds=30)
 
 
 def test_kueue_grant_rejects_multi_node_immutable_catalog(
@@ -1430,6 +1529,8 @@ def test_pool_leases_are_independent_and_retryable(actuation_database) -> None:
     west = _plan(free_slots=1, context='west', physical_uid='uid-west')
     _grant_plan(repository, east, max_capacity=2)
     _grant_plan(repository, west, max_capacity=2)
+    _install_fresh_provider_proofs(actuation_database,
+                                   east.intents + west.intents)
     owner = uuid.uuid4()
 
     east_lease = repository.lease_next(service_name='svc',
@@ -1454,6 +1555,53 @@ def test_pool_leases_are_independent_and_retryable(actuation_database) -> None:
                                     lease_seconds=30)
     assert retried is not None
     assert retried.generation == east_lease.generation + 1
+
+
+def test_proof_blackout_parks_only_its_exact_pool_and_resumes(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    east = _plan(free_slots=1, context='east', physical_uid='uid-east')
+    west = _plan(free_slots=1, context='west', physical_uid='uid-west')
+    _grant_plan(repository, east, max_capacity=2)
+    _grant_plan(repository, west, max_capacity=2)
+    _install_fresh_provider_proofs(actuation_database,
+                                   east.intents + west.intents)
+    proof_table = (reserved_fill_reclaim_proof_schema.
+                   serve_reserved_fill_reclaim_provider_proofs_table)
+    with actuation_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(proof_table).where(
+                proof_table.c.kubernetes_context == 'west').values(
+                    completed_at=(sqlalchemy.func.clock_timestamp() -
+                                  datetime.timedelta(seconds=11))))
+
+    assert repository.actionable_pool_keys(
+        service_name='svc') == (east.intents[0].pool_key,)
+    assert repository.lease_next(service_name='svc',
+                                 pool_key=west.intents[0].pool_key,
+                                 owner=uuid.uuid4(),
+                                 lease_seconds=30) is None
+    with actuation_database.connect() as connection:
+        west_row = connection.execute(
+            sqlalchemy.select(
+                zero_cost_actuation_schema.
+                serve_zero_cost_actuation_intents_table).where(
+                    zero_cost_actuation_schema.
+                    serve_zero_cost_actuation_intents_table.c.kubernetes_context
+                    == 'west')).mappings().one()
+    assert west_row['state'] == 'GRANTED'
+    assert west_row['lease_generation'] == 0
+
+    _install_fresh_provider_proofs(actuation_database, west.intents)
+    assert set(repository.actionable_pool_keys(service_name='svc')) == {
+        east.intents[0].pool_key, west.intents[0].pool_key
+    }
+    west_lease = repository.lease_next(service_name='svc',
+                                       pool_key=west.intents[0].pool_key,
+                                       owner=uuid.uuid4(),
+                                       lease_seconds=30)
+    assert west_lease is not None
 
 
 def _replica_for_intent(intent: reserved_fill_planner.FillIntent,
@@ -1617,6 +1765,7 @@ def test_replica_and_intent_commit_in_one_transaction(
         actuation_database)
     plan = _plan(free_slots=1)
     _grant_plan(repository, plan, max_capacity=1)
+    _install_fresh_provider_proofs(actuation_database, plan.intents)
     lease = repository.lease_next(service_name='svc',
                                   pool_key=plan.intents[0].pool_key,
                                   owner=uuid.uuid4(),
@@ -1647,6 +1796,7 @@ def test_pre_serve056_json_only_replica_is_cleanup_only(
         actuation_database)
     plan = _plan(free_slots=1)
     _grant_plan(repository, plan, max_capacity=1)
+    _install_fresh_provider_proofs(actuation_database, plan.intents)
     lease = repository.lease_next(service_name='svc',
                                   pool_key=plan.intents[0].pool_key,
                                   owner=uuid.uuid4(),
@@ -1692,6 +1842,7 @@ def test_committed_replica_id_high_water_survives_replica_cleanup(
         actuation_database)
     plan = _plan(free_slots=1)
     _grant_plan(repository, plan, max_capacity=1)
+    _install_fresh_provider_proofs(actuation_database, plan.intents)
     lease = repository.lease_next(service_name='svc',
                                   pool_key=plan.intents[0].pool_key,
                                   owner=uuid.uuid4(),
@@ -1734,6 +1885,7 @@ def test_intent_mismatch_rolls_back_replica_insert(actuation_database) -> None:
         actuation_database)
     plan = _plan(free_slots=1)
     _grant_plan(repository, plan, max_capacity=1)
+    _install_fresh_provider_proofs(actuation_database, plan.intents)
     lease = repository.lease_next(service_name='svc',
                                   pool_key=plan.intents[0].pool_key,
                                   owner=uuid.uuid4(),

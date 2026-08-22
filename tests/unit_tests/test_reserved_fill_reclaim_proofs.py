@@ -676,6 +676,43 @@ def test_cold_consumer_withholds_admission_without_creating_proof(proof_engine):
         ).scalar_one() == 0
 
 
+def test_admission_readiness_requires_exact_receipt_and_renewal_reserve(
+        proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    _renew_receipt(repository, _proof_candidate)
+
+    def ready(connection, **overrides):
+        arguments = {
+            'identity': _identity(),
+            'gate_generation': _GATE_GENERATION,
+            'kubernetes_context': _CONTEXT,
+            'expected_physical_cluster_uid': 'physical-cluster-uid',
+            'minimum_remaining_seconds':
+                reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS,
+        }
+        arguments.update(overrides)
+        return proofs.provider_proof_admission_ready_in_connection(
+            connection, **arguments)
+
+    with proof_engine.connect() as connection:
+        assert ready(connection)
+        assert not ready(connection,
+                         expected_physical_cluster_uid='different-cluster')
+        assert not ready(connection, gate_generation=_GATE_GENERATION + 1)
+
+    with proof_engine.connect().execution_options(
+            isolation_level='REPEATABLE READ') as connection:
+        assert not ready(connection)
+
+    with proof_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                proof_schema.serve_reserved_fill_reclaim_provider_proofs_table).
+            values(completed_at=(sqlalchemy.func.clock_timestamp() -
+                                 datetime.timedelta(seconds=11))))
+        assert not ready(connection)
+
+
 def test_one_renewal_serves_100_concurrent_consumers_without_provider_io(
         proof_engine):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
