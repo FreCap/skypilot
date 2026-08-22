@@ -18,6 +18,7 @@ from unittest import mock
 
 from sky.serve import autoscalers
 from sky.serve import constants
+from sky.serve import kueue_lane_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -253,6 +254,247 @@ def _allocation(target,
         paid_target_by_accelerator=(explicit
                                     if paid_target is None else paid_target),
         card_attribution_complete=complete)
+
+
+class TestKueueAdmissionCapacity(unittest.TestCase):
+    """Waiting is zero-width; admission retires paid only after READY."""
+
+    def test_minimal_classes_drive_committed_capacity(self):
+        autoscaler = _make_autoscaler(replica_unit='logical')
+        waiting = _replica(1,
+                           status=serve_state.ReplicaStatus.PROVISIONING,
+                           planned_capacity=4,
+                           reserved_fill=True)
+        admitted = _replica(2,
+                            status=serve_state.ReplicaStatus.PROVISIONING,
+                            planned_capacity=4,
+                            reserved_fill=True)
+        unknown = _replica(3,
+                           status=serve_state.ReplicaStatus.PROVISIONING,
+                           planned_capacity=4,
+                           reserved_fill=True)
+        autoscaler._kueue_capacity_by_replica_id_for_tick = {
+            1: kueue_lane_capacity.KueueReplicaCapacityClass.FRESH_WAITING,
+            2: kueue_lane_capacity.KueueReplicaCapacityClass.POLICY_ADMITTED,
+            3: kueue_lane_capacity.KueueReplicaCapacityClass.UNKNOWN,
+        }
+
+        self.assertEqual(autoscaler._committed_capacity(waiting), 0)
+        self.assertEqual(autoscaler._committed_capacity(admitted), 4)
+        self.assertEqual(autoscaler._committed_capacity(unknown), 4)
+        self.assertEqual(
+            autoscaler._latest_committed_logical_capacity(
+                [waiting, admitted, unknown]), 8)
+
+    def test_live_admitted_predecessor_remains_committed(self):
+        autoscaler = autoscalers.ConcurrencyAutoscaler(
+            'svc', _spec(replica_unit='logical'), version=2)
+        predecessor = _replica(1,
+                               version=1,
+                               status=serve_state.ReplicaStatus.PROVISIONING,
+                               planned_capacity=8,
+                               reserved_fill=True)
+        autoscaler._kueue_capacity_by_replica_id_for_tick = {
+            1: kueue_lane_capacity.KueueReplicaCapacityClass.POLICY_ADMITTED,
+        }
+
+        self.assertEqual(
+            autoscaler._nonterminal_committed_logical_capacity([predecessor]),
+            8)
+
+    def test_paid_ready_replica_waits_for_reserved_readiness(self):
+        autoscaler = _make_autoscaler()
+        autoscaler.target_num_replicas = 1
+        paid = _replica(1)
+        paid.is_zero_cost = False
+        paid.handle.return_value.launched_resources.get_cost.return_value = 2.0
+        reserved = _replica(2,
+                            status=serve_state.ReplicaStatus.PROVISIONING,
+                            reserved_fill=True)
+        reserved.is_zero_cost = True
+        reserved.handle.return_value.launched_resources.get_cost.return_value = 0
+        autoscaler._kueue_capacity_by_replica_id_for_tick = {
+            2: kueue_lane_capacity.KueueReplicaCapacityClass.POLICY_ADMITTED,
+        }
+        autoscaler._kueue_transition_replica_ids_for_tick = frozenset({1, 2})
+        _report(autoscaler, {1: 0, 2: 0})
+
+        decisions = autoscaler._generate_scaling_decisions([paid, reserved])
+        self.assertEqual(_scale_downs(decisions), [])
+
+        reserved.status = serve_state.ReplicaStatus.READY
+        reserved.is_ready = True
+        autoscaler._kueue_ready_paid_replacement_replica_ids_for_tick = (
+            frozenset({1}))
+        decisions = autoscaler._generate_scaling_decisions([paid, reserved])
+        self.assertEqual(_scale_downs(decisions), [1])
+
+    def test_unknown_admission_blocks_only_compatible_victims(self):
+        autoscaler = _make_autoscaler()
+        autoscaler.target_num_replicas = 1
+        replicas = [_replica(1), _replica(2), _replica(3, card='H200')]
+        autoscaler._kueue_capacity_by_replica_id_for_tick = {
+            2: kueue_lane_capacity.KueueReplicaCapacityClass.UNKNOWN,
+        }
+        autoscaler._kueue_blocked_retirement_shapes_for_tick = frozenset({('l4',
+                                                                           1)})
+
+        self.assertFalse(autoscaler._kueue_ordinary_victim_eligible(
+            replicas[0]))
+        self.assertFalse(autoscaler._kueue_ordinary_victim_eligible(
+            replicas[1]))
+        self.assertTrue(autoscaler._kueue_ordinary_victim_eligible(replicas[2]))
+
+    def _assert_unknown_lineage_blocks_paid_retirement(self):
+        autoscaler = _make_autoscaler()
+        paid = _replica(1)
+        reserved = _replica(2,
+                            status=serve_state.ReplicaStatus.PROVISIONING,
+                            reserved_fill=True)
+        reserved.is_zero_cost = True
+        snapshot = kueue_lane_capacity.KueueReplicaCapacitySnapshot(
+            {
+                2: kueue_lane_capacity.KueueReplicaCapacityClass.UNKNOWN,
+            }, frozenset({('l4', 1)}))
+        with mock.patch.object(kueue_lane_capacity,
+                               'snapshot_replica_capacity_classes',
+                               return_value=snapshot):
+            inputs = autoscaler._prepare_scaling_decision_inputs(
+                [paid, reserved])
+
+        autoscaler._kueue_capacity_by_replica_id_for_tick = dict(
+            inputs.kueue_capacity_by_replica_id)
+        autoscaler._kueue_blocked_retirement_shapes_for_tick = (
+            inputs.kueue_blocked_retirement_shapes)
+        self.assertFalse(autoscaler._kueue_ordinary_victim_eligible(paid))
+        self.assertFalse(autoscaler._kueue_ordinary_victim_eligible(reserved))
+
+    def test_missing_kueue_admission_blocks_paid_retirement(self):
+        self._assert_unknown_lineage_blocks_paid_retirement()
+
+    def test_copied_kueue_identity_mismatch_blocks_paid_retirement(self):
+        self._assert_unknown_lineage_blocks_paid_retirement()
+
+    def test_proven_east_without_admission_retains_ordinary_retirement(self):
+        autoscaler = _make_autoscaler()
+        paid = _replica(1)
+        with mock.patch.object(
+                kueue_lane_capacity,
+                'snapshot_replica_capacity_classes',
+                return_value=kueue_lane_capacity.KueueReplicaCapacitySnapshot(
+                    {})):
+            inputs = autoscaler._prepare_scaling_decision_inputs([paid])
+
+        autoscaler._kueue_capacity_by_replica_id_for_tick = dict(
+            inputs.kueue_capacity_by_replica_id)
+        autoscaler._kueue_blocked_retirement_shapes_for_tick = (
+            inputs.kueue_blocked_retirement_shapes)
+        self.assertTrue(autoscaler._kueue_ordinary_victim_eligible(paid))
+
+    def test_admitted_replacement_makes_paid_the_only_eligible_victim(self):
+        autoscaler = _make_autoscaler()
+        paid = _replica(1)
+        reserved = _replica(2, reserved_fill=True)
+        reserved.is_zero_cost = True
+        autoscaler._kueue_capacity_by_replica_id_for_tick = {
+            2: kueue_lane_capacity.KueueReplicaCapacityClass.POLICY_ADMITTED,
+        }
+        autoscaler._kueue_transition_replica_ids_for_tick = frozenset({1, 2})
+        autoscaler._kueue_ready_paid_replacement_replica_ids_for_tick = (
+            frozenset({1}))
+
+        self.assertTrue(autoscaler._kueue_ordinary_victim_eligible(paid))
+        self.assertFalse(autoscaler._kueue_ordinary_victim_eligible(reserved))
+
+    def test_heterogeneous_admitted_reserved_never_widens_surge(self):
+        for reserved_card in ('H200', 'A100', 'A100-80GB'):
+            with self.subTest(reserved_card=reserved_card):
+                autoscaler = _make_autoscaler(replica_unit='logical')
+                paid = _replica(1, card='L4', planned_capacity=1)
+                reserved = _replica(2,
+                                    card=reserved_card,
+                                    planned_capacity=1,
+                                    reserved_fill=True)
+                reserved.is_zero_cost = True
+                snapshot = kueue_lane_capacity.KueueReplicaCapacitySnapshot(
+                    {
+                        2: kueue_lane_capacity.KueueReplicaCapacityClass.
+                           POLICY_ADMITTED,
+                    },
+                    replacement_surge_replica_ids=frozenset({2}),
+                    replacement_surge_shapes=frozenset({
+                        (reserved_card.casefold(), 1)
+                    }))
+                with mock.patch.object(kueue_lane_capacity,
+                                       'snapshot_replica_capacity_classes',
+                                       return_value=snapshot):
+                    inputs = autoscaler._prepare_scaling_decision_inputs(
+                        [paid, reserved])
+
+                self.assertEqual(inputs.kueue_transition_replica_ids, {2})
+                self.assertEqual(
+                    inputs.kueue_ready_paid_replacement_replica_ids, set())
+
+    def test_exact_shape_surge_makes_only_paid_victim_eligible_when_ready(self):
+        autoscaler = _make_autoscaler(replica_unit='logical')
+        paid = _replica(1, card='H200', gpu_count=8, planned_capacity=8)
+        paid.is_zero_cost = False
+        reserved = _replica(2,
+                            card='H200',
+                            gpu_count=8,
+                            planned_capacity=8,
+                            reserved_fill=True)
+        reserved.is_zero_cost = True
+        snapshot = kueue_lane_capacity.KueueReplicaCapacitySnapshot(
+            {
+                2: kueue_lane_capacity.KueueReplicaCapacityClass.
+                   POLICY_ADMITTED,
+            },
+            replacement_surge_replica_ids=frozenset({2}),
+            replacement_surge_shapes=frozenset({('h200', 8)}))
+        with mock.patch.object(kueue_lane_capacity,
+                               'snapshot_replica_capacity_classes',
+                               return_value=snapshot):
+            inputs = autoscaler._prepare_scaling_decision_inputs(
+                [paid, reserved])
+
+        self.assertEqual(inputs.kueue_transition_replica_ids, {1, 2})
+        self.assertEqual(inputs.kueue_ready_paid_replacement_replica_ids, {1})
+
+    def test_cleanup_unproven_paid_keeps_surge_reserved_protected(self):
+        autoscaler = _make_autoscaler(replica_unit='logical')
+        paid = _replica(1,
+                        card='H200',
+                        gpu_count=8,
+                        planned_capacity=8,
+                        status=serve_state.ReplicaStatus.SHUTTING_DOWN)
+        paid.is_zero_cost = False
+        reserved = _replica(2,
+                            card='H200',
+                            gpu_count=8,
+                            planned_capacity=8,
+                            reserved_fill=True)
+        reserved.is_zero_cost = True
+        snapshot = kueue_lane_capacity.KueueReplicaCapacitySnapshot(
+            {
+                2: kueue_lane_capacity.KueueReplicaCapacityClass.
+                   POLICY_ADMITTED,
+            },
+            replacement_surge_replica_ids=frozenset({2}),
+            replacement_surge_shapes=frozenset({('h200', 8)}))
+        with mock.patch.object(kueue_lane_capacity,
+                               'snapshot_replica_capacity_classes',
+                               return_value=snapshot):
+            inputs = autoscaler._prepare_scaling_decision_inputs(
+                [paid, reserved])
+
+        self.assertEqual(inputs.kueue_transition_replica_ids, {1, 2})
+        self.assertEqual(inputs.kueue_ready_paid_replacement_replica_ids, set())
+        autoscaler._kueue_transition_replica_ids_for_tick = (
+            inputs.kueue_transition_replica_ids)
+        autoscaler._kueue_ready_paid_replacement_replica_ids_for_tick = (
+            inputs.kueue_ready_paid_replacement_replica_ids)
+        self.assertFalse(autoscaler._kueue_ordinary_victim_eligible(reserved))
 
 
 class TestFromSpecSelection(unittest.TestCase):

@@ -314,7 +314,7 @@ def test_previous_cohort_intent_retries_before_provider_or_materialization(
     intent = _plan((_snapshot('east-context', 'uid-east', 1),)).intents[0]
     lease = SimpleNamespace(intent=intent)
     repository = mock.Mock()
-    repository.lease_next.return_value = lease
+    repository.lease_batch.return_value = (lease,)
     manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
 
     with mock.patch.object(replica_managers.provider_phase,
@@ -361,8 +361,8 @@ def test_durable_pool_executor_does_not_serialize_independent_pools() -> None:
         for intent in plan.intents
     }
     repository = mock.Mock()
-    repository.lease_next.side_effect = (
-        lambda **kwargs: leases[kwargs['pool_key']])
+    repository.lease_batch.side_effect = (lambda **kwargs:
+                                          (leases[kwargs['pool_key']],))
     manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
     blocked_entered = threading.Event()
     release_blocked = threading.Event()
@@ -425,9 +425,233 @@ def test_durable_pool_executor_does_not_serialize_independent_pools() -> None:
 
     assert not blocked.is_alive()
     assert not healthy.is_alive()
-    assert repository.lease_next.call_count == 2
+    assert repository.lease_batch.call_count == 2
     repository.release_retryable.assert_not_called()
     repository.terminate.assert_not_called()
+
+
+def test_durable_pool_executor_materializes_one_bounded_shared_preflight_wave(
+) -> None:
+    manager = _manager()
+    manager.lock = threading.Lock()
+    manager._workspace = 'workspace-a'  # pylint: disable=protected-access
+    manager._zero_cost_actuation_executor_id = (  # pylint: disable=protected-access
+        mock.sentinel.executor_id)
+    manager._scale_reconciliation_event = threading.Event()  # pylint: disable=protected-access
+    manager._zero_cost_actuation_event = threading.Event()  # pylint: disable=protected-access
+    plan = _plan((_snapshot('east-context', 'uid-east', 3),))
+    leases = tuple(SimpleNamespace(intent=intent) for intent in plan.intents)
+    repository = mock.Mock()
+    repository.lease_batch.return_value = leases
+    manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
+    preflights = SimpleNamespace(
+        preflights={('east-context', 'uid-east'): SimpleNamespace(error=None)})
+
+    def materialize(_resources_override, used_replica_ids, *_args, **_kwargs):
+        replica_id = 100 + len(used_replica_ids)
+        return replica_managers._ReplicaLaunchResult(  # pylint: disable=protected-access
+            replica_id=replica_id,
+            planned_capacity=1,
+            funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)  # pylint: disable=protected-access
+
+    with mock.patch.object(
+            manager,
+            '_zero_cost_actuation_authority_current',
+            return_value=True), mock.patch.object(
+                replica_managers.provider_phase,
+                'try_provider_phase',
+                return_value=contextlib.nullcontext(mock.sentinel.admission)), \
+            mock.patch.object(
+                manager,
+                '_start_reserved_fill_physical_preflights',
+                return_value=preflights) as start_preflights, mock.patch.object(
+                    manager,
+                    '_release_reserved_fill_physical_preflights') as release, \
+            mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[]), mock.patch.object(
+                    manager,
+                    '_scale_up_one_locked',
+                    side_effect=materialize) as scale_one:
+        manager._actuate_zero_cost_pool(plan.intents[0].pool_key)
+
+    repository.lease_batch.assert_called_once_with(
+        service_name='svc',
+        pool_key=plan.intents[0].pool_key,
+        owner=mock.sentinel.executor_id,
+        lease_seconds=mock.ANY,
+        max_leases=zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE)
+    start_preflights.assert_called_once_with(
+        tuple(intent for intent in plan.intents), mock.sentinel.admission,
+        'workspace-a')
+    release.assert_called_once_with(preflights)
+    assert scale_one.call_count == 3
+    repository.release_retryable.assert_not_called()
+    repository.terminate.assert_not_called()
+
+
+def test_durable_pool_executor_continues_after_per_intent_ambiguity() -> None:
+    manager = _manager()
+    manager.lock = threading.Lock()
+    manager._workspace = 'workspace-a'  # pylint: disable=protected-access
+    manager._zero_cost_actuation_executor_id = (  # pylint: disable=protected-access
+        mock.sentinel.executor_id)
+    manager._scale_reconciliation_event = threading.Event()  # pylint: disable=protected-access
+    manager._zero_cost_actuation_event = threading.Event()  # pylint: disable=protected-access
+    plan = _plan((_snapshot('east-context', 'uid-east', 3),))
+    leases = tuple(SimpleNamespace(intent=intent) for intent in plan.intents)
+    repository = mock.Mock()
+    repository.lease_batch.return_value = leases
+    manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
+    preflights = SimpleNamespace(
+        preflights={('east-context', 'uid-east'): SimpleNamespace(error=None)})
+    result = replica_managers._ReplicaLaunchResult(  # pylint: disable=protected-access
+        replica_id=101,
+        planned_capacity=1,
+        funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)  # pylint: disable=protected-access
+
+    with mock.patch.object(
+            manager,
+            '_zero_cost_actuation_authority_current',
+            return_value=True), mock.patch.object(
+                replica_managers.provider_phase,
+                'try_provider_phase',
+                return_value=contextlib.nullcontext(mock.sentinel.admission)), \
+            mock.patch.object(
+                manager,
+                '_start_reserved_fill_physical_preflights',
+                return_value=preflights), mock.patch.object(
+                    manager,
+                    '_release_reserved_fill_physical_preflights'), \
+            mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[]), mock.patch.object(
+                    manager,
+                    '_scale_up_one_locked',
+                    side_effect=(reserved_fill_admission.AdmissionAmbiguousError(
+                        'first acknowledgement lost'), result, result)) as scale_one:
+        manager._actuate_zero_cost_pool(plan.intents[0].pool_key)
+
+    assert scale_one.call_count == 3
+    repository.release_retryable.assert_not_called()
+    repository.terminate.assert_not_called()
+
+
+def test_shared_preflight_failure_releases_every_uncommitted_batch_lease(
+) -> None:
+    manager = _manager()
+    manager.lock = threading.Lock()
+    manager._workspace = 'workspace-a'  # pylint: disable=protected-access
+    manager._zero_cost_actuation_executor_id = (  # pylint: disable=protected-access
+        mock.sentinel.executor_id)
+    manager._scale_reconciliation_event = threading.Event()  # pylint: disable=protected-access
+    manager._zero_cost_actuation_event = threading.Event()  # pylint: disable=protected-access
+    plan = _plan((_snapshot('east-context', 'uid-east', 3),))
+    leases = tuple(SimpleNamespace(intent=intent) for intent in plan.intents)
+    repository = mock.Mock()
+    repository.lease_batch.return_value = leases
+    manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
+    preflights = SimpleNamespace(
+        preflights={
+            ('east-context', 'uid-east'): SimpleNamespace(
+                error=replica_managers.exceptions.ProviderPhaseBusyError(
+                    'physical fence busy'))
+        })
+
+    with mock.patch.object(
+            manager,
+            '_zero_cost_actuation_authority_current',
+            return_value=True), mock.patch.object(
+                replica_managers.provider_phase,
+                'try_provider_phase',
+                return_value=contextlib.nullcontext(mock.sentinel.admission)), \
+            mock.patch.object(
+                manager,
+                '_start_reserved_fill_physical_preflights',
+                return_value=preflights), mock.patch.object(
+                    manager,
+                    '_release_reserved_fill_physical_preflights'), \
+            mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[]), mock.patch.object(
+                    manager, '_scale_up_one_locked') as scale_one:
+        manager._actuate_zero_cost_pool(plan.intents[0].pool_key)
+
+    assert repository.release_retryable.call_args_list == [
+        mock.call(lease, 'ProviderPhaseBusyError') for lease in leases
+    ]
+    repository.terminate.assert_not_called()
+    scale_one.assert_not_called()
+
+
+def test_per_intent_physical_fence_busy_retries_without_terminalizing() -> None:
+    manager = _manager()
+    manager.lock = threading.Lock()
+    manager._workspace = 'workspace-a'  # pylint: disable=protected-access
+    manager._zero_cost_actuation_executor_id = (  # pylint: disable=protected-access
+        mock.sentinel.executor_id)
+    intent = _plan((_snapshot('east-context', 'uid-east', 1),)).intents[0]
+    lease = SimpleNamespace(intent=intent)
+    repository = mock.Mock()
+    repository.lease_batch.return_value = (lease,)
+    manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
+    preflights = SimpleNamespace(
+        preflights={('east-context', 'uid-east'): SimpleNamespace(error=None)})
+    busy = replica_managers.exceptions.KubernetesPhysicalClusterFenceBusyError(
+        'another capture is active', 'east-context', 7)
+
+    with mock.patch.object(
+            manager,
+            '_zero_cost_actuation_authority_current',
+            return_value=True), mock.patch.object(
+                replica_managers.provider_phase,
+                'try_provider_phase',
+                return_value=contextlib.nullcontext(mock.sentinel.admission)), \
+            mock.patch.object(
+                manager,
+                '_start_reserved_fill_physical_preflights',
+                return_value=preflights), mock.patch.object(
+                    manager,
+                    '_release_reserved_fill_physical_preflights'), \
+            mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[]), mock.patch.object(
+                    manager, '_scale_up_one_locked', side_effect=busy):
+        manager._actuate_zero_cost_pool(intent.pool_key)
+
+    repository.release_retryable.assert_called_once_with(
+        lease, 'KubernetesPhysicalClusterFenceBusyError')
+    repository.terminate.assert_not_called()
+
+
+def test_dispatcher_does_not_erase_publication_during_durable_scan() -> None:
+    manager = _manager()
+    manager._zero_cost_actuation_event = threading.Event()  # pylint: disable=protected-access
+    manager._zero_cost_actuation_lane_lock = threading.Lock()  # pylint: disable=protected-access
+    manager._zero_cost_actuation_lanes = {}  # pylint: disable=protected-access
+    manager._manager_daemon_should_stop = mock.Mock(  # pylint: disable=protected-access
+        side_effect=(False, True))
+    repository = mock.Mock()
+
+    def publish_while_scanning(**_kwargs):
+        manager._zero_cost_actuation_event.set()  # pylint: disable=protected-access
+        return ()
+
+    repository.actionable_pool_keys.side_effect = publish_while_scanning
+    manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
+
+    with mock.patch.object(
+            zero_cost_actuation,
+            'get_service_mode',
+            return_value=zero_cost_actuation.ActuationMode.DURABLE_INTENT):
+        manager._zero_cost_actuation_dispatcher()
+
+    assert manager._zero_cost_actuation_event.is_set()  # pylint: disable=protected-access
+    repository.actionable_pool_keys.assert_called_once_with(service_name='svc')
 
 
 def test_ambiguous_atomic_admission_preserves_intent_without_cleanup() -> None:
@@ -440,7 +664,7 @@ def test_ambiguous_atomic_admission_preserves_intent_without_cleanup() -> None:
     intent = _plan((_snapshot('east-context', 'uid-east', 1),)).intents[0]
     lease = SimpleNamespace(intent=intent)
     repository = mock.Mock()
-    repository.lease_next.return_value = lease
+    repository.lease_batch.return_value = (lease,)
     manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
     preflights = SimpleNamespace(
         preflights={('east-context', 'uid-east'): SimpleNamespace(error=None)})
@@ -484,7 +708,7 @@ def test_rejected_atomic_admission_releases_intent_for_retry() -> None:
     intent = _plan((_snapshot('east-context', 'uid-east', 1),)).intents[0]
     lease = SimpleNamespace(intent=intent)
     repository = mock.Mock()
-    repository.lease_next.return_value = lease
+    repository.lease_batch.return_value = (lease,)
     manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
     preflights = SimpleNamespace(
         preflights={('east-context', 'uid-east'): SimpleNamespace(error=None)})

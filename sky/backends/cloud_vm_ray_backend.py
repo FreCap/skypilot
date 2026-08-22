@@ -774,20 +774,22 @@ class RetryingVmProvisioner:
             self.prev_config_hash = prev_config_hash
             self.prev_cluster_hash = prev_cluster_hash
 
-    def __init__(self,
-                 log_dir: str,
-                 dag: 'dag.Dag',
-                 optimize_target: 'common.OptimizeTarget',
-                 requested_features: set[clouds.CloudImplementationFeatures],
-                 local_wheel_path: pathlib.Path,
-                 wheel_hash: str,
-                 blocked_resources: Iterable[resources_lib.Resources] |
-                 None = None,
-                 is_managed: bool | None = None,
-                 *,
-                 extra_launch_context: dict[str, Any],
-                 is_launched_by_jobs_controller: bool = False,
-                 workload_type: str = 'cluster'):
+    def __init__(
+            self,
+            log_dir: str,
+            dag: 'dag.Dag',
+            optimize_target: 'common.OptimizeTarget',
+            requested_features: set[clouds.CloudImplementationFeatures],
+            local_wheel_path: pathlib.Path,
+            wheel_hash: str,
+            blocked_resources: Iterable[resources_lib.Resources] | None = None,
+            is_managed: bool | None = None,
+            *,
+            extra_launch_context: dict[str, Any],
+            kueue_admission_runtime: (provision_common.KueuePodAdmissionRuntime
+                                      | None) = None,
+            is_launched_by_jobs_controller: bool = False,
+            workload_type: str = 'cluster'):
         self._blocked_resources: set[resources_lib.Resources] = set()
         if blocked_resources:
             # blocked_resources is not None and not empty.
@@ -801,6 +803,7 @@ class RetryingVmProvisioner:
         self._wheel_hash = wheel_hash
         self._is_managed = is_managed
         self._extra_launch_context: dict[str, Any] = extra_launch_context
+        self._kueue_admission_runtime = kueue_admission_runtime
         self._is_launched_by_jobs_controller = is_launched_by_jobs_controller
         self._workload_type = workload_type
         self._active_cluster_hash: str | None = None
@@ -906,11 +909,12 @@ class RetryingVmProvisioner:
     def _validate_service_replica_launch_preflight(self) -> None:
         """Reject stale protocol-v2 planning without granting provider I/O.
 
-        Protocol-v2 reserved fill deliberately releases its active association
-        guard between bounded provider effects so a passive Kubernetes/Kueue
-        wait cannot retain the service advisory lock.  Planning and local INIT
-        bookkeeping in that interval therefore use the existing conservative
-        non-locking qualification.  Every provider-bearing call still enters
+        Protocol-v2 reserved fill uses a short durable association/request
+        effect claim for every bounded provider effect, so passive
+        Kubernetes/Kueue waits and provider I/O retain no service advisory
+        lock. Planning and local INIT bookkeeping between those claims use the
+        existing conservative non-locking qualification. Every
+        provider-bearing call still enters
         ``_service_replica_launch_provider_guard()`` and requires the exact
         active effect authorization there.
         """
@@ -1088,25 +1092,29 @@ class RetryingVmProvisioner:
     def _service_replica_launch_provider_owner_guard(
         self,
     ) -> typing.Iterator[serve_state.ServiceReplicaLaunchFenceSnapshot | None]:
-        """Keep one durable Serve fence valid across an opaque cloud call.
+        """Fence one opaque cloud call with the profile's durable authority.
 
         Built-in provisioners and legacy ``ray up`` can perform their own
         waits and provider-mutating retries.  A check immediately before the
         call therefore leaves a check/use race.  Shared authorization guards
-        let parallel replicas proceed while making every fence-invalidating
-        database writer wait until the whole provider operation returns.
+        retain that exclusion for legacy profiles. Protocol-v2 reserved fill
+        instead commits its exact execution/effect claim before the call and
+        fresh-validates it after; controller transitions can proceed but must
+        await the execution's guardian quiescence receipt before replay.
         """
         if self._workload_type not in ('service', 'pool'):
             yield None
             return
         launch_context = self._extra_launch_context
         if ordinary_launch_binding.has_bound_launch_context(launch_context):
-            # execution._execute_dag() owns one association guard across the
-            # entire provider-bearing tail.  Re-entering the legacy PID/IP
-            # guard would reject every valid bound request because its queued
-            # body intentionally carries impossible PID/IP sentinels.  A
-            # strict contextvar check prevents a forged or directly invoked
-            # bound context from using this bypass.
+            # The request boundary owns the exact association authorization.
+            # For reserved fill this is a committed durable effect claim with
+            # short pre/post transactions; other profiles retain the shared
+            # guard. Re-entering the legacy PID/IP guard would reject every
+            # valid bound request because its queued body intentionally
+            # carries impossible PID/IP sentinels. A strict contextvar check
+            # prevents a forged or directly invoked bound context from using
+            # this bypass.
             try:
                 association_authorization = (
                     ordinary_launch_binding.
@@ -1843,6 +1851,10 @@ class RetryingVmProvisioner:
                             bulk_provision_kwargs[
                                 'provider_effect_guard_factory'] = (
                                     split_guard_factory)
+                            if self._kueue_admission_runtime is not None:
+                                bulk_provision_kwargs[
+                                    'kueue_admission_runtime'] = (
+                                        self._kueue_admission_runtime)
                         # Recheck at the terminal provider boundary as well as
                         # at each outer retry iteration. This protects against
                         # future in-attempt planning changes being inserted
@@ -3836,6 +3848,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         self._dump_final_script = False
         self._is_managed = False
         self._extra_launch_context: dict[str, Any] = {}
+        self._kueue_admission_runtime: (
+            provision_common.KueuePodAdmissionRuntime | None) = None
         self._is_launched_by_jobs_controller = False
         self._workload_type = 'cluster'
         # Serializes the one decision that can consume a fresh-provider-create
@@ -3899,6 +3913,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         self._dump_final_script = kwargs.pop('dump_final_script', False)
         self._is_managed = kwargs.pop('is_managed', False)
         self._extra_launch_context = kwargs.pop('extra_launch_context', {})
+        self._kueue_admission_runtime = kwargs.pop('kueue_admission_runtime',
+                                                   None)
         try:
             self._reserved_fill_tail_guard_required = (
                 reserved_capacity.parse_protocol_v2_launch_fence(
@@ -4429,6 +4445,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                         blocked_resources=task.blocked_resources,
                         is_managed=self._is_managed,
                         extra_launch_context=self._extra_launch_context,
+                        kueue_admission_runtime=self._kueue_admission_runtime,
                         is_launched_by_jobs_controller=(
                             self._is_launched_by_jobs_controller),
                         workload_type=self._workload_type)
@@ -4736,9 +4753,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         if cluster_config_overrides:
             provider_config['cluster_config_overrides'] = (
                 cluster_config_overrides)
-        # The sole call site is inside the guarded
+        # The sole call site is inside the fenced
         # _update_after_cluster_provisioned() finalization phase. Do not nest
-        # another policy ticket/advisory-lock session here.
+        # another policy ticket/effect-claim epoch here.
         provision_lib.open_ports(repr(cloud), handle.cluster_name_on_cloud,
                                  handle.launched_resources.ports,
                                  provider_config)

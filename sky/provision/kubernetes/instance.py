@@ -21,6 +21,7 @@ from sky.provision.kubernetes import autostop_events
 from sky.provision.kubernetes import config as config_lib
 from sky.provision.kubernetes import constants as k8s_constants
 from sky.provision.kubernetes import host_network_probe
+from sky.provision.kubernetes import kueue_admission
 from sky.provision.kubernetes import pod_diagnostics
 from sky.provision.kubernetes import pod_scheduling
 from sky.provision.kubernetes import pod_spec as pod_spec_lib
@@ -1365,7 +1366,8 @@ def _create_namespaced_pod_with_retries(
     context: str | None,
     post_create_attestation: Callable[[Any], None] | None = None,
     provider_effect_guard_factory: (common.ProviderEffectGuardFactory |
-                                    None) = None
+                                    None) = None,
+    persisted_pod_identity: (common.KueuePersistedPodIdentity | None) = None,
 ) -> Any:
     """Attempts to create a Kubernetes Pod and handle any errors.
 
@@ -1375,6 +1377,11 @@ def _create_namespaced_pod_with_retries(
 
     Returns: The created Pod object.
     """
+    if persisted_pod_identity is not None:
+        _raise_persisted_kueue_pod_requires_reconciliation(
+            persisted_pod_identity,
+            'the Pod-create helper was reached after PostgreSQL had already '
+            'bound an exact Pod UID')
 
     def attest_if_required(pod: Any) -> Any:
         # Run every server-owned admission check on the exact API response
@@ -1399,7 +1406,9 @@ def _create_namespaced_pod_with_retries(
             # new authorization per bounded attempt so its retry sleeps cannot
             # monopolize service/fleet authority.
             _raise_rejected_serve_worker_after_cleanup(
-                rejection, provider_effect_guard_factory)
+                rejection,
+                provider_effect_guard_factory,
+                persisted_pod_identity=persisted_pod_identity)
 
     try:
         # Attempt to create the Pod with the AppArmor annotation
@@ -1632,8 +1641,14 @@ def _raise_rejected_serve_worker_after_cleanup(
     rejection: _ServeWorkerIdentityRejection,
     provider_effect_guard_factory: (common.ProviderEffectGuardFactory |
                                     None) = None,
+    persisted_pod_identity: (common.KueuePersistedPodIdentity | None) = None,
 ) -> NoReturn:
     """Cleans one rejected worker under fresh authority, then rejects it."""
+    if persisted_pod_identity is not None:
+        _raise_persisted_kueue_pod_requires_reconciliation(
+            persisted_pod_identity,
+            f'observed {rejection.identity_name} {rejection.actual!r}; '
+            f'expected {rejection.expected!r}')
     cleanup_error = None
     try:
         _delete_admitted_serve_worker_and_confirm_absent(
@@ -1658,6 +1673,21 @@ def _raise_rejected_serve_worker_after_cleanup(
         f'{rejection.actual!r}; expected {rejection.expected!r}. The Pod was '
         'rejected to enforce the immutable platform placement contract.'
         f'{cleanup_detail}') from rejection
+
+
+def _raise_persisted_kueue_pod_requires_reconciliation(
+    persisted_pod_identity: common.KueuePersistedPodIdentity,
+    detail: str,
+) -> NoReturn:
+    """Reject replacement of a Pod whose exact UID is durable Serve state."""
+    provider_resource_id = (f'{persisted_pod_identity.namespace}/'
+                            f'{persisted_pod_identity.pod_name}@'
+                            f'{persisted_pod_identity.pod_uid}')
+    raise exceptions.ReservedFillProviderPresentError(
+        'Persisted Kueue Pod identity requires adoption-only provisioning; '
+        f'{detail}. SkyPilot refused replacement mutation. Canonical '
+        'protocol-v2 teardown and reconciliation retain cleanup authority.',
+        (provider_resource_id,))
 
 
 def _reject_admitted_serve_worker_identity(
@@ -2143,6 +2173,7 @@ def _attest_pod_with_provider_guard(
     pod: Any,
     post_create_attestation: Callable[[Any], None],
     provider_effect_guard_factory: (common.ProviderEffectGuardFactory | None),
+    persisted_pod_identity: (common.KueuePersistedPodIdentity | None) = None,
 ) -> None:
     """Attests an existing Pod, then separately cleans any rejection."""
     try:
@@ -2150,7 +2181,9 @@ def _attest_pod_with_provider_guard(
             post_create_attestation(pod)
     except _ServeWorkerIdentityRejection as rejection:
         _raise_rejected_serve_worker_after_cleanup(
-            rejection, provider_effect_guard_factory)
+            rejection,
+            provider_effect_guard_factory,
+            persisted_pod_identity=persisted_pod_identity)
 
 
 def _wait_for_required_kueue_admission(
@@ -2161,6 +2194,10 @@ def _wait_for_required_kueue_admission(
     provider_effect_guard_factory: common.ProviderEffectGuardFactory | None,
     *,
     timeout: int = k8s_constants.KUEUE_ADMISSION_TIMEOUT_SECONDS,
+    lane_expectation: (kueue_admission.KueuePodAdmissionExpectation |
+                       None) = None,
+    lane_observer: common.KueuePodAdmissionObserver | None = None,
+    persisted_pod_identity: (common.KueuePersistedPodIdentity | None) = None,
 ) -> dict[str, str]:
     """Wait for exact required-Kueue Pods to become admitted.
 
@@ -2172,6 +2209,15 @@ def _wait_for_required_kueue_admission(
     """
     if not pods:
         return {}
+    if (lane_expectation is None) != (lane_observer is None):
+        raise config_lib.KubernetesError(
+            'Kueue lane expectation and observer must be supplied together.')
+    if (lane_observer is not None and
+        (not callable(lane_observer) or
+         not callable(getattr(lane_observer, 'begin_observation', None)))):
+        raise config_lib.KubernetesError(
+            'Kueue lane observer must expose callable clock-begin and commit '
+            'boundaries.')
 
     expected_pod_uids: dict[str, str] = {}
     cluster_name_on_cloud: str | None = None
@@ -2207,6 +2253,133 @@ def _wait_for_required_kueue_admission(
     assert cluster_name_on_cloud is not None
     expected_pod_names = set(expected_pod_uids)
     deadline = time.time() + timeout
+
+    if lane_expectation is not None:
+        assert lane_observer is not None
+        if (lane_expectation.namespace != namespace or
+                lane_expectation.cluster_name_on_cloud
+                != cluster_name_on_cloud):
+            raise config_lib.KubernetesError(
+                'Kueue lane expectation does not match the exact Pod lookup '
+                'scope.')
+
+        def observe_lane_pods() -> list[tuple[
+            common.KueuePodAdmissionObservation, datetime.datetime]]:
+            """Clock-anchor, read, and classify exact Pods without locks."""
+            observations: list[tuple[common.KueuePodAdmissionObservation,
+                                     datetime.datetime]] = []
+            for pod_name, expected_uid in expected_pod_uids.items():
+                try:
+                    # This is one unlocked database-clock read.  It must
+                    # precede provider I/O so Kubernetes latency and later CAS
+                    # lock contention consume (rather than mint) freshness.
+                    provider_read_started_at = (
+                        lane_observer.begin_observation())
+                    observed_pod = kubernetes.core_api(
+                        context).read_namespaced_pod(
+                            pod_name,
+                            namespace,
+                            _request_timeout=kubernetes.API_TIMEOUT)
+                except kubernetes.api_exception() as error:
+                    if error.status == 404:
+                        raise config_lib.KubernetesError(
+                            'Required Kueue admission lost exact Pod '
+                            f'{namespace}/{pod_name}@{expected_uid}; SkyPilot '
+                            'refused to adopt a deletion or same-name '
+                            'replacement.') from None
+                    raise
+                try:
+                    observation = kueue_admission.classify_pod(
+                        observed_pod,
+                        lane_expectation,
+                        expected_pod_name=pod_name,
+                        expected_pod_uid=expected_uid)
+                except (kueue_admission.KueuePodAdmissionClassificationError
+                       ) as error:
+                    # Cleanup must target the exact requested name, even if an
+                    # invalid API response claimed a different metadata.name.
+                    raise _ServeWorkerIdentityRejection(
+                        pod_name, namespace, context, error.identity_name,
+                        error.actual, error.expected) from error
+                observations.append((observation, provider_read_started_at))
+            return observations
+
+        def publish_lane_observations(
+            observations: list[tuple[common.KueuePodAdmissionObservation,
+                                     datetime.datetime]],
+        ) -> None:
+            # The callback owns the PostgreSQL CAS. Invoke it only after all
+            # provider reads have exited, so no SQL/advisory lock can wrap
+            # Kubernetes I/O.
+            for observation, provider_read_started_at in observations:
+                lane_observer(observation, provider_read_started_at)
+
+        def raise_lane_observation_failure(error: Exception,
+                                           operation: str) -> NoReturn:
+            if isinstance(error, exceptions.RequestCancelled):
+                raise error
+            if provider_effect_guard_factory is not None:
+                provider_resource_ids = tuple(
+                    f'{namespace}/{pod_name}@{pod_uid}'
+                    for pod_name, pod_uid in sorted(expected_pod_uids.items()))
+                raise exceptions.ReservedFillProviderPresentError(
+                    f'Reserved-fill Kueue {operation} failed after exact Pod '
+                    'materialization. Protocol-v2 reconciliation retains '
+                    'cleanup authority.', provider_resource_ids) from error
+            raise error
+
+        try:
+            lane_observations = observe_lane_pods()
+        except _ServeWorkerIdentityRejection as rejection:
+            _raise_rejected_serve_worker_after_cleanup(
+                rejection,
+                provider_effect_guard_factory,
+                persisted_pod_identity=persisted_pod_identity)
+        except Exception as error:  # pylint: disable=broad-except
+            raise_lane_observation_failure(error, 'Pod observation')
+        waiting_pod_names = [
+            observation.pod_name
+            for observation, _ in lane_observations
+            if observation.state is common.KueuePodAdmissionState.POD_WAITING
+        ]
+        if not waiting_pod_names:
+            # One final fresh read narrows an admission-to-bootstrap race. It
+            # is read-only and remains outside both the provider-effect
+            # advisory guard and the callback's SQL transaction; the later
+            # lifecycle/identity CAS rejects a concurrent teardown or update.
+            try:
+                lane_observations = observe_lane_pods()
+            except _ServeWorkerIdentityRejection as rejection:
+                _raise_rejected_serve_worker_after_cleanup(
+                    rejection,
+                    provider_effect_guard_factory,
+                    persisted_pod_identity=persisted_pod_identity)
+            except Exception as error:  # pylint: disable=broad-except
+                raise_lane_observation_failure(error, 'Pod observation')
+            waiting_pod_names = [
+                observation.pod_name for observation, _ in lane_observations if
+                observation.state is common.KueuePodAdmissionState.POD_WAITING
+            ]
+        try:
+            publish_lane_observations(lane_observations)
+        except Exception as error:  # pylint: disable=broad-except
+            raise_lane_observation_failure(error, 'receipt commit')
+        if not waiting_pod_names:
+            return expected_pod_uids
+
+        # A policy-gated Pod is healthy durable provider state, not a reason to
+        # retain one execution process and worker slot for hours.  The callback
+        # has just committed a PostgreSQL-clock receipt for the exact Pod UID.
+        # Pause this invocation so the request executor can atomically release
+        # its claim and redeliver the same launch after a short delay.  Provider
+        # teardown explicitly preserves ExecutionPausedError, and the replay
+        # adopts and reattests this same immutable Pod before making progress.
+        raise exceptions.ExecutionPausedError(
+            'Required Kueue admission is still policy-gated for exact Pods '
+            f'{sorted(waiting_pod_names)!r}.',
+            'SkyPilot retained the Pods and will retry their exact admission '
+            'observation without occupying an executor slot.',
+            retry_wait_seconds=5)
 
     def observe_exact_pods() -> list[str]:
         """Return gated Pod names from one fresh, exact batch observation."""
@@ -2299,7 +2472,9 @@ def _wait_for_required_kueue_admission(
             waiting_pod_names = observe_exact_pods()
         except _ServeWorkerIdentityRejection as rejection:
             _raise_rejected_serve_worker_after_cleanup(
-                rejection, provider_effect_guard_factory)
+                rejection,
+                provider_effect_guard_factory,
+                persisted_pod_identity=persisted_pod_identity)
 
         if not waiting_pod_names:
             # The passive read above can race a service update or association
@@ -2312,7 +2487,9 @@ def _wait_for_required_kueue_admission(
                     waiting_pod_names = observe_exact_pods()
             except _ServeWorkerIdentityRejection as rejection:
                 _raise_rejected_serve_worker_after_cleanup(
-                    rejection, provider_effect_guard_factory)
+                    rejection,
+                    provider_effect_guard_factory,
+                    persisted_pod_identity=persisted_pod_identity)
             if not waiting_pod_names:
                 return expected_pod_uids
         if time.time() >= deadline:
@@ -2350,6 +2527,7 @@ def _read_and_attest_pod_with_provider_guard(
     provider_effect_guard_factory: (common.ProviderEffectGuardFactory | None),
     *,
     require_runtime_readiness: bool = False,
+    persisted_pod_identity: (common.KueuePersistedPodIdentity | None) = None,
 ) -> None:
     """Fresh-read and attest one exact publishable Pod in one authority epoch."""
     try:
@@ -2425,7 +2603,9 @@ def _read_and_attest_pod_with_provider_guard(
             post_create_attestation(pod)
     except _ServeWorkerIdentityRejection as rejection:
         _raise_rejected_serve_worker_after_cleanup(
-            rejection, provider_effect_guard_factory)
+            rejection,
+            provider_effect_guard_factory,
+            persisted_pod_identity=persisted_pod_identity)
 
 
 @timeline.event
@@ -2454,6 +2634,45 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         kueue_local_queue_name)
     kueue_workload_priority_class_name = provider_config.get(
         'kueue_workload_priority_class_name')
+    lane_runtime = config.kueue_admission_runtime
+    if lane_runtime is not None and not isinstance(
+            lane_runtime, common.KueuePodAdmissionRuntime):
+        raise exceptions.ReservedFillLaunchFenceError(
+            'Kueue lane observation requires one complete typed runtime.')
+    lane_identity = None if lane_runtime is None else lane_runtime.identity
+    lane_accelerator = (None
+                        if lane_runtime is None else lane_runtime.accelerator)
+    lane_observer = None if lane_runtime is None else lane_runtime.observer
+    persisted_pod_identity = (None if lane_runtime is None else
+                              lane_runtime.persisted_pod_identity)
+    if (lane_runtime is not None and
+            not isinstance(lane_identity, common.KueuePodAdmissionIdentity)):
+        raise config_lib.KubernetesError(
+            'Kueue lane runtime has an invalid admission identity.')
+    if (persisted_pod_identity is not None and not isinstance(
+            persisted_pod_identity, common.KueuePersistedPodIdentity)):
+        raise exceptions.ReservedFillLaunchFenceError(
+            'Persisted Kueue Pod identity must use the typed runtime contract.')
+    if (lane_runtime is not None and
+        (not isinstance(lane_accelerator, str) or not lane_accelerator)):
+        raise config_lib.KubernetesError(
+            'Kueue lane accelerator must be a non-empty string.')
+    if (lane_runtime is not None and
+        (not callable(lane_observer) or
+         not callable(getattr(lane_observer, 'begin_observation', None)))):
+        raise config_lib.KubernetesError(
+            'Kueue lane observer must expose callable clock-begin and commit '
+            'boundaries.')
+    if lane_runtime is not None and config.count != 1:
+        raise config_lib.KubernetesError(
+            'Kueue lane observation requires exactly one Pod.')
+    if persisted_pod_identity is not None:
+        expected_pod_name = f'{cluster_name_on_cloud}-head'
+        if (persisted_pod_identity.namespace != namespace or
+                persisted_pod_identity.pod_name != expected_pod_name):
+            _raise_persisted_kueue_pod_requires_reconciliation(
+                persisted_pod_identity,
+                'the rendered single-Pod cluster namespace or name changed')
     serve_worker_projection_protocol_version = provider_config.get(
         'serve_worker_projection_protocol_version')
     try:
@@ -2466,6 +2685,12 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     strict_kueue_projection = (
         pod_spec_lib.serve_worker_projection_protocol_has_strict_admission(
             serve_worker_projection_protocol_version))
+    if (strict_kueue_projection and kueue_require_managed and
+            config.provider_effect_guard_factory is not None and
+            lane_runtime is None):
+        raise config_lib.KubernetesError(
+            'Protocol-v2 reserved-fill Kueue provisioning requires the exact '
+            'lane identity, accelerator, and durable observation callback.')
     require_runtime_readiness = (
         pod_spec_lib.serve_worker_projection_protocol_has_runtime_readiness(
             serve_worker_projection_protocol_version))
@@ -2651,6 +2876,51 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 'The rendered SkyServe worker accelerator attestation is '
                 'invalid.')
 
+    lane_expectation: (kueue_admission.KueuePodAdmissionExpectation |
+                       None) = None
+    if lane_runtime is not None:
+        if (not kueue_require_managed or not strict_kueue_projection or
+                kueue_cluster_queue_name is None):
+            raise config_lib.KubernetesError(
+                'Kueue lane observation requires one strict projected worker '
+                'with non-null Kueue admission.')
+        assert isinstance(lane_identity, common.KueuePodAdmissionIdentity)
+        assert isinstance(lane_accelerator, str)
+        assert lane_observer is not None
+        assert isinstance(kueue_local_queue_name, str)
+        assert isinstance(serve_worker_expected_service_account_name, str)
+        assert isinstance(serve_worker_expected_scheduler_name, str)
+        assert isinstance(serve_worker_expected_accelerator_label_key, str)
+        assert isinstance(serve_worker_expected_accelerator_label_values, list)
+        assert isinstance(serve_worker_expected_accelerator_resource_key, str)
+        assert isinstance(serve_worker_expected_accelerator_count, int)
+        assert (serve_worker_expected_priority_class_name is None or
+                isinstance(serve_worker_expected_priority_class_name, str))
+        assert (serve_worker_expected_priority_value is None or
+                isinstance(serve_worker_expected_priority_value, int))
+        assert (serve_worker_expected_preemption_policy is None or
+                isinstance(serve_worker_expected_preemption_policy, str))
+        lane_expectation = kueue_admission.KueuePodAdmissionExpectation(
+            namespace=namespace,
+            cluster_name_on_cloud=cluster_name_on_cloud,
+            local_queue_name=kueue_local_queue_name,
+            cluster_queue_name=kueue_cluster_queue_name,
+            workload_priority_class_name=(kueue_workload_priority_class_name),
+            pod_group_total_count=config.count,
+            priority_class_name=serve_worker_expected_priority_class_name,
+            priority_value=serve_worker_expected_priority_value,
+            preemption_policy=serve_worker_expected_preemption_policy,
+            service_account_name=(serve_worker_expected_service_account_name),
+            scheduler_name=serve_worker_expected_scheduler_name,
+            accelerator=lane_accelerator,
+            accelerator_label_key=(serve_worker_expected_accelerator_label_key),
+            accelerator_label_values=tuple(
+                serve_worker_expected_accelerator_label_values),
+            accelerator_resource_key=(
+                serve_worker_expected_accelerator_resource_key),
+            accelerator_count=serve_worker_expected_accelerator_count,
+            identity=lane_identity)
+
     post_create_attestation: Callable[[Any], None] | None = None
     existing_pod_attestation: Callable[[Any], None] | None = None
     post_wait_pod_attestation: Callable[[Any], None] | None = None
@@ -2778,6 +3048,10 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                                                     ['Terminating'])
     _validate_cluster_name_annotations(terminating_pods, cluster_name,
                                        cluster_name_on_cloud)
+    if terminating_pods and persisted_pod_identity is not None:
+        _raise_persisted_kueue_pod_requires_reconciliation(
+            persisted_pod_identity, 'a tagged Pod is terminating '
+            f'({sorted(terminating_pods)!r})')
     start_time = time.time()
     while (terminating_pods and
            time.time() - start_time < _TIMEOUT_FOR_POD_TERMINATION):
@@ -2813,6 +3087,10 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                                               ['Failed', 'Succeeded'])
     _validate_cluster_name_annotations(stale_pods, cluster_name,
                                        cluster_name_on_cloud)
+    if stale_pods and persisted_pod_identity is not None:
+        _raise_persisted_kueue_pod_requires_reconciliation(
+            persisted_pod_identity, 'a tagged Pod is terminal '
+            f'({sorted(stale_pods)!r})')
     if stale_pods:
         logger.info(f'Found {len(stale_pods)} pods in Failed/Succeeded '
                     f'phase: {list(stale_pods.keys())}. Deleting them.')
@@ -2833,17 +3111,56 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 resource_type='pod',
                 resource_name=pod_name)
 
-    running_pods = kubernetes_utils.filter_pods(namespace, context, tags,
-                                                ['Pending', 'Running'])
+    if persisted_pod_identity is not None:
+        try:
+            with _provider_mutation_guard(config.provider_effect_guard_factory):
+                persisted_pod = kubernetes.core_api(
+                    context).read_namespaced_pod(
+                        persisted_pod_identity.pod_name,
+                        namespace,
+                        _request_timeout=kubernetes.API_TIMEOUT)
+        except exceptions.RequestCancelled:
+            raise
+        except Exception as error:  # pylint: disable=broad-except
+            _raise_persisted_kueue_pod_requires_reconciliation(
+                persisted_pod_identity,
+                'the exact persisted Pod could not be re-read '
+                f'({common_utils.format_exception(error)})')
+        metadata = getattr(persisted_pod, 'metadata', None)
+        actual_name = getattr(metadata, 'name', None)
+        actual_uid = getattr(metadata, 'uid', None)
+        deletion_timestamp = getattr(metadata, 'deletion_timestamp', None)
+        actual_phase = getattr(getattr(persisted_pod, 'status', None), 'phase',
+                               None)
+        if (actual_name != persisted_pod_identity.pod_name or
+                actual_uid != persisted_pod_identity.pod_uid or
+                deletion_timestamp is not None or
+                actual_phase not in ('Pending', 'Running')):
+            _raise_persisted_kueue_pod_requires_reconciliation(
+                persisted_pod_identity,
+                'the exact persisted Pod is absent, replaced, terminating, '
+                'or terminal; observed '
+                f'name={actual_name!r}, uid={actual_uid!r}, '
+                f'deletion_timestamp={deletion_timestamp!r}, '
+                f'phase={actual_phase!r}')
+        running_pods = {persisted_pod_identity.pod_name: persisted_pod}
+    else:
+        running_pods = kubernetes_utils.filter_pods(namespace, context, tags,
+                                                    ['Pending', 'Running'])
     _validate_cluster_name_annotations(running_pods, cluster_name,
                                        cluster_name_on_cloud)
+    if persisted_pod_identity is not None:
+        assert len(running_pods) == 1
     if existing_pod_attestation is not None:
         for existing_pod in running_pods.values():
-            # Reattestation may force-delete a Pod whose admitted identity no
-            # longer matches the durable projection.
+            # Pre-receipt reattestation may delete an unsafe Pod. Once its UID
+            # is durable, rejection remains observation-only and canonical
+            # reconciliation owns cleanup.
             _attest_pod_with_provider_guard(
-                existing_pod, existing_pod_attestation,
-                config.provider_effect_guard_factory)
+                existing_pod,
+                existing_pod_attestation,
+                config.provider_effect_guard_factory,
+                persisted_pod_identity=persisted_pod_identity)
     head_pod_name = _get_head_pod_name(running_pods)
     running_pod_statuses = [{
         pod.metadata.name: pod.status.phase
@@ -2999,6 +3316,15 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                     kueue_workload_priority_class_name),
                 strict_projection=strict_kueue_projection,
             )
+        if lane_identity is not None:
+            # Dynamic intent identity is installed after every caller/workspace
+            # merge and after static projection rendering.  Any collision is a
+            # caller attempt to occupy a server-owned field and fails closed.
+            try:
+                kueue_admission.install_dynamic_identity_annotations(
+                    pod_spec_copy, lane_identity)
+            except (TypeError, ValueError) as error:
+                raise config_lib.KubernetesError(str(error)) from error
 
         if to_create_deployment:
             assert deployment_spec is not None
@@ -3031,13 +3357,15 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         # Keep every create/retry response and its immediate admission
         # attestation in one fresh authority epoch. Internal retries reacquire;
         # passive scheduling/readiness waits below hold no authority guard.
-        return _create_namespaced_pod_with_retries(
-            namespace,
-            pod_spec_copy,
-            context,
-            post_create_attestation=post_create_attestation,
-            provider_effect_guard_factory=(
-                config.provider_effect_guard_factory))
+        create_kwargs: dict[str, Any] = {
+            'post_create_attestation': post_create_attestation,
+            'provider_effect_guard_factory':
+                (config.provider_effect_guard_factory),
+        }
+        if persisted_pod_identity is not None:
+            create_kwargs['persisted_pod_identity'] = persisted_pod_identity
+        return _create_namespaced_pod_with_retries(namespace, pod_spec_copy,
+                                                   context, **create_kwargs)
 
     if not to_start_count:
         is_provisioned_cluster_ha = is_high_availability_cluster_by_kubectl(
@@ -3117,8 +3445,14 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             k8s_constants.KUEUE_ADMISSION_TIMEOUT_SECONDS, wait_str,
             [pod.metadata.name for pod in pods])
         admitted_kueue_pod_uids = _wait_for_required_kueue_admission(
-            namespace, context, pods, existing_pod_attestation,
-            config.provider_effect_guard_factory)
+            namespace,
+            context,
+            pods,
+            existing_pod_attestation,
+            config.provider_effect_guard_factory,
+            lane_expectation=lane_expectation,
+            lane_observer=lane_observer,
+            persisted_pod_identity=persisted_pod_identity)
         # Autoscaler and scheduling-error evidence from while Kueue retained
         # the admission gate cannot have been caused by these Pods. Start that
         # observation window together with the fresh scheduling deadline.
@@ -3204,7 +3538,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 context,
                 post_wait_pod_attestation,
                 config.provider_effect_guard_factory,
-                require_runtime_readiness=require_runtime_readiness)
+                require_runtime_readiness=require_runtime_readiness,
+                persisted_pod_identity=persisted_pod_identity)
 
     assert head_pod_name is not None, 'head_instance_id should not be None'
     return common.ProvisionRecord(

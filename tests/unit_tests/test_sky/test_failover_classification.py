@@ -1201,6 +1201,7 @@ def _configure_reserved_fill_kubernetes_attempt(tmp_path,
     launch_context, association_id, request_id = _bound_reserved_fill_context(
         launch_context)
     provisioner._extra_launch_context = launch_context
+    provisioner._kueue_admission_runtime = None
 
     # Protocol-v2 provider retries are generic bound non-pool requests.  Keep
     # this provider-focused harness on that complete production envelope so
@@ -1723,6 +1724,39 @@ def test_reserved_fill_builtin_success_marks_materialized_and_checkpoints(
     assert result['provision_record'] is provision_record
     cleanup.assert_not_called()
     blocklist.assert_not_called()
+
+
+def test_reserved_fill_kueue_pause_preserves_created_pod_without_failover(
+        tmp_path, monkeypatch):
+    """A provider-internal admission pause precedes the bulk-return marker."""
+    events = []
+    post_bulk_variables = {
+        'instance_type': '4CPU--16GB--H200:1',
+        'custom_resources': 'H200:1',
+        'region': 'phx-context',
+    }
+    (provisioner, to_provision, _, bulk_provision, cleanup, blocklist,
+     _) = _configure_reserved_fill_kubernetes_attempt(tmp_path, monkeypatch,
+                                                      events,
+                                                      [post_bulk_variables])
+    paused = exceptions.ExecutionPausedError(
+        'Required Kueue Pod is policy-gated.',
+        hint='retry exact Pod admission',
+        retry_wait_seconds=5)
+    bulk_provision.side_effect = paused
+
+    with pytest.raises(exceptions.ExecutionPausedError) as exc_info:
+        _call_retry_zones(provisioner, to_provision)
+
+    assert exc_info.value is paused
+    bulk_provision.assert_called_once()
+    # bulk_provision owns the created/adopted Pod and intentionally raises
+    # before returning the post-create materialization marker.  The pause must
+    # therefore bypass both provider cleanup and capacity failover; retry
+    # adopts the exact Pod rather than launching another one.
+    cleanup.assert_not_called()
+    blocklist.assert_not_called()
+    assert not provisioner._blocked_resources
 
 
 def test_reserved_fill_retry_preflight_is_passive_but_bulk_has_active_guard(

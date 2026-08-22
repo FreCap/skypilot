@@ -3,9 +3,15 @@ import abc
 from collections.abc import Callable
 import contextlib
 import dataclasses
+import datetime
+import enum
 import functools
+import hashlib
+import json
 import os
-from typing import Any
+import re
+from typing import Any, Protocol
+import uuid
 
 from sky import sky_logging
 from sky.utils import config_utils
@@ -27,6 +33,331 @@ logger = sky_logging.init_logger(__name__)
 
 ProviderEffectGuardFactory = Callable[[],
                                       contextlib.AbstractContextManager[None]]
+
+
+class KueuePodAdmissionState(enum.Enum):
+    """Pod-only Kueue admission facts reported by a provisioner."""
+
+    POD_WAITING = 'POD_WAITING'
+    POLICY_ADMITTED = 'POLICY_ADMITTED'
+
+
+@dataclasses.dataclass(frozen=True)
+class KueuePodAdmissionIdentity:
+    """Dynamic server identity stamped on one reserved-fill Pod.
+
+    These values are deliberately runtime-only.  They identify one durable
+    fill intent, while the static worker projection remains independently
+    content-addressed by ``worker_projection_sha256``.
+    """
+
+    intent_key: str
+    replica_record_uuid: str
+    pool_physical_uid: str
+    worker_projection_sha256: str
+
+    def __post_init__(self) -> None:
+        for field_name in ('intent_key', 'worker_projection_sha256'):
+            value = getattr(self, field_name)
+            if (not isinstance(value, str) or
+                    re.fullmatch(r'[0-9a-f]{64}', value) is None):
+                raise ValueError(
+                    f'{field_name} must be 64 lowercase hexadecimal characters.'
+                )
+        try:
+            record_uuid = uuid.UUID(self.replica_record_uuid)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError('replica_record_uuid must be a canonical UUID.') \
+                from error
+        if str(record_uuid) != self.replica_record_uuid:
+            raise ValueError('replica_record_uuid must be a canonical UUID.')
+        if (not isinstance(self.pool_physical_uid, str) or
+                not self.pool_physical_uid):
+            raise ValueError('pool_physical_uid must be a nonempty string.')
+
+
+@dataclasses.dataclass(frozen=True)
+class KueuePersistedPodIdentity:
+    """Exact Pod identity already bound by a durable admission receipt."""
+
+    namespace: str
+    pod_name: str
+    pod_uid: str
+
+    def __post_init__(self) -> None:
+        for field_name in ('namespace', 'pod_name', 'pod_uid'):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f'{field_name} must be a nonempty string.')
+
+
+@dataclasses.dataclass(frozen=True)
+class KueuePodAdmissionReceipt:
+    """Canonical immutable receipt for every verified CoreV1 Pod fact."""
+
+    state: KueuePodAdmissionState
+    namespace: str
+    pod_name: str
+    pod_uid: str
+    pod_phase: str
+    scheduling_gates: tuple[str, ...]
+    cluster_name_on_cloud: str
+    kueue_managed_finalizer: str
+    local_queue_name: str
+    cluster_queue_name: str
+    admission_local_queue_name: str | None
+    admission_cluster_queue_name: str | None
+    workload_priority_class_name: str | None
+    pod_group_name: str
+    pod_group_total_count: int
+    role_hash: str
+    podset: str | None
+    workload_name: str | None
+    unconstrained_topology: str | None
+    priority_class_name: str | None
+    priority_value: int | None
+    preemption_policy: str | None
+    scheduler_name: str
+    service_account_name: str
+    accelerator: str
+    accelerator_label_key: str
+    accelerator_label_values: tuple[str, ...]
+    accelerator_resource_key: str
+    accelerator_count: int
+    identity: KueuePodAdmissionIdentity
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, KueuePodAdmissionState):
+            raise TypeError('state must be a KueuePodAdmissionState.')
+        for field_name in ('namespace', 'pod_name', 'pod_uid', 'pod_phase',
+                           'cluster_name_on_cloud', 'kueue_managed_finalizer',
+                           'local_queue_name', 'cluster_queue_name',
+                           'pod_group_name', 'role_hash', 'scheduler_name',
+                           'service_account_name', 'accelerator',
+                           'accelerator_label_key', 'accelerator_resource_key'):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f'{field_name} must be a nonempty string.')
+        if self.pod_phase not in ('Pending', 'Running'):
+            raise ValueError('pod_phase must be Pending or Running.')
+        if (not isinstance(self.scheduling_gates, tuple) or
+                any(not isinstance(value, str) or not value
+                    for value in self.scheduling_gates)):
+            raise ValueError('scheduling_gates must be a tuple of nonempty '
+                             'strings.')
+        if tuple(sorted(set(self.scheduling_gates))) != self.scheduling_gates:
+            raise ValueError('scheduling_gates must be unique and sorted.')
+        if (not isinstance(self.accelerator_label_values, tuple) or
+                not self.accelerator_label_values or
+                any(not isinstance(value, str) or not value
+                    for value in self.accelerator_label_values)):
+            raise ValueError('accelerator_label_values must be a nonempty '
+                             'tuple of strings.')
+        if len(set(self.accelerator_label_values)) != len(
+                self.accelerator_label_values):
+            raise ValueError('accelerator_label_values must be unique.')
+        for field_name in ('admission_local_queue_name',
+                           'admission_cluster_queue_name',
+                           'workload_priority_class_name', 'podset',
+                           'workload_name', 'unconstrained_topology',
+                           'priority_class_name', 'preemption_policy'):
+            value = getattr(self, field_name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f'{field_name} must be null or nonempty.')
+        if self.priority_value is not None and type(
+                self.priority_value) is not int:
+            raise TypeError('priority_value must be an integer or null.')
+        priority_parts = (self.priority_class_name, self.priority_value,
+                          self.preemption_policy)
+        if any(value is None for value in priority_parts) and not all(
+                value is None for value in priority_parts):
+            raise ValueError('priority class, value, and preemption policy '
+                             'must all be null or all be present.')
+        if re.fullmatch(r'[0-9a-f]{8}', self.role_hash) is None:
+            raise ValueError('role_hash must be 8 lowercase hexadecimal '
+                             'characters.')
+        admitted_outputs = (self.admission_local_queue_name,
+                            self.admission_cluster_queue_name, self.podset)
+        if self.state is KueuePodAdmissionState.POD_WAITING:
+            if any(value is not None for value in admitted_outputs) or any(
+                    value is not None
+                    for value in (self.workload_name,
+                                  self.unconstrained_topology)):
+                raise ValueError('POD_WAITING cannot carry admitted outputs.')
+        elif (self.admission_local_queue_name != self.local_queue_name or
+              self.admission_cluster_queue_name != self.cluster_queue_name or
+              self.podset != self.role_hash or
+              self.workload_name not in (None, self.pod_group_name) or
+              self.unconstrained_topology not in (None, 'true')):
+            raise ValueError('POLICY_ADMITTED requires exact admitted queue, '
+                             'PodSet, workload, and topology outputs.')
+        if (type(self.pod_group_total_count) is not int or
+                self.pod_group_total_count < 1):
+            raise ValueError('pod_group_total_count must be positive.')
+        if (type(self.accelerator_count) is not int or
+                self.accelerator_count < 1):
+            raise ValueError('accelerator_count must be a positive integer.')
+        if not isinstance(self.identity, KueuePodAdmissionIdentity):
+            raise TypeError('identity must be KueuePodAdmissionIdentity.')
+
+    def canonical_dict(self) -> dict[str, Any]:
+        """Return the closed JSON schema used by PostgreSQL audit state."""
+        return {
+            'schema_version': 1,
+            'state': self.state.value,
+            'pod': {
+                'namespace': self.namespace,
+                'name': self.pod_name,
+                'uid': self.pod_uid,
+                'phase': self.pod_phase,
+                'deletion_timestamp_absent': True,
+                'scheduling_gates': list(self.scheduling_gates),
+            },
+            'skypilot': {
+                'cluster_name_on_cloud': self.cluster_name_on_cloud,
+                'intent_key': self.identity.intent_key,
+                'replica_record_uuid': self.identity.replica_record_uuid,
+                'pool_physical_uid': self.identity.pool_physical_uid,
+                'worker_projection_sha256':
+                    self.identity.worker_projection_sha256,
+            },
+            'kueue': {
+                'managed_finalizer': self.kueue_managed_finalizer,
+                'managed_label': True,
+                'local_queue_name': self.local_queue_name,
+                'cluster_queue_name': self.cluster_queue_name,
+                'admission_local_queue_name': self.admission_local_queue_name,
+                'admission_cluster_queue_name':
+                    self.admission_cluster_queue_name,
+                'workload_priority_class_name':
+                    self.workload_priority_class_name,
+                'pod_group_name': self.pod_group_name,
+                'pod_group_total_count': self.pod_group_total_count,
+                'retriable_in_group': False,
+                'role_hash': self.role_hash,
+                'podset': self.podset,
+                'workload_name': self.workload_name,
+                'unconstrained_topology': self.unconstrained_topology,
+            },
+            'priority': {
+                'class_name': self.priority_class_name,
+                'value': self.priority_value,
+                'preemption_policy': self.preemption_policy,
+            },
+            'scheduler_name': self.scheduler_name,
+            'service_account_name': self.service_account_name,
+            'accelerator': {
+                'name': self.accelerator,
+                'label_key': self.accelerator_label_key,
+                'label_values': list(self.accelerator_label_values),
+                'resource_key': self.accelerator_resource_key,
+                'count': self.accelerator_count,
+                'sole_ray_node_resource_owner': True,
+                'dynamic_resource_claims_absent': True,
+            },
+        }
+
+    def canonical_json(self) -> str:
+        return json.dumps(self.canonical_dict(),
+                          sort_keys=True,
+                          separators=(',', ':'),
+                          ensure_ascii=True,
+                          allow_nan=False)
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.canonical_json().encode('utf-8')).hexdigest()
+
+
+@dataclasses.dataclass(frozen=True)
+class KueuePodAdmissionObservation:
+    """Exact receipt delivered to the Serve-owned durable state callback."""
+
+    receipt: KueuePodAdmissionReceipt
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt, KueuePodAdmissionReceipt):
+            raise TypeError('receipt must be KueuePodAdmissionReceipt.')
+
+    @property
+    def state(self) -> KueuePodAdmissionState:
+        return self.receipt.state
+
+    @property
+    def namespace(self) -> str:
+        return self.receipt.namespace
+
+    @property
+    def pod_name(self) -> str:
+        return self.receipt.pod_name
+
+    @property
+    def pod_uid(self) -> str:
+        return self.receipt.pod_uid
+
+    @property
+    def accelerator(self) -> str:
+        return self.receipt.accelerator
+
+    @property
+    def accelerator_count(self) -> int:
+        return self.receipt.accelerator_count
+
+    @property
+    def identity(self) -> KueuePodAdmissionIdentity:
+        return self.receipt.identity
+
+    @property
+    def receipt_sha256(self) -> str:
+        return self.receipt.sha256
+
+
+class KueuePodAdmissionObserver(Protocol):
+    """Runtime observer that anchors provider reads to database time.
+
+    ``begin_observation`` performs only a short clock read and returns after
+    releasing its connection.  The provisioner then performs Kubernetes I/O
+    without a SQL/advisory lock and passes the original token to ``__call__``.
+    The durable implementation rejects a token whose freshness was consumed
+    by provider latency or later lock contention.
+    """
+
+    def begin_observation(self) -> datetime.datetime:
+        """Sample the durable clock immediately before provider I/O."""
+
+    def __call__(self, observation: KueuePodAdmissionObservation,
+                 provider_read_started_at: datetime.datetime) -> None:
+        """Commit one exact observation against its original clock token."""
+
+
+@dataclasses.dataclass(frozen=True)
+class KueuePodAdmissionRuntime:
+    """Complete runtime-only contract for one Kueue-managed provider Pod.
+
+    The generic provisioner owns this transport boundary.  Serve supplies the
+    immutable identity and callback implementation, but downstream provider
+    code receives one all-or-none value instead of four independently optional
+    arguments that could form an invalid partial runtime.
+    """
+
+    identity: KueuePodAdmissionIdentity
+    accelerator: str
+    observer: KueuePodAdmissionObserver
+    persisted_pod_identity: KueuePersistedPodIdentity | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, KueuePodAdmissionIdentity):
+            raise TypeError('identity must be KueuePodAdmissionIdentity.')
+        if not isinstance(self.accelerator, str) or not self.accelerator:
+            raise ValueError('accelerator must be a nonempty string.')
+        if (not callable(self.observer) or not callable(
+                getattr(self.observer, 'begin_observation', None))):
+            raise TypeError('observer must expose callable clock-begin and '
+                            'commit boundaries.')
+        if (self.persisted_pod_identity is not None and not isinstance(
+                self.persisted_pod_identity, KueuePersistedPodIdentity)):
+            raise TypeError('persisted_pod_identity must be '
+                            'KueuePersistedPodIdentity or None.')
 
 
 class ProvisionerError(RuntimeError):
@@ -93,17 +424,26 @@ class ProvisionConfig:
     provider_effect_guard_factory: ProviderEffectGuardFactory | None = (
         dataclasses.field(default=None, kw_only=True, repr=False,
                           compare=False))
+    # Complete runtime-only Kueue admission contract.  The generic provisioner
+    # classifies only CoreV1 Pod state; it neither imports Serve nor owns
+    # PostgreSQL transitions.  A persisted Pod identity, when present inside
+    # the contract, makes provisioning adoption-only for that exact object.
+    kueue_admission_runtime: KueuePodAdmissionRuntime | None = (
+        dataclasses.field(default=None, kw_only=True, repr=False,
+                          compare=False))
 
     def get_redacted_config(self) -> dict[str, Any]:
         """Get the redacted config."""
         # Avoid deepcopying a bound guard factory (and therefore its backend)
         # while projecting this dataclass for logging.
         serializable = dataclasses.replace(self,
-                                           provider_effect_guard_factory=None)
+                                           provider_effect_guard_factory=None,
+                                           kueue_admission_runtime=None)
         config = dataclasses.asdict(serializable)
         # This internal identity is not part of the provision-log contract.
         config.pop('cluster_incarnation', None)
         config.pop('provider_effect_guard_factory', None)
+        config.pop('kueue_admission_runtime', None)
 
         config_copy = config_utils.Config(config)
 

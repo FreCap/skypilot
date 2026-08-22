@@ -66,6 +66,8 @@ capacity_admission = adaptors_common.LazyImport('sky.serve.capacity_admission')
 capacity_authority = adaptors_common.LazyImport('sky.serve.capacity_authority')
 serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
 serve_state_schema = adaptors_common.LazyImport('sky.serve.serve_state_schema')
+kueue_lane_lineage_schema = adaptors_common.LazyImport(
+    'sky.serve.kueue_lane_lineage_schema')
 zero_cost_actuation = adaptors_common.LazyImport(
     'sky.serve.zero_cost_actuation')
 managed_job_state_schema = adaptors_common.LazyImport('sky.jobs.state_schema')
@@ -4730,6 +4732,20 @@ def gc_bound_ordinary_launch_tombstones_in_transaction(
     replica_reference_exists = sqlalchemy.exists().where(
         serve_state_schema.replicas_table.c.ordinary_launch_association_id ==
         associations.c.association_id)
+    # Serve057 may be installed before or after API009.  Compile no reference
+    # to its relation until PostgreSQL proves it exists, while preserving the
+    # admission -> association RESTRICT edge whenever it does.  Otherwise one
+    # protected Kueue association poisons the entire GC batch at DELETE time.
+    admission_relation_exists = connection.execute(
+        sqlalchemy.text(
+            "SELECT to_regclass('serve_kueue_admissions') IS NOT NULL")
+    ).scalar_one()
+    admission_absence_predicates: tuple[Any, ...] = ()
+    if admission_relation_exists:
+        admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
+        admission_reference_exists = sqlalchemy.exists().where(
+            admissions.c.association_id == associations.c.association_id)
+        admission_absence_predicates = (~admission_reference_exists,)
     candidate_rows = connection.execute(
         sqlalchemy.select(associations.c.association_id).where(
             associations.c.resolution.in_(
@@ -4739,7 +4755,8 @@ def gc_bound_ordinary_launch_tombstones_in_transaction(
             associations.c.pin_released_at.is_not(None),
             associations.c.tombstone_not_before
             <= sqlalchemy.func.clock_timestamp(), ~replica_reference_exists,
-            ~request_reference_exists, ~pin_reference_exists).order_by(
+            ~request_reference_exists, ~pin_reference_exists,
+            *admission_absence_predicates).order_by(
                 associations.c.tombstone_not_before,
                 associations.c.association_id).limit(limit).with_for_update(
                     skip_locked=True)).scalars().all()
@@ -4755,7 +4772,8 @@ def gc_bound_ordinary_launch_tombstones_in_transaction(
             associations.c.pin_released_at.is_not(None),
             associations.c.tombstone_not_before
             <= sqlalchemy.func.clock_timestamp(), ~replica_reference_exists,
-            ~request_reference_exists, ~pin_reference_exists))
+            ~request_reference_exists, ~pin_reference_exists,
+            *admission_absence_predicates))
     return result.rowcount
 
 

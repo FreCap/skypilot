@@ -11,19 +11,27 @@ import uuid
 import sqlalchemy
 
 from sky.serve import controller_transport
+from sky.serve import kueue_lane_capacity
+from sky.serve import kueue_lane_lineage
+from sky.serve import kueue_lane_lineage_schema
 from sky.serve import pool_capacity_observation_schema
+from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
+from sky.serve import reserved_fill_projection_authority
+from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import serve_state_schema
 from sky.serve import serve_statuses
 from sky.serve import zero_cost_actuation_schema
-from sky.utils import common_utils
 from sky.utils.db import db_utils
 
 PROTOCOL_VERSION = 1
+MAX_ACTUATION_LEASE_BATCH_SIZE = 32
 
 _SERVICES = serve_state_schema.services_table
 _REPLICAS = serve_state_schema.replicas_table
+_VERSION_SPECS = serve_state_schema.version_specs_table
 _INTENTS = (zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
+_KUEUE_ADMISSIONS = (kueue_lane_lineage_schema.serve_kueue_admissions_table)
 _PROTOCOL = serve_state_schema.reserved_fill_protocol_state_table
 _SEQUENCE = pool_capacity_observation_schema.protocol_state_sequence_table
 _PENDING_STATES = frozenset({'GRANTED', 'ACTUATING', 'RETRYABLE'})
@@ -281,6 +289,159 @@ def _intent_values(
     }
 
 
+def _version_placement_snapshot_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    service_name: str,
+    service_version: int,
+) -> tuple[Any, Any]:
+    """Lock the exact immutable placement snapshot selected by an intent."""
+    row = connection.execute(
+        sqlalchemy.select(
+            _VERSION_SPECS.c.worker_placement_projections,
+            _VERSION_SPECS.c.placement_catalog).where(
+                _VERSION_SPECS.c.service_name == service_name,
+                _VERSION_SPECS.c.version == service_version,
+                _VERSION_SPECS.c.yaml_content.isnot(None),
+                _VERSION_SPECS.c.quarantined_at.is_(None),
+                _VERSION_SPECS.c.retired_at.is_(None)).with_for_update(
+                    read=True)).mappings().one_or_none()
+    if row is None or row['worker_placement_projections'] is None:
+        raise ZeroCostActuationConflict(
+            'Durable fill intent has no current immutable worker projection.')
+    return (row['worker_placement_projections'], row['placement_catalog'])
+
+
+def _require_single_node_kueue_catalog(placement_catalog: Any) -> None:
+    """Reject a Kueue lane that cannot be represented by one Pod receipt."""
+    if (not isinstance(placement_catalog, Mapping) or
+            type(placement_catalog.get('num_nodes')) is not int or
+            placement_catalog['num_nodes'] != 1):
+        raise ZeroCostActuationConflict(
+            'Kueue reserved fill requires immutable placement_catalog.'
+            'num_nodes == 1.')
+
+
+def _kueue_lane_identity_from_projection(
+    *,
+    worker_projections: Any,
+    placement_catalog: Any,
+    service_name: str,
+    service_hash: str,
+    service_lifecycle_epoch: int,
+    service_version: int,
+    pool_key: str,
+    pool_epoch: int,
+    physical_cluster_uid: str,
+    kubernetes_context: str,
+    accelerator: str,
+    accelerator_count: int,
+    worker_projection_sha256: str,
+) -> kueue_lane_lineage.KueueAdmissionIdentity | None:
+    """Resolve scheduler mode and identity from one immutable projection."""
+    try:
+        _, admission = (reserved_fill_projection_authority.
+                        projected_admission_for_candidate(
+                            worker_projections,
+                            kubernetes_context=kubernetes_context,
+                            accelerator=accelerator,
+                            accelerator_count=accelerator_count,
+                            expected_sha256=worker_projection_sha256))
+    except (IndexError, TypeError, ValueError) as error:
+        raise ZeroCostActuationConflict(
+            'Durable fill intent no longer resolves its exact worker '
+            'projection.') from error
+    if admission.admission_mode is (reserved_fill_reclaim_attestation.
+                                    ReclaimAdmissionMode.KUBERNETES_SCHEDULER):
+        return None
+    if admission.admission_mode is not (
+            reserved_fill_reclaim_attestation.ReclaimAdmissionMode.KUEUE):
+        raise ZeroCostActuationConflict(
+            'Durable fill intent resolved an unknown admission authority.')
+    _require_single_node_kueue_catalog(placement_catalog)
+    identity = kueue_lane_lineage.KueueAdmissionIdentity(
+        service_name=service_name,
+        service_hash=service_hash,
+        service_lifecycle_epoch=service_lifecycle_epoch,
+        service_version=service_version,
+        pool_key=pool_key,
+        pool_epoch=pool_epoch,
+        physical_cluster_uid=physical_cluster_uid,
+        kubernetes_context=kubernetes_context,
+        accelerator=accelerator.casefold(),
+        accelerator_count=accelerator_count,
+        worker_projection_sha256=worker_projection_sha256)
+    identity.validate()
+    return identity
+
+
+def kueue_lane_identity_for_intent_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    service_name: str,
+    service_lifecycle_epoch: int,
+    intent: reserved_fill_planner.FillIntent,
+    worker_projections: Any | None = None,
+    placement_catalog: Any | None = None,
+) -> kueue_lane_lineage.KueueAdmissionIdentity | None:
+    """Resolve one intent to a Kueue lane, or return ``None`` for east.
+
+    The service/version owner is locked by each caller before this helper is
+    used.  Projection selection is provider-free and exact-digest checked, so
+    a task or launch-time override cannot turn a Kueue lane into the ordinary
+    concurrent Kubernetes-scheduler path.
+    """
+    _require_postgres(connection)
+    if (not isinstance(service_name, str) or not service_name or
+            not isinstance(service_lifecycle_epoch, int) or
+            isinstance(service_lifecycle_epoch, bool) or
+            service_lifecycle_epoch < 1 or
+            not isinstance(intent, reserved_fill_planner.FillIntent)):
+        raise ValueError('Kueue lane resolution requires exact intent state.')
+    intent.__post_init__()
+    if worker_projections is None:
+        (worker_projections,
+         placement_catalog) = (_version_placement_snapshot_in_connection(
+             connection,
+             service_name=service_name,
+             service_version=intent.service_version))
+    return _kueue_lane_identity_from_projection(
+        worker_projections=worker_projections,
+        placement_catalog=placement_catalog,
+        service_name=service_name,
+        service_hash=intent.service_incarnation,
+        service_lifecycle_epoch=service_lifecycle_epoch,
+        service_version=intent.service_version,
+        pool_key=intent.pool_key,
+        pool_epoch=intent.pool_epoch,
+        physical_cluster_uid=intent.physical_cluster_uid,
+        kubernetes_context=intent.allowed_locations[0].region,
+        accelerator=intent.accelerator,
+        accelerator_count=intent.accelerator_count,
+        worker_projection_sha256=intent.worker_projection_sha256)
+
+
+def _lane_row_matches_identity(
+    row: Any,
+    identity: kueue_lane_lineage.KueueAdmissionIdentity,
+) -> bool:
+    """Return whether one retained lineage names the exact projection."""
+    return all((
+        row.unresolved_domain_sha256 == identity.unresolved_domain_sha256,
+        row.service_name == identity.service_name,
+        row.service_hash == identity.service_hash,
+        row.service_lifecycle_epoch == identity.service_lifecycle_epoch,
+        row.service_version == identity.service_version,
+        row.pool_key == identity.pool_key,
+        row.pool_epoch == identity.pool_epoch,
+        row.physical_cluster_uid == identity.physical_cluster_uid,
+        row.kubernetes_context == identity.kubernetes_context,
+        row.accelerator == identity.accelerator,
+        row.accelerator_count == identity.accelerator_count,
+        row.worker_projection_sha256 == identity.worker_projection_sha256,
+    ))
+
+
 def _intent_from_row(
         row: Mapping[str, Any]) -> reserved_fill_planner.FillIntent:
     raw_locations = row['allowed_locations']
@@ -333,6 +494,86 @@ def _intent_from_row(
     return intent
 
 
+def kueue_admission_identity_for_locked_intent_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    intent_row: Mapping[str, Any],
+) -> kueue_lane_lineage.KueueAdmissionIdentity | None:
+    """Resolve an already-locked intent row to its exact Kueue identity.
+
+    This is the provider-free adapter used by the admission repository's
+    graph validator.  It deliberately accepts the complete locked row rather
+    than independently re-reading mutable intent authority.
+    """
+    _require_postgres(connection)
+    if not isinstance(intent_row, Mapping):
+        raise TypeError('Kueue admission identity requires a locked row.')
+    try:
+        service_name = intent_row['service_name']
+        service_hash = intent_row['service_hash']
+        lifecycle_epoch = intent_row['service_lifecycle_epoch']
+        service_version = intent_row['service_version']
+        pool_key = intent_row['pool_key']
+        pool_epoch = intent_row['pool_epoch']
+        physical_cluster_uid = intent_row['physical_cluster_uid']
+        kubernetes_context = intent_row['kubernetes_context']
+        accelerator = intent_row['accelerator']
+        accelerator_count = intent_row['accelerator_count']
+        projection_sha256 = intent_row['worker_projection_sha256']
+        raw_locations = intent_row['allowed_locations']
+        identity = kueue_lane_lineage.KueueAdmissionIdentity(
+            service_name=service_name,
+            service_hash=service_hash,
+            service_lifecycle_epoch=lifecycle_epoch,
+            service_version=service_version,
+            pool_key=pool_key,
+            pool_epoch=pool_epoch,
+            physical_cluster_uid=physical_cluster_uid,
+            kubernetes_context=kubernetes_context,
+            accelerator=str(accelerator).casefold(),
+            accelerator_count=accelerator_count,
+            worker_projection_sha256=projection_sha256)
+        identity.validate()
+        pool_identity = reserved_capacity_broker.parse_pool_identity(pool_key)
+        if (pool_identity.protocol_version
+                != reserved_capacity_broker.PROTOCOL_V2 or
+                pool_identity.physical_cluster_uid != physical_cluster_uid or
+                identity.accelerator not in pool_identity.gpu_names):
+            raise ValueError('pool identity diverged')
+        if not isinstance(raw_locations, list) or not raw_locations:
+            raise ValueError('allowed locations are absent')
+        locations = tuple(
+            reserved_fill_planner.LocationSnapshot.from_pickleable(location)
+            for location in raw_locations)
+        if any(location.cloud.casefold() != 'kubernetes' or location.region !=
+               kubernetes_context or location.accelerator.casefold() != identity
+               .accelerator or location.accelerator_count != accelerator_count
+               for location in locations):
+            raise ValueError('allowed locations diverged')
+    except (KeyError, TypeError, ValueError) as error:
+        raise ZeroCostActuationConflict(
+            'Locked intent has malformed immutable placement authority.') from (
+                error)
+    worker_projections, placement_catalog = (
+        _version_placement_snapshot_in_connection(
+            connection,
+            service_name=service_name,
+            service_version=service_version))
+    return _kueue_lane_identity_from_projection(
+        worker_projections=worker_projections,
+        placement_catalog=placement_catalog,
+        service_name=service_name,
+        service_hash=service_hash,
+        service_lifecycle_epoch=lifecycle_epoch,
+        service_version=service_version,
+        pool_key=pool_key,
+        pool_epoch=pool_epoch,
+        physical_cluster_uid=physical_cluster_uid,
+        kubernetes_context=kubernetes_context,
+        accelerator=identity.accelerator,
+        accelerator_count=accelerator_count,
+        worker_projection_sha256=projection_sha256)
+
+
 def _row_matches_values(row: Mapping[str, Any], values: Mapping[str,
                                                                 Any]) -> bool:
     immutable = set(values)
@@ -342,12 +583,45 @@ def _row_matches_values(row: Mapping[str, Any], values: Mapping[str,
         if field in immutable)
 
 
+@dataclasses.dataclass(frozen=True)
+class _LockedReplicaCapacity:
+    """Physical/provider debit and non-retiring paid replacement coverage."""
+
+    total: int
+    nonretiring_paid_by_shape: Mapping[tuple[str, int], int]
+    reserved_fill_intent_keys: frozenset[str]
+
+
+def _replica_shape(storage_version: Any, state: Any) -> tuple[str, int] | None:
+    """Return one exact persisted GPU shape, or no replacement authority."""
+    if (storage_version != 1 or not isinstance(state, Mapping) or
+            state.get('replica_info_version') != 18):
+        return None
+    shapes: set[tuple[str, int]] = set()
+    for field in ('resources_override', 'location'):
+        resource_state = state.get(field)
+        if resource_state is None:
+            continue
+        if not isinstance(resource_state, Mapping):
+            return None
+        accelerators = resource_state.get('accelerators')
+        if accelerators is None:
+            continue
+        try:
+            card, count = reserved_fill_planner.exact_accelerator_shape(
+                accelerators)
+        except ValueError:
+            return None
+        shapes.add((card.casefold(), count))
+    return next(iter(shapes)) if len(shapes) == 1 else None
+
+
 def _locked_replica_capacity(
     connection: sqlalchemy.engine.Connection,
     *,
     service_name: str,
     capacity_unit: reserved_fill_planner.FillCapacityUnit,
-) -> int:
+) -> _LockedReplicaCapacity:
     """Return service-wide capacity that may still exist at the provider.
 
     Lifecycle status is not teardown evidence.  Old-version, failed, unknown,
@@ -358,18 +632,45 @@ def _locked_replica_capacity(
     without making cleanup-proven history part of the admission hot path.
     """
     rows = connection.execute(
-        sqlalchemy.select(_REPLICAS.c.sky_down_status,
-                          _REPLICAS.c.replica_state_version,
-                          _REPLICAS.c.replica_state).where(
-                              _REPLICAS.c.service_name == service_name,
-                              _REPLICAS.c.sky_down_status.is_distinct_from(
-                                  common_utils.ProcessStatus.SUCCEEDED.value)).
-        order_by(_REPLICAS.c.replica_id).with_for_update()).mappings().all()
+        sqlalchemy.select(
+            _REPLICAS.c.status, _REPLICAS.c.sky_down_status,
+            _REPLICAS.c.replica_state_version, _REPLICAS.c.replica_state,
+            _REPLICAS.c.reserved_fill_intent_idempotency_key).where(
+                _REPLICAS.c.service_name == service_name).order_by(
+                    _REPLICAS.c.replica_id).with_for_update()).mappings().all()
     total = 0
+    nonretiring_paid_by_shape: dict[tuple[str, int], int] = {}
+    reserved_fill_intent_keys: set[str] = set()
     for row in rows:
-        total += _replica_capacity_for_unit(row['replica_state_version'],
-                                            row['replica_state'], capacity_unit)
-    return total
+        capacity = _replica_capacity_for_unit(row['replica_state_version'],
+                                              row['replica_state'],
+                                              capacity_unit)
+        total += capacity
+        intent_key = row['reserved_fill_intent_idempotency_key']
+        if isinstance(intent_key, str) and intent_key:
+            reserved_fill_intent_keys.add(intent_key)
+        state = row['replica_state']
+        if (row['status'] in {
+                status.value
+                for status in serve_statuses.ReplicaStatus.terminal_statuses()
+        } or row['replica_state_version'] != 1 or
+                not isinstance(state, Mapping) or
+                state.get('replica_info_version') != 18 or
+                state.get('is_zero_cost') is not False):
+            continue
+        status = state.get('status_property')
+        if (not isinstance(status, Mapping) or
+                status.get('is_scale_down') is not False or
+                status.get('sky_down_status') is not None or
+                row['sky_down_status'] is not None):
+            continue
+        shape = _replica_shape(row['replica_state_version'], state)
+        if shape is None:
+            continue
+        nonretiring_paid_by_shape[shape] = (
+            nonretiring_paid_by_shape.get(shape, 0) + capacity)
+    return _LockedReplicaCapacity(total, dict(nonretiring_paid_by_shape),
+                                  frozenset(reserved_fill_intent_keys))
 
 
 def _replica_capacity_for_unit(
@@ -384,29 +685,12 @@ def _replica_capacity_for_unit(
             state.get('replica_info_version') != 18):
         raise ZeroCostActuationConflict(
             'Current logical replica state is malformed.')
-    shapes: set[tuple[str, int]] = set()
-    for field in ('resources_override', 'location'):
-        resource_state = state.get(field)
-        if resource_state is None:
-            continue
-        if not isinstance(resource_state, Mapping):
-            raise ZeroCostActuationConflict(
-                'Current logical replica resource state is malformed.')
-        accelerators = resource_state.get('accelerators')
-        if accelerators is None:
-            continue
-        try:
-            shapes.add(
-                reserved_fill_planner.exact_accelerator_shape(accelerators))
-        except ValueError as error:
-            raise ZeroCostActuationConflict(
-                'Current logical replica accelerator shape is malformed.'
-            ) from error
-    if len(shapes) != 1:
+    shape = _replica_shape(storage_version, state)
+    if shape is None:
         raise ZeroCostActuationConflict(
             'Current logical replica has missing or conflicting accelerator '
             'shapes.')
-    _, accelerator_count = next(iter(shapes))
+    _, accelerator_count = shape
     return capacity_unit.intent_cost(accelerator_count)
 
 
@@ -436,12 +720,37 @@ def _pending_capacity_for_unit(
     rows: list[Mapping[str, Any]],
     now: datetime.datetime,
     capacity_unit: reserved_fill_planner.FillCapacityUnit,
+    *,
+    admission_owned_intent_keys: frozenset[str],
 ) -> int:
-    """Project every live pending intent into the current service unit."""
+    """Project live non-Kueue intents into the current service unit."""
     return sum(
         _pending_row_capacity(row, capacity_unit)
         for row in rows
-        if row['state'] in _PENDING_STATES and row['valid_until'] > now)
+        if (row['state'] in _PENDING_STATES and row['valid_until'] > now and
+            row['intent_idempotency_key'] not in admission_owned_intent_keys))
+
+
+def _unrepresented_kueue_admission_capacity(
+    admission_rows: list[kueue_lane_lineage.KueueAdmissionRow],
+    *,
+    capacity_unit: reserved_fill_planner.FillCapacityUnit,
+    represented_intent_keys: frozenset[str],
+) -> int:
+    """Debit every unresolved admission not represented by a replica row."""
+    total = 0
+    for row in admission_rows:
+        if row.capacity_unit != capacity_unit.value:
+            raise ZeroCostActuationConflict(
+                'Kueue admission uses a different configured ceiling unit.')
+        planned_capacity = row.planned_capacity
+        if (not isinstance(planned_capacity, int) or
+                isinstance(planned_capacity, bool) or planned_capacity < 1):
+            raise ZeroCostActuationConflict(
+                'Kueue admission planned capacity is malformed.')
+        if row.intent_idempotency_key not in represented_intent_keys:
+            total += planned_capacity
+    return total
 
 
 def _retire_expired_locked(connection: sqlalchemy.engine.Connection,
@@ -465,13 +774,97 @@ def _retire_expired_locked(connection: sqlalchemy.engine.Connection,
                     terminal_at=now))
 
 
+def terminalize_unmaterialized_service_intents_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    service_name: str,
+    service_hash: str,
+    service_lifecycle_epoch: int,
+) -> tuple[str, ...]:
+    """Retire provider-free intent leases during exact service teardown.
+
+    ``ACTUATING`` is still provider-free in this protocol: execution may do
+    provider/identity preflight while leased, but provider submission authority
+    is created only by the transaction that also changes the intent to
+    ``COMMITTED`` and installs its replica/request graph.  Locking the service
+    row first makes that transaction and this teardown transition mutually
+    exclusive.  A loser therefore observes either a terminal intent or a
+    materialized graph; it can never submit from a forgotten lease.
+    """
+    _require_postgres(connection)
+    if (not isinstance(service_name, str) or not service_name or
+            not isinstance(service_hash, str) or not service_hash or
+            not isinstance(service_lifecycle_epoch, int) or
+            isinstance(service_lifecycle_epoch, bool) or
+            service_lifecycle_epoch < 1):
+        raise ValueError(
+            'Intent teardown requires an exact service lifecycle identity.')
+    owner = connection.execute(
+        sqlalchemy.select(_SERVICES.c.hash, _SERVICES.c.lifecycle_epoch,
+                          _SERVICES.c.status).where(
+                              _SERVICES.c.name ==
+                              service_name).with_for_update()).one_or_none()
+    if (owner is None or owner.hash != service_hash or
+            owner.lifecycle_epoch != service_lifecycle_epoch or
+            owner.status != serve_statuses.ServiceStatus.SHUTTING_DOWN.value):
+        raise ZeroCostActuationConflict(
+            'Intent teardown lost the SHUTTING_DOWN service lifecycle.')
+    rows = connection.execute(
+        sqlalchemy.select(
+            _INTENTS.c.intent_idempotency_key, _INTENTS.c.state,
+            _INTENTS.c.replica_id, _INTENTS.c.replica_record_id).where(
+                _INTENTS.c.service_name == service_name,
+                _INTENTS.c.service_hash == service_hash,
+                _INTENTS.c.service_lifecycle_epoch ==
+                service_lifecycle_epoch).order_by(
+                    _INTENTS.c.intent_idempotency_key).with_for_update()).all()
+    # Lock the complete exact-lifecycle intent set before filtering.  Teardown
+    # subsequently locks replica/association/admission graph rows; taking only
+    # a pending subset here would invert with a reconciler that locks all
+    # intents in key order before following those graph edges.
+    keys = tuple(
+        str(row.intent_idempotency_key)
+        for row in rows
+        if row.state in _PENDING_STATES and row.replica_id is None and
+        row.replica_record_id is None)
+    if not keys:
+        return ()
+    now = connection.execute(
+        sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+    result = connection.execute(
+        sqlalchemy.update(_INTENTS).where(
+            _INTENTS.c.intent_idempotency_key.in_(keys),
+            _INTENTS.c.service_name == service_name,
+            _INTENTS.c.service_hash == service_hash,
+            _INTENTS.c.service_lifecycle_epoch == service_lifecycle_epoch,
+            _INTENTS.c.state.in_(tuple(_PENDING_STATES)),
+            _INTENTS.c.replica_id.is_(None),
+            _INTENTS.c.replica_record_id.is_(None)).values(
+                state=IntentState.TERMINAL.value,
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error='service_teardown',
+                updated_at=now,
+                terminal_at=now))
+    if result.rowcount != len(keys):
+        raise ZeroCostActuationConflict(
+            'An unmaterialized intent changed during service teardown.')
+    return keys
+
+
 def _locked_grant_intent_rows(
     connection: sqlalchemy.engine.Connection,
     *,
     service_name: str,
     plan_keys: tuple[str, ...],
 ) -> list[Mapping[str, Any]]:
-    """Lock live pending intents plus exact idempotency replay rows."""
+    """Lock live, replay, and admission-owned intents in canonical order.
+
+    Retained terminal history without an admission is irrelevant and remains
+    unlocked.  Admission-owned terminal intents are included so independent
+    evidence-backed garbage collection can remove provider-free rows before
+    new admission and surge decisions.
+    """
     if not plan_keys:
         raise ValueError('Grant intent locking requires current plan keys.')
     return connection.execute(
@@ -479,9 +872,14 @@ def _locked_grant_intent_rows(
             _INTENTS.c.service_name == service_name,
             sqlalchemy.or_(
                 _INTENTS.c.state.in_(tuple(_PENDING_STATES)),
-                _INTENTS.c.intent_idempotency_key.in_(plan_keys))).order_by(
-                    _INTENTS.c.intent_idempotency_key).with_for_update()
-    ).mappings().all()
+                _INTENTS.c.intent_idempotency_key.in_(plan_keys),
+                _INTENTS.c.intent_idempotency_key.in_(
+                    sqlalchemy.select(
+                        _KUEUE_ADMISSIONS.c.intent_idempotency_key).where(
+                            _KUEUE_ADMISSIONS.c.service_name ==
+                            service_name)))).order_by(
+                                _INTENTS.c.intent_idempotency_key).
+        with_for_update()).mappings().all()
 
 
 def pending_capacity_in_connection(
@@ -1161,29 +1559,109 @@ class ZeroCostActuationRepository:
                                        expected_controller_incarnation),
                                    expected_controller_owner_epoch=(
                                        expected_controller_owner_epoch))
-            now = connection.execute(
-                sqlalchemy.select(
-                    sqlalchemy.func.clock_timestamp())).scalar_one()
-            rows = _locked_grant_intent_rows(
-                connection,
-                service_name=service_name,
-                plan_keys=tuple(
-                    intent.idempotency_key for intent in plan.intents))
-            _retire_expired_locked(connection, rows, now)
-            rows_by_key = {row['intent_idempotency_key']: row for row in rows}
-            pending_capacity = _pending_capacity_for_unit(
-                rows, now, plan.capacity_unit)
-            current_capacity = _locked_replica_capacity(
-                connection,
-                service_name=service_name,
-                capacity_unit=plan.capacity_unit)
-            remaining = max(0,
-                            max_capacity - current_capacity - pending_capacity)
             lifecycle_epoch = service['lifecycle_epoch']
             if (not isinstance(lifecycle_epoch, int) or
                     isinstance(lifecycle_epoch, bool) or lifecycle_epoch < 1):
                 raise ZeroCostActuationConflict(
                     'Service lifecycle authority is malformed.')
+            (worker_projections,
+             placement_catalog) = (_version_placement_snapshot_in_connection(
+                 connection,
+                 service_name=service_name,
+                 service_version=plan.intents[0].service_version))
+            lane_identities = {
+                intent.idempotency_key:
+                    kueue_lane_identity_for_intent_in_connection(
+                        connection,
+                        service_name=service_name,
+                        service_lifecycle_epoch=lifecycle_epoch,
+                        intent=intent,
+                        worker_projections=worker_projections,
+                        placement_catalog=placement_catalog)
+                for intent in plan.intents
+            }
+            lane_repository = kueue_lane_lineage.KueueAdmissionRepository(
+                self.engine)
+            now = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.clock_timestamp())).scalar_one()
+            grant_intent_keys = tuple(
+                sorted(intent.idempotency_key for intent in plan.intents))
+            rows = _locked_grant_intent_rows(connection,
+                                             service_name=service_name,
+                                             plan_keys=grant_intent_keys)
+            _retire_expired_locked(connection, rows, now)
+            locked_intent_keys = tuple(
+                str(row['intent_idempotency_key']) for row in rows)
+            if locked_intent_keys:
+                # Re-read after expiry retirement.  RowMapping values returned
+                # by the first SELECT are snapshots and must not be mistaken
+                # for the newly committed TERMINAL state.
+                rows = connection.execute(
+                    sqlalchemy.select(_INTENTS).where(
+                        _INTENTS.c.service_name == service_name,
+                        _INTENTS.c.intent_idempotency_key.in_(
+                            locked_intent_keys)).order_by(
+                                _INTENTS.c.intent_idempotency_key).
+                    with_for_update()).mappings().all()
+            replica_capacity = _locked_replica_capacity(
+                connection,
+                service_name=service_name,
+                capacity_unit=plan.capacity_unit)
+            # Service -> intent/replica -> admission is the frozen lock order.
+            # Evidence-clean, never-materialized terminal admissions are
+            # deleted before capacity is calculated.  Every other admission
+            # remains an independent conservation debit even after its intent
+            # expires; intent state is not provider-clean evidence.
+            provider_free_proofs = (
+                lane_repository.
+                prelock_provider_free_terminal_admissions_in_connection(
+                    connection, service_name, str(service['hash'])))
+            deleted_admission_keys: set[str] = set()
+            for proof in provider_free_proofs:
+                deleted = (
+                    lane_repository.
+                    delete_provider_free_terminal_admission_in_connection(
+                        connection, proof))
+                deleted_admission_keys.add(deleted.intent_idempotency_key)
+            admission_rows = list(
+                lane_repository.lock_service_admissions_in_connection(
+                    connection, service_name, str(service['hash'])))
+            admission_owned_intent_keys = frozenset(
+                row.intent_idempotency_key for row in admission_rows)
+            pending_capacity = _pending_capacity_for_unit(
+                rows,
+                now,
+                plan.capacity_unit,
+                admission_owned_intent_keys=admission_owned_intent_keys)
+            unresolved_admission_capacity = (
+                _unrepresented_kueue_admission_capacity(
+                    admission_rows,
+                    capacity_unit=plan.capacity_unit,
+                    represented_intent_keys=(
+                        replica_capacity.reserved_fill_intent_keys)))
+            physical_capacity_debit = (replica_capacity.total +
+                                       pending_capacity +
+                                       unresolved_admission_capacity)
+            if physical_capacity_debit <= max_capacity:
+                (lane_repository.
+                 release_satisfied_replacement_surge_in_connection)(
+                     connection,
+                     service_name=service_name,
+                     service_hash=str(service['hash']),
+                     capacity_unit=plan.capacity_unit.value,
+                     physical_capacity_debit=physical_capacity_debit,
+                     max_capacity=max_capacity)
+                admission_rows = list(
+                    lane_repository.lock_service_admissions_in_connection(
+                        connection, service_name, str(service['hash'])))
+            lane_by_intent = {
+                row.intent_idempotency_key: row for row in admission_rows
+            }
+            rows_by_key = {row['intent_idempotency_key']: row for row in rows}
+            surge_lease_active = any(
+                int(getattr(row, 'replacement_surge_units', 0)) > 0
+                for row in admission_rows)
             for intent in plan.intents:
                 values = _intent_values(
                     intent,
@@ -1191,6 +1669,7 @@ class ZeroCostActuationRepository:
                     service_lifecycle_epoch=lifecycle_epoch,
                     actuation_epoch=int(
                         service['reserved_fill_actuation_epoch']))
+                lane_identity = lane_identities[intent.idempotency_key]
                 existing = rows_by_key.get(intent.idempotency_key)
                 if existing is not None:
                     if not _row_matches_values(existing, values):
@@ -1198,6 +1677,41 @@ class ZeroCostActuationRepository:
                             'Intent idempotency key maps to different authority.'
                         )
                     state = IntentState(existing['state'])
+                    if lane_identity is not None:
+                        admission = lane_by_intent.get(intent.idempotency_key)
+                        if (admission is None and
+                                not (state is IntentState.TERMINAL and
+                                     intent.idempotency_key
+                                     in deleted_admission_keys)):
+                            raise ZeroCostActuationConflict(
+                                'Kueue intent replay lost its exact durable '
+                                'admission.')
+                        if (admission is not None and
+                                not _lane_row_matches_identity(
+                                    admission, lane_identity)):
+                            raise ZeroCostActuationConflict(
+                                'Kueue intent replay changed its exact durable '
+                                'admission.')
+                        admission_state = (
+                            kueue_lane_lineage.KueueAdmissionState(
+                                admission.state)
+                            if admission is not None else None)
+                        if (state in {
+                                IntentState.GRANTED, IntentState.ACTUATING,
+                                IntentState.RETRYABLE
+                        } and admission_state is not kueue_lane_lineage.
+                             KueueAdmissionState.INTENT_PENDING):
+                            deferred.append(
+                                reserved_fill_planner.DeferredFillIntent(
+                                    intent,
+                                    reserved_fill_planner.DeferredFillReason.
+                                    PROVIDER_QUEUE_BACKPRESSURE,
+                                    'the Kueue admission is no longer pending '
+                                    'supply for this intent'))
+                            continue
+                    elif intent.idempotency_key in lane_by_intent:
+                        raise ZeroCostActuationConflict(
+                            'Non-Kueue intent replay owns a Kueue admission.')
                     if state is IntentState.COMMITTED:
                         accepted.append(
                             reserved_fill_planner.AcceptedFillIntent(
@@ -1225,13 +1739,24 @@ class ZeroCostActuationRepository:
                     authority_current = False
                     continue
                 cost = int(values['planned_capacity'])
-                if cost > remaining:
+                surge = kueue_lane_capacity.decide_zero_cost_replacement_surge(
+                    max_capacity=max_capacity,
+                    physical_capacity_debit=physical_capacity_debit,
+                    candidate_capacity=cost,
+                    candidate_is_kueue=lane_identity is not None,
+                    compatible_live_paid_capacity=(
+                        replica_capacity.nonretiring_paid_by_shape.get(
+                            (intent.accelerator.casefold(),
+                             intent.accelerator_count), 0)),
+                    surge_lease_active=surge_lease_active)
+                if not surge.allowed:
                     deferred.append(
                         reserved_fill_planner.DeferredFillIntent(
                             intent, reserved_fill_planner.DeferredFillReason.
                             MAX_REPLICAS_EXHAUSTED,
-                            'durable rows and pending grants consumed the '
-                            'service capacity ceiling'))
+                            'durable physical rows and pending grants consumed '
+                            'the service ceiling and its one replacement surge')
+                    )
                     continue
                 connection.execute(
                     sqlalchemy.insert(_INTENTS).values(
@@ -1240,10 +1765,37 @@ class ZeroCostActuationRepository:
                         lease_generation=0,
                         created_at=now,
                         updated_at=now))
+                if lane_identity is not None:
+                    projected_capacity = physical_capacity_debit + cost
+                    surge_units = (max(0, projected_capacity -
+                                       max_capacity) if surge.uses_surge else 0)
+                    new_admission = (
+                        lane_repository.insert_intent_pending_in_connection(
+                            connection,
+                            lane_identity,
+                            intent_idempotency_key=intent.idempotency_key,
+                            replacement_surge_units=surge_units,
+                            replacement_compatibility_sha256=(
+                                kueue_lane_capacity.
+                                replacement_compatibility_sha256(
+                                    service_hash=str(service['hash']),
+                                    service_lifecycle_epoch=lifecycle_epoch,
+                                    service_version=int(
+                                        service['current_version']),
+                                    capacity_unit=plan.capacity_unit.value,
+                                    accelerator=(lane_identity.accelerator),
+                                    accelerator_count=(
+                                        lane_identity.accelerator_count),
+                                    worker_projection_sha256=(
+                                        lane_identity.worker_projection_sha256))
+                                if surge.uses_surge else None)))
+                    lane_by_intent[intent.idempotency_key] = new_admission
+                    surge_lease_active = (surge_lease_active or
+                                          surge.uses_surge)
                 accepted.append(
                     reserved_fill_planner.AcceptedFillIntent(
                         intent.idempotency_key, None))
-                remaining -= cost
+                physical_capacity_debit += cost
         receipt = reserved_fill_planner.FillCommitResult(
             accepted=tuple(accepted),
             deferred=tuple(deferred),
@@ -1260,9 +1812,33 @@ class ZeroCostActuationRepository:
         lease_seconds: int,
     ) -> IntentLease | None:
         """Lease one intent without serializing an unrelated physical pool."""
+        leases = self.lease_batch(service_name=service_name,
+                                  pool_key=pool_key,
+                                  owner=owner,
+                                  lease_seconds=lease_seconds,
+                                  max_leases=1)
+        return leases[0] if leases else None
+
+    def lease_batch(
+        self,
+        *,
+        service_name: str,
+        pool_key: str,
+        owner: uuid.UUID,
+        lease_seconds: int,
+        max_leases: int = MAX_ACTUATION_LEASE_BATCH_SIZE,
+    ) -> tuple[IntentLease, ...]:
+        """Lease one bounded oldest-first physical-pool submission wave."""
         if (not isinstance(owner, uuid.UUID) or
-                not isinstance(lease_seconds, int) or lease_seconds <= 0):
-            raise ValueError('Intent lease requires a UUID owner and TTL.')
+                not isinstance(lease_seconds, int) or lease_seconds <= 0 or
+                not isinstance(max_leases, int) or
+                isinstance(max_leases, bool) or max_leases < 1 or
+                max_leases > MAX_ACTUATION_LEASE_BATCH_SIZE):
+            raise ValueError('Intent lease batch requires a UUID owner, TTL, '
+                             'and bounded positive size.')
+        if (not isinstance(service_name, str) or not service_name or
+                not isinstance(pool_key, str) or not pool_key):
+            raise ValueError('Intent lease batch requires service and pool.')
         with self.engine.begin() as connection:
             now = connection.execute(
                 sqlalchemy.select(
@@ -1290,7 +1866,8 @@ class ZeroCostActuationRepository:
                                    last_error='grant_expired',
                                    updated_at=now,
                                    terminal_at=now))
-            row = connection.execute(
+
+            rows = connection.execute(
                 sqlalchemy.select(_INTENTS).where(
                     _INTENTS.c.service_name == service_name,
                     _INTENTS.c.pool_key == pool_key,
@@ -1298,27 +1875,33 @@ class ZeroCostActuationRepository:
                         (IntentState.GRANTED.value,
                          IntentState.RETRYABLE.value)), _INTENTS.c.valid_until
                     > now).order_by(_INTENTS.c.created_at,
-                                    _INTENTS.c.intent_idempotency_key).limit(1).
-                with_for_update(skip_locked=True)).mappings().one_or_none()
-            if row is None:
-                return None
-            generation = int(row['lease_generation']) + 1
+                                    _INTENTS.c.intent_idempotency_key).limit(
+                                        max_leases).with_for_update(
+                                            skip_locked=True)).mappings().all()
+            if not rows:
+                return ()
             expires_at = now + datetime.timedelta(seconds=lease_seconds)
-            connection.execute(
+            keys = tuple(str(row['intent_idempotency_key']) for row in rows)
+            result = connection.execute(
                 sqlalchemy.update(_INTENTS).where(
-                    _INTENTS.c.intent_idempotency_key ==
-                    row['intent_idempotency_key'],
-                    _INTENTS.c.state.in_((IntentState.GRANTED.value,
-                                          IntentState.RETRYABLE.value))).values(
-                                              state=IntentState.ACTUATING.value,
-                                              lease_owner=owner,
-                                              lease_generation=generation,
-                                              lease_expires_at=expires_at,
-                                              updated_at=now))
-            intent = _intent_from_row(row)
-            return IntentLease(intent, int(row['service_lifecycle_epoch']),
-                               int(row['actuation_epoch']), owner, generation,
-                               expires_at)
+                    _INTENTS.c.intent_idempotency_key.in_(keys),
+                    _INTENTS.c.state.in_(
+                        (IntentState.GRANTED.value,
+                         IntentState.RETRYABLE.value))).values(
+                             state=IntentState.ACTUATING.value,
+                             lease_owner=owner,
+                             lease_generation=(_INTENTS.c.lease_generation + 1),
+                             lease_expires_at=expires_at,
+                             updated_at=now))
+            if result.rowcount != len(rows):
+                raise ZeroCostActuationConflict(
+                    'Intent lease batch changed after its locked selection.')
+            return tuple(
+                IntentLease(_intent_from_row(row),
+                            int(row['service_lifecycle_epoch']),
+                            int(row['actuation_epoch']), owner,
+                            int(row['lease_generation']) + 1, expires_at)
+                for row in rows)
 
     def actionable_pool_keys(self, *, service_name: str) -> tuple[str, ...]:
         """Return independent physical lanes with work for this service."""

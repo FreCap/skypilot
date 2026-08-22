@@ -89,6 +89,9 @@ else:
     psutil = adaptors_common.LazyImport('psutil')
     requests = controller_transport.requests
 
+kueue_lane_observer = adaptors_common.LazyImport(
+    'sky.serve.kueue_lane_observer')
+
 logger: logging.Logger = sky_logging.init_logger(__name__)
 controller_transport.logger = logger
 
@@ -4528,6 +4531,11 @@ def replica_cleanup_requires_terminal_history(
 def _partition_replica_cleanup_targets(
     replica_infos: list['replica_managers.ReplicaInfo'],
     existing_cluster_names: set[str],
+    *,
+    live_service_name: str | None = None,
+    live_service_hash: str | None = None,
+    live_lifecycle_epoch: int | None = None,
+    live_controller_owner: tuple[int | None, str | None] | None = None,
 ) -> tuple[list[tuple['replica_managers.ReplicaInfo', Any]], list[str]]:
     """Separate cleanup targets from rows whose provider absence is unknown.
 
@@ -4559,6 +4567,51 @@ def _partition_replica_cleanup_targets(
         if info.cluster_name in existing_cluster_names:
             to_terminate.append((info, cleanup_fence))
         elif cleanup_fence is not None:
+            if live_service_name is not None:
+                if (live_service_hash is None or live_lifecycle_epoch is None or
+                        live_controller_owner is None):
+                    raise ValueError(
+                        'Live exact cleanup requires the complete service '
+                        'incarnation and controller owner.')
+                # Persist teardown intent before any unlocked provider read.
+                # A crash after the subsequent 404 can then safely retry this
+                # exact stored Pod identity without recreating a cluster row.
+                if info.status_property.sky_down_status is None:
+                    info.status_property.sky_down_status = (
+                        common_utils.ProcessStatus.SCHEDULED)
+                persisted = serve_state.add_or_update_replica(
+                    live_service_name,
+                    info.replica_id,
+                    info,
+                    expected_service_hash=live_service_hash,
+                    expected_lifecycle_epoch=live_lifecycle_epoch,
+                    expected_controller_owner=live_controller_owner,
+                    expected_replica_exists=True)
+                if not persisted:
+                    logger.error(
+                        'Retaining protocol-v2 replica cluster %r because its '
+                        'live teardown identity changed before exact Pod probe.',
+                        info.cluster_name)
+                    unresolved_cluster_names.append(info.cluster_name)
+                    continue
+                try:
+                    exact_absence = (kueue_lane_observer.
+                                     project_exact_pod_absence_after_teardown(
+                                         live_service_name, info.replica_id,
+                                         info.replica_record_id))
+                except Exception as error:  # pylint: disable=broad-except
+                    logger.error(
+                        'Retaining protocol-v2 replica cluster %r because its '
+                        'exact admitted Pod absence is unproved: %s.',
+                        info.cluster_name, common_utils.format_exception(error))
+                    unresolved_cluster_names.append(info.cluster_name)
+                    continue
+                if exact_absence:
+                    logger.info(
+                        'Protocol-v2 replica cluster %r exact admitted Pod is '
+                        'absent; provider cleanup is complete.',
+                        info.cluster_name)
+                    continue
             presence = reserved_capacity.probe_physical_replica_presence(
                 cleanup_fence, info.cluster_name)
             if presence is reserved_capacity.PhysicalReplicaPresence.ABSENT:
@@ -4932,8 +4985,14 @@ def _terminate_failed_services_locked(
     # This remains the failed-service purge submission owner.  The retired
     # action-authority proposal does not replace it.
     to_terminate, unresolved_cluster_names = (
-        _partition_replica_cleanup_targets(partition_infos,
-                                           existing_cluster_names))
+        _partition_replica_cleanup_targets(
+            partition_infos,
+            existing_cluster_names,
+            live_service_name=service_name,
+            live_service_hash=(expected_service_hash),
+            live_lifecycle_epoch=lifecycle_epoch,
+            live_controller_owner=(owner.get('controller_pid'),
+                                   owner.get('controller_ip'))))
     cleanup_targets: list[tuple[Any, Any, Any | None]] = []
     for info, cleanup_fence in to_terminate:
         try:
@@ -5007,8 +5066,8 @@ def _terminate_failed_services_locked(
                     terminate_kwargs['cleanup_fence'] = cleanup_fence
                 # pylint: disable=protected-access
                 service_lib._terminate_replica_cluster_for_service_cleanup(
-                    info, cleanup_context, bound_authority, info.cluster_name,
-                    log_file_name, **terminate_kwargs)
+                    service_name, info, cleanup_context, bound_authority,
+                    info.cluster_name, log_file_name, **terminate_kwargs)
                 # pylint: enable=protected-access
                 return None
             except Exception as e:  # pylint: disable=broad-except

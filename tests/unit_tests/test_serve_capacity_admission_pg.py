@@ -12,6 +12,8 @@ from alembic import command as alembic_command
 import pytest
 import sqlalchemy
 from sqlalchemy.dialects import postgresql
+from test_kueue_lane_lineage_pg import _intent_values as _kueue_intent_values
+from test_kueue_lane_lineage_pg import _receipt as _kueue_receipt
 from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
@@ -19,13 +21,18 @@ from sky.serve import capacity_admission
 from sky.serve import capacity_admission_schema
 from sky.serve import constants
 from sky.serve import demand_state
+from sky.serve import kubernetes_identity
+from sky.serve import kueue_lane_lineage
+from sky.serve import kueue_lane_lineage_schema
 from sky.serve import ordinary_launch_binding
 from sky.serve import replica_managers
+from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
 from sky.serve import route_projection
 from sky.serve import route_projection_schema
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
+from sky.serve import zero_cost_actuation_schema
 from sky.utils import common_utils
 from sky.utils.db import migration_utils
 
@@ -33,6 +40,62 @@ pytestmark = pytest.mark.xdist_group(
     name='serve_capacity_admission_schema_052_pg')
 
 _URL = 'http://replica:8000'
+_CAPACITY_KUEUE_PROJECTION = {
+    'projection_version': 2,
+    'candidate_id': 'kubernetes-0000',
+    'kubernetes_context': 'phx',
+    'namespace': 'skypilot',
+    'service_account_name': 'skypilot-pool-sa',
+    'scheduler_name': 'gpu-binpack-scheduler',
+    'priority_class_name': 'skypilot-low',
+    'priority_value': -1000,
+    'preemption_policy': 'Never',
+    'kueue_admission': {
+        'local_queue_name': 'be',
+        'workload_priority_class_name': 'be-ls',
+    },
+    'pod_identity_role_arn': None,
+    'accelerator_name': 'L4',
+    'accelerator_count': 1,
+    'accelerator_scheduling': {
+        'label_key': 'nvidia.com/gpu.product',
+        'label_values': ['NVIDIA-L4'],
+        'resource_key': 'nvidia.com/gpu',
+    },
+    'cache': {
+        'kind': 'none',
+    },
+}
+_CAPACITY_KUEUE_PROJECTION_SHA256 = (
+    kubernetes_identity.worker_projection_sha256(_CAPACITY_KUEUE_PROJECTION))
+_CAPACITY_EAST_PROJECTION = {
+    **_CAPACITY_KUEUE_PROJECTION,
+    'candidate_id': 'kubernetes-0001',
+    'kubernetes_context': 'east',
+    'service_account_name': 'skyserve-worker',
+    'scheduler_name': 'default-scheduler',
+    'priority_class_name': 'skyserve-preemptible',
+    'kueue_admission': None,
+}
+_CAPACITY_EAST_PROJECTION_SHA256 = (
+    kubernetes_identity.worker_projection_sha256(_CAPACITY_EAST_PROJECTION))
+_COPIED_ADMISSION_MUTATIONS = (
+    ('intent_idempotency_key', '0' * 64),
+    ('unresolved_domain_sha256', '0' * 64),
+    ('service_name', 'other-service'),
+    ('service_hash', 'other-incarnation'),
+    ('service_lifecycle_epoch', 4),
+    ('service_version', 2),
+    ('pool_key', 'other-pool'),
+    ('pool_epoch', 8),
+    ('physical_cluster_uid', 'other-cluster'),
+    ('kubernetes_context', 'other-context'),
+    ('accelerator', 'h200'),
+    ('accelerator_count', 2),
+    ('worker_projection_sha256', '0' * 64),
+    ('capacity_unit', 'logical'),
+    ('planned_capacity', 2),
+)
 
 
 def _route_response():
@@ -283,6 +346,232 @@ def _replica_values(replica_id: int,
             },
         },
     }
+
+
+def _install_waiting_kueue_capacity(engine) -> str:
+    """Install one exact fresh-waiting L4 intent for final accounting."""
+    key = '9' * 64
+    identity = kueue_lane_lineage.KueueAdmissionIdentity(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        pool_key=reserved_capacity_broker.make_pool_key(
+            'phx',
+            'l4',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='cluster-phx'),
+        pool_epoch=7,
+        physical_cluster_uid='cluster-phx',
+        kubernetes_context='phx',
+        accelerator='l4',
+        accelerator_count=1,
+        worker_projection_sha256=_CAPACITY_KUEUE_PROJECTION_SHA256)
+    intent_values = _kueue_intent_values(key)
+    intent_values.update(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        pool_key=identity.pool_key,
+        pool_epoch=identity.pool_epoch,
+        physical_cluster_uid=identity.physical_cluster_uid,
+        kubernetes_context=identity.kubernetes_context,
+        worker_projection_sha256=identity.worker_projection_sha256,
+        accelerator='l4',
+        accelerator_count=1,
+        allowed_locations=[{
+            'cloud': 'Kubernetes',
+            'region': 'phx',
+            'zone': None,
+            'accelerators': {
+                'l4': 1,
+            },
+            'use_spot': False,
+            'image_id': None,
+            'container_image': None,
+            'disk_tier': None,
+            'ephemeral_storage': None,
+            'instance_type': None,
+        }])
+    repository = kueue_lane_lineage.KueueAdmissionRepository(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.version_specs_table).values(
+                service_name='svc',
+                version=1,
+                yaml_content='service: {}',
+                placement_catalog={
+                    'schema_version': 1,
+                    'entries': [],
+                    'num_nodes': 1,
+                },
+                worker_placement_projections=[_CAPACITY_KUEUE_PROJECTION]))
+        connection.execute(
+            sqlalchemy.insert(zero_cost_actuation_schema.
+                              serve_zero_cost_actuation_intents_table).values(
+                                  **intent_values))
+        repository.insert_intent_pending_in_connection(connection, identity,
+                                                       key)
+
+    record_id = uuid.uuid4()
+    association_id = uuid.uuid4()
+    replica_id = 90
+    provider_generation = 9
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    intents = (
+        zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
+    replicas = serve_state_schema.replicas_table
+    profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+        authorization_reference=f'reserved-fill:{key}',
+        authorization_generation=1,
+        authorization_payload={'intent_idempotency_key': key})
+    with engine.begin() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc')).mappings().one()
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        for table in (intents.name, replicas.name, associations.name):
+            connection.exec_driver_sql(
+                f'ALTER TABLE {table} DISABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.insert(associations).values(
+                association_id=association_id,
+                submission_id=uuid.uuid4(),
+                tenant_scope='tenant-a',
+                service_name='svc',
+                service_hash='svc-hash',
+                service_workspace='workspace-a',
+                service_lifecycle_epoch=3,
+                service_binding_epoch=service['ordinary_launch_binding_epoch'],
+                service_version=1,
+                replica_id=replica_id,
+                replica_record_id=record_id,
+                launch_generation=provider_generation,
+                cluster_name='svc-90',
+                request_id=f'request-{uuid.uuid4()}',
+                input_digest='a' * 64,
+                owner_controller_incarnation=service['controller_incarnation'],
+                owner_controller_epoch=service['controller_owner_epoch'],
+                effect_phase='NOT_STARTED',
+                effect_phase_changed_at=now,
+                resolution='BOUND',
+                created_at=now,
+                updated_at=now,
+                binding_protocol_version=2,
+                profile_kind='RESERVED_FILL',
+                profile_version=1,
+                profile_digest=profile.digest,
+                capability_cohort_epoch=1,
+                capability_profile_set_digest='c' * 64,
+                receipt_protocol_version=1,
+                authorization_kind=profile.authorization_kind.value,
+                authorization_reference=profile.authorization_reference,
+                authorization_generation=profile.authorization_generation,
+                authorization_digest=profile.authorization_digest,
+                reconciliation_outcome='ACTIVE_ADOPT',
+                provider_evidence='NOT_QUERIED'))
+        connection.execute(
+            sqlalchemy.update(intents).where(
+                intents.c.intent_idempotency_key == key).values(
+                    state='COMMITTED',
+                    replica_id=replica_id,
+                    replica_record_id=record_id,
+                    committed_at=now,
+                    updated_at=now))
+        replica_values = _replica_values(replica_id,
+                                         zero_cost=True,
+                                         accelerator='L4')
+        replica_values['replica_state']['replica_record_id'] = str(record_id)
+        replica_values.update(ordinary_launch_association_id=association_id,
+                              reserved_fill_intent_idempotency_key=key)
+        connection.execute(sqlalchemy.insert(replicas).values(**replica_values))
+        for table in (intents.name, replicas.name, associations.name):
+            connection.exec_driver_sql(
+                f'ALTER TABLE {table} ENABLE TRIGGER USER')
+        repository.bind_materialized_in_connection(
+            connection,
+            identity,
+            intent_idempotency_key=key,
+            replica_id=replica_id,
+            replica_record_id=record_id,
+            provider_cluster_generation=provider_generation,
+            association_id=association_id)
+        receipt = _kueue_receipt(
+            kueue_lane_lineage.KueueAdmissionState.POD_WAITING,
+            key,
+            record_id,
+            identity=identity)
+        repository.observe_pod_waiting_in_connection(
+            connection,
+            identity,
+            intent_idempotency_key=key,
+            replica_id=replica_id,
+            replica_record_id=record_id,
+            provider_cluster_generation=provider_generation,
+            association_id=association_id,
+            pod_namespace='skypilot',
+            pod_name='worker-1',
+            pod_uid='pod-uid-1',
+            pod_receipt=receipt,
+            provider_read_started_at=now)
+    return key
+
+
+def _install_pending_east_capacity(engine) -> str:
+    """Install one immutable ordinary-scheduler intent without admission."""
+    key = '8' * 64
+    intent_values = _kueue_intent_values(key)
+    intent_values.update(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        pool_key=reserved_capacity_broker.make_pool_key(
+            'east',
+            'l4',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='cluster-east'),
+        pool_epoch=7,
+        physical_cluster_uid='cluster-east',
+        kubernetes_context='east',
+        worker_projection_sha256=_CAPACITY_EAST_PROJECTION_SHA256,
+        accelerator='l4',
+        accelerator_count=1,
+        allowed_locations=[{
+            'cloud': 'Kubernetes',
+            'region': 'east',
+            'zone': None,
+            'accelerators': {
+                'l4': 1,
+            },
+            'use_spot': False,
+            'image_id': None,
+            'container_image': None,
+            'disk_tier': None,
+            'ephemeral_storage': None,
+            'instance_type': None,
+        }])
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.version_specs_table).values(
+                service_name='svc',
+                version=1,
+                yaml_content='service: {}',
+                placement_catalog={
+                    'schema_version': 1,
+                    'entries': [],
+                    'num_nodes': 1,
+                },
+                worker_placement_projections=[_CAPACITY_EAST_PROJECTION]))
+        connection.execute(
+            sqlalchemy.insert(zero_cost_actuation_schema.
+                              serve_zero_cost_actuation_intents_table).values(
+                                  **intent_values))
+    return key
 
 
 def _insert_claim(engine, authority, replica_id: int) -> dict:
@@ -857,6 +1146,95 @@ def test_zero_cost_commit_after_plan_revokes_paid_claim(capacity_database):
                     'replica_id': 21,
                 },
                 prospective=True)
+
+
+@pytest.mark.parametrize('provider_effect', [False, True],
+                         ids=['final-claim', 'provider-effect'])
+def test_missing_kueue_admission_fails_closed_at_final_paid_boundaries(
+        capacity_database, provider_effect):
+    engine, _, _ = capacity_database
+    key = _install_waiting_kueue_capacity(engine)
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+    claim = (authority.claim_values('L4')
+             if not provider_effect else _insert_claim(engine, authority, 100))
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(
+                kueue_lane_lineage_schema.serve_kueue_admissions_table).where(
+                    kueue_lane_lineage_schema.serve_kueue_admissions_table.c.
+                    intent_idempotency_key == key))
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                           match='Committed capacity changed'):
+            capacity_admission.validate_paid_claim_in_connection(
+                connection, {
+                    **service, 'name': 'svc'
+                }, {
+                    **claim, 'replica_id': 101
+                },
+                prospective=not provider_effect)
+
+
+@pytest.mark.parametrize('provider_effect', [False, True],
+                         ids=['final-claim', 'provider-effect'])
+@pytest.mark.parametrize(('field', 'value'), _COPIED_ADMISSION_MUTATIONS)
+def test_each_copied_kueue_identity_mismatch_fails_closed_at_paid_boundaries(
+        capacity_database, monkeypatch, provider_effect, field, value):
+    engine, _, _ = capacity_database
+    key = _install_waiting_kueue_capacity(engine)
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+    claim = (authority.claim_values('L4')
+             if not provider_effect else _insert_claim(engine, authority, 102))
+    original = (kueue_lane_lineage.KueueAdmissionRepository.
+                lock_service_admissions_in_connection)
+
+    def _corrupt(self, connection, service_name, service_hash):
+        rows = original(self, connection, service_name, service_hash)
+        return tuple(
+            dataclasses.replace(row, **{field: value}) if row.
+            intent_idempotency_key == key else row for row in rows)
+
+    monkeypatch.setattr(kueue_lane_lineage.KueueAdmissionRepository,
+                        'lock_service_admissions_in_connection', _corrupt)
+    with engine.begin() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                           match='Committed capacity changed'):
+            capacity_admission.validate_paid_claim_in_connection(
+                connection, {
+                    **service, 'name': 'svc'
+                }, {
+                    **claim, 'replica_id': 103
+                },
+                prospective=not provider_effect)
+
+
+def test_proven_east_intent_without_admission_allows_final_paid_claim(
+        capacity_database):
+    engine, _, _ = capacity_database
+    _install_pending_east_capacity(engine)
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(2))
+    assert authority.remaining() == {'l4': 1}
+    with engine.begin() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        capacity_admission.validate_paid_claim_in_connection(connection, {
+            **service, 'name': 'svc'
+        }, {
+            **authority.claim_values('L4'), 'replica_id': 104
+        },
+                                                             prospective=True)
 
 
 def test_cross_card_reserved_capacity_satisfies_supply_aware_target(

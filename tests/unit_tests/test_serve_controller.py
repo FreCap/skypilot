@@ -2652,6 +2652,24 @@ class TestServiceUpdateReconciler:
         assert 'superseded' in json.loads(response.body)['message']
         ctrl._record_committed_update.assert_not_called()  # pylint: disable=protected-access
 
+    def test_kueue_admission_hold_returns_409_without_scheduling(self):
+        ctrl = _make_update_controller()
+        spec = _make_update_spec()
+        ctrl._record_committed_update = mock.Mock()  # pylint: disable=protected-access
+        with mock.patch.object(
+                controller.serve_state,
+                'add_or_update_version',
+                return_value=(
+                    serve_state.VersionCommitResult.KUEUE_ADMISSION_HOLD)):
+            response = ctrl._commit_service_update(  # pylint: disable=protected-access
+                2, spec, 'service: held', serve_utils.UpdateMode.ROLLING,
+                'incarnation-a', 7)
+
+        assert response.status_code == 409
+        assert 'waiting for Kueue admission' in json.loads(
+            response.body)['message']
+        ctrl._record_committed_update.assert_not_called()  # pylint: disable=protected-access
+
     def test_durable_activation_fence_rejects_racing_physical_commit(self):
         ctrl = _make_update_controller()
         # Runtime is still physical while a previously committed logical

@@ -59,6 +59,27 @@ KUEUE_LOCAL_QUEUE_PLURAL = 'localqueues'
 KUEUE_CLUSTER_QUEUE_PLURAL = 'clusterqueues'
 KUEUE_ACTIVE_CONDITION = 'Active'
 
+# Dynamic reserved-fill identity is server-owned and installed only after the
+# static worker projection has been rendered and content-addressed.  The
+# values therefore never participate in the worker-projection digest; the
+# digest itself is carried as one of the exact values and reattested from the
+# live Pod.
+RESERVED_FILL_IDENTITY_ANNOTATION_PREFIX = 'skypilot.co/reserved-fill-'
+RESERVED_FILL_INTENT_KEY_ANNOTATION = (
+    f'{RESERVED_FILL_IDENTITY_ANNOTATION_PREFIX}intent-key')
+RESERVED_FILL_REPLICA_RECORD_UUID_ANNOTATION = (
+    f'{RESERVED_FILL_IDENTITY_ANNOTATION_PREFIX}replica-record-uuid')
+RESERVED_FILL_POOL_PHYSICAL_UID_ANNOTATION = (
+    f'{RESERVED_FILL_IDENTITY_ANNOTATION_PREFIX}pool-physical-uid')
+RESERVED_FILL_WORKER_PROJECTION_SHA256_ANNOTATION = (
+    f'{RESERVED_FILL_IDENTITY_ANNOTATION_PREFIX}worker-projection-sha256')
+RESERVED_FILL_IDENTITY_ANNOTATION_KEYS = frozenset({
+    RESERVED_FILL_INTENT_KEY_ANNOTATION,
+    RESERVED_FILL_REPLICA_RECORD_UUID_ANNOTATION,
+    RESERVED_FILL_POOL_PHYSICAL_UID_ANNOTATION,
+    RESERVED_FILL_WORKER_PROJECTION_SHA256_ANNOTATION,
+})
+
 # Required-Kueue Pods can legitimately remain admission-gated while quota is
 # borrowed or reclaimed. Keep that wait separate from the ordinary scheduler
 # placement timeout, but bounded so a permanently blocked queue cannot retain

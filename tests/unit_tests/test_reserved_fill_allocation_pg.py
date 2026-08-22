@@ -193,6 +193,11 @@ def allocation_engine(observation_engine, monkeypatch):  # noqa: F811
                 version=1,
                 spec=pickle.dumps(_service_spec()),
                 yaml_content='service: v1\n',
+                placement_catalog={
+                    'schema_version': 1,
+                    'entries': [],
+                    'num_nodes': 1,
+                },
                 worker_placement_projections=_WORKER_PROJECTIONS))
         connection.execute(
             serve_state_schema.service_lifecycle_fences_table.insert().values(
@@ -513,6 +518,11 @@ def _insert_peer_service(
                 version=1,
                 spec=pickle.dumps(_service_spec()),
                 yaml_content='service: v1\n',
+                placement_catalog={
+                    'schema_version': 1,
+                    'entries': [],
+                    'num_nodes': 1,
+                },
                 worker_placement_projections=_WORKER_PROJECTIONS))
         connection.execute(
             serve_state_schema.service_lifecycle_fences_table.insert().values(

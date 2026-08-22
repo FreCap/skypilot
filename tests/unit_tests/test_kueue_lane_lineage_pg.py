@@ -1,0 +1,2053 @@
+"""Real-PostgreSQL contracts for three-state Kueue admissions."""
+# pylint: disable=not-callable,redefined-outer-name,unused-import
+
+import concurrent.futures
+import contextlib
+import datetime
+import threading
+import time
+import types
+import uuid
+
+from alembic import command as alembic_command
+from alembic import script as alembic_script
+import pytest
+import sqlalchemy
+from sqlalchemy.dialects import postgresql
+from test_serve_resource_actions_pg import empty_postgres
+from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
+
+from sky.adaptors import kubernetes as kubernetes_adaptor
+from sky.serve import kubernetes_identity
+from sky.serve import kueue_lane_lineage
+from sky.serve import kueue_lane_lineage_schema
+from sky.serve import kueue_lane_observer
+from sky.serve import ordinary_launch_binding
+from sky.serve import replica_managers
+from sky.serve import reserved_capacity_broker
+from sky.serve import serve_state
+from sky.serve import serve_state_schema
+from sky.serve import service
+from sky.serve import zero_cost_actuation
+from sky.serve import zero_cost_actuation_schema
+from sky.server.requests import postgres as request_postgres
+from sky.server.requests import postgres_schema as request_postgres_schema
+from sky.utils import common_utils
+from sky.utils.db import migration_utils
+
+pytestmark = pytest.mark.xdist_group(name='serve_kueue_admission_057_pg')
+
+_SERVICE = 'svc'
+_SERVICE_HASH = 'service-incarnation'
+_LIFECYCLE_EPOCH = 3
+_SERVICE_VERSION = 19
+_POOL_EPOCH = 7
+_PHYSICAL_UID = 'cluster-uid-a'
+_CONTEXT = 'phx'
+_ACCELERATOR = 'h200'
+_ACCELERATOR_COUNT = 1
+_POOL_KEY = reserved_capacity_broker.make_pool_key(
+    _CONTEXT,
+    _ACCELERATOR,
+    protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+    physical_cluster_uid=_PHYSICAL_UID)
+_WORKER_PROJECTION = {
+    'projection_version': 2,
+    'candidate_id': 'kubernetes-0000',
+    'kubernetes_context': _CONTEXT,
+    'namespace': 'skypilot',
+    'service_account_name': 'skypilot-pool-sa',
+    'scheduler_name': 'gpu-binpack-scheduler',
+    'priority_class_name': 'skypilot-low',
+    'priority_value': -1000,
+    'preemption_policy': 'Never',
+    'kueue_admission': {
+        'local_queue_name': 'be',
+        'workload_priority_class_name': 'be-ls',
+    },
+    'pod_identity_role_arn': None,
+    'accelerator_name': 'H200',
+    'accelerator_count': _ACCELERATOR_COUNT,
+    'accelerator_scheduling': {
+        'label_key': 'nvidia.com/gpu.product',
+        'label_values': ['NVIDIA-H200'],
+        'resource_key': 'nvidia.com/gpu',
+    },
+    'cache': {
+        'kind': 'none',
+    },
+}
+_EAST_WORKER_PROJECTION = {
+    **_WORKER_PROJECTION,
+    'candidate_id': 'kubernetes-0001',
+    'kubernetes_context': 'east',
+    'service_account_name': 'skyserve-worker',
+    'scheduler_name': 'default-scheduler',
+    'priority_class_name': 'skyserve-preemptible',
+    'kueue_admission': None,
+}
+_PROJECTION = kubernetes_identity.worker_projection_sha256(_WORKER_PROJECTION)
+_EAST_PROJECTION = kubernetes_identity.worker_projection_sha256(
+    _EAST_WORKER_PROJECTION)
+
+
+def _identity(**overrides) -> kueue_lane_lineage.KueueAdmissionIdentity:
+    values = {
+        'service_name': _SERVICE,
+        'service_hash': _SERVICE_HASH,
+        'service_lifecycle_epoch': _LIFECYCLE_EPOCH,
+        'service_version': _SERVICE_VERSION,
+        'pool_key': _POOL_KEY,
+        'pool_epoch': _POOL_EPOCH,
+        'physical_cluster_uid': _PHYSICAL_UID,
+        'kubernetes_context': _CONTEXT,
+        'accelerator': _ACCELERATOR,
+        'accelerator_count': _ACCELERATOR_COUNT,
+        'worker_projection_sha256': _PROJECTION,
+    }
+    values.update(overrides)
+    return kueue_lane_lineage.KueueAdmissionIdentity(**values)
+
+
+def _reserved_location_state() -> dict:
+    return {
+        'cloud': 'Kubernetes',
+        'region': _CONTEXT,
+        'zone': None,
+        'accelerators': {
+            _ACCELERATOR: _ACCELERATOR_COUNT
+        },
+        'use_spot': False,
+        'image_id': None,
+        'container_image': None,
+        'disk_tier': None,
+        'ephemeral_storage': None,
+        'instance_type': None,
+    }
+
+
+def _intent_values(intent_key: str, **overrides) -> dict:
+    created_at = datetime.datetime(2030, 1, 1, tzinfo=datetime.timezone.utc)
+    valid_until = created_at + datetime.timedelta(minutes=5)
+    values = {
+        'intent_idempotency_key': intent_key,
+        'service_name': _SERVICE,
+        'service_hash': _SERVICE_HASH,
+        'service_lifecycle_epoch': _LIFECYCLE_EPOCH,
+        'actuation_epoch': 1,
+        'service_version': _SERVICE_VERSION,
+        'controller_owner': 'controller-owner',
+        'ordinal': 0,
+        'protocol_version': 2,
+        'policy_revision': 1,
+        'reconcile_generation': 1,
+        'allocation_generation': 1,
+        'allocation_input_sha256': 'a' * 64,
+        'allocation_claim_generation': 1,
+        'reconciliation_gate_generation': 1,
+        'reclaim_fleet_bundle_sha256': 'b' * 64,
+        'reclaim_policy_revision': 'reclaim-v1',
+        'reclaim_provider_inventory_sha256': 'c' * 64,
+        'service_generation': 1,
+        'pool_key': _POOL_KEY,
+        'pool_epoch': _POOL_EPOCH,
+        'physical_cluster_uid': _PHYSICAL_UID,
+        'kubernetes_context': _CONTEXT,
+        'worker_projection_sha256': _PROJECTION,
+        'observation_generation': 1,
+        'observation_sequence': 1,
+        'ordinary_zero_cost_admission_sequence': 1,
+        'valid_until_epoch': valid_until.timestamp(),
+        'valid_until': valid_until,
+        'accelerator': _ACCELERATOR,
+        'accelerator_count': _ACCELERATOR_COUNT,
+        'capacity_unit': 'physical',
+        'planned_capacity': 1,
+        'allowed_locations': [_reserved_location_state()],
+        'state': 'GRANTED',
+        'lease_generation': 0,
+        'created_at': created_at,
+        'updated_at': created_at,
+    }
+    values.update(overrides)
+    return values
+
+
+@pytest.fixture
+def admission_database(empty_postgres):
+    config = migration_utils.get_alembic_config(empty_postgres,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '057')
+    migration_utils.safe_alembic_upgrade(empty_postgres,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         migration_utils.API_REQUESTS_VERSION)
+    incarnation = uuid.uuid4()
+    with empty_postgres.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.service_lifecycle_fences_table).values(
+                    name=_SERVICE, epoch=_LIFECYCLE_EPOCH))
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.services_table).values(
+                name=_SERVICE,
+                workspace='workspace-a',
+                status='READY',
+                hash=_SERVICE_HASH,
+                resource_scope=_SERVICE_HASH,
+                current_version=_SERVICE_VERSION,
+                active_versions=f'[{_SERVICE_VERSION}]',
+                pool=0,
+                lifecycle_epoch=_LIFECYCLE_EPOCH,
+                controller_incarnation=incarnation,
+                controller_owner_epoch=1,
+                controller_pid=1,
+                controller_ip='10.0.0.1',
+                controller_port=8000,
+                ordinary_launch_binding_capable=True,
+                ordinary_launch_binding_mode='bound',
+                ordinary_launch_binding_epoch=1,
+                reserved_fill_actuation_mode='DURABLE_INTENT',
+                reserved_fill_actuation_epoch=1,
+                reserved_fill_actuation_capable=True,
+                reserved_fill_actuation_controller_incarnation=incarnation,
+                reserved_fill_actuation_protocol_version=1))
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.version_specs_table).values(
+                service_name=_SERVICE,
+                version=_SERVICE_VERSION,
+                yaml_content='service: {}',
+                placement_catalog={
+                    'schema_version': 1,
+                    'entries': [],
+                    'num_nodes': 1,
+                },
+                worker_placement_projections=[
+                    _WORKER_PROJECTION, _EAST_WORKER_PROJECTION
+                ]))
+    return empty_postgres
+
+
+def _insert_intent(engine, intent_key: str, **overrides) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(zero_cost_actuation_schema.
+                              serve_zero_cost_actuation_intents_table).values(
+                                  **_intent_values(intent_key, **overrides)))
+
+
+def _receipt(
+    state: kueue_lane_lineage.KueueAdmissionState,
+    intent_key: str,
+    record_id: uuid.UUID,
+    *,
+    identity: kueue_lane_lineage.KueueAdmissionIdentity,
+    phase: str = 'Pending',
+    workload_name: str | None = None,
+    unconstrained_topology: str | None = None,
+) -> dict:
+    admitted = (state is kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED)
+    return {
+        'schema_version': 1,
+        'state': state.value,
+        'pod': {
+            'namespace': 'skypilot',
+            'name': 'worker-1',
+            'uid': 'pod-uid-1',
+            'phase': phase,
+            'deletion_timestamp_absent': True,
+            'scheduling_gates':
+                ([] if admitted else ['kueue.x-k8s.io/admission']),
+        },
+        'skypilot': {
+            'cluster_name_on_cloud': 'worker-1',
+            'intent_key': intent_key,
+            'replica_record_uuid': str(record_id),
+            'pool_physical_uid': identity.physical_cluster_uid,
+            'worker_projection_sha256': identity.worker_projection_sha256,
+        },
+        'kueue': {
+            'managed_finalizer': 'kueue.x-k8s.io/managed',
+            'managed_label': True,
+            'local_queue_name': 'be',
+            'cluster_queue_name': 'research',
+            'admission_local_queue_name': ('be' if admitted else None),
+            'admission_cluster_queue_name': ('research' if admitted else None),
+            'workload_priority_class_name': 'be-ls',
+            'pod_group_name': 'worker-1',
+            'pod_group_total_count': 1,
+            'retriable_in_group': False,
+            'role_hash': '0123abcd',
+            'podset': ('0123abcd' if admitted else None),
+            'workload_name': workload_name,
+            'unconstrained_topology': unconstrained_topology,
+        },
+        'priority': {
+            'class_name': 'skypilot-low',
+            'value': -1000,
+            'preemption_policy': 'Never',
+        },
+        'scheduler_name': 'gpu-binpack-scheduler',
+        'service_account_name': 'skypilot-pool-sa',
+        'accelerator': {
+            'name': identity.accelerator,
+            'label_key': 'nvidia.com/gpu.product',
+            'label_values': ['NVIDIA-H200'],
+            'resource_key': 'nvidia.com/gpu',
+            'count': identity.accelerator_count,
+            'sole_ray_node_resource_owner': True,
+            'dynamic_resource_claims_absent': True,
+        },
+    }
+
+
+def _receipt_digest(connection, receipt: dict) -> str:
+    payload = sqlalchemy.literal(receipt, type_=postgresql.JSONB)
+    return connection.execute(
+        sqlalchemy.select(
+            sqlalchemy.func.encode(
+                sqlalchemy.func.sha256(
+                    sqlalchemy.func.convert_to(
+                        sqlalchemy.cast(payload, sqlalchemy.Text), 'UTF8')),
+                'hex'))).scalar_one()
+
+
+def _postgres_now(
+        connection: sqlalchemy.engine.Connection) -> datetime.datetime:
+    return connection.execute(
+        sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+
+
+def _install_materialized_graph(
+    connection: sqlalchemy.engine.Connection,
+    intent_key: str,
+    replica_id: int,
+    record_id: uuid.UUID,
+    provider_generation: int,
+) -> uuid.UUID:
+    """Install an exact graph without re-testing Serve047/056 triggers."""
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    replicas = serve_state_schema.replicas_table
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    for table in (intents.name, replicas.name, associations.name):
+        connection.exec_driver_sql(f'ALTER TABLE {table} DISABLE TRIGGER USER')
+    association_id = uuid.uuid4()
+    now = connection.execute(
+        sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+    controller_incarnation = connection.execute(
+        sqlalchemy.select(
+            serve_state_schema.services_table.c.controller_incarnation).where(
+                serve_state_schema.services_table.c.name ==
+                _SERVICE)).scalar_one()
+    profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+        authorization_reference=f'reserved-fill:{intent_key}',
+        authorization_generation=1,
+        authorization_payload={'intent_idempotency_key': intent_key})
+    info = replica_managers.ReplicaInfo(replica_id, f'{_SERVICE}-{replica_id}',
+                                        '8000', False, None, _SERVICE_VERSION,
+                                        None)
+    location = _reserved_location_state()
+    info.location = dict(location)
+    info.resources_override = dict(location)
+    info.replica_record_id = str(record_id)
+    info.reserved_fill = True
+    info.reserved_fill_pool_key = _POOL_KEY
+    info.reserved_fill_service_generation = 1
+    info.reserved_fill_physical_cluster_uid = _PHYSICAL_UID
+    info.reserved_fill_kubernetes_context = _CONTEXT
+    info.reserved_fill_allocation_generation = 1
+    info.reserved_fill_allocation_input_sha256 = 'a' * 64
+    info.reserved_fill_allocation_claim_generation = 1
+    info.reserved_fill_reconciliation_gate_generation = 1
+    info.reserved_fill_reclaim_fleet_bundle_sha256 = 'b' * 64
+    info.reserved_fill_reclaim_policy_revision = 'reclaim-v1'
+    info.reserved_fill_reclaim_provider_inventory_sha256 = 'c' * 64
+    info.reserved_fill_worker_projection_sha256 = _PROJECTION
+    info.reserved_fill_observation_generation = 1
+    info.reserved_fill_observation_sequence = replica_id
+    info.reserved_fill_intent_idempotency_key = intent_key
+    info.zero_cost_admission_sequence = replica_id
+    info.is_zero_cost = True
+    connection.execute(
+        sqlalchemy.insert(associations).values(
+            association_id=association_id,
+            submission_id=uuid.uuid4(),
+            tenant_scope='tenant-a',
+            service_name=_SERVICE,
+            service_hash=_SERVICE_HASH,
+            service_workspace='workspace-a',
+            service_lifecycle_epoch=_LIFECYCLE_EPOCH,
+            service_binding_epoch=1,
+            service_version=_SERVICE_VERSION,
+            replica_id=replica_id,
+            replica_record_id=record_id,
+            launch_generation=provider_generation,
+            cluster_name=f'{_SERVICE}-{replica_id}',
+            request_id=f'request-{uuid.uuid4()}',
+            input_digest='a' * 64,
+            owner_controller_incarnation=controller_incarnation,
+            owner_controller_epoch=1,
+            effect_phase='NOT_STARTED',
+            effect_phase_changed_at=now,
+            resolution='BOUND',
+            created_at=now,
+            updated_at=now,
+            binding_protocol_version=2,
+            profile_kind='RESERVED_FILL',
+            profile_version=1,
+            profile_digest=profile.digest,
+            capability_cohort_epoch=1,
+            capability_profile_set_digest='c' * 64,
+            receipt_protocol_version=1,
+            authorization_kind=profile.authorization_kind.value,
+            authorization_reference=profile.authorization_reference,
+            authorization_generation=profile.authorization_generation,
+            authorization_digest=profile.authorization_digest,
+            reconciliation_outcome='ACTIVE_ADOPT',
+            provider_evidence='NOT_QUERIED'))
+    connection.execute(
+        sqlalchemy.update(intents).where(
+            intents.c.intent_idempotency_key == intent_key).values(
+                state='COMMITTED',
+                replica_id=replica_id,
+                replica_record_id=record_id,
+                committed_at=now,
+                updated_at=now))
+    connection.execute(
+        sqlalchemy.insert(replicas).values(
+            service_name=_SERVICE,
+            replica_id=replica_id,
+            replica_state_version=1,
+            replica_state=info.to_storage_dict(),
+            status='PENDING',
+            version=_SERVICE_VERSION,
+            cluster_name=f'{_SERVICE}-{replica_id}',
+            is_spot=False,
+            ordinary_launch_association_id=association_id,
+            reserved_fill_intent_idempotency_key=intent_key))
+    for table in (intents.name, replicas.name, associations.name):
+        connection.exec_driver_sql(f'ALTER TABLE {table} ENABLE TRIGGER USER')
+    return association_id
+
+
+def _materialize(
+    engine: sqlalchemy.engine.Engine,
+    repository: kueue_lane_lineage.KueueAdmissionRepository,
+    identity: kueue_lane_lineage.KueueAdmissionIdentity,
+    intent_key: str,
+    *,
+    replica_id: int = 1,
+    provider_generation: int = 9,
+) -> tuple[uuid.UUID, uuid.UUID]:
+    record_id = uuid.uuid4()
+    with engine.begin() as connection:
+        association_id = _install_materialized_graph(connection, intent_key,
+                                                     replica_id, record_id,
+                                                     provider_generation)
+        repository.bind_materialized_in_connection(
+            connection,
+            identity,
+            intent_idempotency_key=intent_key,
+            replica_id=replica_id,
+            replica_record_id=record_id,
+            provider_cluster_generation=provider_generation,
+            association_id=association_id)
+    return record_id, association_id
+
+
+def _install_retirable_materialized_graph(
+    engine: sqlalchemy.engine.Engine,
+    repository: kueue_lane_lineage.KueueAdmissionRepository,
+    *,
+    intent_key: str,
+    replica_id: int,
+) -> tuple[uuid.UUID, uuid.UUID, str]:
+    """Install the exact terminal, quiesced, provider-absent delete graph."""
+    identity = _identity()
+    _insert_intent(engine,
+                   intent_key,
+                   ordinal=replica_id - 1,
+                   observation_sequence=replica_id,
+                   ordinary_zero_cost_admission_sequence=replica_id)
+    with engine.begin() as connection:
+        repository.insert_intent_pending_in_connection(connection, identity,
+                                                       intent_key)
+    record_id, association_id = _materialize(engine,
+                                             repository,
+                                             identity,
+                                             intent_key,
+                                             replica_id=replica_id,
+                                             provider_generation=replica_id + 8)
+
+    info = replica_managers.ReplicaInfo(replica_id, f'{_SERVICE}-{replica_id}',
+                                        '8000', False, None, _SERVICE_VERSION,
+                                        None)
+    location = _reserved_location_state()
+    info.location = dict(location)
+    info.resources_override = dict(location)
+    info.replica_record_id = str(record_id)
+    info.reserved_fill = True
+    info.reserved_fill_pool_key = _POOL_KEY
+    info.reserved_fill_service_generation = 1
+    info.reserved_fill_physical_cluster_uid = _PHYSICAL_UID
+    info.reserved_fill_kubernetes_context = _CONTEXT
+    info.reserved_fill_allocation_generation = 1
+    info.reserved_fill_allocation_input_sha256 = 'a' * 64
+    info.reserved_fill_allocation_claim_generation = 1
+    info.reserved_fill_reconciliation_gate_generation = 1
+    info.reserved_fill_reclaim_fleet_bundle_sha256 = 'b' * 64
+    info.reserved_fill_reclaim_policy_revision = 'reclaim-v1'
+    info.reserved_fill_reclaim_provider_inventory_sha256 = 'c' * 64
+    info.reserved_fill_worker_projection_sha256 = _PROJECTION
+    info.reserved_fill_observation_generation = 1
+    info.reserved_fill_observation_sequence = 1
+    info.reserved_fill_intent_idempotency_key = intent_key
+    info.zero_cost_admission_sequence = replica_id
+    info.is_zero_cost = True
+    info.status_property.sky_launch_status = (
+        common_utils.ProcessStatus.INTERRUPTED)
+    info.status_property.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+    info.status_property.is_scale_down = True
+    info.status_property.drain_cap_seconds = 0
+
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    replicas = serve_state_schema.replicas_table
+    with engine.begin() as connection:
+        association = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.association_id ==
+                association_id)).mappings().one()
+        request_id = str(association['request_id'])
+        now = _postgres_now(connection)
+        payload, payload_digest = (
+            ordinary_launch_binding._reserved_fill_provider_evidence(  # pylint: disable=protected-access
+                association, info,
+                ordinary_launch_binding.ProviderEvidence.ABSENT))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {replicas.name} DISABLE TRIGGER USER')
+        connection.exec_driver_sql(
+            f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
+        replica_values = serve_state._replica_row_values(  # pylint: disable=protected-access
+            _SERVICE, replica_id, info)
+        connection.execute(
+            sqlalchemy.update(replicas).where(
+                replicas.c.service_name == _SERVICE,
+                replicas.c.replica_id == replica_id).values(
+                    **replica_values,
+                    ordinary_launch_association_id=None,
+                    reserved_fill_intent_idempotency_key=intent_key))
+        connection.execute(
+            sqlalchemy.update(associations).
+            where(associations.c.association_id == association_id).values(
+                resolution=ordinary_launch_binding.Resolution.PROJECTED.value,
+                reconciliation_outcome=ordinary_launch_binding.
+                ReconciliationOutcome.PROJECTED.value,
+                provider_evidence=ordinary_launch_binding.ProviderEvidence.
+                ABSENT.value,
+                provider_evidence_observed_at=now,
+                provider_evidence_payload=payload,
+                provider_evidence_digest=payload_digest,
+                terminal_status=ordinary_launch_binding.TerminalStatus.
+                CANCELLED.value,
+                terminal_cause='execution_lease_expired',
+                terminal_execution_generation=1,
+                execution_quiescence_required=True,
+                execution_quiesced_generation=1,
+                execution_quiesced_at=now,
+                projected_at=now,
+                pin_released_at=now,
+                tombstone_not_before=(now + datetime.timedelta(days=60)),
+                updated_at=now))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {associations.name} ENABLE TRIGGER USER')
+        connection.exec_driver_sql(
+            f'ALTER TABLE {replicas.name} ENABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.insert(request_postgres_schema.REQUESTS).values(
+                request_id=request_id,
+                name='sky.launch',
+                handler_name='sky.server.requests.non_pool_launch:launch',
+                payload_type='test-payload',
+                payload_format='json',
+                payload_version=1,
+                producer_version='test',
+                payload_json={},
+                execution_class='normal',
+                status='CANCELLED',
+                terminal_cause='execution_lease_expired',
+                created_at=now,
+                schedule_type='short',
+                user_id='test-user',
+                should_retry=False,
+                finished_at=now,
+                ignore_return_value=True,
+                retryable=False,
+                execution_generation=1,
+                execution_quiescence_required=True,
+                execution_quiesced_generation=1,
+                execution_quiesced_at=now,
+                ordinary_launch_association_id=association_id,
+                binding_protocol_version=2,
+                profile_kind='RESERVED_FILL',
+                profile_version=1,
+                profile_digest=association['profile_digest'],
+                capability_cohort_epoch=association['capability_cohort_epoch'],
+                capability_profile_set_digest=association[
+                    'capability_profile_set_digest'],
+                receipt_protocol_version=association[
+                    'receipt_protocol_version'],
+                updated_at=now))
+    return record_id, association_id, request_id
+
+
+def _install_normal_admitted_teardown_graph(
+    engine: sqlalchemy.engine.Engine,
+    repository: kueue_lane_lineage.KueueAdmissionRepository,
+    *,
+    intent_key: str,
+    replica_id: int,
+    is_scale_down: bool,
+    down_status: common_utils.ProcessStatus | None,
+    terminal_status: str = 'SUCCEEDED',
+    terminal_cause: str = 'handler_succeeded',
+    launch_status: common_utils.ProcessStatus = common_utils.ProcessStatus.
+    SUCCEEDED,
+    projection_owner: str = 'manager',
+) -> tuple[uuid.UUID, uuid.UUID, str]:
+    """Run the production projector for a launch with one admitted Pod."""
+    if projection_owner not in ('manager', 'service'):
+        raise ValueError('projection_owner must be manager or service.')
+    identity = _identity()
+    _insert_intent(engine,
+                   intent_key,
+                   ordinal=replica_id - 1,
+                   observation_sequence=replica_id,
+                   ordinary_zero_cost_admission_sequence=replica_id)
+    with engine.begin() as connection:
+        repository.insert_intent_pending_in_connection(connection, identity,
+                                                       intent_key)
+    record_id, association_id = _materialize(engine,
+                                             repository,
+                                             identity,
+                                             intent_key,
+                                             replica_id=replica_id,
+                                             provider_generation=replica_id + 8)
+    admitted_receipt = _receipt(
+        kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED,
+        intent_key,
+        record_id,
+        identity=identity,
+        phase='Running',
+        workload_name='worker-1',
+        unconstrained_topology='true')
+    with engine.begin() as connection:
+        repository.observe_policy_admitted_in_connection(
+            connection,
+            identity,
+            intent_idempotency_key=intent_key,
+            replica_id=replica_id,
+            replica_record_id=record_id,
+            provider_cluster_generation=replica_id + 8,
+            association_id=association_id,
+            provider_read_started_at=_postgres_now(connection),
+            pod_namespace='skypilot',
+            pod_name='worker-1',
+            pod_uid='pod-uid-1',
+            pod_receipt=admitted_receipt)
+
+    info = replica_managers.ReplicaInfo(replica_id, f'{_SERVICE}-{replica_id}',
+                                        '8000', False, None, _SERVICE_VERSION,
+                                        None)
+    location = _reserved_location_state()
+    info.location = dict(location)
+    info.resources_override = dict(location)
+    info.replica_record_id = str(record_id)
+    info.reserved_fill = True
+    info.reserved_fill_pool_key = _POOL_KEY
+    info.reserved_fill_service_generation = 1
+    info.reserved_fill_physical_cluster_uid = _PHYSICAL_UID
+    info.reserved_fill_kubernetes_context = _CONTEXT
+    info.reserved_fill_allocation_generation = 1
+    info.reserved_fill_allocation_input_sha256 = 'a' * 64
+    info.reserved_fill_allocation_claim_generation = 1
+    info.reserved_fill_reconciliation_gate_generation = 1
+    info.reserved_fill_reclaim_fleet_bundle_sha256 = 'b' * 64
+    info.reserved_fill_reclaim_policy_revision = 'reclaim-v1'
+    info.reserved_fill_reclaim_provider_inventory_sha256 = 'c' * 64
+    info.reserved_fill_worker_projection_sha256 = _PROJECTION
+    info.reserved_fill_observation_generation = 1
+    info.reserved_fill_observation_sequence = replica_id
+    info.reserved_fill_intent_idempotency_key = intent_key
+    info.zero_cost_admission_sequence = replica_id
+    info.is_zero_cost = True
+    info.status_property.sky_launch_status = launch_status
+    info.status_property.sky_down_status = down_status
+    info.status_property.is_scale_down = is_scale_down
+
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    replicas = serve_state_schema.replicas_table
+    with engine.begin() as connection:
+        association = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.association_id ==
+                association_id)).mappings().one()
+        request_id = str(association['request_id'])
+        service_job_id = 1000 + replica_id
+        now = _postgres_now(connection)
+        connection.exec_driver_sql(
+            f'ALTER TABLE {replicas.name} DISABLE TRIGGER USER')
+        connection.exec_driver_sql(
+            f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
+        replica_values = serve_state._replica_row_values(  # pylint: disable=protected-access
+            _SERVICE, replica_id, info)
+        connection.execute(
+            sqlalchemy.update(replicas).where(
+                replicas.c.service_name == _SERVICE,
+                replicas.c.replica_id == replica_id).values(
+                    **replica_values,
+                    ordinary_launch_association_id=association_id,
+                    reserved_fill_intent_idempotency_key=intent_key))
+        connection.execute(
+            sqlalchemy.update(associations).where(
+                associations.c.association_id == association_id).values(
+                    effect_phase='SERVICE_JOB_RECORDED',
+                    effect_phase_changed_at=now,
+                    resolution='RESULT_RECORDED',
+                    reconciliation_outcome='RESULT_RECORDED',
+                    terminal_status=terminal_status,
+                    terminal_cause=terminal_cause,
+                    terminal_execution_generation=1,
+                    execution_quiescence_required=True,
+                    execution_quiesced_generation=1,
+                    execution_quiesced_at=now,
+                    service_job_id=service_job_id,
+                    result_recorded_at=now,
+                    updated_at=now))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {associations.name} ENABLE TRIGGER USER')
+        connection.exec_driver_sql(
+            f'ALTER TABLE {replicas.name} ENABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.insert(request_postgres_schema.REQUESTS).values(
+                request_id=request_id,
+                name='sky.launch',
+                handler_name='sky.server.requests.non_pool_launch:launch',
+                payload_type='test-payload',
+                payload_format='json',
+                payload_version=1,
+                producer_version='test',
+                payload_json={},
+                execution_class='normal',
+                status=terminal_status,
+                terminal_cause=terminal_cause,
+                created_at=now,
+                schedule_type='short',
+                user_id='test-user',
+                should_retry=False,
+                finished_at=now,
+                ignore_return_value=True,
+                retryable=False,
+                execution_generation=1,
+                execution_quiescence_required=True,
+                execution_quiesced_generation=1,
+                execution_quiesced_at=now,
+                ordinary_launch_association_id=association_id,
+                binding_protocol_version=2,
+                profile_kind='RESERVED_FILL',
+                profile_version=1,
+                profile_digest=association['profile_digest'],
+                capability_cohort_epoch=association['capability_cohort_epoch'],
+                capability_profile_set_digest=association[
+                    'capability_profile_set_digest'],
+                receipt_protocol_version=association[
+                    'receipt_protocol_version'],
+                updated_at=now))
+        profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+            authorization_reference=f'reserved-fill:{intent_key}',
+            authorization_generation=1,
+            authorization_payload={'intent_idempotency_key': intent_key})
+        context = ordinary_launch_binding.BoundNonPoolLaunchContext(
+            association_id=association_id,
+            request_id=request_id,
+            service_name=_SERVICE,
+            replica_id=replica_id,
+            replica_record_id=record_id,
+            launch_generation=replica_id + 8,
+            input_digest=str(association['input_digest']),
+            profile=profile,
+            capability_cohort_epoch=int(association['capability_cohort_epoch']),
+            capability_profile_set_digest=str(
+                association['capability_profile_set_digest']),
+            receipt_protocol_version=int(
+                association['receipt_protocol_version']))
+        projection = types.SimpleNamespace(
+            locked_replica_info=info,
+            request=types.SimpleNamespace(error=None),
+            status=types.SimpleNamespace(value=terminal_status),
+            cause=terminal_cause,
+            context=context,
+            pre_effect_terminal=False,
+            service_job_id=service_job_id,
+            cancel_reason=None,
+            paid_capacity_pool_key=None)
+        if projection_owner == 'manager':
+            manager = replica_managers.SkyPilotReplicaManager.__new__(
+                replica_managers.SkyPilotReplicaManager)
+            manager._service_name = _SERVICE
+            manager._ordinary_launch_binding_authority = types.SimpleNamespace(
+                service_hash=_SERVICE_HASH)
+            projected = manager._project_bound_ordinary_launch(
+                None, connection, projection)
+        else:
+            authority = types.SimpleNamespace(service_name=_SERVICE,
+                                              service_hash=_SERVICE_HASH)
+            projected = service._project_bound_ordinary_launch_for_teardown(
+                authority, connection, projection)
+        assert projected
+        assert info.launch_request_id is None
+        assert info.service_job_id is None
+        assert ordinary_launch_binding.project_in_connection(
+            connection,
+            context,
+            pre_effect_terminal=False,
+            service_job_id=service_job_id)
+    return record_id, association_id, request_id
+
+
+def _configure_serve_state_for_kueue_retirement(
+    monkeypatch: pytest.MonkeyPatch,
+    engine: sqlalchemy.engine.Engine,
+) -> None:
+    monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
+    monkeypatch.setattr(
+        zero_cost_actuation,
+        'kueue_admission_identity_for_locked_intent_in_connection',
+        lambda _connection, _intent: _identity())
+
+
+def _mark_service_shutting_down(engine: sqlalchemy.engine.Engine) -> None:
+    del engine
+    result = ordinary_launch_binding.begin_service_teardown_if_owner(
+        _SERVICE, _SERVICE_HASH, (1, '10.0.0.1'))
+    assert result.disposition == (
+        ordinary_launch_binding.ServiceTeardownDisposition.MARKED_BOUND)
+
+
+def _assert_retired_graph(
+    engine: sqlalchemy.engine.Engine,
+    *,
+    intent_keys: tuple[str, ...],
+    replica_ids: tuple[int, ...],
+    association_ids: tuple[uuid.UUID, ...],
+) -> None:
+    admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    replicas = serve_state_schema.replicas_table
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()).select_from(admissions).where(
+                    admissions.c.intent_idempotency_key.in_(
+                        intent_keys))).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()).select_from(intents).where(
+                    intents.c.intent_idempotency_key.in_(
+                        intent_keys))).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()).select_from(replicas).where(
+                    replicas.c.service_name == _SERVICE,
+                    replicas.c.replica_id.in_(replica_ids))).scalar_one() == 0
+        retained = connection.execute(
+            sqlalchemy.select(associations.c.association_id).where(
+                associations.c.association_id.in_(
+                    association_ids))).scalars().all()
+        assert set(retained) == set(association_ids)
+
+
+def test_serve_state_single_replica_retirement_is_atomic_and_retains_history(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = '8' * 64
+    record_id, association_id, _ = _install_retirable_materialized_graph(
+        admission_database, repository, intent_key=key, replica_id=1)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+
+    assert serve_state.remove_replica(_SERVICE,
+                                      1,
+                                      expected_service_hash=_SERVICE_HASH,
+                                      expected_lifecycle_epoch=_LIFECYCLE_EPOCH,
+                                      expected_replica_record_id=str(record_id))
+    _assert_retired_graph(admission_database,
+                          intent_keys=(key,),
+                          replica_ids=(1,),
+                          association_ids=(association_id,))
+
+
+@pytest.mark.parametrize('projection_owner', ('manager', 'service'))
+def test_normal_admitted_teardown_exact_pod_404_retires_replica(
+        admission_database, monkeypatch, projection_owner) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = 'd' * 64
+    record_id, association_id, _ = _install_normal_admitted_teardown_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        is_scale_down=True,
+        down_status=common_utils.ProcessStatus.SCHEDULED,
+        projection_owner=projection_owner)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        lambda _mode: contextlib.nullcontext())
+    monkeypatch.setattr(kubernetes_adaptor, 'physical_cluster_uid_fence',
+                        lambda *_args, **_kwargs: contextlib.nullcontext())
+
+    class _MissingPodApi:
+
+        def read_namespaced_pod(self, *_args, **_kwargs):
+            raise kubernetes_adaptor.api_exception()(status=404)
+
+    monkeypatch.setattr(kubernetes_adaptor, 'core_api',
+                        lambda _context: _MissingPodApi())
+
+    assert kueue_lane_observer.project_exact_pod_absence_after_teardown(
+        _SERVICE, 1, record_id)
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with admission_database.connect() as connection:
+        evidence = connection.execute(
+            sqlalchemy.select(associations.c.provider_evidence,
+                              associations.c.provider_evidence_payload).where(
+                                  associations.c.association_id ==
+                                  association_id)).mappings().one()
+        assert evidence['provider_evidence'] == 'ABSENT'
+        assert evidence['provider_evidence_payload']['probe_contract'] == (
+            'kueue-exact-pod-absence-v1')
+        assert evidence['provider_evidence_payload']['pod'] == {
+            'namespace': 'skypilot',
+            'name': 'worker-1',
+            'uid': 'pod-uid-1',
+        }
+    assert serve_state.remove_replica(_SERVICE,
+                                      1,
+                                      expected_service_hash=_SERVICE_HASH,
+                                      expected_lifecycle_epoch=_LIFECYCLE_EPOCH,
+                                      expected_replica_record_id=str(record_id))
+    _assert_retired_graph(admission_database,
+                          intent_keys=(key,),
+                          replica_ids=(1,),
+                          association_ids=(association_id,))
+
+
+def test_exact_pod_replacement_fails_closed_without_evidence_stamp(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = 'd' * 64
+    record_id, association_id, _ = _install_normal_admitted_teardown_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        is_scale_down=True,
+        down_status=common_utils.ProcessStatus.SCHEDULED)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        lambda _mode: contextlib.nullcontext())
+    monkeypatch.setattr(kubernetes_adaptor, 'physical_cluster_uid_fence',
+                        lambda *_args, **_kwargs: contextlib.nullcontext())
+
+    class _ReplacedPodApi:
+
+        def read_namespaced_pod(self, *_args, **_kwargs):
+            return types.SimpleNamespace(metadata=types.SimpleNamespace(
+                uid='replacement-pod-uid'))
+
+    monkeypatch.setattr(kubernetes_adaptor, 'core_api',
+                        lambda _context: _ReplacedPodApi())
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
+                       match='REPLACED'):
+        kueue_lane_observer.project_exact_pod_absence_after_teardown(
+            _SERVICE, 1, record_id)
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with admission_database.connect() as connection:
+        evidence = connection.execute(
+            sqlalchemy.select(associations.c.provider_evidence).where(
+                associations.c.association_id == association_id)).scalar_one()
+        assert evidence == 'NOT_QUERIED'
+
+
+@pytest.mark.parametrize(
+    ('terminal_status', 'terminal_cause', 'launch_status'), (
+        ('FAILED', 'handler_failed', common_utils.ProcessStatus.FAILED),
+        ('CANCELLED', 'explicit_cancel',
+         common_utils.ProcessStatus.INTERRUPTED),
+    ))
+def test_post_job_terminal_launch_exact_pod_absence_remains_retirable(
+        admission_database, monkeypatch, terminal_status, terminal_cause,
+        launch_status) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = 'd' * 64
+    record_id, association_id, _ = _install_normal_admitted_teardown_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        is_scale_down=True,
+        down_status=common_utils.ProcessStatus.SCHEDULED,
+        terminal_status=terminal_status,
+        terminal_cause=terminal_cause,
+        launch_status=launch_status)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    with admission_database.connect() as connection:
+        target = repository.load_exact_pod_absence_probe_target_in_connection(
+            connection,
+            service_name=_SERVICE,
+            replica_id=1,
+            replica_record_id=record_id)
+        assert target is not None
+    with admission_database.begin() as connection:
+        repository.record_exact_pod_absence_after_normal_teardown_in_connection(
+            connection,
+            target,
+            provider_read_started_at=_postgres_now(connection))
+    assert serve_state.remove_replica(_SERVICE,
+                                      1,
+                                      expected_service_hash=_SERVICE_HASH,
+                                      expected_lifecycle_epoch=_LIFECYCLE_EPOCH,
+                                      expected_replica_record_id=str(record_id))
+    _assert_retired_graph(admission_database,
+                          intent_keys=(key,),
+                          replica_ids=(1,),
+                          association_ids=(association_id,))
+
+
+def test_missing_cluster_record_whole_service_uses_exact_pod_404_with_no_down_status(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = 'd' * 64
+    record_id, association_id, _ = _install_normal_admitted_teardown_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        is_scale_down=False,
+        down_status=None)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+    # Normal request GC may run long before a live replica is retired.  The
+    # projected association is the durable copied terminal/quiescence receipt.
+    with admission_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(request_postgres_schema.REQUESTS).where(
+                request_postgres_schema.REQUESTS.c.
+                ordinary_launch_association_id == association_id))
+    with admission_database.connect() as connection:
+        target = repository.load_exact_pod_absence_probe_target_in_connection(
+            connection,
+            service_name=_SERVICE,
+            replica_id=1,
+            replica_record_id=record_id)
+        assert target is not None
+    with admission_database.begin() as connection:
+        repository.record_exact_pod_absence_after_normal_teardown_in_connection(
+            connection,
+            target,
+            provider_read_started_at=_postgres_now(connection))
+
+    assert serve_state.remove_service_completely(
+        _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+    _assert_retired_graph(admission_database,
+                          intent_keys=(key,),
+                          replica_ids=(1,),
+                          association_ids=(association_id,))
+
+
+def test_association_gc_skips_live_kueue_admission_and_collects_other_tombstone(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    protected_key = 'd' * 64
+    protected_record, protected_association, _ = (
+        _install_normal_admitted_teardown_graph(
+            admission_database,
+            repository,
+            intent_key=protected_key,
+            replica_id=1,
+            is_scale_down=True,
+            down_status=common_utils.ProcessStatus.SCHEDULED))
+    collectible_key = 'e' * 64
+    collectible_record, collectible_association, _ = (
+        _install_retirable_materialized_graph(admission_database,
+                                              repository,
+                                              intent_key=collectible_key,
+                                              replica_id=2))
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    assert serve_state.remove_replica(
+        _SERVICE,
+        2,
+        expected_service_hash=_SERVICE_HASH,
+        expected_lifecycle_epoch=_LIFECYCLE_EPOCH,
+        expected_replica_record_id=str(collectible_record))
+
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    requests = request_postgres_schema.REQUESTS
+    with admission_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(requests).where(
+                requests.c.ordinary_launch_association_id.in_((
+                    protected_association,
+                    collectible_association,
+                ))))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.update(associations).where(
+                associations.c.association_id.in_((
+                    protected_association,
+                    collectible_association,
+                ))).values(
+                    tombstone_not_before=(sqlalchemy.func.clock_timestamp() -
+                                          datetime.timedelta(days=1))))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {associations.name} ENABLE TRIGGER USER')
+
+        assert request_postgres.gc_bound_ordinary_launch_tombstones_in_transaction(
+            connection) == 1
+
+    with admission_database.connect() as connection:
+        retained = connection.execute(
+            sqlalchemy.select(associations.c.association_id).where(
+                associations.c.association_id.in_((
+                    protected_association,
+                    collectible_association,
+                )))).scalars().all()
+        assert retained == [protected_association]
+        admission = connection.execute(
+            sqlalchemy.select(admissions.c.association_id).where(
+                admissions.c.intent_idempotency_key ==
+                protected_key)).scalar_one()
+        assert admission == protected_association
+        replica_state = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.replica_state).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    _SERVICE, serve_state_schema.replicas_table.c.replica_id ==
+                    1)).scalar_one()
+        assert replica_state['replica_record_id'] == str(protected_record)
+
+
+def test_association_gc_compiles_before_serve057_relation(
+        admission_database) -> None:
+    admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    with admission_database.begin() as connection:
+        connection.exec_driver_sql(f'DROP TABLE {admissions.name}')
+        assert request_postgres.gc_bound_ordinary_launch_tombstones_in_transaction(
+            connection) == 0
+
+
+def test_serve_state_batch_retirement_is_atomic_and_retains_history(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    first_key = '8' * 64
+    second_key = '9' * 64
+    first_record, first_association, _ = (_install_retirable_materialized_graph(
+        admission_database, repository, intent_key=first_key, replica_id=1))
+    second_record, second_association, _ = (
+        _install_retirable_materialized_graph(admission_database,
+                                              repository,
+                                              intent_key=second_key,
+                                              replica_id=2))
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+
+    assert serve_state.remove_replicas(
+        _SERVICE, [2, 1],
+        expected_service_hash=_SERVICE_HASH,
+        expected_lifecycle_epoch=_LIFECYCLE_EPOCH,
+        expected_replica_record_ids={
+            1: str(first_record),
+            2: str(second_record),
+        })
+    _assert_retired_graph(admission_database,
+                          intent_keys=(first_key, second_key),
+                          replica_ids=(1, 2),
+                          association_ids=(first_association,
+                                           second_association))
+
+
+def test_serve_state_batch_ambiguous_evidence_rolls_back_every_graph(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    first_key = '8' * 64
+    second_key = '9' * 64
+    first_record, first_association, _ = (_install_retirable_materialized_graph(
+        admission_database, repository, intent_key=first_key, replica_id=1))
+    second_record, second_association, _ = (
+        _install_retirable_materialized_graph(admission_database,
+                                              repository,
+                                              intent_key=second_key,
+                                              replica_id=2))
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with admission_database.begin() as connection:
+        connection.exec_driver_sql(
+            f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.update(associations).
+            where(associations.c.association_id == second_association).values(
+                resolution=ordinary_launch_binding.Resolution.AMBIGUOUS.value,
+                reconciliation_outcome=ordinary_launch_binding.
+                ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value,
+                ambiguity_code='test-provider-evidence-uncertain',
+                projected_at=None,
+                pin_released_at=None,
+                tombstone_not_before=None,
+                owner_revision=associations.c.owner_revision + 1,
+                updated_at=sqlalchemy.func.clock_timestamp()))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {associations.name} ENABLE TRIGGER USER')
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
+                       match='provider-absence authority'):
+        serve_state.remove_replicas(_SERVICE, [1, 2],
+                                    expected_service_hash=_SERVICE_HASH,
+                                    expected_lifecycle_epoch=_LIFECYCLE_EPOCH,
+                                    expected_replica_record_ids={
+                                        1: str(first_record),
+                                        2: str(second_record),
+                                    })
+
+    admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    replicas = serve_state_schema.replicas_table
+    with admission_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                admissions)).scalar_one() == 2
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()).select_from(intents)).scalar_one() == 2
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                replicas)).scalar_one() == 2
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()).select_from(associations).where(
+                    associations.c.association_id.in_((
+                        first_association,
+                        second_association,
+                    )))).scalar_one() == 2
+
+
+def test_serve_state_missing_kueue_admission_fails_closed_without_mutation(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = '8' * 64
+    record_id, _, _ = _install_retirable_materialized_graph(admission_database,
+                                                            repository,
+                                                            intent_key=key,
+                                                            replica_id=1)
+    admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    with admission_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(admissions).where(
+                admissions.c.intent_idempotency_key == key))
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
+                       match='lost its admission'):
+        serve_state.remove_replica(_SERVICE,
+                                   1,
+                                   expected_service_hash=_SERVICE_HASH,
+                                   expected_lifecycle_epoch=_LIFECYCLE_EPOCH,
+                                   expected_replica_record_id=str(record_id))
+
+    with admission_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.replicas_table)).scalar_one() == 1
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                zero_cost_actuation_schema.
+                serve_zero_cost_actuation_intents_table)).scalar_one() == 1
+
+
+def test_serve_state_whole_service_teardown_retires_exact_graph(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = '8' * 64
+    _, association_id, _ = _install_retirable_materialized_graph(
+        admission_database, repository, intent_key=key, replica_id=1)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+
+    assert serve_state.remove_service_completely(
+        _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+    _assert_retired_graph(admission_database,
+                          intent_keys=(key,),
+                          replica_ids=(1,),
+                          association_ids=(association_id,))
+    with admission_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table)).scalar_one() == 0
+
+
+@pytest.mark.parametrize('intent_state', ('GRANTED', 'RETRYABLE', 'ACTUATING'))
+def test_serve_state_whole_service_teardown_terminalizes_provider_free_intent(
+        admission_database, monkeypatch, intent_state) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = '8' * 64
+    overrides = {'state': intent_state}
+    if intent_state == 'ACTUATING':
+        overrides.update({
+            'lease_generation': 1,
+            'lease_owner': uuid.uuid4(),
+            'lease_expires_at': datetime.datetime.now(datetime.timezone.utc) +
+                                datetime.timedelta(minutes=5),
+        })
+    _insert_intent(admission_database, key, **overrides)
+    with admission_database.begin() as connection:
+        repository.insert_intent_pending_in_connection(connection, _identity(),
+                                                       key)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+
+    assert serve_state.remove_service_completely(
+        _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+
+    with admission_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table)).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                kueue_lane_lineage_schema.serve_kueue_admissions_table)
+        ).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                zero_cost_actuation_schema.
+                serve_zero_cost_actuation_intents_table)).scalar_one() == 0
+
+
+def test_serve_state_whole_service_teardown_keeps_materialization_race(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = '8' * 64
+    _insert_intent(admission_database, key)
+    with admission_database.begin() as connection:
+        repository.insert_intent_pending_in_connection(connection, _identity(),
+                                                       key)
+    _materialize(admission_database, repository, _identity(), key)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict):
+        serve_state.remove_service_completely(
+            _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+
+    with admission_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table)).scalar_one() == 1
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                kueue_lane_lineage_schema.serve_kueue_admissions_table)
+        ).scalar_one() == 1
+        state = connection.execute(
+            sqlalchemy.select(
+                zero_cost_actuation_schema.
+                serve_zero_cost_actuation_intents_table.c.state)).scalar_one()
+        assert state == 'COMMITTED'
+
+
+def test_serve057_is_linear_postgresql_only_head() -> None:
+    sqlite = sqlalchemy.create_engine('sqlite://')
+    config = migration_utils.get_alembic_config(sqlite,
+                                                migration_utils.SERVE_DB_NAME)
+    scripts = alembic_script.ScriptDirectory.from_config(config)
+    assert scripts.get_heads() == ['057']
+    assert scripts.get_revision('057').down_revision == '056'
+    assert migration_utils.SERVE_VERSION == '057'
+    assert migration_utils.serve_target_version(sqlite) == '037'
+    with pytest.raises(RuntimeError, match='PostgreSQL-only'):
+        alembic_command.upgrade(config, '057')
+
+
+def test_schema_is_one_three_state_relation_with_restrictive_graph_fks(
+        admission_database) -> None:
+    inspector = sqlalchemy.inspect(admission_database)
+    table = kueue_lane_lineage_schema.serve_kueue_admissions_table.name
+    assert table == 'serve_kueue_admissions'
+    assert inspector.get_pk_constraint(table)['constrained_columns'] == [
+        'intent_idempotency_key'
+    ]
+    indexes = {item['name']: item for item in inspector.get_indexes(table)}
+    assert 'uq_serve057_kueue_admission_preadmission_domain' not in indexes
+    surge = indexes['uq_serve057_kueue_admission_surge']
+    assert surge['unique']
+    assert surge['column_names'] == ['service_name']
+    assert 'replacement_surge_units > 0' in str(
+        surge['dialect_options']['postgresql_where'])
+
+    foreign_keys = {
+        item['name']: item for item in inspector.get_foreign_keys(table)
+    }
+    assert set(foreign_keys) == {
+        'serve057_kueue_admission_intent_fk',
+        'serve057_kueue_admission_replica_fk',
+        'serve057_kueue_admission_association_fk',
+    }
+    assert foreign_keys['serve057_kueue_admission_intent_fk'][
+        'referred_table'] == 'serve_zero_cost_actuation_intents'
+    assert foreign_keys['serve057_kueue_admission_replica_fk'][
+        'referred_table'] == 'replicas'
+    assert foreign_keys['serve057_kueue_admission_association_fk'][
+        'referred_table'] == 'serve_ordinary_launch_associations'
+    assert all(value['options']['ondelete'] == 'RESTRICT'
+               for value in foreign_keys.values())
+    checks = ' '.join(
+        item['sqltext'] for item in inspector.get_check_constraints(table))
+    for state in ('INTENT_PENDING', 'POD_WAITING', 'POLICY_ADMITTED'):
+        assert state in checks
+    for removed in ('PAID_HANDOFF', 'PAID_OCCUPIED', 'REPROBE_READY'):
+        assert removed not in checks
+
+
+def test_grant_time_insert_copies_frozen_unit_and_replays_exactly(
+        admission_database) -> None:
+    key = '1' * 64
+    _insert_intent(admission_database,
+                   key,
+                   accelerator_count=8,
+                   capacity_unit='logical',
+                   planned_capacity=8)
+    identity = _identity(accelerator_count=8)
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    compatibility = 'f' * 64
+    with admission_database.begin() as connection:
+        first = repository.insert_intent_pending_in_connection(
+            connection,
+            identity,
+            key,
+            replacement_surge_units=6,
+            replacement_compatibility_sha256=compatibility)
+        replay = repository.insert_intent_pending_in_connection(
+            connection,
+            identity,
+            key,
+            replacement_surge_units=6,
+            replacement_compatibility_sha256=compatibility)
+    assert replay == first
+    assert first.state is kueue_lane_lineage.KueueAdmissionState.INTENT_PENDING
+    assert first.capacity_unit == 'logical'
+    assert first.planned_capacity == 8
+    assert first.replacement_surge_units == 6
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict):
+        with admission_database.begin() as connection:
+            repository.insert_intent_pending_in_connection(
+                connection,
+                identity,
+                key,
+                replacement_surge_units=5,
+                replacement_compatibility_sha256=compatibility)
+
+
+def test_same_domain_grant_batch_creates_one_admission_per_intent(
+        admission_database) -> None:
+    keys = ('c' * 64, 'd' * 64, 'e' * 64)
+    for ordinal, key in enumerate(keys):
+        _insert_intent(admission_database, key, ordinal=ordinal)
+    identity = _identity()
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    with admission_database.begin() as connection:
+        rows = tuple(
+            repository.insert_intent_pending_in_connection(
+                connection, identity, key) for key in keys)
+    assert tuple(row.intent_idempotency_key for row in rows) == keys
+    assert len({row.unresolved_domain_sha256 for row in rows}) == 1
+    with admission_database.begin() as connection:
+        locked = repository.lock_service_admissions_in_connection(
+            connection, _SERVICE, _SERVICE_HASH)
+    assert tuple(row.intent_idempotency_key for row in locked) == keys
+
+
+def test_materialization_binds_association_and_enforces_delete_order(
+        admission_database) -> None:
+    key = '2' * 64
+    _insert_intent(admission_database, key)
+    identity = _identity()
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    with admission_database.begin() as connection:
+        repository.insert_intent_pending_in_connection(connection, identity,
+                                                       key)
+    record_id, association_id = _materialize(admission_database, repository,
+                                             identity, key)
+    with admission_database.begin() as connection:
+        replay = repository.bind_materialized_in_connection(
+            connection,
+            identity,
+            intent_idempotency_key=key,
+            replica_id=1,
+            replica_record_id=record_id,
+            provider_cluster_generation=9,
+            association_id=association_id)
+        assert replay.association_id == association_id
+        assert repository.validate_materialized_in_connection(
+            connection,
+            identity,
+            intent_idempotency_key=key,
+            replica_id=1,
+            replica_record_id=record_id,
+            provider_cluster_generation=9,
+            association_id=association_id) == replay
+        assert repository.validate_materialized_in_connection(
+            connection,
+            identity,
+            intent_idempotency_key=key,
+            replica_id=1,
+            replica_record_id=record_id,
+            provider_cluster_generation=9,
+            association_id=uuid.uuid4()) is None
+
+    admission = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    association = ordinary_launch_binding.ordinary_launch_associations_table
+    replica = serve_state_schema.replicas_table
+    intent = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    for parent, statement in (
+        (association, sqlalchemy.delete(association).where(
+            association.c.association_id == association_id)),
+        (replica,
+         sqlalchemy.delete(replica).where(replica.c.service_name == _SERVICE,
+                                          replica.c.replica_id == 1)),
+        (intent, sqlalchemy.delete(intent).where(
+            intent.c.intent_idempotency_key == key)),
+    ):
+        with pytest.raises(sqlalchemy.exc.IntegrityError):
+            with admission_database.begin() as connection:
+                # Isolate the Serve057 FK from the older user-trigger guards;
+                # the failing transaction rolls this ALTER back as well.
+                connection.exec_driver_sql(
+                    f'ALTER TABLE {parent.name} DISABLE TRIGGER USER')
+                connection.execute(statement)
+
+    # Evidence-backed cleanup settles/clears the ordinary edge before this
+    # structural order.  The admission must still precede every graph parent.
+    with admission_database.begin() as connection:
+        connection.exec_driver_sql(
+            f'ALTER TABLE {replica.name} DISABLE TRIGGER USER')
+        connection.exec_driver_sql(
+            f'ALTER TABLE {intent.name} DISABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.delete(admission).where(
+                admission.c.intent_idempotency_key == key))
+        connection.execute(
+            sqlalchemy.delete(replica).where(replica.c.service_name == _SERVICE,
+                                             replica.c.replica_id == 1))
+        connection.execute(
+            sqlalchemy.delete(intent).where(
+                intent.c.intent_idempotency_key == key))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {intent.name} ENABLE TRIGGER USER')
+        connection.exec_driver_sql(
+            f'ALTER TABLE {replica.name} ENABLE TRIGGER USER')
+    with admission_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(association.c.association_id).where(
+                association.c.association_id ==
+                association_id)).scalar_one() == association_id
+
+
+def test_waiting_receipt_renews_then_admission_is_monotonic(
+        admission_database) -> None:
+    key = '3' * 64
+    _insert_intent(admission_database, key)
+    identity = _identity()
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    with admission_database.begin() as connection:
+        repository.insert_intent_pending_in_connection(connection, identity,
+                                                       key)
+    record_id, association_id = _materialize(admission_database, repository,
+                                             identity, key)
+    waiting_receipt = _receipt(
+        kueue_lane_lineage.KueueAdmissionState.POD_WAITING,
+        key,
+        record_id,
+        identity=identity)
+    with admission_database.begin() as connection:
+        provider_read_started_at = _postgres_now(connection)
+        first = repository.observe_pod_waiting_in_connection(
+            connection,
+            identity,
+            intent_idempotency_key=key,
+            replica_id=1,
+            replica_record_id=record_id,
+            provider_cluster_generation=9,
+            association_id=association_id,
+            pod_namespace='skypilot',
+            pod_name='worker-1',
+            pod_uid='pod-uid-1',
+            pod_receipt=waiting_receipt,
+            provider_read_started_at=provider_read_started_at)
+        with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
+                           match='expired while waiting'):
+            repository.observe_pod_waiting_in_connection(
+                connection,
+                identity,
+                intent_idempotency_key=key,
+                replica_id=1,
+                replica_record_id=record_id,
+                provider_cluster_generation=9,
+                association_id=association_id,
+                pod_namespace='skypilot',
+                pod_name='worker-1',
+                pod_uid='pod-uid-1',
+                pod_receipt=waiting_receipt,
+                provider_read_started_at=(_postgres_now(connection) -
+                                          datetime.timedelta(seconds=16)))
+        with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
+                           match='later than PostgreSQL'):
+            repository.observe_pod_waiting_in_connection(
+                connection,
+                identity,
+                intent_idempotency_key=key,
+                replica_id=1,
+                replica_record_id=record_id,
+                provider_cluster_generation=9,
+                association_id=association_id,
+                pod_namespace='skypilot',
+                pod_name='worker-1',
+                pod_uid='pod-uid-1',
+                pod_receipt=waiting_receipt,
+                provider_read_started_at=(_postgres_now(connection) +
+                                          datetime.timedelta(seconds=1)))
+        connection.execute(sqlalchemy.select(sqlalchemy.func.pg_sleep(0.01)))
+        provider_read_started_at = _postgres_now(connection)
+        renewed = repository.observe_pod_waiting_in_connection(
+            connection,
+            identity,
+            intent_idempotency_key=key,
+            replica_id=1,
+            replica_record_id=record_id,
+            provider_cluster_generation=9,
+            association_id=association_id,
+            pod_namespace='skypilot',
+            pod_name='worker-1',
+            pod_uid='pod-uid-1',
+            pod_receipt=waiting_receipt,
+            provider_read_started_at=provider_read_started_at)
+        assert renewed.observed_at > first.observed_at
+        assert renewed.valid_until - renewed.observed_at == (datetime.timedelta(
+            seconds=15))
+        assert renewed.pod_receipt_sha256 == _receipt_digest(
+            connection, waiting_receipt)
+
+        admitted_receipt = _receipt(
+            kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED,
+            key,
+            record_id,
+            identity=identity)
+        provider_read_started_at = _postgres_now(connection)
+        admitted = repository.observe_policy_admitted_in_connection(
+            connection,
+            identity,
+            intent_idempotency_key=key,
+            replica_id=1,
+            replica_record_id=record_id,
+            provider_cluster_generation=9,
+            association_id=association_id,
+            pod_namespace='skypilot',
+            pod_name='worker-1',
+            pod_uid='pod-uid-1',
+            pod_receipt=admitted_receipt,
+            provider_read_started_at=provider_read_started_at)
+        assert admitted.state is (
+            kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED)
+        assert admitted.valid_until is None
+        assert admitted.admitted_at is not None
+        admitted_at = admitted.admitted_at
+        refreshed_receipt = _receipt(
+            kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED,
+            key,
+            record_id,
+            identity=identity,
+            phase='Running',
+            workload_name='worker-1',
+            unconstrained_topology='true')
+        connection.execute(sqlalchemy.select(sqlalchemy.func.pg_sleep(0.01)))
+        provider_read_started_at = _postgres_now(connection)
+        refreshed = repository.observe_policy_admitted_in_connection(
+            connection,
+            identity,
+            intent_idempotency_key=key,
+            replica_id=1,
+            replica_record_id=record_id,
+            provider_cluster_generation=9,
+            association_id=association_id,
+            pod_namespace='skypilot',
+            pod_name='worker-1',
+            pod_uid='pod-uid-1',
+            pod_receipt=refreshed_receipt,
+            provider_read_started_at=provider_read_started_at)
+        assert refreshed.admitted_at == admitted_at
+        assert refreshed.observed_at > admitted.observed_at
+        with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict):
+            repository.observe_pod_waiting_in_connection(
+                connection,
+                identity,
+                intent_idempotency_key=key,
+                replica_id=1,
+                replica_record_id=record_id,
+                provider_cluster_generation=9,
+                association_id=association_id,
+                pod_namespace='skypilot',
+                pod_name='worker-1',
+                pod_uid='pod-uid-1',
+                pod_receipt=waiting_receipt,
+                provider_read_started_at=_postgres_now(connection))
+
+
+def test_database_rejects_partial_shapes_removed_states_and_regression(
+        admission_database) -> None:
+    key = '4' * 64
+    _insert_intent(admission_database, key)
+    identity = _identity()
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    with admission_database.begin() as connection:
+        repository.insert_intent_pending_in_connection(connection, identity,
+                                                       key)
+    table = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with admission_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(table).where(
+                    table.c.intent_idempotency_key == key).values(replica_id=1))
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with admission_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(table).where(
+                    table.c.intent_idempotency_key == key).values(
+                        state='PAID_HANDOFF'))
+    with pytest.raises(sqlalchemy.exc.IntegrityError,
+                       match='identity is immutable'):
+        with admission_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(table).where(
+                    table.c.intent_idempotency_key == key).values(
+                        service_version=_SERVICE_VERSION + 1))
+
+
+def test_outgoing_update_holds_only_lower_unresolved_versions(
+        admission_database) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    pending_key = '1' * 64
+    incoming_key = '2' * 64
+    waiting_key = '3' * 64
+    admitted_key = '4' * 64
+    for ordinal, key, version in (
+        (0, pending_key, _SERVICE_VERSION),
+        (1, incoming_key, _SERVICE_VERSION + 1),
+        (2, waiting_key, _SERVICE_VERSION),
+        (3, admitted_key, _SERVICE_VERSION),
+    ):
+        _insert_intent(admission_database,
+                       key,
+                       ordinal=ordinal,
+                       service_version=version,
+                       observation_sequence=ordinal + 1,
+                       ordinary_zero_cost_admission_sequence=ordinal + 1)
+        with admission_database.begin() as connection:
+            repository.insert_intent_pending_in_connection(
+                connection, _identity(service_version=version), key)
+
+    waiting_record, waiting_association = _materialize(admission_database,
+                                                       repository,
+                                                       _identity(),
+                                                       waiting_key,
+                                                       replica_id=1,
+                                                       provider_generation=9)
+    admitted_record, admitted_association = _materialize(admission_database,
+                                                         repository,
+                                                         _identity(),
+                                                         admitted_key,
+                                                         replica_id=2,
+                                                         provider_generation=10)
+    with admission_database.begin() as connection:
+        repository.observe_pod_waiting_in_connection(
+            connection,
+            _identity(),
+            intent_idempotency_key=waiting_key,
+            replica_id=1,
+            replica_record_id=waiting_record,
+            provider_cluster_generation=9,
+            association_id=waiting_association,
+            provider_read_started_at=_postgres_now(connection),
+            pod_namespace='skypilot',
+            pod_name='worker-1',
+            pod_uid='pod-uid-1',
+            pod_receipt=_receipt(
+                kueue_lane_lineage.KueueAdmissionState.POD_WAITING,
+                waiting_key,
+                waiting_record,
+                identity=_identity()))
+        repository.observe_policy_admitted_in_connection(
+            connection,
+            _identity(),
+            intent_idempotency_key=admitted_key,
+            replica_id=2,
+            replica_record_id=admitted_record,
+            provider_cluster_generation=10,
+            association_id=admitted_association,
+            provider_read_started_at=_postgres_now(connection),
+            pod_namespace='skypilot',
+            pod_name='worker-1',
+            pod_uid='pod-uid-1',
+            pod_receipt=_receipt(
+                kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED,
+                admitted_key,
+                admitted_record,
+                identity=_identity()))
+
+    with admission_database.begin() as connection:
+        holds = repository.lock_outgoing_update_holds_in_connection(
+            connection, _SERVICE, _SERVICE_HASH, _SERVICE_VERSION + 1)
+        assert {row.intent_idempotency_key for row in holds
+               } == {pending_key, waiting_key}
+
+
+def test_expired_provider_free_terminal_cleanup_requires_locked_exact_graph(
+        admission_database) -> None:
+    predecessor_key = 'a' * 64
+    successor_key = 'b' * 64
+    now = datetime.datetime.now(datetime.timezone.utc)
+    valid_until = now + datetime.timedelta(milliseconds=500)
+    _insert_intent(admission_database,
+                   predecessor_key,
+                   created_at=now - datetime.timedelta(seconds=1),
+                   updated_at=now - datetime.timedelta(seconds=1),
+                   valid_until=valid_until,
+                   valid_until_epoch=valid_until.timestamp())
+    identity = _identity()
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    with admission_database.begin() as connection:
+        repository.insert_intent_pending_in_connection(connection, identity,
+                                                       predecessor_key)
+    time.sleep(0.6)
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    with admission_database.begin() as connection:
+        terminal_at = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        connection.execute(
+            sqlalchemy.update(intents).where(
+                intents.c.intent_idempotency_key == predecessor_key).values(
+                    state='TERMINAL',
+                    terminal_at=terminal_at,
+                    updated_at=terminal_at))
+
+    replicas = serve_state_schema.replicas_table
+    # Even a partial/corrupt provider path fails closed.  This row cannot be
+    # reached through the normal writer, so disable only the pre-existing user
+    # trigger while constructing the adversarial database state.
+    with admission_database.begin() as connection:
+        connection.exec_driver_sql(
+            f'ALTER TABLE {replicas.name} DISABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.insert(replicas).values(
+                service_name=_SERVICE,
+                replica_id=99,
+                replica_state_version=18,
+                replica_state={
+                    'replica_record_id': str(uuid.uuid4()),
+                    'reserved_fill': True,
+                },
+                status='PENDING',
+                version=_SERVICE_VERSION,
+                cluster_name=f'{_SERVICE}-99',
+                is_spot=False,
+                reserved_fill_intent_idempotency_key=predecessor_key))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {replicas.name} ENABLE TRIGGER USER')
+    with admission_database.begin() as connection:
+        assert repository.prelock_provider_free_terminal_admissions_in_connection(
+            connection, _SERVICE, _SERVICE_HASH) == ()
+        assert repository.get_for_intent_in_connection(
+            connection, _SERVICE, predecessor_key) is not None
+    with admission_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(replicas).where(
+                replicas.c.service_name == _SERVICE,
+                replicas.c.replica_id == 99))
+
+    # A proof is authority only inside the transaction that locked every
+    # possible provider/request path.
+    with admission_database.begin() as connection:
+        stale_proof, = (
+            repository.prelock_provider_free_terminal_admissions_in_connection(
+                connection, _SERVICE, _SERVICE_HASH))
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
+                       match='another transaction'):
+        with admission_database.begin() as connection:
+            repository.delete_provider_free_terminal_admission_in_connection(
+                connection, stale_proof)
+
+    # Cleanup does not mint a privileged successor.  A fresh ordinary grant may
+    # follow in the same sequenced transaction and obeys normal batch bounds.
+    with admission_database.begin() as connection:
+        proof, = (
+            repository.prelock_provider_free_terminal_admissions_in_connection(
+                connection, _SERVICE, _SERVICE_HASH))
+        repository.lock_service_admissions_in_connection(
+            connection, _SERVICE, _SERVICE_HASH)
+        removed = (
+            repository.delete_provider_free_terminal_admission_in_connection(
+                connection, proof))
+        assert removed.intent_idempotency_key == predecessor_key
+        connection.execute(
+            sqlalchemy.insert(intents).values(
+                **_intent_values(successor_key, ordinal=1)))
+        successor = repository.insert_intent_pending_in_connection(
+            connection, identity, successor_key)
+        assert successor.intent_idempotency_key == successor_key
+        assert successor.state is (
+            kueue_lane_lineage.KueueAdmissionState.INTENT_PENDING)
+        assert repository.get_for_intent_in_connection(connection, _SERVICE,
+                                                       predecessor_key) is None
+        retained_terminal = connection.execute(
+            sqlalchemy.select(
+                intents.c.state).where(intents.c.intent_idempotency_key ==
+                                       predecessor_key)).scalar_one()
+        assert retained_terminal == 'TERMINAL'
+
+
+@pytest.mark.parametrize(
+    ('capacity_unit', 'accelerator_count', 'planned_capacity', 'surge_units'), (
+        ('physical', 1, 1, 1),
+        ('logical', 8, 8, 6),
+    ))
+def test_surge_is_frozen_in_configured_unit_and_clears_for_any_clean_reduction(
+        admission_database, capacity_unit, accelerator_count, planned_capacity,
+        surge_units) -> None:
+    key = '5' * 64
+    _insert_intent(admission_database,
+                   key,
+                   accelerator_count=accelerator_count,
+                   capacity_unit=capacity_unit,
+                   planned_capacity=planned_capacity)
+    identity = _identity(accelerator_count=accelerator_count)
+    compatibility = '9' * 64
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    with admission_database.begin() as connection:
+        repository.insert_intent_pending_in_connection(
+            connection,
+            identity,
+            key,
+            replacement_surge_units=surge_units,
+            replacement_compatibility_sha256=compatibility)
+        validated = repository.validate_replacement_surge_in_connection(
+            connection,
+            identity,
+            intent_idempotency_key=key,
+            expected_compatibility_sha256=compatibility)
+        assert validated.capacity_unit == capacity_unit
+        assert validated.replacement_surge_units == surge_units
+        with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict):
+            repository.release_satisfied_replacement_surge_in_connection(
+                connection,
+                service_name=_SERVICE,
+                service_hash=_SERVICE_HASH,
+                capacity_unit=('logical'
+                               if capacity_unit == 'physical' else 'physical'),
+                physical_capacity_debit=planned_capacity,
+                max_capacity=planned_capacity)
+        released = repository.release_satisfied_replacement_surge_in_connection(
+            connection,
+            service_name=_SERVICE,
+            service_hash=_SERVICE_HASH,
+            capacity_unit=capacity_unit,
+            physical_capacity_debit=planned_capacity - 1,
+            max_capacity=planned_capacity)
+        assert released is not None
+        assert released.replacement_surge_units == 0
+        assert released.replacement_compatibility_sha256 is None
+
+
+def test_cross_domain_waiting_surge_serializes_the_empty_gap_and_blocks_chain(
+        admission_database) -> None:
+    first_key = '6' * 64
+    second_key = '7' * 64
+    _insert_intent(admission_database, first_key)
+    _insert_intent(admission_database,
+                   second_key,
+                   ordinal=1,
+                   physical_cluster_uid='cluster-uid-b')
+    first_identity = _identity()
+    second_identity = _identity(physical_cluster_uid='cluster-uid-b')
+    compatibility = '8' * 64
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    with admission_database.begin() as connection:
+        repository.insert_intent_pending_in_connection(
+            connection,
+            first_identity,
+            first_key,
+            replacement_surge_units=1,
+            replacement_compatibility_sha256=compatibility)
+    record_id, association_id = _materialize(admission_database, repository,
+                                             first_identity, first_key)
+    waiting = _receipt(kueue_lane_lineage.KueueAdmissionState.POD_WAITING,
+                       first_key,
+                       record_id,
+                       identity=first_identity)
+    with admission_database.begin() as connection:
+        provider_read_started_at = _postgres_now(connection)
+        row = repository.observe_pod_waiting_in_connection(
+            connection,
+            first_identity,
+            intent_idempotency_key=first_key,
+            replica_id=1,
+            replica_record_id=record_id,
+            provider_cluster_generation=9,
+            association_id=association_id,
+            pod_namespace='skypilot',
+            pod_name='worker-1',
+            pod_uid='pod-uid-1',
+            pod_receipt=waiting,
+            provider_read_started_at=provider_read_started_at)
+        assert row.replacement_surge_units == 1
+
+    locked = threading.Event()
+    release = threading.Event()
+
+    def hold_service_gap() -> None:
+        with admission_database.begin() as connection:
+            rows = repository.lock_service_admissions_in_connection(
+                connection, _SERVICE, _SERVICE_HASH)
+            assert rows[0].state is (
+                kueue_lane_lineage.KueueAdmissionState.POD_WAITING)
+            locked.set()
+            assert release.wait(timeout=5)
+
+    def try_cross_domain_chain() -> None:
+        assert locked.wait(timeout=5)
+        with admission_database.begin() as connection:
+            repository.lock_service_admissions_in_connection(
+                connection, _SERVICE, _SERVICE_HASH)
+            repository.insert_intent_pending_in_connection(
+                connection,
+                second_identity,
+                second_key,
+                replacement_surge_units=1,
+                replacement_compatibility_sha256=compatibility)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        holder = executor.submit(hold_service_gap)
+        assert locked.wait(timeout=5)
+        contender = executor.submit(try_cross_domain_chain)
+        time.sleep(0.15)
+        assert not contender.done()
+        release.set()
+        holder.result(timeout=5)
+        with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
+                           match='one replacement surge'):
+            contender.result(timeout=5)
