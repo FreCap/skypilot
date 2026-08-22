@@ -2671,6 +2671,117 @@ def test_competing_distinct_lineages_finish_without_deadlock(
         assert _suffix_counts(connection) == (2, 2, 2, 2, 2)
 
 
+def test_cleanup_profile_survives_independent_materialization_sequence(
+        atomic_database) -> None:
+    """Authenticate a real two-admission graph after only #2 materializes."""
+    specs = _atomic_specs(atomic_database, 2)
+    outcomes = [
+        reserved_fill_admission._transaction(spec, 7, require_existing=False)
+        for spec in specs
+    ]
+    _, receipt = outcomes[1]
+    association_id = uuid.UUID(receipt.association_id)
+    intent_key = specs[1].actuation_lease.intent.idempotency_key
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    replicas = serve_state_schema.replicas_table
+    services = serve_state_schema.services_table
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+
+    with atomic_database.connect() as connection:
+        intent = connection.execute(
+            sqlalchemy.select(intents).where(intents.c.intent_idempotency_key ==
+                                             intent_key)).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(replicas).where(
+                replicas.c.service_name == _SERVICE,
+                replicas.c.replica_id == 2)).mappings().one()
+        service_row = connection.execute(
+            sqlalchemy.select(services).where(
+                services.c.name == _SERVICE)).mappings().one()
+        association = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.association_id ==
+                association_id)).mappings().one()
+        info = serve_state.decode_replica_state_for_authority(
+            replica['replica_state_version'], replica['replica_state'])
+        identity = (zero_cost_actuation.
+                    kueue_admission_identity_for_locked_intent_in_connection(
+                        connection, intent))
+        assert identity is not None
+        assert (intent['observation_sequence'],
+                intent['ordinary_zero_cost_admission_sequence'],
+                info.zero_cost_admission_sequence,
+                info.zero_cost_materialization_sequence) == (0, 0, 2, None)
+        assert kueue_lane_lineage._replica_matches_reserved_fill_intent(
+            info, intent, identity, intent_key)
+        info.zero_cost_admission_sequence = intent['observation_sequence']
+        assert not kueue_lane_lineage._replica_matches_reserved_fill_intent(
+            info, intent, identity, intent_key)
+        info.zero_cost_admission_sequence = 2
+        context = ordinary_launch_binding.bound_context_from_association(
+            association)
+        assert isinstance(context,
+                          ordinary_launch_binding.BoundNonPoolLaunchContext)
+        frozen_profile = context.profile
+        assert ordinary_launch_binding.validate_reserved_fill_cleanup_association_in_connection(
+            connection, service_row, replica, association) == frozen_profile
+
+    with atomic_database.begin() as connection:
+        serve_state.lock_zero_cost_protocol_for_bound_launch_projection(
+            connection)
+        ordinary_launch_binding.lock_reduction_authority_in_connection(
+            connection, context)
+        locked_info = (
+            serve_state.read_replica_for_bound_ordinary_launch_in_transaction(
+                connection, _SERVICE, 2, receipt.replica_record_id,
+                association_id))
+        locked_info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        assert serve_state.update_replica_for_bound_ordinary_launch_in_transaction(
+            connection,
+            _SERVICE,
+            _SERVICE_HASH,
+            2,
+            receipt.replica_record_id,
+            association_id,
+            locked_info,
+            provider_launch_succeeded=True,
+            paid_capacity_pool_key=None,
+            paid_capacity_outcome=None)
+
+    with atomic_database.connect() as connection:
+        replica = connection.execute(
+            sqlalchemy.select(replicas).where(
+                replicas.c.service_name == _SERVICE,
+                replicas.c.replica_id == 2)).mappings().one()
+        service_row = connection.execute(
+            sqlalchemy.select(services).where(
+                services.c.name == _SERVICE)).mappings().one()
+        association = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.association_id ==
+                association_id)).mappings().one()
+        materialized = serve_state.decode_replica_state_for_authority(
+            replica['replica_state_version'], replica['replica_state'])
+        assert (materialized.zero_cost_admission_sequence,
+                materialized.zero_cost_materialization_sequence) == (2, 1)
+        assert ordinary_launch_binding.validate_reserved_fill_cleanup_association_in_connection(
+            connection, service_row, replica, association) == frozen_profile
+        materialized.zero_cost_admission_sequence = 3
+        with pytest.raises(
+                ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                match='sequencer authority'):
+            ordinary_launch_binding._zero_cost_sequence_payload(  # pylint: disable=protected-access
+                connection, materialized)
+        materialized.zero_cost_admission_sequence = 2
+        materialized.zero_cost_materialization_sequence = 2
+        with pytest.raises(
+                ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                match='sequencer authority'):
+            ordinary_launch_binding._zero_cost_sequence_payload(  # pylint: disable=protected-access
+                connection, materialized)
+
+
 def test_grant_writer_and_atomic_admission_forced_overlap_has_no_deadlock(
         atomic_database) -> None:
     spec = _atomic_spec(atomic_database)

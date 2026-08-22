@@ -29,6 +29,12 @@ from sky.utils.db import db_utils
 WAITING_OBSERVATION_TTL_SECONDS = 15
 
 _SHA256_RE = re.compile(r'[0-9a-f]{64}')
+_TERMINAL_STATUSES = frozenset({'SUCCEEDED', 'FAILED', 'CANCELLED'})
+_TERMINAL_PROFILE_FIELDS = ('binding_protocol_version', 'profile_kind',
+                            'profile_version', 'profile_digest',
+                            'capability_cohort_epoch',
+                            'capability_profile_set_digest',
+                            'receipt_protocol_version')
 _ADMISSIONS = kueue_lane_lineage_schema.serve_kueue_admissions_table
 _INTENTS = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
 _REPLICAS = serve_state_schema.replicas_table
@@ -214,8 +220,8 @@ class MaterializedAdmissionRetirementTarget:
 
 
 @dataclasses.dataclass(frozen=True)
-class MaterializedAdmissionRetirementProof:
-    """Transaction-bound proof for one exact provider-clean Kueue graph."""
+class MaterializedRetirementProofBase:
+    """Common transaction-bound proof for a provider-clean Kueue graph."""
 
     transaction_id: int
     service_name: str
@@ -228,10 +234,25 @@ class MaterializedAdmissionRetirementProof:
     provider_cluster_generation: int
     association_id: uuid.UUID
     association_updated_at: datetime.datetime
-    admission_updated_at: datetime.datetime
     request_id: str
     request_updated_at: datetime.datetime | None
     checked_at: datetime.datetime
+
+
+@dataclasses.dataclass(frozen=True)
+class MaterializedAdmissionRetirementProof(MaterializedRetirementProofBase):
+    """Retirement proof for a graph with one exact admission row."""
+
+    admission_updated_at: datetime.datetime
+
+
+@dataclasses.dataclass(frozen=True)
+class AdmissionlessMaterializedRetirementProof(MaterializedRetirementProofBase):
+    """Whole-service retirement proof for a provider-free missing admission."""
+
+
+MaterializedRetirementProof = (MaterializedAdmissionRetirementProof |
+                               AdmissionlessMaterializedRetirementProof)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -261,6 +282,89 @@ class ExactPodAbsenceProbeTarget:
                 raise ValueError(f'{field} must be a UUID.')
         for field in ('pod_namespace', 'pod_name', 'pod_uid'):
             _require_nonempty(getattr(self, field), field)
+
+
+@dataclasses.dataclass(frozen=True)
+class AdmissionlessPhysicalAbsenceProbeTarget:
+    """Provider-read target for one teardown-fenced missing admission."""
+
+    identity: KueueAdmissionIdentity
+    intent_idempotency_key: str
+    replica_id: int
+    replica_record_id: uuid.UUID
+    provider_cluster_generation: int
+    association_id: uuid.UUID
+    cluster_name: str
+
+    def validate(self) -> None:
+        if not isinstance(self.identity, KueueAdmissionIdentity):
+            raise TypeError('identity must be KueueAdmissionIdentity.')
+        self.identity.validate()
+        _require_sha256(self.intent_idempotency_key, 'intent_idempotency_key')
+        _require_positive(self.replica_id, 'replica_id')
+        if not isinstance(self.replica_record_id, uuid.UUID):
+            raise ValueError('replica_record_id must be a UUID.')
+        _require_positive(self.provider_cluster_generation,
+                          'provider_cluster_generation')
+        if not isinstance(self.association_id, uuid.UUID):
+            raise ValueError('association_id must be a UUID.')
+        _require_nonempty(self.cluster_name, 'cluster_name')
+
+
+class PhysicalAbsenceLoadState(str, enum.Enum):
+    """Closed result set for loading durable provider-absence authority."""
+
+    NOT_APPLICABLE = 'NOT_APPLICABLE'
+    NEEDS_PROBE = 'NEEDS_PROBE'
+    ALREADY_PROVEN = 'ALREADY_PROVEN'
+
+
+@dataclasses.dataclass(frozen=True)
+class ExactPodAbsenceLoadResult:
+    """Typed exact-Pod probe decision that preserves durable replay."""
+
+    state: PhysicalAbsenceLoadState
+    target: ExactPodAbsenceProbeTarget | None = None
+
+    def validate(self) -> None:
+        if not isinstance(self.state, PhysicalAbsenceLoadState):
+            raise TypeError('state must be PhysicalAbsenceLoadState.')
+        if self.state is PhysicalAbsenceLoadState.NEEDS_PROBE:
+            if not isinstance(self.target, ExactPodAbsenceProbeTarget):
+                raise ValueError('NEEDS_PROBE requires an exact target.')
+            self.target.validate()
+        elif self.target is not None:
+            raise ValueError(f'{self.state.value} cannot carry a target.')
+
+
+@dataclasses.dataclass(frozen=True)
+class AdmissionlessPhysicalAbsenceLoadResult:
+    """Typed provider-probe decision that preserves durable replay."""
+
+    state: PhysicalAbsenceLoadState
+    target: AdmissionlessPhysicalAbsenceProbeTarget | None = None
+
+    def validate(self) -> None:
+        if not isinstance(self.state, PhysicalAbsenceLoadState):
+            raise TypeError('state must be PhysicalAbsenceLoadState.')
+        if self.state is PhysicalAbsenceLoadState.NEEDS_PROBE:
+            if not isinstance(self.target,
+                              AdmissionlessPhysicalAbsenceProbeTarget):
+                raise ValueError('NEEDS_PROBE requires an exact target.')
+            self.target.validate()
+        elif self.target is not None:
+            raise ValueError(f'{self.state.value} cannot carry a target.')
+
+
+@dataclasses.dataclass(frozen=True)
+class _AdmissionlessTeardownGraph:
+    """Validated database graph behind one admissionless provider probe."""
+
+    target: AdmissionlessPhysicalAbsenceProbeTarget
+    association: Mapping[str, Any]
+    replica_info: Any
+    service: Mapping[str, Any]
+    provider_absence_state: PhysicalAbsenceLoadState
 
 
 def _identity_predicates(identity: KueueAdmissionIdentity) -> tuple[Any, ...]:
@@ -415,6 +519,10 @@ def _replica_matches_reserved_fill_intent(
     association and Kueue admission are the durable request/job/Pod lineage for
     reserved fill, so duplicating those identities into ReplicaInfo would make
     an otherwise canonical RESERVED_FILL record undecodable.
+
+    The intent snapshots the all-zero-cost observation high-water before
+    atomic admission.  The replica owns the later sequence allocated by that
+    admission, so the latter must be strictly newer rather than equal.
     """
     try:
         return bool(
@@ -449,9 +557,40 @@ def _replica_matches_reserved_fill_intent(
             info.reserved_fill_observation_sequence
             == intent['observation_sequence'] and
             info.reserved_fill_intent_idempotency_key == intent_idempotency_key
-            and info.zero_cost_admission_sequence
-            == intent['ordinary_zero_cost_admission_sequence'])
+            and type(info.zero_cost_admission_sequence) is int and
+            type(intent['observation_sequence']) is int and
+            info.zero_cost_admission_sequence > intent['observation_sequence'])
     except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
+def _terminal_request_matches_association(
+    request: Mapping[str, Any],
+    association: Mapping[str, Any],
+) -> bool:
+    """Return whether one retained request exactly copies terminal lineage."""
+    try:
+        return bool(
+            request['request_id'] == association['request_id'] and
+            request['ordinary_launch_association_id']
+            == association['association_id'] and request['handler_name']
+            == 'sky.server.requests.non_pool_launch:launch' and
+            request['status'] in _TERMINAL_STATUSES and
+            request['status'] == association['terminal_status'] and
+            isinstance(request['terminal_cause'], str) and
+            request['terminal_cause'] and
+            request['terminal_cause'] == association['terminal_cause'] and
+            request['finished_at'] is not None and
+            request['execution_generation']
+            == association['terminal_execution_generation'] and
+            request['execution_quiescence_required'] is True and
+            request['execution_quiesced_generation']
+            == association['execution_quiesced_generation'] and
+            request['execution_quiesced_at']
+            == association['execution_quiesced_at'] and
+            all(request[field] == association[field]
+                for field in _TERMINAL_PROFILE_FIELDS))
+    except (KeyError, TypeError):
         return False
 
 
@@ -611,6 +750,18 @@ def _validate_provider_read_started_at(
     return provider_read_started_at, valid_until
 
 
+def _validate_provider_publication_completed_at(
+    connection: sqlalchemy.engine.Connection,
+    valid_until: datetime.datetime,
+) -> None:
+    """Require the provider-derived publication statement to beat its TTL."""
+    database_now = connection.execute(
+        sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+    if database_now >= valid_until:
+        raise KueueAdmissionConflict(
+            'Provider evidence expired during database publication.')
+
+
 def _canonical_json_sha256(payload: Mapping[str, Any]) -> str:
     canonical = json.dumps(payload,
                            sort_keys=True,
@@ -645,6 +796,223 @@ def _exact_pod_absence_evidence(
         'profile_digest': association['profile_digest'],
     })
     return payload, digest
+
+
+def _provider_absence_publication_values(
+    service: Mapping[str, Any],
+    association: Mapping[str, Any],
+    *,
+    observed_at: datetime.datetime,
+    payload: Mapping[str, Any],
+    digest: str,
+) -> dict[str, Any]:
+    """Build one evidence write that also adopts the current service owner."""
+    owner_incarnation = service.get('controller_incarnation')
+    owner_epoch = service.get('controller_owner_epoch')
+    if (not isinstance(owner_incarnation, uuid.UUID) or
+            type(owner_epoch) is not int or owner_epoch < 1 or
+            service.get('ordinary_launch_binding_mode') != 'bound' or
+            service.get('ordinary_launch_binding_capable') is not True):
+        raise KueueAdmissionConflict(
+            'Provider absence lost the current bound service owner.')
+    owner_changed = (association['owner_controller_incarnation']
+                     != owner_incarnation or
+                     association['owner_controller_epoch'] != owner_epoch)
+    values: dict[str, Any] = {
+        'provider_evidence': 'ABSENT',
+        'provider_evidence_observed_at': observed_at,
+        'provider_evidence_payload': dict(payload),
+        'provider_evidence_digest': digest,
+        'owner_controller_incarnation': owner_incarnation,
+        'owner_controller_epoch': owner_epoch,
+        'owner_revision': int(association['owner_revision']) + 1,
+        'updated_at': sqlalchemy.func.clock_timestamp(),
+    }
+    if owner_changed:
+        values['owner_transferred_at'] = sqlalchemy.func.clock_timestamp()
+    return values
+
+
+def _validate_admissionless_retirement_rows_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    lifecycle_epoch: int,
+    service: Mapping[str, Any],
+    intent: Mapping[str, Any],
+    identity: KueueAdmissionIdentity,
+    intent_idempotency_key: str,
+    replica: Mapping[str, Any],
+    association: Mapping[str, Any],
+    request: Mapping[str, Any] | None,
+    replica_id: int,
+    replica_record_id: uuid.UUID,
+) -> _AdmissionlessTeardownGraph:
+    """Validate the shared rows of one admissionless retirement graph.
+
+    This acquires no rows or locks and performs no writes or provider I/O.  The
+    single-replica probe and sorted multi-replica retirement transaction own
+    those operations, then use this validator so provider publication and
+    final deletion cannot drift on the durable row contract.  Its frozen-profile
+    authentication may perform read-only PostgreSQL lookups.  Association
+    effect-phase shape remains a caller concern: a post-job graph can require a
+    new provider probe, while an older pre-job graph may already own a
+    provider-absence tombstone.
+    """
+    _require_postgres_connection(connection)
+    if not all(
+            isinstance(row, Mapping)
+            for row in (service, intent, replica, association)):
+        raise TypeError('Admissionless retirement requires mapped rows.')
+    if request is not None and not isinstance(request, Mapping):
+        raise TypeError('Admissionless retirement request must be mapped.')
+    _require_positive(lifecycle_epoch, 'lifecycle_epoch')
+    _require_positive(replica_id, 'replica_id')
+    if not isinstance(replica_record_id, uuid.UUID):
+        raise ValueError('replica_record_id must be a UUID.')
+    identity.validate()
+    intent_idempotency_key = _require_sha256(intent_idempotency_key,
+                                             'intent_idempotency_key')
+
+    if service['status'] not in ('SHUTTING_DOWN', 'FAILED_CLEANUP'):
+        raise KueueAdmissionConflict(
+            'A Kueue-bound protocol-v2 replica lost its admission outside '
+            'whole-service teardown.')
+    if (lifecycle_epoch != identity.service_lifecycle_epoch or
+            service['name'] != identity.service_name or
+            service['hash'] != identity.service_hash or
+            service['lifecycle_epoch'] != identity.service_lifecycle_epoch or
+            intent['intent_idempotency_key'] != intent_idempotency_key or
+            intent['service_name'] != identity.service_name or
+            intent['service_hash'] != identity.service_hash or
+            intent['service_lifecycle_epoch']
+            != identity.service_lifecycle_epoch or
+            intent['service_version'] != identity.service_version or
+            intent['state'] != 'COMMITTED' or
+            intent['replica_id'] != replica_id or
+            intent['replica_record_id'] != replica_record_id):
+        raise KueueAdmissionConflict(
+            'Admissionless teardown lost its exact committed handoff.')
+
+    state = replica['replica_state']
+    try:
+        info = serve_state.decode_replica_state_for_authority(
+            replica['replica_state_version'], state)
+    except (AttributeError, KeyError, RuntimeError, TypeError,
+            ValueError) as error:
+        raise KueueAdmissionConflict(
+            'Admissionless teardown found malformed replica authority.'
+        ) from error
+    if (not isinstance(state, Mapping) or
+            replica['service_name'] != identity.service_name or
+            replica['replica_id'] != replica_id or
+            replica['version'] != identity.service_version or
+            state.get('replica_record_id') != str(replica_record_id) or
+            state.get('reserved_fill_intent_idempotency_key')
+            != intent_idempotency_key or
+            replica['reserved_fill_intent_idempotency_key']
+            != intent_idempotency_key or
+            replica['ordinary_launch_association_id'] is not None or
+            info.replica_id != replica_id or
+            info.replica_record_id != str(replica_record_id) or
+            info.version != identity.service_version or
+            info.reserved_fill is not True or info.is_zero_cost is not True or
+            info.paid_capacity_pool_key is not None or
+            not _replica_matches_reserved_fill_intent(info, intent, identity,
+                                                      intent_idempotency_key)):
+        raise KueueAdmissionConflict(
+            'Admissionless teardown replica is not an exact zero-cost '
+            'materialization.')
+
+    try:
+        (ordinary_launch_binding.
+         validate_reserved_fill_cleanup_association_in_connection)(connection,
+                                                                   service,
+                                                                   replica,
+                                                                   association)
+    except (ordinary_launch_binding.OrdinaryLaunchBindingConflict, TypeError,
+            ValueError) as error:
+        raise KueueAdmissionConflict(
+            'Admissionless teardown lost its frozen reserved-fill profile.'
+        ) from error
+    provider_generation = association['launch_generation']
+    if (association['service_name'] != identity.service_name or
+            association['service_workspace'] != service['workspace'] or
+            association['service_hash'] != identity.service_hash or
+            association['service_lifecycle_epoch']
+            != identity.service_lifecycle_epoch or
+            association['service_version'] != identity.service_version or
+            association['replica_id'] != replica_id or
+            association['replica_record_id'] != replica_record_id or
+            association['binding_protocol_version'] != 2 or
+            association['authorization_reference']
+            != f'reserved-fill:{intent_idempotency_key}' or
+            association['profile_kind'] != 'RESERVED_FILL' or
+            association['paid_capacity_pool_key'] is not None or
+            association['cluster_name'] != info.cluster_name or
+            type(provider_generation) is not int or provider_generation < 1 or
+            association['terminal_status'] not in _TERMINAL_STATUSES or
+            not isinstance(association['terminal_cause'], str) or
+            not association['terminal_cause'] or
+            type(association['terminal_execution_generation']) is not int or
+            association['terminal_execution_generation'] < 1 or
+            association['execution_quiescence_required'] is not True or
+            association['execution_quiesced_generation']
+            != association['terminal_execution_generation'] or
+            association['execution_quiesced_at'] is None or
+            association['projected_at'] is None or
+            association['pin_released_at'] is None or
+            association['tombstone_not_before'] is None):
+        raise KueueAdmissionConflict(
+            'Admissionless teardown launch is not exact, terminal, and '
+            'quiescent.')
+
+    request_id = association['request_id']
+    if not isinstance(request_id, str) or not request_id:
+        raise KueueAdmissionConflict(
+            'Admissionless teardown lost its launch request identity.')
+    if (request is not None and
+            not _terminal_request_matches_association(request, association)):
+        raise KueueAdmissionConflict(
+            'Admissionless teardown request receipt is not exact.')
+
+    target = AdmissionlessPhysicalAbsenceProbeTarget(
+        identity=identity,
+        intent_idempotency_key=intent_idempotency_key,
+        replica_id=replica_id,
+        replica_record_id=replica_record_id,
+        provider_cluster_generation=provider_generation,
+        association_id=association['association_id'],
+        cluster_name=info.cluster_name)
+    target.validate()
+    evidence = association['provider_evidence']
+    if evidence == 'NOT_QUERIED':
+        if (association['provider_evidence_observed_at'] is not None or
+                association['provider_evidence_payload'] is not None or
+                association['provider_evidence_digest'] is not None):
+            raise KueueAdmissionConflict(
+                'Admissionless teardown requires fresh provider absence.')
+        absence_state = PhysicalAbsenceLoadState.NEEDS_PROBE
+    elif evidence == 'ABSENT':
+        expected_payload, expected_digest = (
+            ordinary_launch_binding._reserved_fill_provider_evidence(  # pylint: disable=protected-access
+                association, info,
+                ordinary_launch_binding.ProviderEvidence.ABSENT))
+        if (association['provider_evidence_observed_at'] is None or
+                association['provider_evidence_observed_at']
+                < association['execution_quiesced_at'] or
+                association['provider_evidence_payload'] != expected_payload or
+                association['provider_evidence_digest'] != expected_digest):
+            raise KueueAdmissionConflict(
+                'Admissionless teardown retained noncanonical absence.')
+        absence_state = PhysicalAbsenceLoadState.ALREADY_PROVEN
+    else:
+        raise KueueAdmissionConflict(
+            'Admissionless teardown requires fresh provider absence.')
+    return _AdmissionlessTeardownGraph(target=target,
+                                       association=dict(association),
+                                       replica_info=info,
+                                       service=dict(service),
+                                       provider_absence_state=absence_state)
 
 
 class KueueAdmissionRepository:
@@ -742,8 +1110,8 @@ class KueueAdmissionRepository:
         service_name: str,
         replica_id: int,
         replica_record_id: uuid.UUID,
-    ) -> ExactPodAbsenceProbeTarget | None:
-        """Load one exact admitted Pod target without retaining SQL locks."""
+    ) -> ExactPodAbsenceLoadResult:
+        """Load one exact admitted Pod probe decision without SQL locks."""
         _require_postgres_connection(connection)
         _require_nonempty(service_name, 'service_name')
         _require_positive(replica_id, 'replica_id')
@@ -756,7 +1124,10 @@ class KueueAdmissionRepository:
                 _ADMISSIONS.c.replica_record_id == replica_record_id).order_by(
                     _ADMISSIONS.c.intent_idempotency_key)).mappings().all()
         if not admission_rows:
-            return None
+            result = ExactPodAbsenceLoadResult(
+                PhysicalAbsenceLoadState.NOT_APPLICABLE)
+            result.validate()
+            return result
         if len(admission_rows) != 1:
             raise KueueAdmissionConflict(
                 'Replica owns multiple Kueue admission identities.')
@@ -859,7 +1230,287 @@ class KueueAdmissionRepository:
             pod_name=pod_name,
             pod_uid=pod_uid)
         target.validate()
-        return target
+        evidence = association['provider_evidence']
+        if evidence == 'ABSENT':
+            expected_payload, expected_digest = _exact_pod_absence_evidence(
+                association, target)
+            if (association['execution_quiesced_at'] is None or
+                    association['provider_evidence_observed_at'] is None or
+                    association['provider_evidence_observed_at']
+                    < association['execution_quiesced_at'] or
+                    association['provider_evidence_payload'] != expected_payload
+                    or
+                    association['provider_evidence_digest'] != expected_digest):
+                raise KueueAdmissionConflict(
+                    'Exact Pod teardown retained noncanonical absence.')
+            result = ExactPodAbsenceLoadResult(
+                PhysicalAbsenceLoadState.ALREADY_PROVEN)
+            result.validate()
+            return result
+        if (evidence != 'NOT_QUERIED' or
+                association['provider_evidence_observed_at'] is not None or
+                association['provider_evidence_payload'] is not None or
+                association['provider_evidence_digest'] is not None):
+            raise KueueAdmissionConflict(
+                'Exact Pod teardown requires fresh provider absence.')
+        result = ExactPodAbsenceLoadResult(PhysicalAbsenceLoadState.NEEDS_PROBE,
+                                           target)
+        result.validate()
+        return result
+
+    def _load_admissionless_teardown_graph_in_connection(
+        self,
+        connection: sqlalchemy.engine.Connection,
+        *,
+        service_name: str,
+        replica_id: int,
+        replica_record_id: uuid.UUID,
+        for_update: bool,
+    ) -> _AdmissionlessTeardownGraph | None:
+        """Validate one whole-service provider-free missing-admission graph."""
+        _require_postgres_connection(connection)
+        _require_nonempty(service_name, 'service_name')
+        _require_positive(replica_id, 'replica_id')
+        if not isinstance(replica_record_id, uuid.UUID):
+            raise ValueError('replica_record_id must be a UUID.')
+
+        def _locked(statement: Any) -> Any:
+            return statement.with_for_update() if for_update else statement
+
+        # Discover only the immutable intent edge before taking locks. The
+        # locked read below rejects any replacement or projection change.
+        replica_discovery = connection.execute(
+            sqlalchemy.select(_REPLICAS).where(
+                _REPLICAS.c.service_name == service_name,
+                _REPLICAS.c.replica_id == replica_id)).mappings().one_or_none()
+        if replica_discovery is None:
+            return None
+        discovery_state = replica_discovery['replica_state']
+        if not isinstance(discovery_state, Mapping):
+            raise KueueAdmissionConflict(
+                'Admissionless teardown found malformed replica state.')
+        intent_key = replica_discovery['reserved_fill_intent_idempotency_key']
+        projected_key = discovery_state.get(
+            'reserved_fill_intent_idempotency_key')
+        if intent_key is None:
+            if projected_key is not None:
+                raise KueueAdmissionConflict(
+                    'Admissionless teardown lost its normalized intent edge.')
+            return None
+        try:
+            intent_key = _require_sha256(intent_key, 'intent_idempotency_key')
+        except ValueError as error:
+            raise KueueAdmissionConflict(
+                'Admissionless teardown has a malformed intent edge.'
+            ) from error
+        if (projected_key != intent_key or
+                discovery_state.get('replica_record_id')
+                != str(replica_record_id)):
+            raise KueueAdmissionConflict(
+                'Admissionless teardown found a replaced replica identity.')
+
+        lifecycle = connection.execute(
+            _locked(
+                sqlalchemy.select(
+                    serve_state_schema.service_lifecycle_fences_table).where(
+                        serve_state_schema.service_lifecycle_fences_table.c.name
+                        == service_name))).mappings().one_or_none()
+        service = connection.execute(
+            _locked(
+                sqlalchemy.select(_SERVICES).where(
+                    _SERVICES.c.name ==
+                    service_name))).mappings().one_or_none()
+        intent = connection.execute(
+            _locked(
+                sqlalchemy.select(_INTENTS).where(
+                    _INTENTS.c.intent_idempotency_key ==
+                    intent_key))).mappings().one_or_none()
+        replica = connection.execute(
+            _locked(
+                sqlalchemy.select(_REPLICAS).where(
+                    _REPLICAS.c.service_name == service_name,
+                    _REPLICAS.c.replica_id ==
+                    replica_id))).mappings().one_or_none()
+        if lifecycle is None or service is None or intent is None or replica is None:
+            raise KueueAdmissionConflict(
+                'Admissionless teardown lost its service or intent graph.')
+        try:
+            identity = (
+                zero_cost_actuation.
+                kueue_admission_identity_for_locked_intent_in_connection(
+                    connection, intent))
+        except Exception as error:  # pylint: disable=broad-except
+            raise KueueAdmissionConflict(
+                'Admissionless teardown cannot prove immutable Kueue '
+                'identity.') from error
+        if identity is None:
+            return None
+        identity.validate()
+
+        associations = ordinary_launch_binding.ordinary_launch_associations_table
+        association_rows = connection.execute(
+            _locked(
+                sqlalchemy.select(associations).where(
+                    associations.c.service_name == service_name,
+                    associations.c.replica_id == replica_id,
+                    associations.c.replica_record_id == replica_record_id,
+                    associations.c.binding_protocol_version == 2).order_by(
+                        associations.c.association_id))).mappings().all()
+        if len(association_rows) != 1:
+            raise KueueAdmissionConflict(
+                'Admissionless teardown requires one exact launch association.')
+        association = association_rows[0]
+        if (association['resolution'] != 'PROJECTED' or
+                association['reconciliation_outcome'] != 'PROJECTED' or
+                association['effect_phase'] != 'SERVICE_JOB_RECORDED' or
+                type(association['service_job_id']) is not int or
+                association['service_job_id'] < 1):
+            raise KueueAdmissionConflict(
+                'Admissionless teardown is not a materialized service launch.')
+
+        paid_claims = serve_state_schema.paid_capacity_claims_table
+        claim_rows = connection.execute(
+            _locked(
+                sqlalchemy.select(paid_claims).where(
+                    paid_claims.c.service_name == service_name,
+                    paid_claims.c.replica_id == replica_id).order_by(
+                        paid_claims.c.pool_key))).mappings().all()
+        requests = request_postgres_schema.REQUESTS
+        request_rows = connection.execute(
+            _locked(
+                sqlalchemy.select(requests).where(
+                    sqlalchemy.or_(
+                        requests.c.request_id == association['request_id'],
+                        requests.c.ordinary_launch_association_id ==
+                        association['association_id'])).order_by(
+                            requests.c.request_id))).mappings().all()
+        if len(request_rows) > 1:
+            raise KueueAdmissionConflict(
+                'Admissionless teardown found multiple request receipts.')
+        request = request_rows[0] if request_rows else None
+        queue = request_postgres_schema.QUEUE
+        queue_rows = connection.execute(
+            _locked(
+                sqlalchemy.select(queue).where(
+                    queue.c.request_id == association['request_id']).order_by(
+                        queue.c.request_id))).mappings().all()
+        pins = request_postgres_schema.REQUEST_RETENTION_PINS
+        pin_rows = connection.execute(
+            _locked(
+                sqlalchemy.select(pins).where(
+                    sqlalchemy.or_(
+                        pins.c.request_id == association['request_id'],
+                        pins.c.pin_id ==
+                        association['association_id'])).order_by(
+                            pins.c.pin_kind, pins.c.pin_id))).mappings().all()
+        admission_rows = connection.execute(
+            _locked(
+                sqlalchemy.select(_ADMISSIONS).where(
+                    _ADMISSIONS.c.intent_idempotency_key == intent_key).
+                order_by(
+                    _ADMISSIONS.c.intent_idempotency_key))).mappings().all()
+        if claim_rows or queue_rows or pin_rows or admission_rows:
+            raise KueueAdmissionConflict(
+                'Admissionless teardown found paid, queued, pinned, or '
+                'materialized admission authority.')
+        return _validate_admissionless_retirement_rows_in_connection(
+            connection,
+            lifecycle_epoch=lifecycle['epoch'],
+            service=service,
+            intent=intent,
+            identity=identity,
+            intent_idempotency_key=intent_key,
+            replica=replica,
+            association=association,
+            request=request,
+            replica_id=replica_id,
+            replica_record_id=replica_record_id)
+
+    def load_admissionless_physical_absence_probe_target_in_connection(
+        self,
+        connection: sqlalchemy.engine.Connection,
+        *,
+        service_name: str,
+        replica_id: int,
+        replica_record_id: uuid.UUID,
+    ) -> AdmissionlessPhysicalAbsenceLoadResult:
+        """Load a typed provider decision for missing-admission teardown."""
+        graph = self._load_admissionless_teardown_graph_in_connection(
+            connection,
+            service_name=service_name,
+            replica_id=replica_id,
+            replica_record_id=replica_record_id,
+            for_update=False)
+        if graph is None:
+            result = AdmissionlessPhysicalAbsenceLoadResult(
+                PhysicalAbsenceLoadState.NOT_APPLICABLE)
+            result.validate()
+            return result
+        target = (graph.target if graph.provider_absence_state
+                  is PhysicalAbsenceLoadState.NEEDS_PROBE else None)
+        result = AdmissionlessPhysicalAbsenceLoadResult(
+            graph.provider_absence_state, target)
+        result.validate()
+        return result
+
+    def record_admissionless_physical_absence_after_teardown_in_connection(
+        self,
+        connection: sqlalchemy.engine.Connection,
+        target: AdmissionlessPhysicalAbsenceProbeTarget,
+        *,
+        provider_read_started_at: datetime.datetime,
+    ) -> Mapping[str, Any]:
+        """Stamp canonical physical absence for one missing admission graph."""
+        _require_postgres_connection(connection)
+        if not isinstance(target, AdmissionlessPhysicalAbsenceProbeTarget):
+            raise TypeError(
+                'target must be AdmissionlessPhysicalAbsenceProbeTarget.')
+        target.validate()
+        graph = self._load_admissionless_teardown_graph_in_connection(
+            connection,
+            service_name=target.identity.service_name,
+            replica_id=target.replica_id,
+            replica_record_id=target.replica_record_id,
+            for_update=True)
+        if graph is None or graph.target != target:
+            raise KueueAdmissionConflict(
+                'Admissionless teardown target changed during provider read.')
+        association = graph.association
+        observed_at, valid_until = _validate_provider_read_started_at(
+            connection, provider_read_started_at)
+        if observed_at < association['execution_quiesced_at']:
+            raise KueueAdmissionConflict(
+                'Admissionless provider absence predates execution quiescence.')
+        expected_payload, expected_digest = (
+            ordinary_launch_binding._reserved_fill_provider_evidence(  # pylint: disable=protected-access
+                association, graph.replica_info,
+                ordinary_launch_binding.ProviderEvidence.ABSENT))
+        if (graph.provider_absence_state
+                is PhysicalAbsenceLoadState.ALREADY_PROVEN):
+            return dict(association)
+        if graph.provider_absence_state is not PhysicalAbsenceLoadState.NEEDS_PROBE:
+            raise KueueAdmissionConflict(
+                'Admissionless absence cannot replace provider evidence.')
+        associations = ordinary_launch_binding.ordinary_launch_associations_table
+        updated = connection.execute(
+            sqlalchemy.update(associations).where(
+                associations.c.association_id == target.association_id,
+                associations.c.updated_at == association['updated_at'],
+                associations.c.owner_revision == association['owner_revision'],
+                associations.c.provider_evidence == 'NOT_QUERIED',
+                sqlalchemy.func.clock_timestamp()
+                < valid_until).values(**_provider_absence_publication_values(
+                    graph.service,
+                    association,
+                    observed_at=observed_at,
+                    payload=expected_payload,
+                    digest=expected_digest)).returning(
+                        *associations.c)).mappings().one_or_none()
+        if updated is None:
+            raise KueueAdmissionConflict(
+                'Admissionless teardown association changed before stamp.')
+        _validate_provider_publication_completed_at(connection, valid_until)
+        return dict(updated)
 
     def record_exact_pod_absence_after_normal_teardown_in_connection(
         self,
@@ -1027,11 +1678,6 @@ class KueueAdmissionRepository:
             raise KueueAdmissionConflict(
                 'Exact Pod absence receipt digest is not canonical.')
 
-        terminal_profile_fields = ('binding_protocol_version', 'profile_kind',
-                                   'profile_version', 'profile_digest',
-                                   'capability_cohort_epoch',
-                                   'capability_profile_set_digest',
-                                   'receipt_protocol_version')
         if (association['service_name'] != identity.service_name or
                 association['service_hash'] != identity.service_hash or
                 association['service_lifecycle_epoch']
@@ -1064,25 +1710,12 @@ class KueueAdmissionRepository:
                 association['pin_released_at'] is None or
                 association['tombstone_not_before'] is None or
             (request is not None and
-             (request['ordinary_launch_association_id'] != target.association_id
-              or request['request_id'] != request_id or request['handler_name']
-              != 'sky.server.requests.non_pool_launch:launch' or
-              request['status'] != association['terminal_status'] or
-              request['terminal_cause'] != association['terminal_cause'] or
-              request['finished_at'] is None or request['execution_generation']
-              != association['terminal_execution_generation'] or
-              request['execution_quiescence_required'] is not True or
-              request['execution_quiesced_generation']
-              != association['execution_quiesced_generation'] or
-              request['execution_quiesced_at']
-              != association['execution_quiesced_at'] or
-              any(request[field] != association[field]
-                  for field in terminal_profile_fields)))):
+             not _terminal_request_matches_association(request, association))):
             raise KueueAdmissionConflict(
                 'Exact Pod absence launch request is not terminal and quiescent.'
             )
 
-        observed_at, _ = _validate_provider_read_started_at(
+        observed_at, valid_until = _validate_provider_read_started_at(
             connection, provider_read_started_at)
         if observed_at < association['execution_quiesced_at']:
             raise KueueAdmissionConflict(
@@ -1110,17 +1743,19 @@ class KueueAdmissionRepository:
                 associations.c.association_id == target.association_id,
                 associations.c.updated_at == association['updated_at'],
                 associations.c.owner_revision == association['owner_revision'],
-                associations.c.provider_evidence == 'NOT_QUERIED').values(
-                    provider_evidence='ABSENT',
-                    provider_evidence_observed_at=observed_at,
-                    provider_evidence_payload=payload,
-                    provider_evidence_digest=digest,
-                    owner_revision=int(association['owner_revision']) + 1,
-                    updated_at=sqlalchemy.func.clock_timestamp()).returning(
+                associations.c.provider_evidence == 'NOT_QUERIED',
+                sqlalchemy.func.clock_timestamp()
+                < valid_until).values(**_provider_absence_publication_values(
+                    service,
+                    association,
+                    observed_at=observed_at,
+                    payload=payload,
+                    digest=digest)).returning(
                         *associations.c)).mappings().one_or_none()
         if updated is None:
             raise KueueAdmissionConflict(
                 'Exact Pod absence association changed before its stamp.')
+        _validate_provider_publication_completed_at(connection, valid_until)
         return dict(updated)
 
     def _lock_exact_intent(
@@ -1532,14 +2167,15 @@ class KueueAdmissionRepository:
         service_hash: str,
         service_lifecycle_epoch: int,
         targets: tuple[MaterializedAdmissionRetirementTarget, ...],
-    ) -> tuple[MaterializedAdmissionRetirementProof, ...]:
+    ) -> tuple[MaterializedRetirementProof, ...]:
         """Lock and prove the provider-clean Kueue subset of a delete batch.
 
         The caller must already hold the lifecycle and service owner locks and
         must call this before locking replica rows.  Linked East replicas are
         positively classified from their immutable version projection and
         return no proof.  A linked Kueue replica without its exact admission
-        fails closed.
+        fails closed except at the provider-free whole-service teardown
+        boundary documented below.
         """
         _require_postgres_connection(connection)
         _require_nonempty(service_name, 'service_name')
@@ -1679,10 +2315,14 @@ class KueueAdmissionRepository:
             if linked_keys_by_replica[replica_id] in discovered_admissions:
                 raise KueueAdmissionConflict(
                     'Scheduler-admitted East replica owns a Kueue admission.')
-        for replica_id in identity_by_replica:
-            if linked_keys_by_replica[replica_id] not in discovered_admissions:
-                raise KueueAdmissionConflict(
-                    'Kueue-bound protocol-v2 replica lost its admission.')
+        admissionless_replica_ids = {
+            replica_id for replica_id in identity_by_replica
+            if linked_keys_by_replica[replica_id] not in discovered_admissions
+        }
+        if (admissionless_replica_ids and
+                service['status'] not in ('SHUTTING_DOWN', 'FAILED_CLEANUP')):
+            raise KueueAdmissionConflict(
+                'Kueue-bound protocol-v2 replica lost its admission.')
 
         locked_replica_rows = connection.execute(
             sqlalchemy.select(_REPLICAS).where(
@@ -1802,15 +2442,18 @@ class KueueAdmissionRepository:
                 sqlalchemy.func.txid_current())).scalar_one())
         checked_at = connection.execute(
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
-        proofs: list[MaterializedAdmissionRetirementProof] = []
-        terminal_statuses = frozenset({'SUCCEEDED', 'FAILED', 'CANCELLED'})
+        proofs: list[MaterializedRetirementProof] = []
         for replica_id in sorted(identity_by_replica):
             key = linked_keys_by_replica[replica_id]
             intent = intents[key]
             identity = identity_by_replica[replica_id]
             admission = admissions.get(key)
             association = checked_associations[replica_id]
-            request_id = str(association['request_id'])
+            request_id_value = association['request_id']
+            if not isinstance(request_id_value, str) or not request_id_value:
+                raise KueueAdmissionConflict(
+                    'Kueue retirement lost its launch request identity.')
+            request_id = request_id_value
             linked_requests = [
                 row for row in request_rows
                 if (str(row['request_id']) == request_id or
@@ -1822,53 +2465,80 @@ class KueueAdmissionRepository:
                     'Kueue retirement found multiple launch request receipts.')
             request = linked_requests[0] if linked_requests else None
             replica = locked_by_id[replica_id]
-            if admission is None:
-                raise KueueAdmissionConflict(
-                    'Kueue-bound protocol-v2 replica lost its locked admission.'
-                )
-            checked_identity = _validate_admission_intent_identity(
-                admission, intent)
             state = replica['replica_state']
             normal_teardown = replica_id in normal_teardown_ids
             request_is_exact = bool(
-                request is not None and request['request_id'] == request_id and
-                request['ordinary_launch_association_id']
-                == association['association_id'] and request['handler_name']
-                == 'sky.server.requests.non_pool_launch:launch' and
-                request['status'] in terminal_statuses and
-                request['finished_at'] is not None and
-                request['terminal_cause'] is not None and
-                request['status'] == association['terminal_status'] and
-                request['terminal_cause'] == association['terminal_cause'] and
-                request['execution_generation']
-                == association['terminal_execution_generation'] and
-                request['execution_quiescence_required'] is True and
-                request['execution_quiesced_generation']
-                == association['execution_quiesced_generation'] and
-                request['execution_quiesced_at']
-                == association['execution_quiesced_at'] and
-                all(request[field] == association[field]
-                    for field in ('binding_protocol_version', 'profile_kind',
-                                  'profile_version', 'profile_digest',
-                                  'capability_cohort_epoch',
-                                  'capability_profile_set_digest',
-                                  'receipt_protocol_version')))
+                request is not None and
+                _terminal_request_matches_association(request, association))
+            if (replica['ordinary_launch_association_id'] is not None or
+                    replica['reserved_fill_intent_idempotency_key'] != key or
+                    not isinstance(state, Mapping) or
+                    state.get('replica_record_id') != str(
+                        expected_records[replica_id]) or
+                    state.get('reserved_fill_intent_idempotency_key') != key or
+                (request is not None and not request_is_exact)):
+                raise KueueAdmissionConflict(
+                    'Kueue retirement graph is not exact and provider-clean.')
+
+            if admission is None:
+                if (replica_id not in admissionless_replica_ids or
+                        service['status']
+                        not in ('SHUTTING_DOWN', 'FAILED_CLEANUP')):
+                    raise KueueAdmissionConflict(
+                        'Kueue-bound protocol-v2 replica lost its locked '
+                        'admission.')
+                graph = _validate_admissionless_retirement_rows_in_connection(
+                    connection,
+                    lifecycle_epoch=service_lifecycle_epoch,
+                    service=service,
+                    intent=intent,
+                    identity=identity,
+                    intent_idempotency_key=key,
+                    replica=replica,
+                    association=association,
+                    request=request,
+                    replica_id=replica_id,
+                    replica_record_id=expected_records[replica_id])
+                if (graph.provider_absence_state
+                        is not PhysicalAbsenceLoadState.ALREADY_PROVEN):
+                    raise KueueAdmissionConflict(
+                        'Admissionless retirement lacks exact terminal '
+                        'provider-absence authority.')
+                proofs.append(
+                    AdmissionlessMaterializedRetirementProof(
+                        transaction_id=transaction_id,
+                        service_name=service_name,
+                        service_hash=service_hash,
+                        service_lifecycle_epoch=service_lifecycle_epoch,
+                        intent_idempotency_key=key,
+                        intent_updated_at=intent['updated_at'],
+                        replica_id=replica_id,
+                        replica_record_id=expected_records[replica_id],
+                        provider_cluster_generation=int(
+                            association['launch_generation']),
+                        association_id=association['association_id'],
+                        association_updated_at=association['updated_at'],
+                        request_id=request_id,
+                        request_updated_at=(None if request is None else
+                                            request['updated_at']),
+                        checked_at=checked_at))
+                continue
+
+            if replica_id in admissionless_replica_ids:
+                raise KueueAdmissionConflict(
+                    'Kueue admission appeared after retirement discovery.')
+            checked_identity = _validate_admission_intent_identity(
+                admission, intent)
             if (checked_identity != identity or
                     admission['replica_id'] != replica_id or
                     admission['replica_record_id']
                     != expected_records[replica_id] or
                     admission['provider_cluster_generation']
                     != association['launch_generation'] or
-                    admission['association_id'] != association['association_id']
-                    or replica['ordinary_launch_association_id'] is not None or
-                    replica['reserved_fill_intent_idempotency_key'] != key or
-                    not isinstance(state, Mapping) or
-                    state.get('replica_record_id') != str(
-                        expected_records[replica_id]) or
-                (request is not None and not request_is_exact) or
-                (request is None and not normal_teardown)):
+                    admission['association_id']
+                    != association['association_id']):
                 raise KueueAdmissionConflict(
-                    'Kueue retirement graph is not exact and provider-clean.')
+                    'Kueue retirement admission graph is not exact.')
             if normal_teardown:
                 try:
                     info = serve_state.decode_replica_state_for_authority(
@@ -1977,10 +2647,12 @@ class KueueAdmissionRepository:
     @staticmethod
     def _validate_retirement_proofs(
         connection: sqlalchemy.engine.Connection,
-        proofs: tuple[MaterializedAdmissionRetirementProof, ...],
-    ) -> tuple[MaterializedAdmissionRetirementProof, ...]:
+        proofs: tuple[MaterializedRetirementProof, ...],
+    ) -> tuple[MaterializedRetirementProof, ...]:
         if not isinstance(proofs, tuple) or any(
-                not isinstance(proof, MaterializedAdmissionRetirementProof)
+                not isinstance(proof,
+                               (MaterializedAdmissionRetirementProof,
+                                AdmissionlessMaterializedRetirementProof))
                 for proof in proofs):
             raise TypeError('proofs must be an immutable retirement tuple.')
         keys = [proof.intent_idempotency_key for proof in proofs]
@@ -2000,13 +2672,24 @@ class KueueAdmissionRepository:
     def delete_materialized_admissions_in_connection(
         self,
         connection: sqlalchemy.engine.Connection,
-        proofs: tuple[MaterializedAdmissionRetirementProof, ...],
+        proofs: tuple[MaterializedRetirementProof, ...],
     ) -> tuple[KueueAdmissionRow, ...]:
         """Delete prelocked admissions before their replica parents."""
         _require_postgres_connection(connection)
         ordered = self._validate_retirement_proofs(connection, proofs)
         deleted_rows: list[KueueAdmissionRow] = []
         for proof in ordered:
+            if isinstance(proof, AdmissionlessMaterializedRetirementProof):
+                admission = connection.execute(
+                    sqlalchemy.select(_ADMISSIONS).where(
+                        _ADMISSIONS.c.intent_idempotency_key ==
+                        proof.intent_idempotency_key).with_for_update()
+                ).mappings().one_or_none()
+                if admission is not None:
+                    raise KueueAdmissionConflict(
+                        'Admissionless retirement found a concurrent '
+                        'admission row.')
+                continue
             row = connection.execute(
                 sqlalchemy.delete(_ADMISSIONS).where(
                     _ADMISSIONS.c.intent_idempotency_key ==
@@ -2029,7 +2712,7 @@ class KueueAdmissionRepository:
     def finalize_materialized_admission_retirements_in_connection(
         self,
         connection: sqlalchemy.engine.Connection,
-        proofs: tuple[MaterializedAdmissionRetirementProof, ...],
+        proofs: tuple[MaterializedRetirementProof, ...],
     ) -> tuple[str, ...]:
         """Delete committed intents after the caller deleted exact replicas."""
         _require_postgres_connection(connection)
@@ -2348,7 +3031,8 @@ class KueueAdmissionRepository:
             sqlalchemy.update(_ADMISSIONS).where(
                 _ADMISSIONS.c.intent_idempotency_key == intent_idempotency_key,
                 _ADMISSIONS.c.state == materialized.state.value,
-                _ADMISSIONS.c.updated_at == materialized.updated_at).values(
+                _ADMISSIONS.c.updated_at == materialized.updated_at,
+                sqlalchemy.func.clock_timestamp() < valid_until).values(
                     state=KueueAdmissionState.POD_WAITING.value,
                     pod_namespace=pod_namespace,
                     pod_name=pod_name,
@@ -2362,6 +3046,7 @@ class KueueAdmissionRepository:
         if row is None:
             raise KueueAdmissionConflict(
                 'Pod waiting receipt changed before publication.')
+        _validate_provider_publication_completed_at(connection, valid_until)
         return KueueAdmissionRow.from_mapping(row)
 
     def observe_policy_admitted_in_connection(
@@ -2410,7 +3095,7 @@ class KueueAdmissionRepository:
             raise KueueAdmissionConflict(
                 'Admitted receipt changed the exact Pod identity.')
         new_receipt = copy.deepcopy(dict(pod_receipt))
-        observed_at, _ = _validate_provider_read_started_at(
+        observed_at, valid_until = _validate_provider_read_started_at(
             connection, provider_read_started_at)
         if (materialized.observed_at is not None and
                 observed_at < materialized.observed_at):
@@ -2430,7 +3115,8 @@ class KueueAdmissionRepository:
             sqlalchemy.update(_ADMISSIONS).where(
                 _ADMISSIONS.c.intent_idempotency_key == intent_idempotency_key,
                 _ADMISSIONS.c.state == materialized.state.value,
-                _ADMISSIONS.c.updated_at == materialized.updated_at).values(
+                _ADMISSIONS.c.updated_at == materialized.updated_at,
+                sqlalchemy.func.clock_timestamp() < valid_until).values(
                     state=KueueAdmissionState.POLICY_ADMITTED.value,
                     pod_namespace=pod_namespace,
                     pod_name=pod_name,
@@ -2445,4 +3131,5 @@ class KueueAdmissionRepository:
         if row is None:
             raise KueueAdmissionConflict(
                 'Policy-admitted fact changed before publication.')
+        _validate_provider_publication_completed_at(connection, valid_until)
         return KueueAdmissionRow.from_mapping(row)

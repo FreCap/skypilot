@@ -76,6 +76,45 @@ def _identity(**overrides) -> provision_common.KueuePodAdmissionIdentity:
     return provision_common.KueuePodAdmissionIdentity(**values)
 
 
+def _lineage_identity() -> kueue_lane_lineage.KueueAdmissionIdentity:
+    fence = _fence()
+    return kueue_lane_lineage.KueueAdmissionIdentity(
+        service_name='svc',
+        service_hash='service-hash',
+        service_lifecycle_epoch=2,
+        service_version=3,
+        pool_key=fence.pool_key,
+        pool_epoch=7,
+        physical_cluster_uid=fence.physical_cluster_uid,
+        kubernetes_context=fence.kubernetes_context,
+        accelerator=fence.accelerator,
+        accelerator_count=fence.accelerator_count,
+        worker_projection_sha256=fence.worker_projection_sha256)
+
+
+def _admissionless_target(
+) -> kueue_lane_lineage.AdmissionlessPhysicalAbsenceProbeTarget:
+    return kueue_lane_lineage.AdmissionlessPhysicalAbsenceProbeTarget(
+        identity=_lineage_identity(),
+        intent_idempotency_key=_INTENT_KEY,
+        replica_id=5,
+        replica_record_id=_REPLICA_RECORD_ID,
+        provider_cluster_generation=4,
+        association_id=uuid.UUID('22222222-2222-4222-8222-222222222222'),
+        cluster_name='svc-replica-5')
+
+
+def _admissionless_load_result(
+    state: kueue_lane_lineage.PhysicalAbsenceLoadState,
+    target: kueue_lane_lineage.AdmissionlessPhysicalAbsenceProbeTarget |
+    None = None,
+) -> kueue_lane_lineage.AdmissionlessPhysicalAbsenceLoadResult:
+    result = kueue_lane_lineage.AdmissionlessPhysicalAbsenceLoadResult(
+        state, target)
+    result.validate()
+    return result
+
+
 def _observation(
     state: provision_common.KueuePodAdmissionState,
 ) -> provision_common.KueuePodAdmissionObservation:
@@ -128,6 +167,181 @@ def _transaction_engine(events: list[str]):
             events.append('transaction-commit')
 
     return types.SimpleNamespace(begin=begin)
+
+
+def _admissionless_probe_engine(events: list[str]):
+    connection = mock.Mock()
+    connection.execute.return_value.scalar_one.return_value = _READ_STARTED_AT
+
+    @contextlib.contextmanager
+    def connect():
+        events.append('connection-enter')
+        try:
+            yield connection
+        finally:
+            events.append('connection-close')
+
+    @contextlib.contextmanager
+    def begin():
+        events.append('transaction-enter')
+        try:
+            yield connection
+        except BaseException:
+            events.append('transaction-rollback')
+            raise
+        else:
+            events.append('transaction-commit')
+
+    return types.SimpleNamespace(connect=connect, begin=begin)
+
+
+def test_admissionless_teardown_uncached_absence_is_stamped_without_backfill():
+    events: list[str] = []
+    engine = _admissionless_probe_engine(events)
+    target = _admissionless_target()
+    repository = mock.MagicMock()
+    load_target = (
+        repository.
+        load_admissionless_physical_absence_probe_target_in_connection)
+    load_target.return_value = _admissionless_load_result(
+        kueue_lane_lineage.PhysicalAbsenceLoadState.NEEDS_PROBE, target)
+
+    def probe(*_args, **_kwargs):
+        assert events == [
+            'connection-enter', 'connection-close', 'connection-enter',
+            'connection-close'
+        ]
+        events.append('provider-probe')
+        return reserved_capacity.PhysicalReplicaPresence.ABSENT
+
+    def persist(*_args, **_kwargs):
+        assert events[-1] == 'transaction-enter'
+        events.append('persist-absence')
+
+    record_absence = (
+        repository.
+        record_admissionless_physical_absence_after_teardown_in_connection)
+    record_absence.side_effect = persist
+    with mock.patch.object(
+            kueue_lane_observer.serve_state_schema,
+            'get_database_engine',
+            return_value=engine), mock.patch.object(
+                kueue_lane_observer.kueue_lane_lineage,
+                'KueueAdmissionRepository',
+                return_value=repository), mock.patch.object(
+                    kueue_lane_observer.provider_phase,
+                    'provider_phase',
+                    return_value=contextlib.nullcontext()), mock.patch.object(
+                        kueue_lane_observer.kubernetes_adaptor,
+                        'physical_cluster_uid_fence',
+                        return_value=contextlib.nullcontext()
+                    ), mock.patch.object(kueue_lane_observer.reserved_capacity,
+                                         'probe_physical_replica_presence',
+                                         side_effect=probe) as provider_probe:
+        assert (kueue_lane_observer.
+                project_admissionless_physical_absence_after_teardown(
+                    'svc', 5, _REPLICA_RECORD_ID))
+
+    provider_probe.assert_called_once_with(
+        reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context=target.identity.kubernetes_context,
+            physical_cluster_uid=target.identity.physical_cluster_uid),
+        target.cluster_name,
+        use_cache=False)
+    record_absence.assert_called_once_with(
+        mock.ANY, target, provider_read_started_at=_READ_STARTED_AT)
+    repository.insert_intent_pending_in_connection.assert_not_called()
+    repository.bind_materialized_in_connection.assert_not_called()
+    assert events == [
+        'connection-enter', 'connection-close', 'connection-enter',
+        'connection-close', 'provider-probe', 'transaction-enter',
+        'persist-absence', 'transaction-commit'
+    ]
+
+
+def test_admissionless_durable_absence_replays_without_provider_io():
+    events: list[str] = []
+    engine = _admissionless_probe_engine(events)
+    repository = mock.MagicMock()
+    load_target = (
+        repository.
+        load_admissionless_physical_absence_probe_target_in_connection)
+    load_target.return_value = _admissionless_load_result(
+        kueue_lane_lineage.PhysicalAbsenceLoadState.ALREADY_PROVEN)
+
+    with mock.patch.object(
+            kueue_lane_observer.serve_state_schema,
+            'get_database_engine',
+            return_value=engine), mock.patch.object(
+                kueue_lane_observer.kueue_lane_lineage,
+                'KueueAdmissionRepository',
+                return_value=repository), mock.patch.object(
+                    kueue_lane_observer.provider_phase,
+                    'provider_phase') as provider_phase, mock.patch.object(
+                        kueue_lane_observer.reserved_capacity,
+                        'probe_physical_replica_presence') as provider_probe:
+        assert (kueue_lane_observer.
+                project_admissionless_physical_absence_after_teardown(
+                    'svc', 5, _REPLICA_RECORD_ID))
+
+    assert events == ['connection-enter', 'connection-close']
+    provider_phase.assert_not_called()
+    provider_probe.assert_not_called()
+    record_absence = (
+        repository.
+        record_admissionless_physical_absence_after_teardown_in_connection)
+    record_absence.assert_not_called()
+
+
+@pytest.mark.parametrize('presence',
+                         (reserved_capacity.PhysicalReplicaPresence.PRESENT,
+                          reserved_capacity.PhysicalReplicaPresence.UNPROVEN))
+def test_admissionless_teardown_nonabsence_fails_without_stamp_or_backfill(
+        presence):
+    events: list[str] = []
+    engine = _admissionless_probe_engine(events)
+    target = _admissionless_target()
+    repository = mock.MagicMock()
+    load_target = (
+        repository.
+        load_admissionless_physical_absence_probe_target_in_connection)
+    load_target.return_value = _admissionless_load_result(
+        kueue_lane_lineage.PhysicalAbsenceLoadState.NEEDS_PROBE, target)
+    record_absence = (
+        repository.
+        record_admissionless_physical_absence_after_teardown_in_connection)
+    with mock.patch.object(
+            kueue_lane_observer.serve_state_schema,
+            'get_database_engine',
+            return_value=engine), mock.patch.object(
+                kueue_lane_observer.kueue_lane_lineage,
+                'KueueAdmissionRepository',
+                return_value=repository), mock.patch.object(
+                    kueue_lane_observer.provider_phase,
+                    'provider_phase',
+                    return_value=contextlib.nullcontext()), mock.patch.object(
+                        kueue_lane_observer.kubernetes_adaptor,
+                        'physical_cluster_uid_fence',
+                        return_value=contextlib.nullcontext()), mock.patch.object(
+                            kueue_lane_observer.reserved_capacity,
+                            'probe_physical_replica_presence',
+                            return_value=presence) as provider_probe, \
+         pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
+                       match=presence.value):
+        (kueue_lane_observer.
+         project_admissionless_physical_absence_after_teardown(
+             'svc', 5, _REPLICA_RECORD_ID))
+
+    provider_probe.assert_called_once_with(
+        reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context=target.identity.kubernetes_context,
+            physical_cluster_uid=target.identity.physical_cluster_uid),
+        target.cluster_name,
+        use_cache=False)
+    record_absence.assert_not_called()
+    repository.insert_intent_pending_in_connection.assert_not_called()
+    repository.bind_materialized_in_connection.assert_not_called()
+    assert 'transaction-enter' not in events
 
 
 def test_observation_clock_token_is_sampled_on_a_closed_short_connection():
@@ -311,7 +525,7 @@ def test_runtime_is_derived_only_for_projected_kueue_admission(
     if not expects_runtime:
         assert runtime is None
         validate.assert_not_called()
-        assert transaction_events == []
+        assert not transaction_events
         return
     assert runtime is not None
     assert runtime.identity == _identity()

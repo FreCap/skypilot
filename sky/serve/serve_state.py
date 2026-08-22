@@ -1496,7 +1496,7 @@ def remove_service_completely(
         service_lifecycle_epoch = int(service_row[1])
         kueue_repository = None
         kueue_retirement_proofs: tuple[
-            kueue_lane_lineage.MaterializedAdmissionRetirementProof, ...] = ()
+            kueue_lane_lineage.MaterializedRetirementProof, ...] = ()
         if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
             # Lock the complete exact-lifecycle intent set first and retire
             # only provider-free pending leases.  The SHUTTING_DOWN service
@@ -7017,7 +7017,7 @@ def _prelock_and_delete_materialized_kueue_admissions(
     service_lifecycle_epoch: int,
     expected_replica_record_ids: dict[int, str],
 ) -> tuple[kueue_lane_lineage.KueueAdmissionRepository | None, tuple[
-        kueue_lane_lineage.MaterializedAdmissionRetirementProof, ...]]:
+        kueue_lane_lineage.MaterializedRetirementProof, ...]]:
     """Retire exact provider-clean admission children before replica rows."""
     if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
         return None, ()
@@ -7040,7 +7040,7 @@ def _prelock_and_delete_materialized_kueue_admissions(
 def _finalize_materialized_kueue_admissions(
     session: orm.Session,
     repository: kueue_lane_lineage.KueueAdmissionRepository | None,
-    proofs: tuple[kueue_lane_lineage.MaterializedAdmissionRetirementProof, ...],
+    proofs: tuple[kueue_lane_lineage.MaterializedRetirementProof, ...],
 ) -> None:
     """Delete exact committed intent parents after their replicas are gone."""
     if repository is None:
@@ -7099,7 +7099,7 @@ def remove_replica(
                 return False
         kueue_repository = None
         kueue_retirement_proofs: tuple[
-            kueue_lane_lineage.MaterializedAdmissionRetirementProof, ...] = ()
+            kueue_lane_lineage.MaterializedRetirementProof, ...] = ()
         if is_postgres:
             assert owner is not None
             kueue_repository, kueue_retirement_proofs = (
@@ -7201,7 +7201,7 @@ def remove_replicas(
             return False
         kueue_repository = None
         kueue_retirement_proofs: tuple[
-            kueue_lane_lineage.MaterializedAdmissionRetirementProof, ...] = ()
+            kueue_lane_lineage.MaterializedRetirementProof, ...] = ()
         if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
             kueue_repository, kueue_retirement_proofs = (
                 _prelock_and_delete_materialized_kueue_admissions(
