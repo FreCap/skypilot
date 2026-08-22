@@ -4,26 +4,44 @@ Last updated: 2026-08-22
 
 Status: the atomic reserved-capacity allocator, PostgreSQL recovery boundary,
 and Serve057 policy-admission feedback are deployed, but end-to-end reserved
-backfill is **not yet production-converged**. PR #1659 merged at
-`8af84f99fa4b1a16fbe184c463fac98e0e93847b`; release `1.1.1431` runs that
-exact commit and immutable image digest
-`sha256:5686da239b0db6e81071806029cc43b5d0f85fd3e6bf9f997b2515baa9f04bc0`
-on all six API/controller/executor Pods. Helm revision 508 has released the
-Serve controller hold, the
-consolidated controller has re-adopted `boltz-l4-fleet`, and both external-load-
-balancer slots have converged to the same release. The control plane remains
-PostgreSQL-authoritative with Helm storage disabled and has no EFS, PV, or PVC
-correctness dependency.
+backfill is **not yet production-converged**. PR #1662 merged at
+`0066ee808254cc98148f9d901b40eea01f2c91c6`; release `1.1.1432` and Helm
+revision 511 run its exact immutable image digest
+`sha256:2e9d6d16c7920849f53195cf296909d1ae48954529f611be16bda8d8e035430e`
+on all six API/controller/executor Pods and both external-load-balancer slots.
+The control plane remains PostgreSQL-authoritative with Helm storage disabled
+and has no EFS, PV, or PVC correctness dependency.
 
-That activation exposed one teardown contract gap before the intended clean
-recreation. Every retained lifecycle-84 replica was committed before Serve057
-and therefore legitimately has no `serve_kueue_admissions` row; Serve057
-deliberately performs no backfill. Its strict retirement path nevertheless
-classifies each immutable PHX projection as Kueue-bound and rejects the missing
-row even after normal provider cleanup. This blocks fenced service deletion; it
-does not indicate Kueue scarcity, paid-capacity demand, or a reason to mutate
-shared queue policy. The corrective contract below must be merged and deployed
-before normal teardown/recreation continues.
+Two independent live blockers remain before clean recreation and final fill
+proof. First, normal down advances lifecycle 84 to 85 before publishing
+`SHUTTING_DOWN`; Serve042 correctly rejects that transaction because eleven
+unresolved associations retain immutable admission lifecycle 84. Normal down
+must retain the current lifecycle under the name advisory lock; only fresh
+birth or same-name rebirth advances it. Second, each current reserved-pool
+observer commits a fresh `BLACKOUT` with `No PostgreSQL server-config identity
+is loaded in this process context.` Guarded Serve children intentionally load
+an immutable projected config with no central-config identity, but the generic
+realtime Kubernetes catalog still enters the global enabled-cloud credential
+refresh before its exact-context credential probe. The blackout leaves the
+current claim set at `allocation_generation = 0`, so no allocation map or new
+fill intent can be published.
+
+The observer correction makes every explicit-context realtime Kubernetes
+accelerator query use the immutable snapshot's policy-only allowed-cloud gate
+followed by the existing exact-context credential/RBAC and uncached provider
+reads. Non-realtime and implicit-context catalog discovery retain the central
+cached credential path. The correction does not stamp a central PostgreSQL
+identity onto derived child bytes, weaken provider/physical-UID fences, or
+introduce a Serve-only catalog branch.
+
+The 2026-08-22 14:43 UTC live census found 40 healthy free East A100-80GB GPUs
+and 55 healthy free PHX H200 GPUs. East has no Kueue admission boundary. In PHX,
+Simone's unchanged `be -> skypilot-be` path was Active with no pending research
+or SkyPilot Workload, and its GPU, CPU, memory, and EFA accounting made all 55
+H200 GPUs policy-admissible at that instant. The convergence target is every
+healthy compatible GPU that this existing policy admits, not raw occupancy
+obtained by changing its ClusterQueues, cohort, quotas, priorities, borrowing,
+or preemption behavior.
 SkyPilot PR #1650's provider proof and flat-PHX attester, PR #1651 and its
 teardown successors, and PR #1655's projected-worker finalization are all in
 that deployed image. Live readback proves Platform PR #8824 released both
@@ -2574,6 +2592,30 @@ in-tree Kubernetes create/adopt/attest boundary so success has an unambiguous
 one-way Pod-materialization transition.
 
 ## Architecture and invariants
+
+### Mixed-release trust and compatibility
+
+Durable state is not authority merely because another SkyPilot version wrote
+it. A runtime advertises the bounded protocol versions it can decode and the
+single actuation version it can write. The current release and its two
+immediate predecessors must retain read, status, recovery, and normal teardown
+support for rows inside that declared window. Only a runtime whose actuation
+capability exactly covers the durable gate may allocate or call a provider;
+unknown newer state and malformed older state fail closed without making
+teardown unavailable. New durable shapes therefore land additively, keep their
+older readers for two releases, and remove them only after the live-row and
+stale-writer gates prove the compatibility window empty.
+
+An immutable Serve child projection carries no ambient central PostgreSQL
+config identity from its parent. Provider observations re-prove their exact
+Kubernetes context, physical UID, credentials, RBAC, and deadline in the child;
+they do not treat a parent version's config receipt or process environment as
+delegated central authority. The current realtime-catalog correction changes no
+durable encoding or capability number, so current, N-1, and N-2 readers retain
+their existing behavior while the fully converged writer cohort adopts the
+correct provider-read boundary. The current rollout still requires one exact
+writer digest before actuation is reauthorized; mixed-release read
+compatibility is not permission for mixed writers.
 
 ### 1. Provider-free observation ledger
 

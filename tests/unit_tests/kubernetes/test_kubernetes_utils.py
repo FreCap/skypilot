@@ -1330,6 +1330,69 @@ def test_realtime_gpu_detection_observes_uncordon_without_cache_clear():
     assert get_nodes.call_count == 3
 
 
+def test_realtime_accelerator_gate_is_policy_only():
+    """Realtime exact-context probes must not refresh global credentials."""
+    with mock.patch(
+            'sky.catalog.kubernetes_catalog.sky_check.'
+            'get_workspace_allowed_clouds',
+            return_value=['Kubernetes']) as policy_gate, mock.patch(
+                'sky.catalog.kubernetes_catalog.sky_check.'
+                'get_cached_enabled_clouds_or_refresh',
+                side_effect=AssertionError(
+                    'global discovery used')), mock.patch(
+                        'sky.provision.kubernetes.utils.check_credentials',
+                        return_value=(False, 'test stop')) as credential_probe:
+        result = kubernetes_catalog.list_accelerators_realtime(
+            True, None, 'test-context', None)
+
+    assert result == ({}, {}, {})
+    policy_gate.assert_called_once()
+    credential_probe.assert_called_once_with('test-context', cloud='kubernetes')
+
+
+def test_realtime_accelerator_policy_rejection_avoids_provider_calls():
+    with mock.patch(
+            'sky.catalog.kubernetes_catalog.sky_check.'
+            'get_workspace_allowed_clouds',
+            return_value=[]), mock.patch(
+                'sky.provision.kubernetes.utils.check_credentials',
+                side_effect=AssertionError('provider call used')):
+        result = kubernetes_catalog.list_accelerators_realtime(
+            True, None, 'test-context', None)
+
+    assert result == ({}, {}, {})
+
+
+def test_nonrealtime_accelerator_gate_retains_cached_discovery():
+    with mock.patch(
+            'sky.catalog.kubernetes_catalog.sky_check.'
+            'get_cached_enabled_clouds_or_refresh',
+            return_value=[]) as cached_gate, mock.patch(
+                'sky.catalog.kubernetes_catalog.sky_check.'
+                'get_workspace_allowed_clouds',
+                side_effect=AssertionError('policy-only gate used')):
+        result = kubernetes_catalog.list_accelerators(True, None,
+                                                      'test-context', None)
+
+    assert result == {}
+    cached_gate.assert_called_once()
+
+
+def test_implicit_realtime_accelerator_gate_retains_cached_discovery():
+    with mock.patch(
+            'sky.catalog.kubernetes_catalog.sky_check.'
+            'get_cached_enabled_clouds_or_refresh',
+            return_value=[]) as cached_gate, mock.patch(
+                'sky.catalog.kubernetes_catalog.sky_check.'
+                'get_workspace_allowed_clouds',
+                side_effect=AssertionError('policy-only gate used')):
+        result = kubernetes_catalog.list_accelerators_realtime(
+            True, None, None, None)
+
+    assert result == ({}, {}, {})
+    cached_gate.assert_called_once()
+
+
 def test_low_priority_pod_filtering():
     """Tests that low priority pods (e.g., CoreWeave HPC verification) are excluded from GPU allocation calculations."""
     # Mock node with 8 GPUs
