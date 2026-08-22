@@ -40,6 +40,7 @@ from sky import clouds
 from sky import exceptions
 from sky import resources as resources_lib
 from sky import sky_logging
+from sky import skypilot_config
 from sky.adaptors import kubernetes
 from sky.catalog import kubernetes_catalog
 from sky.serve import constants
@@ -84,6 +85,21 @@ if not (reserved_fill_reclaim_attestation.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS
     raise RuntimeError('The reclaim-provider process lifetime must exceed the '
                        'provider operation deadline and remain inside the '
                        'provider-proof freshness horizon.')
+
+
+def require_protocol_v2_admin_policy_absent() -> None:
+    """Enforce the policy mode bound by exact reserved-fill launches.
+
+    Protocol-v2's frozen controller request is the durable resource authority.
+    Its typed provider contract binds ``absent_controller_and_executor`` rather
+    than an unjournaled policy transformation. Until a post-policy projection
+    is itself durably bound, reject a configured executor policy instead of
+    allowing retries to produce different launchable resources.
+    """
+    if skypilot_config.get_nested(('admin_policy',), None) is not None:
+        raise ReservedFillLaunchFenceError(
+            'Protocol-v2 reserved fill requires admin policy to be absent at '
+            'both controller preparation and executor replay.')
 
 
 def raise_protocol_v2_materialized_launch_error(error: Exception, *,

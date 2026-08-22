@@ -312,6 +312,44 @@ def _validate_reserved_fill_final_resources(
             'Kueue reserved fill requires exactly one task node and Pod.')
 
 
+def _finalize_reserved_fill_resources(
+    task: 'sky.Task',
+    fence: reserved_capacity.ProtocolV2LaunchFence,
+) -> None:
+    """Finalize the immutable v2 placement without re-running optimization.
+
+    A protocol-v2 intent is admitted only after the controller has reduced its
+    worker task to one exact Kubernetes location and accelerator shape.  That
+    pin is part of the executable request body and the durable launch fence;
+    optimizer output is therefore neither new placement authority nor durable
+    retry state.  Reconstruct the concrete candidate from the frozen singleton
+    on every execution attempt so a cluster row left by an earlier attempt
+    cannot make ``cluster_exists`` skip optimization and erase the plan.
+    """
+    candidates = tuple(task.resources)
+    if len(candidates) != 1:
+        raise reserved_capacity.ReservedFillLaunchFenceError(
+            'Reserved-fill launch does not contain one exact resource.')
+    # The frozen request candidate is the authority.  Discard rather than
+    # trust any process-local optimizer residue: it is neither persisted nor
+    # covered by the durable request digest on a replay.
+    candidate = candidates[0]
+    try:
+        reserved_capacity.validate_protocol_v2_launch_resources(
+            fence, candidate)
+    except ValueError as error:
+        raise reserved_capacity.ReservedFillLaunchFenceError(
+            'Reserved-fill launch no longer matches its fenced Kubernetes '
+            'context and accelerator shape.') from error
+    try:
+        launchable = candidate.assert_launchable()
+    except AssertionError as error:
+        raise reserved_capacity.ReservedFillLaunchFenceError(
+            'Reserved-fill launch does not contain a finalized launchable '
+            'resource.') from error
+    task.best_resources = launchable
+
+
 @contextlib.contextmanager
 def _reserved_fill_effect_epoch(
         launch_context: dict[str, Any]) -> typing.Iterator[None]:
@@ -516,6 +554,11 @@ def _execute(
         _extra_launch_context,
         is_launched_by_sky_serve_controller=_is_launched_by_sky_serve_controller
     )
+    if reserved_fill_launch_fence is not None:
+        # The exact provider contract binds an absent admin-policy mode. The
+        # prepared request singleton is durable; an executor-local policy
+        # result is not, so it cannot become replay placement authority.
+        reserved_capacity.require_protocol_v2_admin_policy_absent()
     has_bound_ordinary_launch_context = (
         ordinary_launch_request._has_bound_context_fields(  # pylint: disable=protected-access
             _extra_launch_context))
@@ -698,6 +741,13 @@ def _execute_dag_under_provider_fence(
     assert len(dag) == 1, f'We support 1 task for now. {dag}'
     task = dag.tasks[0]
     reserved_fill_launch_fence = _reserved_fill_launch_fence
+    if reserved_fill_launch_fence is not None:
+        # Server policy has already returned the final task.  Protocol-v2
+        # carries one exact controller-selected resource in that task, so
+        # recover it before cluster existence and Stage.OPTIMIZE can influence
+        # this attempt.  This is deterministic for both first execution and a
+        # replay after a partial provider effect.
+        _finalize_reserved_fill_resources(task, reserved_fill_launch_fence)
 
     if any(r.job_recovery is not None for r in task.resources):
         job_logger.warning(

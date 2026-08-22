@@ -2551,6 +2551,14 @@ class RetryingVmProvisioner:
         self._active_cluster_hash = to_provision_config.prev_cluster_hash
         launchable_retries_disabled = (self._dag is None or
                                        self._optimize_target is None)
+        try:
+            protocol_v2_reserved_fill = (
+                reserved_capacity.parse_protocol_v2_launch_fence(
+                    self._extra_launch_context) is not None)
+        except ValueError as error:
+            raise reserved_capacity.ReservedFillLaunchFenceError(
+                'Reserved-fill retry candidate changed its fenced '
+                'Kubernetes context or accelerator shape.') from error
         skip_if_config_hash_matches = (to_provision_config.prev_config_hash if
                                        skip_unnecessary_provisioning else None)
 
@@ -2734,6 +2742,13 @@ class RetryingVmProvisioner:
                     resources_lib.Resources(cloud=to_provision.cloud))
                 failover_history.append(e)
             except exceptions.ResourcesUnavailableError as e:
+                if protocol_v2_reserved_fill:
+                    # Preserve the exact nested provider evidence before the
+                    # ordinary no-failover/unregistered paths can replace it
+                    # with this wrapper itself.  Protocol v2 returns this one
+                    # candidate failure to reserved-fill reconciliation.
+                    logger.warning(common_utils.format_exception(e))
+                    raise
                 failover_history.append(e)
                 if e.no_failover:
                     raise e.with_failover_history(failover_history)
@@ -2749,6 +2764,17 @@ class RetryingVmProvisioner:
             else:
                 # Provisioning succeeded.
                 return config_dict
+
+            if protocol_v2_reserved_fill:
+                # One protocol-v2 request is durably bound to exactly one
+                # provider candidate.  A failed attempt must return control to
+                # reserved-fill reconciliation; re-running the optimizer here
+                # would turn that exact authority into ordinary failover. The
+                # ResourcesUnavailableError family already exited intact in
+                # its handler above; this tail terminates the remaining
+                # exception families.
+                terminal_error = failover_history[-1]
+                raise terminal_error
 
             if prev_cluster_status is None:
                 # Add failed resources to the blocklist, only when it

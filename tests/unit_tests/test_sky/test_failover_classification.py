@@ -2315,12 +2315,9 @@ def test_provision_with_retries_preserves_nested_terminal_failure(
                         lambda *_: ['acct'])
     monkeypatch.setattr(provisioner, '_retry_zones',
                         mock.Mock(side_effect=per_location_error))
-    monkeypatch.setattr(
-        backend.optimizer.Optimizer,
-        'optimize',
-        mock.Mock(side_effect=exceptions.ResourcesUnavailableError(
-            'optimizer exhausted')),
-    )
+    optimize = mock.Mock(
+        side_effect=exceptions.ResourcesUnavailableError('optimizer exhausted'))
+    monkeypatch.setattr(backend.optimizer.Optimizer, 'optimize', optimize)
     monkeypatch.setattr(backend, '_format_provision_failure_blocks',
                         lambda *_: '')
     monkeypatch.setattr(backend.rich_utils, 'force_update_status',
@@ -2336,19 +2333,14 @@ def test_provision_with_retries_preserves_nested_terminal_failure(
         )
 
     assert exc_info.value.failover_history == [per_location_error]
+    optimize.assert_called_once()
     assert backend.classify_resources_unavailable_error(
         clouds.AWS(), exc_info.value) == 'capacity'
 
 
-@pytest.mark.parametrize(
-    ('retry_context', 'retry_count'),
-    [
-        ('retargeted-context', 1),
-        ('phx-context', 2),
-    ],
-)
-def test_reserved_fill_retry_candidate_drift_is_terminal_before_provider(
-        tmp_path, monkeypatch, retry_context, retry_count):
+@pytest.mark.parametrize('no_failover', [False, True])
+def test_reserved_fill_exact_candidate_failure_is_terminal_before_optimizer(
+        tmp_path, monkeypatch, no_failover):
 
     def launchable_resources(context, count):
 
@@ -2365,7 +2357,6 @@ def test_reserved_fill_retry_candidate_drift_is_terminal_before_provider(
         return _LaunchableResources()
 
     initial_resources = launchable_resources('phx-context', 1)
-    retry_resources = launchable_resources(retry_context, retry_count)
     pool_key = reserved_capacity_broker.make_pool_key(
         'phx-context',
         'H200',
@@ -2407,9 +2398,12 @@ def test_reserved_fill_retry_candidate_drift_is_terminal_before_provider(
         prev_cluster_ever_up=False,
         prev_config_hash=None,
     )
-    provider_attempt = mock.Mock(
-        side_effect=exceptions.ResourcesUnavailableError(
-            'first exact attempt unavailable'))
+    provider_leaf = _aggregate_error('InsufficientInstanceCapacity')
+    provider_error = exceptions.ResourcesUnavailableError(
+        'first exact attempt unavailable',
+        no_failover=no_failover,
+        failover_history=[provider_leaf])
+    provider_attempt = mock.Mock(side_effect=provider_error)
     monkeypatch.setattr(provisioner, '_retry_zones', provider_attempt)
     claim = types.SimpleNamespace(request_id=request_id,
                                   worker_instance_id=str(uuid.uuid4()))
@@ -2425,26 +2419,26 @@ def test_reserved_fill_retry_candidate_drift_is_terminal_before_provider(
     monkeypatch.setattr(clouds.Kubernetes, 'check_features_are_supported',
                         lambda *_: None)
 
-    def optimize(*args, **kwargs):
-        del args, kwargs
-        task.best_resources = retry_resources
-        return dag
-
+    optimize = mock.Mock(
+        side_effect=AssertionError('v2 must not invoke optimizer'))
     monkeypatch.setattr(backend.optimizer.Optimizer, 'optimize', optimize)
     monkeypatch.setattr(backend.rich_utils, 'force_update_status',
                         lambda *_: None)
 
-    with pytest.raises(exceptions.RequestCancelled,
-                       match='retry candidate changed'):
+    with pytest.raises(exceptions.ResourcesUnavailableError,
+                       match='first exact attempt unavailable') as exc_info:
         provisioner.provision_with_retries(task,
                                            config,
                                            dryrun=False,
                                            stream_logs=False,
                                            skip_unnecessary_provisioning=False)
 
-    # The exact candidate reached the provider once. The optimizer's drifted
-    # candidate was rejected at the next iteration's terminal fence.
+    assert exc_info.value is provider_error
+    assert exc_info.value.failover_history == [provider_leaf]
+    assert backend.classify_resources_unavailable_error(
+        clouds.AWS(), exc_info.value) == 'capacity'
     provider_attempt.assert_called_once()
+    optimize.assert_not_called()
 
 
 def test_quota_notification_has_generic_actionable_context(monkeypatch):
