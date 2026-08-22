@@ -1330,8 +1330,8 @@ def test_realtime_gpu_detection_observes_uncordon_without_cache_clear():
     assert get_nodes.call_count == 3
 
 
-def test_realtime_accelerator_gate_is_policy_only():
-    """Realtime exact-context probes must not refresh global credentials."""
+def test_realtime_accelerator_gate_is_policy_only_and_fails_closed():
+    """Exact-context probe failures must not masquerade as zero capacity."""
     with mock.patch(
             'sky.catalog.kubernetes_catalog.sky_check.'
             'get_workspace_allowed_clouds',
@@ -1342,10 +1342,12 @@ def test_realtime_accelerator_gate_is_policy_only():
                     'global discovery used')), mock.patch(
                         'sky.provision.kubernetes.utils.check_credentials',
                         return_value=(False, 'test stop')) as credential_probe:
-        result = kubernetes_catalog.list_accelerators_realtime(
-            True, None, 'test-context', None)
+        with pytest.raises(
+                RuntimeError,
+                match="Cannot observe Kubernetes context.*test stop"):
+            kubernetes_catalog.list_accelerators_realtime(
+                True, None, 'test-context', None)
 
-    assert result == ({}, {}, {})
     policy_gate.assert_called_once()
     credential_probe.assert_called_once_with('test-context', cloud='kubernetes')
 
