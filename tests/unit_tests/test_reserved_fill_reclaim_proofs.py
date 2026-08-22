@@ -32,6 +32,7 @@ from test_pool_capacity_observation_pg import pg_server  # noqa: F401
 
 from sky.serve import placement_normalization_authority
 from sky.serve import pool_capacity_observation
+from sky.serve import pool_capacity_observation_schema
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_reclaim_attestation as reclaim
 from sky.serve import reserved_fill_reclaim_proof_schema as proof_schema
@@ -187,9 +188,22 @@ def _renew_receipt(
     repository: proofs.ReclaimProviderProofRepository,
     prove: Callable[[], proofs.ReclaimProviderProofCandidate],
 ) -> proofs.ReclaimProviderProofReceipt:
+    return _renew_exact_receipt(repository,
+                                identity=_identity(),
+                                gate_generation=_GATE_GENERATION,
+                                prove=prove)
+
+
+def _renew_exact_receipt(
+    repository: proofs.ReclaimProviderProofRepository,
+    *,
+    identity: reclaim.ReclaimPolicyIdentity,
+    gate_generation: int,
+    prove: Callable[[], proofs.ReclaimProviderProofCandidate],
+) -> proofs.ReclaimProviderProofReceipt:
     return repository.renew(
-        identity=_identity(),
-        gate_generation=_GATE_GENERATION,
+        identity=identity,
+        gate_generation=gate_generation,
         kubernetes_context=_CONTEXT,
         deadline_monotonic=time.monotonic() +
         reclaim.PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS,
@@ -977,6 +991,228 @@ def test_gate_rotation_rejects_old_receipt_and_cold_successor_does_not_churn(
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
                 proof_schema.serve_reserved_fill_reclaim_provider_proofs_table)
         ).scalar_one() == 1
+
+
+def test_publication_does_not_join_zero_cost_protocol_writer_convoy(
+        proof_engine):
+    """A launch wave cannot starve its deployment proof publication."""
+    protocol = pool_capacity_observation_schema.protocol_state_sequence_table
+    gate_locked = threading.Event()
+    release_gate = threading.Event()
+
+    def _hold_protocol_writer() -> None:
+        with proof_engine.connect() as connection:
+            transaction = connection.begin()
+            try:
+                connection.execute(
+                    sqlalchemy.select(protocol.c.id).where(
+                        protocol.c.id == 1).with_for_update()).one()
+                gate_locked.set()
+                assert release_gate.wait(timeout=10)
+            finally:
+                transaction.rollback()
+
+    writer = threading.Thread(target=_hold_protocol_writer,
+                              name='proof-test-protocol-writer')
+    writer.start()
+    assert gate_locked.wait(timeout=5)
+    try:
+        repository = proofs.ReclaimProviderProofRepository(proof_engine)
+        started = time.monotonic()
+        receipt = _renew_receipt(repository, _proof_candidate)
+        assert time.monotonic() - started < 1
+        with proof_engine.begin() as connection:
+            assert proofs.provider_proof_reference_holds_in_connection(
+                connection,
+                receipt.reference,
+                expected_physical_cluster_uid='physical-cluster-uid')
+    finally:
+        release_gate.set()
+        writer.join(timeout=5)
+    assert not writer.is_alive()
+
+
+def test_late_old_gate_publication_is_inert_and_successor_renews(
+        proof_engine, monkeypatch):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    revalidated = threading.Event()
+    resume_publication = threading.Event()
+    original_require = repository._require_live_gate
+
+    def _pause_after_revalidation(connection, *, identity, gate_generation):
+        original_require(connection,
+                         identity=identity,
+                         gate_generation=gate_generation)
+        if gate_generation == _GATE_GENERATION:
+            revalidated.set()
+            assert resume_publication.wait(timeout=10)
+
+    monkeypatch.setattr(repository, '_require_live_gate',
+                        _pause_after_revalidation)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_renew_receipt, repository, _proof_candidate)
+    assert revalidated.wait(timeout=5)
+    successor_identity = dataclasses.replace(_identity(),
+                                             policy_revision='successor-policy')
+    started = time.monotonic()
+    rotated = (pool_capacity_observation.PoolCapacityObservationRepository(
+        proof_engine).authorize_sequenced_reconciliation(
+            expected_generation=_GATE_GENERATION,
+            receipt=_activation_receipt(successor_identity, marker='f')))
+    assert time.monotonic() - started < 1
+    assert rotated.gate.generation == _GATE_GENERATION + 1
+    resume_publication.set()
+    old_receipt = future.result(timeout=5)
+    executor.shutdown()
+
+    with pytest.raises(proofs.ReclaimProviderProofError,
+                       match='live sequenced gate'):
+        _read_receipt(repository)
+    with proof_engine.begin() as connection:
+        assert not proofs.provider_proof_admission_ready_in_connection(
+            connection,
+            identity=_identity(),
+            gate_generation=_GATE_GENERATION,
+            kubernetes_context=_CONTEXT,
+            expected_physical_cluster_uid='physical-cluster-uid')
+        assert not proofs.provider_proof_reference_holds_in_connection(
+            connection,
+            old_receipt.reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
+
+    successor = _renew_exact_receipt(repository,
+                                     identity=successor_identity,
+                                     gate_generation=_GATE_GENERATION + 1,
+                                     prove=_proof_candidate)
+    with proof_engine.begin() as connection:
+        assert proofs.provider_proof_reference_holds_in_connection(
+            connection,
+            successor.reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
+
+
+def test_gate_rotation_during_provider_read_rejects_old_publication(
+        proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    provider_started = threading.Event()
+    resume_provider = threading.Event()
+
+    def _paused_candidate() -> proofs.ReclaimProviderProofCandidate:
+        provider_started.set()
+        assert resume_provider.wait(timeout=10)
+        return _proof_candidate()
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_renew_receipt, repository, _paused_candidate)
+    assert provider_started.wait(timeout=5)
+    successor_identity = dataclasses.replace(_identity(),
+                                             policy_revision='successor-policy')
+    rotated = (pool_capacity_observation.PoolCapacityObservationRepository(
+        proof_engine).authorize_sequenced_reconciliation(
+            expected_generation=_GATE_GENERATION,
+            receipt=_activation_receipt(successor_identity, marker='f')))
+    assert rotated.gate.generation == _GATE_GENERATION + 1
+    resume_provider.set()
+    with pytest.raises(proofs.ReclaimProviderProofError,
+                       match='live sequenced gate'):
+        future.result(timeout=5)
+    executor.shutdown()
+    with proof_engine.begin() as connection:
+        table = proof_schema.serve_reserved_fill_reclaim_provider_proofs_table
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()).select_from(table)).scalar_one() == 0
+
+
+def test_late_old_gate_invalidation_cannot_delete_successor(
+        proof_engine, monkeypatch):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    old_receipt = _renew_receipt(repository, _proof_candidate)
+    revalidated = threading.Event()
+    resume_invalidation = threading.Event()
+    original_require = repository._require_live_gate
+
+    def _pause_after_revalidation(connection, *, identity, gate_generation):
+        original_require(connection,
+                         identity=identity,
+                         gate_generation=gate_generation)
+        if gate_generation == _GATE_GENERATION:
+            revalidated.set()
+            assert resume_invalidation.wait(timeout=10)
+
+    monkeypatch.setattr(repository, '_require_live_gate',
+                        _pause_after_revalidation)
+
+    def _negative() -> proofs.ReclaimProviderProofCandidate:
+        raise reclaim.ReclaimProviderNonconformanceError('complete negative')
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_renew_receipt, repository, _negative)
+    assert revalidated.wait(timeout=5)
+    successor_identity = dataclasses.replace(_identity(),
+                                             policy_revision='successor-policy')
+    rotated = (pool_capacity_observation.PoolCapacityObservationRepository(
+        proof_engine).authorize_sequenced_reconciliation(
+            expected_generation=_GATE_GENERATION,
+            receipt=_activation_receipt(successor_identity, marker='f')))
+    assert rotated.gate.generation == _GATE_GENERATION + 1
+    successor = _renew_exact_receipt(
+        proofs.ReclaimProviderProofRepository(proof_engine),
+        identity=successor_identity,
+        gate_generation=_GATE_GENERATION + 1,
+        prove=_proof_candidate)
+    resume_invalidation.set()
+    with pytest.raises(reclaim.ReclaimProviderNonconformanceError):
+        future.result(timeout=5)
+    executor.shutdown()
+    with proof_engine.begin() as connection:
+        assert not proofs.provider_proof_reference_holds_in_connection(
+            connection,
+            old_receipt.reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
+        assert proofs.provider_proof_reference_holds_in_connection(
+            connection,
+            successor.reference,
+            expected_physical_cluster_uid='physical-cluster-uid')
+
+
+def test_negative_invalidation_does_not_join_protocol_writer_convoy(
+        proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    _renew_receipt(repository, _proof_candidate)
+    protocol = pool_capacity_observation_schema.protocol_state_sequence_table
+    gate_locked = threading.Event()
+    release_gate = threading.Event()
+
+    def _hold_protocol_writer() -> None:
+        with proof_engine.connect() as connection:
+            transaction = connection.begin()
+            try:
+                connection.execute(
+                    sqlalchemy.select(protocol.c.id).where(
+                        protocol.c.id == 1).with_for_update()).one()
+                gate_locked.set()
+                assert release_gate.wait(timeout=10)
+            finally:
+                transaction.rollback()
+
+    writer = threading.Thread(target=_hold_protocol_writer,
+                              name='proof-test-protocol-writer')
+    writer.start()
+    assert gate_locked.wait(timeout=5)
+
+    def _negative() -> proofs.ReclaimProviderProofCandidate:
+        raise reclaim.ReclaimProviderNonconformanceError('complete negative')
+
+    try:
+        started = time.monotonic()
+        with pytest.raises(reclaim.ReclaimProviderNonconformanceError):
+            _renew_receipt(repository, _negative)
+        assert time.monotonic() - started < 1
+    finally:
+        release_gate.set()
+        writer.join(timeout=5)
+    assert not writer.is_alive()
 
 
 def test_slow_database_read_is_bounded_and_reaps_launch_workers(
