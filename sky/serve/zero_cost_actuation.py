@@ -19,6 +19,7 @@ from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
 from sky.serve import reserved_fill_projection_authority
 from sky.serve import reserved_fill_reclaim_attestation
+from sky.serve import reserved_fill_reclaim_proofs
 from sky.serve import serve_state_schema
 from sky.serve import serve_statuses
 from sky.serve import zero_cost_actuation_schema
@@ -35,6 +36,8 @@ _KUEUE_ADMISSIONS = (kueue_lane_lineage_schema.serve_kueue_admissions_table)
 _PROTOCOL = serve_state_schema.reserved_fill_protocol_state_table
 _SEQUENCE = pool_capacity_observation_schema.protocol_state_sequence_table
 _PENDING_STATES = frozenset({'GRANTED', 'ACTUATING', 'RETRYABLE'})
+
+_ProviderProofAuthority = tuple[int, str, str, str, str, str]
 
 
 class ActuationMode(str, enum.Enum):
@@ -235,6 +238,74 @@ def _require_postgres(connection: sqlalchemy.engine.Connection) -> None:
 
 def _utc_from_epoch(value: float) -> datetime.datetime:
     return datetime.datetime.fromtimestamp(value, tz=datetime.timezone.utc)
+
+
+def _provider_proof_authority(
+        row: Mapping[str, Any]) -> _ProviderProofAuthority | None:
+    """Extract the exact context-wide proof authority carried by an intent."""
+    try:
+        gate_generation = row['reconciliation_gate_generation']
+        values = tuple(row[key] for key in ('reclaim_fleet_bundle_sha256',
+                                            'reclaim_policy_revision',
+                                            'reclaim_provider_inventory_sha256',
+                                            'kubernetes_context',
+                                            'physical_cluster_uid'))
+    except (KeyError, TypeError):
+        return None
+    if (type(gate_generation) is not int or gate_generation < 1 or
+            any(type(value) is not str or not value for value in values)):
+        return None
+    return (gate_generation, *values)
+
+
+def _provider_proof_ready_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    authority: _ProviderProofAuthority | None,
+    cache: dict[_ProviderProofAuthority, bool] | None = None,
+) -> bool:
+    """Return provider-free readiness, memoized per exact context authority."""
+    if authority is None:
+        return False
+    if cache is not None and authority in cache:
+        return cache[authority]
+    (gate_generation, fleet_bundle_sha256, policy_revision,
+     provider_inventory_sha256, kubernetes_context,
+     physical_cluster_uid) = authority
+    try:
+        identity = reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
+            fleet_bundle_sha256=fleet_bundle_sha256,
+            policy_revision=policy_revision,
+            provider_inventory_sha256=provider_inventory_sha256)
+    except ValueError:
+        ready = False
+    else:
+        ready = (reserved_fill_reclaim_proofs.
+                 provider_proof_admission_ready_in_connection)(
+                     connection,
+                     identity=identity,
+                     gate_generation=gate_generation,
+                     kubernetes_context=kubernetes_context,
+                     expected_physical_cluster_uid=physical_cluster_uid,
+                     minimum_remaining_seconds=(
+                         reserved_fill_reclaim_attestation.
+                         PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS))
+    if cache is not None:
+        cache[authority] = ready
+    return ready
+
+
+def _provider_proof_authority_predicate(
+    authorities: tuple[_ProviderProofAuthority, ...],
+) -> sqlalchemy.sql.ColumnElement[bool]:
+    """Build the exact intent predicate for proof-ready authorities."""
+    return sqlalchemy.or_(*(sqlalchemy.and_(
+        _INTENTS.c.reconciliation_gate_generation == authority[0],
+        _INTENTS.c.reclaim_fleet_bundle_sha256 == authority[1],
+        _INTENTS.c.reclaim_policy_revision == authority[2],
+        _INTENTS.c.reclaim_provider_inventory_sha256 == authority[3],
+        _INTENTS.c.kubernetes_context == authority[4],
+        _INTENTS.c.physical_cluster_uid == authority[5])
+                            for authority in authorities))
 
 
 def _intent_values(
@@ -1700,7 +1771,7 @@ class ZeroCostActuationRepository:
                                 IntentState.GRANTED, IntentState.ACTUATING,
                                 IntentState.RETRYABLE
                         } and admission_state is not kueue_lane_lineage.
-                             KueueAdmissionState.INTENT_PENDING):
+                                KueueAdmissionState.INTENT_PENDING):
                             deferred.append(
                                 reserved_fill_planner.DeferredFillIntent(
                                     intent,
@@ -1867,17 +1938,45 @@ class ZeroCostActuationRepository:
                                    updated_at=now,
                                    terminal_at=now))
 
+            pending_predicates = (_INTENTS.c.service_name == service_name,
+                                  _INTENTS.c.pool_key == pool_key,
+                                  _INTENTS.c.state.in_(
+                                      (IntentState.GRANTED.value,
+                                       IntentState.RETRYABLE.value)),
+                                  _INTENTS.c.valid_until > now)
+            authority_rows = connection.execute(
+                sqlalchemy.select(
+                    _INTENTS.c.reconciliation_gate_generation,
+                    _INTENTS.c.reclaim_fleet_bundle_sha256,
+                    _INTENTS.c.reclaim_policy_revision,
+                    _INTENTS.c.reclaim_provider_inventory_sha256,
+                    _INTENTS.c.kubernetes_context,
+                    _INTENTS.c.physical_cluster_uid).where(
+                        *pending_predicates).distinct()).mappings().all()
+            proof_cache: dict[_ProviderProofAuthority, bool] = {}
+            ready_authorities = tuple(authority for authority in (
+                _provider_proof_authority(row) for row in authority_rows
+            ) if authority is not None and _provider_proof_ready_in_connection(
+                connection, authority, proof_cache))
+            if not ready_authorities:
+                return ()
             rows = connection.execute(
                 sqlalchemy.select(_INTENTS).where(
-                    _INTENTS.c.service_name == service_name,
-                    _INTENTS.c.pool_key == pool_key,
-                    _INTENTS.c.state.in_(
-                        (IntentState.GRANTED.value,
-                         IntentState.RETRYABLE.value)), _INTENTS.c.valid_until
-                    > now).order_by(_INTENTS.c.created_at,
-                                    _INTENTS.c.intent_idempotency_key).limit(
-                                        max_leases).with_for_update(
-                                            skip_locked=True)).mappings().all()
+                    *pending_predicates,
+                    _provider_proof_authority_predicate(
+                        ready_authorities)).order_by(
+                            _INTENTS.c.created_at,
+                            _INTENTS.c.intent_idempotency_key).limit(
+                                max_leases).with_for_update(
+                                    skip_locked=True)).mappings().all()
+            # Close the authority-scan-to-row-lock race immediately before the
+            # lease transition.  The renewal reserve keeps this bounded check
+            # well away from the terminal launch horizon.
+            proof_cache.clear()
+            rows = [
+                row for row in rows if _provider_proof_ready_in_connection(
+                    connection, _provider_proof_authority(row), proof_cache)
+            ]
             if not rows:
                 return ()
             expires_at = now + datetime.timedelta(seconds=lease_seconds)
@@ -1922,6 +2021,7 @@ class ZeroCostActuationRepository:
                         _INTENTS.c.intent_idempotency_key).with_for_update()
             ).mappings().all()
             _retire_expired_locked(connection, rows, now)
+            proof_cache: dict[_ProviderProofAuthority, bool] = {}
             return tuple(
                 sorted({
                     str(row['pool_key'])
@@ -1930,7 +2030,9 @@ class ZeroCostActuationRepository:
                     (row['state'] in (IntentState.GRANTED.value,
                                       IntentState.RETRYABLE.value) or
                      (row['state'] == IntentState.ACTUATING.value and
-                      row['lease_expires_at'] <= now))
+                      row['lease_expires_at'] <= now)) and
+                    _provider_proof_ready_in_connection(
+                        connection, _provider_proof_authority(row), proof_cache)
                 }))
 
     def release_retryable(self, lease: IntentLease, error: str) -> bool:

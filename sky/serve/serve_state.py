@@ -12117,6 +12117,40 @@ def _stage_postgres_replica_if_round_epoch(
                     allocation_map.get('reclaim_provider_inventory_sha256')
                     != reclaim_provider_inventory_sha256):
                 return None
+            assert actuation_lease is not None
+            assert transaction_location is not None
+            proof_intent = actuation_lease.intent
+            proof_context = proof_intent.allowed_locations[0].region
+            if (proof_intent.reconciliation_gate_generation != gate_generation
+                    or proof_intent.reclaim_fleet_bundle_sha256
+                    != reclaim_fleet_bundle_sha256 or
+                    proof_intent.reclaim_policy_revision
+                    != reclaim_policy_revision or
+                    proof_intent.reclaim_provider_inventory_sha256
+                    != reclaim_provider_inventory_sha256 or
+                    proof_intent.physical_cluster_uid
+                    != expected_physical_cluster_uid or
+                    proof_context != transaction_location.region):
+                return None
+            proof_identity = (
+                reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
+                    fleet_bundle_sha256=(
+                        proof_intent.reclaim_fleet_bundle_sha256),
+                    policy_revision=proof_intent.reclaim_policy_revision,
+                    provider_inventory_sha256=(
+                        proof_intent.reclaim_provider_inventory_sha256)))
+            if not (
+                    reserved_fill_reclaim_proofs.
+                    provider_proof_admission_ready_in_connection
+            )(connection,
+              identity=proof_identity,
+              gate_generation=(proof_intent.reconciliation_gate_generation),
+              kubernetes_context=proof_context,
+              expected_physical_cluster_uid=(proof_intent.physical_cluster_uid),
+              minimum_remaining_seconds=(
+                  reserved_fill_reclaim_attestation.
+                  PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS)):
+                return None
             current_sequence = sequence_row['zero_cost_admission_sequence']
             current_ordinary_sequence = sequence_row[
                 'ordinary_zero_cost_admission_sequence']

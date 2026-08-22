@@ -27,6 +27,7 @@ from sky.serve import reserved_fill_reclaim_attestation as reclaim
 from sky.serve import reserved_fill_reclaim_proof_schema as proof_schema
 from sky.utils.db import db_utils
 from sky.utils.db import postgres_lock
+from sky.utils.db import retries as db_retries
 
 serve_state_schema = adaptors_common.LazyImport('sky.serve.serve_state_schema')
 
@@ -53,6 +54,10 @@ if (_DATABASE_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS
 
 class ReclaimProviderProofError(RuntimeError):
     """A completed provider proof could not be read or published safely."""
+
+
+class ReclaimProviderProofUnavailableError(ReclaimProviderProofError):
+    """A fresh exact receipt is temporarily unavailable to a consumer."""
 
 
 class _ReclaimProviderProofClockError(ReclaimProviderProofError):
@@ -136,9 +141,11 @@ class _ReclaimProviderProofElection:
 def _require_deadline(deadline_monotonic: float) -> float:
     if (isinstance(deadline_monotonic, bool) or
             not isinstance(deadline_monotonic, (int, float)) or
-            not math.isfinite(float(deadline_monotonic)) or
-            time.monotonic() >= float(deadline_monotonic)):
+            not math.isfinite(float(deadline_monotonic))):
         raise ReclaimProviderProofError(
+            'The provider-proof receipt deadline is invalid or expired.')
+    if time.monotonic() >= float(deadline_monotonic):
+        raise ReclaimProviderProofUnavailableError(
             'The provider-proof receipt deadline is invalid or expired.')
     return float(deadline_monotonic)
 
@@ -395,8 +402,8 @@ class ReclaimProviderProofRepository:
             gate_holds).select_from(
                 anchor.outerjoin(candidates, sqlalchemy.true()))
 
+    @staticmethod
     def _decode_query_row(
-        self,
         row: Mapping[str, Any] | None,
         *,
         identity: reclaim.ReclaimPolicyIdentity,
@@ -404,6 +411,7 @@ class ReclaimProviderProofRepository:
         kubernetes_context: str,
         local_read_started: float,
         local_read_finished: float,
+        invalid_receipt_as_missing: bool,
     ) -> tuple[ReclaimProviderProofReceipt | None, datetime.datetime]:
         if row is None:
             raise ReclaimProviderProofError(
@@ -431,7 +439,9 @@ class ReclaimProviderProofRepository:
         except _ReclaimProviderProofClockError:
             raise
         except ReclaimProviderProofError:
-            return None, database_now
+            if invalid_receipt_as_missing:
+                return None, database_now
+            raise
         return receipt, database_now
 
     @staticmethod
@@ -467,6 +477,7 @@ class ReclaimProviderProofRepository:
         kubernetes_context: str,
         deadline: float,
         connection: sqlalchemy.engine.Connection | None = None,
+        invalid_receipt_as_missing: bool = True,
     ) -> tuple[ReclaimProviderProofReceipt | None, datetime.datetime, float]:
         statement = self._read_statement(identity, gate_generation,
                                          kubernetes_context)
@@ -502,7 +513,8 @@ class ReclaimProviderProofRepository:
             gate_generation=gate_generation,
             kubernetes_context=kubernetes_context,
             local_read_started=local_started,
-            local_read_finished=local_finished)
+            local_read_finished=local_finished,
+            invalid_receipt_as_missing=invalid_receipt_as_missing)
         _require_deadline(deadline)
         return receipt, database_now, local_finished
 
@@ -581,7 +593,8 @@ class ReclaimProviderProofRepository:
             gate_generation=gate_generation,
             kubernetes_context=kubernetes_context,
             local_read_started=local_started,
-            local_read_finished=local_finished)
+            local_read_finished=local_finished,
+            invalid_receipt_as_missing=False)
         if (receipt is None or receipt.proof_payload != proof_payload or
                 receipt.reference.proof_sha256 != proof_sha256 or
                 receipt.completed_at != completed_at or
@@ -836,16 +849,30 @@ class ReclaimProviderProofRepository:
     ) -> ReclaimProviderProofReceipt:
         """Read one exact positive receipt without performing provider I/O."""
         deadline = _require_deadline(deadline_monotonic)
-        receipt, _, _ = self._read(identity=identity,
-                                   gate_generation=gate_generation,
-                                   kubernetes_context=kubernetes_context,
-                                   deadline=deadline)
-        _require_deadline(deadline)
-        if (receipt is None or
-                not self._payload_is_accepted(receipt.proof_payload, validate)
-                or not receipt.has_remaining(minimum_remaining_seconds)):
+        try:
+            receipt, _, _ = self._read(identity=identity,
+                                       gate_generation=gate_generation,
+                                       kubernetes_context=kubernetes_context,
+                                       deadline=deadline,
+                                       invalid_receipt_as_missing=False)
+        except db_retries.RETRYABLE_EXCEPTIONS as error:
+            raise ReclaimProviderProofUnavailableError(
+                'The provider-proof receipt database is temporarily '
+                'unavailable.') from error
+        except sqlalchemy.exc.SQLAlchemyError as error:
             raise ReclaimProviderProofError(
+                'The provider-proof receipt database read failed.') from error
+        _require_deadline(deadline)
+        if receipt is None:
+            raise ReclaimProviderProofUnavailableError(
                 'No fresh exact provider-proof receipt is available.')
+        if not self._payload_is_accepted(receipt.proof_payload, validate):
+            raise ReclaimProviderProofError(
+                'The fresh provider-proof receipt payload is not accepted.')
+        if not receipt.has_remaining(minimum_remaining_seconds):
+            raise ReclaimProviderProofUnavailableError(
+                'No fresh exact provider-proof receipt is available.')
+        _require_deadline(deadline)
         return receipt
 
     def renew(
@@ -909,6 +936,65 @@ class ReclaimProviderProofRepository:
                     selected = dataclasses.replace(selected,
                                                    publication_observed=True)
                 return selected
+
+
+def provider_proof_admission_ready_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    identity: reclaim.ReclaimPolicyIdentity,
+    gate_generation: int,
+    kubernetes_context: str,
+    expected_physical_cluster_uid: str,
+    minimum_remaining_seconds: float = (
+        reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS),
+) -> bool:
+    """Check exact proof readiness before starting durable provider work.
+
+    This is a provider-free flow-control predicate, not provider-effect
+    authority.  It keeps an actuation wave parked while the deployment-owned
+    proof is missing or has entered its renewal reserve.  The launch handler
+    must still obtain a policy-validated exact reference and pass
+    ``provider_proof_reference_holds_in_connection()`` immediately before the
+    concrete provider effect.
+    """
+    if (connection.dialect.name != 'postgresql' or
+            connection.get_isolation_level().upper() != 'READ COMMITTED' or
+            not isinstance(identity, reclaim.ReclaimPolicyIdentity) or
+            type(gate_generation) is not int or gate_generation < 1 or
+            type(kubernetes_context) is not str or not kubernetes_context or
+            type(expected_physical_cluster_uid) is not str or
+            not expected_physical_cluster_uid):
+        return False
+    try:
+        # These are the repository's canonical SQL/decode primitives; reuse
+        # them here so the admission predicate cannot drift from consumers.
+        # pylint: disable=protected-access
+        statement = ReclaimProviderProofRepository._read_statement(
+            identity, gate_generation, kubernetes_context)
+        local_started = time.monotonic()
+        rows = connection.execute(statement).mappings().all()
+        local_finished = time.monotonic()
+        if len(rows) != 1:
+            return False
+        receipt, _ = ReclaimProviderProofRepository._decode_query_row(
+            rows[0],
+            identity=identity,
+            gate_generation=gate_generation,
+            kubernetes_context=kubernetes_context,
+            local_read_started=local_started,
+            local_read_finished=local_finished,
+            invalid_receipt_as_missing=False)
+        # pylint: enable=protected-access
+        if receipt is None:
+            return False
+        kubernetes_summary = receipt.proof_payload.get('kubernetes')
+        return bool(receipt.is_fresh and
+                    receipt.has_remaining(minimum_remaining_seconds) and
+                    isinstance(kubernetes_summary, Mapping) and
+                    kubernetes_summary.get('physical_cluster_uid')
+                    == expected_physical_cluster_uid)
+    except (ReclaimProviderProofError, TypeError, ValueError):
+        return False
 
 
 def provider_proof_reference_holds_in_connection(

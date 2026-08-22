@@ -101,9 +101,12 @@ def test_execution_control_errors_are_picklable():
     retryable = exceptions.ExecutionRetryableError('retry', 'later', 3)
     paused = exceptions.ExecutionPausedError('pause', 'waiting', 5,
                                              {'signal': 'ready'})
+    proof_paused = exceptions.ReservedFillProviderProofPausedError(
+        'proof pause', 'waiting for renewal', 3)
 
     restored_retryable = pickle.loads(pickle.dumps(retryable))
     restored_paused = pickle.loads(pickle.dumps(paused))
+    restored_proof_paused = pickle.loads(pickle.dumps(proof_paused))
 
     assert isinstance(restored_retryable, exceptions.ExecutionRetryableError)
     assert restored_retryable.hint == 'later'
@@ -112,6 +115,9 @@ def test_execution_control_errors_are_picklable():
     assert restored_paused.hint == 'waiting'
     assert restored_paused.retry_wait_seconds == 5
     assert restored_paused.continue_condition == {'signal': 'ready'}
+    assert isinstance(restored_proof_paused,
+                      exceptions.ReservedFillProviderProofPausedError)
+    assert restored_proof_paused.retry_wait_seconds == 3
 
 
 def test_resources_unavailable_error():
@@ -609,6 +615,9 @@ def test_all_current_skypilot_exceptions_round_trip_exactly():
         exceptions.ExecutionPausedError:
             lambda: exceptions.ExecutionPausedError('paused', 'waiting', 5,
                                                     {'signal': 'ready'}),
+        exceptions.ReservedFillProviderProofPausedError:
+            lambda: exceptions.ReservedFillProviderProofPausedError(
+                'proof paused', 'waiting for renewal', 3),
         exceptions.ServerTemporarilyUnavailableError:
             lambda: exceptions.ServerTemporarilyUnavailableError('maintenance'),
     }

@@ -6,6 +6,7 @@ import concurrent.futures
 import contextlib
 import copy
 import dataclasses
+import datetime
 import functools
 import os
 import threading
@@ -38,6 +39,7 @@ from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
 from sky.serve import controller_transport
 from sky.serve import kueue_lane_lineage
+from sky.serve import kueue_lane_lineage_schema
 from sky.serve import ordinary_launch_binding
 from sky.serve import pool_capacity_observation
 from sky.serve import replica_managers
@@ -45,6 +47,7 @@ from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
 from sky.serve import reserved_fill_reclaim_attestation
+from sky.serve import reserved_fill_reclaim_proof_schema
 from sky.serve import reserved_fill_reclaim_proofs
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
@@ -163,7 +166,50 @@ def atomic_database(allocation_engine, monkeypatch):
             sqlalchemy.insert(global_user_state_schema.user_table).values(
                 id=_CREATOR_ID, name=_CREATOR_NAME,
                 created_at=int(time.time())))
+    _publish_fresh_provider_proof(allocation_engine)
     return allocation_engine
+
+
+def _publish_fresh_provider_proof(engine) -> None:
+    identity = reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
+        fleet_bundle_sha256='a' * 64,
+        policy_revision='test-policy-v1',
+        provider_inventory_sha256='b' * 64)
+    repository = reserved_fill_reclaim_proofs.ReclaimProviderProofRepository(
+        engine)
+    try:
+        repository.renew(
+            identity=identity,
+            gate_generation=1,
+            kubernetes_context=_CONTEXT,
+            deadline_monotonic=(time.monotonic() +
+                                reserved_fill_reclaim_attestation.
+                                PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS),
+            prove=lambda: reserved_fill_reclaim_proofs.
+            ReclaimProviderProofCandidate(proof_payload={
+                'aws': {},
+                'kubernetes': {
+                    'physical_cluster_uid': _UID,
+                },
+            },
+                                          oldest_completed_monotonic=time.
+                                          monotonic()),
+            validate=lambda _payload: True,
+            minimum_remaining_seconds=(
+                reserved_fill_reclaim_attestation.
+                PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS))
+    finally:
+        repository._proof_engine.dispose()
+
+
+def _age_provider_proof(engine, seconds: float) -> None:
+    table = (reserved_fill_reclaim_proof_schema.
+             serve_reserved_fill_reclaim_provider_proofs_table)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(table).values(
+                completed_at=(sqlalchemy.func.clock_timestamp() -
+                              datetime.timedelta(seconds=seconds))))
 
 
 def _authority():
@@ -195,6 +241,7 @@ def _atomic_specs(engine, count=1, *, image_id=None, authority=None):
         authority = _authority()
     serve_state.attest_service_owner_user_id(authority, _CREATOR_ID,
                                              _CREATOR_NAME)
+    _publish_fresh_provider_proof(engine)
     _, snapshot = _commit_evidence(engine)
     if image_id is not None:
         snapshot = dataclasses.replace(
@@ -1586,6 +1633,9 @@ def test_outer_commit_publishes_sequences_and_hydrates_exact_request(
     assert spec.replica_info.zero_cost_materialization_sequence is None
 
     # A lost commit ACK retries before any process-local publication.
+    # Hydration is recovery of an already-committed graph and therefore must
+    # remain independent of a newer provider-proof blackout.
+    _age_provider_proof(atomic_database, 11)
     replay, replay_receipt = reserved_fill_admission._transaction(
         spec, 7, require_existing=True)
     assert replay.already_committed
@@ -1643,6 +1693,38 @@ def test_outer_commit_publishes_sequences_and_hydrates_exact_request(
         receipt.request_id, 'different-owner', _WORKSPACE)
     assert not ordinary_launch_binding.reserved_fill_binding_authorizes_workspace(
         receipt.request_id, _CREATOR_ID, 'different-workspace')
+
+
+def test_atomic_admission_parks_before_any_suffix_when_proof_needs_renewal(
+        atomic_database, monkeypatch) -> None:
+    spec = _atomic_spec(atomic_database)
+    _age_provider_proof(atomic_database, 11)
+    _use_real_broker(monkeypatch, atomic_database)
+
+    result = reserved_fill_admission.admit(spec)
+
+    assert result.disposition is (
+        reserved_fill_admission.AdmissionDisposition.REJECTED)
+    with atomic_database.connect() as connection:
+        assert _suffix_counts(connection) == (0, 0, 0, 0, 0)
+        intent_state = connection.execute(
+            sqlalchemy.select(
+                zero_cost_actuation_schema.
+                serve_zero_cost_actuation_intents_table.c.state)).scalar_one()
+        lane = connection.execute(
+            sqlalchemy.select(kueue_lane_lineage_schema.
+                              serve_kueue_admissions_table)).mappings().one()
+    assert intent_state == zero_cost_actuation.IntentState.ACTUATING.value
+    assert lane['state'] == 'INTENT_PENDING'
+    assert lane['replica_id'] is None
+    assert lane['association_id'] is None
+
+    _publish_fresh_provider_proof(atomic_database)
+    resumed = reserved_fill_admission.admit(spec)
+    assert resumed.disposition is (
+        reserved_fill_admission.AdmissionDisposition.COMMITTED)
+    with atomic_database.connect() as connection:
+        assert _suffix_counts(connection) == (1, 1, 1, 1, 1)
 
 
 def test_reserved_fill_provider_io_holds_no_postgres_authority_session(

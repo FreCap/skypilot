@@ -4,11 +4,13 @@ Last updated: 2026-08-22
 
 Status: the atomic reserved-capacity allocator, PostgreSQL recovery boundary,
 and Serve057 policy-admission feedback are deployed, but end-to-end reserved
-backfill is **not yet production-converged**. PRs #1663--#1666 are merged
-through `45d8d066f21e582611ac61b81fa4f9f11401decf`; release `1.1.1436` and
-Helm revision 523 run exact immutable image digest
-`sha256:e203746fca10cd4ed6e80b67786d1beef56933b1cf45d6ff4cc458bd2d650d54`
-on the complete API/controller/executor cohort. The control plane remains
+backfill is **not yet production-converged**. PR #1667 is merged at
+`69572f4029e22e375736f5d02ca73d882b478c88`; release `1.1.1437` and Helm
+revision 525 run exact immutable image digest
+`sha256:02d8849aa13f14b160925b0e0c6b370ba803577bf74e63af7318f368a1e7dc4b`
+on the complete API/controller/executor cohort. That release contains exact
+protocol-v2 resource replay, no retry optimization, absent-admin-policy
+enforcement, and non-pool capability cohort 3. The control plane remains
 PostgreSQL-authoritative with Helm storage disabled and has no EFS, PV, or PVC
 correctness dependency.
 
@@ -24,8 +26,8 @@ stopped below scheduler-fit residual while Kueue had no pending Workload, so
 the remaining blocker is upstream SkyPilot actuation, not Simone's queue
 policy. Lifecycle 85 was subsequently removed by normal evidence-backed purge.
 The current production state is **no `boltz-l4-fleet` service** and no fleet
-Pod in East or PHX; this clean absence is deliberate while the executor
-correction in PR #1667 is completed and deployed.
+Pod in East or PHX; this clean absence is deliberate while the provider-proof
+flow-control correction is merged and deployed.
 
 That clean run exposed two coupled executor defects. Protocol-v2 requests were
 deserialized with no `best_resources` and unnecessarily ran the optimizer even
@@ -36,7 +38,7 @@ the 30-second receipts to expire, so otherwise valid launches failed closed. A
 retry after any partial cluster record then skipped
 optimization and failed with `Reserved-fill launch has no finalized
 resources`, causing SkyPilot to tear down healthy runtime-ready Pods. The
-pending PR #1667 correction makes the request's one frozen, already-launchable
+merged PR #1667 correction makes the request's one frozen, already-launchable
 Kubernetes resource the only protocol-v2 placement authority. The
 server-controller preparation boundary requires configured `admin_policy` to
 be absent before request freezing and hashing, and the executor requires the
@@ -55,19 +57,22 @@ optimizer or cross-placement failover. Thus v2 invokes neither the initial nor
 retry optimizer; ordinary launches retain their existing policy and optimizer
 behavior. The terminal return preserves the exact nested typed provider
 history, so capacity and quota evidence remains classifiable without turning
-that evidence into retry authority. This correction is pending review/merge in
-PR #1667 and is **not** in
-release `1.1.1436` or Helm revision 523. Its direct-Helm deployment, canonical
-service recreation, free-capacity convergence, paid-residual proof, telemetry,
-takeover, and full production horizon all remain open.
+that evidence into retry authority. This correction is deployed in release
+`1.1.1437` / Helm revision 525. Canonical service recreation, free-capacity
+convergence, paid-residual proof, telemetry, takeover, and the full production
+horizon remain open.
 
-Because this correction changes executor/provider semantics, PR #1667 rotates
-the existing non-pool capability cohort from 2 to 3. Mixed writer cohorts fail
-the existing fleet barrier, and the already-implemented adjacent-cohort path
-allows only settlement and cleanup of cohort-2 work; it cannot admit a new
-request or enter provider I/O. The service remains absent during the Helm
-rollout and is recreated only after all API, controller, and executor writers
-advertise cohort 3.
+Because exact replay changed executor/provider semantics, PR #1667 rotated the
+non-pool capability cohort from 2 to 3. The follow-up provider-proof contract
+rotates it from 3 to 4: a stale or missing exact proof parks durable intent
+before leasing, again before atomic replica/request/Kueue staging, and as a
+typed pre-effect executor pause if the receipt expires later. Malformed proof,
+authority drift, and every post-effect ambiguity remain terminal. Mixed writer
+cohorts fail the existing fleet barrier, while adjacent cohorts may only read,
+settle, recover, or clean already-owned work; they cannot admit a new request
+or enter provider I/O. The service remains absent during the Helm rollout and
+is recreated only after every API, controller, and executor writer advertises
+cohort 4 and the exact deployed proof-policy bundle is fix-forward activated.
 
 The following lifecycle-84 cleanup account is retained as incident history,
 not current service state. Before the `1.1.1436` correction, normal fenced down
@@ -110,14 +115,20 @@ catalog discovery retain the central cached credential path. The correction
 does not stamp a central PostgreSQL identity onto derived child bytes, weaken
 provider/physical-UID fences, or introduce a Serve-only catalog branch.
 
-The 2026-08-22 14:43 UTC live census found 40 healthy free East A100-80GB GPUs
-and 55 healthy free PHX H200 GPUs. East has no Kueue admission boundary. In PHX,
-Simone's unchanged `be -> skypilot-be` path was Active with no pending research
-or SkyPilot Workload, and its GPU, CPU, memory, and EFA accounting made all 55
-H200 GPUs policy-admissible at that instant. The convergence target is every
-healthy compatible GPU that this existing policy admits, not raw occupancy
-obtained by changing its ClusterQueues, cohort, quotas, priorities, borrowing,
-or preemption behavior.
+The latest 2026-08-22 read-only PHX census found all 64 H200 nodes Ready, 512
+allocatable H200 GPUs, 402 consumed by research, and 110 raw candidate slots;
+CPU and memory were not tighter constraints. Because the service is absent,
+there are currently zero SkyPilot Workloads and therefore zero presently
+Kueue-admitted SkyPilot slots. East has no Kueue admission boundary. The
+production denominator is established after recreation: every non-finished
+SkyPilot Workload with `QuotaReserved=True` and `Admitted=True` must map one to
+one to a durable intent, replica, request, and provisioning or Ready runtime.
+SkyPilot must submit enough work to cover every broker grant; any remaining raw
+idle PHX GPU is acceptable only when an exact submitted Workload is visibly
+withheld by Kueue's unchanged policy. The convergence target is every healthy
+compatible GPU this existing policy admits, not raw occupancy obtained by
+changing Simone's ClusterQueues, LocalQueues, cohort, flavors, quotas,
+priorities, borrowing, preemption, or scheduler behavior.
 SkyPilot PR #1650's provider proof and flat-PHX attester, PR #1651 and its
 teardown successors, and PR #1655's projected-worker finalization are all in
 that deployed image. Live readback proves Platform PR #8824 released both
@@ -241,10 +252,11 @@ raw occupancy work-conserving in this state requires research-owner approval to
 change borrowing/preemption semantics and is outside this design. Automatic
 reserved backfill, live proof of current-request telemetry, and the
 immediate/+10/+30/full-horizon production proofs remain open. The deployed
-`1.1.1436` writer is fix-forward authorized and Serve057 plus the
+`1.1.1437` writer is fix-forward authorized and Serve057, exact replay, and the
 admissionless-retirement contract are merged, deployed, and exercised through
-normal purge. PR #1667 is the remaining source/deployment gate. After its
-direct-Helm rollout, one fresh Serve057-native recreation must be proven until
+normal purge. The typed proof-pause plus pre-materialization proof circuit is
+the remaining source/deployment gate. After its direct-Helm rollout and cohort-4
+activation, one fresh Serve057-native recreation must be proven until
 every genuinely healthy, compatible, policy-admissible free-capacity
 observation converges to zero. Exact completed logical requests
 require the separate PostgreSQL idempotency/completeness contract described

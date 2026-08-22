@@ -716,6 +716,89 @@ def test_committed_provider_guard_uses_frozen_handoff_fresh_proof_and_uid(
     assert deadline > time.monotonic()
 
 
+def test_committed_provider_guard_pauses_typed_proof_unavailability_before_effect(
+        monkeypatch):
+    context = _launch_context()
+    provisioner = _provisioner(context)
+    committed = mock.Mock(return_value=True)
+    physical = mock.Mock()
+
+    def _unavailable(*_args, **_kwargs):
+        raise reclaim.ReclaimProviderProofUnavailableError(
+            'proof renewer has not published yet')
+
+    _install_launch_policy(monkeypatch, callback=_unavailable)
+    monkeypatch.setattr(serve_state,
+                        'reserved_fill_committed_launch_authority_holds',
+                        committed)
+    monkeypatch.setattr(backend.kubernetes_adaptor,
+                        'physical_cluster_uid_fence', physical)
+
+    with pytest.raises(
+            exceptions.ReservedFillProviderProofPausedError) as error:
+        with provisioner._reserved_fill_committed_provider_guard(
+                _launch_snapshot(context)):
+            pytest.fail('provider body must not run')
+
+    assert error.value.retry_wait_seconds == 3
+    committed.assert_not_called()
+    physical.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    'attestation_error',
+    (reclaim.ReclaimAttestationError('malformed proof'),
+     reclaim.ReclaimProviderNonconformanceError('provider mismatch')))
+def test_committed_provider_guard_keeps_permanent_attestation_terminal(
+        monkeypatch, attestation_error):
+    context = _launch_context()
+    provisioner = _provisioner(context)
+    committed = mock.Mock(return_value=True)
+    physical = mock.Mock()
+
+    def _refused(*_args, **_kwargs):
+        raise attestation_error
+
+    _install_launch_policy(monkeypatch, callback=_refused)
+    monkeypatch.setattr(serve_state,
+                        'reserved_fill_committed_launch_authority_holds',
+                        committed)
+    monkeypatch.setattr(backend.kubernetes_adaptor,
+                        'physical_cluster_uid_fence', physical)
+
+    with pytest.raises(exceptions.ReservedFillLaunchFenceError) as error:
+        with provisioner._reserved_fill_committed_provider_guard(
+                _launch_snapshot(context)):
+            pytest.fail('provider body must not run')
+
+    assert not isinstance(error.value, exceptions.ExecutionRetryableError)
+    committed.assert_not_called()
+    physical.assert_not_called()
+
+
+def test_committed_provider_guard_rejects_proof_pause_after_effect_started(
+        monkeypatch):
+    context = _launch_context()
+    provisioner = _provisioner(context)
+    _install_launch_policy(monkeypatch)
+    monkeypatch.setattr(serve_state,
+                        'reserved_fill_committed_launch_authority_holds',
+                        lambda *_args: True)
+    monkeypatch.setattr(backend.kubernetes_adaptor,
+                        'physical_cluster_uid_fence',
+                        lambda *_args: contextlib.nullcontext())
+    late_pause = exceptions.ReservedFillProviderProofPausedError(
+        'late pause', 'must fail closed', retry_wait_seconds=3)
+
+    with pytest.raises(exceptions.ReservedFillLaunchFenceError) as error:
+        with provisioner._reserved_fill_committed_provider_guard(
+                _launch_snapshot(context)):
+            raise late_pause
+
+    assert error.value.__cause__ is late_pause
+    assert not isinstance(error.value, exceptions.ExecutionRetryableError)
+
+
 def test_mutable_successor_state_cannot_revoke_committed_provider_epochs(
         monkeypatch):
     context = _launch_context()

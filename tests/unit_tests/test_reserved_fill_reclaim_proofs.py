@@ -665,7 +665,7 @@ def test_repository_preserves_url_options_and_installs_named_metrics(
 def test_cold_consumer_withholds_admission_without_creating_proof(proof_engine):
     repository = proofs.ReclaimProviderProofRepository(proof_engine)
 
-    with pytest.raises(proofs.ReclaimProviderProofError,
+    with pytest.raises(proofs.ReclaimProviderProofUnavailableError,
                        match='No fresh exact'):
         _read_receipt(repository)
 
@@ -674,6 +674,43 @@ def test_cold_consumer_withholds_admission_without_creating_proof(proof_engine):
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
                 proof_schema.serve_reserved_fill_reclaim_provider_proofs_table)
         ).scalar_one() == 0
+
+
+def test_admission_readiness_requires_exact_receipt_and_renewal_reserve(
+        proof_engine):
+    repository = proofs.ReclaimProviderProofRepository(proof_engine)
+    _renew_receipt(repository, _proof_candidate)
+
+    def ready(connection, **overrides):
+        arguments = {
+            'identity': _identity(),
+            'gate_generation': _GATE_GENERATION,
+            'kubernetes_context': _CONTEXT,
+            'expected_physical_cluster_uid': 'physical-cluster-uid',
+            'minimum_remaining_seconds':
+                reclaim.PROVIDER_PROOF_RENEW_MIN_REMAINING_SECONDS,
+        }
+        arguments.update(overrides)
+        return proofs.provider_proof_admission_ready_in_connection(
+            connection, **arguments)
+
+    with proof_engine.connect() as connection:
+        assert ready(connection)
+        assert not ready(connection,
+                         expected_physical_cluster_uid='different-cluster')
+        assert not ready(connection, gate_generation=_GATE_GENERATION + 1)
+
+    with proof_engine.connect().execution_options(
+            isolation_level='REPEATABLE READ') as connection:
+        assert not ready(connection)
+
+    with proof_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                proof_schema.serve_reserved_fill_reclaim_provider_proofs_table).
+            values(completed_at=(sqlalchemy.func.clock_timestamp() -
+                                 datetime.timedelta(seconds=11))))
+        assert not ready(connection)
 
 
 def test_one_renewal_serves_100_concurrent_consumers_without_provider_io(
@@ -767,7 +804,7 @@ def test_changed_positive_rotates_and_proven_negative_revokes(proof_engine):
 
     with pytest.raises(reclaim.ReclaimProviderNonconformanceError):
         _renew_receipt(repository, prove_negative)
-    with pytest.raises(proofs.ReclaimProviderProofError,
+    with pytest.raises(proofs.ReclaimProviderProofUnavailableError,
                        match='No fresh exact'):
         _read_receipt(repository)
     with proof_engine.begin() as connection:
@@ -959,7 +996,7 @@ def test_slow_database_read_is_bounded_and_reaps_launch_workers(
     with mock.patch.object(policy_lib.reserved_fill_reclaim_proofs,
                            'ReclaimProviderProofRepository',
                            return_value=repository):
-        with pytest.raises(reclaim.ReclaimAttestationError,
+        with pytest.raises(reclaim.ReclaimProviderProofUnavailableError,
                            match='no fresh exact'):
             policy.authorize_launch(_launch_scope(policy),
                                     expected_identity=policy.policy_identity(),
@@ -991,7 +1028,7 @@ def test_blackholed_connect_is_single_attempt_reaps_workers_and_recovers(
         with mock.patch.object(policy_lib.reserved_fill_reclaim_proofs,
                                'ReclaimProviderProofRepository',
                                return_value=repository):
-            with pytest.raises(reclaim.ReclaimAttestationError,
+            with pytest.raises(reclaim.ReclaimProviderProofUnavailableError,
                                match='no fresh exact'):
                 policy.authorize_launch(
                     _launch_scope(policy),
@@ -2552,6 +2589,11 @@ def test_malformed_receipt_is_reproved_under_exact_lock(proof_engine):
                 SET proof_sha256 = :wrong_digest
             """), {'wrong_digest': 'f' * 64})
 
+    with pytest.raises(proofs.ReclaimProviderProofError) as error:
+        _read_receipt(repository)
+    assert not isinstance(error.value,
+                          proofs.ReclaimProviderProofUnavailableError)
+
     refreshed = repository.renew(**kwargs,
                                  deadline_monotonic=time.monotonic() + 5)
 
@@ -2595,11 +2637,13 @@ def test_semantically_wrong_receipt_is_repaired_only_by_renewer(
                            'ReclaimProviderProofRepository',
                            return_value=repository):
         with pytest.raises(reclaim.ReclaimAttestationError,
-                           match='no fresh exact'):
+                           match='receipt is invalid') as error:
             policy.authorize_launch(_launch_scope(policy),
                                     expected_identity=policy.policy_identity(),
                                     expected_gate_generation=_GATE_GENERATION,
                                     deadline_monotonic=deadline)
+        assert not isinstance(error.value,
+                              reclaim.ReclaimProviderProofUnavailableError)
         assert not provider_calls
         repository.renew(
             identity=policy.policy_identity(),
