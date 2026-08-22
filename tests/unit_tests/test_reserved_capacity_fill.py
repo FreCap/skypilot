@@ -6510,6 +6510,16 @@ class TestQueryFreeSlots(unittest.TestCase):
                 reserved_capacity.query_free_slots_by_context(locations),
                 {'research-ctx': 0})
 
+    def test_demand_snapshot_treats_observation_failure_as_unknown(self):
+        locations = [self._k8s_location(gpu='A100')]
+        with mock.patch.object(
+                reserved_capacity.kubernetes_catalog,
+                'list_accelerators_realtime',
+                side_effect=RuntimeError('credential probe failed')):
+            self.assertEqual(
+                reserved_capacity.query_free_slots_by_context(locations),
+                {'research-ctx': None})
+
     def test_shared_demand_cache_returns_raw_gpus_per_accelerator(self):
         locations = [
             self._k8s_location(gpu='A100', count=8),

@@ -29,10 +29,13 @@ fill intent can be published.
 The observer correction makes every explicit-context realtime Kubernetes
 accelerator query use the immutable snapshot's policy-only allowed-cloud gate
 followed by the existing exact-context credential/RBAC and uncached provider
-reads. Non-realtime and implicit-context catalog discovery retain the central
-cached credential path. The correction does not stamp a central PostgreSQL
-identity onto derived child bytes, weaken provider/physical-UID fences, or
-introduce a Serve-only catalog branch.
+reads. A policy-disabled context is a successful zero-capacity result, while a
+failed credential, RBAC, transport, or measurement probe raises into the
+observer's `BLACKOUT` path; it can never masquerade as authoritative zero and
+withdraw confirmed reserved holdings. Non-realtime and implicit-context
+catalog discovery retain the central cached credential path. The correction
+does not stamp a central PostgreSQL identity onto derived child bytes, weaken
+provider/physical-UID fences, or introduce a Serve-only catalog branch.
 
 The 2026-08-22 14:43 UTC live census found 40 healthy free East A100-80GB GPUs
 and 55 healthy free PHX H200 GPUs. East has no Kueue admission boundary. In PHX,

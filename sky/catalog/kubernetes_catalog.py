@@ -189,8 +189,20 @@ def _list_accelerators(
     if context is None:
         return {}, {}, {}
 
-    # Verify that the credentials are still valid.
-    if not kubernetes_utils.check_credentials(context, cloud='kubernetes')[0]:
+    # Verify that the credentials are still valid.  An explicit realtime
+    # observation is an authority input: credential, RBAC, or transport
+    # failure must remain distinguishable from a successful observation of
+    # zero capacity.  Its callers turn this exception into BLACKOUT and retain
+    # the last confirmed allocation instead of authoritatively withdrawing
+    # reserved capacity.  Legacy discovery callers retain their historical
+    # empty-result behavior.
+    credentials_ok, credential_error = kubernetes_utils.check_credentials(
+        context, cloud='kubernetes')
+    if not credentials_ok:
+        if realtime and region_filter is not None:
+            detail = credential_error or 'unknown credential probe failure'
+            raise RuntimeError('Cannot observe Kubernetes context '
+                               f'{context!r}: {detail}')
         return {}, {}, {}
     kubernetes.raise_if_api_call_deadline_exceeded()
 
