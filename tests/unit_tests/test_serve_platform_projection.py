@@ -230,10 +230,10 @@ def test_worker_projection_protocol_v5_is_canonical_and_older_are_isolated():
     missing_timeout.pop('provision_timeout')
     with pytest.raises(ValueError, match='protocol-v3/v4/v5 keys'):
         kubernetes_identity.worker_projection_protocol_version(missing_timeout)
-    assert (kubernetes_identity.worker_projection_sha256(v3) !=
-            kubernetes_identity.worker_projection_sha256(v4))
-    assert (kubernetes_identity.worker_projection_sha256(v4) !=
-            kubernetes_identity.worker_projection_sha256(v5))
+    assert (kubernetes_identity.worker_projection_sha256(v3)
+            != kubernetes_identity.worker_projection_sha256(v4))
+    assert (kubernetes_identity.worker_projection_sha256(v4)
+            != kubernetes_identity.worker_projection_sha256(v5))
 
 
 def test_worker_projection_v3_digest_covers_scratch():
