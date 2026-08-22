@@ -85,10 +85,10 @@ def _make_provision_config(count):
 
 
 @pytest.mark.parametrize(('protocol_version', 'scratch', 'message'), [
-    (3, None, 'v3/v4 requires the complete worker scratch'),
+    (5, None, 'v3/v4/v5 requires the complete worker scratch'),
     (2, {
         'kind': 'none'
-    }, 'Only projection protocol v3/v4'),
+    }, 'Only projection protocol v3/v4/v5'),
     (3, {
         'kind': 'memory',
         'size_limit_bytes': 1024,
@@ -111,9 +111,10 @@ def test_create_pods_rejects_invalid_worker_scratch_provider_contract(
 
 
 @pytest.mark.parametrize(('protocol_version', 'bootstrap_sha256', 'message'), [
-    (4, None, 'v4 requires the complete worker runtime bootstrap'),
-    (4, 'A' * 64, '64 lowercase hexadecimal'),
-    (3, '0' * 64, 'Only projection protocol v4'),
+    (4, None, 'v4/v5 requires the complete worker runtime bootstrap'),
+    (5, None, 'v4/v5 requires the complete worker runtime bootstrap'),
+    (5, 'A' * 64, '64 lowercase hexadecimal'),
+    (3, '0' * 64, 'Only projection protocol v4/v5'),
 ])
 def test_create_pods_rejects_invalid_worker_runtime_bootstrap_contract(
         monkeypatch, protocol_version, bootstrap_sha256, message):
@@ -355,6 +356,83 @@ def test_create_pods_rejects_finalizer_runtime_bootstrap_drift_before_create(
         'serve_worker_expected_scratch': {
             'kind': 'none',
         },
+        'serve_worker_expected_runtime_bootstrap_sha256': bootstrap_sha256,
+    })
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='finalized SkyServe worker Pod changed'):
+        instance._create_pods('us', cluster_on_cloud, cluster_on_cloud, config)
+
+    create_pod.assert_not_called()
+
+
+def test_create_pods_rejects_finalizer_v5_runtime_environment_drift_before_create(
+        monkeypatch):
+    cluster_on_cloud = 'runtime-environment-finalizer-drift'
+    _patch_create_pods_k8s_boundary(monkeypatch, {}, None)
+    monkeypatch.setattr(kubernetes_utils, 'get_allowed_nodes_config',
+                        lambda _context: None)
+    monkeypatch.setattr(kubernetes_utils, 'inject_allowed_nodes_affinity',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(subprocess_utils, 'run_in_parallel',
+                        lambda fn, items, *_args: [fn(i) for i in items])
+    create_pod = mock.Mock()
+    monkeypatch.setattr(instance, '_create_namespaced_pod_with_retries',
+                        create_pod)
+
+    scratch = {
+        'kind': 'memory',
+        'mount_path': '/tmp',
+        'volume_name': 'skypilot-serve-worker-tmp',
+        'size_limit_bytes': 20 * 1024**3,
+    }
+    runtime_environment = {
+        'SKY_RUNTIME_DIR': '/tmp',
+        'UV_CACHE_DIR': '/tmp/uv-cache',
+    }
+    pod_spec = {
+        'containers': [{
+            'name': 'ray-node',
+            'command': ['/bin/bash', '-c', '--'],
+            'args': ['canonical bootstrap'],
+        }],
+    }
+    instance.pod_spec_lib.enforce_projected_worker_scratch_contract(
+        pod_spec, scratch, rewrite=True)
+    bootstrap_sha256 = (instance.pod_spec_lib.
+                        projected_worker_runtime_bootstrap_sha256(pod_spec))
+    readiness = (instance.pod_spec_lib.
+                 enforce_projected_worker_runtime_readiness_contract(
+                     pod_spec,
+                     rewrite=True,
+                     expected_bootstrap_sha256=bootstrap_sha256,
+                     expected_runtime_environment=runtime_environment))
+    assert readiness.matches
+
+    def mutate_runtime_environment_after_finalization(template, **kwargs):
+        finalized = copy.deepcopy(template)
+        finalized['metadata']['name'] = kwargs['pod_name']
+        runtime = finalized['spec']['containers'][0]
+        next(entry for entry in runtime['env']
+             if entry['name'] == 'UV_CACHE_DIR')['value'] = '/forged-cache'
+        return finalized
+
+    monkeypatch.setattr(instance.pod_spec_lib, 'finalize_pod_spec',
+                        mutate_runtime_environment_after_finalization)
+    config = _make_provision_config(count=1)
+    config.node_config['spec'] = pod_spec
+    config.provider_config.update({
+        'serve_worker_projection_protocol_version': 5,
+        'serve_worker_expected_priority_class_name': None,
+        'serve_worker_expected_priority_value': None,
+        'serve_worker_expected_preemption_policy': None,
+        'serve_worker_expected_service_account_name': 'inference-worker',
+        'serve_worker_expected_scheduler_name': 'default-scheduler',
+        'serve_worker_expected_accelerator_label_key': 'nvidia.com/gpu.product',
+        'serve_worker_expected_accelerator_label_values': ['NVIDIA-H200'],
+        'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
+        'serve_worker_expected_accelerator_count': 1,
+        'serve_worker_expected_scratch': scratch,
         'serve_worker_expected_runtime_bootstrap_sha256': bootstrap_sha256,
     })
 
