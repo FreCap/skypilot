@@ -1307,6 +1307,100 @@ class TestBackgroundDutyOwnershipLifecycle:
         mgr._refresh_thread_pool.assert_called_once_with()
 
 
+def test_replica_launch_task_clones_cached_template_and_omits_display_yaml():
+    yaml_content = """
+resources:
+  cpus: 1
+  ports: 8080
+service:
+  readiness_probe: /health
+  replica_policy:
+    min_replicas: 0
+    max_replicas: 2
+    target_qps_per_replica: 1
+run: echo hi
+"""
+    template = replica_managers.task_lib.Task.from_yaml_str(yaml_content)
+    assert template._user_specified_yaml == yaml_content
+
+    with mock.patch.object(
+            replica_managers,
+            'load_task_with_service_spec',
+            side_effect=AssertionError('cached version must not be reparsed')):
+        first = replica_managers._build_replica_launch_task(
+            yaml_content,
+            1,
+            None,
+            exact_resources_override=False,
+            authoritative_service_spec=template.service,
+            service_name=None,
+            task_template=template)
+        second = replica_managers._build_replica_launch_task(
+            yaml_content,
+            2,
+            None,
+            exact_resources_override=False,
+            authoritative_service_spec=template.service,
+            service_name=None,
+            task_template=template)
+
+    assert first is not template
+    assert second is not template
+    assert first is not second
+    assert template._user_specified_yaml == yaml_content
+    assert replica_managers.serve_constants.REPLICA_ID_ENV_VAR not in (
+        template.envs)
+    assert first.envs[replica_managers.serve_constants.REPLICA_ID_ENV_VAR] == (
+        '1')
+    assert second.envs[replica_managers.serve_constants.REPLICA_ID_ENV_VAR] == (
+        '2')
+    assert '_user_specified_yaml' not in first.to_yaml_config()
+    assert '_user_specified_yaml' not in second.to_yaml_config()
+
+
+def test_manager_parses_an_immutable_service_version_once():
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    template = mock.sentinel.task_template
+    spec = mock.sentinel.service_spec
+
+    with mock.patch.object(replica_managers,
+                           'load_task_with_service_spec',
+                           return_value=template) as parse:
+        first = manager._task_template_for_version(7, 'service: yaml', spec)
+        second = manager._task_template_for_version(7, 'ignored: yaml', spec)
+
+    assert first is template
+    assert second is template
+    parse.assert_called_once_with('service: yaml', spec)
+
+
+def test_service_version_task_cache_is_bounded_and_keeps_current_version():
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager.latest_version = 4
+    tasks = {
+        version: getattr(mock.sentinel, f'task_{version}')
+        for version in range(1, 5)
+    }
+
+    for version, task in tasks.items():
+        manager._cache_task_template(version, task)
+
+    assert manager._version_task_templates == {
+        2: tasks[2],
+        3: tasks[3],
+        4: tasks[4],
+    }
+    old_recovery_task = mock.sentinel.old_recovery_task
+    manager._cache_task_template(1, old_recovery_task)
+    assert manager._version_task_templates == {
+        3: tasks[3],
+        4: tasks[4],
+        1: old_recovery_task,
+    }
+
+
 class TestGetResourcesPorts:
 
     def test_infers_common_port_from_heterogeneous_resources(self):
@@ -5682,6 +5776,7 @@ class TestLaunchReplicaAvailabilityMaxRetry:
         manager.yaml_content = 'dummy: yaml'
         manager.latest_version = 1
         manager._version_specs = {1: mock.Mock()}
+        manager._version_task_templates = {1: mock.Mock(name='task_template')}
         manager._launch_thread_pool = thread_utils.ThreadSafeDict()
         manager._replica_to_request_id = thread_utils.ThreadSafeDict()
         manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
@@ -5900,6 +5995,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
         build_placer.assert_not_called()
         new_placer.inherit_preemption_state.assert_called_once_with(old_placer)
         assert mgr._spot_placer is new_placer
+        assert mgr._version_task_templates[2] is new_task
         assert mgr.get_target_num_replicas() is None
 
     def test_reuses_distinct_old_version_yamls(self):
@@ -13755,6 +13851,7 @@ class TestLaunchReplicaSnapshotAccumulation:
         manager.yaml_content = 'dummy: yaml'
         manager.latest_version = 1
         manager._version_specs = {1: mock.Mock()}
+        manager._version_task_templates = {1: mock.Mock(name='task_template')}
         manager._launch_thread_pool = thread_utils.ThreadSafeDict()
         manager._replica_to_request_id = thread_utils.ThreadSafeDict()
         manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
@@ -13938,6 +14035,8 @@ class TestLaunchReplicaSnapshotAccumulation:
         manager._uses_logical_replicas = True
         prior_spec = mock.Mock()
         manager._version_specs[7] = prior_spec
+        prior_task_template = mock.Mock(name='prior_task_template')
+        manager._version_task_templates[7] = prior_task_template
         persisted = []
         thread = mock.Mock()
 
@@ -13972,7 +14071,7 @@ class TestLaunchReplicaSnapshotAccumulation:
         assert safe_thread.call_args.kwargs['args'][1] == (
             'resources:\n  accelerators: L4:1\n')
         get_ports.assert_called_once_with('resources:\n  accelerators: L4:1\n',
-                                          prior_spec)
+                                          prior_spec, prior_task_template)
 
 
 class TestFailedCleanupReconciliation:
@@ -17176,6 +17275,7 @@ class TestRecoveryRetryAndIsolation:
         mgr.latest_version = 1
         mgr._uses_logical_replicas = True
         mgr._logical_exact_accelerator_shapes = {'A100': 1}
+        mgr._version_task_templates[1] = mock.Mock(name='task_template')
         mgr._spot_placer = None
         mgr._replica_to_request_id = {}
         mgr._replica_to_launch_cancelled = {}
