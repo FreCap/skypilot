@@ -141,10 +141,11 @@ paid-handoff/reprobe proposal, which was never deployed. Its exact three-state,
 bounded-batch, and exact-card surge contract is source-qualified after the
 refreshed adversarial review; merge, deployment, activation, and production
 proof remain open. Draft feature PR #1659 carries the frozen implementation;
-its required Serve058 cleanup draft must be cross-linked before #1659 becomes
-mergeable. The steady state deliberately has one narrow PostgreSQL
-admission relation, three states, the existing durable request retry mechanism,
-and the ordinary READY-aware paid-retirement path. The non-authoritative HTTP
+required draft cleanup PR #1660 is stacked on and cross-linked from #1659.
+The source-stack gate is complete; feature merge, deployment, activation, and
+production proof remain open. The steady state deliberately has one narrow
+PostgreSQL admission relation, three states, the existing durable request retry
+mechanism, and the ordinary READY-aware paid-retirement path. The non-authoritative HTTP
 wakeup was deleted, and one frozen provider-owned runtime object now carries
 the complete Kueue Pod identity, accelerator, observer, and optional persisted
 Pod identity through provisioning instead of four parallel optional values.
@@ -841,8 +842,9 @@ Remaining work, in exact order:
 
 1. The exact Serve057 source/design, including durable Pod lineage, Kueue-only
    lane scope, split physical/demand accounting, and restart-safe
-   reserved-first paid suppression, is qualified in draft PR #1659. Author and
-   cross-link the required Serve058 cleanup draft before Serve057 merges.
+   reserved-first paid suppression, is qualified in draft PR #1659. Required
+   draft cleanup PR #1660 is source-qualified, stacked on #1659, and
+   cross-linked; it remains blocked on the production cleanup gates below.
 2. Direct-Helm deploy the Serve057 successor image under the existing hold with
    `--reuse-values`. Read back one uniform API/controller/executor digest and
    preserve the deployed flat Kueue topology; do not add a Cohort, priority
@@ -1543,9 +1545,10 @@ revision `1.1.1430`: Helm revision 505, generation 10, and the repeated east/
 PHX renewal plus deployment-proof-daemon takeover horizon all passed under the
 Serve controller hold.
 
-1. After its separate design freeze, author and cross-link the required
-   Serve058 cleanup draft, then merge and deploy the SkyPilot-only Serve057
-   policy-admission feedback correction on one successor image while the same
+1. Required draft cleanup PR #1660 is cross-linked from #1659 and remains
+   blocked on the production cleanup gates below. Merge and deploy the
+   SkyPilot-only Serve057 policy-admission feedback correction on one successor
+   image while the same
    hold remains active. Reauthorize the exact successor writer cohort through
    the canonical generation-fenced command. Under the hold, prove only the
    PostgreSQL schema, exact read-only reconstruction, and fail-closed source
@@ -2208,11 +2211,11 @@ ordinary, or caller-crafted requests fall through to ordinary owner RBAC, and
 the final provider guard still revalidates the binding before provider I/O.
 The request body is only a query-scope hint and never authorization authority.
 
-Separately, the pre-existing Serve058 owner-column cleanup branch is planned as
-`fix/serve-atomic-fill-admission-cleanup`, but has not yet been authored or
-opened. It is not the historical-digest verifier cleanup stack introduced
-above. Its only steady-state change is Serve058: after the transition gates
-below, make both owner columns `NOT NULL`, remove the application
+Separately, the Serve058 owner-column cleanup is authored on
+`fix/serve-atomic-fill-admission-cleanup` and open as cross-linked draft PR
+#1660, stacked on #1659. It is not the historical-digest verifier cleanup stack
+introduced above. Its only steady-state change is Serve058: after the
+transition gates below, make both owner columns `NOT NULL`, remove the application
 `NULL`-attestation controller branch, and retire its transition-only
 observability/tests. This is a PostgreSQL-only constraint change: the
 dialect-neutral SQLAlchemy model remains nullable for controller-local SQLite
@@ -4723,10 +4726,10 @@ either case.
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537, deployed, and active through lifecycle 84/version 1 at `DURABLE_INTENT` epoch 1. Full busy-lane/no-row and throughput production evidence remains part of phase 2g. |
 | 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged, deployed, and active for lifecycle 84/version 1: one controller fence, routing linearization lock, and PostgreSQL transaction own the live `DURABLE_FEED`/`DURABLE_INTENT` pair. Draft cleanup PR #1556 removes deprecated separate surfaces and unsupported demand demotion only after the documented horizon. |
 | 2f | Promoted capacity-authority controller takeover | PR #1562 is merged and deployed. Revision 502 proved one consolidated-HA recovery with the bound/demand/fill pair preserved and fresh route evidence restored from PostgreSQL; revision 505 then proved takeover of the deployment-owned renewal singleton. A true service-controller takeover after Serve057 activation, one post-TTL worker bootstrap, and the full stale horizon remain production gates; no schema, chart, provider, or platform change is required. |
-| 2g | Production full reserved backfill | **Active and incomplete.** Platform PR #8652 is merged. The former version-64 graph and its 71-row delete-order blocker were removed by the deployed teardown successors. Canonical lifecycle 84/version 1 is `READY` after consolidated-HA recovery on revision 502 with no EFS/PV/PVC runtime dependency, and Platform PR #8824 has activated only the existing SkyPilot queues. The deployment singleton, policy revision `1.1.1430`, Helm revision 505, generation-10 reauthorization, and the renewal/takeover horizon are proven. Serve057 policy-admission feedback is source-qualified in draft PR #1659; its cleanup cross-link, merge, deployment, and activation remain open. Exact free-capacity convergence, nonzero-demand no-paid proof, live proof of the already-implemented current-request telemetry, and the full production horizon remain open. Exact completed logical requests are a separate PostgreSQL idempotency/completeness feature, not a prerequisite for honest processing/queued/in-flight status. |
+| 2g | Production full reserved backfill | **Active and incomplete.** Platform PR #8652 is merged. The former version-64 graph and its 71-row delete-order blocker were removed by the deployed teardown successors. Canonical lifecycle 84/version 1 is `READY` after consolidated-HA recovery on revision 502 with no EFS/PV/PVC runtime dependency, and Platform PR #8824 has activated only the existing SkyPilot queues. The deployment singleton, policy revision `1.1.1430`, Helm revision 505, generation-10 reauthorization, and the renewal/takeover horizon are proven. Serve057 policy-admission feedback is source-qualified in draft PR #1659, and source-qualified draft cleanup PR #1660 is stacked and cross-linked; feature merge, deployment, and activation remain open. Exact free-capacity convergence, nonzero-demand no-paid proof, live proof of the already-implemented current-request telemetry, and the full production horizon remain open. Exact completed logical requests are a separate PostgreSQL idempotency/completeness feature, not a prerequisite for honest processing/queued/in-flight status. |
 | 2h | Atomic reserved-fill replica/request admission | Merged in PR #1626 and deployed on Helm revision 473 / release `1.1.1401`. One atomic-admission module owns the root PostgreSQL transaction and savepoint; the manager only prepares immutable server-local input before it and starts the returned request reducer after commit. Serve055 adds the owner audit tuple, user FK, and retained-row one-shot transition. The deployed pending-first/global-pending/cleanup-unproven accounting correctly avoided duplicate replacement capacity. The remaining postcommit mutable-authority rejection is owned by phase 2i, not by another admission path or infrastructure change. |
 | 2i | Serve056 committed reserved-fill provider handoff and cohort rotation | PR #1629 merged at `1642ca2e3` as the scalar-schema precursor; PR #1632 restored adoption and corrective PR #1630 supplied the complete committed-handoff contract. That source is deployed through release `1.1.1410` and inherited by revision 489. Draft cleanup PR #1633 remains gated on the final zero-legacy census and production horizon. No EFS, KubeRay, Terraform/Terragrunt, platform runtime pin, or alternate provider path is added. |
-| 3a | Stacked Serve055 owner-transition cleanup after the production horizon | The required `fix/serve-atomic-fill-admission-cleanup` branch adds PostgreSQL-only Serve058 `NOT NULL` owner columns and removes only the application one-shot `NULL` attestation branch, the schema-derived temporary global user-deletion guard, and transition-only observability/tests. The dialect-neutral SQLAlchemy model remains nullable for the separately supported controller-local SQLite/Serve037 path. Serve058 verifies or reinstalls the permanent PostgreSQL owner FK and owner-immutability trigger in the same migration. Its draft PR must be cross-linked and remains blocked on a complete capable cohort, zero `NULL` tuples, no old writers, backups, and the complete stale/HA production horizon. |
+| 3a | Stacked Serve055 owner-transition cleanup after the production horizon | The required `fix/serve-atomic-fill-admission-cleanup` branch adds PostgreSQL-only Serve058 `NOT NULL` owner columns and removes only the application one-shot `NULL` attestation branch, the schema-derived temporary global user-deletion guard, and transition-only observability/tests. The dialect-neutral SQLAlchemy model remains nullable for the separately supported controller-local SQLite/Serve037 path. Serve058 verifies or reinstalls the permanent PostgreSQL owner FK and owner-immutability trigger in the same migration. Draft PR #1660 is stacked on and cross-linked from #1659; it remains blocked on a complete capable cohort, zero `NULL` tuples, no old writers, backups, and the complete stale/HA production horizon. |
 | 3b | Stacked Serve056 scalar-`NULL` cleanup bridge removal | Draft PR #1633 is stacked on and cross-linked from #1630, replacing automatically closed draft #1631. It removes only the cleanup-only JSON resolver and its transition tests after zero scalar-`NULL` protocol-v2 replicas, zero unsettled scalar-`NULL` provider-effect associations, and zero scalar-`NULL` cleanup-unproven markers persist through the complete stale/quiescence/provider-reprobe horizon. It cannot merge earlier. Closed PRs #1506/#1510 are not revived. |
 
 Durable acceptance atomically binds rows to the existing asynchronous launch
@@ -6186,10 +6189,10 @@ legacy activation.
   evidence, east/PHX/generic/no-paid proofs, and the full 180-second
   stale-authority/quiescence horizon are complete; then remove the v1/v2/v3
   projection readers through that stacked cleanup.
-- [ ] Open the cross-linked Serve058 cleanup and, only after a complete capable
-  cohort, zero nullable owner tuples, no old writers, backups, and the full
-  stale/HA production horizon, make service owner columns `NOT NULL` and remove
-  the one-shot attestation transition.
+- [x] Open cross-linked draft Serve058 cleanup PR #1660. Keep it draft and,
+  only after a complete capable cohort, zero nullable owner tuples, no old
+  writers, backups, and the full stale/HA production horizon, make service
+  owner columns `NOT NULL` and remove the one-shot attestation transition.
 - [x] Merge and direct-Helm deploy reclaim-safe failed-service teardown PR
   #1651 in release `1.1.1423` / Helm revision 489. Production proved zero
   matching provider Workloads/Pods, load-balancer objects, and central cluster
