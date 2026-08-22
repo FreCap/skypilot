@@ -40,6 +40,7 @@ from sky.client.api_auth import api_login
 from sky.client.api_auth import api_logout
 from sky.events import api_models as event_api_models
 from sky.schemas.api import responses
+from sky.serve import constants as serve_constants
 from sky.server import common as server_common
 from sky.server import constants as server_constants
 from sky.server import rest
@@ -79,10 +80,13 @@ if typing.TYPE_CHECKING:
     from sky import models
     from sky.events import client as events_client
     from sky.provision.kubernetes import utils as kubernetes_utils
+    from sky.serve import reserved_capacity
     from sky.skylet import job_lib
 else:
     requests = adaptors_common.LazyImport('requests')
     events_client = adaptors_common.LazyImport('sky.events.client')
+    reserved_capacity = adaptors_common.LazyImport(
+        'sky.serve.reserved_capacity')
     # only used in api_stop()
     psutil = adaptors_common.LazyImport('psutil')
 
@@ -906,6 +910,25 @@ def _prepared_launch_request_in_current_context(
                        'Please upgrade to a newer API server to use it.')
 
     dag = dag_utils.convert_entrypoint_to_dag(task)
+    launch_context = _extra_launch_context or {}
+    has_reserved_fill_context = any(
+        isinstance(key, str) and
+        key.startswith(serve_constants.RESERVED_FILL_LAUNCH_FENCE_PREFIX)
+        for key in launch_context)
+    if _server_side_only and has_reserved_fill_context:
+        try:
+            reserved_fill_fence = (
+                reserved_capacity.parse_protocol_v2_launch_fence(launch_context)
+            )
+        except ValueError as error:
+            raise exceptions.ReservedFillLaunchFenceError(
+                'Server-controller launch has a malformed reserved-fill '
+                'fence.') from error
+        if reserved_fill_fence is not None:
+            # The v2 execution capsule binds the controller and executor to
+            # the policy-absent mode. This check happens before request bytes
+            # are frozen and hashed.
+            reserved_capacity.require_protocol_v2_admin_policy_absent()
     # Override the autostop config from command line flags to task YAML.
     for dag_task in dag.tasks:
         for resource in dag_task.resources:
@@ -931,13 +954,13 @@ def _prepared_launch_request_in_current_context(
         idle_minutes_to_autostop=idle_minutes_to_autostop,
         down=down,
         dryrun=dryrun)
-    policy_context = (contextlib.nullcontext(dag) if _server_side_only else
-                      admin_policy_utils.apply_and_use_config_in_current_request(
-                          dag,
-                          request_name=(request_names.AdminPolicyRequestName.
-                                        CLUSTER_LAUNCH),
-                          request_options=request_options,
-                          at_client_side=True))
+    policy_context = (
+        contextlib.nullcontext(dag) if _server_side_only else
+        admin_policy_utils.apply_and_use_config_in_current_request(
+            dag,
+            request_name=(request_names.AdminPolicyRequestName.CLUSTER_LAUNCH),
+            request_options=request_options,
+            at_client_side=True))
     # Public submission keeps policy transport overrides active through yield.
     # pylint: disable-next=contextmanager-generator-missing-cleanup
     with policy_context as dag:

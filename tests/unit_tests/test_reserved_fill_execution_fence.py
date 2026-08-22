@@ -10,7 +10,10 @@ from sky import backends
 from sky import clouds
 from sky import exceptions
 from sky import execution
+from sky import resources as resources_lib
+from sky import task as task_lib
 from sky.adaptors import kubernetes
+from sky.client import sdk
 from sky.provision import common as provision_common
 from sky.serve import constants
 from sky.serve import kubernetes_identity
@@ -18,7 +21,9 @@ from sky.serve import kueue_lane_lineage
 from sky.serve import ordinary_launch_binding
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
+from sky.server.requests import request_names
 from sky.utils import common
+from sky.utils import dag_utils
 
 
 def _fill_context() -> dict[str, object]:
@@ -147,6 +152,7 @@ def _task(*, context='phx-context', accelerator='H200', count=1, num_nodes=1):
                                      job_recovery=None,
                                      autostop_config=None,
                                      hooks=None)
+    resource.assert_launchable = lambda: resource
     return types.SimpleNamespace(
         resources=[resource],
         best_resources=resource,
@@ -159,6 +165,15 @@ def _task(*, context='phx-context', accelerator='H200', count=1, num_nodes=1):
         envs_and_secrets=None,
         get_required_cloud_features=set,
     )
+
+
+def _real_task():
+    task = task_lib.Task()
+    task.set_resources(
+        resources_lib.Resources(cloud=clouds.Kubernetes(),
+                                region='phx-context',
+                                accelerators={'H200': 1}))
+    return task
 
 
 class _Dag:
@@ -515,6 +530,157 @@ def test_final_resource_drift_fails_before_identity_read(
     get_uid.assert_not_called()
 
 
+def test_v2_finalizes_frozen_singleton_without_optimizer_state():
+    fence = reserved_capacity.parse_protocol_v2_launch_fence(_fill_context())
+    assert fence is not None
+    task = _task()
+    pinned = task.resources[0]
+    task.best_resources = None
+
+    execution._finalize_reserved_fill_resources(task, fence)
+
+    assert task.best_resources is pinned
+
+
+def test_v2_real_frozen_resource_round_trip_is_exact_and_launchable():
+    source_resource = resources_lib.Resources(
+        cloud=clouds.Kubernetes(),
+        region='phx-context',
+        instance_type='4CPU--16GB--H200:1',
+        accelerators={'H200': 1},
+        use_spot=False)
+    source_resource.assert_launchable()
+    source_task = task_lib.Task(run='echo ready').set_resources(source_resource)
+
+    prepared = sdk.prepare_launch_request_for_server_controller(
+        source_task,
+        'svc-replica',
+        workspace='default',
+        extra_launch_context=_fill_context())
+    launch_body = prepared.body
+    fence = reserved_capacity.parse_protocol_v2_launch_fence(
+        launch_body.extra_launch_context)
+    assert fence is not None
+
+    finalized_resources = []
+    for _ in range(2):
+        # Each body inspection and DAG load starts from the immutable bytes,
+        # matching independent first-attempt and replay executor processes.
+        deserialized_dag = dag_utils.load_dag_from_yaml_str(prepared.body.task)
+        deserialized_task = deserialized_dag.tasks[0]
+        assert deserialized_task.best_resources is None
+        execution._finalize_reserved_fill_resources(deserialized_task, fence)
+        finalized = deserialized_task.best_resources
+        assert finalized is not None
+        assert finalized.assert_launchable() is finalized
+        finalized_resources.append(finalized)
+
+    assert finalized_resources[0] is not finalized_resources[1]
+    expected_config = source_resource.to_yaml_config()
+    assert [resource.to_yaml_config() for resource in finalized_resources
+           ] == [expected_config] * 2
+
+
+def test_v2_policy_mode_rejects_configured_admin_policy():
+    with mock.patch.object(reserved_capacity.skypilot_config,
+                           'get_nested',
+                           return_value='company.Policy'), \
+         pytest.raises(reserved_capacity.ReservedFillLaunchFenceError,
+                       match='admin policy to be absent'):
+        reserved_capacity.require_protocol_v2_admin_policy_absent()
+
+
+def test_v2_controller_preparation_rejects_before_request_freeze():
+    error = reserved_capacity.ReservedFillLaunchFenceError('policy present')
+    with mock.patch.object(
+            reserved_capacity,
+            'require_protocol_v2_admin_policy_absent',
+            side_effect=error) as require_policy_absent, \
+         mock.patch.object(sdk, '_freeze_launch_request') as freeze, \
+         pytest.raises(reserved_capacity.ReservedFillLaunchFenceError,
+                       match='policy present'):
+        sdk.prepare_launch_request_for_server_controller(
+            _real_task(),
+            'svc-replica',
+            workspace='workspace',
+            extra_launch_context=_fill_context())
+
+    require_policy_absent.assert_called_once_with()
+    freeze.assert_not_called()
+
+
+def test_v2_executor_rejects_policy_before_policy_application():
+    error = reserved_capacity.ReservedFillLaunchFenceError('policy present')
+    with mock.patch.object(
+            reserved_capacity,
+            'require_protocol_v2_admin_policy_absent',
+            side_effect=error) as require_policy_absent, \
+         mock.patch.object(
+             execution.admin_policy_utils,
+             'apply_and_use_config_in_current_request') as apply_policy, \
+         pytest.raises(reserved_capacity.ReservedFillLaunchFenceError,
+                       match='policy present'):
+        execution._execute(
+            _real_task(),
+            cluster_name='svc-replica',
+            _request_name=request_names.AdminPolicyRequestName.CLUSTER_LAUNCH,
+            _is_launched_by_sky_serve_controller=True,
+            _extra_launch_context=_fill_context())
+
+    require_policy_absent.assert_called_once_with()
+    apply_policy.assert_not_called()
+
+
+def test_v2_finalization_rejects_non_singleton_with_valid_best_resource():
+    fence = reserved_capacity.parse_protocol_v2_launch_fence(_fill_context())
+    assert fence is not None
+    task = _task()
+    task.resources.append(
+        types.SimpleNamespace(cloud=clouds.Kubernetes(),
+                              region='phx-context',
+                              accelerators={'H200': 1}))
+
+    with pytest.raises(reserved_capacity.ReservedFillLaunchFenceError,
+                       match='one exact resource'):
+        execution._finalize_reserved_fill_resources(task, fence)
+
+
+def test_v2_finalization_uses_frozen_singleton_not_optimizer_residue():
+    fence = reserved_capacity.parse_protocol_v2_launch_fence(_fill_context())
+    assert fence is not None
+    task = _task()
+    pinned = task.resources[0]
+    task.best_resources = _task().resources[0]
+
+    execution._finalize_reserved_fill_resources(task, fence)
+
+    assert task.best_resources is pinned
+
+
+def test_v2_finalization_rejects_non_launchable_singleton():
+    fence = reserved_capacity.parse_protocol_v2_launch_fence(_fill_context())
+    assert fence is not None
+    task = _task()
+    task.best_resources = None
+    task.resources[0].assert_launchable = mock.MagicMock(
+        side_effect=AssertionError('not launchable'))
+
+    with pytest.raises(reserved_capacity.ReservedFillLaunchFenceError,
+                       match='finalized launchable resource'):
+        execution._finalize_reserved_fill_resources(task, fence)
+
+
+def test_v2_finalization_rejects_unfenced_singleton_request():
+    fence = reserved_capacity.parse_protocol_v2_launch_fence(_fill_context())
+    assert fence is not None
+    task = _task(context='retargeted-context')
+    task.best_resources = None
+
+    with pytest.raises(reserved_capacity.ReservedFillLaunchFenceError,
+                       match='no longer matches'):
+        execution._finalize_reserved_fill_resources(task, fence)
+
+
 def test_multi_node_kueue_fill_fails_before_provider_identity_read():
     context = _bound_policy_fill_context()
     fence = reserved_capacity.parse_protocol_v2_launch_fence(context)
@@ -730,6 +896,62 @@ def test_v2_does_not_install_post_fence_replanning_callback(
             _extra_launch_context=_fill_context())
 
     assert result_handle is handle
+    assert backend.register_info.call_args.kwargs['planner'] is None
+
+
+@pytest.mark.parametrize('cluster_exists', [False, True])
+def test_v2_reconstructs_final_resources_before_optimizer(
+        monkeypatch, tmp_path, cluster_exists):
+    task = _task()
+    pinned = task.resources[0]
+    task.best_resources = None
+    dag = _Dag(task)
+    handle = object()
+    backend = backends.CloudVmRayBackend()
+    backend.register_info = mock.MagicMock()
+    backend.provision = mock.MagicMock(return_value=(handle, False))
+    capture_path = tmp_path / 'capture.yaml'
+    capture_path.write_text('capture', encoding='utf-8')
+    monkeypatch.setattr(kubernetes, '_capture_fenced_kubeconfig',
+                        lambda _context: str(capture_path))
+    monkeypatch.setattr(kubernetes, '_new_api_client_from_fence_capture',
+                        lambda _context, _path: mock.MagicMock())
+    monkeypatch.setattr(kubernetes,
+                        '_read_physical_cluster_uid_from_api_client',
+                        lambda _client: 'physical-uid')
+
+    with mock.patch.object(execution.global_user_state,
+                           'cluster_with_name_exists',
+                           return_value=cluster_exists), \
+         mock.patch.object(execution.container_image_consumers,
+                           'derive',
+                           return_value=mock.sentinel.image_consumer), \
+         mock.patch.object(execution.optimizer.Optimizer,
+                           'optimize',
+                           side_effect=AssertionError(
+                               'v2 must not invoke optimizer')) as optimize:
+        _, result_handle = execution._execute_dag(
+            dag,
+            dryrun=False,
+            stream_logs=False,
+            handle=None,
+            backend=backend,
+            retry_until_up=False,
+            optimize_target=common.OptimizeTarget.COST,
+            stages=[execution.Stage.OPTIMIZE, execution.Stage.PROVISION],
+            cluster_name='svc-replica',
+            detach_setup=False,
+            no_setup=False,
+            clone_disk_from=None,
+            skip_unnecessary_provisioning=False,
+            _quiet_optimizer=False,
+            _is_launched_by_jobs_controller=False,
+            _is_launched_by_sky_serve_controller=True,
+            _extra_launch_context=_fill_context())
+
+    assert result_handle is handle
+    assert task.best_resources is pinned
+    optimize.assert_not_called()
     assert backend.register_info.call_args.kwargs['planner'] is None
 
 
