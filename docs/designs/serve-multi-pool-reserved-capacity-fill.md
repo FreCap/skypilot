@@ -7,7 +7,7 @@ Serve057 policy-admission feedback, exact protocol-v2 resource replay, and
 provider-proof readiness circuit are deployed, but end-to-end reserved
 backfill is **not yet production-converged**. PRs #1667, #1668, and #1669 are
 merged through `be839eb202ff341f06535a035f12022babbadb2f`. Release `1.1.1440`
-and held Helm revision 549 run the exact immutable image digest
+and held Helm revision 551 run the exact immutable image digest
 `sha256:9bed3f4fd999cc2da046415c10764f5c6d9cdcbca71f36947c948b686377b3f2`
 on the complete API/controller/executor cohort. The controller remains
 intentionally held. The control plane is PostgreSQL-authoritative with Helm storage disabled
@@ -27,6 +27,8 @@ not changed. A fresh East/PHX read shows all nodes Ready and `DiskPressure=0`.
 PR #1670 is merged and deployed dark under that hold. Its bounded four-item
 manager handoff is retained exactly, but this intermediate release is
 superseded and is not eligible for hold release or service recreation.
+Revisions 550 and 551 changed only SkyPilot API/executor resource requests
+under the same hold and digest; they created no service or provider state.
 Fix-forward PR #1671 replaces its first protocol-v5 runtime-storage
 implementation with the narrower memory-scratch bootstrap contract and adds
 the post-teardown physical-absence fence described below.
@@ -258,7 +260,7 @@ Workloads. Every LocalQueue reports zero pending Workloads, including
 `research-ma`, and both SkyPilot ClusterQueues are Active/Ready. The remaining
 nine GPUs were therefore **policy-admissible free capacity at that readback**.
 The earlier revision-502 controller hold was released for the historical
-lifecycle proof. A new hold is active on Helm revision 549 while the service is
+lifecycle proof. A new hold is active on Helm revision 551 while the service is
 absent and PR #1671 is qualified, so no current lack of occupancy is attributed
 to Kueue. The retained pre-Serve057 lifecycle was not a valid final fill proof
 and has now been normally removed.
@@ -899,7 +901,7 @@ latency, restart recovery, and fresh request counts.
 
 ## Qualification history
 
-Current production truth at this design revision is held Helm revision 549,
+Current production truth at this design revision is held Helm revision 551,
 release `1.1.1440`, exact merge commit
 `b151b71c976bff7a09aef6e94fc372f08ef18103`, Serve057, and image digest
 `sha256:9bed3f4fd999cc2da046415c10764f5c6d9cdcbca71f36947c948b686377b3f2`
@@ -5115,7 +5117,7 @@ either case.
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed. Lifecycle 84/version 1 and lifecycle 85/version 1 both promoted `DURABLE_INTENT` epoch 1 before normal purge. Full busy-lane/no-row and throughput production evidence remains part of phase 2g. |
 | 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed. Lifecycle 84/version 1 and lifecycle 85/version 1 exercised the single controller fence, routing linearization lock, and PostgreSQL transaction owning the `DURABLE_FEED`/`DURABLE_INTENT` pair. The service is currently absent. Draft cleanup PR #1556 removes deprecated separate surfaces and unsupported demand demotion only after the documented horizon. |
 | 2f | Promoted capacity-authority controller takeover | PR #1562 is merged and deployed. Revision 502 proved one consolidated-HA recovery with the bound/demand/fill pair preserved and fresh route evidence restored from PostgreSQL; revision 505 then proved takeover of the deployment-owned renewal singleton. A true service-controller takeover after the post-#1671 recreation, one post-TTL worker bootstrap, and the full stale horizon remain production gates; no schema, chart, provider, or platform change is required. |
-| 2g | Production full reserved backfill | **Incomplete; service intentionally absent.** Platform PR #8652 is merged, and #8824 activates only the pre-existing SkyPilot queues. Held release `1.1.1440` / Helm revision 549 runs PR #1670's intermediate cohort with storage disabled, but it has generated no service/provider state and is not eligible for activation. Historical release `1.1.1436` normally purged lifecycle 84, created lifecycle 85, and proved every submitted PHX Workload admitted under the unchanged existing lane with zero paid claims; executor optimization/replay churn prevented scheduler-fit convergence, so lifecycle 85 was normally purged. PR #1667 deployment is complete; PR #1671 deployment, clean recreation, exact free-capacity convergence, nonzero-demand no-paid proof, live current-request telemetry proof, takeover, and the full production horizon remain open. Exact completed logical requests are a separate PostgreSQL idempotency/completeness feature, not a prerequisite for honest processing/queued/in-flight status. |
+| 2g | Production full reserved backfill | **Incomplete; service intentionally absent.** Platform PR #8652 is merged, and #8824 activates only the pre-existing SkyPilot queues. Held release `1.1.1440` / Helm revision 551 runs PR #1670's intermediate cohort with storage disabled, but it has generated no service/provider state and is not eligible for activation. Historical release `1.1.1436` normally purged lifecycle 84, created lifecycle 85, and proved every submitted PHX Workload admitted under the unchanged existing lane with zero paid claims; executor optimization/replay churn prevented scheduler-fit convergence, so lifecycle 85 was normally purged. PR #1667 deployment is complete; PR #1671 deployment, clean recreation, exact free-capacity convergence, nonzero-demand no-paid proof, live current-request telemetry proof, takeover, and the full production horizon remain open. Exact completed logical requests are a separate PostgreSQL idempotency/completeness feature, not a prerequisite for honest processing/queued/in-flight status. |
 | 2h | Atomic reserved-fill replica/request admission | Merged in PR #1626 and deployed on Helm revision 473 / release `1.1.1401`. One atomic-admission module owns the root PostgreSQL transaction and savepoint; the manager only prepares immutable server-local input before it and starts the returned request reducer after commit. Serve055 adds the owner audit tuple, user FK, and retained-row one-shot transition. The deployed pending-first/global-pending/cleanup-unproven accounting correctly avoided duplicate replacement capacity. The remaining postcommit mutable-authority rejection is owned by phase 2i, not by another admission path or infrastructure change. |
 | 2i | Serve056 committed reserved-fill provider handoff and cohort rotation | PR #1629 merged at `1642ca2e3` as the scalar-schema precursor; PR #1632 restored adoption and corrective PR #1630 supplied the complete committed-handoff contract. That source is deployed through release `1.1.1410` and inherited by revision 489. Draft cleanup PR #1633 remains gated on the final zero-legacy census and production horizon. No EFS, KubeRay, Terraform/Terragrunt, platform runtime pin, or alternate provider path is added. |
 | 2j | Exact protocol-v2 execution capsule and no-failover retry boundary | PR #1667 is merged and deployed in release `1.1.1437`. Under the explicitly absent configured admin-policy mode, the server controller freezes one already-launchable Kubernetes resource in the hashed request, the executor reconstructs `best_resources` from it before cluster-existence/initial optimization, and the provisioner exits an exact-candidate failure before retry optimization or failover. Ordinary launches are unchanged. Clean recreation and production proof remain open behind PR #1671. |

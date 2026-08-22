@@ -4,7 +4,7 @@
 two-phase Kueue wait, and strict worker/Kueue projection binding are
 implemented in fix-forward PR #1671. The dedicated workspaces, Kueue admission
 inputs, accelerator scheduling, and memory-scratch inputs are configured and
-applied. Intermediate release `1.1.1440` / Helm revision 549 is deployed under
+applied. Intermediate release `1.1.1440` / Helm revision 551 is deployed under
 the controller hold from PR #1670, but its first runtime-storage implementation
 is superseded and is not eligible for hold release or service recreation. A
 homogeneous PR #1671 successor deployment and fresh protocol-v5 projection,
@@ -977,7 +977,7 @@ for this rollout.
 
 ## Open gates
 
-- Keep release `1.1.1440` / Helm revision 549 under the controller hold. Merge
+- Keep release `1.1.1440` / Helm revision 551 under the controller hold. Merge
   PR #1671, publish one immutable successor, and direct-Helm deploy its exact
   API/controller/executor cohort before releasing the hold or recreating a
   service. Verify the common digest, protocol/cohort 5, and provider-proof
