@@ -4173,9 +4173,11 @@ class TestFillLaunchPath(unittest.TestCase):
         manager._scale_reconciliation_event = mock.Mock()
         intent = types.SimpleNamespace(
             allowed_locations=(types.SimpleNamespace(region='phx-context'),),
-            physical_cluster_uid='physical-uid')
+            physical_cluster_uid='physical-uid',
+            idempotency_key='a' * 64)
         lease = types.SimpleNamespace(intent=intent)
-        manager._zero_cost_actuation_repository.lease_next.return_value = lease
+        manager._zero_cost_actuation_repository.lease_batch.return_value = (
+            lease,)
         manager._zero_cost_actuation_authority_current = mock.Mock(
             return_value=True)
         preflight = replica_managers._ReservedFillPhysicalPreflight(
@@ -5180,7 +5182,7 @@ class TestFillLaunchPath(unittest.TestCase):
         )
         manager._zero_cost_actuation_repository.terminate.assert_not_called()
         self.assertIs(
-            manager._zero_cost_actuation_repository.lease_next.return_value,
+            manager._zero_cost_actuation_repository.lease_batch.return_value[0],
             lease)
 
     def test_v2_actuation_primary_signal_baseexception_wins_cleanup_signal(

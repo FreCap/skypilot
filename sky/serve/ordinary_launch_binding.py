@@ -1064,7 +1064,7 @@ class EffectAuthorization:
     claim: ExecutionClaim
     owner_revision: int
     durable_replica_info: Any
-    guard: Any
+    guard: Any | None
     claim_validator: ClaimValidator
 
 
@@ -4300,6 +4300,41 @@ def non_pool_provider_effect_guard(
     if claim.request_id != context.request_id:
         raise OrdinaryLaunchBindingConflict(
             'Active request claim does not name the bound request.')
+    if context.profile.kind is NonPoolLaunchProfileKind.RESERVED_FILL:
+        # The durable execution claim, claimed queue delivery, retention pin,
+        # association effect phase, and guardian-authored quiescence receipt
+        # are the in-flight barrier for reserved fill.  Commit that complete
+        # boundary before provider I/O instead of retaining a PostgreSQL
+        # session/advisory lock across a potentially blocked Kubernetes call.
+        engine = serve_state.get_database_engine()
+        with engine.begin() as connection:
+            next_revision, durable_replica_info = _advance_effect_phase(
+                connection,
+                context,
+                claim,
+                claim_validator,
+                EffectPhase.NOT_STARTED,
+                EffectPhase.PROVIDER_IO,
+                launch_context=launch_context)
+        authorization = EffectAuthorization(context, claim, next_revision,
+                                            durable_replica_info, None,
+                                            claim_validator)
+        token = _ACTIVE_EFFECT_AUTHORIZATION.set(authorization)
+        try:
+            yield authorization
+            # A provider exception skips this read and remains effect-
+            # ambiguous.  A completed call must not publish success after a
+            # concurrently committed authority transition.
+            current_authorization = _ACTIVE_EFFECT_AUTHORIZATION.get()
+            if (current_authorization is None or
+                    current_authorization.context != context):
+                raise OrdinaryLaunchBindingConflict(
+                    'Reserved-fill effect lost its active authorization.')
+            _revalidate_lock_free_effect_authorization(current_authorization,
+                                                       launch_context)
+        finally:
+            _ACTIVE_EFFECT_AUTHORIZATION.reset(token)
+        return
     with serve_state.service_replica_launch_authority_guard(
             context.service_name) as guard:
         if not serve_state.service_replica_launch_authority_guard_is_valid(
@@ -4339,12 +4374,47 @@ def _active_authorization(
         return None
     requested = _parse_any_bound_launch_context(launch_context)
     authorization = _ACTIVE_EFFECT_AUTHORIZATION.get()
-    if (authorization is None or authorization.context != requested or
-            not serve_state.service_replica_launch_authority_guard_is_valid(
-                authorization.guard)):
+    if authorization is None or authorization.context != requested:
+        raise OrdinaryLaunchBindingConflict(
+            'Service-job I/O requires the active provider authority guard.')
+    if authorization.guard is None:
+        _revalidate_lock_free_effect_authorization(authorization,
+                                                   launch_context)
+    elif not serve_state.service_replica_launch_authority_guard_is_valid(
+            authorization.guard):
         raise OrdinaryLaunchBindingConflict(
             'Service-job I/O requires the active provider authority guard.')
     return authorization
+
+
+def _revalidate_lock_free_effect_authorization(
+    authorization: EffectAuthorization,
+    launch_context: Mapping[str, Any],
+) -> None:
+    """Freshly validate one durable reserved-fill effect claim.
+
+    This function deliberately owns only a short transaction.  The caller
+    invokes it before or after provider I/O; it must never wrap that I/O.
+    """
+    context = authorization.context
+    if (authorization.guard is not None or
+            not isinstance(context, BoundNonPoolLaunchContext) or
+            context.profile.kind is not NonPoolLaunchProfileKind.RESERVED_FILL
+            or parse_bound_non_pool_launch_context(launch_context) != context):
+        raise OrdinaryLaunchBindingConflict(
+            'Lock-free effect authority is not reserved fill.')
+    engine = serve_state.get_database_engine()
+    with engine.begin() as connection:
+        snapshot = validate_effect_authority_in_connection(
+            connection,
+            context,
+            authorization.claim,
+            authorization.claim_validator,
+            launch_context=launch_context)
+        if int(snapshot.association['owner_revision']) != (
+                authorization.owner_revision):
+            raise OrdinaryLaunchBindingConflict(
+                'Reserved-fill effect claim owner revision changed.')
 
 
 def require_active_provider_effect_authorization(
@@ -4551,14 +4621,16 @@ def begin_service_teardown_if_owner(
 ) -> ServiceTeardownResult:
     """Atomically classify binding mode and publish terminal admission.
 
-    A provider effect owns the shared launch-authority advisory guard for its
-    entire retry loop. Teardown must publish its terminal intent and deliver
-    request cancellation before waiting for that guard, or the cancellation
-    needed to end the provider loop is unreachable. This transaction uses the
-    canonical lifecycle/service row locks to classify the exact binding epoch
-    and close new admissions in one commit. A concurrent promotion therefore
-    orders entirely before this transaction (and returns bound authority) or
-    entirely after it (and is rejected by terminal status).
+    Generic provider effects own the shared launch-authority advisory guard for
+    their retry loop. Reserved fill instead owns a durable execution/effect
+    claim and requires exact guardian quiescence. Teardown must publish its
+    terminal intent and deliver request cancellation before waiting for either
+    exclusion proof, or the cancellation needed to end the provider loop is
+    unreachable. This transaction uses the canonical lifecycle/service row
+    locks to classify the exact binding epoch and close new admissions in one
+    commit. A concurrent promotion therefore orders entirely before this
+    transaction (and returns bound authority) or entirely after it (and is
+    rejected by terminal status).
 
     Serve042 legacy mode is marked in the same transaction and needs no second
     status CAS. Stores without Serve042 return ``UNSUPPORTED`` without writing;

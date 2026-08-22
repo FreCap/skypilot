@@ -31,6 +31,8 @@ from sky.serve import capacity_admission
 from sky.serve import constants
 from sky.serve import demand_state_schema
 from sky.serve import ephemeral_storage_contract
+from sky.serve import kueue_lane_lineage
+from sky.serve import kueue_lane_lineage_schema
 from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
 from sky.serve import maintenance
@@ -178,6 +180,10 @@ demand_capacity_observations_table = (
 paid_capacity_pools_table = serve_state_schema.paid_capacity_pools_table
 paid_capacity_claims_table = serve_state_schema.paid_capacity_claims_table
 paid_capacity_waiters_table = serve_state_schema.paid_capacity_waiters_table
+serve_kueue_admissions_table = (
+    kueue_lane_lineage_schema.serve_kueue_admissions_table)
+serve_zero_cost_actuation_intents_table = (
+    zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
 create_table = serve_state_schema.create_table
 _db_manager = serve_state_schema._db_manager  # pylint: disable=protected-access
 ensure_tables_initialized = serve_state_schema.ensure_tables_initialized
@@ -1447,12 +1453,10 @@ def remove_service_completely(
 
     The exact service row is conditionally locked first inside the transaction.
     If its durable hash (and, for a live controller, PID/IP owner) no longer
-    matches, no child table is touched. The replica rows are then deleted
-    before the service row because deleting the service cascades its durable
-    actuation intents, whose committed rows are protected by a restrictive
-    replica foreign key. The locked service row prevents a same-name successor
-    from inserting until this transaction commits, so deleting the child rows
-    cannot cross an A-to-B reuse boundary.
+    matches, no child table is touched. PostgreSQL Kueue admissions are removed
+    before their restrictive replica and intent parents. The locked service row
+    prevents a same-name successor from inserting until this transaction
+    commits, so deleting the child rows cannot cross an A-to-B reuse boundary.
 
     Returns:
         True when the expected incarnation was removed; False when ownership
@@ -1482,15 +1486,90 @@ def remove_service_completely(
                 services_table.c.controller_ip == expected_ip,
             ])
         service_row = session.execute(
-            sqlalchemy.select(services_table.c.resource_scope).where(
-                *predicates).with_for_update()).fetchone()
+            sqlalchemy.select(services_table.c.resource_scope,
+                              services_table.c.lifecycle_epoch).where(
+                                  *predicates).with_for_update()).fetchone()
         if service_row is None:
             session.rollback()
             return False
         resource_scope = service_row[0]
+        service_lifecycle_epoch = int(service_row[1])
+        kueue_repository = None
+        kueue_retirement_proofs: tuple[
+            kueue_lane_lineage.MaterializedAdmissionRetirementProof, ...] = ()
+        if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            # Lock the complete exact-lifecycle intent set first and retire
+            # only provider-free pending leases.  The SHUTTING_DOWN service
+            # row already excludes materialization; doing this in the final
+            # deletion transaction also makes a crash between teardown
+            # publication and cleanup retry-safe.  COMMITTED/materialized
+            # intents are deliberately left for the evidence-backed path
+            # below.
+            (zero_cost_actuation.
+             terminalize_unmaterialized_service_intents_in_connection)(
+                 session.connection(),
+                 service_name=service_name,
+                 service_hash=expected_service_hash,
+                 service_lifecycle_epoch=service_lifecycle_epoch)
+            # Discover immutable record IDs without taking replica locks; the
+            # repository then acquires intent -> replica -> association ->
+            # request/queue/pin -> admission locks and revalidates the complete
+            # graph. No status scalar can authorize this deletion.
+            replica_rows = session.execute(
+                sqlalchemy.select(
+                    replicas_table.c.replica_id,
+                    replicas_table.c.replica_state_version,
+                    replicas_table.c.replica_state).where(
+                        replicas_table.c.service_name == service_name).order_by(
+                            replicas_table.c.replica_id)).all()
+            expected_record_ids: dict[int, str] = {}
+            for replica_row in replica_rows:
+                replica_info = _replica_from_state(
+                    replica_row.replica_state_version,
+                    replica_row.replica_state)
+                record_id = replica_info.replica_record_id
+                _validate_expected_replica_record_id(record_id)
+                expected_record_ids[int(replica_row.replica_id)] = record_id
+            kueue_repository, kueue_retirement_proofs = (
+                _prelock_and_delete_materialized_kueue_admissions(
+                    session,
+                    engine,
+                    service_name=service_name,
+                    service_hash=expected_service_hash,
+                    service_lifecycle_epoch=service_lifecycle_epoch,
+                    expected_replica_record_ids=expected_record_ids))
+            assert kueue_repository is not None
+            provider_free_proofs = (
+                kueue_repository.
+                prelock_provider_free_terminal_admissions_in_connection(
+                    session.connection(), service_name, expected_service_hash))
+            for proof in provider_free_proofs:
+                (kueue_repository.
+                 delete_provider_free_terminal_admission_in_connection)(
+                     session.connection(), proof)
+            remaining_admission = session.execute(
+                sqlalchemy.select(sqlalchemy.literal(True)).
+                select_from(serve_kueue_admissions_table).where(
+                    serve_kueue_admissions_table.c.service_name == service_name,
+                    serve_kueue_admissions_table.c.service_hash ==
+                    expected_service_hash).limit(1)).scalar_one_or_none()
+            if remaining_admission is not None:
+                raise kueue_lane_lineage.KueueAdmissionConflict(
+                    'Whole-service teardown retains unresolved Kueue '
+                    'admission authority.')
         session.execute(
             sqlalchemy.delete(replicas_table).where(
                 replicas_table.c.service_name == service_name))
+        if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            _finalize_materialized_kueue_admissions(session, kueue_repository,
+                                                    kueue_retirement_proofs)
+            session.execute(
+                sqlalchemy.delete(
+                    serve_zero_cost_actuation_intents_table).where(
+                        serve_zero_cost_actuation_intents_table.c.service_name
+                        == service_name,
+                        serve_zero_cost_actuation_intents_table.c.service_hash
+                        == expected_service_hash))
         session.execute(sqlalchemy.delete(services_table).where(*predicates))
         session.execute(
             sqlalchemy.delete(version_specs_table).where(
@@ -3084,9 +3163,11 @@ def reserved_fill_committed_launch_authority_holds(
     Serve056 atomically links a replica to a COMMITTED intent, that frozen
     graph defines the exact scope.  A newly minted deployment-policy ticket
     must still attest the live context-wide provider/admission/no-paid facts
-    for that frozen scope.  The surrounding bound-request guard owns the exact
-    association/request execution generation and holds service authority
-    across the concrete provider mutation.
+    for that frozen scope.  The surrounding reserved-fill effect claim owns
+    the exact association/request execution generation durably and closes its
+    PostgreSQL transaction before the concrete provider mutation.  Its exact
+    guardian quiescence receipt, rather than a retained database session,
+    prevents replay while that mutation can still be active.
     """
     if (scope is None or authorization is None or launch_snapshot is None or
             launch_snapshot.durable_replica_info is None):
@@ -6927,6 +7008,48 @@ def _validate_expected_replica_record_id(record_id: Any) -> None:
         raise ValueError('Expected replica record IDs must be canonical UUIDs.')
 
 
+def _prelock_and_delete_materialized_kueue_admissions(
+    session: orm.Session,
+    engine: sqlalchemy.engine.Engine,
+    *,
+    service_name: str,
+    service_hash: str,
+    service_lifecycle_epoch: int,
+    expected_replica_record_ids: dict[int, str],
+) -> tuple[kueue_lane_lineage.KueueAdmissionRepository | None, tuple[
+        kueue_lane_lineage.MaterializedAdmissionRetirementProof, ...]]:
+    """Retire exact provider-clean admission children before replica rows."""
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return None, ()
+    targets = tuple(
+        kueue_lane_lineage.MaterializedAdmissionRetirementTarget(
+            replica_id=replica_id, replica_record_id=uuid.UUID(record_id)) for
+        replica_id, record_id in sorted(expected_replica_record_ids.items()))
+    repository = kueue_lane_lineage.KueueAdmissionRepository(engine)
+    connection = session.connection()
+    proofs = repository.prelock_materialized_admission_retirements_in_connection(
+        connection,
+        service_name=service_name,
+        service_hash=service_hash,
+        service_lifecycle_epoch=service_lifecycle_epoch,
+        targets=targets)
+    repository.delete_materialized_admissions_in_connection(connection, proofs)
+    return repository, proofs
+
+
+def _finalize_materialized_kueue_admissions(
+    session: orm.Session,
+    repository: kueue_lane_lineage.KueueAdmissionRepository | None,
+    proofs: tuple[kueue_lane_lineage.MaterializedAdmissionRetirementProof, ...],
+) -> None:
+    """Delete exact committed intent parents after their replicas are gone."""
+    if repository is None:
+        assert not proofs
+        return
+    repository.finalize_materialized_admission_retirements_in_connection(
+        session.connection(), proofs)
+
+
 def remove_replica(
     service_name: str,
     replica_id: int,
@@ -6954,7 +7077,10 @@ def remove_replica(
             replicas_table.c.service_name == service_name,
             replicas_table.c.replica_id == replica_id,
         ]
-        if (expected_service_hash is not None or
+        is_postgres = (
+            engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value)
+        owner = None
+        if (is_postgres or expected_service_hash is not None or
                 expected_controller_owner is not None):
             owner = session.execute(
                 sqlalchemy.select(
@@ -6971,6 +7097,21 @@ def remove_replica(
                  (owner[2], owner[3]) != expected_controller_owner)):
                 session.rollback()
                 return False
+        kueue_repository = None
+        kueue_retirement_proofs: tuple[
+            kueue_lane_lineage.MaterializedAdmissionRetirementProof, ...] = ()
+        if is_postgres:
+            assert owner is not None
+            kueue_repository, kueue_retirement_proofs = (
+                _prelock_and_delete_materialized_kueue_admissions(
+                    session,
+                    engine,
+                    service_name=service_name,
+                    service_hash=str(owner[0]),
+                    service_lifecycle_epoch=int(owner[1]),
+                    expected_replica_record_ids={
+                        replica_id: expected_replica_record_id
+                    }))
         locked_record_ids = _lock_replica_record_ids_in_session(
             session, engine, service_name, [replica_id])
         if locked_record_ids is None:
@@ -6997,6 +7138,8 @@ def remove_replica(
             if result.rowcount != 1:
                 session.rollback()
                 return False
+        _finalize_materialized_kueue_admissions(session, kueue_repository,
+                                                kueue_retirement_proofs)
         session.commit()
     # Once exact ownership is proven, an already-absent child is the desired
     # idempotent cleanup state, not evidence of ownership loss.
@@ -7056,6 +7199,18 @@ def remove_replicas(
              (owner[2], owner[3]) != expected_controller_owner)):
             session.rollback()
             return False
+        kueue_repository = None
+        kueue_retirement_proofs: tuple[
+            kueue_lane_lineage.MaterializedAdmissionRetirementProof, ...] = ()
+        if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            kueue_repository, kueue_retirement_proofs = (
+                _prelock_and_delete_materialized_kueue_admissions(
+                    session,
+                    engine,
+                    service_name=service_name,
+                    service_hash=str(owner[0]),
+                    service_lifecycle_epoch=int(owner[1]),
+                    expected_replica_record_ids=(expected_replica_record_ids)))
         locked_record_ids = _lock_replica_record_ids_in_session(
             session, engine, service_name, replica_ids)
         if locked_record_ids is None:
@@ -7093,6 +7248,8 @@ def remove_replicas(
             if result.rowcount != len(chunk):
                 session.rollback()
                 return False
+        _finalize_materialized_kueue_admissions(session, kueue_repository,
+                                                kueue_retirement_proofs)
         session.commit()
     return True
 
@@ -7544,6 +7701,7 @@ class VersionCommitResult(enum.Enum):
     CONTENT_CONFLICT = 'content_conflict'
     SEMANTIC_CONFLICT = 'semantic_conflict'
     LB_HA_CONFLICT = 'lb_ha_conflict'
+    KUEUE_ADMISSION_HOLD = 'kueue_admission_hold'
     STALE_VERSION = 'stale_version'
 
     def __bool__(self) -> bool:
@@ -7753,6 +7911,7 @@ def add_or_update_version(
     resource_scope: str | None = None
     service_pool: bool | None = None
     service_lifecycle_epoch: int | None = None
+    locked_service_hash: str | None = None
     with _replica_launch_authority_write_session(service_name) as (engine,
                                                                    session):
         _begin_immediate_if_sqlite(session, engine)
@@ -7787,6 +7946,7 @@ def add_or_update_version(
                 session.rollback()
                 return VersionCommitResult.REJECTED
             resource_scope = owner[5]
+            locked_service_hash = owner[0]
             if type(owner[6]) is not int or owner[6] not in (0, 1):
                 raise ephemeral_storage_contract.EphemeralStorageContractError(
                     'Scoped storage commit has an invalid parent pool bit.')
@@ -7848,6 +8008,48 @@ def add_or_update_version(
                  existing[5] != submitted_yaml_content)):
                 session.rollback()
                 return VersionCommitResult.CONTENT_CONFLICT
+        if not identical_retry:
+            # A stale candidate cannot elect or alter launch authority, so it
+            # must not be held behind an unrelated outgoing admission.  Keep
+            # this check under the already-held service lock and before the
+            # Kueue hold, while both outcomes are still write-free.
+            higher_committed_version = session.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.max(version_specs_table.c.version)).where(
+                        version_specs_table.c.service_name == service_name,
+                        version_specs_table.c.version > version,
+                        version_specs_table.c.yaml_content.isnot(
+                            None))).scalar()
+            if higher_committed_version is not None:
+                session.rollback()
+                return VersionCommitResult.STALE_VERSION
+        if (not identical_retry and engine.dialect.name
+                == db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+            # A version election changes the durable launch authority.  An
+            # outgoing Kueue Pod that has not reached policy admission still
+            # needs the old version's materialization/provider fences.  Hold
+            # the election under the same service-row transaction used by
+            # grants; otherwise the pointer can move between a provider-free
+            # precheck and this commit and permanently strand the admission.
+            revision = session.execute(
+                sqlalchemy.text(
+                    'SELECT version_num FROM '
+                    'alembic_version_serve_state_db')).scalar_one_or_none()
+            if revision is not None and int(revision) >= 57:
+                if locked_service_hash is None:
+                    locked_service_hash = session.execute(
+                        sqlalchemy.select(services_table.c.hash).where(
+                            services_table.c.name ==
+                            service_name).with_for_update()).scalar_one()
+                admission_repository = (
+                    kueue_lane_lineage.KueueAdmissionRepository(engine))
+                holds = (admission_repository.
+                         lock_outgoing_update_holds_in_connection(
+                             session.connection(), service_name,
+                             locked_service_hash, version))
+                if holds:
+                    session.rollback()
+                    return VersionCommitResult.KUEUE_ADMISSION_HOLD
         serialized_spec: bytes | None = None
         if not identical_retry:
             serialized_spec = _serialize_current_service_spec(spec)
@@ -7903,18 +8105,6 @@ def add_or_update_version(
             if existing_recovery_script != ha_recovery_script:
                 session.rollback()
                 return VersionCommitResult.CONTENT_CONFLICT
-        if not identical_retry:
-            higher_committed_version = session.execute(
-                sqlalchemy.select(
-                    sqlalchemy.func.max(version_specs_table.c.version)).where(
-                        version_specs_table.c.service_name == service_name,
-                        version_specs_table.c.version > version,
-                        version_specs_table.c.yaml_content.isnot(
-                            None))).scalar()
-            if higher_committed_version is not None:
-                session.rollback()
-                return VersionCommitResult.STALE_VERSION
-
         uses_logical_replicas = spec.uses_logical_replicas is True
         semantics_row = session.execute(
             sqlalchemy.select(services_table.c.logical_replica_semantics,

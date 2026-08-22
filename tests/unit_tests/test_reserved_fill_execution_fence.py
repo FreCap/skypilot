@@ -11,8 +11,11 @@ from sky import clouds
 from sky import exceptions
 from sky import execution
 from sky.adaptors import kubernetes
+from sky.provision import common as provision_common
 from sky.serve import constants
 from sky.serve import kubernetes_identity
+from sky.serve import kueue_lane_lineage
+from sky.serve import ordinary_launch_binding
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.utils import common
@@ -97,7 +100,47 @@ def _policy_fill_context() -> dict[str, object]:
     return context
 
 
-def _task(*, context='phx-context', accelerator='H200', count=1):
+def _bound_policy_fill_context() -> dict[str, object]:
+    """Build the complete persisted envelope used by a bound fill request."""
+    intent_key = 'c' * 64
+    profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+        authorization_reference=f'reserved-fill:{intent_key}',
+        authorization_generation=7,
+        authorization_payload={'intent_key': intent_key})
+    context = _policy_fill_context()
+    context.update({
+        ordinary_launch_binding.ASSOCIATION_ID_KEY: '22222222-2222-4222-8222-222222222222',
+        ordinary_launch_binding.BOUND_REQUEST_ID_KEY: 'request-id',
+        ordinary_launch_binding.REPLICA_ID_KEY: 5,
+        ordinary_launch_binding.REPLICA_RECORD_ID_KEY: '11111111-1111-4111-8111-111111111111',
+        ordinary_launch_binding.LAUNCH_GENERATION_KEY: 4,
+        ordinary_launch_binding.INPUT_DIGEST_KEY: 'f' * 64,
+        ordinary_launch_binding.LIFECYCLE_EPOCH_KEY: 2,
+        ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY:
+            ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION,
+        ordinary_launch_binding.PROFILE_KIND_KEY: profile.kind.value,
+        ordinary_launch_binding.PROFILE_VERSION_KEY: profile.version,
+        ordinary_launch_binding.PROFILE_DIGEST_KEY: profile.digest,
+        ordinary_launch_binding.CAPABILITY_COHORT_EPOCH_KEY: 1,
+        ordinary_launch_binding.CAPABILITY_PROFILE_SET_DIGEST_KEY:
+            ordinary_launch_binding.supported_non_pool_profile_set_digest(),
+        ordinary_launch_binding.RECEIPT_PROTOCOL_VERSION_KEY:
+            ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION,
+        ordinary_launch_binding.AUTHORIZATION_KIND_KEY:
+            profile.authorization_kind.value,
+        ordinary_launch_binding.AUTHORIZATION_REFERENCE_KEY:
+            profile.authorization_reference,
+        ordinary_launch_binding.AUTHORIZATION_GENERATION_KEY:
+            profile.authorization_generation,
+        ordinary_launch_binding.AUTHORIZATION_DIGEST_KEY:
+            profile.authorization_digest,
+        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [_worker_projection()],
+    })
+    return context
+
+
+def _task(*, context='phx-context', accelerator='H200', count=1, num_nodes=1):
     resource = types.SimpleNamespace(cloud=clouds.Kubernetes(),
                                      region=context,
                                      accelerators={accelerator: count},
@@ -107,6 +150,7 @@ def _task(*, context='phx-context', accelerator='H200', count=1):
     return types.SimpleNamespace(
         resources=[resource],
         best_resources=resource,
+        num_nodes=num_nodes,
         service=types.SimpleNamespace(pool=False),
         use_spot=False,
         storage_mounts=None,
@@ -191,6 +235,178 @@ def _rejected_effect_guard(error):
     return guard
 
 
+def _execute_runtime_registration(
+        launch_context: dict[str, object],
+        fence: reserved_capacity.ProtocolV2LaunchFence | None, backend):
+    """Run only far enough to inspect executor-to-backend registration."""
+    task = _task()
+    if isinstance(backend, backends.CloudVmRayBackend):
+        handle = backends.CloudVmRayResourceHandle(
+            cluster_name='svc-replica',
+            cluster_name_on_cloud='svc-replica-cloud',
+            cluster_yaml='/tmp/svc-replica.yaml',
+            launched_nodes=1,
+            launched_resources=task.best_resources)
+    else:
+        handle = mock.MagicMock()
+    backend.register_info = mock.MagicMock()
+    backend.provision = mock.MagicMock(return_value=(handle, False))
+    with mock.patch.object(execution.global_user_state,
+                           'cluster_with_name_exists',
+                           return_value=False), \
+         mock.patch.object(execution.container_image_consumers,
+                           'derive',
+                           return_value=mock.sentinel.image_consumer), \
+         mock.patch.object(
+             execution,
+             '_reserved_fill_effect_epoch',
+             side_effect=lambda _context: execution.contextlib.nullcontext()), \
+         mock.patch.object(
+             execution.ordinary_launch_request,
+             '_provider_effect_guard',
+             side_effect=lambda _context: execution.contextlib.nullcontext()), \
+         mock.patch.object(
+             execution.provider_phase,
+             'provider_phase',
+             side_effect=lambda _mode: execution.contextlib.nullcontext()), \
+         mock.patch.object(
+             kubernetes,
+             'physical_cluster_uid_fence',
+             return_value=execution.contextlib.nullcontext()), \
+         mock.patch.object(
+             execution,
+             '_apply_service_worker_runtime_projection_to_task'), \
+         execution.contextlib.ExitStack() as provider_fence_stack:
+        execution._execute_dag_under_provider_fence(
+            _Dag(task),
+            dryrun=False,
+            stream_logs=False,
+            handle=None,
+            backend=backend,
+            retry_until_up=False,
+            optimize_target=common.OptimizeTarget.COST,
+            stages=[execution.Stage.PROVISION],
+            cluster_name='svc-replica',
+            detach_setup=False,
+            no_setup=True,
+            clone_disk_from=None,
+            skip_unnecessary_provisioning=False,
+            _quiet_optimizer=False,
+            _is_launched_by_jobs_controller=False,
+            _is_launched_by_sky_serve_controller=True,
+            _extra_launch_context=launch_context,
+            _reserved_fill_launch_fence=fence,
+            _provider_fence_stack=provider_fence_stack)
+    return backend
+
+
+def test_bound_reserved_fill_passes_kueue_runtime_to_cloud_vm_backend():
+    context = _bound_policy_fill_context()
+    fence = reserved_capacity.parse_protocol_v2_launch_fence(context)
+    assert fence is not None
+    backend = backends.CloudVmRayBackend()
+    runtime_factory_impl = (
+        execution.kueue_lane_observer.runtime_for_reserved_fill_launch)
+    durable_admission = types.SimpleNamespace(
+        state=kueue_lane_lineage.KueueAdmissionState.POD_WAITING,
+        pod_namespace='inference',
+        pod_name='svc-replica-cloud-head',
+        pod_uid='persisted-pod-uid')
+    engine = types.SimpleNamespace(begin=lambda: execution.contextlib.
+                                   nullcontext(mock.sentinel.connection))
+
+    with mock.patch.object(execution.kueue_lane_observer,
+                           'runtime_for_reserved_fill_launch',
+                           wraps=runtime_factory_impl) as runtime_factory, \
+         mock.patch.object(
+             execution.kueue_lane_observer.serve_state_schema,
+             'get_database_engine',
+             return_value=engine), \
+         mock.patch.object(
+             execution.kueue_lane_observer,
+             '_lock_and_validate_materialization',
+             return_value=(mock.sentinel.repository, mock.sentinel.identity,
+                           durable_admission)):
+        _execute_runtime_registration(context, fence, backend)
+
+    runtime_factory.assert_called_once_with(context, fence)
+    registration = backend.register_info.call_args.kwargs
+    runtime = registration['kueue_admission_runtime']
+    assert isinstance(runtime, provision_common.KueuePodAdmissionRuntime)
+    identity = runtime.identity
+    assert identity.intent_key == 'c' * 64
+    assert (
+        identity.replica_record_uuid == '11111111-1111-4111-8111-111111111111')
+    assert identity.pool_physical_uid == 'physical-uid'
+    assert (identity.worker_projection_sha256 == fence.worker_projection_sha256)
+    assert runtime.accelerator == 'h200'
+    assert callable(runtime.observer)
+    assert callable(runtime.observer.begin_observation)
+    assert runtime.persisted_pod_identity == (
+        provision_common.KueuePersistedPodIdentity(
+            namespace='inference',
+            pod_name='svc-replica-cloud-head',
+            pod_uid='persisted-pod-uid'))
+
+
+def test_unbound_legacy_reserved_fill_never_builds_kueue_runtime():
+    context = _fill_context()
+    fence = reserved_capacity.parse_protocol_v2_launch_fence(context)
+    assert fence is not None
+    backend = backends.CloudVmRayBackend()
+
+    with mock.patch.object(
+            execution.kueue_lane_observer,
+            'runtime_for_reserved_fill_launch') as runtime_factory:
+        _execute_runtime_registration(context, fence, backend)
+
+    runtime_factory.assert_not_called()
+    registration = backend.register_info.call_args.kwargs
+    assert registration['kueue_admission_runtime'] is None
+
+
+def test_unbound_policy_reserved_fill_without_projection_fails_closed():
+    context = _policy_fill_context()
+    fence = reserved_capacity.parse_protocol_v2_launch_fence(context)
+    assert fence is not None
+    backend = backends.CloudVmRayBackend()
+
+    with mock.patch.object(
+            execution.kueue_lane_observer,
+            'runtime_for_reserved_fill_launch') as runtime_factory:
+        with pytest.raises(reserved_capacity.ReservedFillLaunchFenceError,
+                           match='lost its immutable worker projection'):
+            _execute_runtime_registration(context, fence, backend)
+
+    runtime_factory.assert_not_called()
+
+
+def test_ordinary_launch_does_not_build_kueue_runtime():
+    backend = backends.CloudVmRayBackend()
+
+    with mock.patch.object(
+            execution.kueue_lane_observer,
+            'runtime_for_reserved_fill_launch') as runtime_factory:
+        _execute_runtime_registration({}, None, backend)
+
+    runtime_factory.assert_not_called()
+    registration = backend.register_info.call_args.kwargs
+    assert registration['kueue_admission_runtime'] is None
+
+
+def test_ordinary_non_cloud_vm_backend_receives_no_kueue_arguments():
+    backend = mock.MagicMock()
+
+    with mock.patch.object(
+            execution.kueue_lane_observer,
+            'runtime_for_reserved_fill_launch') as runtime_factory:
+        _execute_runtime_registration({}, None, backend)
+
+    runtime_factory.assert_not_called()
+    registration = backend.register_info.call_args.kwargs
+    assert not any(key.startswith('kueue_') for key in registration)
+
+
 def test_execution_parser_preserves_ordinary_and_rejects_external_fill():
     assert execution._parse_reserved_fill_launch_fence(
         {}, is_launched_by_sky_serve_controller=False) is None
@@ -207,7 +423,10 @@ def test_policy_fill_reloads_and_authenticates_exact_v2_projection():
 
     with mock.patch.object(execution.serve_state,
                            'get_placement_projection_record',
-                           return_value=(True, None, None, [projection])):
+                           return_value=(True, None, None, [projection])), \
+         mock.patch.object(execution.serve_state,
+                           'get_placement_catalog',
+                           return_value={'num_nodes': 1}):
         execution._load_service_worker_projections(context, fence)
 
     assert context[constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY] == [
@@ -233,7 +452,10 @@ def test_policy_fill_reloads_and_authenticates_exact_v3_projection():
 
     with mock.patch.object(execution.serve_state,
                            'get_placement_projection_record',
-                           return_value=(True, None, None, [projection])):
+                           return_value=(True, None, None, [projection])), \
+         mock.patch.object(execution.serve_state,
+                           'get_placement_catalog',
+                           return_value={'num_nodes': 1}):
         execution._load_service_worker_projections(context, fence)
 
     assert context[constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY] == [
@@ -289,8 +511,44 @@ def test_final_resource_drift_fails_before_identity_read(
             reserved_capacity,
             'get_kubernetes_physical_cluster_uid') as get_uid, \
          pytest.raises(exceptions.RequestCancelled):
-        execution._validate_reserved_fill_final_resources(task, fence)
+        execution._validate_reserved_fill_final_resources(task, fence, None)
     get_uid.assert_not_called()
+
+
+def test_multi_node_kueue_fill_fails_before_provider_identity_read():
+    context = _bound_policy_fill_context()
+    fence = reserved_capacity.parse_protocol_v2_launch_fence(context)
+    assert fence is not None
+    task = _task(num_nodes=2)
+
+    with mock.patch.object(
+            kubernetes,
+            'physical_cluster_uid_fence') as physical_identity, \
+         pytest.raises(reserved_capacity.ReservedFillLaunchFenceError,
+                       match='exactly one task node'):
+        execution._validate_reserved_fill_final_resources(
+            task, fence,
+            context[constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY])
+
+    physical_identity.assert_not_called()
+
+
+def test_execution_rejects_multi_node_kueue_catalog():
+    context = _policy_fill_context()
+    fence = reserved_capacity.parse_protocol_v2_launch_fence(context)
+    assert fence is not None
+    projection = _worker_projection()
+
+    with mock.patch.object(execution.serve_state,
+                           'get_placement_projection_record',
+                           return_value=(True, None, None, [projection])), \
+         mock.patch.object(execution.serve_state,
+                           'get_placement_catalog',
+                           return_value={'num_nodes': 2}), \
+         pytest.raises(exceptions.RequestCancelled,
+                       match='invalid or stale') as exc_info:
+        execution._load_service_worker_projections(context, fence)
+    assert 'placement_catalog.num_nodes == 1' in str(exc_info.value.__cause__)
 
 
 def test_capture_identity_error_preserves_typed_classification():

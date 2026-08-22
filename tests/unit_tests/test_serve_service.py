@@ -1655,6 +1655,10 @@ def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
                            'cleanup_storage_intents', return_value=True), \
          mock.patch.object(service.replica_managers,
                            'terminate_cluster') as terminate, \
+         mock.patch(
+             'sky.serve.kueue_lane_observer.'
+             'project_exact_pod_absence_after_teardown',
+             return_value=False), \
          mock.patch.object(service.time, 'sleep'):
         failed = service._cleanup('svc', True, 'incarnation-a',
                                   expected_owner[0], expected_owner[1],
@@ -1926,6 +1930,10 @@ def test_cleanup_retains_unproven_protocol_v2_replica_as_failed_cleanup():
                            'parse_protocol_v2_cleanup_fence',
                            side_effect=parse_cleanup_fence), \
          mock.patch.object(
+             service.kueue_lane_observer,
+             'project_exact_pod_absence_after_teardown',
+             return_value=False) as exact_absence, \
+         mock.patch.object(
              service.reserved_capacity,
              'probe_physical_replica_presence',
              return_value=(service.reserved_capacity.
@@ -1952,14 +1960,17 @@ def test_cleanup_retains_unproven_protocol_v2_replica_as_failed_cleanup():
         expected_replica_record_ids={
             legacy.replica_id: legacy.replica_record_id
         })
-    persist.assert_called_once_with('svc',
-                                    protocol_v2.replica_id,
-                                    protocol_v2,
-                                    expected_service_hash='incarnation-a',
-                                    expected_lifecycle_epoch=31,
-                                    expected_controller_owner=expected_owner,
-                                    expected_replica_exists=True,
-                                    guard_launch_exclusion=False)
+    assert persist.call_count == 2
+    persist.assert_called_with('svc',
+                               protocol_v2.replica_id,
+                               protocol_v2,
+                               expected_service_hash='incarnation-a',
+                               expected_lifecycle_epoch=31,
+                               expected_controller_owner=expected_owner,
+                               expected_replica_exists=True,
+                               guard_launch_exclusion=False)
+    exact_absence.assert_called_once_with('svc', protocol_v2.replica_id,
+                                          protocol_v2.replica_record_id)
     assert (protocol_v2.status_property.sky_down_status ==
             service.common_utils.ProcessStatus.FAILED)
     remove_one.assert_not_called()
@@ -1995,6 +2006,10 @@ def test_cleanup_removes_provider_proven_absent_protocol_v2_replica():
                            'parse_protocol_v2_cleanup_fence',
                            return_value=cleanup_fence), \
          mock.patch.object(
+             service.kueue_lane_observer,
+             'project_exact_pod_absence_after_teardown',
+             return_value=False) as exact_absence, \
+         mock.patch.object(
              service.reserved_capacity,
              'probe_physical_replica_presence',
              return_value=(service.reserved_capacity.
@@ -2022,7 +2037,16 @@ def test_cleanup_removes_provider_proven_absent_protocol_v2_replica():
         expected_replica_record_ids={
             protocol_v2.replica_id: protocol_v2.replica_record_id
         })
-    persist.assert_not_called()
+    persist.assert_called_once_with('svc',
+                                    protocol_v2.replica_id,
+                                    protocol_v2,
+                                    expected_service_hash='incarnation-a',
+                                    expected_lifecycle_epoch=31,
+                                    expected_controller_owner=expected_owner,
+                                    expected_replica_exists=True,
+                                    guard_launch_exclusion=False)
+    exact_absence.assert_called_once_with('svc', protocol_v2.replica_id,
+                                          protocol_v2.replica_record_id)
     remove_one.assert_not_called()
     terminate.assert_not_called()
 
@@ -2084,6 +2108,10 @@ def test_cleanup_skips_tail_sleep_after_final_success():
                            'SafeThread', SynchronousThread), \
          mock.patch.object(service.replica_managers,
                            'terminate_cluster'), \
+         mock.patch(
+             'sky.serve.kueue_lane_observer.'
+             'project_exact_pod_absence_after_teardown',
+             return_value=False), \
          mock.patch.object(service.time,
                            'sleep', side_effect=lambda _: events.append(
                                'sleep')), \

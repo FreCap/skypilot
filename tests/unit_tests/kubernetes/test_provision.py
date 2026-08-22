@@ -137,6 +137,105 @@ def test_create_pods_rejects_invalid_worker_runtime_bootstrap_contract(
         instance._create_pods('us', 'cluster', 'cluster', config)
 
 
+def _kueue_lane_identity():
+    return provision_common.KueuePodAdmissionIdentity(
+        intent_key='1' * 64,
+        replica_record_uuid='12345678-1234-5678-9234-567812345678',
+        pool_physical_uid='physical-cluster-uid',
+        worker_projection_sha256='2' * 64)
+
+
+def _kueue_persisted_pod_identity(
+        cluster_name_on_cloud: str
+) -> provision_common.KueuePersistedPodIdentity:
+    return provision_common.KueuePersistedPodIdentity(
+        namespace='ns',
+        pod_name=f'{cluster_name_on_cloud}-head',
+        pod_uid='persisted-pod-uid')
+
+
+def _kueue_lane_runtime(
+    *,
+    persisted_pod_identity: (provision_common.KueuePersistedPodIdentity |
+                             None) = None,
+) -> provision_common.KueuePodAdmissionRuntime:
+    return provision_common.KueuePodAdmissionRuntime(
+        identity=_kueue_lane_identity(),
+        accelerator='H200',
+        observer=mock.Mock(),
+        persisted_pod_identity=persisted_pod_identity)
+
+
+def _configure_strict_kueue_lane(config: provision_common.ProvisionConfig,
+                                 cluster_name_on_cloud: str) -> None:
+    config.provider_config.update({
+        'serve_worker_projection_protocol_version': 2,
+        'kueue_local_queue_name': 'be',
+        'kueue_require_managed': True,
+        'kueue_workload_priority_class_name': 'skypilot-low',
+        'serve_worker_expected_priority_class_name': 'skypilot-low',
+        'serve_worker_expected_priority_value': -1000,
+        'serve_worker_expected_preemption_policy': 'Never',
+        'serve_worker_expected_service_account_name': 'inference-worker',
+        'serve_worker_expected_scheduler_name': 'default-scheduler',
+        'serve_worker_expected_accelerator_label_key': 'nvidia.com/gpu.product',
+        'serve_worker_expected_accelerator_label_values': ['NVIDIA-H200'],
+        'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
+        'serve_worker_expected_accelerator_count': 1,
+    })
+    config.provider_effect_guard_factory = contextlib.nullcontext
+    config.kueue_admission_runtime = _kueue_lane_runtime(
+        persisted_pod_identity=_kueue_persisted_pod_identity(
+            cluster_name_on_cloud))
+
+
+def test_kueue_lane_runtime_requires_typed_contract(monkeypatch):
+    monkeypatch.setattr(kubernetes_utils, 'get_namespace_from_config',
+                        lambda *_args, **_kwargs: 'ns')
+    monkeypatch.setattr(kubernetes_utils, 'get_context_from_config',
+                        lambda *_args, **_kwargs: 'ctx')
+    config = _make_provision_config(count=1)
+    config.kueue_admission_runtime = object()
+
+    with pytest.raises(sky_exceptions.ReservedFillLaunchFenceError,
+                       match='one complete typed runtime'):
+        instance._create_pods('us', 'cluster', 'cluster', config)
+
+
+def test_kueue_lane_rejects_multi_pod_config_before_kubernetes_api(monkeypatch):
+    monkeypatch.setattr(kubernetes_utils, 'get_namespace_from_config',
+                        lambda *_args, **_kwargs: 'ns')
+    monkeypatch.setattr(kubernetes_utils, 'get_context_from_config',
+                        lambda *_args, **_kwargs: 'ctx')
+    core_api = mock.Mock()
+    monkeypatch.setattr(kubernetes, 'core_api', core_api)
+    config = _make_provision_config(count=2)
+    config.kueue_admission_runtime = _kueue_lane_runtime()
+
+    with pytest.raises(config_lib.KubernetesError, match='exactly one Pod'):
+        instance._create_pods('us', 'cluster', 'cluster', config)
+
+    core_api.assert_not_called()
+
+
+def test_reserved_fill_required_kueue_requires_lane_runtime(monkeypatch):
+    monkeypatch.setattr(kubernetes_utils, 'get_namespace_from_config',
+                        lambda *_args, **_kwargs: 'ns')
+    monkeypatch.setattr(kubernetes_utils, 'get_context_from_config',
+                        lambda *_args, **_kwargs: 'ctx')
+    config = _make_provision_config(count=1)
+    config.provider_config.update({
+        'serve_worker_projection_protocol_version': 2,
+        'kueue_local_queue_name': 'be',
+        'kueue_require_managed': True,
+    })
+    config.provider_effect_guard_factory = contextlib.nullcontext
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='requires the exact lane identity'):
+        instance._create_pods('us', 'cluster', 'cluster', config)
+
+
 def test_create_pods_rejects_finalizer_scratch_drift_before_api_create(
         monkeypatch):
     cluster_on_cloud = 'scratch-finalizer-drift'
@@ -997,6 +1096,121 @@ def _patch_create_pods_k8s_boundary(monkeypatch,
                             lambda *a, **k: None)
 
 
+@pytest.mark.parametrize(('persisted_phase', 'matching_query'), [
+    ('Terminating', 'Terminating'),
+    ('Failed', 'Failed'),
+])
+def test_persisted_kueue_pod_terminal_state_defers_without_mutation(
+        monkeypatch, persisted_phase, matching_query):
+    """A durable Pod UID may only be cleaned by canonical reconciliation."""
+    cluster_on_cloud = 'persisted-kueue-pod'
+    head_name = f'{cluster_on_cloud}-head'
+    persisted_pod = _fake_pod(head_name)
+    persisted_pod.metadata.uid = 'persisted-pod-uid'
+    persisted_pod.metadata.annotations = {
+        'skypilot-cluster-name': cluster_on_cloud,
+    }
+    persisted_pod.status.phase = persisted_phase
+    _patch_create_pods_k8s_boundary(monkeypatch, {}, None)
+
+    def filter_pods(_namespace, _context, _tags, phases):
+        if matching_query in phases:
+            return {head_name: persisted_pod}
+        return {}
+
+    monkeypatch.setattr(kubernetes_utils, 'filter_pods', filter_pods)
+    core_api = mock.MagicMock()
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    config = _make_provision_config(count=1)
+    _configure_strict_kueue_lane(config, cluster_on_cloud)
+
+    with pytest.raises(
+            sky_exceptions.ReservedFillProviderPresentError) as exc_info:
+        instance._create_pods('us', cluster_on_cloud, cluster_on_cloud, config)
+
+    assert exc_info.value.provider_resource_ids == (
+        f'ns/{head_name}@persisted-pod-uid',)
+    core_api.create_namespaced_pod.assert_not_called()
+    core_api.patch_namespaced_pod.assert_not_called()
+    core_api.delete_namespaced_pod.assert_not_called()
+
+
+@pytest.mark.parametrize('observed_state', ['absent', 'same-name-replacement'])
+def test_persisted_kueue_pod_conflict_fails_before_create(
+        monkeypatch, observed_state):
+    """An absent or replaced persisted UID never reaches a 409/create race."""
+    cluster_on_cloud = 'persisted-kueue-race'
+    head_name = f'{cluster_on_cloud}-head'
+    _patch_create_pods_k8s_boundary(monkeypatch, {}, None)
+    core_api = mock.MagicMock()
+    if observed_state == 'absent':
+        core_api.read_namespaced_pod.side_effect = _make_api_exception(
+            404, 'Not Found')
+    else:
+        replacement = _fake_pod(head_name)
+        replacement.metadata.uid = 'replacement-pod-uid'
+        replacement.metadata.deletion_timestamp = None
+        replacement.metadata.annotations = {
+            'skypilot-cluster-name': cluster_on_cloud,
+        }
+        core_api.read_namespaced_pod.return_value = replacement
+    core_api.create_namespaced_pod.side_effect = _make_api_exception(
+        409, 'Already Exists')
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    config = _make_provision_config(count=1)
+    _configure_strict_kueue_lane(config, cluster_on_cloud)
+
+    with pytest.raises(
+            sky_exceptions.ReservedFillProviderPresentError) as exc_info:
+        instance._create_pods('us', cluster_on_cloud, cluster_on_cloud, config)
+
+    assert exc_info.value.provider_resource_ids == (
+        f'ns/{head_name}@persisted-pod-uid',)
+    core_api.read_namespaced_pod.assert_called_once_with(
+        head_name, 'ns', _request_timeout=kubernetes.API_TIMEOUT)
+    core_api.create_namespaced_pod.assert_not_called()
+    core_api.patch_namespaced_pod.assert_not_called()
+    core_api.delete_namespaced_pod.assert_not_called()
+
+
+def test_persisted_kueue_pod_create_helper_refuses_before_409(monkeypatch):
+    """The final create seam refuses a persisted UID before any API call."""
+    conflict = _make_api_exception(
+        409,
+        'Conflict',
+        body=json.dumps({
+            'message': ('object is being deleted: pods "replica-head" '
+                        'already exists')
+        }))
+    core_api = mock.MagicMock()
+    core_api.create_namespaced_pod.side_effect = conflict
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+    persisted_pod_identity = provision_common.KueuePersistedPodIdentity(
+        namespace='inference-ns',
+        pod_name='replica-head',
+        pod_uid='persisted-pod-uid')
+
+    with pytest.raises(
+            sky_exceptions.ReservedFillProviderPresentError) as exc_info:
+        instance._create_namespaced_pod_with_retries(
+            'inference-ns', {'metadata': {
+                'name': 'replica-head'
+            }},
+            None,
+            persisted_pod_identity=persisted_pod_identity)
+
+    assert exc_info.value.provider_resource_ids == (
+        'inference-ns/replica-head@persisted-pod-uid',)
+    core_api.create_namespaced_pod.assert_not_called()
+    core_api.read_namespaced_pod.assert_not_called()
+    core_api.patch_namespaced_pod.assert_not_called()
+    core_api.delete_namespaced_pod.assert_not_called()
+
+
 def test_v4_create_pods_waits_for_runtime_ready_before_final_read(monkeypatch):
     cluster_on_cloud = 'test-v4-runtime-ready-order'
     head_name = f'{cluster_on_cloud}-head'
@@ -1033,9 +1247,11 @@ def test_v4_create_pods_waits_for_runtime_ready_before_final_read(monkeypatch):
                    _attestation,
                    _guard_factory,
                    *,
-                   require_runtime_readiness=False):
+                   require_runtime_readiness=False,
+                   persisted_pod_identity=None):
         assert (pod_name, pod_uid) == (head_name, expected_uid)
         assert require_runtime_readiness
+        assert persisted_pod_identity is None
         events.append('final-read')
 
     monkeypatch.setattr(instance, '_wait_for_pods_to_run', wait_running)

@@ -69,11 +69,15 @@ def _bulk_provision(
 
     start = time.time()
 
+    expected_provider_effect_guard_factory = (
+        bootstrap_config.provider_effect_guard_factory)
+    expected_kueue_runtime = bootstrap_config.kueue_admission_runtime
+
     # Ephemeral volumes are optional provider objects.  Keep their creation in
     # a separate bounded effect epoch when this launch carries runtime
     # authorization; a stale reserved-fill request must not leak a PVC before
     # the later Pod-create boundary gets a chance to reject it.
-    with _runtime_effect_guard(bootstrap_config.provider_effect_guard_factory):
+    with _runtime_effect_guard(expected_provider_effect_guard_factory):
         provision_volume.provision_ephemeral_volumes(cloud, region_name,
                                                      cluster_name.name_on_cloud,
                                                      bootstrap_config)
@@ -87,15 +91,18 @@ def _bulk_provision(
     # other provider objects.  It is short, but it is not passive validation;
     # fence the complete bootstrap transaction before run_instances enters its
     # finer Pod mutation epochs and passive admission/scheduling waits.
-    with _runtime_effect_guard(bootstrap_config.provider_effect_guard_factory):
+    with _runtime_effect_guard(expected_provider_effect_guard_factory):
         config = provision.bootstrap_instances(provider_name, region_name,
                                                cluster_name.name_on_cloud,
                                                bootstrap_config)
-    if (bootstrap_config.provider_effect_guard_factory is not None and
-            getattr(config, 'provider_effect_guard_factory', None)
-            is not bootstrap_config.provider_effect_guard_factory):
-        raise RuntimeError('Provider bootstrap discarded its runtime effect '
+    if (getattr(config, 'provider_effect_guard_factory', None)
+            is not expected_provider_effect_guard_factory):
+        raise RuntimeError('Provider bootstrap changed its runtime effect '
                            'authorization boundary.')
+    if (getattr(config, 'kueue_admission_runtime', None)
+            is not expected_kueue_runtime):
+        raise RuntimeError('Provider bootstrap changed its runtime Kueue '
+                           'admission boundary.')
 
     provision_record = provision.run_instances(provider_name,
                                                region_name,
@@ -161,6 +168,8 @@ def bulk_provision(
     cluster_incarnation: str | None = None,
     provider_effect_guard_factory: (provision_common.ProviderEffectGuardFactory
                                     | None) = None,
+    kueue_admission_runtime: (provision_common.KueuePodAdmissionRuntime |
+                              None) = None,
 ) -> provision_common.ProvisionRecord:
     """Provisions a cluster and wait until fully provisioned.
 
@@ -170,6 +179,16 @@ def bulk_provision(
         Cloud specific exceptions: If the provisioning process failed, cloud-
             specific exceptions will be raised by the cloud APIs.
     """
+    if (kueue_admission_runtime is not None and
+            not isinstance(kueue_admission_runtime,
+                           provision_common.KueuePodAdmissionRuntime)):
+        raise exceptions.ReservedFillLaunchFenceError(
+            'Kueue reserved-fill provisioning requires one complete typed '
+            'admission runtime.')
+    if kueue_admission_runtime is not None and num_nodes != 1:
+        raise exceptions.ReservedFillLaunchFenceError(
+            'Kueue reserved-fill provisioning requires exactly one node and '
+            'Pod.')
     original_config = global_user_state.get_cluster_yaml_dict(cluster_yaml)
     head_node_type = original_config['head_node_type']
     bootstrap_config = provision_common.ProvisionConfig(
@@ -185,7 +204,8 @@ def bulk_provision(
         resume_stopped_nodes=True,
         ports_to_open_on_launch=ports_to_open_on_launch,
         cluster_incarnation=cluster_incarnation,
-        provider_effect_guard_factory=provider_effect_guard_factory)
+        provider_effect_guard_factory=provider_effect_guard_factory,
+        kueue_admission_runtime=kueue_admission_runtime)
 
     with provision_logging.setup_provision_logging(log_dir):
         try:

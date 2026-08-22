@@ -24,6 +24,7 @@ from sky.serve import capacity_admission_schema
 from sky.serve import constants
 from sky.serve import demand_state
 from sky.serve import demand_state_schema
+from sky.serve import kueue_lane_capacity
 from sky.serve import route_projection
 from sky.serve import route_projection_schema
 from sky.serve import serve_state_schema
@@ -346,14 +347,142 @@ def _validated_replica_attribution(
             bool(status['is_scale_down']))
 
 
-def _locked_capacity_inventory(
+@dataclasses.dataclass(frozen=True)
+class _LockedCapacityRows:
+    """Intent/replica graph locked before its Kueue admission rows."""
+
+    replica_rows: tuple[Mapping[str, Any], ...]
+    intent_rows: tuple[Mapping[str, Any], ...]
+    live_replica_record_ids: frozenset[tuple[int, uuid.UUID]]
+    provider_present_replica_record_ids: frozenset[tuple[int, uuid.UUID]]
+    live_intent_keys: frozenset[str]
+    planned_capacity_by_intent_key: Mapping[str, int]
+    capacity_unit_by_intent_key: Mapping[str, str]
+
+
+def _lock_capacity_rows(
     connection: sqlalchemy.engine.Connection,
     *,
     service_name: str,
+    service_hash: str,
+    now: datetime.datetime,
+) -> _LockedCapacityRows:
+    """Lock the complete capacity graph before sorted Kueue admission rows."""
+    intent_rows = connection.execute(
+        sqlalchemy.select(_ZERO_COST_INTENTS).where(
+            _ZERO_COST_INTENTS.c.service_name == service_name,
+            _ZERO_COST_INTENTS.c.service_hash == service_hash).order_by(
+                _ZERO_COST_INTENTS.c.intent_idempotency_key).with_for_update()
+    ).mappings().all()
+    replica_rows = connection.execute(
+        sqlalchemy.select(
+            _REPLICAS.c.replica_id, _REPLICAS.c.status, _REPLICAS.c.version,
+            _REPLICAS.c.reserved_fill_intent_idempotency_key,
+            _REPLICAS.c.replica_state_version, _REPLICAS.c.replica_state).where(
+                _REPLICAS.c.service_name == service_name).order_by(
+                    _REPLICAS.c.replica_id).with_for_update()).mappings().all()
+
+    live_replica_record_ids: set[tuple[int, uuid.UUID]] = set()
+    provider_present_replica_record_ids: set[tuple[int, uuid.UUID]] = set()
+    live_intent_keys: set[str] = set()
+    for row in replica_rows:
+        state = row['replica_state']
+        if row['replica_state_version'] != 1 or not isinstance(state, Mapping):
+            continue
+        try:
+            record_id = uuid.UUID(str(state.get('replica_record_id')))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        record = (int(row['replica_id']), record_id)
+        provider_present_replica_record_ids.add(record)
+        intent_key = row['reserved_fill_intent_idempotency_key']
+        if isinstance(intent_key, str) and intent_key:
+            # A retained provider-owned replica can still affect final paid
+            # and retirement accounting even after its status turns terminal.
+            live_intent_keys.add(intent_key)
+        status = state.get('status_property')
+        if (row['status'] in _TERMINAL_REPLICA_STATUSES or
+                not isinstance(status, Mapping) or
+                status.get('is_scale_down') is True):
+            continue
+        live_replica_record_ids.add(record)
+
+    planned_capacity_by_intent_key: dict[str, int] = {}
+    capacity_unit_by_intent_key: dict[str, str] = {}
+    for row in intent_rows:
+        key = row['intent_idempotency_key']
+        planned_capacity = row['planned_capacity']
+        capacity_unit = row['capacity_unit']
+        if (not isinstance(key, str) or not key or
+                not isinstance(planned_capacity, int) or
+                isinstance(planned_capacity, bool) or planned_capacity < 1 or
+                capacity_unit not in ('physical', 'logical')):
+            raise CapacityAdmissionConflict(
+                'Zero-cost intent capacity attribution is malformed.')
+        planned_capacity_by_intent_key[key] = planned_capacity
+        capacity_unit_by_intent_key[key] = capacity_unit
+        if (row['state'] == 'COMMITTED' or
+            (row['state'] in _PENDING_ZERO_COST_INTENT_STATES and
+             row['valid_until'] > now)):
+            live_intent_keys.add(key)
+    return _LockedCapacityRows(
+        replica_rows=tuple(replica_rows),
+        intent_rows=tuple(intent_rows),
+        live_replica_record_ids=frozenset(live_replica_record_ids),
+        provider_present_replica_record_ids=frozenset(
+            provider_present_replica_record_ids),
+        live_intent_keys=frozenset(live_intent_keys),
+        planned_capacity_by_intent_key=planned_capacity_by_intent_key,
+        capacity_unit_by_intent_key=capacity_unit_by_intent_key)
+
+
+def _lock_kueue_projection(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    service_name: str,
+    service_hash: str,
+    service_lifecycle_epoch: int,
     service_version: int,
     accounting_cards: set[str],
-) -> tuple[dict[str, int], dict[str, int]]:
-    """Project compatible committed rows under the locked service mutex."""
+    locked: _LockedCapacityRows,
+) -> kueue_lane_capacity.KueueAdmissionCapacityProjection:
+    """Lock and validate the admission rows associated with the graph."""
+    try:
+        projection = (
+            kueue_lane_capacity.lock_capacity_projection_in_connection(
+                connection,
+                service_name=service_name,
+                service_hash=service_hash,
+                service_lifecycle_epoch=service_lifecycle_epoch,
+                service_version=service_version,
+                accounting_cards=accounting_cards,
+                locked_intent_rows=locked.intent_rows,
+                planned_capacity_by_intent_key=(
+                    locked.planned_capacity_by_intent_key),
+                capacity_unit_by_intent_key=(
+                    locked.capacity_unit_by_intent_key),
+                live_replica_record_ids=set(locked.live_replica_record_ids),
+                provider_present_replica_record_ids=set(
+                    locked.provider_present_replica_record_ids),
+                live_intent_keys=set(locked.live_intent_keys)))
+    except kueue_lane_capacity.KueueAdmissionCapacityError as error:
+        raise CapacityAdmissionConflict(
+            'Kueue admission capacity cannot be proven.') from error
+    if projection.unbounded_unknown:
+        raise CapacityAdmissionConflict(
+            'Kueue admission capacity has an unbounded unknown scope.')
+    return projection
+
+
+def _project_capacity_inventory(
+    locked: _LockedCapacityRows,
+    *,
+    service_version: int,
+    accounting_cards: set[str],
+    now: datetime.datetime,
+    lane_projection: kueue_lane_capacity.KueueAdmissionCapacityProjection,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    """Project demand supply from one locked replica/admission snapshot."""
     if not accounting_cards:
         raise CapacityAdmissionConflict(
             'Capacity plan has no accounting class.')
@@ -363,15 +492,9 @@ def _locked_capacity_inventory(
             'Capacity plan mixes aggregate and exact-card accounting.')
     zero_cost = {card: 0 for card in accounting_cards}
     paid = {card: 0 for card in accounting_cards}
-    rows = connection.execute(
-        sqlalchemy.select(
-            _REPLICAS.c.status, _REPLICAS.c.version,
-            _REPLICAS.c.replica_state_version, _REPLICAS.c.replica_state).where(
-                _REPLICAS.c.service_name == service_name).order_by(
-                    _REPLICAS.c.replica_id).with_for_update()).mappings().all()
-    for row in rows:
-        if (row['version'] != service_version or
-                row['status'] in _TERMINAL_REPLICA_STATUSES):
+    counted_kueue_intents: set[str] = set()
+    for row in locked.replica_rows:
+        if row['status'] in _TERMINAL_REPLICA_STATUSES:
             continue
         state, planned_capacity, is_zero_cost, is_scale_down = (
             _validated_replica_attribution(row))
@@ -379,67 +502,55 @@ def _locked_capacity_inventory(
             continue
         card = (AGGREGATE_ACCELERATOR if aggregate else _replica_card(state))
         if card not in accounting_cards:
+            intent_key = row['reserved_fill_intent_idempotency_key']
+            if (is_zero_cost and
+                    intent_key in lane_projection.unknown_intent_keys and
+                    not lane_projection.unbounded_unknown):
+                # A bounded exact-shape UNKNOWN cannot suppress an unrelated
+                # paid accounting class.
+                continue
             raise CapacityAdmissionConflict(
                 'Committed replica is outside the exact-card accounting set.')
-        target = zero_cost if is_zero_cost else paid
-        target[card] += planned_capacity
-    return zero_cost, paid
+        if is_zero_cost:
+            intent_key = row['reserved_fill_intent_idempotency_key']
+            lane_assigned = lane_projection.assigned_gpu_for_intent(intent_key)
+            if lane_assigned is False:
+                continue
+            if row['version'] != service_version and lane_assigned is not True:
+                continue
+            zero_cost[card] += planned_capacity
+            if lane_assigned is True and isinstance(intent_key, str):
+                counted_kueue_intents.add(intent_key)
+        elif row['version'] == service_version:
+            paid[card] += planned_capacity
 
-
-def _locked_pending_zero_cost_inventory(
-    connection: sqlalchemy.engine.Connection,
-    *,
-    service_name: str,
-    service_hash: str,
-    service_version: int,
-    accounting_cards: set[str],
-    now: datetime.datetime,
-) -> dict[str, int]:
-    """Project unmaterialized zero-cost grants under the service mutex."""
-    aggregate = accounting_cards == {AGGREGATE_ACCELERATOR}
-    if not accounting_cards or (AGGREGATE_ACCELERATOR in accounting_cards and
-                                not aggregate):
-        raise CapacityAdmissionConflict(
-            'Pending zero-cost accounting classes are invalid.')
-    rows = connection.execute(
-        sqlalchemy.select(_ZERO_COST_INTENTS).where(
-            _ZERO_COST_INTENTS.c.service_name == service_name,
-            _ZERO_COST_INTENTS.c.service_hash == service_hash,
-            _ZERO_COST_INTENTS.c.service_version == service_version).order_by(
-                _ZERO_COST_INTENTS.c.intent_idempotency_key).with_for_update()
-    ).mappings().all()
-    expired_keys = [
-        row['intent_idempotency_key']
-        for row in rows
-        if row['state'] in _PENDING_ZERO_COST_INTENT_STATES and
-        row['valid_until'] <= now
-    ]
-    if expired_keys:
-        connection.execute(
-            sqlalchemy.update(_ZERO_COST_INTENTS).where(
-                _ZERO_COST_INTENTS.c.intent_idempotency_key.in_(expired_keys),
-                _ZERO_COST_INTENTS.c.state.in_(
-                    _PENDING_ZERO_COST_INTENT_STATES)).values(
-                        state='TERMINAL',
-                        lease_owner=None,
-                        lease_expires_at=None,
-                        last_error='grant_expired',
-                        updated_at=now,
-                        terminal_at=now))
-    result = {card: 0 for card in accounting_cards}
-    for row in rows:
-        if (row['state'] not in _PENDING_ZERO_COST_INTENT_STATES or
-                row['valid_until'] <= now):
+    pending_zero_cost = {card: 0 for card in accounting_cards}
+    for row in locked.intent_rows:
+        intent_key = row['intent_idempotency_key']
+        lane_assigned = lane_projection.assigned_gpu_for_intent(intent_key)
+        if lane_assigned is True:
+            if intent_key in counted_kueue_intents:
+                continue
+        elif lane_assigned is False:
+            continue
+        elif (row['state'] not in _PENDING_ZERO_COST_INTENT_STATES or
+              row['valid_until'] <= now or
+              row['service_version'] != service_version):
             continue
         card = (AGGREGATE_ACCELERATOR
                 if aggregate else str(row['accelerator']).casefold())
         planned_capacity = row['planned_capacity']
-        if (card not in result or not isinstance(planned_capacity, int) or
+        if (card not in pending_zero_cost or
+                not isinstance(planned_capacity, int) or
                 isinstance(planned_capacity, bool) or planned_capacity < 1):
+            if (card not in pending_zero_cost and
+                    intent_key in lane_projection.unknown_intent_keys and
+                    not lane_projection.unbounded_unknown):
+                continue
             raise CapacityAdmissionConflict(
                 'Pending zero-cost intent accounting is malformed.')
-        result[card] += planned_capacity
-    return result
+        pending_zero_cost[card] += planned_capacity
+    return zero_cost, paid, pending_zero_cost
 
 
 def _claim_units_for_plan(
@@ -662,21 +773,29 @@ class CapacityAdmissionRepository:
             if service is None:
                 raise CapacityAdmissionConflict('Service no longer exists.')
             self._validate_sources(connection, plan, service)
-            full_zero_cost, full_paid = _locked_capacity_inventory(
-                connection,
-                service_name=plan.service_name,
-                service_version=plan.service_version,
-                accounting_cards=accounting_cards)
             now = connection.execute(
                 sqlalchemy.select(
                     sqlalchemy.func.clock_timestamp())).scalar_one()
-            pending_zero_cost = _locked_pending_zero_cost_inventory(
+            locked_capacity = _lock_capacity_rows(
                 connection,
                 service_name=plan.service_name,
                 service_hash=plan.service_hash,
+                now=now)
+            lane_projection = _lock_kueue_projection(
+                connection,
+                service_name=plan.service_name,
+                service_hash=plan.service_hash,
+                service_lifecycle_epoch=plan.service_lifecycle_epoch,
                 service_version=plan.service_version,
                 accounting_cards=accounting_cards,
-                now=now)
+                locked=locked_capacity)
+            full_zero_cost, full_paid, pending_zero_cost = (
+                _project_capacity_inventory(
+                    locked_capacity,
+                    service_version=plan.service_version,
+                    accounting_cards=accounting_cards,
+                    now=now,
+                    lane_projection=lane_projection))
             head = connection.execute(
                 sqlalchemy.select(_HEADS).where(
                     _HEADS.c.service_name == plan.service_name).with_for_update(
@@ -974,24 +1093,31 @@ def validate_paid_claim_in_connection(
             set(paid) - accounting_cards):
         raise CapacityAdmissionConflict(
             'Capacity plan accounting classes are inconsistent.')
+    locked_capacity = _lock_capacity_rows(connection,
+                                          service_name=service['name'],
+                                          service_hash=service['hash'],
+                                          now=now)
+    lane_projection = _lock_kueue_projection(
+        connection,
+        service_name=service['name'],
+        service_hash=service['hash'],
+        service_lifecycle_epoch=int(service['lifecycle_epoch']),
+        service_version=int(service['current_version']),
+        accounting_cards=accounting_cards,
+        locked=locked_capacity)
+    current_zero, current_paid, current_pending_zero = (
+        _project_capacity_inventory(locked_capacity,
+                                    service_version=int(
+                                        service['current_version']),
+                                    accounting_cards=accounting_cards,
+                                    now=now,
+                                    lane_projection=lane_projection))
     claim_units_by_card = _claim_units_for_plan(
         connection,
         service_name=service['name'],
         service_hash=service['hash'],
         generation=generation,
         accounting_cards=accounting_cards)
-    current_zero, current_paid = _locked_capacity_inventory(
-        connection,
-        service_name=service['name'],
-        service_version=int(service['current_version']),
-        accounting_cards=accounting_cards)
-    current_pending_zero = _locked_pending_zero_cost_inventory(
-        connection,
-        service_name=service['name'],
-        service_hash=service['hash'],
-        service_version=int(service['current_version']),
-        accounting_cards=accounting_cards,
-        now=now)
     expected_paid = {
         card: baseline_paid.get(card, 0) + claim_units_by_card.get(card, 0)
         for card in accounting_cards

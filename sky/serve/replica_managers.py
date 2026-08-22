@@ -96,6 +96,8 @@ request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
 api_requests = adaptors_common.LazyImport('sky.server.requests.requests')
 reserved_fill_admission = adaptors_common.LazyImport(
     'sky.server.requests.reserved_fill_admission')
+kueue_lane_observer = adaptors_common.LazyImport(
+    'sky.serve.kueue_lane_observer')
 requests = adaptors_common.LazyImport('requests')
 
 
@@ -2293,6 +2295,24 @@ def terminate_bound_non_pool_provider_present_cluster(
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Fenced provider cleanup completed without fresh exact ABSENT '
             'evidence for the reserved-fill allocation.')
+
+
+def terminate_cluster_with_kueue_absence_receipt(
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+    cluster_name: str,
+    log_file: str,
+    replica_drain_delay_seconds: int = 0,
+    **terminate_kwargs: Any,
+) -> None:
+    """Down one cluster and record exact admitted-Pod absence when applicable."""
+    if replica_drain_delay_seconds:
+        terminate_kwargs['replica_drain_delay_seconds'] = (
+            replica_drain_delay_seconds)
+    terminate_cluster(cluster_name, log_file, **terminate_kwargs)
+    kueue_lane_observer.project_exact_pod_absence_after_teardown(
+        service_name, replica_id, replica_record_id)
 
 
 def _get_resources_ports(
@@ -5553,6 +5573,26 @@ class SkyPilotReplicaManager(ReplicaManager):
             return False
         if cleanup_fence is None:
             return False
+        try:
+            exact_absence = (
+                kueue_lane_observer.project_exact_pod_absence_after_teardown(
+                    self._service_name, info.replica_id,
+                    info.replica_record_id))
+        except Exception as error:  # pylint: disable=broad-except
+            # An exact Kueue admission exists but its stored Pod is still
+            # present/replaced or unreadable.  Never downgrade that result to
+            # the cluster-name census below.
+            logger.error(
+                'Exact admitted-Pod absence remains unproved for replica %s: %s',
+                info.replica_id, common_utils.format_exception(error))
+            return False
+        if exact_absence:
+            logger.info(
+                'Replica %s exact admitted Pod is absent: treating cleanup as '
+                'complete despite the unprovable step (%s).', info.replica_id,
+                message)
+            self._handle_sky_down_finish(info, format_exc=None)
+            return True
         presence = reserved_capacity.probe_physical_replica_presence(
             cleanup_fence, info.cluster_name)
         if presence is not reserved_capacity.PhysicalReplicaPresence.ABSENT:
@@ -5564,10 +5604,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._handle_sky_down_finish(info, format_exc=None)
         return True
 
-    def _record_cleanup_uncertain(self, info: ReplicaInfo,
-                                  message: str) -> None:
+    def _record_cleanup_uncertain(self,
+                                  info: ReplicaInfo,
+                                  message: str,
+                                  *,
+                                  allow_presence_probe: bool = True) -> None:
         """Retain one row whose exact provider cleanup cannot be proven."""
-        if self._prove_cleanup_complete(info, message):
+        if allow_presence_probe and self._prove_cleanup_complete(info, message):
             return
         logger.error(f'Replica {info.replica_id} cleanup is uncertain: '
                      f'{message}')
@@ -8991,64 +9034,138 @@ class SkyPilotReplicaManager(ReplicaManager):
             and owner_fingerprint == intent.controller_owner)
 
     def _actuate_zero_cost_pool(self, pool_key: str) -> None:
-        """Execute at most one lease in a physical-pool concurrency lane."""
-        lease: zero_cost_actuation.IntentLease | None = None
+        """Stage one bounded wave in an independent physical-pool lane."""
+        leases: tuple[zero_cost_actuation.IntentLease, ...] = ()
+        handled_intent_keys: set[str] = set()
         preflights: _ReservedFillPhysicalPreflightBatch | None = None
         materialization_committed = False
+        submitted_count = 0
+        ambiguous_error: Exception | None = None
         actuation_error: BaseException | None = None
         try:
-            lease = self._zero_cost_actuation_repository.lease_next(
+            leases = self._zero_cost_actuation_repository.lease_batch(
                 service_name=self._service_name,
                 pool_key=pool_key,
                 owner=self._zero_cost_actuation_executor_id,
-                lease_seconds=_ZERO_COST_ACTUATION_LEASE_SECONDS)
-            if lease is None:
+                lease_seconds=_ZERO_COST_ACTUATION_LEASE_SECONDS,
+                max_leases=(zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE))
+            if not leases:
                 return
-            intent = lease.intent
-            if not self._zero_cost_actuation_authority_current(intent):
+            actionable: list[zero_cost_actuation.IntentLease] = []
+            for lease in leases:
+                if self._zero_cost_actuation_authority_current(lease.intent):
+                    actionable.append(lease)
+                    continue
                 self._zero_cost_actuation_repository.release_retryable(
                     lease, 'controller_authority_unavailable')
+                handled_intent_keys.add(lease.intent.idempotency_key)
+            if not actionable:
                 return
             with provider_phase.try_provider_phase(
                     provider_phase.ProviderPhaseMode.V2_FENCED) as admission:
                 preflights = self._start_reserved_fill_physical_preflights(
-                    (intent,), admission, self._workspace)
+                    tuple(lease.intent for lease in actionable), admission,
+                    self._workspace)
                 launch_error: BaseException | None = None
-                result: _ReplicaLaunchResult | None = None
                 try:
-                    preflight = preflights.preflights[(
-                        intent.allowed_locations[0].region,
-                        intent.physical_cluster_uid)]
-                    if preflight.error is not None:
-                        raise preflight.error
+                    for lease in actionable:
+                        intent = lease.intent
+                        preflight = preflights.preflights[(
+                            intent.allowed_locations[0].region,
+                            intent.physical_cluster_uid)]
+                        if preflight.error is not None:
+                            raise preflight.error
                     with self.lock:
-                        if not self._zero_cost_actuation_authority_current(
-                                intent):
-                            (self._zero_cost_actuation_repository.
-                             release_retryable(lease,
-                                               'controller_authority_changed'))
-                            return
                         infos = serve_state.get_replica_infos(
                             self._service_name)
                         used_replica_ids = {info.replica_id for info in infos}
-                        try:
-                            result = self._scale_up_one_locked(
-                                self._reserved_fill_override(intent),
-                                used_replica_ids,
-                                infos,
-                                paid_launch_allowed=False,
-                                provider_phase_admission=admission,
-                                require_preinitialized_physical_fence=True,
-                                zero_cost_actuation_lease=lease)
-                        except reserved_fill_admission.AdmissionAmbiguousError:
+                        for lease in actionable:
+                            intent = lease.intent
+                            intent_key = intent.idempotency_key
+                            if not self._zero_cost_actuation_authority_current(
+                                    intent):
+                                (self._zero_cost_actuation_repository.
+                                 release_retryable(
+                                     lease, 'controller_authority_changed'))
+                                handled_intent_keys.add(intent_key)
+                                continue
+                            result = None
+                            try:
+                                result = self._scale_up_one_locked(
+                                    self._reserved_fill_override(intent),
+                                    used_replica_ids,
+                                    infos,
+                                    paid_launch_allowed=False,
+                                    provider_phase_admission=admission,
+                                    require_preinitialized_physical_fence=True,
+                                    zero_cost_actuation_lease=lease)
+                            except (reserved_fill_admission.
+                                    AdmissionAmbiguousError) as error:
+                                # Preserve only this exact maybe-committed
+                                # graph.  Later batch members remain
+                                # independently actionable.
+                                materialization_committed = True
+                                submitted_count += 1
+                                handled_intent_keys.add(intent_key)
+                                if ambiguous_error is None:
+                                    ambiguous_error = error
+                                logger.warning(
+                                    'Zero-cost admission for pool %s intent '
+                                    '%s is ambiguous; preserving it and '
+                                    'continuing the bounded wave: %s', pool_key,
+                                    intent_key,
+                                    common_utils.format_exception(error))
+                                continue
+                            except (exceptions.ProviderPhaseBusyError,
+                                    exceptions.ProviderPhaseTimeoutError,
+                                    exceptions.
+                                    KubernetesPhysicalClusterFenceBusyError,
+                                    TimeoutError) as error:
+                                (self._zero_cost_actuation_repository.
+                                 release_retryable(lease,
+                                                   type(error).__name__))
+                                handled_intent_keys.add(intent_key)
+                                continue
+                            except (exceptions.
+                                    KubernetesPhysicalClusterIdentityError
+                                   ) as error:
+                                self._zero_cost_actuation_repository.terminate(
+                                    lease, 'physical_cluster_identity_changed')
+                                handled_intent_keys.add(intent_key)
+                                logger.info(
+                                    'Terminalized zero-cost actuation for '
+                                    'pool %s intent %s: %s', pool_key,
+                                    intent_key,
+                                    common_utils.format_exception(error))
+                                continue
+                            except BaseException as error:  # noqa: ASYNC103  # pylint: disable=broad-except
+                                if not isinstance(error, Exception):
+                                    raise
+                                try:
+                                    (self._zero_cost_actuation_repository.
+                                     release_retryable(lease,
+                                                       type(error).__name__))
+                                    handled_intent_keys.add(intent_key)
+                                except Exception:  # pylint: disable=broad-except
+                                    logger.exception(
+                                        'Could not release zero-cost '
+                                        'actuation lease for pool %s intent '
+                                        '%s.', pool_key, intent_key)
+                                logger.exception(
+                                    'Zero-cost actuation failed for pool %s '
+                                    'intent %s: %s', pool_key, intent_key,
+                                    common_utils.format_exception(error))
+                                continue
+                            if result is None:
+                                (self._zero_cost_actuation_repository.
+                                 release_retryable(lease,
+                                                   'replica_commit_deferred'))
+                                handled_intent_keys.add(intent_key)
+                                continue
                             materialization_committed = True
-                            raise
-                        materialization_committed = result is not None
-                        if result is None:
-                            (self._zero_cost_actuation_repository.
-                             release_retryable(lease,
-                                               'replica_commit_deferred'))
-                            return
+                            submitted_count += 1
+                            handled_intent_keys.add(intent_key)
+                            used_replica_ids.add(result.replica_id)
                 except BaseException as error:
                     launch_error = error
                     raise
@@ -9062,11 +9179,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                             raise launch_error from release_error
                         raise
                     preflights = None
+            if ambiguous_error is not None:
+                # Finish every independently actionable batch member, then
+                # enter the established ambiguity path exactly once. It owns
+                # the sole reconciliation signal and preserves BaseException
+                # precedence without retrying the provider effect.
+                raise ambiguous_error
             self._scale_reconciliation_event.set()
         except BaseException as error:  # pylint: disable=broad-except
             actuation_error = error
-            if (materialization_committed or isinstance(
-                    error, reserved_fill_admission.AdmissionAmbiguousError)):
+            unresolved = tuple(
+                lease for lease in leases
+                if lease.intent.idempotency_key not in handled_intent_keys)
+            if materialization_committed:
                 # Preserve possibly committed evidence for restart hydration.
                 formatted_error = (common_utils.format_exception(error)
                                    if isinstance(error, (Exception, SystemExit,
@@ -9093,13 +9218,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                              exceptions.ProviderPhaseTimeoutError,
                              exceptions.KubernetesPhysicalClusterFenceBusyError,
                              TimeoutError)):
-                if lease is not None:
+                for lease in unresolved:
                     self._zero_cost_actuation_repository.release_retryable(
                         lease,
                         type(error).__name__)
             elif isinstance(error,
                             exceptions.KubernetesPhysicalClusterIdentityError):
-                if lease is not None:
+                for lease in unresolved:
                     self._zero_cost_actuation_repository.terminate(
                         lease, 'physical_cluster_identity_changed')
                 logger.info('Terminalized zero-cost actuation for pool %s: %s',
@@ -9107,7 +9232,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             elif not isinstance(error, Exception):
                 raise
             else:
-                if lease is not None:
+                for lease in unresolved:
                     try:
                         self._zero_cost_actuation_repository.release_retryable(
                             lease,
@@ -9134,10 +9259,21 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'Committed zero-cost admission for pool %s is ambiguous '
                         'after physical-preflight release failed: %s', pool_key,
                         common_utils.format_exception(error))
+            # Do not impose the one-second poll delay between bounded waves.
+            # The dispatcher rechecks durable work and still owns at most one
+            # active executor thread for this pool.
+            if (submitted_count > 0 and len(leases)
+                    == zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE):
+                self._zero_cost_actuation_event.set()
 
     def _zero_cost_actuation_dispatcher(self) -> None:
         """Supervise one independent executor lane per physical pool."""
         while not self._manager_daemon_should_stop():
+            # Clear before the durable scan.  A publication before this point
+            # is visible to the scan; a publication or completed batch after
+            # this point leaves the event set for the wait below.  Clearing
+            # after the scan would lose that wakeup and impose a poll delay.
+            self._zero_cost_actuation_event.clear()
             mode = zero_cost_actuation.get_service_mode(self._service_name)
             self._reserved_fill_actuation_mode = mode
             pool_keys: tuple[str, ...] = ()
@@ -9164,7 +9300,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                         daemon=True)
                     self._zero_cost_actuation_lanes[pool_key] = worker
                     worker.start()
-            self._zero_cost_actuation_event.clear()
             self._zero_cost_actuation_event.wait(
                 _ZERO_COST_ACTUATION_POLL_SECONDS)
 
@@ -10492,6 +10627,25 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._schedule_non_pool_provider_reconciliation(
                         info, provider_present_cleanup_context)
                     return
+                info.status_property.sky_down_status = (
+                    common_utils.ProcessStatus.SCHEDULED)
+                self._persist_replica(replica_id, info)
+                try:
+                    exact_absence = (kueue_lane_observer.
+                                     project_exact_pod_absence_after_teardown(
+                                         self._service_name, replica_id,
+                                         info.replica_record_id))
+                except Exception as error:  # pylint: disable=broad-except
+                    self._record_cleanup_uncertain(
+                        info,
+                        'the exact admitted Kubernetes Pod could not be proved '
+                        'absent after its cluster record disappeared: '
+                        f'{common_utils.format_exception(error)}',
+                        allow_presence_probe=False)
+                    return
+                if exact_absence:
+                    self._handle_sky_down_finish(info, format_exc=None)
+                    return
                 self._record_cleanup_uncertain(
                     info, 'the durable cluster record is absent, so cleanup '
                     'of partial resources cannot be proven')
@@ -10561,9 +10715,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         target: Callable[..., None]
         target_args: tuple[Any, ...]
         if provider_present_cleanup_context is None:
-            target = terminate_cluster
-            target_args = (info.cluster_name, log_file_name,
-                           replica_drain_delay_seconds)
+            target = terminate_cluster_with_kueue_absence_receipt
+            target_args = (self._service_name, replica_id,
+                           info.replica_record_id, info.cluster_name,
+                           log_file_name, replica_drain_delay_seconds)
         else:
             assert binding_authority is not None
             target = terminate_bound_non_pool_provider_present_cluster

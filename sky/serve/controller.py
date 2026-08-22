@@ -4810,6 +4810,13 @@ class SkyServeController:
                     'explicit migration or rollback.'
             },
                                           status_code=400)
+        if result is serve_state.VersionCommitResult.KUEUE_ADMISSION_HOLD:
+            return responses.JSONResponse(content={
+                'message': 'Service version election is held while an outgoing '
+                           'reserved-capacity Pod is still waiting for Kueue '
+                           'admission. Retry after it is policy-admitted.'
+            },
+                                          status_code=409)
         if result is serve_state.VersionCommitResult.CONTENT_CONFLICT:
             return responses.JSONResponse(content={
                 'message': f'Service version {version} was already committed '

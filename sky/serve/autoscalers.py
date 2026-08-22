@@ -18,6 +18,7 @@ from sky.jobs import state as managed_job_state
 from sky.serve import autoscaler_compatibility
 from sky.serve import autoscaler_decisions
 from sky.serve import constants
+from sky.serve import kueue_lane_capacity
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
@@ -56,6 +57,13 @@ class ScalingDecisionInputs:
     replica_ids: tuple[int, ...]
     gpu_shape_handles: dict[int, Any] | None = None
     historical_scaling_values: dict[int, Any] | None = None
+    kueue_capacity_by_replica_id: dict[
+        int,
+        kueue_lane_capacity.KueueReplicaCapacityClass] = (dataclasses.field(
+            default_factory=dict))
+    kueue_blocked_retirement_shapes: frozenset[tuple[str, int]] = frozenset()
+    kueue_transition_replica_ids: frozenset[int] = frozenset()
+    kueue_ready_paid_replacement_replica_ids: frozenset[int] = frozenset()
 
 
 # Preserve historical private import and pickle identities while the pure
@@ -448,6 +456,17 @@ class Autoscaler:
         # entering their state lock. The neutral value is part of the shared
         # resolver interface and means no snapshot is active.
         self._gpu_shape_handles_for_tick: dict[int, Any] | None = None
+        # Exact Kueue admission classification is also prepared outside the
+        # routing lock. None means no prepared decision is active. Unknown is
+        # conservative capacity and is never ordinary retirement authority.
+        self._kueue_capacity_by_replica_id_for_tick: dict[
+            int, kueue_lane_capacity.KueueReplicaCapacityClass] | None = None
+        self._kueue_blocked_retirement_shapes_for_tick: frozenset[tuple[
+            str, int]] = frozenset()
+        self._kueue_transition_replica_ids_for_tick: frozenset[int] = (
+            frozenset())
+        self._kueue_ready_paid_replacement_replica_ids_for_tick: frozenset[
+            int] = frozenset()
         # Seed from the constructed service version (not always
         # INITIAL_VERSION). On a controller restart/respawn the autoscaler is
         # rebuilt; if it reset to version 1 while live replicas are at version
@@ -1717,6 +1736,12 @@ class Autoscaler:
         """Whether this autoscaler can resolve exact replica GPU shapes."""
         return False
 
+    def _kueue_counts_as_assigned(self,
+                                  info: 'replica_managers.ReplicaInfo') -> bool:
+        """Neutral Kueue accounting for autoscalers without exact shapes."""
+        del info
+        return True
+
     def _resolve_fill_gpu_shape(
             self, info: 'replica_managers.ReplicaInfo') -> tuple[str, int]:
         """Resolve one replica's exact GPU shape for fill accounting."""
@@ -1833,7 +1858,8 @@ class Autoscaler:
         }
         for info in replica_infos:
             if (info.is_terminal or info.version != self.latest_version or
-                    _replica_is_retiring_card_supply(info)):
+                    _replica_is_retiring_card_supply(info) or
+                    not self._kueue_counts_as_assigned(info)):
                 continue
             raw_card, _ = self._resolve_fill_gpu_shape(info)
             card = canonical_by_name.get(str(raw_card).casefold())
@@ -3819,6 +3845,11 @@ class _GpuShapeResolverMixin:
     # Immutable per-decision legacy handle snapshot, populated before the
     # autoscaler state lock is acquired.
     _gpu_shape_handles_for_tick: dict[int, Any] | None
+    _kueue_capacity_by_replica_id_for_tick: dict[
+        int, kueue_lane_capacity.KueueReplicaCapacityClass] | None
+    _kueue_blocked_retirement_shapes_for_tick: frozenset[tuple[str, int]]
+    _kueue_transition_replica_ids_for_tick: frozenset[int]
+    _kueue_ready_paid_replacement_replica_ids_for_tick: frozenset[int]
 
     def _supports_exact_fill_shape_resolution(self) -> bool:
         return True
@@ -3858,10 +3889,96 @@ class _GpuShapeResolverMixin:
                         'version %s; using the latest-version fallback for '
                         'this decision tick.', version)
                 historical_values[version] = value
+        try:
+            kueue_snapshot = (
+                kueue_lane_capacity.snapshot_replica_capacity_classes(
+                    self._service_name, replica_infos))
+        except kueue_lane_capacity.KueueAdmissionCapacityError as error:
+            # A read failure cannot make a waiting/admitted lane disappear.
+            # Conservatively protect all reserved-fill rows from retirement;
+            # final PostgreSQL paid admission independently fails closed.
+            unknown = {
+                info.replica_id:
+                    kueue_lane_capacity.KueueReplicaCapacityClass.UNKNOWN
+                for info in replica_infos
+                if isinstance(
+                    getattr(info, 'reserved_fill_intent_idempotency_key', None),
+                    str) and bool(info.reserved_fill_intent_idempotency_key)
+            }
+            logger.warning(
+                'Failed to prepare Kueue admission capacity for '
+                'service %s: %s', self._service_name,
+                common_utils.format_exception(error))
+            unknown_shapes: set[tuple[str, int]] = set()
+            for info in replica_infos:
+                if info.replica_id not in unknown:
+                    continue
+                try:
+                    raw_card, count = self._resolve_fill_gpu_shape(info)
+                except (AttributeError, TypeError, ValueError):
+                    unknown_shapes.add(('*', 0))
+                else:
+                    unknown_shapes.add((raw_card.casefold(), int(count)))
+            kueue_snapshot = kueue_lane_capacity.KueueReplicaCapacitySnapshot(
+                unknown, frozenset(unknown_shapes))
+
+        shape_by_replica_id: dict[int, tuple[str, int]] = {}
+        zero_cost_infos: list[replica_managers.ReplicaInfo] = []
+        paid_infos: list[replica_managers.ReplicaInfo] = []
+        unknown_shapes = set(kueue_snapshot.unknown_shapes)
+        for info in replica_infos:
+            try:
+                raw_card, count = self._resolve_fill_gpu_shape(info)
+                shape = (raw_card.casefold(), int(count))
+            except (AttributeError, TypeError, ValueError):
+                if info.replica_id in kueue_snapshot.by_replica_id:
+                    unknown_shapes.add(('*', 0))
+                continue
+            shape_by_replica_id[info.replica_id] = shape
+            admission = kueue_snapshot.by_replica_id.get(info.replica_id)
+            if info.is_zero_cost is not True:
+                paid_infos.append(info)
+            else:
+                zero_cost_infos.append(info)
+            if (admission
+                    is kueue_lane_capacity.KueueReplicaCapacityClass.UNKNOWN):
+                unknown_shapes.add(shape)
+
+        if kueue_snapshot.unbounded_unknown:
+            unknown_shapes.add(('*', 0))
+        transition_ids: set[int] = set()
+        ready_paid_ids: set[int] = set()
+        surge_shapes = set(kueue_snapshot.replacement_surge_shapes)
+        if surge_shapes:
+            # A durable surge lease, not a mutable request-profile snapshot,
+            # owns paid-first replacement ordering.  Keep every zero-cost row
+            # out of the ordinary victim set until provider-clean evidence
+            # has reduced the conserved debit and PostgreSQL clears the lease.
+            transition_ids.update(info.replica_id for info in zero_cost_infos)
+            compatible_paid = [
+                info for info in paid_infos
+                if shape_by_replica_id.get(info.replica_id) in surge_shapes
+            ]
+            transition_ids.update(info.replica_id for info in compatible_paid)
+            surge_ready = any(
+                info.replica_id in kueue_snapshot.replacement_surge_replica_ids
+                and kueue_snapshot.by_replica_id.get(info.replica_id) is
+                kueue_lane_capacity.KueueReplicaCapacityClass.POLICY_ADMITTED
+                and info.is_ready for info in zero_cost_infos)
+            if surge_ready:
+                ready_paid_ids.update(
+                    info.replica_id
+                    for info in compatible_paid
+                    if (not info.is_terminal and
+                        info.status_property.is_scale_down is not True))
         return ScalingDecisionInputs(
-            tuple(info.replica_id for info in replica_infos),
+            replica_ids=tuple(info.replica_id for info in replica_infos),
             gpu_shape_handles=self._resolve_gpu_shape_handles(replica_infos),
-            historical_scaling_values=historical_values)
+            historical_scaling_values=historical_values,
+            kueue_capacity_by_replica_id=dict(kueue_snapshot.by_replica_id),
+            kueue_blocked_retirement_shapes=frozenset(unknown_shapes),
+            kueue_transition_replica_ids=frozenset(transition_ids),
+            kueue_ready_paid_replacement_replica_ids=frozenset(ready_paid_ids))
 
     def _cached_historical_scaling_versions(self) -> set[int]:
         """Return versions whose capacity metadata needs no durable read."""
@@ -3882,11 +3999,79 @@ class _GpuShapeResolverMixin:
         if decision_inputs.replica_ids != replica_ids:
             raise ValueError('Scaling decision inputs do not match the exact '
                              'replica snapshot.')
+        kueue_classes = decision_inputs.kueue_capacity_by_replica_id
+        if (set(kueue_classes) - set(replica_ids) or not all(
+                isinstance(value, kueue_lane_capacity.KueueReplicaCapacityClass)
+                for value in kueue_classes.values())):
+            raise ValueError('Scaling decision inputs have an invalid Kueue '
+                             'admission snapshot.')
+        for shapes in (decision_inputs.kueue_blocked_retirement_shapes,):
+            if (not isinstance(shapes, frozenset) or not all(
+                    isinstance(shape, tuple) and len(shape) == 2 and
+                    isinstance(shape[0], str) and shape[0] and
+                    isinstance(shape[1], int) and
+                    not isinstance(shape[1], bool) and shape[1] >= 0
+                    for shape in shapes)):
+                raise ValueError('Scaling decision inputs have invalid Kueue '
+                                 'capacity scopes.')
+        transition_ids = decision_inputs.kueue_transition_replica_ids
+        ready_paid_ids = (
+            decision_inputs.kueue_ready_paid_replacement_replica_ids)
+        if (not isinstance(transition_ids, frozenset) or
+                not isinstance(ready_paid_ids, frozenset) or
+                not ready_paid_ids <= transition_ids or
+                not transition_ids <= set(replica_ids) or
+                any(not isinstance(value, int) or isinstance(value, bool)
+                    for value in transition_ids)):
+            raise ValueError('Scaling decision inputs have invalid Kueue '
+                             'replacement replicas.')
 
     def _resolve_fill_gpu_shape(
             self, info: 'replica_managers.ReplicaInfo') -> tuple[str, int]:
         """Expose exact GPU shapes to the shared reserved-fill overlay."""
         return self._get_gpu_shape_from_replica_info(info)
+
+    def _kueue_capacity_class(
+        self, info: 'replica_managers.ReplicaInfo'
+    ) -> kueue_lane_capacity.KueueReplicaCapacityClass | None:
+        snapshot = self._kueue_capacity_by_replica_id_for_tick
+        if snapshot is None:
+            return None
+        return snapshot.get(info.replica_id)
+
+    def _kueue_counts_as_assigned(self,
+                                  info: 'replica_managers.ReplicaInfo') -> bool:
+        """Fresh waiting Pods are the sole zero-width assigned state."""
+        return (
+            self._kueue_capacity_class(info)
+            is not kueue_lane_capacity.KueueReplicaCapacityClass.FRESH_WAITING)
+
+    def _kueue_ordinary_victim_eligible(
+            self, info: 'replica_managers.ReplicaInfo') -> bool:
+        """Keep replacement safety exact-shape scoped and paid-first."""
+        try:
+            raw_card, count = self._resolve_fill_gpu_shape(info)
+            shape = (raw_card.casefold(), int(count))
+        except (AttributeError, TypeError, ValueError):
+            shape = ('*', 0)
+        blocked = self._kueue_blocked_retirement_shapes_for_tick
+        if ('*', 0) in blocked or shape in blocked:
+            return False
+        admission = self._kueue_capacity_class(info)
+        if admission in (
+                kueue_lane_capacity.KueueReplicaCapacityClass.FRESH_WAITING,
+                kueue_lane_capacity.KueueReplicaCapacityClass.UNKNOWN):
+            return False
+        if info.replica_id in self._kueue_transition_replica_ids_for_tick:
+            # While compatible paid capacity covers the transition, admitted
+            # reserved supply is not a victim.  Only a compatible paid row may
+            # retire, and only once at least one replacement is READY.
+            return (info.replica_id
+                    in self._kueue_ready_paid_replacement_replica_ids_for_tick)
+        if (admission is
+                kueue_lane_capacity.KueueReplicaCapacityClass.POLICY_ADMITTED):
+            return info.is_ready
+        return True
 
     @staticmethod
     def _gpu_shape_from_resources_override(
@@ -4442,6 +4627,14 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                                 f'value for version {version}.')
         with self._instance_state_lock:
             self._gpu_shape_handles_for_tick = shape_handles
+            self._kueue_capacity_by_replica_id_for_tick = dict(
+                decision_inputs.kueue_capacity_by_replica_id)
+            self._kueue_blocked_retirement_shapes_for_tick = (
+                decision_inputs.kueue_blocked_retirement_shapes)
+            self._kueue_transition_replica_ids_for_tick = (
+                decision_inputs.kueue_transition_replica_ids)
+            self._kueue_ready_paid_replacement_replica_ids_for_tick = (
+                decision_inputs.kueue_ready_paid_replacement_replica_ids)
             self._qps_dict_unavailable_versions_for_tick = {
                 version for version, value in historical_values.items()
                 if value is None
@@ -4457,6 +4650,11 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 finally:
                     self._qps_dict_unavailable_versions_for_tick = None
                     self._gpu_shape_handles_for_tick = None
+                    self._kueue_capacity_by_replica_id_for_tick = None
+                    self._kueue_blocked_retirement_shapes_for_tick = frozenset()
+                    self._kueue_transition_replica_ids_for_tick = frozenset()
+                    self._kueue_ready_paid_replacement_replica_ids_for_tick = (
+                        frozenset())
 
     def _generate_scaling_decisions_locked(
         self,
@@ -4496,7 +4694,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         latest_nonterminal_replicas: list[replica_managers.ReplicaInfo] = []
 
         for info in replica_infos:
-            if not info.is_terminal and info.version == self.latest_version:
+            if (not info.is_terminal and info.version == self.latest_version and
+                    self._kueue_counts_as_assigned(info)):
                 latest_nonterminal_replicas.append(info)
 
         target_num_replicas = self.get_final_target_num_replicas()
@@ -4545,8 +4744,27 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                     excess = max(0, len(replicas) - target_by_card.get(card, 0))
                     if excess <= 0:
                         continue
-                    for replica_id in self._select_replicas_to_scale_down_by_qps(
-                            excess, replicas):
+                    eligible = [
+                        info for info in replicas
+                        if self._kueue_ordinary_victim_eligible(info)
+                    ]
+                    ordered_ids = self._select_replicas_to_scale_down_by_qps(
+                        len(eligible), eligible)
+                    by_id = {info.replica_id: info for info in eligible}
+                    remaining_ready = sum(info.is_ready for info in replicas)
+                    selected: list[int] = []
+                    for replica_id in ordered_ids:
+                        info = by_id[replica_id]
+                        if (info.is_ready and
+                                remaining_ready - 1 < target_by_card.get(
+                                    card, 0)):
+                            continue
+                        selected.append(replica_id)
+                        if info.is_ready:
+                            remaining_ready -= 1
+                        if len(selected) >= excess:
+                            break
+                    for replica_id in selected:
                         scaling_decisions.append(
                             AutoscalerDecision(
                                 AutoscalerDecisionOperator.SCALE_DOWN,
@@ -4565,8 +4783,17 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 current_num_replicas - target_num_replicas
 
             # Use instance-aware scale down logic
-            replicas_to_scale_down = self._select_replicas_to_scale_down_by_qps(
-                num_replicas_to_scale_down, latest_nonterminal_replicas)
+            eligible = [
+                info for info in latest_nonterminal_replicas
+                if self._kueue_ordinary_victim_eligible(info)
+            ]
+            ordered_ids = self._select_replicas_to_scale_down_by_qps(
+                len(eligible), eligible)
+            replicas_to_scale_down = []
+            for replica_id in ordered_ids:
+                replicas_to_scale_down.append(replica_id)
+                if len(replicas_to_scale_down) >= num_replicas_to_scale_down:
+                    break
             for replica_id in replicas_to_scale_down:
                 scaling_decisions.append(
                     AutoscalerDecision(AutoscalerDecisionOperator.SCALE_DOWN,
@@ -4655,7 +4882,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         nonretiring_supply = {card: 0 for card in cards}
         for info in replica_infos:
             if (info.is_terminal or info.version != self.latest_version or
-                    _replica_is_retiring_card_supply(info)):
+                    _replica_is_retiring_card_supply(info) or
+                    not self._kueue_counts_as_assigned(info)):
                 continue
             raw_card, _ = self._get_gpu_shape_from_replica_info(info)
             card = canonical_by_name.get(raw_card.casefold())
@@ -4934,8 +5162,13 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         have kept.
         """
         if self.update_mode != serve_utils.UpdateMode.ROLLING:
-            return super()._select_outdated_replicas_to_scale_down(
+            candidates = super()._select_outdated_replicas_to_scale_down(
                 replica_infos, active_versions)
+            by_id = {info.replica_id: info for info in replica_infos}
+            return [
+                replica_id for replica_id in candidates
+                if self._kueue_ordinary_victim_eligible(by_id[replica_id])
+            ]
         old_nonterminal = [
             info for info in replica_infos
             if info.version < self.latest_version and not info.is_terminal
@@ -4977,7 +5210,11 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         if num_ready_latest >= self.get_final_target_num_replicas():
             # Enough latest-version replicas: retire all old ones (same
             # terminal condition as the base class).
-            return [info.replica_id for info in old_nonterminal]
+            return [
+                info.replica_id
+                for info in old_nonterminal
+                if self._kueue_ordinary_victim_eligible(info)
+            ]
 
         demand = len(self.request_timestamps) / self.qps_window_size
         shortfall = demand - ready_latest_capacity
@@ -5030,7 +5267,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         return [
             info.replica_id
             for info in old_nonterminal
-            if info.replica_id not in keep_ids
+            if (info.replica_id not in keep_ids and
+                self._kueue_ordinary_victim_eligible(info))
         ]
 
     def _get_qps_dict_for_version(self, version: int) -> dict[str, float]:
@@ -5143,7 +5381,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         for info in replica_infos:
             # Include old-version replicas as well so they also get a target_qps
             # assigned. Skip terminal replicas only.
-            if info.is_terminal:
+            if (info.is_terminal or
+                    not self._kueue_ordinary_victim_eligible(info)):
                 continue
 
             # Get GPU shape directly from replica info
@@ -6143,6 +6382,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         """Pinned capacity used to suppress duplicate logical launches."""
         if _replica_is_retiring_card_supply(info):
             return 0
+        if not self._kueue_counts_as_assigned(info):
+            return 0
         planned = int(self._replica_capacity(info))
         observed = self._observed_slots_by_replica_id.get(info.replica_id)
         degraded = (info.replica_id in self._unknown_capacity_replica_ids or
@@ -6198,7 +6439,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         """Capacities of live latest-version replicas, largest first."""
         capacities = []
         for info in replica_infos:
-            if info.is_terminal or info.version != self.latest_version:
+            if (info.is_terminal or info.version != self.latest_version or
+                    not self._kueue_counts_as_assigned(info)):
                 continue
             capacity = self._replica_capacity(info)
             if capacity > 0:
@@ -6522,7 +6764,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     ) -> int:
         """Latest-version planned slots, from every launch origin."""
         return sum(
-            max(0, int(self._replica_capacity(info)))
+            max(0, self._committed_capacity(info))
             for info in replica_infos
             if (not info.is_terminal and info.version == self.latest_version and
                 info.status_property.is_scale_down is not True))
@@ -6571,7 +6813,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         stays on the latest-version rate base.
         """
         return sum(
-            max(0, int(self._replica_capacity(info)))
+            max(0, self._committed_capacity(info))
             for info in replica_infos
             if (not info.is_terminal and
                 info.status_property.is_scale_down is not True))
@@ -8068,6 +8310,14 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                                 f'value for version {version}.')
         with self._logical_state_lock:
             self._gpu_shape_handles_for_tick = shape_handles
+            self._kueue_capacity_by_replica_id_for_tick = dict(
+                decision_inputs.kueue_capacity_by_replica_id)
+            self._kueue_blocked_retirement_shapes_for_tick = (
+                decision_inputs.kueue_blocked_retirement_shapes)
+            self._kueue_transition_replica_ids_for_tick = (
+                decision_inputs.kueue_transition_replica_ids)
+            self._kueue_ready_paid_replacement_replica_ids_for_tick = (
+                decision_inputs.kueue_ready_paid_replacement_replica_ids)
             self._knob_unavailable_versions_for_tick = {
                 version for version, value in historical_values.items()
                 if value is None
@@ -8083,6 +8333,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 finally:
                     self._knob_unavailable_versions_for_tick = None
                     self._gpu_shape_handles_for_tick = None
+                    self._kueue_capacity_by_replica_id_for_tick = None
+                    self._kueue_blocked_retirement_shapes_for_tick = frozenset()
+                    self._kueue_transition_replica_ids_for_tick = frozenset()
+                    self._kueue_ready_paid_replacement_replica_ids_for_tick = (
+                        frozenset())
 
     def _generate_scaling_decisions_locked(
         self,
@@ -8346,10 +8601,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # count as busy through _replica_is_busy and remain protected.
             idle_nonready_old = [
                 info for info in old_nonterminal
-                if not info.is_ready and not self._replica_is_busy(info)
+                if (not info.is_ready and not self._replica_is_busy(info) and
+                    self._kueue_ordinary_victim_eligible(info))
             ]
             idle_ready_old = [
-                info for info in old_ready if not self._replica_is_busy(info)
+                info for info in old_ready
+                if (not self._replica_is_busy(info) and
+                    self._kueue_ordinary_victim_eligible(info))
             ]
             batch_limit = _LOGICAL_ROLLING_UPDATE_MAX_RETIREMENTS_PER_TICK
             selected_nonready = _select_nonterminal_replicas_to_scale_down(
@@ -8408,8 +8666,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                         'drain while an upscale is pending hysteresis.')
             return []
         if self.update_mode != serve_utils.UpdateMode.ROLLING:
-            return super()._select_outdated_replicas_to_scale_down(
+            candidates = super()._select_outdated_replicas_to_scale_down(
                 replica_infos, active_versions)
+            by_id = {info.replica_id: info for info in replica_infos}
+            return [
+                replica_id for replica_id in candidates
+                if self._kueue_ordinary_victim_eligible(by_id[replica_id])
+            ]
         old_nonterminal = [
             info for info in replica_infos
             if info.version < self.latest_version and not info.is_terminal
@@ -8433,7 +8696,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             return [
                 info.replica_id
                 for info in old_nonterminal
-                if not self._replica_is_busy(info)
+                if (not self._replica_is_busy(info) and
+                    self._kueue_ordinary_victim_eligible(info))
             ]
 
         shortfall = (self._outstanding_work(replica_infos) -
@@ -8497,7 +8761,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return [
             info.replica_id
             for info in old_nonterminal
-            if info.replica_id not in keep_ids
+            if (info.replica_id not in keep_ids and
+                self._kueue_ordinary_victim_eligible(info))
         ]
 
     def _generate_scaling_decisions(
@@ -8511,7 +8776,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         """
         latest_nonterminal_replicas: list[replica_managers.ReplicaInfo] = []
         for info in replica_infos:
-            if not info.is_terminal and info.version == self.latest_version:
+            if (not info.is_terminal and info.version == self.latest_version and
+                    self._kueue_counts_as_assigned(info)):
                 latest_nonterminal_replicas.append(info)
 
         if self.replica_unit == 'logical':
@@ -8585,12 +8851,27 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                         continue
                     eligible = [
                         info for info in replicas
-                        if not self._replica_is_busy(info)
+                        if (not self._replica_is_busy(info) and
+                            self._kueue_ordinary_victim_eligible(info))
                     ]
+                    ordered_ids = (self._select_victims_capacity_and_cost_aware(
+                        len(eligible), eligible))
+                    by_id = {info.replica_id: info for info in eligible}
+                    remaining_ready = sum(info.is_ready for info in replicas)
+                    selected: list[int] = []
+                    for replica_id in ordered_ids:
+                        info = by_id[replica_id]
+                        if (info.is_ready and
+                                remaining_ready - 1 < target_by_card.get(
+                                    card, 0)):
+                            continue
+                        selected.append(replica_id)
+                        if info.is_ready:
+                            remaining_ready -= 1
+                        if len(selected) >= excess:
+                            break
                     scaling_decisions.extend(
-                        _generate_scale_down_decisions(
-                            self._select_victims_capacity_and_cost_aware(
-                                min(excess, len(eligible)), eligible)))
+                        _generate_scale_down_decisions(selected))
             return scaling_decisions
 
         if self.configured_accelerator_shapes:
@@ -8629,13 +8910,16 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             # work on them (probe-blipped mid-job).
             eligible_victims = [
                 info for info in latest_nonterminal_replicas
-                if not self._replica_is_busy(info)
+                if (not self._replica_is_busy(info) and
+                    self._kueue_ordinary_victim_eligible(info))
             ]
             # Clip to the eligible victims and wait otherwise (same
             # pattern as QueueLengthAutoscaler's idle clip): a busy
             # replica finishing its ~1 h job frees up on a later tick.
-            actual_num_to_scale_down = min(num_to_scale_down,
-                                           len(eligible_victims))
+            ordered_ids = self._select_victims_capacity_and_cost_aware(
+                len(eligible_victims), eligible_victims)
+            selected_ids = ordered_ids[:num_to_scale_down]
+            actual_num_to_scale_down = len(selected_ids)
             if actual_num_to_scale_down < num_to_scale_down:
                 logger.info(
                     'Concurrency autoscaler clipping scale-down: requested '
@@ -8644,9 +8928,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     'eligible.')
             if actual_num_to_scale_down > 0:
                 scaling_decisions.extend(
-                    _generate_scale_down_decisions(
-                        self._select_victims_capacity_and_cost_aware(
-                            actual_num_to_scale_down, eligible_victims)))
+                    _generate_scale_down_decisions(selected_ids))
 
         return scaling_decisions
 
@@ -8779,7 +9061,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         candidates = [
             info for info in latest_nonterminal_replicas
             if (info.status_property.is_scale_down is not True and
-                not self._replica_is_busy(info))
+                not self._replica_is_busy(info) and
+                self._kueue_ordinary_victim_eligible(info))
         ]
         candidates.sort(key=lambda info: (
             _status_rank(info),

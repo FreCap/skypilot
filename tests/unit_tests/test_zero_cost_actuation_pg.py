@@ -15,6 +15,9 @@ from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 from sky import clouds
 from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
+from sky.serve import kubernetes_identity
+from sky.serve import kueue_lane_lineage_schema
+from sky.serve import ordinary_launch_binding
 from sky.serve import pool_capacity_observation
 from sky.serve import pool_capacity_observation_schema
 from sky.serve import replica_managers
@@ -27,6 +30,7 @@ from sky.serve import service_spec
 from sky.serve import spot_placer
 from sky.serve import zero_cost_actuation
 from sky.serve import zero_cost_actuation_schema
+from sky.server.requests import postgres_schema as request_postgres_schema
 from sky.utils import common_utils
 from sky.utils.db import migration_utils
 
@@ -43,16 +47,65 @@ _OWNER = serve_utils.make_controller_owner_fingerprint(_SERVICE_HASH,
                                                        _CONTROLLER_PORT)
 
 
+def _worker_projection(context: str,
+                       accelerator_count: int,
+                       *,
+                       kueue: bool = False) -> dict[str, object]:
+    context_ordinal = {
+        'context-a': 0,
+        'east': 1,
+        'west': 2,
+        'phx': 3,
+    }[context]
+    candidate_ordinal = context_ordinal * 2 + int(accelerator_count == 8)
+    return {
+        'projection_version': 2,
+        'candidate_id': f'kubernetes-{candidate_ordinal:04d}',
+        'kubernetes_context': context,
+        'namespace': 'default',
+        'service_account_name': 'skyserve-worker',
+        'scheduler_name': 'default-scheduler',
+        'priority_class_name': 'skyserve-preemptible',
+        'priority_value': -1000,
+        'preemption_policy': 'Never',
+        'kueue_admission': ({
+            'local_queue_name': 'be',
+            'workload_priority_class_name': 'be-ls',
+        } if kueue else None),
+        'pod_identity_role_arn': None,
+        'accelerator_name': 'L4',
+        'accelerator_count': accelerator_count,
+        'accelerator_scheduling': {
+            'label_key': 'nvidia.com/gpu.product',
+            'label_values': ['NVIDIA-L4'],
+            'resource_key': 'nvidia.com/gpu',
+        },
+        'cache': {
+            'kind': 'none',
+        },
+    }
+
+
+_WORKER_PROJECTIONS = [
+    _worker_projection(context, count)
+    for context in ('context-a', 'east', 'west')
+    for count in (1, 8)
+] + [_worker_projection('phx', count, kueue=True) for count in (1, 8)]
+
+
 def _plan(
     *,
     free_slots: int = 2,
+    service_version: int = 19,
     accelerator_count: int = 1,
     context: str = 'context-a',
     physical_uid: str = 'uid-a',
+    kueue: bool = False,
     valid_until: float | None = None,
     capacity_unit: reserved_fill_planner.FillCapacityUnit = (
         reserved_fill_planner.FillCapacityUnit.PHYSICAL)
 ) -> reserved_fill_planner.FillPlan:
+    projection = _worker_projection(context, accelerator_count, kueue=kueue)
     location = spot_placer.Location(cloud=clouds.Kubernetes(),
                                     region=context,
                                     zone=None,
@@ -69,7 +122,7 @@ def _plan(
         'physical_cluster_uid': physical_uid,
         'service_generation': 7,
         'worker_projection_sha256_by_accelerator': {
-            'l4': 'e' * 64,
+            'l4': kubernetes_identity.worker_projection_sha256(projection),
         },
         'edge_cap': free_slots,
         'broker_slot_width': accelerator_count,
@@ -89,7 +142,7 @@ def _plan(
     allocation = reserved_fill_planner.AuthenticatedAllocationMap.create(
         allocation_generation=5,
         allocation_claim_generation=11,
-        service_version=19,
+        service_version=service_version,
         ordinary_zero_cost_admission_sequence_high_water=17,
         reconciliation_gate_generation=29,
         reclaim_fleet_bundle_sha256='c' * 64,
@@ -101,7 +154,7 @@ def _plan(
         reconcile_generation=3,
         allocation_map=allocation,
         service_incarnation=_SERVICE_HASH,
-        service_version=19,
+        service_version=service_version,
         controller_owner=_OWNER,
         max_replicas=100,
         planned_replicas=0,
@@ -112,15 +165,22 @@ def _plan(
 def actuation_database(empty_postgres, monkeypatch):
     config = migration_utils.get_alembic_config(empty_postgres,
                                                 migration_utils.SERVE_DB_NAME)
-    # Exercise the pre-Serve056 cleanup-only behavior against the latest
-    # schema that does not yet have the scalar handoff column.  Older schema
-    # revisions cannot represent the current service-owner contract used by
-    # these repository tests.
-    alembic_command.upgrade(config, '055')
+    # Exercise retained pre-Serve056 rows through the current canonical
+    # Serve057 schema. Older revisions cannot represent the admission graph
+    # now locked by every grant, including non-Kueue grants.
+    alembic_command.upgrade(config, '057')
+    request_postgres_schema.REQUESTS.create(empty_postgres, checkfirst=True)
+    request_postgres_schema.QUEUE.create(empty_postgres, checkfirst=True)
+    request_postgres_schema.REQUEST_RETENTION_PINS.create(empty_postgres,
+                                                          checkfirst=True)
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         empty_postgres)
     incarnation = uuid.uuid4()
     with empty_postgres.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.service_lifecycle_fences_table).values(
+                    name='svc', epoch=3))
         connection.execute(
             sqlalchemy.insert(serve_state_schema.services_table).values(
                 name='svc',
@@ -145,6 +205,25 @@ def actuation_database(empty_postgres, monkeypatch):
                 reserved_fill_actuation_capable=True,
                 reserved_fill_actuation_controller_incarnation=incarnation,
                 reserved_fill_actuation_protocol_version=1))
+        ordinary_launch_binding.promote_non_pool_launch_service_in_connection(
+            connection,
+            service_name='svc',
+            controller_incarnation=incarnation,
+            controller_owner_epoch=4,
+            expected_binding_epoch=1,
+            participant_barrier_passed=lambda _: True,
+            legacy_requests_drained=lambda _: True)
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.version_specs_table).values(
+                service_name='svc',
+                version=19,
+                yaml_content='service: {}',
+                placement_catalog={
+                    'schema_version': 1,
+                    'entries': [],
+                    'num_nodes': 1,
+                },
+                worker_placement_projections=_WORKER_PROJECTIONS))
     return empty_postgres
 
 
@@ -169,16 +248,70 @@ def _grant_plan(
         expected_controller_owner_epoch=controller['controller_owner_epoch'])
 
 
+def _commit_test_service_version(
+        version: int) -> serve_state.VersionCommitResult:
+    spec = service_spec.SkyServiceSpec(readiness_path='/health',
+                                       initial_delay_seconds=0,
+                                       readiness_timeout_seconds=5,
+                                       endpoint_probe_interval_seconds=1,
+                                       lb_stream_timeout_seconds=10,
+                                       min_replicas=0,
+                                       max_replicas=2,
+                                       target_qps_per_replica=1,
+                                       lb_high_availability=False)
+    return serve_state.add_or_update_version(
+        'svc',
+        version,
+        spec,
+        'service: {}',
+        expected_service_hash=_SERVICE_HASH,
+        expected_controller_owner=(_CONTROLLER_PID, _CONTROLLER_IP))
+
+
+def _paid_replica_for_shape(
+    intent: reserved_fill_planner.FillIntent,
+    replica_id: int,
+) -> replica_managers.ReplicaInfo:
+    """Build an ordinary paid replica with the intent's exact shape."""
+    location = intent.allowed_locations[0].to_location()
+    info = replica_managers.ReplicaInfo(
+        replica_id=replica_id,
+        cluster_name=f'svc-{replica_id}',
+        replica_port='8080',
+        is_spot=True,
+        location=location,
+        version=intent.service_version,
+        resources_override=location.to_dict(),
+        planned_capacity=intent.capacity_unit.intent_cost(
+            intent.accelerator_count))
+    info.is_zero_cost = False
+    return info
+
+
+def _insert_paid_replica_for_shape(
+    engine: sqlalchemy.engine.Engine,
+    intent: reserved_fill_planner.FillIntent,
+    *,
+    replica_id: int = 900,
+) -> None:
+    """Install one cleanup-unproven paid row with the intent's exact shape."""
+    info = _paid_replica_for_shape(intent, replica_id)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                **serve_state._replica_row_values('svc', replica_id, info)))
+
+
 def test_serve056_lineage_and_postgresql_only() -> None:
     sqlite = sqlalchemy.create_engine('sqlite://')
     config = migration_utils.get_alembic_config(sqlite,
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
     revision = scripts.get_revision('052')
-    assert scripts.get_heads() == ['056']
+    assert scripts.get_heads() == ['057']
     assert scripts.get_revision('056').down_revision == '055'
     assert revision.down_revision == '051'
-    assert migration_utils.SERVE_VERSION == '056'
+    assert migration_utils.SERVE_VERSION == '057'
     assert migration_utils.serve_target_version(sqlite) == '037'
     with pytest.raises(RuntimeError, match='PostgreSQL-only'):
         alembic_command.upgrade(config, '056')
@@ -209,7 +342,516 @@ def test_grant_is_idempotent_and_allocates_no_replica(
     assert replica_count == 0
 
 
-def test_grant_locks_exclude_cleanup_proven_history(actuation_database) -> None:
+def test_kueue_grant_accepts_full_authenticated_same_domain_batch(
+        actuation_database) -> None:
+    config = migration_utils.get_alembic_config(actuation_database,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '057')
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=90,
+                 context='phx',
+                 physical_uid='uid-phx',
+                 kueue=True)
+
+    first = _grant_plan(repository, plan, max_capacity=90)
+    replay = _grant_plan(repository, plan, max_capacity=90)
+
+    assert [item.intent_idempotency_key for item in first.accepted
+           ] == [intent.idempotency_key for intent in plan.intents]
+    assert not first.deferred
+    assert replay == first
+    with actuation_database.connect() as connection:
+        intent_rows = connection.execute(
+            sqlalchemy.select(
+                zero_cost_actuation_schema.
+                serve_zero_cost_actuation_intents_table)).mappings().all()
+        lane_rows = connection.execute(
+            sqlalchemy.select(kueue_lane_lineage_schema.
+                              serve_kueue_admissions_table)).mappings().all()
+    assert len(intent_rows) == 90
+    assert len(lane_rows) == 90
+    assert {row['intent_idempotency_key'] for row in lane_rows
+           } == {intent.idempotency_key for intent in plan.intents}
+    assert {row['state'] for row in lane_rows} == {'INTENT_PENDING'}
+
+
+@pytest.mark.parametrize(('kueue', 'expected_result'), [
+    (True, serve_state.VersionCommitResult.KUEUE_ADMISSION_HOLD),
+    (False, serve_state.VersionCommitResult.COMMITTED),
+],
+                         ids=('waiting-for-kueue', 'non-kueue'))
+def test_version_election_holds_only_outgoing_kueue_admission(
+        actuation_database, kueue: bool,
+        expected_result: serve_state.VersionCommitResult) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1,
+                 context='phx' if kueue else 'context-a',
+                 physical_uid='uid-phx' if kueue else 'uid-a',
+                 kueue=kueue)
+    assert len(_grant_plan(repository, plan, max_capacity=2).accepted) == 1
+
+    result = _commit_test_service_version(20)
+
+    assert result is expected_result
+    with actuation_database.connect() as connection:
+        elected = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.services_table.c.current_version).where(
+                    serve_state_schema.services_table.c.name ==
+                    'svc')).scalar_one()
+        committed = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.version_specs_table.c.yaml_content).where(
+                    serve_state_schema.version_specs_table.c.service_name ==
+                    'svc', serve_state_schema.version_specs_table.c.version ==
+                    20)).scalar_one_or_none()
+    assert elected == (19 if kueue else 20)
+    if kueue:
+        assert committed is None
+    else:
+        assert committed == 'service: {}'
+
+
+def test_stale_version_precedes_older_kueue_admission_hold(
+        actuation_database) -> None:
+    specs = serve_state_schema.version_specs_table
+    services = serve_state_schema.services_table
+    with actuation_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(specs).where(specs.c.service_name == 'svc',
+                                           specs.c.version == 19))
+        connection.execute(
+            sqlalchemy.insert(specs).values(
+                service_name='svc',
+                version=18,
+                yaml_content='service: old',
+                placement_catalog={
+                    'schema_version': 1,
+                    'entries': [],
+                    'num_nodes': 1,
+                },
+                worker_placement_projections=_WORKER_PROJECTIONS))
+        connection.execute(
+            sqlalchemy.update(services).where(services.c.name == 'svc').values(
+                current_version=18, active_versions='[18]'))
+
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1,
+                 service_version=18,
+                 context='phx',
+                 physical_uid='uid-phx',
+                 kueue=True)
+    assert len(_grant_plan(repository, plan, max_capacity=2).accepted) == 1
+
+    with actuation_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(specs).values(service_name='svc',
+                                            version=20,
+                                            yaml_content='service: high'))
+        connection.execute(
+            sqlalchemy.update(services).where(services.c.name == 'svc').values(
+                current_version=20, active_versions='[20]'))
+
+    result = _commit_test_service_version(19)
+
+    assert result is serve_state.VersionCommitResult.STALE_VERSION
+    with actuation_database.connect() as connection:
+        current_version = connection.execute(
+            sqlalchemy.select(services.c.current_version).where(
+                services.c.name == 'svc')).scalar_one()
+        candidate = connection.execute(
+            sqlalchemy.select(specs.c.yaml_content).where(
+                specs.c.service_name == 'svc',
+                specs.c.version == 19)).scalar_one_or_none()
+    assert current_version == 20
+    assert candidate is None
+
+
+def test_kueue_same_domain_batch_leases_in_three_bounded_waves(
+        actuation_database) -> None:
+    config = migration_utils.get_alembic_config(actuation_database,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '057')
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=90,
+                 context='phx',
+                 physical_uid='uid-phx',
+                 kueue=True)
+    assert len(_grant_plan(repository, plan, max_capacity=90).accepted) == 90
+    owner = uuid.uuid4()
+
+    waves = tuple(
+        repository.lease_batch(service_name='svc',
+                               pool_key=plan.intents[0].pool_key,
+                               owner=owner,
+                               lease_seconds=30) for _ in range(3))
+
+    assert tuple(len(wave) for wave in waves) == (32, 32, 26)
+    leases = tuple(lease for wave in waves for lease in wave)
+    assert len({lease.intent.idempotency_key for lease in leases}) == 90
+    assert {lease.generation for lease in leases} == {1}
+    assert [lease.intent.idempotency_key for lease in leases
+           ] == sorted(intent.idempotency_key for intent in plan.intents)
+    assert repository.lease_batch(service_name='svc',
+                                  pool_key=plan.intents[0].pool_key,
+                                  owner=owner,
+                                  lease_seconds=30) == ()
+
+
+def test_kueue_grant_rejects_multi_node_immutable_catalog(
+        actuation_database) -> None:
+    config = migration_utils.get_alembic_config(actuation_database,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '057')
+    with actuation_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 19).values(
+                    placement_catalog={
+                        'schema_version': 1,
+                        'entries': [],
+                        'num_nodes': 2,
+                    }))
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1,
+                 context='phx',
+                 physical_uid='uid-phx',
+                 kueue=True)
+
+    with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict,
+                       match='num_nodes == 1'):
+        _grant_plan(repository, plan, max_capacity=1)
+
+    with actuation_database.connect() as connection:
+        intent_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                zero_cost_actuation_schema.
+                serve_zero_cost_actuation_intents_table)).scalar_one()
+        lane_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                kueue_lane_lineage_schema.serve_kueue_admissions_table)
+        ).scalar_one()
+    assert intent_count == 0
+    assert lane_count == 0
+
+
+@pytest.mark.parametrize('accelerator_count', [1, 8])
+def test_kueue_grant_allows_one_exact_shape_physical_replacement_surge(
+        actuation_database, accelerator_count) -> None:
+    config = migration_utils.get_alembic_config(actuation_database,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '057')
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1,
+                 accelerator_count=accelerator_count,
+                 context='phx',
+                 physical_uid='uid-phx',
+                 kueue=True)
+    _insert_paid_replica_for_shape(actuation_database, plan.intents[0])
+
+    receipt = _grant_plan(repository, plan, max_capacity=1)
+
+    assert len(receipt.accepted) == 1
+    assert not receipt.deferred
+    admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    with actuation_database.connect() as connection:
+        row = connection.execute(sqlalchemy.select(admissions)).mappings().one()
+    # The exception is one physical Pod even when that Pod exposes eight GPUs.
+    assert row['replacement_surge_units'] == 1
+    assert row['replacement_compatibility_sha256'] is not None
+
+
+def test_kueue_replacement_surge_rejects_cross_shape_paid_capacity(
+        actuation_database) -> None:
+    config = migration_utils.get_alembic_config(actuation_database,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '057')
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    paid_shape = _plan(free_slots=1,
+                       accelerator_count=1,
+                       context='phx',
+                       physical_uid='uid-paid',
+                       kueue=True)
+    candidate = _plan(free_slots=1,
+                      accelerator_count=8,
+                      context='phx',
+                      physical_uid='uid-reserved',
+                      kueue=True)
+    _insert_paid_replica_for_shape(actuation_database, paid_shape.intents[0])
+
+    receipt = _grant_plan(repository, candidate, max_capacity=1)
+
+    assert not receipt.accepted
+    assert len(receipt.deferred) == 1
+    assert receipt.deferred[0].reason is (
+        reserved_fill_planner.DeferredFillReason.MAX_REPLICAS_EXHAUSTED)
+
+
+def test_kueue_replacement_surge_is_service_wide_and_cannot_chain(
+        actuation_database) -> None:
+    config = migration_utils.get_alembic_config(actuation_database,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '057')
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    first = _plan(free_slots=1,
+                  context='phx',
+                  physical_uid='uid-phx-a',
+                  kueue=True)
+    second = _plan(free_slots=1,
+                   context='phx',
+                   physical_uid='uid-phx-b',
+                   kueue=True)
+    _insert_paid_replica_for_shape(actuation_database, first.intents[0])
+    assert len(_grant_plan(repository, first, max_capacity=1).accepted) == 1
+
+    receipt = _grant_plan(repository, second, max_capacity=1)
+
+    assert not receipt.accepted
+    assert len(receipt.deferred) == 1
+    assert receipt.deferred[0].reason is (
+        reserved_fill_planner.DeferredFillReason.MAX_REPLICAS_EXHAUSTED)
+
+
+def test_kueue_replacement_surge_releases_only_after_provider_clean_evidence(
+        actuation_database) -> None:
+    config = migration_utils.get_alembic_config(actuation_database,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '057')
+    first_repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1,
+                 context='phx',
+                 physical_uid='uid-phx',
+                 kueue=True)
+    _insert_paid_replica_for_shape(actuation_database, plan.intents[0])
+    assert len(_grant_plan(first_repository, plan,
+                           max_capacity=1).accepted) == 1
+    admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    replicas = serve_state_schema.replicas_table
+
+    # Lifecycle intent is not cleanup evidence; the durable lease survives.
+    with actuation_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(replicas).where(
+                replicas.c.service_name == 'svc',
+                replicas.c.replica_id == 900).values(status='SHUTTING_DOWN'))
+    restarted = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    _grant_plan(restarted, plan, max_capacity=1)
+    with actuation_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(
+                admissions.c.replacement_surge_units)).scalar_one() == 1
+
+    # A scalar successful sky.down status is not an evidence-clean graph.
+    with actuation_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(replicas).where(
+                replicas.c.service_name == 'svc',
+                replicas.c.replica_id == 900).values(
+                    sky_down_status=common_utils.ProcessStatus.SUCCEEDED.value))
+    _grant_plan(restarted, plan, max_capacity=1)
+    with actuation_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(
+                admissions.c.replacement_surge_units)).scalar_one() == 1
+
+    # Exact removal of the paid victim row is the provider-clean boundary.
+    with actuation_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(replicas).where(replicas.c.service_name == 'svc',
+                                              replicas.c.replica_id == 900))
+    _grant_plan(restarted, plan, max_capacity=1)
+    with actuation_database.connect() as connection:
+        row = connection.execute(sqlalchemy.select(admissions)).mappings().one()
+    assert row['replacement_surge_units'] == 0
+    assert row['replacement_compatibility_sha256'] is None
+
+
+def test_kueue_grant_atomically_replaces_provider_free_expired_sentinel(
+        actuation_database) -> None:
+    config = migration_utils.get_alembic_config(actuation_database,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '057')
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    predecessor = _plan(free_slots=1,
+                        context='phx',
+                        physical_uid='uid-phx',
+                        kueue=True,
+                        valid_until=time.time() + 0.3)
+    first = _grant_plan(repository, predecessor, max_capacity=1)
+    assert len(first.accepted) == 1
+    time.sleep(0.4)
+    successor = _plan(free_slots=1,
+                      context='phx',
+                      physical_uid='uid-phx',
+                      kueue=True,
+                      valid_until=time.time() + 60)
+
+    second = _grant_plan(repository, successor, max_capacity=1)
+
+    assert [item.intent_idempotency_key for item in second.accepted
+           ] == [successor.intents[0].idempotency_key]
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    lineages = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    with actuation_database.connect() as connection:
+        intent_rows = connection.execute(
+            sqlalchemy.select(intents).order_by(
+                intents.c.intent_idempotency_key)).mappings().all()
+        lineage_rows = connection.execute(
+            sqlalchemy.select(lineages)).mappings().all()
+    assert len(intent_rows) == 2
+    assert {row['state'] for row in intent_rows} == {'GRANTED', 'TERMINAL'}
+    assert len(lineage_rows) == 1
+    assert lineage_rows[0]['intent_idempotency_key'] == (
+        successor.intents[0].idempotency_key)
+    assert lineage_rows[0]['state'] == 'INTENT_PENDING'
+
+
+def test_kueue_expired_replay_garbage_collects_provider_free_admission(
+        actuation_database) -> None:
+    config = migration_utils.get_alembic_config(actuation_database,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '057')
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1,
+                 context='phx',
+                 physical_uid='uid-phx',
+                 kueue=True,
+                 valid_until=time.time() + 0.3)
+    _grant_plan(repository, plan, max_capacity=1)
+    time.sleep(0.4)
+
+    replay = _grant_plan(repository, plan, max_capacity=1)
+
+    assert not replay.accepted
+    assert len(replay.deferred) == 1
+    lineages = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    with actuation_database.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(lineages)).mappings().one_or_none()
+    assert row is None
+
+
+def test_kueue_expired_association_witness_retains_capacity_debit(
+        actuation_database) -> None:
+    config = migration_utils.get_alembic_config(actuation_database,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '057')
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    predecessor = _plan(free_slots=1,
+                        context='phx',
+                        physical_uid='uid-phx',
+                        kueue=True,
+                        valid_until=time.time() + 0.3)
+    _grant_plan(repository, predecessor, max_capacity=2)
+    with actuation_database.begin() as connection:
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        controller = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.services_table.c.controller_incarnation,
+                serve_state_schema.services_table.c.controller_owner_epoch).
+            where(serve_state_schema.services_table.c.name ==
+                  'svc')).mappings().one()
+        association_table = (
+            ordinary_launch_binding.ordinary_launch_associations_table)
+        # This test isolates provider-free lineage GC.  The generic binding
+        # trigger suite is covered separately; disabling it lets us install
+        # the exact association witness whose mere existence must fail GC.
+        connection.exec_driver_sql(
+            f'ALTER TABLE {association_table.name} DISABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.insert(association_table).values(
+                association_id=uuid.uuid4(),
+                submission_id=uuid.uuid4(),
+                tenant_scope='tenant-a',
+                service_name='svc',
+                service_hash=_SERVICE_HASH,
+                service_workspace='workspace-a',
+                service_lifecycle_epoch=3,
+                service_binding_epoch=1,
+                service_version=19,
+                replica_id=1,
+                replica_record_id=uuid.uuid4(),
+                launch_generation=1,
+                cluster_name='svc-1',
+                request_id=f'request-{uuid.uuid4()}',
+                input_digest='a' * 64,
+                owner_controller_incarnation=(
+                    controller['controller_incarnation']),
+                owner_controller_epoch=(controller['controller_owner_epoch']),
+                effect_phase='NOT_STARTED',
+                effect_phase_changed_at=now,
+                resolution='BOUND',
+                created_at=now,
+                updated_at=now,
+                binding_protocol_version=2,
+                profile_kind='RESERVED_FILL',
+                profile_version=1,
+                profile_digest='b' * 64,
+                capability_cohort_epoch=1,
+                capability_profile_set_digest='c' * 64,
+                receipt_protocol_version=1,
+                authorization_kind=('RESERVED_FILL_ALLOCATION'),
+                authorization_reference=(
+                    'reserved-fill:' + predecessor.intents[0].idempotency_key),
+                authorization_generation=1,
+                authorization_digest='d' * 64,
+                reconciliation_outcome='ACTIVE_ADOPT',
+                provider_evidence='NOT_QUERIED'))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {association_table.name} ENABLE TRIGGER USER')
+    time.sleep(0.4)
+    successor = _plan(free_slots=1,
+                      context='phx',
+                      physical_uid='uid-phx',
+                      kueue=True,
+                      valid_until=time.time() + 60)
+
+    blocked = _grant_plan(repository, successor, max_capacity=1)
+
+    assert not blocked.accepted
+    assert len(blocked.deferred) == 1
+    assert blocked.deferred[0].reason is (
+        reserved_fill_planner.DeferredFillReason.MAX_REPLICAS_EXHAUSTED)
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    with actuation_database.connect() as connection:
+        predecessor_state = connection.execute(
+            sqlalchemy.select(intents.c.state).where(
+                intents.c.intent_idempotency_key ==
+                predecessor.intents[0].idempotency_key)).scalar_one()
+    assert predecessor_state == 'TERMINAL'
+
+    second = _grant_plan(repository, successor, max_capacity=2)
+
+    assert [item.intent_idempotency_key for item in second.accepted
+           ] == [successor.intents[0].idempotency_key]
+    assert not second.deferred
+    lineages = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    with actuation_database.connect() as connection:
+        rows = connection.execute(sqlalchemy.select(lineages)).mappings().all()
+    assert {row['intent_idempotency_key'] for row in rows} == {
+        predecessor.intents[0].idempotency_key,
+        successor.intents[0].idempotency_key,
+    }
+    assert {row['state'] for row in rows} == {'INTENT_PENDING'}
+
+
+def test_grant_locks_exclude_terminal_intents_but_retain_replica_rows(
+        actuation_database) -> None:
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
     plan = _plan(free_slots=1)
@@ -237,7 +879,7 @@ def test_grant_locks_exclude_cleanup_proven_history(actuation_database) -> None:
             terminal_rows.append(row)
         connection.execute(sqlalchemy.insert(intents), terminal_rows)
         for replica_id in range(1, 33):
-            cleaned = _replica_for_intent(plan.intents[0], replica_id)
+            cleaned = _paid_replica_for_shape(plan.intents[0], replica_id)
             cleaned.status_property.sky_down_status = (
                 common_utils.ProcessStatus.SUCCEEDED)
             cleaned.status_property.is_scale_down = True
@@ -260,23 +902,29 @@ def test_grant_locks_exclude_cleanup_proven_history(actuation_database) -> None:
             locked_replica_capacity = getattr(zero_cost_actuation,
                                               '_locked_replica_capacity')
             # pylint: disable-next=missing-kwoa
-            assert locked_replica_capacity(locking_connection,
-                                           service_name='svc',
-                                           capacity_unit=reserved_fill_planner.
-                                           FillCapacityUnit.PHYSICAL) == 0
-            # Excluded history is not merely skipped in Python: it is not
-            # locked by the admission transaction.
-            with actuation_database.begin() as contender:
+            replica_capacity = locked_replica_capacity(
+                locking_connection,
+                service_name='svc',
+                capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+            assert replica_capacity.total == 32
+            assert replica_capacity.nonretiring_paid_by_shape == {}
+            # Unrelated terminal intent history remains unlocked, but a
+            # retained replica row is still provider-possible even when its
+            # scalar sky.down status says SUCCEEDED.
+            with actuation_database.connect() as contender:
+                contender_transaction = contender.begin()
                 contender.execute(
                     sqlalchemy.select(intents.c.intent_idempotency_key).where(
                         intents.c.intent_idempotency_key ==
                         excluded_terminal_key).with_for_update(
                             nowait=True)).one()
-                contender.execute(
-                    sqlalchemy.select(replicas.c.replica_id).where(
-                        replicas.c.service_name == 'svc',
-                        replicas.c.replica_id == 32).with_for_update(
-                            nowait=True)).one()
+                with pytest.raises(sqlalchemy.exc.OperationalError):
+                    contender.execute(
+                        sqlalchemy.select(replicas.c.replica_id).where(
+                            replicas.c.service_name == 'svc',
+                            replicas.c.replica_id == 32).with_for_update(
+                                nowait=True)).one()
+                contender_transaction.rollback()
         finally:
             transaction.rollback()
 
@@ -354,13 +1002,6 @@ def test_promotion_requires_fleet_barrier_and_is_one_way(
             sqlalchemy.update(services).where(services.c.name == 'svc').values(
                 reserved_fill_actuation_mode='DIRECT_REPLICA',
                 reserved_fill_actuation_epoch=0,
-                ordinary_launch_binding_epoch=2,
-                non_pool_launch_binding_capable=True,
-                non_pool_launch_controller_incarnation=incarnation,
-                non_pool_launch_binding_protocol_version=2,
-                non_pool_launch_capability_profile_set_digest='a' * 64,
-                non_pool_launch_capability_cohort_epoch=1,
-                non_pool_launch_receipt_protocol_version=1,
                 route_source_mode='DURABLE_PROJECTED',
                 route_source_epoch=1,
                 route_projection_capable=True,
@@ -445,7 +1086,7 @@ def test_pending_grants_enforce_headroom_and_debit_paid_residual(
     with actuation_database.begin() as connection:
         now = connection.execute(
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
-        pending = capacity_admission._locked_pending_zero_cost_inventory(
+        pending = zero_cost_actuation.pending_capacity_in_connection(
             connection,
             service_name='svc',
             service_hash=_SERVICE_HASH,
@@ -515,7 +1156,7 @@ def test_grant_ceiling_counts_materialized_old_version(
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
     plan = _plan(free_slots=1)
-    old = _replica_for_intent(plan.intents[0], 1)
+    old = _paid_replica_for_shape(plan.intents[0], 1)
     old.version = plan.intents[0].service_version - 1
     old.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
     with actuation_database.begin() as connection:
@@ -539,7 +1180,7 @@ def test_logical_grant_ceiling_projects_old_physical_row_from_exact_shape(
         free_slots=1,
         accelerator_count=8,
         capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL)
-    old = _replica_for_intent(physical_plan.intents[0], 1)
+    old = _paid_replica_for_shape(physical_plan.intents[0], 1)
     old.version = physical_plan.intents[0].service_version - 1
     assert old.planned_capacity == 1
     with actuation_database.begin() as connection:
@@ -567,7 +1208,7 @@ def test_logical_grant_ceiling_rejects_conflicting_persisted_shapes(
         free_slots=1,
         accelerator_count=8,
         capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL)
-    old = _replica_for_intent(physical_plan.intents[0], 1)
+    old = _paid_replica_for_shape(physical_plan.intents[0], 1)
     assert old.resources_override is not None
     old.resources_override['accelerators'] = {'A100': 8}
     with actuation_database.begin() as connection:
@@ -605,12 +1246,12 @@ def test_logical_capacity_rejects_noncanonical_replica_state_version(
             reserved_fill_planner.FillCapacityUnit.LOGICAL)
 
 
-def test_grant_ceiling_releases_cleanup_proven_old_version(
+def test_grant_ceiling_retains_status_only_cleanup_row_until_removed(
         actuation_database) -> None:
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
     plan = _plan(free_slots=1)
-    cleaned = _replica_for_intent(plan.intents[0], 1)
+    cleaned = _paid_replica_for_shape(plan.intents[0], 1)
     cleaned.version = plan.intents[0].service_version - 1
     cleaned.status_property.sky_launch_status = (
         common_utils.ProcessStatus.SUCCEEDED)
@@ -624,6 +1265,18 @@ def test_grant_ceiling_releases_cleanup_proven_old_version(
             sqlalchemy.insert(
                 serve_state_schema.replicas_table).values(**values))
 
+    retained = _grant_plan(repository, plan, max_capacity=1)
+
+    assert not retained.accepted
+    assert len(retained.deferred) == 1
+    assert retained.deferred[0].reason is (
+        reserved_fill_planner.DeferredFillReason.MAX_REPLICAS_EXHAUSTED)
+
+    with actuation_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id == 1))
     receipt = _grant_plan(repository, plan, max_capacity=1)
 
     assert len(receipt.accepted) == 1
@@ -635,7 +1288,7 @@ def test_grant_ceiling_counts_uncommitted_shutting_down_capacity(
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
     plan = _plan(free_slots=1)
-    retiring = _replica_for_intent(plan.intents[0], 1)
+    retiring = _paid_replica_for_shape(plan.intents[0], 1)
     retiring.status_property.sky_launch_status = (
         common_utils.ProcessStatus.SUCCEEDED)
     retiring.status_property.sky_down_status = (
@@ -749,7 +1402,7 @@ def test_idle_gate_controls_width_adjusted_durable_intents_without_paid_spill(
                 serve_state_schema.paid_capacity_claims_table)).scalar_one()
         now = connection.execute(
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
-        pending = capacity_admission._locked_pending_zero_cost_inventory(
+        pending = zero_cost_actuation.pending_capacity_in_connection(
             connection,
             service_name='svc',
             service_hash=_SERVICE_HASH,
@@ -853,9 +1506,109 @@ def _commit_and_insert_replica(
                                                    replica_id=info.replica_id,
                                                    replica_record_id=record_id,
                                                    replica_info=info)
+    values = serve_state._reserved_fill_replica_row_values(
+        'svc',
+        info.replica_id,
+        info,
+        pool_key=lease.intent.pool_key,
+        expected_protocol_version=reserved_capacity_broker.PROTOCOL_V2)
+    assert values is not None
     connection.execute(
-        sqlalchemy.insert(serve_state_schema.replicas_table).values(
-            **serve_state._replica_row_values('svc', info.replica_id, info)))
+        sqlalchemy.insert(serve_state_schema.replicas_table).values(**values))
+    service = connection.execute(
+        sqlalchemy.select(serve_state_schema.services_table).where(
+            serve_state_schema.services_table.c.name ==
+            'svc')).mappings().one()
+    profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+        authorization_reference=(
+            f'reserved-fill:{lease.intent.idempotency_key}'),
+        authorization_generation=lease.intent.allocation_generation,
+        authorization_payload={
+            'intent_idempotency_key': lease.intent.idempotency_key,
+        })
+    intent = ordinary_launch_binding.BindingIntent(
+        service_name='svc',
+        service_hash=_SERVICE_HASH,
+        service_version=info.version,
+        replica_id=info.replica_id,
+        replica_record_id=record_id,
+        lifecycle_epoch=3,
+        binding_epoch=service['ordinary_launch_binding_epoch'],
+        controller_incarnation=service['controller_incarnation'],
+        controller_owner_epoch=service['controller_owner_epoch'],
+        controller_pid=_CONTROLLER_PID,
+        controller_ip=_CONTROLLER_IP)
+    identity = ordinary_launch_binding.build_non_pool_binding_identity(
+        intent,
+        submission_id=uuid.uuid5(uuid.NAMESPACE_URL,
+                                 lease.intent.idempotency_key),
+        tenant_scope='tenant-a',
+        service_workspace='workspace-a',
+        cluster_name=info.cluster_name,
+        input_digest='a' * 64,
+        profile=profile,
+        capability_cohort_epoch=(
+            service['non_pool_launch_capability_cohort_epoch']),
+        capability_profile_set_digest=(
+            service['non_pool_launch_capability_profile_set_digest']),
+        receipt_protocol_version=(
+            service['non_pool_launch_receipt_protocol_version']))
+    association_values = ordinary_launch_binding._identity_values(
+        identity, 1, paid_capacity_pool_key=None)
+    association_values.update({
+        'owner_controller_incarnation': service['controller_incarnation'],
+        'owner_controller_epoch': service['controller_owner_epoch'],
+        'owner_revision': 1,
+        'effect_phase': ordinary_launch_binding.EffectPhase.NOT_STARTED.value,
+        'resolution': ordinary_launch_binding.Resolution.BOUND.value,
+        'updated_at': sqlalchemy.func.clock_timestamp(),
+        'reconciliation_outcome':
+            (ordinary_launch_binding.ReconciliationOutcome.ACTIVE_ADOPT.value),
+        'provider_evidence':
+            (ordinary_launch_binding.ProviderEvidence.NOT_QUERIED.value),
+    })
+    connection.execute(
+        sqlalchemy.insert(
+            ordinary_launch_binding.ordinary_launch_associations_table).values(
+                **association_values))
+    connection.execute(
+        sqlalchemy.update(serve_state_schema.replicas_table).where(
+            serve_state_schema.replicas_table.c.service_name == 'svc',
+            serve_state_schema.replicas_table.c.replica_id == info.replica_id).
+        values(ordinary_launch_association_id=identity.association_id))
+
+
+def _retain_as_pre_serve056_json_only_replica(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    replica_id: int,
+) -> None:
+    """Project a committed graph into the exact retained legacy shape."""
+    replicas = serve_state_schema.replicas_table
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    association_id = connection.execute(
+        sqlalchemy.select(replicas.c.ordinary_launch_association_id).where(
+            replicas.c.service_name == 'svc',
+            replicas.c.replica_id == replica_id)).scalar_one()
+    # Serve056 deliberately does not normalize historical JSON-only rows.
+    # Install that migration input explicitly; fresh rows are covered by the
+    # canonical graph helper above and must never bypass these triggers.
+    for table in (replicas, associations):
+        connection.exec_driver_sql(
+            f'ALTER TABLE {table.name} DISABLE TRIGGER USER')
+    connection.execute(
+        sqlalchemy.update(replicas).where(
+            replicas.c.service_name == 'svc',
+            replicas.c.replica_id == replica_id).values(
+                ordinary_launch_association_id=None,
+                reserved_fill_intent_idempotency_key=None))
+    connection.execute(
+        sqlalchemy.delete(associations).where(
+            associations.c.association_id == association_id))
+    for table in (replicas, associations):
+        connection.exec_driver_sql(
+            f'ALTER TABLE {table.name} ENABLE TRIGGER USER')
 
 
 def test_replica_and_intent_commit_in_one_transaction(
@@ -902,10 +1655,8 @@ def test_pre_serve056_json_only_replica_is_cleanup_only(
     info = _replica_for_intent(lease.intent, 1)
     with actuation_database.begin() as connection:
         _commit_and_insert_replica(connection, lease, info)
-
-    config = migration_utils.get_alembic_config(actuation_database,
-                                                migration_utils.SERVE_DB_NAME)
-    alembic_command.upgrade(config, '056')
+    with actuation_database.begin() as connection:
+        _retain_as_pre_serve056_json_only_replica(connection, replica_id=1)
 
     with actuation_database.connect() as connection:
         assert zero_cost_actuation.committed_intent_for_replica_in_connection(
@@ -950,10 +1701,29 @@ def test_committed_replica_id_high_water_survives_replica_cleanup(
 
     with actuation_database.begin() as connection:
         _commit_and_insert_replica(connection, lease, info)
+    with actuation_database.begin() as connection:
+        replicas = serve_state_schema.replicas_table
+        associations = (
+            ordinary_launch_binding.ordinary_launch_associations_table)
+        association_id = connection.execute(
+            sqlalchemy.select(replicas.c.ordinary_launch_association_id).where(
+                replicas.c.service_name == 'svc',
+                replicas.c.replica_id == 9)).scalar_one()
+        # Historical cleanup predates Serve056's immutable handoff graph.  A
+        # fresh linked row cannot be deleted; explicitly model only that
+        # retained migration input here.
+        for table in (replicas, associations):
+            connection.exec_driver_sql(
+                f'ALTER TABLE {table.name} DISABLE TRIGGER USER')
         connection.execute(
-            sqlalchemy.delete(serve_state_schema.replicas_table).where(
-                serve_state_schema.replicas_table.c.service_name == 'svc',
-                serve_state_schema.replicas_table.c.replica_id == 9))
+            sqlalchemy.delete(replicas).where(replicas.c.service_name == 'svc',
+                                              replicas.c.replica_id == 9))
+        connection.execute(
+            sqlalchemy.delete(associations).where(
+                associations.c.association_id == association_id))
+        for table in (replicas, associations):
+            connection.exec_driver_sql(
+                f'ALTER TABLE {table.name} ENABLE TRIGGER USER')
 
     assert repository.committed_replica_id_high_water('svc') == 9
     assert repository.committed_replica_id_high_water('other') == 0
@@ -1004,7 +1774,7 @@ def test_expired_retryable_grant_releases_paid_debit(
     with actuation_database.begin() as connection:
         now = connection.execute(
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
-        pending = capacity_admission._locked_pending_zero_cost_inventory(
+        pending = zero_cost_actuation.pending_capacity_in_connection(
             connection,
             service_name='svc',
             service_hash=_SERVICE_HASH,

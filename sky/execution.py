@@ -35,8 +35,10 @@ from sky.execution_autostop import apply_launch_autostop
 from sky.execution_autostop import autostop_requested_features
 from sky.serve import constants as serve_constants
 from sky.serve import kubernetes_identity
+from sky.serve import kueue_lane_observer
 from sky.serve import provider_phase
 from sky.serve import reserved_capacity
+from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.server import runtime_profile
@@ -154,8 +156,17 @@ def _load_service_worker_projections(
             # versions. The reclaim adapter accepts the exact v2/v3 strict
             # representations and authenticates their stored digest; new
             # commits are always v3.
-            reserved_capacity.require_reclaim_worker_projection(
+            _, admission = reserved_capacity.require_reclaim_worker_projection(
                 reserved_fill_fence, projections)
+            if admission.admission_mode is (reserved_fill_reclaim_attestation.
+                                            ReclaimAdmissionMode.KUEUE):
+                placement_catalog = serve_state.get_placement_catalog(
+                    service_name, service_version)
+                if (not isinstance(placement_catalog, dict) or
+                        type(placement_catalog.get('num_nodes')) is not int or
+                        placement_catalog['num_nodes'] != 1):
+                    raise ValueError('Kueue reserved fill requires immutable '
+                                     'placement_catalog.num_nodes == 1.')
     except ValueError as e:
         raise exceptions.RequestCancelled(
             f'SkyServe version {service_name!r}/{service_version} has invalid '
@@ -271,6 +282,7 @@ def _parse_reserved_fill_launch_fence(
 def _validate_reserved_fill_final_resources(
     task: 'sky.Task',
     fence: reserved_capacity.ProtocolV2LaunchFence,
+    worker_projections: Any | None,
 ) -> None:
     """Revalidate a queued fill pin immediately before provider actuation."""
     best_resources = task.best_resources
@@ -284,12 +296,26 @@ def _validate_reserved_fill_final_resources(
         raise reserved_capacity.ReservedFillLaunchFenceError(
             'Reserved-fill launch no longer matches its fenced Kubernetes '
             'context and accelerator shape.') from error
+    if not fence.policy_bound:
+        return
+    try:
+        _, admission = reserved_capacity.require_reclaim_worker_projection(
+            fence, worker_projections)
+    except ValueError as error:
+        raise reserved_capacity.ReservedFillLaunchFenceError(
+            'Reserved-fill launch lost its immutable worker projection.') \
+            from error
+    if (admission.admission_mode
+            is reserved_fill_reclaim_attestation.ReclaimAdmissionMode.KUEUE and
+            task.num_nodes != 1):
+        raise reserved_capacity.ReservedFillLaunchFenceError(
+            'Kueue reserved fill requires exactly one task node and Pod.')
 
 
 @contextlib.contextmanager
 def _reserved_fill_effect_epoch(
         launch_context: dict[str, Any]) -> typing.Iterator[None]:
-    """Hold bound-request and process authority for one concrete v2 effect."""
+    """Claim bound-request/process authority for one concrete v2 effect."""
     with ordinary_launch_request._provider_effect_guard(  # pylint: disable=protected-access
             launch_context):
         with provider_phase.provider_phase(
@@ -297,9 +323,9 @@ def _reserved_fill_effect_epoch(
             yield
             if ordinary_launch_request._has_bound_context_fields(  # pylint: disable=protected-access
                     launch_context):
-                # Probe the exact advisory-lock session after successful I/O.
-                # A failed operation keeps its own provider classification;
-                # a successful one must not cross a silently lost authority.
+                # Freshly revalidate the durable effect claim after successful
+                # I/O. A failed operation keeps its provider classification;
+                # a successful one must not publish across changed authority.
                 ordinary_launch_binding.require_active_provider_effect_authorization(
                     launch_context)
 
@@ -912,8 +938,10 @@ def _execute_dag_under_provider_fence(
         # before physical_cluster_uid_fence() performs its first provider
         # identity read, then keep the resulting immutable capture alive for
         # registration, provisioning, setup, and job submission below.
-        _validate_reserved_fill_final_resources(task,
-                                                reserved_fill_launch_fence)
+        _validate_reserved_fill_final_resources(
+            task, reserved_fill_launch_fence,
+            _extra_launch_context.get(
+                serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY))
         # Capture/UID verification is one bounded provider effect. Retain only
         # the immutable kubeconfig token across the later passive wait; the
         # service advisory lock and provider phase retire immediately after
@@ -923,6 +951,26 @@ def _execute_dag_under_provider_fence(
                 kubernetes_adaptor.physical_cluster_uid_fence(
                     reserved_fill_launch_fence.kubernetes_context,
                     reserved_fill_launch_fence.physical_cluster_uid))
+
+    kueue_admission_runtime = None
+    bound_reserved_fill = bool(
+        reserved_fill_launch_fence is not None and
+        ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY
+        in _extra_launch_context)
+    if bound_reserved_fill:
+        if not isinstance(backend, backends.CloudVmRayBackend):
+            raise reserved_capacity.ReservedFillLaunchFenceError(
+                'Reserved-fill Kueue observation requires CloudVmRayBackend.')
+        assert reserved_fill_launch_fence is not None
+        kueue_admission_runtime = (
+            kueue_lane_observer.runtime_for_reserved_fill_launch(
+                _extra_launch_context, reserved_fill_launch_fence))
+
+    kueue_registration = {}
+    if isinstance(backend, backends.CloudVmRayBackend):
+        kueue_registration = {
+            'kueue_admission_runtime': kueue_admission_runtime,
+        }
 
     backend.register_info(
         dag=dag,
@@ -936,7 +984,8 @@ def _execute_dag_under_provider_fence(
         planner=planner,
         extra_launch_context=_extra_launch_context,
         is_launched_by_jobs_controller=_is_launched_by_jobs_controller,
-        workload_type=workload_type)
+        workload_type=workload_type,
+        **kueue_registration)
 
     if task.storage_mounts is not None:
         # Optimizer should eventually choose where to store bucket.

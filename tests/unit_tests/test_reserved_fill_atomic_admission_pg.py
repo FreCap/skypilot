@@ -34,8 +34,10 @@ from sky import global_user_state
 from sky import global_user_state_schema
 from sky.client import sdk
 from sky.events import api_models as event_api_models
+from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
 from sky.serve import controller_transport
+from sky.serve import kueue_lane_lineage
 from sky.serve import ordinary_launch_binding
 from sky.serve import pool_capacity_observation
 from sky.serve import replica_managers
@@ -55,6 +57,7 @@ from sky.server.requests import payloads
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import requests as api_requests
 from sky.server.requests import reserved_fill_admission
+from sky.server.requests import storage as request_storage
 from sky.skylet import constants as skylet_constants
 from sky.utils import common_utils
 from sky.utils import locks
@@ -125,6 +128,14 @@ def atomic_database(allocation_engine, monkeypatch):
                     ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
                 non_pool_launch_receipt_protocol_version=(
                     ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION),
+                demand_source_mode=(
+                    capacity_admission.DemandSourceMode.DURABLE_FEED.value),
+                demand_source_epoch=1,
+                demand_authority_capable=True,
+                demand_authority_controller_incarnation=(
+                    _CONTROLLER_INCARNATION),
+                demand_authority_protocol_version=(
+                    capacity_admission.PROTOCOL_VERSION),
                 reserved_fill_actuation_mode='DURABLE_INTENT',
                 reserved_fill_actuation_epoch=1,
                 reserved_fill_actuation_capable=True,
@@ -272,6 +283,50 @@ def _atomic_specs(engine, count=1, *, image_id=None, authority=None):
 
 def _atomic_spec(engine, **kwargs):
     return _atomic_specs(engine, **kwargs)[0]
+
+
+def _active_reserved_fill_effect_claim(engine):
+    """Commit one fill graph and install its exact live executor claim."""
+    spec = _atomic_spec(engine)
+    _, receipt = reserved_fill_admission._transaction(spec,
+                                                      7,
+                                                      require_existing=False)
+    claim_token = uuid.uuid4()
+    worker_instance_id = uuid.uuid4()
+    with engine.begin() as connection:
+        updated_request = connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                receipt.request_id).values(
+                    status=api_requests.RequestStatus.RUNNING.value,
+                    execution_generation=1,
+                    claim_token=claim_token,
+                    worker_instance_id=worker_instance_id,
+                    lease_expires_at=sqlalchemy.text(
+                        "clock_timestamp() + INTERVAL '1 hour'"),
+                    execution_quiescence_required=True,
+                    updated_at=sqlalchemy.func.clock_timestamp()))
+        assert updated_request.rowcount == 1
+        updated_delivery = connection.execute(
+            sqlalchemy.update(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id ==
+                receipt.request_id).values(
+                    delivery_state='claimed',
+                    claim_generation=1,
+                    updated_at=sqlalchemy.func.clock_timestamp()))
+        assert updated_delivery.rowcount == 1
+        row = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                receipt.request_id)).mappings().one()
+    request = request_postgres.request_from_mapping(row)
+    launch_context = request.request_body.extra_launch_context
+    context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
+        launch_context)
+    claim = request_storage.ExecutionClaim(receipt.request_id, 1,
+                                           str(claim_token),
+                                           str(worker_instance_id))
+    return context, launch_context, claim
 
 
 def _suffix_counts(connection):
@@ -784,10 +839,10 @@ def test_serve056_lineage_and_sqlite_ceiling() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['056']
+    assert scripts.get_heads() == ['057']
     assert scripts.get_revision('056').down_revision == '055'
     assert scripts.get_revision('055').down_revision == '054'
-    assert migration_utils.SERVE_VERSION == '056'
+    assert migration_utils.SERVE_VERSION == '057'
     assert migration_utils.serve_target_version(sqlite) == '037'
     with pytest.raises(RuntimeError, match='PostgreSQL-only'):
         alembic_command.upgrade(config, '056')
@@ -1590,14 +1645,250 @@ def test_outer_commit_publishes_sequences_and_hydrates_exact_request(
         receipt.request_id, _CREATOR_ID, 'different-workspace')
 
 
+def test_reserved_fill_provider_io_holds_no_postgres_authority_session(
+        atomic_database) -> None:
+    """A parked K8s effect has durable authority, not a retained PG lock."""
+    engine = atomic_database
+    context, launch_context, claim = _active_reserved_fill_effect_claim(engine)
+    lock_key = locks.postgres_lock_key(
+        serve_state._replica_launch_authority_lock_id(_SERVICE, engine))
+
+    def transition_service() -> bool:
+        return serve_state.set_service_status_and_active_versions_if_owner(
+            _SERVICE,
+            _SERVICE_HASH,
+            _OWNER[0],
+            _OWNER[1],
+            serve_state.ServiceStatus.SHUTTING_DOWN,
+            expected_lifecycle_epoch=4)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        with pytest.raises(
+                ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                match='no longer authorizes provider effects'):
+            with ordinary_launch_binding.non_pool_provider_effect_guard(
+                    launch_context,
+                    claim,
+                    claim_validator=(
+                        request_postgres.
+                        validate_bound_non_pool_launch_claim_in_transaction
+                    )) as authorization:
+                assert authorization.guard is None
+                with engine.connect() as connection:
+                    advisory_locks = connection.execute(
+                        sqlalchemy.text(
+                            'SELECT count(*) FROM pg_locks '
+                            "WHERE locktype = 'advisory' "
+                            'AND database = ('
+                            '  SELECT oid FROM pg_database '
+                            '  WHERE datname = current_database()'
+                            ') '
+                            'AND ((classid::bigint << 32) | objid::bigint) = '
+                            ':lock_key'), {
+                                'lock_key': lock_key,
+                            }).scalar_one()
+                    all_advisory_locks = connection.execute(
+                        sqlalchemy.text('SELECT count(*) FROM pg_locks '
+                                        "WHERE locktype = 'advisory' "
+                                        'AND database = ('
+                                        '  SELECT oid FROM pg_database '
+                                        '  WHERE datname = current_database()'
+                                        ')')).scalar_one()
+                    idle_transactions = connection.execute(
+                        sqlalchemy.text(
+                            'SELECT count(*) FROM pg_stat_activity '
+                            'WHERE datname = current_database() '
+                            'AND pid <> pg_backend_pid() '
+                            "AND state = 'idle in transaction'")) \
+                        .scalar_one()
+                assert advisory_locks == 0
+                assert all_advisory_locks == 0
+                assert idle_transactions == 0
+
+                # This body stands in for blocked Kubernetes I/O. The same-
+                # service exclusive writer must complete instead of waiting
+                # for the parked provider call.
+                transition = pool.submit(transition_service)
+                assert transition.result(timeout=5) is True
+
+    with engine.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table.c.
+                effect_phase, ordinary_launch_binding.
+                ordinary_launch_associations_table.c.resolution).where(
+                    ordinary_launch_binding.ordinary_launch_associations_table.
+                    c.association_id == context.association_id)).one()
+        request = connection.execute(
+            sqlalchemy.select(
+                request_postgres.REQUESTS.c.status,
+                request_postgres.REQUESTS.c.claim_token,
+                request_postgres.REQUESTS.c.worker_instance_id).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    context.request_id)).one()
+    assert association.effect_phase == (
+        ordinary_launch_binding.EffectPhase.PROVIDER_IO.value)
+    assert association.resolution == (
+        ordinary_launch_binding.Resolution.BOUND.value)
+    assert request.status == api_requests.RequestStatus.RUNNING.value
+    assert request.claim_token == uuid.UUID(claim.claim_token)
+    assert request.worker_instance_id == uuid.UUID(claim.worker_instance_id)
+
+
+def test_reserved_fill_owner_transfer_fences_lock_free_provider_effect(
+        atomic_database) -> None:
+    """Takeover commits during provider I/O and the stale effect cannot win."""
+    engine = atomic_database
+    context, launch_context, claim = _active_reserved_fill_effect_claim(engine)
+    new_incarnation = uuid.UUID('33333333-3333-4333-8333-333333333333')
+    initial_revision = None
+
+    def transfer_owner():
+        with engine.begin() as connection:
+            return ordinary_launch_binding.transfer_service_owner_in_connection(
+                connection,
+                service_name=_SERVICE,
+                expected_incarnation=_CONTROLLER_INCARNATION,
+                expected_owner_epoch=_CONTROLLER_OWNER_EPOCH,
+                new_incarnation=new_incarnation,
+                new_controller_pid=31337,
+                new_controller_ip='10.0.0.33',
+                capable=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        with pytest.raises(
+                ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                match='owner revision changed'):
+            with ordinary_launch_binding.non_pool_provider_effect_guard(
+                    launch_context,
+                    claim,
+                    claim_validator=(
+                        request_postgres.
+                        validate_bound_non_pool_launch_claim_in_transaction
+                    )) as authorization:
+                assert authorization.guard is None
+                initial_revision = authorization.owner_revision
+                # This body stands in for an effectful provider call.  A
+                # takeover must commit without waiting for it, while the
+                # post-effect read rejects this now-stale authorization.
+                transferred = pool.submit(transfer_owner).result(timeout=5)
+                assert transferred.controller_incarnation == new_incarnation
+                assert transferred.controller_owner_epoch == (
+                    _CONTROLLER_OWNER_EPOCH + 1)
+
+    assert initial_revision is not None
+    with engine.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table.c.
+                effect_phase, ordinary_launch_binding.
+                ordinary_launch_associations_table.c.resolution,
+                ordinary_launch_binding.ordinary_launch_associations_table.c.
+                owner_controller_incarnation, ordinary_launch_binding.
+                ordinary_launch_associations_table.c.owner_controller_epoch,
+                ordinary_launch_binding.ordinary_launch_associations_table.c.
+                owner_revision).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == context.association_id)).mappings().one()
+    assert association.effect_phase == (
+        ordinary_launch_binding.EffectPhase.PROVIDER_IO.value)
+    assert association.resolution == (
+        ordinary_launch_binding.Resolution.BOUND.value)
+    assert association.owner_controller_incarnation == new_incarnation
+    assert association.owner_controller_epoch == _CONTROLLER_OWNER_EPOCH + 1
+    assert association.owner_revision == initial_revision + 1
+
+    # The active queue delivery is adopted, never resubmitted.  If that exact
+    # worker later terminates, provider-effect state waits for its guardian
+    # quiescence receipt before reduction/reconciliation.
+    assert ordinary_launch_binding.classify_startup(
+        association,
+        ordinary_launch_binding.RequestStartupFacts(
+            True, api_requests.RequestStatus.RUNNING.value, True, 1, True, False
+        )) == ordinary_launch_binding.StartupClassification.ADOPT_ACTIVE
+    assert ordinary_launch_binding.classify_startup(
+        association,
+        ordinary_launch_binding.RequestStartupFacts(
+            True, api_requests.RequestStatus.CANCELLED.value, False, 1, False,
+            False)) == (
+                ordinary_launch_binding.StartupClassification.WAIT_QUIESCENCE)
+
+    # A different executor generation has no durable claim and cannot replay
+    # the already-effectful request after takeover.
+    replay_claim = request_storage.ExecutionClaim(context.request_id, 2,
+                                                  str(uuid.uuid4()),
+                                                  str(uuid.uuid4()))
+    entered = False
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='exact API request execution claim'):
+        with ordinary_launch_binding.non_pool_provider_effect_guard(
+                launch_context,
+                replay_claim,
+                claim_validator=(
+                    request_postgres.
+                    validate_bound_non_pool_launch_claim_in_transaction)):
+            entered = True
+    assert not entered
+
+
+def test_reserved_fill_lock_free_effect_tracks_latest_phase_revision(
+        atomic_database) -> None:
+    """Legitimate job-phase CASes remain valid inside one effect epoch."""
+    engine = atomic_database
+    context, launch_context, claim = _active_reserved_fill_effect_claim(engine)
+
+    with ordinary_launch_binding.non_pool_provider_effect_guard(
+            launch_context,
+            claim,
+            claim_validator=(request_postgres.
+                             validate_bound_non_pool_launch_claim_in_transaction
+                            )) as authorization:
+        assert authorization.guard is None
+        assert ordinary_launch_binding.begin_service_job_io(
+            launch_context) == authorization.owner_revision + 1
+        recorded_revision = ordinary_launch_binding.record_service_job(
+            launch_context, 19)
+        assert recorded_revision == authorization.owner_revision + 2
+
+    with engine.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table.c.
+                effect_phase, ordinary_launch_binding.
+                ordinary_launch_associations_table.c.owner_revision,
+                ordinary_launch_binding.ordinary_launch_associations_table.c.
+                service_job_id).where(
+                    ordinary_launch_binding.ordinary_launch_associations_table.
+                    c.association_id == context.association_id)).one()
+    assert association.effect_phase == (
+        ordinary_launch_binding.EffectPhase.SERVICE_JOB_RECORDED.value)
+    assert association.owner_revision == recorded_revision
+    assert association.service_job_id == 19
+
+
 def test_remove_service_completely_removes_intent_linked_replica_graph(
         atomic_database, monkeypatch) -> None:
-    _, info, authority = _failed_teardown_reserved_fill_ambiguity(
+    context, info, authority = _failed_teardown_reserved_fill_ambiguity(
         atomic_database)
     _install_failed_teardown_provider_observation(
         monkeypatch, atomic_database, info,
+        ordinary_launch_binding.ProviderEvidence.PRESENT)
+    cleanup_contexts = service._settle_bound_ordinary_launches_for_teardown(
+        authority, [info])
+    assert cleanup_contexts == {
+        (info.replica_id, info.replica_record_id): context
+    }
+    persisted = serve_state.get_replica_info_from_id(_SERVICE, info.replica_id)
+    assert persisted is not None
+    _install_failed_teardown_provider_observation(
+        monkeypatch, atomic_database, persisted,
         ordinary_launch_binding.ProviderEvidence.ABSENT)
-    service._settle_bound_ordinary_launches_for_teardown(authority, [info])
+    monkeypatch.setattr(replica_managers, 'terminate_cluster',
+                        lambda *_args, **_kwargs: None)
+    replica_managers.terminate_bound_non_pool_provider_present_cluster(
+        context, persisted, authority,
+        functools.partial(service._project_bound_ordinary_launch_for_teardown,
+                          authority), persisted.cluster_name, 'cleanup.log')
 
     assert serve_state.remove_service_completely(
         _SERVICE,
@@ -1622,9 +1913,14 @@ def test_remove_service_completely_rejects_unsettled_intent_graph(
         atomic_database) -> None:
     spec = _atomic_spec(atomic_database)
     reserved_fill_admission._transaction(spec, 7, require_existing=False)
+    teardown = ordinary_launch_binding.begin_service_teardown_if_owner(
+        _SERVICE, _SERVICE_HASH, _OWNER)
+    assert teardown.disposition is (
+        ordinary_launch_binding.ServiceTeardownDisposition.MARKED_BOUND)
 
-    with pytest.raises(sqlalchemy.exc.InternalError,
-                       match='bound ordinary-launch replica cannot be deleted'):
+    with pytest.raises(
+            kueue_lane_lineage.KueueAdmissionConflict,
+            match='retirement lacks canonical provider-absence authority'):
         serve_state.remove_service_completely(_SERVICE,
                                               _SERVICE_HASH,
                                               expected_controller_owner=_OWNER,
@@ -1744,15 +2040,23 @@ def test_provider_cleanup_uses_committed_intent_gate_after_gate_advances(
 
 
 def _reconstruct_serve055_replica_handoff_boundary(engine) -> None:
-    """Remove only Serve056 DDL from an isolated PostgreSQL test database.
+    """Reconstruct Serve055 in an isolated PostgreSQL test database.
 
     The fixture's current writer is needed to produce a fully canonical
-    intent/replica/association/request graph.  Removing the additive Serve056
-    boundary afterward leaves the exact deployed Serve055 representation: the
-    immutable intent key exists only in ReplicaInfo JSON.  No application
-    writes occur until the real 055 -> 056 migration is replayed.
+    intent/replica/association/request graph.  Remove the additive Serve057
+    relation before its Serve056 parent key, then remove the Serve056 boundary.
+    This leaves the exact deployed Serve055 representation: the immutable
+    intent key exists only in ReplicaInfo JSON.  No application writes occur
+    until the real 055 -> 056 migration is replayed.
     """
     statements = (
+        # The fixture starts at the current schema.  Serve057 references the
+        # composite intent key introduced by Serve056, so reverse the additive
+        # test-only DDL in dependency order.  Avoid CASCADE: a newly introduced
+        # dependent object must make this historical reconstruction fail until
+        # the fixture names it explicitly.
+        'DROP TABLE IF EXISTS serve_kueue_admissions',
+        'DROP FUNCTION IF EXISTS skyserve057_guard_kueue_admission()',
         'DROP TRIGGER IF EXISTS '
         'skyserve056_fill_replica_handoff_consistency ON replicas',
         'DROP TRIGGER IF EXISTS '
@@ -1790,6 +2094,7 @@ def _reconstruct_serve055_replica_handoff_boundary(engine) -> None:
         column['name']
         for column in sqlalchemy.inspect(engine).get_columns('replicas')
     }
+    assert not sqlalchemy.inspect(engine).has_table('serve_kueue_admissions')
 
 
 def test_serve056_retained_provider_present_cleanup_reaches_manager_down_shape(

@@ -3,6 +3,7 @@
 
 import contextlib
 import dataclasses
+import datetime
 import importlib
 import inspect
 import pickle
@@ -21,6 +22,31 @@ from sky.utils import resources_utils
 @dataclasses.dataclass
 class _RequiredProvisionConfigExtension(common.ProvisionConfig):
     required_extension: str
+
+
+class _LaneObserver:
+
+    def begin_observation(self) -> datetime.datetime:
+        return datetime.datetime(2026, 8, 21, tzinfo=datetime.timezone.utc)
+
+    def __call__(self, _observation,
+                 _provider_read_started_at: datetime.datetime) -> None:
+        return None
+
+
+def _kueue_runtime(
+    *,
+    persisted_pod_identity: common.KueuePersistedPodIdentity | None = None,
+) -> common.KueuePodAdmissionRuntime:
+    return common.KueuePodAdmissionRuntime(
+        identity=common.KueuePodAdmissionIdentity(
+            intent_key='1' * 64,
+            replica_record_uuid='12345678-1234-5678-9234-567812345678',
+            pool_physical_uid='physical-cluster-uid',
+            worker_projection_sha256='2' * 64),
+        accelerator='H200',
+        observer=_LaneObserver(),
+        persisted_pod_identity=persisted_pod_identity)
 
 
 def _old_positional_values():
@@ -71,30 +97,35 @@ def test_provision_config_retains_old_constructor_and_subclass_contract():
     ]
     parameters = list(
         inspect.signature(common.ProvisionConfig).parameters.values())
-
-    assert [parameter.name for parameter in parameters] == [
-        *old_names, 'cluster_incarnation', 'provider_effect_guard_factory'
+    runtime_names = [
+        'cluster_incarnation', 'provider_effect_guard_factory',
+        'kueue_admission_runtime'
     ]
+
+    assert [parameter.name for parameter in parameters
+           ] == [*old_names, *runtime_names]
     assert all(parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-               for parameter in parameters[:-2])
+               for parameter in parameters[:-len(runtime_names)])
     assert all(parameter.kind is inspect.Parameter.KEYWORD_ONLY
-               for parameter in parameters[-2:])
-    assert all(parameter.default is None for parameter in parameters[-2:])
+               for parameter in parameters[-len(runtime_names):])
+    assert all(parameter.default is None
+               for parameter in parameters[-len(runtime_names):])
 
     config = common.ProvisionConfig(*_old_positional_values())
     assert [getattr(config, name) for name in old_names
            ] == list(_old_positional_values())
     assert config.cluster_incarnation is None
     assert config.provider_effect_guard_factory is None
+    assert config.kueue_admission_runtime is None
 
     extension = _RequiredProvisionConfigExtension(*_old_positional_values(),
                                                   required_extension='required')
     assert extension.required_extension == 'required'
     assert extension.cluster_incarnation is None
     assert extension.provider_effect_guard_factory is None
-    assert [field.name for field in dataclasses.fields(config)] == [
-        *old_names, 'cluster_incarnation', 'provider_effect_guard_factory'
-    ]
+    assert extension.kueue_admission_runtime is None
+    assert [field.name for field in dataclasses.fields(config)
+           ] == [*old_names, *runtime_names]
 
 
 def test_provision_config_equality_repr_pickle_and_redaction_contract():
@@ -130,14 +161,61 @@ def test_provision_config_equality_repr_pickle_and_redaction_contract():
 
     legacy.__dict__.pop('cluster_incarnation')
     legacy.__dict__.pop('provider_effect_guard_factory')
+    legacy.__dict__.pop('kueue_admission_runtime')
     assert 'cluster_incarnation' not in legacy.__dict__
     assert 'provider_effect_guard_factory' not in legacy.__dict__
     restored = pickle.loads(pickle.dumps(legacy))
     assert restored.cluster_incarnation is None
     assert restored.provider_effect_guard_factory is None
+    assert restored.kueue_admission_runtime is None
     assert dataclasses.asdict(restored)['cluster_incarnation'] is None
     assert dataclasses.asdict(restored)['provider_effect_guard_factory'] is None
+    assert dataclasses.asdict(restored)['kueue_admission_runtime'] is None
     assert restored.get_redacted_config() == expected_redacted
+
+
+def test_bulk_provision_rejects_multi_node_kueue_before_bootstrap(
+        monkeypatch, tmp_path):
+
+    def must_not_read_cluster_yaml(*_args, **_kwargs):
+        raise AssertionError('multi-node Kueue reached bootstrap parsing')
+
+    monkeypatch.setattr(global_user_state, 'get_cluster_yaml_dict',
+                        must_not_read_cluster_yaml)
+    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
+                       match='exactly one node'):
+        provisioner.bulk_provision(cloud=clouds.Kubernetes(),
+                                   region=clouds.Region('test-region'),
+                                   zones=None,
+                                   cluster_name=resources_utils.ClusterName(
+                                       'display-name', 'cloud-name'),
+                                   num_nodes=2,
+                                   cluster_yaml='/must-not-be-read.yaml',
+                                   prev_cluster_ever_up=False,
+                                   log_dir=str(tmp_path),
+                                   kueue_admission_runtime=_kueue_runtime())
+
+
+def test_bulk_provision_rejects_untyped_kueue_runtime_before_bootstrap(
+        monkeypatch, tmp_path):
+
+    def must_not_read_cluster_yaml(*_args, **_kwargs):
+        raise AssertionError('untyped Kueue runtime reached bootstrap parsing')
+
+    monkeypatch.setattr(global_user_state, 'get_cluster_yaml_dict',
+                        must_not_read_cluster_yaml)
+    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
+                       match='one complete typed admission runtime'):
+        provisioner.bulk_provision(cloud=clouds.Kubernetes(),
+                                   region=clouds.Region('test-region'),
+                                   zones=None,
+                                   cluster_name=resources_utils.ClusterName(
+                                       'display-name', 'cloud-name'),
+                                   num_nodes=1,
+                                   cluster_yaml='/must-not-be-read.yaml',
+                                   prev_cluster_ever_up=False,
+                                   log_dir=str(tmp_path),
+                                   kueue_admission_runtime=object())
 
 
 @pytest.mark.parametrize('marker', [None, 'raw-generation'])
@@ -205,7 +283,17 @@ def test_bulk_provision_propagates_exact_optional_incarnation(
     monkeypatch.setattr(provision, 'bootstrap_instances', bootstrap_instances)
     monkeypatch.setattr(provision, 'run_instances', run_instances)
 
-    kwargs = {'provider_effect_guard_factory': provider_effect_guard}
+    persisted_pod_identity = common.KueuePersistedPodIdentity(
+        namespace='inference',
+        pod_name='cloud-name-head',
+        pod_uid='persisted-pod-uid')
+    kueue_runtime = _kueue_runtime(
+        persisted_pod_identity=persisted_pod_identity)
+
+    kwargs = {
+        'provider_effect_guard_factory': provider_effect_guard,
+        'kueue_admission_runtime': kueue_runtime,
+    }
     if marker is not None:
         kwargs['cluster_incarnation'] = marker
     result = provisioner.bulk_provision(
@@ -228,6 +316,7 @@ def test_bulk_provision_propagates_exact_optional_incarnation(
     assert bootstrap_config.cluster_incarnation is marker
     assert (bootstrap_config.provider_effect_guard_factory
             is provider_effect_guard)
+    assert bootstrap_config.kueue_admission_runtime is kueue_runtime
 
 
 def test_bulk_provision_rechecks_authority_between_auxiliary_mutations(

@@ -11,6 +11,8 @@ import sqlalchemy
 
 from sky import global_user_state_schema
 from sky.client import sdk
+from sky.serve import kueue_lane_capacity
+from sky.serve import kueue_lane_lineage
 from sky.serve import ordinary_launch_binding
 from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
@@ -138,6 +140,42 @@ def _stage_and_bind_in_savepoint(
         raise AdmissionAmbiguousError(
             'Lost-ACK hydration found a partial handoff.')
 
+    lane_identity = zero_cost_actuation.kueue_lane_identity_for_intent_in_connection(
+        connection,
+        service_name=spec.authority.service_name,
+        service_lifecycle_epoch=spec.authority.service_lifecycle_epoch,
+        intent=spec.actuation_lease.intent)
+    lane_repository = None
+    lane_admission = None
+    if lane_identity is not None:
+        lane_repository = kueue_lane_lineage.KueueAdmissionRepository(
+            connection.engine)
+        lane_admission = lane_repository.get_for_intent_in_connection(
+            connection,
+            spec.authority.service_name,
+            spec.actuation_lease.intent.idempotency_key,
+            for_update=True)
+        if lane_admission is None:
+            raise kueue_lane_lineage.KueueAdmissionConflict(
+                'Kueue fill materialization lost its durable admission.')
+        compatibility_sha256 = (
+            kueue_lane_capacity.replacement_compatibility_sha256(
+                service_hash=spec.authority.service_hash,
+                service_lifecycle_epoch=(
+                    spec.authority.service_lifecycle_epoch),
+                service_version=spec.actuation_lease.intent.service_version,
+                capacity_unit=spec.actuation_lease.intent.capacity_unit.value,
+                accelerator=lane_identity.accelerator,
+                accelerator_count=lane_identity.accelerator_count,
+                worker_projection_sha256=(
+                    lane_identity.worker_projection_sha256)))
+        lane_repository.validate_replacement_surge_in_connection(
+            connection,
+            lane_identity,
+            intent_idempotency_key=(
+                spec.actuation_lease.intent.idempotency_key),
+            expected_compatibility_sha256=compatibility_sha256)
+
     body, _ = _frozen_identity(spec)
     service = connection.execute(
         sqlalchemy.select(serve_state_schema.services_table).where(
@@ -212,6 +250,33 @@ def _stage_and_bind_in_savepoint(
     if require_existing and admission.created:
         raise AdmissionAmbiguousError(
             'Lost-ACK hydration found no existing request.')
+    if lane_identity is not None:
+        assert lane_repository is not None
+        assert lane_admission is not None
+        replica_record_id = uuid.UUID(staged.persisted_info.replica_record_id)
+        if require_existing:
+            validated = lane_repository.validate_materialized_in_connection(
+                connection,
+                lane_identity,
+                intent_idempotency_key=(
+                    spec.actuation_lease.intent.idempotency_key),
+                replica_id=staged.replica_id,
+                replica_record_id=replica_record_id,
+                provider_cluster_generation=admission.launch_generation,
+                association_id=uuid.UUID(admission.association_id))
+            if validated is None:
+                raise AdmissionAmbiguousError(
+                    'Lost-ACK hydration found no exact Kueue lane graph.')
+        else:
+            lane_repository.bind_materialized_in_connection(
+                connection,
+                lane_identity,
+                intent_idempotency_key=(
+                    spec.actuation_lease.intent.idempotency_key),
+                replica_id=staged.replica_id,
+                replica_record_id=replica_record_id,
+                provider_cluster_generation=admission.launch_generation,
+                association_id=uuid.UUID(admission.association_id))
     return staged, AdmissionReceipt(
         replica_id=staged.replica_id,
         replica_record_id=staged.persisted_info.replica_record_id,

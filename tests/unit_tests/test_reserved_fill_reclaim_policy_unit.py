@@ -323,6 +323,8 @@ def _install_gate(monkeypatch,
         serve_state, 'get_placement_projection_record',
         lambda _service_name, _version:
         (True, None, None, [_WORKER_PROJECTION]))
+    monkeypatch.setattr(serve_state, 'get_placement_catalog',
+                        lambda _service_name, _version: {'num_nodes': 1})
     identity = gate.reclaim_policy_identity
     sequenced_active = gate.sequenced_active
     state = getattr(

@@ -68,6 +68,8 @@ if TYPE_CHECKING:
 # to inherit the setup from the `sky` logger.
 logger = sky_logging.init_logger('sky.serve.service')
 request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
+kueue_lane_observer = adaptors_common.LazyImport(
+    'sky.serve.kueue_lane_observer')
 
 _BOUND_ORDINARY_LAUNCH_SETTLE_INTERVAL_SECONDS = 0.5
 
@@ -523,6 +525,7 @@ def _prepare_provider_present_cleanup(
 
 
 def _terminate_replica_cluster_for_service_cleanup(
+    service_name: str,
     info: replica_managers.ReplicaInfo,
     cleanup_context: ordinary_launch_binding.BoundNonPoolLaunchContext | None,
     authority: ordinary_launch_binding.ControllerBindingAuthority | None,
@@ -532,8 +535,9 @@ def _terminate_replica_cluster_for_service_cleanup(
 ) -> None:
     """Dispatch generic or exact PRESENT cleanup through one bulk path."""
     if cleanup_context is None:
-        replica_managers.terminate_cluster(cluster_name, log_file_name,
-                                           **terminate_kwargs)
+        replica_managers.terminate_cluster_with_kueue_absence_receipt(
+            service_name, info.replica_id, info.replica_record_id, cluster_name,
+            log_file_name, **terminate_kwargs)
         return
     if authority is None:
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
@@ -715,6 +719,26 @@ def _cleanup(
             if cleanup_fence is None:
                 absent_legacy_infos.append(info)
             else:
+                info.status_property.sky_down_status = (
+                    common_utils.ProcessStatus.SCHEDULED)
+                _persist_replica(info)
+                try:
+                    exact_absence = (kueue_lane_observer.
+                                     project_exact_pod_absence_after_teardown(
+                                         service_name, info.replica_id,
+                                         info.replica_record_id))
+                except Exception as error:  # pylint: disable=broad-except
+                    _set_to_failed_cleanup(
+                        info, 'the exact admitted Kubernetes Pod could not be '
+                        'proved absent after its cluster record disappeared '
+                        f'({common_utils.format_exception(error)})')
+                    continue
+                if exact_absence:
+                    logger.info(
+                        f'Replica {info.replica_id} exact admitted Pod is '
+                        'absent; provider cleanup is complete.')
+                    absent_legacy_infos.append(info)
+                    continue
                 presence = reserved_capacity.probe_physical_replica_presence(
                     cleanup_fence, info.cluster_name)
                 if (presence
@@ -799,12 +823,18 @@ def _cleanup(
             terminate_kwargs['cleanup_fence'] = cleanup_fence
         t = thread_utils.SafeThread(
             target=_terminate_replica_cluster_for_service_cleanup,
-            args=(info, cleanup_context, binding_authority, info.cluster_name,
-                  log_file_name),
+            args=(service_name, info, cleanup_context, binding_authority,
+                  info.cluster_name, log_file_name),
             kwargs=terminate_kwargs)
         info2thr[info] = t
         # Set replica status to `SHUTTING_DOWN`
-        if cleanup_context is None:
+        if (cleanup_fence is None and info.status_property.sky_launch_status
+                in (None, common_utils.ProcessStatus.SCHEDULED)):
+            # Preserve genuine terminal launch outcomes.  This legacy-only
+            # normalization exists solely so a pre-effect row renders as
+            # shutting down once its down worker is admitted; a projected
+            # protocol-v2 FAILED/CANCELLED request is durable evidence and must
+            # never be rewritten to synthetic success.
             info.status_property.sky_launch_status = (
                 replica_managers.common_utils.ProcessStatus.SUCCEEDED)
         info.status_property.sky_down_status = (

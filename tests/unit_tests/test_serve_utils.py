@@ -5042,7 +5042,8 @@ class TestTerminateFailedServices:
              teardown_identities=None,
              bound_authority=None,
              bound_settle_side_effect=None,
-             quiesce_side_effect=None):
+             quiesce_side_effect=None,
+             exact_absence=False):
         terminated = []
         self.termination_kwargs = []
 
@@ -5114,6 +5115,12 @@ class TestTerminateFailedServices:
              mock.patch('sky.serve.serve_utils.serve_state.'
                         'service_owner_matches', return_value=True), \
              mock.patch('sky.serve.serve_utils.serve_state.'
+                        'add_or_update_replica', return_value=True) as persist, \
+             mock.patch(
+                 'sky.serve.kueue_lane_observer.'
+                 'project_exact_pod_absence_after_teardown',
+                 return_value=exact_absence) as exact_probe, \
+             mock.patch('sky.serve.serve_utils.serve_state.'
                         'set_service_status_and_active_versions_if_hash',
                         return_value=True), \
              mock.patch('sky.serve.serve_utils.serve_state.'
@@ -5124,6 +5131,8 @@ class TestTerminateFailedServices:
                         return_value={
                             'hash': 'incarnation-a',
                             'resource_scope': resource_scope,
+                            'controller_pid': 101,
+                            'controller_ip': '10.0.0.1',
                             'controller_port':
                                 constants.CONTROLLER_TEARDOWN_ACK_PORT,
                         }), \
@@ -5142,6 +5151,8 @@ class TestTerminateFailedServices:
                 'svc', 'incarnation-a', None)
         self.quiesce = quiesce
         self.settle_bound = settle_bound
+        self.persist_replica = persist
+        self.exact_absence_probe = exact_probe
         return (terminated, remove_service, delete_lb, result.message,
                 set_owner_status, remove_directory)
 
@@ -5565,6 +5576,61 @@ class TestTerminateFailedServices:
         set_owner_status.assert_not_called()
         assert message is None
         assert self.quiesce.call_args.kwargs['include_terminal_history'] is True
+
+    def test_protocol_v2_exact_admitted_pod_absence_skips_name_census(self):
+        info = self._replica(1, 'svc-1')
+        info.replica_record_id = '00000000-0000-4000-8000-000000000001'
+        info.status_property = types.SimpleNamespace(sky_down_status=None)
+        cleanup_fence = types.SimpleNamespace(kubernetes_context='phx-context',
+                                              physical_cluster_uid='phx-uid')
+        with mock.patch(
+                'sky.serve.reserved_capacity.'
+                'parse_protocol_v2_cleanup_fence',
+                return_value=cleanup_fence), \
+             mock.patch(
+                 'sky.serve.reserved_capacity.'
+                 'probe_physical_replica_presence') as census:
+            _, remove_service, _, message, _, _ = self._run(
+                [info], exists=lambda _name: False, exact_absence=True)
+
+        assert message is None
+        census.assert_not_called()
+        self.exact_absence_probe.assert_called_once_with(
+            'svc', info.replica_id, info.replica_record_id)
+        self.persist_replica.assert_called_once_with(
+            'svc',
+            info.replica_id,
+            info,
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=17,
+            expected_controller_owner=(101, '10.0.0.1'),
+            expected_replica_exists=True)
+        remove_service.assert_called_once()
+
+    def test_orphan_child_partition_keeps_legacy_census_without_service_row(
+            self):
+        info = self._replica(1, 'svc-1')
+        cleanup_fence = types.SimpleNamespace(kubernetes_context='phx-context',
+                                              physical_cluster_uid='phx-uid')
+        with mock.patch(
+                'sky.serve.reserved_capacity.'
+                'parse_protocol_v2_cleanup_fence',
+                return_value=cleanup_fence), \
+             mock.patch(
+                 'sky.serve.reserved_capacity.'
+                 'probe_physical_replica_presence',
+                 return_value=(reserved_capacity.
+                               PhysicalReplicaPresence.ABSENT)) as census, \
+             mock.patch(
+                 'sky.serve.kueue_lane_observer.'
+                 'project_exact_pod_absence_after_teardown') as exact_probe:
+            to_terminate, unresolved = (
+                serve_utils._partition_replica_cleanup_targets([info], set()))
+
+        assert to_terminate == []
+        assert unresolved == []
+        census.assert_called_once_with(cleanup_fence, info.cluster_name)
+        exact_probe.assert_not_called()
 
     def test_protocol_v2_present_cluster_forwards_exact_cleanup_fence(self):
         info = self._replica(1, 'svc-1')

@@ -880,8 +880,10 @@ def test_serve056_previous_cohort_reconciles_ambiguous_provider_action(
                 launch_context,
                 claim,
                 claim_validator=lambda _connection, _association_id, _claim:
-                True):
-            pass
+                True) as authorization:
+            # Only scalar-linked reserved fill uses the durable lock-free
+            # effect boundary. Other generic profiles keep shared exclusion.
+            assert authorization.guard is not None
 
     authority = dataclasses.replace(
         _generic_controller_authority(),
