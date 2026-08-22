@@ -1,8 +1,14 @@
 # Persisted SkyServe Controller and Worker Placement Projection
 
 **Status:** Protocol-v5 scratch-backed bootstrap, UID-bound readiness, bounded
-two-phase Kueue wait, and strict worker/Kueue projection binding implemented;
-homogeneous-cohort deployment and production verification pending
+two-phase Kueue wait, and strict worker/Kueue projection binding are
+implemented in fix-forward PR #1671. The dedicated workspaces, Kueue admission
+inputs, accelerator scheduling, and memory-scratch inputs are configured and
+applied. Intermediate release `1.1.1440` / Helm revision 549 is deployed under
+the controller hold from PR #1670, but its first runtime-storage implementation
+is superseded and is not eligible for hold release or service recreation. A
+homogeneous PR #1671 successor deployment and fresh protocol-v5 projection,
+admission, and runtime verification remain pending.
 **Last updated:** 2026-08-22
 
 ## Goals
@@ -971,9 +977,15 @@ for this rollout.
 
 ## Open gates
 
+- Keep release `1.1.1440` / Helm revision 549 under the controller hold. Merge
+  PR #1671, publish one immutable successor, and direct-Helm deploy its exact
+  API/controller/executor cohort before releasing the hold or recreating a
+  service. Verify the common digest, protocol/cohort 5, and provider-proof
+  process from the complete successor cohort; the intermediate PR #1670 image
+  is not an activation candidate.
 - The distinct east controller workspace/context/namespace/service account is
-  encoded in the platform change. Deploy it and verify the admitted controller
-  Job's identity, 64 GiB ephemeral-storage request, 80 GiB limit, and
+  configured and applied. Verify a fresh admitted controller Job's identity,
+  64 GiB ephemeral-storage request, 80 GiB limit, and
   `/mnt/scratch` byte/inode checks. Its ambient role needs the controller's
   S3/KMS permissions; worker contexts with a non-null projected Pod Identity
   role must use it for the approved input and output prefixes.
@@ -988,30 +1000,34 @@ for this rollout.
 - The required inference priority class is encoded for both contexts. Verify
   admitted east and PHX workers resolve it to value `-1000` with
   `preemptionPolicy: Never` before bulk traffic.
-- Configure a server-owned inference LocalQueue and
-  `serve_worker_kueue_workload_priority_class_name` for every projected
-  reserved context, and enable `AssignQueueLabelsForPods`. Verify projection v5
-  freezes both, task/request overrides are rejected, the admitted Pod reports
+- The server-owned PHX LocalQueue,
+  `serve_worker_kueue_workload_priority_class_name`, and
+  `AssignQueueLabelsForPods` inputs are configured and applied; east remains
+  intentionally outside Kueue. Verify a fresh protocol-v5 projection freezes
+  the PHX pair, task/request overrides are rejected, the admitted Pod reports
   the exact preflight LocalQueue/ClusterQueue pair, Kueue reports the Workload
-  at that exact class, and higher-priority BCL/research work shares a preempting
-  ClusterQueue domain.
-- Configure the verified east A100/A100-80GB and PHX H200
-  `serve_worker_accelerator_scheduling` entries. Render an H200 worker with no
-  live PHX GPU nodes visible and prove no node, label, resource-key, autoscaler,
-  or `CUSTOM_GPU_RESOURCE_KEY` lookup occurs; the Pod must still require
+  at that exact class, and higher-priority BCL/research work retains the
+  existing preemption relationship. This is verification of Simone's unchanged
+  policy, not authority to mutate Kueue topology or policy.
+- The verified east A100/A100-80GB and PHX H200
+  `serve_worker_accelerator_scheduling` entries are configured and applied.
+  From a fresh protocol-v5 projection, render an H200 worker with no live PHX
+  GPU nodes visible and prove no node, label, resource-key, autoscaler, or
+  `CUSTOM_GPU_RESOURCE_KEY` lookup occurs; the admitted Pod must still require
   `nvidia.com/gpu.product In [NVIDIA-H200]` and `nvidia.com/gpu: 1`.
-- Configure typed `serve_worker_scratch` for every enabled reserved inference
-  context, deploy the matching platform startup verification first, and verify
-  API 79 history freezes the effective `provision_timeout`, Kueue quota wait
-  does not consume that timer, and final Pods and startup evidence agree on
-  kind, `/tmp`, and exact size. No task or service YAML may contain a scratch
-  volume or `pod_config`;
+- Typed memory-backed `serve_worker_scratch` is configured and applied for
+  every enabled reserved inference context. After the PR #1671 successor is
+  deployed, verify fresh protocol-v5 history freezes the effective
+  `provision_timeout`, Kueue quota wait does not consume that timer, and final
+  Pods and startup evidence agree on kind, `/tmp`, and exact size. No task or
+  service YAML may contain a scratch volume or `pod_config`;
   task Kubernetes config also cannot select `provision_timeout`, `auto_mounts`,
   `enable_docker`, or `custom_metadata`, and task resources cannot set labels
   for projected workers. Verify a terminal v5 launch renders the version's
   exact frozen timeout even when the API server's ambient config later differs.
-- The dedicated inference workspace must be updated without disrupting the
-  existing shared service fleet, or migrated during a planned drain.
+- The dedicated inference workspace is configured and applied. Verify the
+  freshly recreated protocol-v5 service resolves its worker projections only
+  from that workspace; no further shared-fleet or workspace mutation is a gate.
 - Do not enable nonempty campaigns until Clin ships and verifies a fresh
   one-shot mode independent of external campaign-controller recovery or
   takeover.
