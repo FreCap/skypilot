@@ -4361,7 +4361,11 @@ def get_spot_label(context: str | None = None) -> tuple[str | None, str | None]:
     return None, None
 
 
-def dict_to_k8s_object(object_dict: dict[str, Any], object_type: 'str') -> Any:
+def dict_to_k8s_object(
+    object_dict: dict[str, Any],
+    object_type: 'str',
+    context: str | None = None,
+) -> Any:
     """Converts a dictionary to a Kubernetes object.
 
     Useful for comparing two Kubernetes objects. Adapted from
@@ -4370,6 +4374,10 @@ def dict_to_k8s_object(object_dict: dict[str, Any], object_type: 'str') -> Any:
     Args:
         object_dict: Dictionary representing the Kubernetes object
         object_type: Type of the Kubernetes object. E.g., 'V1Pod', 'V1Service'.
+        context: Kubernetes context whose already-selected client must perform
+            the local deserialization.  Passing the provider context is
+            required inside a physical-cluster-fenced operation so this
+            helper cannot accidentally consult an unleased default context.
     """
 
     class FakeKubeResponse:
@@ -4378,7 +4386,8 @@ def dict_to_k8s_object(object_dict: dict[str, Any], object_type: 'str') -> Any:
             self.data = json.dumps(obj)
 
     fake_kube_response = FakeKubeResponse(object_dict)
-    return kubernetes.api_client().deserialize(fake_kube_response, object_type)
+    return kubernetes.api_client(context).deserialize(fake_kube_response,
+                                                      object_type)
 
 
 def get_unlabeled_accelerator_nodes(context: str | None = None) -> list[Any]:

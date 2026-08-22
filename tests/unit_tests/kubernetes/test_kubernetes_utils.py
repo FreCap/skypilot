@@ -26,6 +26,25 @@ from sky.provision.kubernetes import pod_config as pod_config_lib
 from sky.provision.kubernetes import utils
 
 
+def test_dict_to_k8s_object_uses_selected_context(monkeypatch):
+    """Local decoding must not escape a physical-cluster fence."""
+    client = mock.MagicMock()
+    decoded = object()
+    client.deserialize.return_value = decoded
+    api_client = mock.MagicMock(return_value=client)
+    monkeypatch.setattr(utils.kubernetes, 'api_client', api_client)
+
+    result = utils.dict_to_k8s_object({'metadata': {
+        'name': 'service'
+    }}, 'V1Service', 'phx-context')
+
+    assert result is decoded
+    api_client.assert_called_once_with('phx-context')
+    response, object_type = client.deserialize.call_args.args
+    assert object_type == 'V1Service'
+    assert response.data == '{"metadata": {"name": "service"}}'
+
+
 # Test for exception on permanent errors like 401 (Unauthorized)
 def test_get_kubernetes_nodes():
     with patch('sky.provision.kubernetes.utils.kubernetes.core_api'

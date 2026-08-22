@@ -345,7 +345,7 @@ def _configure_autoscaler_role(namespace: str, context: str | None,
 
     name = resource['metadata']['name']
     field_selector = f'metadata.name={name}'
-    new_role = kubernetes_utils.dict_to_k8s_object(resource, 'V1Role')
+    new_role = kubernetes_utils.dict_to_k8s_object(resource, 'V1Role', context)
 
     _create_or_patch_resource(
         log_prefix=log_prefix,
@@ -403,7 +403,8 @@ def _configure_autoscaler_role_binding(
     resource['metadata']['name'] = override_name or resource['metadata']['name']
     name = resource['metadata']['name']
     field_selector = f'metadata.name={name}'
-    new_rb = kubernetes_utils.dict_to_k8s_object(resource, 'V1RoleBinding')
+    new_rb = kubernetes_utils.dict_to_k8s_object(resource, 'V1RoleBinding',
+                                                 context)
 
     _create_or_patch_resource(
         log_prefix=log_prefix,
@@ -439,7 +440,8 @@ def _configure_autoscaler_cluster_role(namespace, context,
 
     name = resource['metadata']['name']
     field_selector = f'metadata.name={name}'
-    new_cr = kubernetes_utils.dict_to_k8s_object(resource, 'V1ClusterRole')
+    new_cr = kubernetes_utils.dict_to_k8s_object(resource, 'V1ClusterRole',
+                                                 context)
 
     _create_or_patch_resource(
         log_prefix=log_prefix,
@@ -480,7 +482,8 @@ def _configure_autoscaler_cluster_role_binding(
     name = resource['metadata']['name']
     field_selector = f'metadata.name={name}'
     new_binding = kubernetes_utils.dict_to_k8s_object(resource,
-                                                      'V1ClusterRoleBinding')
+                                                      'V1ClusterRoleBinding',
+                                                      context)
 
     _create_or_patch_resource(
         log_prefix=log_prefix,
@@ -629,7 +632,8 @@ def _configure_services(namespace: str, context: str | None,
             assert len(services) == 1
             existing_service = services[0]
             # Convert to k8s object to compare
-            new_svc = kubernetes_utils.dict_to_k8s_object(service, 'V1Service')
+            new_svc = kubernetes_utils.dict_to_k8s_object(
+                service, 'V1Service', context)
             if new_svc.spec.ports == existing_service.spec.ports:
                 logger.info('_configure_services: '
                             f'{using_existing_msg("service", name)}')

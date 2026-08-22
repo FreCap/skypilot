@@ -3907,6 +3907,39 @@ def _make_provider_config_for_rbac():
     }
 
 
+def test_configure_services_deserializes_with_selected_context(monkeypatch):
+    """An existing Service comparison stays inside the launch context."""
+    context = 'phx-context'
+    ports = [mock.sentinel.port]
+    existing_service = mock.MagicMock()
+    existing_service.spec.ports = ports
+    core_api = mock.MagicMock()
+    core_api.list_namespaced_service.return_value = mock.MagicMock(
+        items=[existing_service])
+    monkeypatch.setattr(kubernetes, 'core_api', lambda _: core_api)
+    decoded_service = mock.MagicMock()
+    decoded_service.spec.ports = ports
+    decode = mock.MagicMock(return_value=decoded_service)
+    monkeypatch.setattr(kubernetes_utils, 'dict_to_k8s_object', decode)
+    provider_config = {
+        'services': [{
+            'metadata': {
+                'name': 'head-service'
+            },
+            'spec': {
+                'ports': []
+            },
+        }]
+    }
+
+    config_lib._configure_services('namespace', context, provider_config)
+
+    decode.assert_called_once_with(provider_config['services'][0], 'V1Service',
+                                   context)
+    core_api.patch_namespaced_service.assert_not_called()
+    core_api.create_namespaced_service.assert_not_called()
+
+
 class TestRbac409ConflictHandling:
     """Tests that RBAC resource creation handles 409 Conflict gracefully.
 
