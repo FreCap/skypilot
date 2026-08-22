@@ -5,11 +5,12 @@ Last updated: 2026-08-22
 Status: the atomic reserved-capacity allocator, PostgreSQL recovery boundary,
 Serve057 policy-admission feedback, exact protocol-v2 resource replay, and
 provider-proof readiness circuit are deployed, but end-to-end reserved
-backfill is **not yet production-converged**. PRs #1667, #1668, and #1669 are
-merged through `be839eb202ff341f06535a035f12022babbadb2f`. Release `1.1.1439`
-and held Helm revision 546 run exact immutable image digest
-`sha256:ae4a7319437f4886e7d79eefe93197e5a0496212292e6f5919e5f0600996252f`
-on the complete two-API/two-controller/two-executor cohort. The control plane
+backfill is **not yet production-converged**. PR #1670 is merged at
+`b151b71c976bff7a09aef6e94fc372f08ef18103`. Release `1.1.1440` and held Helm
+revision 549 run its exact immutable image digest
+`sha256:9bed3f4fd999cc2da046415c10764f5c6d9cdcbca71f36947c948b686377b3f2`
+on the complete two-API/two-controller/three-executor cohort. Projection
+protocol v5 is therefore source-complete and deployed dark. The control plane
 is PostgreSQL-authoritative with Helm storage disabled and has no EFS, PV, or
 PVC correctness dependency.
 
@@ -24,9 +25,9 @@ normal fenced purge after a concurrent rollback had triggered deletion: the
 database now has zero service, replica, or zero-cost-intent rows for
 `boltz-l4-fleet`, both clusters have zero fleet objects, and retained
 association history contains only `PROJECTED` or `PRE_EFFECT_TERMINAL`
-resolutions. Revision 546 restored the hold. This clean absence is deliberate
-while the remaining SkyPilot fixes are integrated; the shortfall is not Kueue
-or Simone's policy.
+resolutions. Revision 549 retains the hold on the v5 cohort. This clean absence
+is deliberate while its executor reservation is corrected; the shortfall is
+not Kueue or Simone's policy.
 
 The run exposed two independent SkyPilot bottlenecks. First, each projected
 worker retained approximately 1.4 GiB in its writable layer
@@ -35,8 +36,8 @@ projection v4 already owned a bounded 20 GiB memory-backed `/tmp`. Bin-packing
 several replicas could therefore approach kubelet nodefs eviction thresholds
 before GPU, CPU, or memory capacity was exhausted. Projection protocol v5 owns
 the runtime and uv-cache paths under that existing tmpfs. Its source and
-focused tests are complete in this branch; production memory and pressure
-observation remain rollout gates.
+focused tests are merged and deployed in the held cohort; production full-wave
+memory and pressure observation remain rollout gates.
 
 Second, a 311-intent sample committed only 50 launch graphs before 261 grants
 expired. One manager lock prepared requests serially at roughly 2.7--3.1
@@ -45,9 +46,24 @@ resulting durable work promptly. PR #1670 bounds manager work to a four-item
 quantum with immediate re-signal, caches the immutable Task template with a
 per-launch deep copy, freezes workspace state once, omits display-only YAML
 from the execution payload, and renews provider proof at a fixed cadence. The
-held v5 rollout also raises only SkyPilot's existing long-request executor
-capacity to the documented 192-request bound; it grants no GPU capacity and
-cannot bypass PostgreSQL or Kueue.
+held v5 rollout exposed one deployment-contract error before activation: the
+executor has a 48 GiB limit but only an 8 GiB request, and the chart's downward
+API deliberately sets `SKYPILOT_POD_MEMORY_BYTES_LIMIT` from the request. The
+running process therefore publishes eight long-request workers per executor,
+not 64. The corrected SkyPilot-only contract makes each executor's memory
+request and limit 48 GiB, retains four CPUs and the multiplier of 16, and
+yields an exact 64 workers per replica and 192 aggregate slots. Reducing each
+API Pod's memory request from 96 GiB to 56 GiB, while retaining its 110 GiB
+limit, makes that reservation fit the existing three hub nodes without
+changing any shared infrastructure. Live API use before rollout is about
+3.8 GiB; 56 GiB also leaves approximately 6.5 GiB of request headroom when the
+topology constraint forces the first 48 GiB executor replacement onto the node
+holding the first replacement API Pod. The rollout is deliberately two held
+Helm revisions: first change only the API request and wait for 2/2 Ready, then
+change only the executor request and wait for 3/3 Ready. A combined rolling
+update is not safe to assume schedulable because simultaneous API and executor
+surge Pods can exceed the only initially roomy node. These execution bounds
+grant no GPU capacity and cannot bypass PostgreSQL or Kueue.
 
 PHX success is defined exclusively by Simone's unchanged Kueue policy.
 SkyPilot must submit every fresh reserved grant; every Workload Kueue marks
@@ -1132,14 +1148,18 @@ infrastructure, or database schema.
 
 Remaining work, in exact order:
 
-1. Merge the reviewed PR #1670 manager-throughput correction and protocol v5
-   as one source cohort, publish one immutable image/chart release, and
-   direct-Helm deploy the exact
-   API/controller/executor cohort under the hold. Preserve the flat Kueue
+1. PR #1670 and protocol v5 are merged and deployed as release `1.1.1440` under
+   the hold. Use two held Helm revisions: first reduce only the API memory
+   request to 56 GiB while preserving its 110 GiB limit and wait for 2/2 Ready;
+   then make every executor's request equal its 48 GiB limit and wait for 3/3
+   Ready. Prove the downward-API memory input reports 48 GiB (`51539607552`
+   bytes), and the runtime calculation and startup log each report 64 long
+   workers on all three executors before releasing any service controller.
+   Re-read node requests before the second stage and let the atomic held rollout
+   fail closed if placement headroom has drifted. Preserve the flat Kueue
    topology; do not add a Cohort, priority class, scheduler, EFS authority,
    Terraform/Terragrunt change, platform runtime pin, admission backfill, or
-   manual row repair. Prove the three 64-worker executors are healthy before
-   any service controller is released.
+   manual row repair.
 2. Lifecycle 89 is normally purged under its stale generation-21 writer fence.
    Authorize successor generation 22 only after the exact v5 deployment proof
    is current, and recreate the test-only service from the
@@ -4258,18 +4278,36 @@ eight long requests each. Durable grants therefore existed without timely Pod
 submission even though both physical schedulers had free capacity. This is not
 a second admission path and it is not a reason to weaken Kueue: the existing
 Serve launch override is only an execution upper bound after PostgreSQL has
-authorized exact zero-cost intents. The next held v5 Helm rollout will set
-`SKYPILOT_SERVE_OVERRIDE_CONCURRENT_LAUNCHES=192`, run three
-executor replicas, and gives each executor four CPUs, a 48 GiB memory limit,
-and `SKYPILOT_LONG_WORKER_CPU_MULTIPLIER=16`, yielding 64 long-request workers
-per replica and 192 aggregate slots. Executor memory requests remain 8 GiB so
-the three SkyPilot-only Pods fit the existing hub; topology spreading places
-them across nodes and the rollout gate observes actual memory, OOM, pressure,
-PostgreSQL connections, and queue latency. These knobs grant no GPU capacity,
-create no provider effect, and cannot bypass the immutable projection or
-Kueue. They only let already-authorized intents reach their existing provider
-boundary concurrently. The steady-state follow-up may replace the explicit
-bound with executor-capacity publication, but it must preserve this single
+authorized exact zero-cost intents. Held revision 549 already sets
+`SKYPILOT_SERVE_OVERRIDE_CONCURRENT_LAUNCHES=192` and runs three executor
+replicas. The corrected resource-only rollout gives each executor four CPUs, a
+48 GiB memory request and limit, and
+`SKYPILOT_LONG_WORKER_CPU_MULTIPLIER=16`, yielding 64 long-request workers per
+replica and 192 aggregate slots. Helm revision 549 initially retained an 8 GiB
+executor request. That is not an overcommit optimization: the chart derives
+`SKYPILOT_POD_MEMORY_BYTES_LIMIT` from `requests.memory`, so the live runtime
+correctly published only eight workers per executor despite the 48 GiB cgroup
+limit. The corrected contract makes request equal limit on the executor. To fit
+three such reservations on the existing hub, a first held Helm revision lowers
+only each API Pod's memory request from 96 GiB to 56 GiB while retaining the
+110 GiB limit and waits for 2/2 Ready. Live API use is approximately 3.8 GiB;
+the 56 GiB request leaves about 6.5 GiB of request headroom when the executor's
+topology constraint forces its first replacement onto the same node. Only then
+does a second held revision raise the executor request from 8 GiB to 48 GiB and
+wait for 3/3 Ready. Current API use is observed separately before rollout. The
+stages are mandatory:
+simultaneous API and executor surge Pods can exceed the only initially roomy
+node even though the final aggregate reservation fits. The rollout gate must
+verify final executor placement and node request headroom rather than assume a
+rolling topology-spread constraint will rebalance already-running Pods. It also
+observes actual memory, OOM, node `PIDPressure`, cgroup
+`pids.current`/`pids.max`, PostgreSQL connections, and queue latency. This is
+required because each executor publishes 64 long plus 68 short request workers
+before launch subprocesses. These knobs grant no GPU capacity, create no
+provider effect, and cannot bypass the immutable projection or Kueue. They only
+let already-authorized intents reach their existing provider boundary
+concurrently. The steady-state follow-up may replace the explicit bound with
+executor-capacity publication, but it must preserve this single
 PostgreSQL-authorized launch path rather than add a fill-specific executor.
 
 Protocol v5 deliberately uses the same closed projection payload key set as
@@ -6513,17 +6551,27 @@ legacy activation.
 
 ## Open gates
 
-- [ ] Implement, review, merge, and direct-Helm deploy projection protocol v5
-  under the controller hold. Prove v4 rendering remains byte-for-byte
-  compatible, v5 memory-scratch workers carry only the derived
-  `SKY_RUNTIME_DIR=/tmp` and `UV_CACHE_DIR=/tmp/uv-cache` pair on `ray-node`,
-  every post-create/adoption/admission/final read attests it, the transient uv
-  cache and runtime reside on the memory `emptyDir`, and per-replica
+- [x] Implement, review, merge, and direct-Helm deploy projection protocol v5
+  under the controller hold. PR #1670 merged as
+  `b151b71c976bff7a09aef6e94fc372f08ef18103`; release `1.1.1440` is held Helm
+  revision 549 at exact image digest
+  `sha256:9bed3f4fd999cc2da046415c10764f5c6d9cdcbca71f36947c948b686377b3f2`.
+  Focused tests prove v4 rendering remains byte-for-byte compatible and v5
+  memory-scratch workers carry only the derived `SKY_RUNTIME_DIR=/tmp` and
+  `UV_CACHE_DIR=/tmp/uv-cache` pair on `ray-node`.
+
+- [ ] Correct the SkyPilot resource reservations in two held revisions: first
+  API request 56 GiB with 2/2 Ready, then executor request 48 GiB with 3/3
+  Ready. Prove all three executors publish 64 long-request slots each, the
+  controller launch ceiling is 192, and PostgreSQL remains healthy before
+  activation. Re-read scheduler headroom immediately before the executor stage,
+  and prove node `PIDPressure` plus executor cgroup
+  `pids.current`/`pids.max` remain healthy. Then prove every
+  post-create/adoption/admission/final read attests protocol v5, the transient
+  uv cache and runtime reside on the memory `emptyDir`, per-replica
   writable-layer growth remains bounded without node DiskPressure or
-  MemoryPressure. Prove three executor replicas publish 64 long-request slots
-  each, the controller launch ceiling is 192, PostgreSQL remains healthy, and
-  the execution queue no longer truncates the first authorized fill wave. No
-  shared Kueue or platform object is in this change.
+  MemoryPressure, and the execution queue no longer truncates the first
+  authorized fill wave. No shared Kueue or platform object is in this change.
 
 - [x] Normally purge lifecycle 89 under its stale writer fence. PostgreSQL has
   zero current service, replica, and intent rows; both clusters have zero fleet
