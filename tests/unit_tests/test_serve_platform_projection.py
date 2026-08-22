@@ -98,14 +98,14 @@ def _worker_projection(*,
             'kind': 'none'
         },
     }
-    if protocol_version in (2, 3, 4, 5):
+    if protocol_version in (2, 3, 4):
         projection = {
             'projection_version': protocol_version,
             **projection,
             'scheduler_name': scheduler_name,
             'kueue_admission': kueue_admission,
         }
-    if protocol_version in (3, 4, 5):
+    if protocol_version in (3, 4):
         projection['provision_timeout'] = provision_timeout
         projection['scratch'] = ({
             'kind': 'none'
@@ -154,7 +154,7 @@ def test_worker_projection_protocol_v2_is_explicit_and_v1_is_isolated():
         })
 
 
-def test_worker_projection_protocol_v5_is_canonical_and_history_is_isolated():
+def test_worker_projection_protocol_v4_is_canonical_and_v3_is_isolated():
     admission = {
         'local_queue_name': 'inference',
         'workload_priority_class_name': 'inference-low',
@@ -172,62 +172,37 @@ def test_worker_projection_protocol_v5_is_canonical_and_history_is_isolated():
         **v3,
         'projection_version': 4,
     }
-    v5 = {
-        **v3,
-        'projection_version': 5,
-    }
 
     assert kubernetes_identity.worker_projection_protocol_version(v2) == 2
     assert kubernetes_identity.worker_projection_protocol_version(v3) == 3
     assert kubernetes_identity.worker_projection_protocol_version(v4) == 4
-    assert kubernetes_identity.worker_projection_protocol_version(v5) == 5
     assert kubernetes_identity.worker_projection_has_strict_admission(v2)
     assert kubernetes_identity.worker_projection_has_strict_admission(v3)
     assert kubernetes_identity.worker_projection_has_strict_admission(v4)
-    assert kubernetes_identity.worker_projection_has_strict_admission(v5)
     assert kubernetes_identity.worker_projection_has_scratch(v3)
     assert kubernetes_identity.worker_projection_has_scratch(v4)
-    assert kubernetes_identity.worker_projection_has_scratch(v5)
     assert not (kubernetes_pod_spec.
                 serve_worker_projection_protocol_has_runtime_readiness(3))
     assert (kubernetes_pod_spec.
             serve_worker_projection_protocol_has_runtime_readiness(4))
-    assert (kubernetes_pod_spec.
-            serve_worker_projection_protocol_has_runtime_readiness(5))
-    assert not (kubernetes_identity.worker_projection_owns_scratch_runtime(v4))
-    assert kubernetes_identity.worker_projection_owns_scratch_runtime(v5)
-    assert kubernetes_identity.runtime_environment(v4) is None
-    assert kubernetes_identity.runtime_environment(v5) == {
-        'SKY_RUNTIME_DIR': '/tmp',
-        'UV_CACHE_DIR': '/tmp/uv-cache',
-    }
-    v5_without_scratch = _worker_projection(protocol_version=5)
-    assert kubernetes_identity.runtime_environment(v5_without_scratch) == {
-        'SKY_RUNTIME_DIR': '/tmp',
-        'UV_CACHE_DIR': '/tmp/uv-cache',
-    }
     assert kubernetes_identity.validate_worker_placement_projections(
         [v2], require_protocol_version=2) == [v2]
     assert kubernetes_identity.validate_worker_placement_projections(
         [v3], require_protocol_version=3) == [v3]
     assert kubernetes_identity.validate_worker_placement_projections(
         [v4], require_protocol_version=4) == [v4]
-    assert kubernetes_identity.validate_worker_placement_projections(
-        [v5], require_protocol_version=5) == [v5]
     with pytest.raises(ValueError, match='must not mix protocol versions'):
-        kubernetes_identity.validate_worker_placement_projections([v4, v5])
-    with pytest.raises(ValueError, match='protocol-v3/v4/v5 keys'):
+        kubernetes_identity.validate_worker_placement_projections([v3, v4])
+    with pytest.raises(ValueError, match='protocol-v3/v4 keys'):
         kubernetes_identity.worker_projection_protocol_version({
-            **v5, 'unknown': True
+            **v4, 'unknown': True
         })
-    missing_timeout = copy.deepcopy(v5)
+    missing_timeout = copy.deepcopy(v4)
     missing_timeout.pop('provision_timeout')
-    with pytest.raises(ValueError, match='protocol-v3/v4/v5 keys'):
+    with pytest.raises(ValueError, match='protocol-v3/v4 keys'):
         kubernetes_identity.worker_projection_protocol_version(missing_timeout)
-    assert (kubernetes_identity.worker_projection_sha256(v3) !=
-            kubernetes_identity.worker_projection_sha256(v4))
-    assert (kubernetes_identity.worker_projection_sha256(v4) !=
-            kubernetes_identity.worker_projection_sha256(v5))
+    assert (kubernetes_identity.worker_projection_sha256(v3)
+            != kubernetes_identity.worker_projection_sha256(v4))
 
 
 def test_worker_projection_v3_digest_covers_scratch():
@@ -242,8 +217,8 @@ def test_worker_projection_v3_digest_covers_scratch():
     changed = copy.deepcopy(projection)
     changed['scratch']['size_limit_bytes'] += 1
 
-    assert (kubernetes_identity.worker_projection_sha256(projection) !=
-            kubernetes_identity.worker_projection_sha256(changed))
+    assert (kubernetes_identity.worker_projection_sha256(projection)
+            != kubernetes_identity.worker_projection_sha256(changed))
 
 
 def test_worker_projection_v3_digest_covers_provision_timeout():
@@ -251,8 +226,8 @@ def test_worker_projection_v3_digest_covers_provision_timeout():
     changed = copy.deepcopy(projection)
     changed['provision_timeout'] = 30
 
-    assert (kubernetes_identity.worker_projection_sha256(projection) !=
-            kubernetes_identity.worker_projection_sha256(changed))
+    assert (kubernetes_identity.worker_projection_sha256(projection)
+            != kubernetes_identity.worker_projection_sha256(changed))
 
 
 @pytest.mark.parametrize('provision_timeout', [-1, 0, 30])
@@ -326,8 +301,8 @@ def test_worker_projection_v2_hashes_explicit_identity_free_partition():
     assert identity_free['pod_identity_role_arn'] is None
     assert kubernetes_identity.validate_worker_placement_projections(
         [identity_free], require_protocol_version=2) == [identity_free]
-    assert (kubernetes_identity.worker_projection_sha256(identity_free) !=
-            kubernetes_identity.worker_projection_sha256(identity_bearing))
+    assert (kubernetes_identity.worker_projection_sha256(identity_free)
+            != kubernetes_identity.worker_projection_sha256(identity_bearing))
 
 
 def test_worker_projection_v1_still_requires_pod_identity_role():
@@ -389,9 +364,9 @@ def test_worker_projection_v2_digest_covers_complete_validated_candidate():
     assert kubernetes_identity.worker_projection_sha256(mutated) != expected
     mutated_scheduler = json.loads(json.dumps(projection))
     mutated_scheduler['scheduler_name'] = 'trusted-batch-scheduler'
-    assert (kubernetes_identity.worker_projection_sha256(mutated_scheduler) !=
-            expected)
-    with pytest.raises(ValueError, match='requires protocol 2, 3, 4, or 5'):
+    assert (kubernetes_identity.worker_projection_sha256(mutated_scheduler)
+            != expected)
+    with pytest.raises(ValueError, match='requires protocol 2, 3, or 4'):
         kubernetes_identity.worker_projection_sha256(_worker_projection())
 
 
@@ -1362,7 +1337,7 @@ run: echo hi
         _worker_role('east'),
         _worker_role('phx'),
     ]
-    assert all(item['projection_version'] == 5 for item in projected)
+    assert all(item['projection_version'] == 4 for item in projected)
     assert all(item['provision_timeout'] == -1 for item in projected)
     assert all(item['scratch'] == {'kind': 'none'} for item in projected)
     assert all(
@@ -1373,7 +1348,7 @@ run: echo hi
     assert projected[1]['accelerator_scheduling'] == (_accelerator_scheduling())
 
 
-def test_worker_catalog_preserves_identity_free_v5_candidates(monkeypatch):
+def test_worker_catalog_preserves_identity_free_v4_candidates(monkeypatch):
     task = task_lib.Task.from_yaml_str('''
 resources:
   infra: k8s/phx
@@ -1416,7 +1391,7 @@ run: echo hi
         task, workspace='inference', placement_catalog={})
 
     assert projected is not None
-    assert projected[0]['projection_version'] == 5
+    assert projected[0]['projection_version'] == 4
     assert projected[0]['provision_timeout'] == -1
     assert projected[0]['scratch'] == {'kind': 'none'}
     assert projected[0]['pod_identity_role_arn'] is None
@@ -1739,102 +1714,6 @@ def test_runtime_scratch_uses_final_v3_projection_and_overrides_caller():
         key.startswith('SKYPILOT_SERVE_SCRATCH_') for key in task.secrets)
 
 
-def test_runtime_storage_uses_final_v5_projection_and_overrides_caller():
-    task = task_lib.Task()
-    task.set_resources(
-        resources_lib.Resources(cloud=kubernetes_identity.clouds.Kubernetes(),
-                                region='phx',
-                                accelerators={'H200': 1}))
-    task.update_envs({'SKY_RUNTIME_DIR': '/caller-runtime'})
-    task.update_secrets({'UV_CACHE_DIR': 'caller-secret'})
-    launch_context = {
-        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
-            _worker_projection(protocol_version=5,
-                               scratch={
-                                   'kind': 'memory',
-                                   'mount_path': '/tmp',
-                                   'volume_name': 'skypilot-serve-worker-tmp',
-                                   'size_limit_bytes': 20 * 1024**3,
-                               })
-        ],
-    }
-
-    execution._apply_service_worker_runtime_projection_to_task(
-        task, launch_context, next(iter(task.resources)))
-
-    assert task.envs['SKY_RUNTIME_DIR'] == '/tmp'
-    assert task.envs['UV_CACHE_DIR'] == '/tmp/uv-cache'
-    assert not (kubernetes_identity.WORKER_RUNTIME_ENV_VAR_NAMES &
-                task.secrets.keys())
-
-
-def test_runtime_storage_v5_none_owns_explicit_environment():
-    task = task_lib.Task()
-    task.set_resources(
-        resources_lib.Resources(cloud=kubernetes_identity.clouds.Kubernetes(),
-                                region='phx',
-                                accelerators={'H200': 1}))
-    task.update_envs({'SKY_RUNTIME_DIR': '/caller-runtime'})
-    task.update_secrets({'UV_CACHE_DIR': 'caller-secret'})
-    launch_context = {
-        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
-            _worker_projection(protocol_version=5)
-        ],
-    }
-
-    execution._apply_service_worker_runtime_projection_to_task(
-        task, launch_context, next(iter(task.resources)))
-
-    assert task.envs['SKY_RUNTIME_DIR'] == '/tmp'
-    assert task.envs['UV_CACHE_DIR'] == '/tmp/uv-cache'
-    assert not (kubernetes_identity.WORKER_RUNTIME_ENV_VAR_NAMES &
-                task.secrets.keys())
-
-
-def test_v5_none_runtime_environment_overrides_env_from_and_image_defaults():
-    expected_environment = {
-        'SKY_RUNTIME_DIR': '/tmp',
-        'UV_CACHE_DIR': '/tmp/uv-cache',
-    }
-    pod_spec = {
-        'containers': [{
-            'name': 'ray-node',
-            'command': ['/bin/bash', '-c', '--'],
-            'args': ['canonical bootstrap'],
-            # Kubernetes gives literal env entries precedence over both
-            # envFrom and image ENV.  Keep envFrom to prove canonicalization
-            # does not depend on reading the referenced object.
-            'envFrom': [{
-                'configMapRef': {
-                    'name': 'caller-environment',
-                },
-            }],
-        }],
-    }
-    bootstrap_sha256 = (
-        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
-
-    contract = (
-        kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
-            pod_spec,
-            rewrite=True,
-            expected_bootstrap_sha256=bootstrap_sha256,
-            expected_runtime_environment=expected_environment))
-
-    assert contract.matches
-    runtime = pod_spec['containers'][0]
-    assert runtime['envFrom'] == [{
-        'configMapRef': {
-            'name': 'caller-environment',
-        },
-    }]
-    assert {
-        entry['name']: entry['value']
-        for entry in runtime['env']
-        if entry['name'] in kubernetes_identity.WORKER_RUNTIME_ENV_VAR_NAMES
-    } == expected_environment
-
-
 def test_final_kubernetes_yaml_enforces_platform_identity_and_cache():
     projection = {
         'candidate_id': 'kubernetes-0002',
@@ -2084,9 +1963,9 @@ def test_final_kubernetes_yaml_reasserts_v2_kueue_admission():
                     'kueue.x-k8s.io/priority-class', 'kueue.x-k8s.io/managed'))
 
 
-def test_final_v5_yaml_composes_kueue_cache_scratch_runtime_and_readiness():
+def test_final_v4_yaml_composes_kueue_cache_scratch_and_readiness():
     projection = _worker_projection(
-        protocol_version=5,
+        protocol_version=4,
         scheduler_name='trusted-batch-scheduler',
         kueue_admission={
             'local_queue_name': 'inference',
@@ -2115,40 +1994,6 @@ def test_final_v5_yaml_composes_kueue_cache_scratch_runtime_and_readiness():
                             'env': [{
                                 'name': 'SKYPILOT_SERVE_SCRATCH_KIND',
                                 'value': 'caller',
-                            }, {
-                                'name': 'SKY_RUNTIME_DIR',
-                                'value': '/caller-runtime',
-                            }, {
-                                'name': 'UV_CACHE_DIR',
-                                'valueFrom': {
-                                    'secretKeyRef': {
-                                        'name': 'caller',
-                                        'key': 'cache',
-                                    },
-                                },
-                            }],
-                        }, {
-                            'name': 'caller-sidecar',
-                            'env': [{
-                                'name': 'SKY_RUNTIME_DIR',
-                                'value': '/caller-sidecar-runtime',
-                            }, {
-                                'name': 'UV_CACHE_DIR',
-                                'value': '/caller-sidecar-cache',
-                            }],
-                        }],
-                        'initContainers': [{
-                            'name': 'caller-init',
-                            'env': [{
-                                'name': 'SKY_RUNTIME_DIR',
-                                'value': '/caller-init-runtime',
-                            }],
-                        }],
-                        'ephemeralContainers': [{
-                            'name': 'caller-debug',
-                            'env': [{
-                                'name': 'UV_CACHE_DIR',
-                                'value': '/caller-debug-cache',
                             }],
                         }],
                     },
@@ -2173,7 +2018,7 @@ def test_final_v5_yaml_composes_kueue_cache_scratch_runtime_and_readiness():
 
     assert cluster_yaml == first
     assert cluster_yaml['provider'][
-        'serve_worker_projection_protocol_version'] == 5
+        'serve_worker_projection_protocol_version'] == 4
     assert cluster_yaml['provider']['timeout'] == -1
     assert cluster_yaml['provider'][
         'serve_worker_expected_runtime_bootstrap_sha256'] == bootstrap_sha256
@@ -2224,23 +2069,6 @@ def test_final_v5_yaml_composes_kueue_cache_scratch_runtime_and_readiness():
         'SKYPILOT_SERVE_SCRATCH_MOUNT_PATH': '/tmp',
         'SKYPILOT_SERVE_SCRATCH_SIZE_LIMIT_BYTES': str(20 * 1024**3),
     }
-    assert {
-        key: environment[key]
-        for key in kubernetes_identity.WORKER_RUNTIME_ENV_VAR_NAMES
-    } == {
-        'SKY_RUNTIME_DIR': '/tmp',
-        'UV_CACHE_DIR': '/tmp/uv-cache',
-    }
-    sidecar = node['spec']['containers'][1]
-    assert not any(
-        entry.get('name') in kubernetes_identity.WORKER_RUNTIME_ENV_VAR_NAMES
-        for entry in sidecar.get('env', []))
-    for container_field in ('initContainers', 'ephemeralContainers'):
-        assert not any(
-            entry.get('name') in
-            kubernetes_identity.WORKER_RUNTIME_ENV_VAR_NAMES
-            for container in node['spec'][container_field]
-            for entry in container.get('env', []))
     assert node['spec']['restartPolicy'] == 'Never'
     assert [
         entry for entry in runtime['env'] if entry['name'] == 'SKYPILOT_POD_UID'
@@ -2297,154 +2125,6 @@ def test_historical_projection_does_not_install_runtime_readiness(
     assert all(
         entry.get('name') != 'SKYPILOT_POD_UID'
         for entry in runtime.get('env', []))
-
-
-@pytest.mark.parametrize('protocol_version', [3, 4])
-def test_v3_v4_projection_does_not_own_runtime_storage_environment(
-        protocol_version):
-    cluster_yaml = _v3_scratch_cluster_yaml()
-    pod_spec = cluster_yaml['available_node_types']['ray_head_default'][
-        'node_config']['spec']
-    runtime = pod_spec['containers'][0]
-    runtime['env'] = [{
-        'name': 'SKY_RUNTIME_DIR',
-        'value': '/historical-runtime',
-    }, {
-        'name': 'UV_CACHE_DIR',
-        'value': '/historical-cache',
-    }]
-    bootstrap_sha256 = None
-    if protocol_version == 4:
-        bootstrap_sha256 = (kubernetes_pod_spec.
-                            projected_worker_runtime_bootstrap_sha256(pod_spec))
-
-    backend_utils._enforce_worker_projection_on_kubernetes_yaml(
-        cluster_yaml,
-        _worker_projection(protocol_version=protocol_version,
-                           scratch={
-                               'kind': 'memory',
-                               'mount_path': '/tmp',
-                               'volume_name': 'skypilot-serve-worker-tmp',
-                               'size_limit_bytes': 20 * 1024**3,
-                           }),
-        expected_runtime_bootstrap_sha256=bootstrap_sha256)
-
-    environment = {
-        entry['name']: entry.get('value') for entry in runtime['env']
-    }
-    assert environment['SKY_RUNTIME_DIR'] == '/historical-runtime'
-    assert environment['UV_CACHE_DIR'] == '/historical-cache'
-
-
-@pytest.mark.parametrize('mutation', [
-    lambda env: env.__setitem__(slice(
-        None), [entry for entry in env if entry['name'] != 'SKY_RUNTIME_DIR']),
-    lambda env: next(entry for entry in env if entry['name'] == 'UV_CACHE_DIR').
-    __setitem__('value', '/forged-cache'),
-    lambda env: env.append({
-        'name': 'SKY_RUNTIME_DIR',
-        'value': '/tmp',
-    }),
-    lambda env: next(entry for entry in env
-                     if entry['name'] == 'UV_CACHE_DIR').update({
-                         'value': None,
-                         'valueFrom': {
-                             'secretKeyRef': {
-                                 'name': 'forged',
-                                 'key': 'cache',
-                             },
-                         },
-                     }),
-])
-def test_v5_runtime_environment_attestation_rejects_mutation(mutation):
-    expected_environment = {
-        'SKY_RUNTIME_DIR': '/tmp',
-        'UV_CACHE_DIR': '/tmp/uv-cache',
-    }
-    pod_spec = {
-        'containers': [{
-            'name': 'ray-node',
-            'command': ['/bin/bash', '-c', '--'],
-            'args': ['canonical bootstrap'],
-        }]
-    }
-    bootstrap_sha256 = (
-        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
-    canonical = (
-        kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
-            pod_spec,
-            rewrite=True,
-            expected_bootstrap_sha256=bootstrap_sha256,
-            expected_runtime_environment=expected_environment))
-    assert canonical.matches
-
-    mutation(pod_spec['containers'][0]['env'])
-    admitted = (
-        kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
-            pod_spec,
-            rewrite=False,
-            expected_bootstrap_sha256=bootstrap_sha256,
-            expected_runtime_environment=expected_environment))
-
-    assert not admitted.matches
-    pod = mock.Mock()
-    pod.metadata.name = 'mutated-v5-worker'
-    pod.spec = pod_spec
-    with pytest.raises(kubernetes_instance._ServeWorkerIdentityRejection):
-        kubernetes_instance._attest_serve_worker_runtime_readiness(
-            pod,
-            'inference',
-            'phx',
-            True,
-            bootstrap_sha256,
-            expected_environment,
-            defer_cleanup=True)
-
-
-@pytest.mark.parametrize(
-    'container_field', ['containers', 'initContainers', 'ephemeralContainers'])
-def test_v5_runtime_environment_attestation_rejects_other_container_owner(
-        container_field):
-    expected_environment = {
-        'SKY_RUNTIME_DIR': '/tmp',
-        'UV_CACHE_DIR': '/tmp/uv-cache',
-    }
-    pod_spec = {
-        'containers': [{
-            'name': 'ray-node',
-            'command': ['/bin/bash', '-c', '--'],
-            'args': ['canonical bootstrap'],
-        }]
-    }
-    bootstrap_sha256 = (
-        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
-    canonical = (
-        kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
-            pod_spec,
-            rewrite=True,
-            expected_bootstrap_sha256=bootstrap_sha256,
-            expected_runtime_environment=expected_environment))
-    assert canonical.matches
-    other_container = {
-        'name': 'other-container',
-        'env': [{
-            'name': 'SKY_RUNTIME_DIR',
-            'value': '/forged-runtime',
-        }],
-    }
-    if container_field == 'containers':
-        pod_spec[container_field].append(other_container)
-    else:
-        pod_spec[container_field] = [other_container]
-
-    admitted = (
-        kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
-            pod_spec,
-            rewrite=False,
-            expected_bootstrap_sha256=bootstrap_sha256,
-            expected_runtime_environment=expected_environment))
-
-    assert not admitted.matches
 
 
 @pytest.mark.parametrize('collision', [
@@ -2574,7 +2254,7 @@ def test_admitted_runtime_readiness_rejects_bootstrap_producer_mutation(
             pod, 'inference', 'phx', True, bootstrap_sha256, defer_cleanup=True)
 
 
-def test_real_kubernetes_client_v5_runtime_environment_contract_is_accepted():
+def test_real_kubernetes_client_runtime_readiness_contract_is_accepted():
     pod_spec = {
         'containers': [{
             'name': 'ray-node',
@@ -2591,16 +2271,9 @@ def test_real_kubernetes_client_v5_runtime_environment_contract_is_accepted():
     }
     bootstrap_sha256 = (
         kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
-    expected_environment = {
-        'SKY_RUNTIME_DIR': '/tmp',
-        'UV_CACHE_DIR': '/tmp/uv-cache',
-    }
     expected = (
         kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
-            pod_spec,
-            rewrite=True,
-            expected_bootstrap_sha256=bootstrap_sha256,
-            expected_runtime_environment=expected_environment))
+            pod_spec, rewrite=True, expected_bootstrap_sha256=bootstrap_sha256))
     client = kubernetes_adaptor.kubernetes.client
     api_pod_spec = client.ApiClient()._ApiClient__deserialize(  # pylint: disable=protected-access
         pod_spec, 'V1PodSpec')
@@ -2609,8 +2282,7 @@ def test_real_kubernetes_client_v5_runtime_environment_contract_is_accepted():
         kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
             api_pod_spec,
             rewrite=False,
-            expected_bootstrap_sha256=bootstrap_sha256,
-            expected_runtime_environment=expected_environment))
+            expected_bootstrap_sha256=bootstrap_sha256))
 
     assert expected.matches
     assert observed.matches
@@ -2775,7 +2447,7 @@ def test_final_v3_none_rejects_inherited_scratch_owner(collision):
             cluster_yaml, _worker_projection(protocol_version=3))
 
 
-@pytest.mark.parametrize('protocol_version', [2, 3, 4, 5])
+@pytest.mark.parametrize('protocol_version', [2, 3, 4])
 def test_kubernetes_deploy_vars_use_only_strict_projected_admission(
         monkeypatch, protocol_version):
     resources = mock.MagicMock()
@@ -2865,14 +2537,14 @@ def test_kubernetes_deploy_vars_use_only_strict_projected_admission(
     assert deploy_vars['k8s_acc_label_key'] == 'nvidia.com/gpu.product'
     assert deploy_vars['k8s_resource_key'] == 'nvidia.com/gpu'
     assert deploy_vars['k8s_projected_serve_worker_runtime_readiness'] is (
-        protocol_version in (4, 5))
+        protocol_version == 4)
     assert deploy_vars['k8s_projected_worker_runtime_ready_marker'] == (
         '/tmp/skypilot-serve-worker-runtime-ready')
     timeout_calls = [
         call for call in config_resolver.call_args_list
         if call.kwargs['keys'] == ('provision_timeout',)
     ]
-    if protocol_version in (3, 4, 5):
+    if protocol_version in (3, 4):
         assert deploy_vars['timeout'] == '-1'
         assert timeout_calls == []
     else:

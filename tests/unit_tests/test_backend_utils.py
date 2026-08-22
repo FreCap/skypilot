@@ -425,9 +425,9 @@ def _builtin_kubernetes_writer_kwargs(monkeypatch, tmp_path, test_name):
     }, output_path)
 
 
-def _projected_h200_worker_v5():
+def _projected_h200_worker_v4():
     return {
-        'projection_version': 5,
+        'projection_version': 4,
         'candidate_id': 'kubernetes-0000',
         'kubernetes_context': 'test-context',
         'namespace': 'inference',
@@ -450,10 +450,7 @@ def _projected_h200_worker_v5():
         'kueue_admission': None,
         'provision_timeout': -1,
         'scratch': {
-            'kind': 'memory',
-            'mount_path': '/tmp',
-            'volume_name': 'skypilot-serve-worker-tmp',
-            'size_limit_bytes': 20 * 1024**3,
+            'kind': 'none',
         },
     }
 
@@ -518,7 +515,7 @@ def test_projected_serve_worker_suppresses_all_static_credential_mounts(
     writer_kwargs['to_provision'] = Resources(
         cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
     writer_kwargs['worker_placement_projections'] = [
-        _projected_h200_worker_v5()
+        _projected_h200_worker_v4()
     ]
     original_fill_template = common_utils.fill_template
     rendered_variables = {}
@@ -552,8 +549,6 @@ def test_projected_serve_worker_suppresses_all_static_credential_mounts(
         'serve_worker_expected_runtime_bootstrap_sha256'] == (
             kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(
                 pod_spec))
-    assert 'serve_worker_expected_runtime_environment' not in rendered[
-        'provider']
     assert pod_spec['affinity']['nodeAffinity'][
         'requiredDuringSchedulingIgnoredDuringExecution']['nodeSelectorTerms'][
             0]['matchExpressions'][-1] == {
@@ -563,14 +558,6 @@ def test_projected_serve_worker_suppresses_all_static_credential_mounts(
             }
     assert ray_node['resources']['requests']['nvidia.com/gpu'] == 1
     assert ray_node['resources']['limits']['nvidia.com/gpu'] == 1
-    runtime_environment = {
-        entry['name']: entry.get('value') for entry in ray_node['env'] if
-        entry['name'] in kubernetes_pod_spec.SERVE_WORKER_RUNTIME_ENV_VAR_NAMES
-    }
-    assert runtime_environment == {
-        'SKY_RUNTIME_DIR': '/tmp',
-        'UV_CACHE_DIR': '/tmp/uv-cache',
-    }
     assert pod_spec['restartPolicy'] == 'Never'
     assert ray_node['startupProbe']['failureThreshold'] == 900
     assert ray_node['readinessProbe']['failureThreshold'] == 1
@@ -656,7 +643,7 @@ def test_projected_worker_persists_authenticated_bootstrap_through_finalizer(
     writer_kwargs['to_provision'] = Resources(
         cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
     writer_kwargs['worker_placement_projections'] = [
-        _projected_h200_worker_v5()
+        _projected_h200_worker_v4()
     ]
     writer_kwargs['dryrun'] = False
 
@@ -722,11 +709,7 @@ def test_projected_worker_persists_authenticated_bootstrap_through_finalizer(
         kubernetes_pod_spec.enforce_projected_worker_runtime_readiness_contract(
             finalized['spec'],
             rewrite=False,
-            expected_bootstrap_sha256=expected_bootstrap_sha256,
-            expected_runtime_environment={
-                'SKY_RUNTIME_DIR': '/tmp',
-                'UV_CACHE_DIR': '/tmp/uv-cache',
-            }))
+            expected_bootstrap_sha256=expected_bootstrap_sha256))
     assert contract.matches
 
 

@@ -23,25 +23,13 @@ from sky.utils import config_utils
 
 PodRole = Literal['head', 'worker']
 
-SERVE_WORKER_PROJECTION_PROTOCOL_VERSION = 5
-_SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
-    {1, 2, 3, 4, 5})
-_STRICT_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({2, 3, 4, 5})
-_SCRATCH_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({3, 4, 5})
-_RUNTIME_READY_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({4, 5})
-_SCRATCH_RUNTIME_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({5})
+SERVE_WORKER_PROJECTION_PROTOCOL_VERSION = 4
+_SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({1, 2, 3, 4})
+_STRICT_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({2, 3, 4})
+_SCRATCH_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({3, 4})
+_RUNTIME_READY_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({4})
 SERVE_WORKER_SCRATCH_MOUNT_PATH = '/tmp'
 SERVE_WORKER_SCRATCH_VOLUME_NAME = 'skypilot-serve-worker-tmp'
-SERVE_WORKER_RUNTIME_DIR_ENV_VAR = 'SKY_RUNTIME_DIR'
-SERVE_WORKER_UV_CACHE_DIR_ENV_VAR = 'UV_CACHE_DIR'
-SERVE_WORKER_RUNTIME_ENV_VAR_NAMES = frozenset({
-    SERVE_WORKER_RUNTIME_DIR_ENV_VAR,
-    SERVE_WORKER_UV_CACHE_DIR_ENV_VAR,
-})
-_SERVE_WORKER_SCRATCH_RUNTIME_ENVIRONMENT = {
-    SERVE_WORKER_RUNTIME_DIR_ENV_VAR: SERVE_WORKER_SCRATCH_MOUNT_PATH,
-    SERVE_WORKER_UV_CACHE_DIR_ENV_VAR: f'{SERVE_WORKER_SCRATCH_MOUNT_PATH}/uv-cache',
-}
 SERVE_WORKER_RUNTIME_READY_MARKER = ('/tmp/skypilot-serve-worker-runtime-ready')
 SERVE_WORKER_RUNTIME_READY_POD_UID_ENV_VAR = 'SKYPILOT_POD_UID'
 # The startup probe starts only after image pull and container creation.  This
@@ -126,7 +114,7 @@ def validate_serve_worker_projection_protocol_version(
     if (type(value) is not int or
             value not in _SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS):
         raise ValueError('SkyServe worker projection protocol version must be '
-                         '1, 2, 3, 4, or 5.')
+                         '1, 2, 3, or 4.')
     return value
 
 
@@ -161,35 +149,8 @@ def serve_worker_projection_protocol_has_runtime_readiness(
     return version in _RUNTIME_READY_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS
 
 
-def serve_worker_projection_protocol_owns_scratch_runtime(
-        value: object) -> bool:
-    """Whether a protocol routes base-runtime writes to projected scratch."""
-    version = validate_serve_worker_projection_protocol_version(value,
-                                                                allow_none=True)
-    return version in _SCRATCH_RUNTIME_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS
-
-
-def projected_worker_runtime_environment(
-    protocol_version: object,
-    scratch: object,
-) -> dict[str, str] | None:
-    """Return the closed runtime environment owned by protocol v5.
-
-    ``None`` means that the historical protocol does not own these variables.
-    Protocol v5 always installs the literal ``/tmp`` pair.  A memory scratch
-    contract makes that path tmpfs-backed; ``kind: none`` retains ordinary
-    container ephemeral storage while still preventing image ``ENV`` or
-    ``envFrom`` from selecting an uncommitted runtime location.
-    """
-    if not serve_worker_projection_protocol_owns_scratch_runtime(
-            protocol_version):
-        return None
-    validate_projected_worker_scratch(scratch)
-    return dict(_SERVE_WORKER_SCRATCH_RUNTIME_ENVIRONMENT)
-
-
 def validate_projected_worker_provision_timeout(value: object) -> int:
-    """Validate the closed v3+ provisioning-wait contract."""
+    """Validate the closed v3/v4 provisioning-wait contract."""
     if type(value) is not int or value < -1:
         raise ValueError('Projected worker provision_timeout must be -1 or a '
                          'non-negative integer.')
@@ -720,40 +681,6 @@ def _observe_projected_worker_runtime_env(entry: object) -> dict[str, object]:
     }
 
 
-def _observe_projected_worker_literal_runtime_env(
-        entry: object) -> dict[str, object]:
-    """Canonicalize one server-owned literal runtime environment entry."""
-    return {
-        'name': _pod_api_field(entry, 'name', 'name'),
-        'value': _pod_api_field(entry, 'value', 'value'),
-        'extra_fields': sorted(_present_json_fields(entry) - {'name', 'value'}),
-    }
-
-
-def _expected_projected_worker_literal_runtime_env(
-        environment: Mapping[str, str]) -> list[dict[str, object]]:
-    return [{
-        'container_field': 'containers',
-        'container_name': 'ray-node',
-        'name': name,
-        'value': value,
-        'extra_fields': [],
-    } for name, value in sorted(environment.items())]
-
-
-def _validate_projected_worker_runtime_environment(
-        value: object) -> dict[str, str]:
-    if not isinstance(value, Mapping):
-        raise ProjectedRuntimeReadinessContractError(
-            'Projected SkyServe worker runtime environment must be a mapping.')
-    copied = dict(value)
-    if copied != _SERVE_WORKER_SCRATCH_RUNTIME_ENVIRONMENT:
-        raise ProjectedRuntimeReadinessContractError(
-            'Projected SkyServe worker runtime environment must be the exact '
-            'server-owned /tmp environment.')
-    return copied
-
-
 def _canonicalize_projected_worker_runtime_bootstrap_value(
         value: object, location: str) -> object:
     """Serialize one bootstrap field identically from YAML or API models."""
@@ -851,9 +778,7 @@ def validate_projected_worker_runtime_bootstrap_sha256(value: object) -> str:
 
 
 def _observe_projected_worker_runtime_readiness(
-    pod_spec: object,
-    expected_runtime_environment: dict[str, str] | None = None,
-) -> dict[str, object]:
+        pod_spec: object) -> dict[str, object]:
     containers = _pod_api_field(pod_spec, 'containers', 'containers')
     if not isinstance(containers, (list, tuple)):
         containers = []
@@ -881,38 +806,6 @@ def _observe_projected_worker_runtime_readiness(
             _pod_api_field(runtime, 'readinessProbe', 'readiness_probe')),
         'ray_node_container_count': len(runtime_containers),
     }
-    if expected_runtime_environment is not None:
-        literal_runtime_env = []
-        for container_field, api_field in (
-            ('containers', 'containers'),
-            ('initContainers', 'init_containers'),
-            ('ephemeralContainers', 'ephemeral_containers'),
-        ):
-            scoped_containers = _pod_api_field(pod_spec, container_field,
-                                               api_field)
-            if not isinstance(scoped_containers, (list, tuple)):
-                continue
-            for container in scoped_containers:
-                scoped_env = _pod_api_field(container, 'env', 'env')
-                if not isinstance(scoped_env, (list, tuple)):
-                    continue
-                for entry in scoped_env:
-                    if (_pod_api_field(entry, 'name', 'name')
-                            not in SERVE_WORKER_RUNTIME_ENV_VAR_NAMES):
-                        continue
-                    observed_entry = (
-                        _observe_projected_worker_literal_runtime_env(entry))
-                    observed_entry.update({
-                        'container_field': container_field,
-                        'container_name': _pod_api_field(
-                            container, 'name', 'name'),
-                    })
-                    literal_runtime_env.append(observed_entry)
-        observed['runtime_environment'] = sorted(
-            literal_runtime_env,
-            key=lambda entry: (str(entry['container_field']),
-                               str(entry['container_name']), str(entry['name']),
-                               str(entry['value']), str(entry['extra_fields'])))
     try:
         observed['bootstrap_sha256'] = (
             projected_worker_runtime_bootstrap_sha256(pod_spec))
@@ -927,7 +820,6 @@ def enforce_projected_worker_runtime_readiness_contract(
     *,
     rewrite: bool,
     expected_bootstrap_sha256: object,
-    expected_runtime_environment: object = None,
 ) -> ProjectedRuntimeReadinessContract:
     """Own the UID-bound bootstrap readiness surface for one worker Pod.
 
@@ -940,14 +832,6 @@ def enforce_projected_worker_runtime_readiness_contract(
         expected_bootstrap_sha256)
     expected = _expected_projected_worker_runtime_readiness()
     expected['bootstrap_sha256'] = expected_digest
-    validated_runtime_environment: dict[str, str] | None = None
-    if expected_runtime_environment is not None:
-        validated_runtime_environment = (
-            _validate_projected_worker_runtime_environment(
-                expected_runtime_environment))
-        expected['runtime_environment'] = (
-            _expected_projected_worker_literal_runtime_env(
-                validated_runtime_environment))
     if rewrite:
         if not isinstance(pod_spec, dict):
             raise ProjectedRuntimeReadinessContractError(
@@ -1011,22 +895,13 @@ def enforce_projected_worker_runtime_readiness_contract(
                 },
             },
         })
-        if validated_runtime_environment is not None:
-            env[:] = [
-                entry for entry in env
-                if entry.get('name') not in SERVE_WORKER_RUNTIME_ENV_VAR_NAMES
-            ]
-            env.extend({
-                'name': name,
-                'value': value,
-            } for name, value in sorted(validated_runtime_environment.items()))
         runtime['env'] = env
         for yaml_field, expected_key in (('startupProbe', 'startup_probe'),
                                          ('readinessProbe', 'readiness_probe')):
             existing = runtime.get(yaml_field)
             if (existing is not None and
-                    _observe_projected_worker_runtime_probe(existing) !=
-                    expected[expected_key]):
+                    _observe_projected_worker_runtime_probe(existing)
+                    != expected[expected_key]):
                 raise ProjectedRuntimeReadinessContractError(
                     'Projected SkyServe worker runtime probe identity '
                     f'collides at {yaml_field}.')
@@ -1041,8 +916,7 @@ def enforce_projected_worker_runtime_readiness_contract(
             assert isinstance(exec_action, dict)
             exec_action.pop('extra_fields', None)
             runtime[yaml_field] = probe
-    actual = _observe_projected_worker_runtime_readiness(
-        pod_spec, validated_runtime_environment)
+    actual = _observe_projected_worker_runtime_readiness(pod_spec)
     return ProjectedRuntimeReadinessContract(matches=actual == expected,
                                              expected=expected,
                                              actual=actual)
