@@ -3,76 +3,62 @@
 Last updated: 2026-08-22
 
 Status: the atomic reserved-capacity allocator, PostgreSQL recovery boundary,
-and Serve057 policy-admission feedback are deployed, but end-to-end reserved
-backfill is **not yet production-converged**. PR #1667 is merged at
-`69572f4029e22e375736f5d02ca73d882b478c88`; release `1.1.1437` and Helm
-revision 525 run exact immutable image digest
-`sha256:02d8849aa13f14b160925b0e0c6b370ba803577bf74e63af7318f368a1e7dc4b`
-on the complete API/controller/executor cohort. That release contains exact
-protocol-v2 resource replay, no retry optimization, absent-admin-policy
-enforcement, and non-pool capability cohort 3. The control plane remains
-PostgreSQL-authoritative with Helm storage disabled and has no EFS, PV, or PVC
-correctness dependency.
+Serve057 policy-admission feedback, exact protocol-v2 resource replay, and
+provider-proof readiness circuit are deployed, but end-to-end reserved
+backfill is **not yet production-converged**. PRs #1667, #1668, and #1669 are
+merged through `be839eb202ff341f06535a035f12022babbadb2f`. Release `1.1.1439`
+and Helm revision 537 run the exact immutable image digest
+`sha256:ae4a7319437f4886e7d79eefe93197e5a0496212292e6f5919e5f0600996252f`
+on the complete API/controller/executor cohort. The controller is intentionally
+held. The control plane is PostgreSQL-authoritative with Helm storage disabled
+and has no EFS, PV, or PVC correctness dependency.
 
-Normal fenced purge on release `1.1.1436` removed the complete historical
-lifecycle-84 graph. A canonical `min_replicas: 0`, zero-floor service was then
-created as lifecycle 85/version 1 and promoted to `DURABLE_INTENT`,
-`DURABLE_FEED`, and `DURABLE_PROJECTED` with three immutable worker
-projections. The first clean fill proved PHX's unchanged
-`be -> skypilot-be` contract correct: every submitted Workload was admitted
-with `be-lt=11`, Pod priority `-1000`/`Never`, `default-scheduler`, and
-`skypilot-pool-sa`. No paid-capacity claim was created. PHX nevertheless
-stopped below scheduler-fit residual while Kueue had no pending Workload, so
-the remaining blocker is upstream SkyPilot actuation, not Simone's queue
-policy. Lifecycle 85 was subsequently removed by normal evidence-backed purge.
-The current production state is **no `boltz-l4-fleet` service** and no fleet
-Pod in East or PHX; this clean absence is deliberate while the provider-proof
-flow-control correction is merged and deployed.
+Normal evidence-backed purge removed lifecycle 88 completely. The current
+production state is **no `boltz-l4-fleet` service**, zero replica rows, zero
+live associations or requests, and zero fleet Pods or Kueue Workloads in East
+or PHX. This clean absence is deliberate while one SkyPilot-only throughput
+correction is merged and deployed; no Kueue or platform mutation is required.
 
-That clean run exposed two coupled executor defects. Protocol-v2 requests were
-deserialized with no `best_resources` and unnecessarily ran the optimizer even
-though the controller had already frozen one exact Kubernetes resource in the
-durable request. Burst optimization compounded provider-launch pressure and
-overlapped 40--104 second deployment-proof publication gaps, long enough for
-the 30-second receipts to expire, so otherwise valid launches failed closed. A
-retry after any partial cluster record then skipped
-optimization and failed with `Reserved-fill launch has no finalized
-resources`, causing SkyPilot to tear down healthy runtime-ready Pods. The
-merged PR #1667 correction makes the request's one frozen, already-launchable
-Kubernetes resource the only protocol-v2 placement authority. The
-server-controller preparation boundary requires configured `admin_policy` to
-be absent before request freezing and hashing, and the executor requires the
-same absent mode before its ordinary policy-application boundary. This is the
-explicit current contract: v2 does not claim to durably replay an unjournaled
-admin-policy mutation. Supporting a mutating policy later requires a separate
-durably hash-bound post-policy projection before v2 can admit it.
+The preceding clean lifecycle proved three source corrections. PR #1667 makes
+the controller's one frozen Kubernetes resource the only protocol-v2 placement
+authority and disables both initial and retry optimization for that exact
+request. PR #1668 parks intent before materialization whenever the exact
+provider proof lacks its 20-second handoff reserve, while malformed proof,
+authority drift, and every post-effect ambiguity remain terminal. PR #1669
+keeps Kubernetes manifest deserialization inside the already selected physical
+context; it removed the `KubernetesPhysicalClusterIdentityError` that formerly
+failed existing Service/RBAC object decoding under a valid launch fence.
 
-Under that absent-policy contract, every execution attempt reconstructs
-`best_resources` from the frozen singleton before cluster-existence or
-`Stage.OPTIMIZE` decisions, validates launchability plus the exact fenced
-Kubernetes context/card/count, and rejects multiple, non-launchable, or
-fence-mismatched candidates before provider I/O. A retry-classified failure of
-that exact provider candidate exits the request before the provisioner's retry
-optimizer or cross-placement failover. Thus v2 invokes neither the initial nor
-retry optimizer; ordinary launches retain their existing policy and optimizer
-behavior. The terminal return preserves the exact nested typed provider
-history, so capacity and quota evidence remains classifiable without turning
-that evidence into retry authority. This correction is deployed in release
-`1.1.1437` / Helm revision 525. Canonical service recreation, free-capacity
-convergence, paid-residual proof, telemetry, takeover, and the full production
-horizon remain open.
+The remaining measured blocker is controller-side head-of-line work, not
+Kueue. A 311-intent production sample committed only 50 graphs before 261
+grants expired because one manager lock prepared requests serially at roughly
+2.7--3.1 seconds each. The repository's 32-item safety batch therefore let one
+pool consume most of a finite grant horizon. Large immutable service YAML was
+reparsed and redundantly embedded in every internal request, and the proof
+daemon added a full three-second sleep after each bounded provider operation.
+The source correction described below uses a four-item manager quantum with
+immediate re-signal, a bounded immutable Task-template cache with per-launch
+deep copy, one-pass workspace freezing, omission of display-only YAML from the
+execution payload, and fixed-rate proof renewal. It changes no capacity debit,
+provider authority, task resource, worker projection, paid residual, or Kueue
+object.
 
-Because exact replay changed executor/provider semantics, PR #1667 rotated the
-non-pool capability cohort from 2 to 3. The follow-up provider-proof contract
-rotates it from 3 to 4: a stale or missing exact proof parks durable intent
-before leasing, again before atomic replica/request/Kueue staging, and as a
-typed pre-effect executor pause if the receipt expires later. Malformed proof,
-authority drift, and every post-effect ambiguity remain terminal. Mixed writer
-cohorts fail the existing fleet barrier, while adjacent cohorts may only read,
-settle, recover, or clean already-owned work; they cannot admit a new request
-or enter provider I/O. The service remains absent during the Helm rollout and
-is recreated only after every API, controller, and executor writer advertises
-cohort 4 and the exact deployed proof-policy bundle is fix-forward activated.
+PHX success is defined exclusively by Simone's unchanged Kueue policy. SkyPilot
+must submit every fresh reserved grant; every Workload that Kueue marks
+`QuotaReserved=True` and `Admitted=True` must map one to one to a durable
+intent, replica, request, and provisioning or Ready runtime. A raw idle GPU is
+not a failure when Kueue withholds the submitted Workload or the immutable task
+is not scheduler-fit. SkyPilot must not change ClusterQueues, LocalQueues,
+Cohorts, ResourceFlavors, quotas, borrowing, preemption, priorities, scheduler,
+or research workload specifications to improve occupancy. East has no Kueue
+boundary and uses its existing scheduler-fit compatible-capacity denominator.
+
+Canonical service recreation, unchanged-policy convergence, paid-residual
+suppression, telemetry, takeover, and the full production horizon remain open.
+Mixed writer cohorts continue to fail the existing fleet barrier. Adjacent
+cohorts may read, settle, recover, or clean already-owned work but cannot admit
+a new request or enter provider I/O; current source does not claim N-2 write
+compatibility.
 
 The following lifecycle-84 cleanup account is retained as incident history,
 not current service state. Before the `1.1.1436` correction, normal fenced down
@@ -417,21 +403,33 @@ provider cleanup.
 
 Durable submission uses one bounded executor per physical pool, not one
 provider-preflight round trip per intent and not an unbounded thread per Pod.
-The executor leases at most 32 oldest actionable intents for that pool in one
-PostgreSQL transaction, giving every intent its own owner, generation, and
-expiry. It opens one V2 provider-phase admission and one deduplicated physical
-UID capture for the batch, then commits each exact intent/replica/request graph
-independently under the existing manager serialization. Each committed graph
-immediately starts the ordinary bound-request adopter, so up to 32 Pods enter
-the asynchronous provider queue together and initialize concurrently. A
-definite failure releases or terminalizes only that intent; an ambiguous
-commit preserves only that exact graph and does not cancel later members of the
-batch. The capture is released after the last member is staged, without
-waiting for Pod scheduling or readiness. Different pools retain independent
-executor threads and compatible V2 provider phases. A completed batch wakes
-the dispatcher immediately when more durable work exists, so a 90-intent PHX
-grant is submitted in at most three bounded waves without adding a scheduler,
-queue, deployment, or platform object.
+The repository retains a hard safety limit of 32 leases, but the manager takes
+an actuation quantum of four oldest actionable intents per mutex turn. Every
+intent keeps its own owner, generation, and expiry. The executor opens one V2
+provider-phase admission and one deduplicated physical-UID capture for that
+quantum, then commits each exact intent/replica/request graph independently
+under the existing manager serialization. Each committed graph immediately
+starts the ordinary bound-request adopter, so provider work remains
+asynchronous and Pods initialize concurrently. A full four-item turn
+immediately re-signals durable work before yielding, which bounds cross-pool
+head-of-line blocking without changing the repository safety ceiling or
+introducing another scheduler. A definite failure releases or terminalizes
+only that intent; an ambiguous commit preserves only that exact graph and does
+not cancel later members. The capture is released after the last member is
+staged, without waiting for Pod scheduling or readiness. Different pools
+retain independent executor threads and compatible V2 provider phases.
+
+Service-version YAML is immutable and can be large. The manager therefore
+parses it once per active/recovery version, retains only the current version
+plus two recently used recovery templates, and deep-copies the template for
+each executable launch. The display-only original YAML remains in the durable
+service-version row but is omitted from the internal launch request. The
+server workspace is injected during the first request freeze instead of
+decoding and re-encoding the frozen body. These are preparation-only
+optimizations: they change no task resource, worker projection, Kueue identity,
+provider proof, capacity debit, or paid-launch authority. An evicted old
+version remains recoverable by reparsing its PostgreSQL-authoritative YAML and
+specification.
 
 The executable protocol-v2 request contains exactly one controller-selected,
 launchable Kubernetes resource. That serialized singleton and the durable
