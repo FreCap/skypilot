@@ -343,6 +343,41 @@ def test_provider_failure_is_a_typed_pool_local_blackout() -> None:
     assert payload.detail == 'pods/list forbidden'
 
 
+def test_credential_probe_failure_publishes_blackout_not_zero(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Failed exact-context authorization cannot publish successful zero."""
+    repository = _Repository()
+    monkeypatch.setattr(reserved_capacity.provider_phase, 'provider_phase',
+                        lambda *_args, **_kwargs: contextlib.nullcontext())
+    monkeypatch.setattr(reserved_capacity.kubernetes,
+                        'physical_cluster_uid_fence',
+                        lambda *_args, **_kwargs: contextlib.nullcontext())
+    monkeypatch.setattr(reserved_capacity.kubernetes_catalog.sky_check,
+                        'get_workspace_allowed_clouds',
+                        lambda *_args, **_kwargs: ['Kubernetes'])
+    monkeypatch.setattr(
+        reserved_capacity.kubernetes_catalog.kubernetes_utils,
+        'check_credentials', lambda *_args, **_kwargs:
+        (False, 'test authorization failure'))
+
+    worker = observer.PoolCapacityObserver(
+        repository,
+        reserved_capacity.query_pool_capacity_target,
+        query_timeout_seconds=1)
+    try:
+        completed = worker.observe_once((_target('uid-a', 'east', 'a100'),))
+    finally:
+        worker.close()
+
+    assert len(repository.completions) == 1
+    assert completed == tuple(repository.completions)
+    payload = completed[0].payload
+    assert isinstance(payload, observation.PoolCapacityBlackout)
+    assert payload.reason is (
+        observation.PoolCapacityBlackoutReason.PROVIDER_ERROR)
+    assert 'test authorization failure' in (payload.detail or '')
+
+
 def test_round_rejects_duplicate_pool_identity() -> None:
     repository = _Repository()
     target = _target('uid-a', 'east', 'a100')

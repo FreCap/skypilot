@@ -4106,14 +4106,14 @@ def _run_round_locked(
             phantom_streak = 0
         else:
             # Phantom pool: the claimed GPU resolves to no labeled nodes.
-            # kubernetes_catalog reports empty dicts WITHOUT raising on
-            # credential/cache/label-formatter failures, so one phantom
-            # reading can be a transient kube-apiserver blip disguised as
-            # a successful observation. Require N consecutive phantom
-            # observations before rejecting every claim on the pool
-            # (their pollers re-log per interval); until confirmed, treat
-            # the round as a measurement blackout: feed 0 (conservative),
-            # release nothing, keep the claims.
+            # Exact-context credential, RBAC, transport, and provider-read
+            # failures raise into BLACKOUT before this point. An empty card
+            # set is therefore a successful topology/label observation, but a
+            # single reading can still reflect transient node or label
+            # propagation. Require N consecutive phantom observations before
+            # rejecting every claim on the pool (their pollers re-log per
+            # interval); until confirmed, treat the round as a measurement
+            # blackout: feed 0 (conservative), release nothing, keep claims.
             phantom_streak = prev_phantom_streak + 1
             if (phantom_streak
                     >= constants.RESERVED_FILL_PHANTOM_CONFIRM_ROUNDS):
