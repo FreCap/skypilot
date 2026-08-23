@@ -2681,7 +2681,7 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     except ValueError as error:
         raise config_lib.KubernetesError(
             'The rendered SkyServe worker projection protocol version must be '
-            '1, 2, 3, 4, 5, 6, or absent.') from error
+            '1, 2, 3, 4, 5, 6, 7, or absent.') from error
     if (serve_worker_projection_protocol_version is not None and
             serve_worker_projection_protocol_version
             != pod_spec_lib.SERVE_WORKER_PROJECTION_PROTOCOL_VERSION):
@@ -2744,7 +2744,7 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         if (serve_worker_expected_scratch
                 is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
             raise config_lib.KubernetesError(
-                'Projection protocol v3/v4/v5/v6 requires the complete worker '
+                'Projection protocol v3/v4/v5/v6/v7 requires the complete worker '
                 'scratch attestation contract.')
         serve_worker_expected_scratch = (
             _validate_serve_worker_scratch_contract(
@@ -2752,13 +2752,13 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     elif (serve_worker_expected_scratch
           is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
         raise config_lib.KubernetesError(
-            'Only projection protocol v3/v4/v5/v6 may carry a worker scratch '
+            'Only projection protocol v3/v4/v5/v6/v7 may carry a worker scratch '
             'attestation contract.')
     if require_runtime_readiness:
         if (serve_worker_expected_runtime_bootstrap_sha256
                 is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
             raise config_lib.KubernetesError(
-                'Projection protocol v4/v5/v6 requires the complete worker runtime '
+                'Projection protocol v4/v5/v6/v7 requires the complete worker runtime '
                 'bootstrap SHA256 contract.')
         try:
             serve_worker_expected_runtime_bootstrap_sha256 = (
@@ -2769,7 +2769,7 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     elif (serve_worker_expected_runtime_bootstrap_sha256
           is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
         raise config_lib.KubernetesError(
-            'Only projection protocol v4/v5/v6 may carry a worker runtime '
+            'Only projection protocol v4/v5/v6/v7 may carry a worker runtime '
             'bootstrap SHA256 contract.')
     priority_attestation_presence = tuple(
         value is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION

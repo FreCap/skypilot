@@ -1042,7 +1042,7 @@ def _enforce_worker_projection_on_kubernetes_yaml(
     else:
         if expected_runtime_bootstrap_sha256 is not None:
             raise exceptions.InvalidCloudConfigs(
-                'Only projection protocol v4/v5/v6 may carry a worker runtime '
+                'Only projection protocol v4/v5/v6/v7 may carry a worker runtime '
                 'bootstrap SHA256 contract.')
         cluster_yaml['provider'].pop(
             'serve_worker_expected_runtime_bootstrap_sha256', None)

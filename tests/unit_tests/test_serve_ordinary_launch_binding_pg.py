@@ -25,6 +25,7 @@ from sky.serve import kubernetes_identity
 from sky.serve import ordinary_launch_binding as binding
 from sky.serve import replica_managers
 from sky.serve import route_projection
+from sky.serve import route_projection_schema
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import serve_statuses
@@ -32,6 +33,7 @@ from sky.serve import serve_utils
 from sky.serve import service_spec
 from sky.serve import system_recovery_state
 from sky.serve import zero_cost_actuation
+from sky.serve import zero_cost_actuation_schema
 from sky.server.requests import payloads
 from sky.skylet import constants as skylet_constants
 from sky.utils import common_utils
@@ -869,7 +871,7 @@ def test_current_paid_effect_accepts_current_worker_projection(
         binding_database) -> None:
     current_protocol = (
         kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
-    assert current_protocol == 6
+    assert current_protocol == 7
     with binding_database.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.version_specs_table).where(
@@ -882,25 +884,34 @@ def test_current_paid_effect_accepts_current_worker_projection(
     _assert_current_paid_provider_effect_is_permitted(binding_database)
 
 
-def test_serve056_previous_cohort_settles_but_cannot_start_provider_effect(
-        binding_database, monkeypatch) -> None:
+@pytest.mark.parametrize('history_distance', [1, 2])
+def test_historical_cohort_cannot_start_provider_effect(
+        binding_database, monkeypatch, history_distance) -> None:
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
-    assert current_cohort > 1
+    assert current_cohort > history_distance
+    historical_cohort = current_cohort - history_distance
     with monkeypatch.context() as old_code:
         old_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
-                         current_cohort - 1)
+                         historical_cohort)
         identity, context, launch_context = _admit_generic_paid(
             binding_database)
 
     authority = dataclasses.replace(
         _generic_controller_authority(),
-        non_pool_capability_cohort_epoch=current_cohort - 1)
+        non_pool_capability_cohort_epoch=historical_cohort)
     assert not authority.generic_launches_required
-    assert authority.retained_non_pool_settlement_allowed
+    assert (authority.retained_non_pool_settlement_allowed
+            is (history_distance == 1))
     with binding_database.begin() as connection:
-        association = binding.lock_reduction_authority_in_connection(
-            connection, context)
-    assert association['association_id'] == identity.association_id
+        if history_distance == 1:
+            association = binding.lock_reduction_authority_in_connection(
+                connection, context)
+            assert association['association_id'] == identity.association_id
+        else:
+            with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                               match='retained generic cleanup cohort'):
+                binding.lock_reduction_authority_in_connection(
+                    connection, context)
 
     claim = _Claim(identity.request_id, 1, str(uuid.uuid4()), str(uuid.uuid4()))
     entered = False
@@ -922,23 +933,27 @@ def test_serve056_previous_cohort_settles_but_cannot_start_provider_effect(
     assert phase == binding.EffectPhase.NOT_STARTED.value
 
 
-def test_exact_v5_projection_retry_is_idempotent_but_effect_requires_v6(
-        binding_database, monkeypatch) -> None:
-    """A lost-ACK retry survives N-1, but cannot start new provider I/O."""
-    assert kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION == 6
+@pytest.mark.parametrize('historical_protocol', [5, 6])
+def test_historical_projection_retry_is_idempotent_but_effect_requires_v7(
+        binding_database, monkeypatch, historical_protocol) -> None:
+    """A lost-ACK retry survives N-1/N-2 without new provider I/O."""
+    assert kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION == 7
     with binding_database.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.version_specs_table).where(
                 serve_state_schema.version_specs_table.c.service_name == 'svc',
                 serve_state_schema.version_specs_table.c.version == 2).values(
-                    worker_placement_projections=[_worker_projection(5)]))
+                    worker_placement_projections=[
+                        _worker_projection(historical_protocol)
+                    ]))
 
-    # Reproduce an association durably admitted by the immediately previous
-    # projection renderer. Cohort identity remains current; only the immutable
-    # service-version projection is N-1.
-    with monkeypatch.context() as v5_code:
-        v5_code.setattr(kubernetes_identity,
-                        'PLACEMENT_PROJECTION_PROTOCOL_VERSION', 5)
+    # Reproduce an association durably admitted by a retained projection
+    # renderer. Cohort identity remains current; only the immutable service-
+    # version projection is historical.
+    with monkeypatch.context() as historical_code:
+        historical_code.setattr(kubernetes_identity,
+                                'PLACEMENT_PROJECTION_PROTOCOL_VERSION',
+                                historical_protocol)
         identity, _, launch_context = _admit_generic_paid(binding_database)
 
     with binding_database.begin() as connection:
@@ -958,7 +973,7 @@ def test_exact_v5_projection_retry_is_idempotent_but_effect_requires_v6(
     assert retry.association_id == str(identity.association_id)
     assert retry.launch_generation == 1
     assert association_count == 1
-    assert persisted_projections[0]['projection_version'] == 5
+    assert persisted_projections[0]['projection_version'] == historical_protocol
 
     claim = _Claim(identity.request_id, 1, str(uuid.uuid4()), str(uuid.uuid4()))
     entered = False
@@ -1032,7 +1047,7 @@ def _reserved_fill_cleanup_rows(
 def test_reserved_fill_cleanup_accepts_exact_adjacent_cohort_tuple(
         binding_database, monkeypatch) -> None:
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
-    assert current_cohort == 6
+    assert current_cohort == 7
     service, replica, association, expected_profile = (
         _reserved_fill_cleanup_rows(current_cohort - 1, current_cohort - 1))
     validated: list[binding.NonPoolLaunchProfile] = []
@@ -1054,15 +1069,16 @@ def test_reserved_fill_cleanup_accepts_exact_adjacent_cohort_tuple(
     assert validated == [expected_profile]
 
 
-def test_adjacent_v5_reserved_fill_graph_settles_provider_absence(
-        binding_database, monkeypatch) -> None:
-    """N-1 state remains reducible but cannot acquire new effect authority."""
+@pytest.mark.parametrize('history_distance', [1, 2])
+def test_retained_v5_v6_reserved_fill_graph_settles_provider_absence(
+        binding_database, monkeypatch, history_distance) -> None:
+    """N-1/N-2 terminal state cleans without new provider authority."""
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
     current_projection = (
         kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
-    assert (current_cohort, current_projection) == (6, 6)
-    historical_cohort = current_cohort - 1
-    historical_projection = current_projection - 1
+    assert (current_cohort, current_projection) == (7, 7)
+    historical_cohort = current_cohort - history_distance
+    historical_projection = current_projection - history_distance
     info = _reserved_fill_replica_info()
     profile_payload = {'physical_cluster_uid': 'physical-uid-a'}
     profile = binding.NonPoolLaunchProfile.create(
@@ -1072,19 +1088,18 @@ def test_adjacent_v5_reserved_fill_graph_settles_provider_absence(
         authorization_generation=info.reserved_fill_allocation_generation,
         authorization_payload=profile_payload)
 
-    # Reproduce one retained v5 graph using the immediately previous writer.
-    # Its JSON-only intent edge is deliberately cleanup-only after Serve056;
-    # the current binary may decode and settle it, but may never use it to
-    # render or begin provider I/O.
-    with monkeypatch.context() as v5_code:
-        v5_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
-                        historical_cohort)
-        v5_code.setattr(kubernetes_identity,
-                        'PLACEMENT_PROJECTION_PROTOCOL_VERSION',
-                        historical_projection)
-        v5_code.setattr(binding,
-                        'resolve_non_pool_launch_profile_in_connection',
-                        lambda *_args, **_kwargs: profile)
+    # Reproduce one retained v5/v6 graph using its original writer. Its JSON-
+    # only intent edge may later be cleaned, but never re-rendered or granted
+    # a new provider effect by v7.
+    with monkeypatch.context() as historical_code:
+        historical_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                                historical_cohort)
+        historical_code.setattr(kubernetes_identity,
+                                'PLACEMENT_PROJECTION_PROTOCOL_VERSION',
+                                historical_projection)
+        historical_code.setattr(
+            binding, 'resolve_non_pool_launch_profile_in_connection',
+            lambda *_args, **_kwargs: profile)
         with binding_database.begin() as connection:
             connection.execute(
                 sqlalchemy.update(serve_state_schema.replicas_table).where(
@@ -1150,6 +1165,182 @@ def test_adjacent_v5_reserved_fill_graph_settles_provider_absence(
 
     monkeypatch.setattr(binding, '_reserved_fill_cleanup_payload',
                         lambda *_args, **_kwargs: profile_payload)
+    if history_distance == 2:
+        # N-2 may retire only an already-canonical ABSENT graph.  It cannot
+        # adopt/retry the old admission, even when every immutable identity
+        # byte still matches.
+        with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                           match='exact generic launch cohort'):
+            with binding_database.begin() as connection:
+                binding.insert_or_get_locked(connection, identity)
+        assert not binding.binding_allows_request(str(identity.association_id),
+                                                  identity.request_id)
+        route_leases = (
+            route_projection_schema.serve_route_replica_leases_table)
+        intents = (
+            zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        valid_until = now + datetime.timedelta(minutes=5)
+        with binding_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(route_leases).values(
+                    service_name='svc',
+                    service_hash='svc-hash',
+                    replica_id=3,
+                    replica_record_id=_RECORD_ID,
+                    service_lifecycle_epoch=4,
+                    controller_incarnation=_CONTROLLER_ID,
+                    controller_owner_epoch=6,
+                    controller_pid=123,
+                    controller_ip='10.0.0.2',
+                    service_version=2,
+                    route_url='http://10.0.0.5:8080',
+                    gpu_type='H200',
+                    gpu_count=1,
+                    probe_method='GET',
+                    readiness_path='/health',
+                    probe_timeout_seconds=5,
+                    probe_post_data=None,
+                    probe_headers=None,
+                    async_occupancy=None,
+                    uses_logical_replicas=False,
+                    is_zero_cost=True,
+                    planned_capacity=1,
+                    route_allowed=True,
+                    requires_route_marker=False,
+                    route_marker_payload=None,
+                    material_sha256='1' * 64,
+                    material_generation=1,
+                    readiness_generation=1,
+                    ready=True,
+                    created_at=now,
+                    resolved_at=now,
+                    observed_at=now,
+                    valid_until=valid_until,
+                    revocation_generation=0,
+                    revoked_at=None,
+                    revocation_reason=None))
+            connection.execute(
+                sqlalchemy.insert(intents).values(
+                    intent_idempotency_key='f' * 64,
+                    service_name='svc',
+                    service_hash='svc-hash',
+                    service_lifecycle_epoch=4,
+                    actuation_epoch=1,
+                    service_version=2,
+                    controller_owner='controller-a',
+                    ordinal=99,
+                    protocol_version=2,
+                    policy_revision=1,
+                    reconcile_generation=1,
+                    allocation_generation=1,
+                    allocation_input_sha256='1' * 64,
+                    allocation_claim_generation=1,
+                    reconciliation_gate_generation=1,
+                    reclaim_fleet_bundle_sha256='2' * 64,
+                    reclaim_policy_revision='policy-v1',
+                    reclaim_provider_inventory_sha256='3' * 64,
+                    service_generation=1,
+                    pool_key='pool-a',
+                    pool_epoch=1,
+                    physical_cluster_uid='physical-uid-a',
+                    kubernetes_context='context-a',
+                    worker_projection_sha256='4' * 64,
+                    observation_generation=1,
+                    observation_sequence=0,
+                    ordinary_zero_cost_admission_sequence=0,
+                    valid_until_epoch=valid_until.timestamp(),
+                    valid_until=valid_until,
+                    accelerator='H200',
+                    accelerator_count=1,
+                    capacity_unit='physical',
+                    planned_capacity=1,
+                    allowed_locations=[{
+                        'cloud': 'kubernetes',
+                        'region': 'context-a',
+                    }],
+                    state=zero_cost_actuation.IntentState.GRANTED.value,
+                    lease_owner=None,
+                    lease_generation=0,
+                    lease_expires_at=None,
+                    replica_id=None,
+                    replica_record_id=None,
+                    last_error=None,
+                    created_at=now,
+                    updated_at=now,
+                    committed_at=None,
+                    terminal_at=None))
+        with binding_database.begin() as connection:
+            before = connection.execute(
+                sqlalchemy.select(binding.ordinary_launch_associations_table).
+                where(
+                    binding.ordinary_launch_associations_table.c.association_id
+                    == identity.association_id)).mappings().one()
+            capacity_fields = (
+                'demand_source_mode',
+                'demand_source_epoch',
+                'demand_authority_capable',
+                'demand_authority_controller_incarnation',
+                'demand_authority_protocol_version',
+                'reserved_fill_actuation_mode',
+                'reserved_fill_actuation_epoch',
+                'reserved_fill_actuation_capable',
+                'reserved_fill_actuation_controller_incarnation',
+                'reserved_fill_actuation_protocol_version',
+            )
+            before_service = connection.execute(
+                sqlalchemy.select(serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    'svc')).mappings().one()
+            before_route = connection.execute(
+                sqlalchemy.select(route_leases)).mappings().one()
+            before_intent = connection.execute(
+                sqlalchemy.select(intents)).mappings().one()
+            nested = connection.begin_nested()
+            try:
+                new_incarnation = uuid.UUID(
+                    '44444444-4444-4444-8444-444444444444')
+                with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                                   match='exact terminal provider absence'):
+                    binding.transfer_service_owner_in_connection(
+                        connection,
+                        service_name='svc',
+                        expected_incarnation=_CONTROLLER_ID,
+                        expected_owner_epoch=6,
+                        new_incarnation=new_incarnation,
+                        new_controller_pid=456,
+                        new_controller_ip='10.0.0.4',
+                        capable=True)
+                transferred_service = connection.execute(
+                    sqlalchemy.select(serve_state_schema.services_table).where(
+                        serve_state_schema.services_table.c.name ==
+                        'svc')).mappings().one()
+                unchanged = connection.execute(
+                    sqlalchemy.select(
+                        binding.ordinary_launch_associations_table).where(
+                            binding.ordinary_launch_associations_table.c.
+                            association_id ==
+                            identity.association_id)).mappings().one()
+                unchanged_route = connection.execute(
+                    sqlalchemy.select(route_leases)).mappings().one()
+                unchanged_intent = connection.execute(
+                    sqlalchemy.select(intents)).mappings().one()
+                assert transferred_service[
+                    'controller_incarnation'] == _CONTROLLER_ID
+                assert transferred_service[
+                    'non_pool_launch_controller_incarnation'] == _CONTROLLER_ID
+                assert tuple(
+                    transferred_service[field]
+                    for field in capacity_fields) == tuple(
+                        before_service[field] for field in capacity_fields)
+                assert dict(unchanged) == dict(before)
+                assert dict(unchanged_route) == dict(before_route)
+                assert dict(unchanged_intent) == dict(before_intent)
+            finally:
+                nested.rollback()
+    else:
+        assert binding.binding_allows_request(str(identity.association_id),
+                                              identity.request_id)
     with binding_database.begin() as connection:
         service = connection.execute(
             sqlalchemy.select(serve_state_schema.services_table).where(
@@ -1171,8 +1362,21 @@ def test_adjacent_v5_reserved_fill_graph_settles_provider_absence(
                     serve_state_schema.version_specs_table.c.service_name ==
                     'svc', serve_state_schema.version_specs_table.c.version ==
                     2)).scalar_one()
-        assert binding.validate_reserved_fill_cleanup_association_in_connection(
-            connection, service, replica, association) == profile
+        if history_distance == 1:
+            assert (binding.
+                    validate_reserved_fill_cleanup_association_in_connection(
+                        connection, service, replica, association) == profile)
+        else:
+            # N-2 cannot use the broad cleanup boundary before terminal,
+            # quiescent, projected provider-absence evidence is complete.
+            with pytest.raises(binding.OrdinaryLaunchBindingConflict):
+                binding.validate_reserved_fill_cleanup_association_in_connection(
+                    connection, service, replica, association)
+            # The direct retirement classifier also rejects the natural
+            # pre-terminal, pre-projection NOT_QUERIED shape.
+            with pytest.raises(binding.OrdinaryLaunchBindingConflict):
+                binding.projected_provider_absence_retirement_authority_in_connection(
+                    connection, 'svc', 3, str(_RECORD_ID))
         connection.execute(
             sqlalchemy.update(binding.ordinary_launch_associations_table).where(
                 binding.ordinary_launch_associations_table.c.association_id ==
@@ -1191,32 +1395,115 @@ def test_adjacent_v5_reserved_fill_graph_settles_provider_absence(
                                         quiesced_generation=1,
                                         quiesced_at=datetime.datetime.now(
                                             datetime.timezone.utc))
-    with binding_database.begin() as connection:
-        assert binding.record_terminal_in_connection(
-            connection, context,
-            terminal) is (binding.StartupClassification.AMBIGUOUS)
-        association = connection.execute(
-            sqlalchemy.select(binding.ordinary_launch_associations_table).where(
-                binding.ordinary_launch_associations_table.c.association_id ==
-                identity.association_id)).mappings().one()
-        replica = connection.execute(
-            sqlalchemy.select(serve_state_schema.replicas_table).where(
-                serve_state_schema.replicas_table.c.service_name == 'svc',
-                serve_state_schema.replicas_table.c.replica_id ==
-                3)).mappings().one()
-        persisted_info = binding._locked_replica_info(replica)
-        provider_payload, _ = binding._reserved_fill_provider_evidence(
-            association, persisted_info, binding.ProviderEvidence.ABSENT)
+
+    def _record_terminal_and_build_payload() -> dict[str, object]:
+        with binding_database.begin() as connection:
+            assert binding.record_terminal_in_connection(
+                connection, context,
+                terminal) is (binding.StartupClassification.AMBIGUOUS)
+            association = connection.execute(
+                sqlalchemy.select(binding.ordinary_launch_associations_table).
+                where(
+                    binding.ordinary_launch_associations_table.c.association_id
+                    == identity.association_id)).mappings().one()
+            replica = connection.execute(
+                sqlalchemy.select(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id ==
+                    3)).mappings().one()
+            payload, _ = binding._reserved_fill_provider_evidence(
+                association, binding._locked_replica_info(replica),
+                binding.ProviderEvidence.ABSENT)
+            return payload
+
+    if history_distance == 2:
+        # Current code cannot mutate terminal state for an N-2 graph. Build
+        # the retained fixture under its original cohort, as though the
+        # terminal write committed before that graph aged into N-2.
+        with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                           match='retained generic cleanup cohort'):
+            with binding_database.begin() as connection:
+                binding.record_terminal_in_connection(connection, context,
+                                                      terminal)
+        with monkeypatch.context() as historical_code:
+            historical_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                                    historical_cohort)
+            provider_payload = _record_terminal_and_build_payload()
+        # Terminal quiescence by itself is insufficient: before provider
+        # evidence and pin release this remains AMBIGUOUS/NOT_QUERIED.
+        with binding_database.begin() as connection:
+            with pytest.raises(binding.OrdinaryLaunchBindingConflict):
+                binding.projected_provider_absence_retirement_authority_in_connection(
+                    connection, 'svc', 3, str(_RECORD_ID))
+    else:
+        provider_payload = _record_terminal_and_build_payload()
 
     historical_authority = dataclasses.replace(
         _generic_controller_authority(),
         non_pool_capability_cohort_epoch=historical_cohort)
-    assert historical_authority.retained_non_pool_settlement_allowed
-    with binding_database.begin() as connection:
-        assert binding.record_non_pool_provider_evidence(
-            connection, context, historical_authority,
-            binding.ProviderEvidence.ABSENT, provider_payload,
-            lambda _connection, _context: terminal)
+    if history_distance == 2:
+        assert not historical_authority.retained_non_pool_settlement_allowed
+        # N-2 does not enter the adopter/reconciliation or evidence-writer
+        # paths, even for a real retained ambiguous association.
+        assert binding.list_provider_reconciliation_contexts(
+            historical_authority) == []
+        with binding_database.begin() as connection:
+            with pytest.raises(binding.OrdinaryLaunchBindingConflict):
+                binding.record_non_pool_provider_evidence(
+                    connection, context, historical_authority,
+                    binding.ProviderEvidence.ABSENT, provider_payload,
+                    lambda _connection, _context: terminal)
+        # Even an exact PRESENT observation recorded while the graph was N-1
+        # cannot cross the current N-2 boundary: terminal retirement is
+        # ABSENT-only and grants no teardown/provider mutation authority.
+        with binding_database.begin() as connection:
+            nested = connection.begin_nested()
+            try:
+                association = connection.execute(
+                    sqlalchemy.select(
+                        binding.ordinary_launch_associations_table).where(
+                            binding.ordinary_launch_associations_table.c.
+                            association_id ==
+                            identity.association_id)).mappings().one()
+                replica = connection.execute(
+                    sqlalchemy.select(serve_state_schema.replicas_table).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        'svc', serve_state_schema.replicas_table.c.replica_id ==
+                        3)).mappings().one()
+                present_payload, _ = binding._reserved_fill_provider_evidence(
+                    association, binding._locked_replica_info(replica),
+                    binding.ProviderEvidence.PRESENT)
+                with monkeypatch.context() as historical_code:
+                    historical_code.setattr(binding,
+                                            'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                                            historical_cohort)
+                    assert binding.record_non_pool_provider_evidence(
+                        connection, context, historical_authority,
+                        binding.ProviderEvidence.PRESENT, present_payload,
+                        lambda _connection, _context: terminal)
+                with pytest.raises(binding.OrdinaryLaunchBindingConflict):
+                    binding.projected_provider_absence_retirement_authority_in_connection(
+                        connection, 'svc', 3, str(_RECORD_ID))
+            finally:
+                nested.rollback()
+        # Simulate the exact ABSENT evidence having been committed before the
+        # old cohort crossed from N-1 to N-2.
+        with monkeypatch.context() as historical_code:
+            historical_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                                    historical_cohort)
+            assert historical_authority.retained_non_pool_settlement_allowed
+            with binding_database.begin() as connection:
+                assert binding.record_non_pool_provider_evidence(
+                    connection, context, historical_authority,
+                    binding.ProviderEvidence.ABSENT, provider_payload,
+                    lambda _connection, _context: terminal)
+    else:
+        assert historical_authority.retained_non_pool_settlement_allowed
+        with binding_database.begin() as connection:
+            assert binding.record_non_pool_provider_evidence(
+                connection, context, historical_authority,
+                binding.ProviderEvidence.ABSENT, provider_payload,
+                lambda _connection, _context: terminal)
 
     # Persist the exact immediate-cleanup marker that the request projector
     # carries into the provider-absence settlement transaction.
@@ -1252,16 +1539,486 @@ def test_adjacent_v5_reserved_fill_graph_settles_provider_absence(
                     status=persisted_info.status.value,
                     sky_down_status=status.sky_down_status.value,
                     replica_state=persisted_info.to_storage_dict()))
-        assert binding.project_provider_absence_in_connection(
-            connection, context, terminal)
+
+    if history_distance == 2:
+        # N-2 cannot perform AMBIGUOUS -> PROJECTED or release the pin. The
+        # fixture's projection is committed under its original cohort before
+        # v7 is restored solely for terminal retirement validation.
+        with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                           match='retained generic cleanup cohort'):
+            with binding_database.begin() as connection:
+                binding.project_provider_absence_in_connection(
+                    connection, context, terminal)
+        with monkeypatch.context() as historical_code:
+            historical_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                                    historical_cohort)
+            with binding_database.begin() as connection:
+                assert binding.project_provider_absence_in_connection(
+                    connection, context, terminal)
+    else:
+        with binding_database.begin() as connection:
+            assert binding.project_provider_absence_in_connection(
+                connection, context, terminal)
+
+    def _take_over_projected_n2() -> None:
+        # Service takeover remains available for an already-PROJECTED N-2
+        # graph. Its complete historical association, capacity-authority,
+        # route-lease, and pending-intent rows remain byte-stable, and the new
+        # service owner can still retire it below.
+        with binding_database.begin() as connection:
+            before_association = connection.execute(
+                sqlalchemy.select(binding.ordinary_launch_associations_table).
+                where(
+                    binding.ordinary_launch_associations_table.c.association_id
+                    == identity.association_id)).mappings().one()
+            before_service = connection.execute(
+                sqlalchemy.select(serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    'svc')).mappings().one()
+            before_route = connection.execute(
+                sqlalchemy.select(route_leases)).mappings().one()
+            before_intent = connection.execute(
+                sqlalchemy.select(intents)).mappings().one()
+            new_incarnation = uuid.UUID('44444444-4444-4444-8444-444444444444')
+            lock_order = []
+
+            def _record_lock_order(_conn, _cursor, statement, _parameters,
+                                   _context, _executemany):
+                normalized = statement.casefold()
+                if 'for update' not in normalized:
+                    return
+                for label, table in (
+                    ('replica', serve_state_schema.replicas_table),
+                    ('claim', serve_state_schema.paid_capacity_claims_table),
+                    ('association', binding.ordinary_launch_associations_table),
+                ):
+                    if table.name.casefold() in normalized:
+                        lock_order.append(label)
+                        return
+
+            sqlalchemy.event.listen(binding_database, 'before_cursor_execute',
+                                    _record_lock_order)
+            try:
+                authority = binding.transfer_service_owner_in_connection(
+                    connection,
+                    service_name='svc',
+                    expected_incarnation=_CONTROLLER_ID,
+                    expected_owner_epoch=6,
+                    new_incarnation=new_incarnation,
+                    new_controller_pid=456,
+                    new_controller_ip='10.0.0.4',
+                    capable=True)
+            finally:
+                sqlalchemy.event.remove(binding_database,
+                                        'before_cursor_execute',
+                                        _record_lock_order)
+            after_association = connection.execute(
+                sqlalchemy.select(binding.ordinary_launch_associations_table).
+                where(
+                    binding.ordinary_launch_associations_table.c.association_id
+                    == identity.association_id)).mappings().one()
+            after_service = connection.execute(
+                sqlalchemy.select(serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    'svc')).mappings().one()
+            after_route = connection.execute(
+                sqlalchemy.select(route_leases)).mappings().one()
+            after_intent = connection.execute(
+                sqlalchemy.select(intents)).mappings().one()
+            assert authority.controller_incarnation == new_incarnation
+            assert after_service['controller_incarnation'] == new_incarnation
+            assert after_service[
+                'non_pool_launch_controller_incarnation'] == new_incarnation
+            assert tuple(
+                after_service[field] for field in capacity_fields) == tuple(
+                    before_service[field] for field in capacity_fields)
+            assert dict(after_association) == dict(before_association)
+            assert dict(after_route) == dict(before_route)
+            assert dict(after_intent) == dict(before_intent)
+            assert lock_order == ['replica', 'claim', 'association']
 
     with binding_database.begin() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc')).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id ==
+                3)).mappings().one()
+        persisted_association = connection.execute(
+            sqlalchemy.select(binding.ordinary_launch_associations_table).where(
+                binding.ordinary_launch_associations_table.c.association_id ==
+                identity.association_id)).mappings().one()
+        if history_distance == 2:
+            with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                               match='retained generic cleanup cohort'):
+                binding.release_projected_paid_capacity_claim_in_connection(
+                    connection, context)
+
+            def _assert_mutated_history_rejected(**values) -> None:
+                nested = connection.begin_nested()
+                try:
+                    # Install a historically corrupted witness while
+                    # preserving production trigger behavior outside this
+                    # savepoint.  The application classifier must still fail
+                    # closed if such a row predates the current triggers.
+                    connection.exec_driver_sql(
+                        "SET LOCAL session_replication_role = 'replica'")
+                    connection.execute(
+                        sqlalchemy.update(
+                            binding.ordinary_launch_associations_table).where(
+                                binding.ordinary_launch_associations_table.c.
+                                association_id == identity.association_id).
+                        values(**values,
+                               owner_revision=(
+                                   binding.ordinary_launch_associations_table.c.
+                                   owner_revision + 1),
+                               updated_at=(sqlalchemy.func.clock_timestamp())))
+                    with pytest.raises(binding.OrdinaryLaunchBindingConflict):
+                        binding.projected_provider_absence_retirement_authority_in_connection(
+                            connection, 'svc', 3, str(_RECORD_ID))
+                finally:
+                    nested.rollback()
+
+            # The terminal N-2 classifier independently rejects false
+            # quiescence and mismatched generations even if historical state
+            # predates today's immutable-evidence database trigger.
+            _assert_mutated_history_rejected(
+                execution_quiescence_required=False)
+            _assert_mutated_history_rejected(
+                execution_quiescence_required=False,
+                execution_quiesced_generation=2)
+            _assert_mutated_history_rejected(provider_evidence_payload={
+                'drift': True,
+            })
+            _assert_mutated_history_rejected(provider_evidence_digest='0' * 64)
+
+            # A live paid claim independently closes retirement, regardless
+            # of the replica and association's zero-cost snapshots.
+            nested = connection.begin_nested()
+            try:
+                connection.execute(
+                    sqlalchemy.insert(
+                        serve_state_schema.paid_capacity_pools_table).values(
+                            pool_key='n2-drift-pool',
+                            current_limit=1,
+                            successes_since_resize=0,
+                            updated_at=time.time()))
+                connection.execute(
+                    sqlalchemy.insert(
+                        serve_state_schema.paid_capacity_claims_table).values(
+                            service_name='svc',
+                            service_hash='svc-hash',
+                            replica_id=3,
+                            pool_key='n2-drift-pool',
+                            priority=1,
+                            claimed_at=time.time()))
+                with pytest.raises(binding.OrdinaryLaunchBindingConflict):
+                    binding.projected_provider_absence_retirement_authority_in_connection(
+                        connection, 'svc', 3, str(_RECORD_ID))
+                with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                                   match='exact terminal provider absence'):
+                    binding.transfer_service_owner_in_connection(
+                        connection,
+                        service_name='svc',
+                        expected_incarnation=_CONTROLLER_ID,
+                        expected_owner_epoch=6,
+                        new_incarnation=uuid.UUID(
+                            '66666666-6666-4666-8666-666666666666'),
+                        new_controller_pid=890,
+                        new_controller_ip='10.0.0.6',
+                        capable=True)
+            finally:
+                nested.rollback()
+
+            # Cleanup reconstructs the immutable intent/observation payload;
+            # any drift from the admission-time profile fails closed.
+            monkeypatch.setattr(
+                binding, '_reserved_fill_cleanup_payload',
+                lambda *_args, **_kwargs: {
+                    **profile_payload,
+                    'drift': True,
+                })
+            with pytest.raises(binding.OrdinaryLaunchBindingConflict):
+                binding.projected_provider_absence_retirement_authority_in_connection(
+                    connection, 'svc', 3, str(_RECORD_ID))
+            monkeypatch.setattr(binding, '_reserved_fill_cleanup_payload',
+                                lambda *_args, **_kwargs: profile_payload)
+
+            # A corrupted/dangling live pointer cannot be reclassified as the
+            # permitted no-graph shape.  The N-2 transfer rejects before its
+            # service-owner CAS even when the exact graph is otherwise fully
+            # terminal and provider-absent.
+            nested = connection.begin_nested()
+            try:
+                connection.exec_driver_sql(
+                    "SET LOCAL session_replication_role = 'replica'")
+                dangling_id = uuid.UUID('ffffffff-ffff-4fff-8fff-ffffffffffff')
+                connection.execute(
+                    sqlalchemy.update(serve_state_schema.replicas_table).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        'svc', serve_state_schema.replicas_table.c.replica_id ==
+                        3).values(ordinary_launch_association_id=dangling_id))
+                with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                                   match='exact terminal provider absence'):
+                    binding.transfer_service_owner_in_connection(
+                        connection,
+                        service_name='svc',
+                        expected_incarnation=_CONTROLLER_ID,
+                        expected_owner_epoch=6,
+                        new_incarnation=uuid.UUID(
+                            '55555555-5555-4555-8555-555555555555'),
+                        new_controller_pid=789,
+                        new_controller_ip='10.0.0.5',
+                        capable=True)
+                unchanged_owner = connection.execute(
+                    sqlalchemy.select(
+                        serve_state_schema.services_table.c.
+                        controller_incarnation).where(
+                            serve_state_schema.services_table.c.name ==
+                            'svc')).scalar_one()
+                assert unchanged_owner == _CONTROLLER_ID
+            finally:
+                nested.rollback()
+
+            # A replica row whose current record has no exact association is
+            # not the empty-service no-graph case.  It may still require
+            # ordinary recovery, so the non-mutating N-2 takeover rejects it.
+            nested = connection.begin_nested()
+            try:
+                connection.exec_driver_sql(
+                    "SET LOCAL session_replication_role = 'replica'")
+                connection.execute(
+                    sqlalchemy.update(
+                        binding.ordinary_launch_associations_table).where(
+                            binding.ordinary_launch_associations_table.c.
+                            association_id == identity.association_id).values(
+                                replica_record_id=uuid.UUID(
+                                    'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee')))
+                with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                                   match='exact terminal provider absence'):
+                    binding.transfer_service_owner_in_connection(
+                        connection,
+                        service_name='svc',
+                        expected_incarnation=_CONTROLLER_ID,
+                        expected_owner_epoch=6,
+                        new_incarnation=uuid.UUID(
+                            '77777777-7777-4777-8777-777777777777'),
+                        new_controller_pid=901,
+                        new_controller_ip='10.0.0.7',
+                        capable=True)
+            finally:
+                nested.rollback()
+
+            # Terminal absence is validation-only unless the replica also
+            # carries the durable immediate-cleanup marker.  Marker drift
+            # must reject N-2 takeover before the service-owner CAS, because
+            # the successor would otherwise have no authority to retire it.
+            nested = connection.begin_nested()
+            try:
+                connection.exec_driver_sql(
+                    "SET LOCAL session_replication_role = 'replica'")
+                replica = connection.execute(
+                    sqlalchemy.select(serve_state_schema.replicas_table).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        'svc', serve_state_schema.replicas_table.c.replica_id ==
+                        3)).mappings().one()
+                drifted_info = binding._locked_replica_info(replica)
+                drifted_info.status_property.is_scale_down = False
+                connection.execute(
+                    sqlalchemy.update(serve_state_schema.replicas_table).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        'svc', serve_state_schema.replicas_table.c.replica_id ==
+                        3).values(
+                            replica_state=(drifted_info.to_storage_dict())))
+                with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                                   match='exact terminal provider absence'):
+                    binding.transfer_service_owner_in_connection(
+                        connection,
+                        service_name='svc',
+                        expected_incarnation=_CONTROLLER_ID,
+                        expected_owner_epoch=6,
+                        new_incarnation=uuid.UUID(
+                            '88888888-8888-4888-8888-888888888888'),
+                        new_controller_pid=902,
+                        new_controller_ip='10.0.0.8',
+                        capable=True)
+                unchanged_owner = connection.execute(
+                    sqlalchemy.select(
+                        serve_state_schema.services_table.c.
+                        controller_incarnation).where(
+                            serve_state_schema.services_table.c.name ==
+                            'svc')).scalar_one()
+                assert unchanged_owner == _CONTROLLER_ID
+            finally:
+                nested.rollback()
+
+            def _assert_replica_free_history_rejected(**values) -> None:
+                nested = connection.begin_nested()
+                try:
+                    # Reproduce malformed history that predates the current
+                    # constraints: its replica is gone, but the association
+                    # is active or has not durably released its pin.
+                    connection.exec_driver_sql(
+                        "SET LOCAL session_replication_role = 'replica'")
+                    connection.execute(
+                        sqlalchemy.delete(
+                            serve_state_schema.replicas_table).where(
+                                serve_state_schema.replicas_table.c.service_name
+                                == 'svc',
+                                serve_state_schema.replicas_table.c.replica_id
+                                == 3))
+                    connection.execute(
+                        sqlalchemy.update(
+                            binding.ordinary_launch_associations_table).where(
+                                binding.ordinary_launch_associations_table.c.
+                                association_id ==
+                                identity.association_id).values(**values))
+                    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                                       match='exact terminal provider absence'):
+                        binding.transfer_service_owner_in_connection(
+                            connection,
+                            service_name='svc',
+                            expected_incarnation=_CONTROLLER_ID,
+                            expected_owner_epoch=6,
+                            new_incarnation=uuid.UUID(
+                                '99999999-9999-4999-8999-999999999999'),
+                            new_controller_pid=903,
+                            new_controller_ip='10.0.0.9',
+                            capable=True)
+                    unchanged_owner = connection.execute(
+                        sqlalchemy.select(
+                            serve_state_schema.services_table.c.
+                            controller_incarnation).where(
+                                serve_state_schema.services_table.c.name ==
+                                'svc')).scalar_one()
+                    assert unchanged_owner == _CONTROLLER_ID
+                finally:
+                    nested.rollback()
+
+            _assert_replica_free_history_rejected(
+                resolution=binding.Resolution.BOUND.value,
+                reconciliation_outcome=(
+                    binding.ReconciliationOutcome.ACTIVE_ADOPT.value),
+                pin_released_at=None)
+            malformed_history = dict(persisted_association)
+            malformed_history['pin_released_at'] = None
+            assert not binding._replica_free_association_is_inert(
+                malformed_history)
+
+            # Exact settled, pin-released association history is inert after
+            # physical replica retirement. N-2 takeover may rotate only the
+            # service owner while preserving that history byte-for-byte.
+            nested = connection.begin_nested()
+            try:
+                connection.execute(
+                    sqlalchemy.delete(serve_state_schema.replicas_table).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        'svc',
+                        serve_state_schema.replicas_table.c.replica_id == 3))
+                before_history = connection.execute(
+                    sqlalchemy.select(
+                        binding.ordinary_launch_associations_table).where(
+                            binding.ordinary_launch_associations_table.c.
+                            association_id ==
+                            identity.association_id)).mappings().one()
+                history_incarnation = uuid.UUID(
+                    'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+                history_authority = (
+                    binding.transfer_service_owner_in_connection(
+                        connection,
+                        service_name='svc',
+                        expected_incarnation=_CONTROLLER_ID,
+                        expected_owner_epoch=6,
+                        new_incarnation=history_incarnation,
+                        new_controller_pid=904,
+                        new_controller_ip='10.0.0.10',
+                        capable=True))
+                after_history = connection.execute(
+                    sqlalchemy.select(
+                        binding.ordinary_launch_associations_table).where(
+                            binding.ordinary_launch_associations_table.c.
+                            association_id ==
+                            identity.association_id)).mappings().one()
+                assert history_authority.controller_incarnation == (
+                    history_incarnation)
+                assert dict(after_history) == dict(before_history)
+            finally:
+                nested.rollback()
+
+        assert (
+            binding.validate_reserved_fill_cleanup_association_in_connection(
+                connection, service, replica, persisted_association) == profile)
         association, teardown_info = (
             binding.projected_provider_absence_cleanup_authority_in_connection(
                 connection, 'svc', 3, str(_RECORD_ID)))
     assert association['capability_cohort_epoch'] == historical_cohort
     assert association['resolution'] == binding.Resolution.PROJECTED.value
     assert teardown_info.status.value == 'SHUTTING_DOWN'
+
+    if history_distance == 2:
+        _take_over_projected_n2()
+        with binding_database.begin() as connection:
+            association, teardown_info = (
+                binding.
+                projected_provider_absence_cleanup_authority_in_connection(
+                    connection, 'svc', 3, str(_RECORD_ID)))
+        assert association['capability_cohort_epoch'] == historical_cohort
+        assert association['resolution'] == binding.Resolution.PROJECTED.value
+        assert teardown_info.status.value == 'SHUTTING_DOWN'
+
+    if history_distance == 1:
+        # A terminal graph cannot cross cohort rotation: the immutable
+        # association would keep cohort N-1 while the service changed to N,
+        # stranding its exact cleanup authority.  Physical replica retirement
+        # must commit first; retained association history is then harmless.
+        with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                           match='backed by a retained replica'):
+            with binding_database.begin() as connection:
+                binding.demote_non_pool_launch_service_in_connection(
+                    connection,
+                    service_name='svc',
+                    controller_incarnation=_CONTROLLER_ID,
+                    controller_owner_epoch=6,
+                    expected_binding_epoch=6,
+                    request_barrier_clear=lambda _connection: True)
+        with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                           match='backed by a retained replica'):
+            with binding_database.begin() as connection:
+                binding.demote_service_in_connection(
+                    connection,
+                    service_name='svc',
+                    controller_incarnation=_CONTROLLER_ID,
+                    controller_owner_epoch=6,
+                    expected_binding_epoch=6,
+                    request_barrier_clear=lambda _connection: True)
+        with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                           match='retained prior-cohort association graphs'):
+            with binding_database.begin() as connection:
+                binding.promote_non_pool_launch_service_in_connection(
+                    connection,
+                    service_name='svc',
+                    controller_incarnation=_CONTROLLER_ID,
+                    controller_owner_epoch=6,
+                    expected_binding_epoch=6,
+                    participant_barrier_passed=lambda _connection: True,
+                    legacy_requests_drained=lambda _connection: True)
+        with binding_database.begin() as connection:
+            deleted = connection.execute(
+                sqlalchemy.delete(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3))
+            assert deleted.rowcount == 1
+            assert binding.promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                expected_binding_epoch=6,
+                participant_barrier_passed=lambda _connection: True,
+                legacy_requests_drained=lambda _connection: True) == 7
 
 
 @pytest.mark.parametrize(('service_cohort', 'association_cohort'), (
@@ -1272,7 +2029,7 @@ def test_adjacent_v5_reserved_fill_graph_settles_provider_absence(
 def test_reserved_fill_cleanup_rejects_older_or_mismatched_cohorts(
         binding_database, monkeypatch, service_cohort,
         association_cohort) -> None:
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 6
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 7
     service, replica, association, _ = _reserved_fill_cleanup_rows(
         service_cohort, association_cohort)
     profile_validation_called = False
@@ -1623,6 +2380,78 @@ def test_serve047_generic_capability_transition_is_adjacent_and_reversible(
     assert service['non_pool_launch_receipt_protocol_version'] is None
 
 
+@pytest.mark.parametrize(('history_distance', 'takeover_allowed'), (
+    (1, True),
+    (2, True),
+    (3, False),
+))
+def test_generic_owner_transfer_preserves_n1_allows_empty_n2_and_rejects_n3(
+        binding_database, monkeypatch, history_distance,
+        takeover_allowed) -> None:
+    current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+    historical_cohort = current_cohort - history_distance
+    with monkeypatch.context() as historical_code:
+        historical_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
+                                historical_cohort)
+        with binding_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        status='READY'))
+            assert binding.promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                expected_binding_epoch=5,
+                participant_barrier_passed=lambda _connection: True,
+                legacy_requests_drained=lambda _connection: True) == 6
+            if history_distance == 2:
+                # An empty service is the sole N-2 no-graph shape.  Retained
+                # replica rows require one exact terminal ABSENT association.
+                deleted = connection.execute(
+                    sqlalchemy.delete(serve_state_schema.replicas_table).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        'svc'))
+                assert deleted.rowcount == 1
+
+    new_incarnation = uuid.UUID('44444444-4444-4444-8444-444444444444')
+    if takeover_allowed:
+        with binding_database.begin() as connection:
+            authority = binding.transfer_service_owner_in_connection(
+                connection,
+                service_name='svc',
+                expected_incarnation=_CONTROLLER_ID,
+                expected_owner_epoch=6,
+                new_incarnation=new_incarnation,
+                new_controller_pid=456,
+                new_controller_ip='10.0.0.4',
+                capable=True)
+        assert authority.controller_incarnation == new_incarnation
+        assert authority.non_pool_capability_cohort_epoch == historical_cohort
+    else:
+        with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                           match='unsupported generic cohort'):
+            with binding_database.begin() as connection:
+                binding.transfer_service_owner_in_connection(
+                    connection,
+                    service_name='svc',
+                    expected_incarnation=_CONTROLLER_ID,
+                    expected_owner_epoch=6,
+                    new_incarnation=new_incarnation,
+                    new_controller_pid=456,
+                    new_controller_ip='10.0.0.4',
+                    capable=True)
+        with binding_database.connect() as connection:
+            owner = connection.execute(
+                sqlalchemy.select(
+                    serve_state_schema.services_table.c.controller_incarnation,
+                    serve_state_schema.services_table.c.controller_owner_epoch).
+                where(serve_state_schema.services_table.c.name == 'svc')).one()
+        assert owner == (_CONTROLLER_ID, 6)
+
+
 def test_serve056_rotates_generic_cohort_only_after_new_fleet_and_drain(
         binding_database, monkeypatch) -> None:
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
@@ -1730,7 +2559,7 @@ def test_serve056_cohort_rotation_rejects_unsettled_association(
         identity, _, _ = _admit_generic_paid(binding_database)
 
     with pytest.raises(binding.OrdinaryLaunchBindingConflict,
-                       match='unsettled prior-cohort associations'):
+                       match='retained prior-cohort association graphs'):
         with binding_database.begin() as connection:
             connection.execute(
                 sqlalchemy.update(serve_state_schema.replicas_table).where(
@@ -2916,11 +3745,51 @@ def test_transition_barriers_run_after_all_canonical_serve_locks(
     context = _bound_context(identity, admission.launch_generation)
     with binding_database.begin() as connection:
         _pre_effect_settle(connection, context)
-        connection.execute(
-            sqlalchemy.update(serve_state_schema.replicas_table).where(
+        # Capability rotation cannot carry an association-backed physical
+        # replica across the cohort boundary.  Retire that exact graph first,
+        # while retaining one unrelated legacy replica so the callback below
+        # still proves the canonical replica-row lock is acquired before any
+        # transition barrier runs.
+        deleted = connection.execute(
+            sqlalchemy.delete(serve_state_schema.replicas_table).where(
                 serve_state_schema.replicas_table.c.service_name == 'svc',
-                serve_state_schema.replicas_table.c.replica_id == 3).values(
-                    status='READY'))
+                serve_state_schema.replicas_table.c.replica_id == 3))
+        assert deleted.rowcount == 1
+        retained_info = replica_managers.ReplicaInfo(replica_id=4,
+                                                     cluster_name='svc-4',
+                                                     replica_port='8080',
+                                                     is_spot=False,
+                                                     location=None,
+                                                     version=2,
+                                                     resources_override=None)
+        retained_info.replica_record_id = (
+            '44444444-4444-4444-8444-444444444444')
+        retained_info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.RUNNING)
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                service_name='svc',
+                replica_id=4,
+                replica_state_version=1,
+                status='READY',
+                version=2,
+                cluster_name='svc-4',
+                is_spot=False,
+                replica_state=retained_info.to_storage_dict()))
+        retained_replicas = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.replica_id,
+                serve_state_schema.replicas_table.c.
+                ordinary_launch_association_id).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    'svc')).all()
+        retained_associations = connection.execute(
+            sqlalchemy.select(
+                binding.ordinary_launch_associations_table.c.association_id).
+            where(binding.ordinary_launch_associations_table.c.service_name ==
+                  'svc')).scalars().all()
+        assert retained_replicas == [(4, None)]
+        assert retained_associations == [identity.association_id]
 
     callbacks: list[str] = []
 

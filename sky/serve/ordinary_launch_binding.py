@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from collections.abc import Iterator
 from collections.abc import Mapping
+from collections.abc import Sequence
 import contextlib
 import contextvars
 import dataclasses
@@ -3234,6 +3235,34 @@ def _validate_retained_generic_cleanup_capability(
             'Service is not owned by a retained generic cleanup cohort.')
 
 
+def _validate_terminal_generic_cleanup_capability(
+    service: Mapping[str, Any],
+    *,
+    capability_cohort_epoch: int | None,
+    capability_profile_set_digest: str | None,
+    receipt_protocol_version: int | None,
+) -> None:
+    """Accept N/N-1/N-2 only after complete terminal cleanup proof.
+
+    This predicate must remain downstream of frozen-profile, zero-paid,
+    terminal, execution-quiescence, projected-pin-release, and canonical
+    provider-absence validation.  It must never guard admission, adoption,
+    provider reconciliation/evidence writes, or provider-effect start.
+    """
+    actual = _non_pool_capability_from_service(service)
+    if (actual != (True, NON_POOL_BINDING_PROTOCOL_VERSION,
+                   capability_profile_set_digest, capability_cohort_epoch,
+                   receipt_protocol_version) or capability_profile_set_digest
+            != supported_non_pool_profile_set_digest() or
+            type(capability_cohort_epoch) is not int or capability_cohort_epoch
+            not in (NON_POOL_CAPABILITY_COHORT_EPOCH,
+                    NON_POOL_CAPABILITY_COHORT_EPOCH - 1,
+                    NON_POOL_CAPABILITY_COHORT_EPOCH - 2) or
+            receipt_protocol_version != NON_POOL_RECEIPT_PROTOCOL_VERSION):
+        raise OrdinaryLaunchBindingConflict(
+            'Service is not owned by a terminal generic cleanup cohort.')
+
+
 def _validate_profile_authority_in_connection(
     connection: sqlalchemy.engine.Connection,
     service: Mapping[str, Any],
@@ -3343,11 +3372,32 @@ def validate_reserved_fill_cleanup_association_in_connection(
             context.profile.kind is not NonPoolLaunchProfileKind.RESERVED_FILL):
         raise OrdinaryLaunchBindingConflict(
             'Cleanup association is not an exact reserved-fill profile.')
-    _validate_retained_generic_cleanup_capability(
-        service,
-        capability_cohort_epoch=context.capability_cohort_epoch,
-        capability_profile_set_digest=context.capability_profile_set_digest,
-        receipt_protocol_version=context.receipt_protocol_version)
+    try:
+        _validate_retained_generic_cleanup_capability(
+            service,
+            capability_cohort_epoch=context.capability_cohort_epoch,
+            capability_profile_set_digest=(
+                context.capability_profile_set_digest),
+            receipt_protocol_version=context.receipt_protocol_version)
+    except OrdinaryLaunchBindingConflict as error:
+        # N-2 is deliberately unavailable to the broad settlement paths.  It
+        # may pass this cleanup boundary only when the already-projected
+        # history independently proves terminal quiescence, released pins,
+        # zero paid authority, and canonical post-quiescence ABSENT evidence.
+        if (context.capability_cohort_epoch
+                != NON_POOL_CAPABILITY_COHORT_EPOCH - 2 or
+                service.get('non_pool_launch_capability_cohort_epoch')
+                != context.capability_cohort_epoch):
+            raise
+        canonical_association, _ = (
+            projected_provider_absence_retirement_authority_in_connection(
+                connection, context.service_name, context.replica_id,
+                str(context.replica_record_id)))
+        if dict(canonical_association) != dict(association):
+            raise OrdinaryLaunchBindingConflict(
+                'Terminal N-2 cleanup does not match its locked association.'
+            ) from error
+        return context.profile
     _validate_reserved_fill_cleanup_profile_in_connection(
         connection, service, replica, context.profile)
     return context.profile
@@ -4001,8 +4051,10 @@ def _binding_allows_request(
          row['_current_non_pool_profile_set']
          == supported_non_pool_profile_set_digest() and
          row['_current_non_pool_cohort'] == row['capability_cohort_epoch'] and
-         row['_current_non_pool_receipt'] == row['receipt_protocol_version'] ==
-         NON_POOL_RECEIPT_PROTOCOL_VERSION))
+         row['_current_non_pool_cohort'] in
+         (NON_POOL_CAPABILITY_COHORT_EPOCH, NON_POOL_CAPABILITY_COHORT_EPOCH -
+          1) and row['_current_non_pool_receipt'] ==
+         row['receipt_protocol_version'] == NON_POOL_RECEIPT_PROTOCOL_VERSION))
     expected_association_id = (row['association_id'] if association_uuid is None
                                else association_uuid)
     authorized = bool(
@@ -4197,6 +4249,24 @@ def _validate_effect_rows(
             != association['owner_controller_epoch']):
         raise OrdinaryLaunchBindingConflict(
             'Service lifecycle, binding epoch, or owner changed.')
+    if persisted_profile is not None:
+        if not isinstance(context, BoundNonPoolLaunchContext):
+            raise OrdinaryLaunchBindingConflict(
+                'Generic association lost its typed execution context.')
+        if require_launch_authorized:
+            _validate_generic_capability(
+                service,
+                capability_cohort_epoch=context.capability_cohort_epoch,
+                capability_profile_set_digest=(
+                    context.capability_profile_set_digest),
+                receipt_protocol_version=context.receipt_protocol_version)
+        else:
+            _validate_retained_generic_cleanup_capability(
+                service,
+                capability_cohort_epoch=context.capability_cohort_epoch,
+                capability_profile_set_digest=(
+                    context.capability_profile_set_digest),
+                receipt_protocol_version=context.receipt_protocol_version)
     if require_launch_authorized:
         try:
             service_status = serve_statuses.ServiceStatus[str(
@@ -4209,16 +4279,6 @@ def _validate_effect_rows(
                               replica_launch_blocking_statuses()):
             raise OrdinaryLaunchBindingConflict(
                 'Service no longer authorizes provider effects.')
-        if persisted_profile is not None:
-            if not isinstance(context, BoundNonPoolLaunchContext):
-                raise OrdinaryLaunchBindingConflict(
-                    'Generic association lost its typed execution context.')
-            _validate_generic_capability(
-                service,
-                capability_cohort_epoch=context.capability_cohort_epoch,
-                capability_profile_set_digest=(
-                    context.capability_profile_set_digest),
-                receipt_protocol_version=context.receipt_protocol_version)
 
 
 def lock_reduction_authority_in_connection(
@@ -4593,7 +4653,7 @@ def transfer_service_owner_in_connection(
     new_controller_ip: str | None,
     capable: bool,
 ) -> ControllerBindingAuthority:
-    """Transfer service and every unsettled association in one transaction."""
+    """Transfer service and only associations in the mutable cohort window."""
     _require_postgres(connection)
     expected_incarnation = _canonical_uuid(expected_incarnation,
                                            'expected_incarnation')
@@ -4620,6 +4680,35 @@ def transfer_service_owner_in_connection(
     if service['ordinary_launch_binding_mode'] == 'bound' and not capable:
         raise OrdinaryLaunchBindingConflict(
             'An incapable controller cannot own a bound service.')
+    capability = _non_pool_capability_from_service(service)
+    exact_capability_prefix = (
+        True,
+        NON_POOL_BINDING_PROTOCOL_VERSION,
+        supported_non_pool_profile_set_digest(),
+    )
+    exact_capability_suffix = (NON_POOL_RECEIPT_PROTOCOL_VERSION,)
+    supported_capabilities = {
+        (*exact_capability_prefix, NON_POOL_CAPABILITY_COHORT_EPOCH,
+         *exact_capability_suffix),
+        (*exact_capability_prefix, NON_POOL_CAPABILITY_COHORT_EPOCH - 1,
+         *exact_capability_suffix),
+        (*exact_capability_prefix, NON_POOL_CAPABILITY_COHORT_EPOCH - 2,
+         *exact_capability_suffix),
+    }
+    if capability[0] is True and capability not in supported_capabilities:
+        raise OrdinaryLaunchBindingConflict(
+            'Controller transfer encountered an unsupported generic cohort.')
+    terminal_n2_takeover = capability == (
+        *exact_capability_prefix,
+        NON_POOL_CAPABILITY_COHORT_EPOCH - 2,
+        *exact_capability_suffix,
+    )
+    if terminal_n2_takeover:
+        if not _retained_graphs_have_terminal_absence_authority(
+                connection, lifecycle, service):
+            raise OrdinaryLaunchBindingConflict(
+                'N-2 controller transfer requires exact terminal provider '
+                'absence for every retained association-backed replica.')
     new_epoch = expected_owner_epoch + 1
     updated = connection.execute(
         sqlalchemy.update(serve_state_schema.services_table).where(
@@ -4644,30 +4733,48 @@ def transfer_service_owner_in_connection(
                 controller_port=None))
     if updated.rowcount != 1:
         raise OrdinaryLaunchBindingConflict('Service owner transfer lost CAS.')
-    try:
-        capacity_authority.rebind_service_after_controller_takeover_in_connection(
-            connection,
-            service_name=service_name,
-            controller_incarnation=new_incarnation,
-            controller_owner_epoch=new_epoch)
-    except capacity_admission.CapacityAdmissionError as error:
-        raise OrdinaryLaunchBindingConflict(
-            'Controller transfer could not preserve capacity authority.'
-        ) from error
-    route_projection.revoke_service_leases_in_session(
-        connection, service_name, 'controller_owner_changed')
-    connection.execute(
-        sqlalchemy.update(ordinary_launch_associations_table).where(
-            ordinary_launch_associations_table.c.service_name == service_name,
-            ordinary_launch_associations_table.c.resolution.in_(
-                tuple(value.value for value in UNSETTLED_RESOLUTIONS))).values(
-                    owner_controller_incarnation=new_incarnation,
-                    owner_controller_epoch=new_epoch,
-                    owner_revision=(
-                        ordinary_launch_associations_table.c.owner_revision +
-                        1),
-                    owner_transferred_at=sqlalchemy.func.clock_timestamp(),
-                    updated_at=sqlalchemy.func.clock_timestamp()))
+    if not terminal_n2_takeover:
+        try:
+            capacity_authority.rebind_service_after_controller_takeover_in_connection(
+                connection,
+                service_name=service_name,
+                controller_incarnation=new_incarnation,
+                controller_owner_epoch=new_epoch)
+        except capacity_admission.CapacityAdmissionError as error:
+            raise OrdinaryLaunchBindingConflict(
+                'Controller transfer could not preserve capacity authority.'
+            ) from error
+        route_projection.revoke_service_leases_in_session(
+            connection, service_name, 'controller_owner_changed')
+        connection.execute(
+            sqlalchemy.update(ordinary_launch_associations_table).where(
+                ordinary_launch_associations_table.c.service_name ==
+                service_name,
+                ordinary_launch_associations_table.c.resolution.in_(
+                    tuple(value.value for value in UNSETTLED_RESOLUTIONS)),
+                sqlalchemy.or_(
+                    ordinary_launch_associations_table.c.
+                    binding_protocol_version.is_(None),
+                    sqlalchemy.and_(
+                        ordinary_launch_associations_table.c.
+                        binding_protocol_version ==
+                        NON_POOL_BINDING_PROTOCOL_VERSION,
+                        ordinary_launch_associations_table.c.
+                        capability_cohort_epoch.in_((
+                            NON_POOL_CAPABILITY_COHORT_EPOCH,
+                            NON_POOL_CAPABILITY_COHORT_EPOCH - 1,
+                        )), ordinary_launch_associations_table.c.
+                        capability_profile_set_digest ==
+                        supported_non_pool_profile_set_digest(),
+                        ordinary_launch_associations_table.c.
+                        receipt_protocol_version ==
+                        NON_POOL_RECEIPT_PROTOCOL_VERSION))).
+            values(owner_controller_incarnation=new_incarnation,
+                   owner_controller_epoch=new_epoch,
+                   owner_revision=(
+                       ordinary_launch_associations_table.c.owner_revision + 1),
+                   owner_transferred_at=(sqlalchemy.func.clock_timestamp()),
+                   updated_at=sqlalchemy.func.clock_timestamp()))
     return _authority_from_service(service,
                                    controller_pid=new_controller_pid,
                                    controller_ip=new_controller_ip,
@@ -5209,6 +5316,7 @@ def _lock_transition_rows(
                 service_name).order_by(
                     ordinary_launch_associations_table.c.association_id).
             with_for_update()).mappings())
+
     return lifecycle, service, replicas, associations
 
 
@@ -5227,6 +5335,249 @@ def _transition_barrier_passes(
             f'A precomputed passing {description} cannot authorize a '
             'transition; provide a transaction-local callback.')
     raise TypeError(f'{description} must be a boolean or callable.')
+
+
+def _has_no_retained_association_graphs(
+    replicas: Sequence[Mapping[str, Any]],
+    associations: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Require every association-backed replica to retire before rotation.
+
+    The immutable association keeps its origin cohort, while the service tuple
+    changes during rotation.  Carrying even a terminal PROJECTED/ABSENT graph
+    across that change would make its exact cleanup authority disagree with
+    the service and strand the replica.  Historical associations are safe only
+    after their exact replica record has been physically retired.
+    """
+    replica_records: set[tuple[int, str]] = set()
+    try:
+        for replica in replicas:
+            info = _locked_replica_info(replica)
+            replica_records.add(
+                (int(replica['replica_id']), str(info.replica_record_id)))
+    except (KeyError, TypeError, ValueError):
+        return False
+    try:
+        association_records = {(int(association['replica_id']),
+                                str(association['replica_record_id']))
+                               for association in associations}
+    except (KeyError, TypeError, ValueError):
+        return False
+    return replica_records.isdisjoint(association_records)
+
+
+def _replica_free_association_is_inert(association: Mapping[str, Any],) -> bool:
+    """Validate history that no longer has a matching replica record.
+
+    N-2 takeover deliberately leaves association ownership byte-stable.  A
+    replica-free row is therefore safe to carry only after its effect is
+    terminal, its projection and pin release are durable, and its closed
+    protocol shape is internally consistent.  Normal PostgreSQL constraints
+    enforce the same shapes for current writes; these checks also fail closed
+    for malformed history that predates those constraints.
+    """
+    try:
+        resolution = Resolution(str(association['resolution']))
+        effect_phase = EffectPhase(str(association['effect_phase']))
+        TerminalStatus(str(association['terminal_status']))
+        execution_generation = association['terminal_execution_generation']
+        quiescence_required = association['execution_quiescence_required']
+        profile = _association_profile(association)
+    except (KeyError, TypeError, ValueError, OrdinaryLaunchBindingConflict):
+        return False
+    terminal_cause = association.get('terminal_cause')
+    projection_times = (
+        association.get('projected_at'),
+        association.get('pin_released_at'),
+        association.get('tombstone_not_before'),
+    )
+    if (resolution not in SETTLED_RESOLUTIONS or
+            not isinstance(terminal_cause, str) or not terminal_cause or
+            len(terminal_cause) > 256 or
+            type(execution_generation) is not int or execution_generation < 0 or
+            type(quiescence_required) is not bool or
+            any(not isinstance(value, datetime.datetime)
+                for value in projection_times)):
+        return False
+    if quiescence_required:
+        quiesced_generation = association.get('execution_quiesced_generation')
+        quiesced_at = association.get('execution_quiesced_at')
+        if (type(quiesced_generation) is not int or
+                quiesced_generation != execution_generation or
+                not isinstance(quiesced_at, datetime.datetime)):
+            return False
+
+    if resolution is Resolution.PRE_EFFECT_TERMINAL:
+        if (effect_phase is not EffectPhase.NOT_STARTED or
+                association.get('service_job_id') is not None):
+            return False
+    elif effect_phase is EffectPhase.SERVICE_JOB_RECORDED:
+        service_job_id = association.get('service_job_id')
+        if type(service_job_id) is not int or service_job_id < 1:
+            return False
+    else:
+        # Provider-absence projection is the only settled path without a
+        # recorded service job.  It must retain exact post-quiescence ABSENT
+        # evidence even though its replica record has already retired.
+        observed_at = association.get('provider_evidence_observed_at')
+        quiesced_at = association.get('execution_quiesced_at')
+        if (profile is None or
+                profile.kind is not NonPoolLaunchProfileKind.RESERVED_FILL or
+                association.get('binding_protocol_version')
+                != NON_POOL_BINDING_PROTOCOL_VERSION or
+                association.get('reconciliation_outcome')
+                != ReconciliationOutcome.PROJECTED.value or
+                association.get('provider_evidence')
+                != ProviderEvidence.ABSENT.value or
+                association.get('service_job_id') is not None or
+                association.get('paid_capacity_pool_key') is not None or
+                quiescence_required is not True or execution_generation < 1 or
+                not isinstance(observed_at, datetime.datetime) or
+                not isinstance(quiesced_at, datetime.datetime) or
+                observed_at < quiesced_at):
+            return False
+
+    if profile is None:
+        return all(
+            association.get(field) is None for field in (
+                'binding_protocol_version',
+                'reconciliation_outcome',
+                'provider_evidence',
+                'provider_evidence_observed_at',
+                'provider_evidence_payload',
+                'provider_evidence_digest',
+            ))
+
+    try:
+        reconciliation_outcome = ReconciliationOutcome(
+            str(association['reconciliation_outcome']))
+        provider_evidence = ProviderEvidence(
+            str(association['provider_evidence']))
+    except (KeyError, TypeError, ValueError):
+        return False
+    expected_outcome = (ReconciliationOutcome.PRE_EFFECT_TERMINAL
+                        if resolution is Resolution.PRE_EFFECT_TERMINAL else
+                        ReconciliationOutcome.PROJECTED)
+    capability_cohort = association.get('capability_cohort_epoch')
+    capability_digest = association.get('capability_profile_set_digest')
+    if (association.get('binding_protocol_version')
+            != NON_POOL_BINDING_PROTOCOL_VERSION or
+            type(capability_cohort) is not int or capability_cohort < 1 or
+            not isinstance(capability_digest, str) or
+            _SHA256_RE.fullmatch(capability_digest) is None or
+            association.get('receipt_protocol_version')
+            != NON_POOL_RECEIPT_PROTOCOL_VERSION or
+            reconciliation_outcome is not expected_outcome):
+        return False
+    observed_at = association.get('provider_evidence_observed_at')
+    evidence_payload = association.get('provider_evidence_payload')
+    evidence_digest = association.get('provider_evidence_digest')
+    if provider_evidence is ProviderEvidence.NOT_QUERIED:
+        return (observed_at is None and evidence_payload is None and
+                evidence_digest is None)
+    if resolution is Resolution.PRE_EFFECT_TERMINAL:
+        return False
+    return (isinstance(observed_at, datetime.datetime) and
+            isinstance(evidence_payload, Mapping) and bool(evidence_payload) and
+            isinstance(evidence_digest, str) and
+            _SHA256_RE.fullmatch(evidence_digest) is not None)
+
+
+def _retained_graphs_have_terminal_absence_authority(
+    connection: sqlalchemy.engine.Connection,
+    lifecycle: Mapping[str, Any],
+    service: Mapping[str, Any],
+) -> bool:
+    """Lock and validate every retained graph for terminal N-2 takeover.
+
+    The caller already owns lifecycle and service locks.  This census acquires
+    every remaining row class once in canonical order: replicas, paid claims,
+    then associations.  Validation consumes those locked mappings directly;
+    it must not perform a later claim lock behind an association lock.
+    """
+    service_name = str(service['name'])
+    replicas = list(
+        connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                service_name).order_by(
+                    serve_state_schema.replicas_table.c.replica_id).
+            with_for_update()).mappings())
+    claims = list(
+        connection.execute(
+            sqlalchemy.select(serve_state_schema.paid_capacity_claims_table).
+            where(
+                serve_state_schema.paid_capacity_claims_table.c.service_name ==
+                service_name).order_by(
+                    serve_state_schema.paid_capacity_claims_table.c.replica_id,
+                    serve_state_schema.paid_capacity_claims_table.c.pool_key).
+            with_for_update()).mappings())
+    associations = list(
+        connection.execute(
+            sqlalchemy.select(ordinary_launch_associations_table).where(
+                ordinary_launch_associations_table.c.service_name ==
+                service_name).order_by(
+                    ordinary_launch_associations_table.c.association_id).
+            with_for_update()).mappings())
+
+    # The N-2 branch deliberately preserves capacity authority byte-for-byte.
+    # It is therefore available only to a completely zero-paid terminal
+    # census, including replicas whose association history is missing.
+    if claims:
+        return False
+
+    try:
+        replica_records: dict[tuple[int, str], Mapping[str, Any]] = {}
+        for replica in replicas:
+            # PROJECTED/ABSENT clears this pointer atomically.  A dangling,
+            # mismatched, or merely unresolved pointer must never be mistaken
+            # for the permitted no-graph shape.
+            if replica['ordinary_launch_association_id'] is not None:
+                return False
+            info = _locked_replica_info(replica)
+            key = (int(replica['replica_id']), str(info.replica_record_id))
+            if key in replica_records:
+                return False
+            replica_records[key] = replica
+        retained_associations: dict[tuple[int, str], list[Mapping[str,
+                                                                  Any]]] = {}
+        replica_free_associations: list[Mapping[str, Any]] = []
+        for association in associations:
+            key = (int(association['replica_id']),
+                   str(association['replica_record_id']))
+            if key in replica_records:
+                retained_associations.setdefault(key, []).append(association)
+            else:
+                replica_free_associations.append(association)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+    # An empty service is the sole legitimate no-graph shape.  Every retained
+    # replica row must otherwise resolve to exactly one current-record graph;
+    # an unassociated or historically mismatched row may still need ordinary
+    # takeover/recovery and cannot enter the non-mutating N-2 branch.
+    if set(retained_associations) != set(replica_records):
+        return False
+    if any(not _replica_free_association_is_inert(association)
+           for association in replica_free_associations):
+        return False
+
+    for key, candidates in retained_associations.items():
+        if (len(candidates) != 1 or
+                candidates[0].get('binding_protocol_version')
+                != NON_POOL_BINDING_PROTOCOL_VERSION):
+            return False
+        try:
+            projected, info = (
+                _validate_projected_provider_absence_retirement_locked_rows(
+                    connection, lifecycle, service, replica_records[key], (),
+                    candidates))
+        except (OrdinaryLaunchBindingConflict, TypeError, ValueError):
+            return False
+        if (projected['association_id'] != candidates[0]['association_id'] or
+                not replica_has_provider_present_cleanup_marker(info)):
+            return False
+    return True
 
 
 def promote_service_in_connection(
@@ -5388,10 +5739,13 @@ def promote_non_pool_launch_service_in_connection(
             if association['resolution'] in tuple(
                 value.value for value in UNSETTLED_RESOLUTIONS)
         ]
-        if service['pool'] != 0 or pending or unsettled:
+        no_retained_graphs = _has_no_retained_association_graphs(
+            replicas, associations)
+        if (service['pool'] != 0 or pending or unsettled or
+                not no_retained_graphs):
             raise OrdinaryLaunchBindingConflict(
                 'Generic capability rotation requires no pending replicas or '
-                'unsettled prior-cohort associations.')
+                'retained prior-cohort association graphs.')
         result = connection.execute(
             sqlalchemy.update(serve_state_schema.services_table).where(
                 serve_state_schema.services_table.c.name == service_name,
@@ -5530,9 +5884,12 @@ def demote_service_in_connection(
                      for association in associations)
     pointers = sum(replica['ordinary_launch_association_id'] is not None
                    for replica in replicas)
-    if unresolved or pointers:
+    no_retained_graphs = _has_no_retained_association_graphs(
+        replicas, associations)
+    if unresolved or pointers or not no_retained_graphs:
         raise OrdinaryLaunchBindingConflict(
-            'Bound associations remain active, unprojected, or pinned.')
+            'Bound associations remain active, unprojected, pinned, or '
+            'backed by a retained replica.')
     next_epoch = int(service['ordinary_launch_binding_epoch']) + 1
     connection.execute(
         sqlalchemy.update(serve_state_schema.services_table).where(
@@ -5596,9 +5953,12 @@ def demote_non_pool_launch_service_in_connection(
         for association in associations)
     pointers = sum(replica['ordinary_launch_association_id'] is not None
                    for replica in replicas)
-    if unresolved or pointers:
+    no_retained_graphs = _has_no_retained_association_graphs(
+        replicas, associations)
+    if unresolved or pointers or not no_retained_graphs:
         raise OrdinaryLaunchBindingConflict(
-            'Generic associations remain active, unprojected, or pinned.')
+            'Generic associations remain active, unprojected, pinned, or '
+            'backed by a retained replica.')
     next_epoch = int(service['ordinary_launch_binding_epoch']) + 1
     result = connection.execute(
         sqlalchemy.update(serve_state_schema.services_table).where(
@@ -6127,6 +6487,79 @@ def provider_presence_cleanup_authority_in_connection(
     return dict(association), info
 
 
+def _validate_projected_provider_absence_retirement_locked_rows(
+    connection: sqlalchemy.engine.Connection,
+    lifecycle: Mapping[str, Any] | None,
+    service: Mapping[str, Any] | None,
+    replica: Mapping[str, Any] | None,
+    claim_rows: Sequence[Any],
+    associations: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], Any]:
+    """Validate ABSENT retirement after canonical rows are already locked."""
+    if (lifecycle is None or service is None or replica is None or
+            len(associations) != 1 or claim_rows):
+        raise OrdinaryLaunchBindingConflict(
+            'Projected provider absence lost its exact service, replica, '
+            'association, or zero-paid shape.')
+    association = associations[0]
+    profile = _association_profile(association)
+    current_epoch = service['lifecycle_epoch']
+    origin_epoch = association['service_lifecycle_epoch']
+    if (type(current_epoch) is not int or type(origin_epoch) is not int or
+            lifecycle['epoch'] != current_epoch or
+            origin_epoch != current_epoch or
+            service['hash'] != association['service_hash'] or
+            service['workspace'] != association['service_workspace'] or
+            replica['ordinary_launch_association_id'] is not None or
+            association['resolution'] != Resolution.PROJECTED.value or
+            association['reconciliation_outcome']
+            != ReconciliationOutcome.PROJECTED.value or
+            association['provider_evidence'] != ProviderEvidence.ABSENT.value or
+            association['effect_phase'] not in (
+                EffectPhase.NOT_STARTED.value, EffectPhase.PROVIDER_IO.value,
+                EffectPhase.SERVICE_JOB_IO.value) or
+            association['service_job_id'] is not None or
+            association['paid_capacity_pool_key'] is not None or
+            association['terminal_status'] is None or
+            type(association['terminal_execution_generation']) is not int or
+            association['terminal_execution_generation'] < 1 or
+            association['execution_quiescence_required'] is not True or
+            association['execution_quiesced_generation']
+            != association['terminal_execution_generation'] or
+            association['execution_quiesced_at'] is None or
+            association['provider_evidence_observed_at'] is None or
+            association['provider_evidence_observed_at']
+            < association['execution_quiesced_at'] or
+            association['projected_at'] is None or
+            association['pin_released_at'] is None or
+            association['tombstone_not_before'] is None or profile is None or
+            profile.kind != NonPoolLaunchProfileKind.RESERVED_FILL or
+            not _replica_snapshot_matches_association(
+                replica, association, require_launch_authorized=False)):
+        raise OrdinaryLaunchBindingConflict(
+            'Projected provider absence history is not exact and complete.')
+    info = _locked_replica_info(replica)
+    expected_payload, expected_digest = _reserved_fill_provider_evidence(
+        association, info, ProviderEvidence.ABSENT)
+    if (association['provider_evidence_payload'] != expected_payload or
+            association['provider_evidence_digest'] != expected_digest):
+        raise OrdinaryLaunchBindingConflict(
+            'Projected provider absence evidence is not canonical.')
+    # This is the sole N-2 operational boundary.  Every check above proves a
+    # frozen zero-cost profile, terminal execution quiescence, released pin,
+    # and canonical post-quiescence provider absence before the wider
+    # terminal-only cohort window is consulted.
+    _validate_reserved_fill_cleanup_profile_in_connection(
+        connection, service, replica, profile)
+    _validate_terminal_generic_cleanup_capability(
+        service,
+        capability_cohort_epoch=association['capability_cohort_epoch'],
+        capability_profile_set_digest=association[
+            'capability_profile_set_digest'],
+        receipt_protocol_version=association['receipt_protocol_version'])
+    return dict(association), info
+
+
 def projected_provider_absence_retirement_authority_in_connection(
     connection: sqlalchemy.engine.Connection,
     service_name: str,
@@ -6180,56 +6613,8 @@ def projected_provider_absence_retirement_authority_in_connection(
                 NON_POOL_BINDING_PROTOCOL_VERSION).order_by(
                     ordinary_launch_associations_table.c.launch_generation).
             with_for_update()).mappings())
-    if (lifecycle is None or service is None or replica is None or
-            len(associations) != 1 or claim_rows):
-        raise OrdinaryLaunchBindingConflict(
-            'Projected provider absence lost its exact service, replica, '
-            'association, or zero-paid shape.')
-    association = associations[0]
-    profile = _association_profile(association)
-    current_epoch = service['lifecycle_epoch']
-    origin_epoch = association['service_lifecycle_epoch']
-    if (type(current_epoch) is not int or type(origin_epoch) is not int or
-            lifecycle['epoch'] != current_epoch or
-            origin_epoch != current_epoch or
-            service['hash'] != association['service_hash'] or
-            service['workspace'] != association['service_workspace'] or
-            replica['ordinary_launch_association_id'] is not None or
-            association['resolution'] != Resolution.PROJECTED.value or
-            association['reconciliation_outcome']
-            != ReconciliationOutcome.PROJECTED.value or
-            association['provider_evidence'] != ProviderEvidence.ABSENT.value or
-            association['effect_phase'] not in (
-                EffectPhase.NOT_STARTED.value, EffectPhase.PROVIDER_IO.value,
-                EffectPhase.SERVICE_JOB_IO.value) or
-            association['service_job_id'] is not None or
-            association['paid_capacity_pool_key'] is not None or
-            association['terminal_status'] is None or
-            type(association['terminal_execution_generation']) is not int or
-            association['terminal_execution_generation'] < 1 or
-            association['execution_quiescence_required'] is not True or
-            association['execution_quiesced_generation']
-            != association['terminal_execution_generation'] or
-            association['execution_quiesced_at'] is None or
-            association['provider_evidence_observed_at'] is None or
-            association['provider_evidence_observed_at']
-            < association['execution_quiesced_at'] or
-            association['projected_at'] is None or
-            association['pin_released_at'] is None or
-            association['tombstone_not_before'] is None or profile is None or
-            profile.kind != NonPoolLaunchProfileKind.RESERVED_FILL or
-            not _replica_snapshot_matches_association(
-                replica, association, require_launch_authorized=False)):
-        raise OrdinaryLaunchBindingConflict(
-            'Projected provider absence history is not exact and complete.')
-    info = _locked_replica_info(replica)
-    expected_payload, expected_digest = _reserved_fill_provider_evidence(
-        association, info, ProviderEvidence.ABSENT)
-    if (association['provider_evidence_payload'] != expected_payload or
-            association['provider_evidence_digest'] != expected_digest):
-        raise OrdinaryLaunchBindingConflict(
-            'Projected provider absence evidence is not canonical.')
-    return dict(association), info
+    return _validate_projected_provider_absence_retirement_locked_rows(
+        connection, lifecycle, service, replica, claim_rows, associations)
 
 
 def projected_provider_absence_cleanup_authority_in_connection(
@@ -6387,6 +6772,12 @@ def release_projected_paid_capacity_claim_in_connection(
     observe the claim; all writes remain invisible until the shared transaction
     commits.
     """
+    service = None
+    if isinstance(context, BoundNonPoolLaunchContext):
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == context.service_name
+            ).with_for_update()).mappings().one_or_none()
     association = connection.execute(
         sqlalchemy.select(ordinary_launch_associations_table).where(
             ordinary_launch_associations_table.c.association_id ==
@@ -6402,6 +6793,16 @@ def release_projected_paid_capacity_claim_in_connection(
                 value.value for value in SETTLED_RESOLUTIONS)):
         raise OrdinaryLaunchBindingConflict(
             'Paid-capacity release lost the exact projected association.')
+    if isinstance(context, BoundNonPoolLaunchContext):
+        if service is None:
+            raise OrdinaryLaunchBindingConflict(
+                'Paid-capacity release lost its generic service tuple.')
+        _validate_retained_generic_cleanup_capability(
+            service,
+            capability_cohort_epoch=context.capability_cohort_epoch,
+            capability_profile_set_digest=(
+                context.capability_profile_set_digest),
+            receipt_protocol_version=context.receipt_protocol_version)
     claims = serve_state_schema.paid_capacity_claims_table
     predicates = (
         claims.c.service_name == association['service_name'],
