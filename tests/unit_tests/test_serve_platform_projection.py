@@ -3,6 +3,9 @@
 import copy
 import hashlib
 import json
+import os
+import pathlib
+import subprocess
 from unittest import mock
 
 import pytest
@@ -55,7 +58,10 @@ def _node_local_cache():
         'kind': 'node_local',
         'mount_path': '/mnt/sky-cache',
         'volume_name': 'phx-cache',
-        'host_path': '/mnt/local-nvme/sky-cache',
+        'host_path': '/mnt/local-nvme/boltz-platform/sky-cache',
+        'host_mount_path': '/mnt/local-nvme',
+        'relative_path': 'boltz-platform/sky-cache',
+        'bootstrap_image': ('registry.example/skypilot-api@sha256:' + 'a' * 64),
         'attestation': {
             'attestation_id': 'phx-cache-v1',
             'device_source_pattern': '^/dev/nvme[0-9]+n[0-9]+$',
@@ -98,14 +104,14 @@ def _worker_projection(*,
             'kind': 'none'
         },
     }
-    if protocol_version in (2, 3, 4, 5, 6, 7):
+    if protocol_version in (2, 3, 4, 5, 6, 7, 8):
         projection = {
             'projection_version': protocol_version,
             **projection,
             'scheduler_name': scheduler_name,
             'kueue_admission': kueue_admission,
         }
-    if protocol_version in (3, 4, 5, 6, 7):
+    if protocol_version in (3, 4, 5, 6, 7, 8):
         projection['provision_timeout'] = provision_timeout
         projection['scratch'] = ({
             'kind': 'none'
@@ -131,8 +137,305 @@ def _current_bootstrap_pod_environment() -> list[dict[str, str]]:
         kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENVIRONMENT.items())]
 
 
+def _run_cache_bootstrap(tmp_path: pathlib.Path,
+                         cache=None,
+                         *,
+                         source='/dev/nvme0n1',
+                         filesystem_type='xfs',
+                         target=None,
+                         parent_mode=0o1777):
+    cache = copy.deepcopy(_node_local_cache() if cache is None else cache)
+    parent = tmp_path / 'cache-parent'
+    parent.mkdir(exist_ok=True)
+    parent.chmod(parent_mode)
+    fake_bin = tmp_path / 'bin'
+    fake_bin.mkdir(exist_ok=True)
+    findmnt = fake_bin / 'findmnt'
+    findmnt.write_text(
+        '#!/usr/bin/env python3\n'
+        'import json, os\n'
+        'print(json.dumps({"filesystems": [{\n'
+        '  "source": os.environ["FAKE_FINDMNT_SOURCE"],\n'
+        '  "fstype": os.environ["FAKE_FINDMNT_FSTYPE"],\n'
+        '  "target": os.environ["FAKE_FINDMNT_TARGET"],\n'
+        '}]}))\n',
+        encoding='utf-8')
+    findmnt.chmod(0o755)
+    environment = dict(os.environ)
+    _, relative_path = (kubernetes_pod_spec.
+                        projected_worker_cache_mount_and_relative_path(cache))
+    environment.update({
+        item['name']: item['value']
+        for item in kubernetes_pod_spec._cache_bootstrap_environment(
+            cache, relative_path)
+    })
+    environment.update({
+        (kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_ENV_PREFIX + 'PARENT_MOUNT_PATH'):
+            str(parent),
+        'FAKE_FINDMNT_SOURCE': source,
+        'FAKE_FINDMNT_FSTYPE': filesystem_type,
+        'FAKE_FINDMNT_TARGET': str(parent) if target is None else target,
+        'PATH': f'{fake_bin}:{environment["PATH"]}',
+    })
+    result = subprocess.run([
+        *kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_COMMAND,
+        kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT,
+    ],
+                            env=environment,
+                            check=False,
+                            capture_output=True,
+                            text=True)
+    return result, parent
+
+
 def _kubernetes_api_error(status):
     return kubernetes_instance.kubernetes.api_exception()(status=status)
+
+
+def test_cache_bootstrap_creates_leaf_idempotently_with_live_parent_shape(
+        tmp_path):
+    first, parent = _run_cache_bootstrap(tmp_path)
+    second, _ = _run_cache_bootstrap(tmp_path)
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    leaf_parent = parent / 'boltz-platform'
+    leaf = leaf_parent / 'sky-cache'
+    assert leaf.is_dir()
+    for path in (leaf_parent, leaf):
+        metadata = path.stat()
+        assert (metadata.st_uid, metadata.st_gid,
+                metadata.st_mode & 0o7777) == (0, 0, 0o755)
+
+
+@pytest.mark.parametrize(('source', 'filesystem_type', 'target'), [
+    ('/dev/root', 'overlay', None),
+    ('/dev/root', 'xfs', None),
+    ('/dev/nvme0n1', 'tmpfs', None),
+    ('/dev/nvme0n1', 'xfs', '/wrong-target'),
+])
+def test_cache_bootstrap_rejects_unattested_parent_before_mkdir(
+        tmp_path, source, filesystem_type, target):
+    result, parent = _run_cache_bootstrap(tmp_path,
+                                          source=source,
+                                          filesystem_type=filesystem_type,
+                                          target=target)
+
+    assert result.returncode != 0
+    assert not (parent / 'boltz-platform').exists()
+
+
+@pytest.mark.parametrize('parent_mode', [0o755, 0o1777])
+def test_cache_bootstrap_accepts_safe_parent_modes(tmp_path, parent_mode):
+    result, parent = _run_cache_bootstrap(tmp_path, parent_mode=parent_mode)
+
+    assert result.returncode == 0, result.stderr
+    assert (parent / 'boltz-platform' / 'sky-cache').is_dir()
+
+
+@pytest.mark.parametrize('parent_mode', [0o775, 0o777])
+def test_cache_bootstrap_rejects_writable_parent_without_sticky_bit(
+        tmp_path, parent_mode):
+    result, parent = _run_cache_bootstrap(tmp_path)
+    assert result.returncode == 0, result.stderr
+    for child in reversed(list(parent.glob('**/*'))):
+        if child.is_dir():
+            child.rmdir()
+    parent.chmod(parent_mode)
+
+    rejected, _ = _run_cache_bootstrap(tmp_path, parent_mode=parent_mode)
+
+    assert rejected.returncode != 0
+    assert 'unsafe owner or permissions' in rejected.stderr
+    assert not (parent / 'boltz-platform').exists()
+
+
+@pytest.mark.parametrize('collision',
+                         ['symlink', 'file', 'permissions', 'ownership'])
+def test_cache_bootstrap_rejects_unsafe_existing_component(tmp_path, collision):
+    parent = tmp_path / 'cache-parent'
+    parent.mkdir()
+    parent.chmod(0o1777)
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    if collision == 'symlink':
+        (parent / 'boltz-platform').symlink_to(outside,
+                                               target_is_directory=True)
+    elif collision == 'file':
+        (parent / 'boltz-platform').write_text('not a directory',
+                                               encoding='utf-8')
+    elif collision == 'permissions':
+        (parent / 'boltz-platform').mkdir(mode=0o700)
+    else:
+        if os.geteuid() != 0:
+            pytest.skip('ownership-drift execution requires chown')
+        component = parent / 'boltz-platform'
+        component.mkdir(mode=0o755)
+        os.chown(component, 1, 1)
+
+    result, _ = _run_cache_bootstrap(tmp_path)
+
+    assert result.returncode != 0
+    assert not (outside / 'sky-cache').exists()
+
+
+def test_cache_bootstrap_reserves_full_node_packing_envelope(tmp_path):
+    cache = _node_local_cache()
+    parent = tmp_path / 'cache-parent'
+    parent.mkdir()
+    stats = os.statvfs(parent)
+    total_bytes = stats.f_blocks * stats.f_frsize
+    free_bytes = stats.f_bavail * stats.f_frsize
+    assert free_bytes < total_bytes
+    cache['attestation'].update({
+        'required_bytes_per_replica': 1,
+        'max_replicas_per_node': 2,
+        'reserved_bytes_per_node': total_bytes - 2,
+        'usable_bytes_per_node': 2,
+        'usable_inodes_per_node': 20,
+    })
+
+    result, parent = _run_cache_bootstrap(tmp_path, cache)
+
+    assert result.returncode != 0
+    assert 'free byte reserve' in result.stderr
+    assert not (parent / 'boltz-platform').exists()
+
+
+def test_cache_bootstrap_reserves_full_node_inode_packing_envelope(tmp_path):
+    cache = _node_local_cache()
+    parent = tmp_path / 'cache-parent'
+    parent.mkdir()
+    stats = os.statvfs(parent)
+    assert stats.f_favail < stats.f_files
+    cache['attestation'].update({
+        'required_inodes_per_replica': 1,
+        'max_replicas_per_node': 2,
+        'usable_bytes_per_node': 200,
+        'reserved_inodes_per_node': stats.f_files - 2,
+        'usable_inodes_per_node': 2,
+    })
+
+    result, parent = _run_cache_bootstrap(tmp_path, cache)
+
+    assert result.returncode != 0
+    assert 'free inode reserve' in result.stderr
+    assert not (parent / 'boltz-platform').exists()
+
+
+def test_cache_bootstrap_is_concurrent_mkdir_safe(tmp_path):
+    # Prime the generated command/environment without creating the leaf, then
+    # remove it so all processes race on the same two mkdirat operations.
+    primed, parent = _run_cache_bootstrap(tmp_path)
+    assert primed.returncode == 0, primed.stderr
+    (parent / 'boltz-platform' / 'sky-cache').rmdir()
+    (parent / 'boltz-platform').rmdir()
+    fake_bin = tmp_path / 'bin'
+    cache = _node_local_cache()
+    _, relative_path = (kubernetes_pod_spec.
+                        projected_worker_cache_mount_and_relative_path(cache))
+    environment = dict(os.environ)
+    environment.update({
+        item['name']: item['value']
+        for item in kubernetes_pod_spec._cache_bootstrap_environment(
+            cache, relative_path)
+    })
+    environment.update({
+        (kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_ENV_PREFIX + 'PARENT_MOUNT_PATH'):
+            str(parent),
+        'FAKE_FINDMNT_SOURCE': '/dev/nvme0n1',
+        'FAKE_FINDMNT_FSTYPE': 'xfs',
+        'FAKE_FINDMNT_TARGET': str(parent),
+        'PATH': f'{fake_bin}:{environment["PATH"]}',
+    })
+    command = [
+        *kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_COMMAND,
+        kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT,
+    ]
+    processes = [
+        subprocess.Popen(command,
+                         env=environment,
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE,
+                         text=True) for _ in range(8)
+    ]
+    results = [process.communicate(timeout=20) for process in processes]
+
+    assert [process.returncode for process in processes] == [0] * 8, results
+    assert (parent / 'boltz-platform' / 'sky-cache').is_dir()
+
+
+@pytest.mark.parametrize('mutation', [
+    lambda pod: pod['volumes'][0]['hostPath'].__setitem__(
+        'type', 'DirectoryOrCreate'),
+    lambda pod: pod['containers'][0]['volumeMounts'][0].__setitem__(
+        'subPath', 'other'),
+    lambda pod: pod['initContainers'][0].__setitem__('image', 'mutable:latest'),
+    lambda pod: pod['initContainers'][0].__setitem__('command', ['/bin/sh']),
+    lambda pod: pod['initContainers'][0]['env'][0].__setitem__('value', 'bad'),
+    lambda pod: pod['initContainers'][0]['securityContext'].__setitem__(
+        'privileged', True),
+    lambda pod: pod['initContainers'][0]['volumeMounts'][0].__setitem__(
+        'mountPath', '/caller'),
+])
+def test_protocol_v8_cache_contract_rejects_every_bootstrap_mutation(mutation):
+    cache = _node_local_cache()
+    pod_spec = {
+        'containers': [{
+            'name': 'ray-node',
+        }],
+    }
+    canonical = kubernetes_pod_spec.enforce_projected_worker_cache_contract(
+        pod_spec, cache, rewrite=True)
+    assert canonical.matches
+    mutation(pod_spec)
+
+    admitted = kubernetes_pod_spec.enforce_projected_worker_cache_contract(
+        pod_spec, cache, rewrite=False)
+
+    assert not admitted.matches
+    pod = mock.Mock()
+    pod.metadata.name = 'mutated-cache-worker'
+    pod.spec = pod_spec
+    with pytest.raises(kubernetes_instance._ServeWorkerIdentityRejection):
+        kubernetes_instance._attest_serve_worker_cache(pod,
+                                                       'inference',
+                                                       'phx',
+                                                       cache,
+                                                       defer_cleanup=True)
+
+
+def test_protocol_v8_cache_contract_accepts_kubernetes_api_model_defaults():
+    cache = _node_local_cache()
+    pod_spec = {
+        'containers': [{
+            'name': 'ray-node',
+        }],
+    }
+    expected = kubernetes_pod_spec.enforce_projected_worker_cache_contract(
+        pod_spec, cache, rewrite=True)
+    client = kubernetes_adaptor.kubernetes.client
+    api_pod_spec = client.ApiClient()._ApiClient__deserialize(  # pylint: disable=protected-access
+        pod_spec, 'V1PodSpec')
+
+    observed = kubernetes_pod_spec.enforce_projected_worker_cache_contract(
+        api_pod_spec, cache, rewrite=False)
+
+    assert expected.matches
+    assert observed.matches
+
+
+@pytest.mark.parametrize('mutation', [
+    lambda cache: cache.__setitem__('bootstrap_image', 'mutable:latest'),
+    lambda cache: cache.__setitem__('relative_path', '../escape'),
+    lambda cache: cache.__setitem__('host_mount_path', '/mnt/other'),
+])
+def test_protocol_v8_cache_projection_rejects_unsafe_contract(mutation):
+    cache = _node_local_cache()
+    mutation(cache)
+
+    with pytest.raises(kubernetes_pod_spec.ProjectedCacheContractError):
+        kubernetes_pod_spec.validate_projected_worker_cache(cache)
 
 
 def test_historical_version_has_null_projections():
@@ -172,7 +475,7 @@ def test_worker_projection_protocol_v2_is_explicit_and_v1_is_isolated():
         })
 
 
-def test_worker_projection_protocol_v7_is_canonical_and_older_are_isolated():
+def test_worker_projection_protocol_v8_is_canonical_and_older_are_isolated():
     admission = {
         'local_queue_name': 'inference',
         'workload_priority_class_name': 'inference-low',
@@ -202,12 +505,17 @@ def test_worker_projection_protocol_v7_is_canonical_and_older_are_isolated():
         **v3,
         'projection_version': 7,
     }
+    v8 = {
+        **v3,
+        'projection_version': 8,
+    }
 
     assert kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENV_MARKER == (
-        'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V7')
+        'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V8')
     assert kubernetes_pod_spec.SERVE_WORKER_LEGACY_BOOTSTRAP_ENV_MARKERS == {
         'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V5',
         'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V6',
+        'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V7',
     }
     assert kubernetes_identity.worker_projection_protocol_version(v2) == 2
     assert kubernetes_identity.worker_projection_protocol_version(v3) == 3
@@ -215,17 +523,20 @@ def test_worker_projection_protocol_v7_is_canonical_and_older_are_isolated():
     assert kubernetes_identity.worker_projection_protocol_version(v5) == 5
     assert kubernetes_identity.worker_projection_protocol_version(v6) == 6
     assert kubernetes_identity.worker_projection_protocol_version(v7) == 7
+    assert kubernetes_identity.worker_projection_protocol_version(v8) == 8
     assert kubernetes_identity.worker_projection_has_strict_admission(v2)
     assert kubernetes_identity.worker_projection_has_strict_admission(v3)
     assert kubernetes_identity.worker_projection_has_strict_admission(v4)
     assert kubernetes_identity.worker_projection_has_strict_admission(v5)
     assert kubernetes_identity.worker_projection_has_strict_admission(v6)
     assert kubernetes_identity.worker_projection_has_strict_admission(v7)
+    assert kubernetes_identity.worker_projection_has_strict_admission(v8)
     assert kubernetes_identity.worker_projection_has_scratch(v3)
     assert kubernetes_identity.worker_projection_has_scratch(v4)
     assert kubernetes_identity.worker_projection_has_scratch(v5)
     assert kubernetes_identity.worker_projection_has_scratch(v6)
     assert kubernetes_identity.worker_projection_has_scratch(v7)
+    assert kubernetes_identity.worker_projection_has_scratch(v8)
     assert not (kubernetes_pod_spec.
                 serve_worker_projection_protocol_has_runtime_readiness(3))
     assert (kubernetes_pod_spec.
@@ -236,12 +547,20 @@ def test_worker_projection_protocol_v7_is_canonical_and_older_are_isolated():
             serve_worker_projection_protocol_has_runtime_readiness(6))
     assert (kubernetes_pod_spec.
             serve_worker_projection_protocol_has_runtime_readiness(7))
+    assert (kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_runtime_readiness(8))
     assert not (kubernetes_pod_spec.
                 serve_worker_projection_protocol_has_scratch_bootstrap(5))
     assert (kubernetes_pod_spec.
             serve_worker_projection_protocol_has_scratch_bootstrap(6))
     assert (kubernetes_pod_spec.
             serve_worker_projection_protocol_has_scratch_bootstrap(7))
+    assert (kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_scratch_bootstrap(8))
+    assert not (kubernetes_pod_spec.
+                serve_worker_projection_protocol_has_cache_bootstrap(7))
+    assert (kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_cache_bootstrap(8))
     assert kubernetes_identity.validate_worker_placement_projections(
         [v2], require_protocol_version=2) == [v2]
     assert kubernetes_identity.validate_worker_placement_projections(
@@ -254,15 +573,17 @@ def test_worker_projection_protocol_v7_is_canonical_and_older_are_isolated():
         [v6], require_protocol_version=6) == [v6]
     assert kubernetes_identity.validate_worker_placement_projections(
         [v7], require_protocol_version=7) == [v7]
+    assert kubernetes_identity.validate_worker_placement_projections(
+        [v8], require_protocol_version=8) == [v8]
     with pytest.raises(ValueError, match='must not mix protocol versions'):
-        kubernetes_identity.validate_worker_placement_projections([v6, v7])
-    with pytest.raises(ValueError, match='protocol-v3/v4/v5/v6/v7 keys'):
+        kubernetes_identity.validate_worker_placement_projections([v7, v8])
+    with pytest.raises(ValueError, match='protocol-v3/v4/v5/v6/v7/v8 keys'):
         kubernetes_identity.worker_projection_protocol_version({
-            **v7, 'unknown': True
+            **v8, 'unknown': True
         })
     missing_timeout = copy.deepcopy(v4)
     missing_timeout.pop('provision_timeout')
-    with pytest.raises(ValueError, match='protocol-v3/v4/v5/v6/v7 keys'):
+    with pytest.raises(ValueError, match='protocol-v3/v4/v5/v6/v7/v8 keys'):
         kubernetes_identity.worker_projection_protocol_version(missing_timeout)
     assert (kubernetes_identity.worker_projection_sha256(v3)
             != kubernetes_identity.worker_projection_sha256(v4))
@@ -272,6 +593,27 @@ def test_worker_projection_protocol_v7_is_canonical_and_older_are_isolated():
             != kubernetes_identity.worker_projection_sha256(v6))
     assert (kubernetes_identity.worker_projection_sha256(v6)
             != kubernetes_identity.worker_projection_sha256(v7))
+    assert (kubernetes_identity.worker_projection_sha256(v7)
+            != kubernetes_identity.worker_projection_sha256(v8))
+
+
+@pytest.mark.parametrize(('field', 'replacement'), [
+    ('host_mount_path', '/different-parent'),
+    ('bootstrap_image', 'registry.example/other@sha256:' + 'f' * 64),
+])
+def test_worker_projection_v8_digest_covers_cache_bootstrap_identity(
+        field, replacement):
+    projection = _worker_projection(protocol_version=8)
+    projection['cache'] = _node_local_cache()
+    original_digest = kubernetes_identity.worker_projection_sha256(projection)
+    mutated = copy.deepcopy(projection)
+    mutated['cache'][field] = replacement
+    if field == 'host_mount_path':
+        mutated['cache']['host_path'] = (replacement + '/' +
+                                         mutated['cache']['relative_path'])
+
+    assert kubernetes_identity.worker_projection_sha256(
+        mutated) != original_digest
 
 
 def test_worker_projection_v3_digest_covers_scratch():
@@ -435,7 +777,8 @@ def test_worker_projection_v2_digest_covers_complete_validated_candidate():
     mutated_scheduler['scheduler_name'] = 'trusted-batch-scheduler'
     assert (kubernetes_identity.worker_projection_sha256(mutated_scheduler)
             != expected)
-    with pytest.raises(ValueError, match='requires protocol 2, 3, 4, 5, or 6'):
+    with pytest.raises(ValueError,
+                       match='requires protocol 2, 3, 4, 5, 6, 7, or 8'):
         kubernetes_identity.worker_projection_sha256(_worker_projection())
 
 
@@ -1406,7 +1749,7 @@ run: echo hi
         _worker_role('east'),
         _worker_role('phx'),
     ]
-    assert all(item['projection_version'] == 7 for item in projected)
+    assert all(item['projection_version'] == 8 for item in projected)
     assert all(item['provision_timeout'] == -1 for item in projected)
     assert all(item['scratch'] == {'kind': 'none'} for item in projected)
     assert all(
@@ -1417,7 +1760,7 @@ run: echo hi
     assert projected[1]['accelerator_scheduling'] == (_accelerator_scheduling())
 
 
-def test_worker_catalog_preserves_identity_free_v7_candidates(monkeypatch):
+def test_worker_catalog_preserves_identity_free_v8_candidates(monkeypatch):
     task = task_lib.Task.from_yaml_str('''
 resources:
   infra: k8s/phx
@@ -1460,10 +1803,100 @@ run: echo hi
         task, workspace='inference', placement_catalog={})
 
     assert projected is not None
-    assert projected[0]['projection_version'] == 7
+    assert projected[0]['projection_version'] == 8
     assert projected[0]['provision_timeout'] == -1
     assert projected[0]['scratch'] == {'kind': 'none'}
     assert projected[0]['pod_identity_role_arn'] is None
+
+
+def _mock_worker_cache_projection_sources(monkeypatch, configured):
+    monkeypatch.setattr(skypilot_config,
+                        'get_effective_workspace_region_config',
+                        lambda **_kwargs: configured)
+    monkeypatch.setattr(
+        kubernetes_identity, '_effective_auto_mounts',
+        lambda *_args, **_kwargs: [{
+            'volume_name': 'phx-cache',
+            'mount_paths': ['/mnt/sky-cache'],
+        }])
+    volume = mock.Mock()
+    volume.type = kubernetes_identity.volume_utils.VolumeType.HOSTPATH.value
+    volume.region = 'phx'
+    volume.config = {
+        'host_path': '/opt/dlami/nvme/boltz-platform/boltz-l4-fleet',
+    }
+    monkeypatch.setattr(kubernetes_identity.global_user_state,
+                        'get_volume_configs_by_names',
+                        lambda _names: {'phx-cache': volume})
+
+
+def test_worker_cache_projection_persists_operator_bootstrap_inputs(
+        monkeypatch):
+    configured = {
+        key: value
+        for key, value in _node_local_cache().items()
+        if key not in ('host_path', 'host_mount_path', 'relative_path',
+                       'bootstrap_image')
+    }
+    _mock_worker_cache_projection_sources(monkeypatch, configured)
+    monkeypatch.setenv(
+        kubernetes_identity.WORKER_CACHE_BOOTSTRAP_HOST_MOUNT_PATH_ENV_VAR,
+        '/opt/dlami/nvme')
+    helper_image = 'registry.example/skypilot-api@sha256:' + 'b' * 64
+    monkeypatch.setenv(kubernetes_identity.WORKER_CACHE_BOOTSTRAP_IMAGE_ENV_VAR,
+                       helper_image)
+
+    projected = kubernetes_identity._project_cache('phx', 'inference')
+
+    assert projected['host_mount_path'] == '/opt/dlami/nvme'
+    assert projected['relative_path'] == 'boltz-platform/boltz-l4-fleet'
+    assert projected['bootstrap_image'] == helper_image
+    assert kubernetes_identity.validate_cache_projection(
+        projected, require_bootstrap_mount=True) == projected
+
+
+def test_worker_cache_projection_requires_bootstrap_construction_inputs(
+        monkeypatch):
+    configured = {
+        key: value
+        for key, value in _node_local_cache().items()
+        if key not in ('host_path', 'host_mount_path', 'relative_path',
+                       'bootstrap_image')
+    }
+    _mock_worker_cache_projection_sources(monkeypatch, configured)
+    monkeypatch.delenv(
+        kubernetes_identity.WORKER_CACHE_BOOTSTRAP_HOST_MOUNT_PATH_ENV_VAR,
+        raising=False)
+    monkeypatch.delenv(kubernetes_identity.WORKER_CACHE_BOOTSTRAP_IMAGE_ENV_VAR,
+                       raising=False)
+
+    with pytest.raises(ValueError,
+                       match='server-owned bootstrap host mount path'):
+        kubernetes_identity._project_cache('phx', 'inference')
+
+
+def test_worker_cache_projection_context_config_overrides_global_environment(
+        monkeypatch):
+    helper_image = 'registry.example/configured-helper@sha256:' + 'c' * 64
+    configured = {
+        key: value
+        for key, value in _node_local_cache().items()
+        if key not in ('host_path', 'relative_path', 'bootstrap_image')
+    }
+    configured['host_mount_path'] = '/opt/dlami/nvme'
+    configured['bootstrap_image'] = helper_image
+    _mock_worker_cache_projection_sources(monkeypatch, configured)
+    monkeypatch.setenv(
+        kubernetes_identity.WORKER_CACHE_BOOTSTRAP_HOST_MOUNT_PATH_ENV_VAR,
+        '/wrong/global-parent')
+    monkeypatch.setenv(kubernetes_identity.WORKER_CACHE_BOOTSTRAP_IMAGE_ENV_VAR,
+                       'registry.example/global-helper@sha256:' + 'd' * 64)
+
+    projected = kubernetes_identity._project_cache('phx', 'inference')
+
+    assert projected['host_mount_path'] == '/opt/dlami/nvme'
+    assert projected['relative_path'] == 'boltz-platform/boltz-l4-fleet'
+    assert projected['bootstrap_image'] == helper_image
 
 
 @pytest.mark.parametrize('resource_config', [
@@ -1688,7 +2121,7 @@ def test_runtime_cache_uses_final_h200_choice_from_heterogeneous_task():
         'SKYPILOT_SERVE_CACHE_EVIL': 'caller-secret',
     })
     projections = [{
-        'projection_version': 7,
+        'projection_version': 8,
         'candidate_id': 'kubernetes-0000',
         'kubernetes_context': 'east',
         'namespace': 'inference',
@@ -1710,7 +2143,7 @@ def test_runtime_cache_uses_final_h200_choice_from_heterogeneous_task():
             'kind': 'none'
         },
     }, {
-        'projection_version': 7,
+        'projection_version': 8,
         'candidate_id': 'kubernetes-0001',
         'kubernetes_context': 'phx',
         'namespace': 'inference',
@@ -1722,24 +2155,7 @@ def test_runtime_cache_uses_final_h200_choice_from_heterogeneous_task():
         'accelerator_name': 'H200',
         'accelerator_count': 1,
         'accelerator_scheduling': _accelerator_scheduling(),
-        'cache': {
-            'kind': 'node_local',
-            'mount_path': '/mnt/sky-cache',
-            'volume_name': 'phx-cache',
-            'host_path': '/mnt/local-nvme/sky-cache',
-            'attestation': {
-                'attestation_id': 'phx-cache-v1',
-                'device_source_pattern': '^/dev/nvme[0-9]+n[0-9]+$',
-                'filesystem_type': 'xfs',
-                'required_bytes_per_replica': 100,
-                'required_inodes_per_replica': 10,
-                'max_replicas_per_node': 1,
-                'reserved_bytes_per_node': 0,
-                'reserved_inodes_per_node': 0,
-                'usable_bytes_per_node': 100,
-                'usable_inodes_per_node': 10,
-            },
-        },
+        'cache': _node_local_cache(),
         'scheduler_name': 'default-scheduler',
         'kueue_admission': None,
         'provision_timeout': -1,
@@ -1763,7 +2179,7 @@ def test_runtime_cache_uses_final_h200_choice_from_heterogeneous_task():
     assert task.envs_and_secrets['SKYPILOT_SERVE_CACHE_KIND'] == 'node_local'
 
 
-def test_runtime_scratch_v7_owns_bootstrap_paths_and_overrides_caller():
+def test_runtime_scratch_v8_owns_bootstrap_paths_and_overrides_caller():
     task = task_lib.Task()
     task.set_resources(
         resources_lib.Resources(cloud=kubernetes_identity.clouds.Kubernetes(),
@@ -1781,7 +2197,7 @@ def test_runtime_scratch_v7_owns_bootstrap_paths_and_overrides_caller():
     })
     launch_context = {
         constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
-            _worker_projection(protocol_version=7,
+            _worker_projection(protocol_version=8,
                                scratch={
                                    'kind': 'memory',
                                    'mount_path': '/tmp',
@@ -1808,7 +2224,7 @@ def test_runtime_scratch_v7_owns_bootstrap_paths_and_overrides_caller():
                    for key in task.secrets)
 
 
-def test_runtime_bootstrap_paths_are_owned_by_v6_v7_memory_scratch():
+def test_runtime_bootstrap_paths_are_owned_by_v6_v7_v8_memory_scratch():
     memory_scratch = {
         'kind': 'memory',
         'mount_path': '/tmp',
@@ -1830,11 +2246,16 @@ def test_runtime_bootstrap_paths_are_owned_by_v6_v7_memory_scratch():
             kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENVIRONMENT)
     assert kubernetes_identity.bootstrap_environment(
         _worker_projection(protocol_version=7)) == {}
+    assert kubernetes_identity.bootstrap_environment(
+        _worker_projection(protocol_version=8, scratch=memory_scratch)) == (
+            kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENVIRONMENT)
+    assert kubernetes_identity.bootstrap_environment(
+        _worker_projection(protocol_version=8)) == {}
 
 
 def test_final_kubernetes_yaml_enforces_platform_identity_and_cache():
     projection = {
-        'projection_version': 7,
+        'projection_version': 8,
         'candidate_id': 'kubernetes-0002',
         'kubernetes_context': 'phx',
         'namespace': 'rescluster-k8s-prod-east1-preemptible-inference',
@@ -1939,7 +2360,10 @@ def test_final_kubernetes_yaml_enforces_platform_identity_and_cache():
         'context': 'phx',
         'namespace': 'rescluster-k8s-prod-east1-preemptible-inference',
         'timeout': -1,
-        'serve_worker_projection_protocol_version': 7,
+        'serve_worker_projection_protocol_version': 8,
+        'serve_worker_expected_cache': {
+            'kind': 'none'
+        },
         'serve_worker_expected_runtime_bootstrap_sha256': bootstrap_sha256,
         'serve_worker_expected_scratch': {
             'kind': 'none'
@@ -2000,7 +2424,7 @@ def test_final_kubernetes_yaml_enforces_platform_identity_and_cache():
 
 @pytest.mark.parametrize('claim_surface', ['pod', 'runtime_container'])
 def test_final_kubernetes_yaml_rejects_dynamic_resource_claims(claim_surface):
-    projection = _worker_projection(protocol_version=7)
+    projection = _worker_projection(protocol_version=8)
     pod_spec = {
         'containers': [{
             'name': 'ray-node',
@@ -2037,9 +2461,9 @@ def test_final_kubernetes_yaml_rejects_dynamic_resource_claims(claim_surface):
             expected_runtime_bootstrap_sha256=bootstrap_sha256)
 
 
-def test_final_kubernetes_yaml_reasserts_v7_kueue_admission():
+def test_final_kubernetes_yaml_reasserts_v8_kueue_admission():
     projection = _worker_projection(
-        protocol_version=7,
+        protocol_version=8,
         scheduler_name='trusted-batch-scheduler',
         kueue_admission={
             'local_queue_name': 'inference',
@@ -2104,7 +2528,7 @@ def test_final_kubernetes_yaml_reasserts_v7_kueue_admission():
     assert 'nodeName' not in node_config['spec']
     assert node_config['spec']['schedulerName'] == 'trusted-batch-scheduler'
 
-    projection_without_kueue = _worker_projection(protocol_version=7,
+    projection_without_kueue = _worker_projection(protocol_version=8,
                                                   kueue_admission=None)
     backend_utils._enforce_worker_projection_on_kubernetes_yaml(
         cluster_yaml,
@@ -2119,9 +2543,9 @@ def test_final_kubernetes_yaml_reasserts_v7_kueue_admission():
                     'kueue.x-k8s.io/priority-class', 'kueue.x-k8s.io/managed'))
 
 
-def test_final_v7_yaml_composes_kueue_cache_scratch_and_readiness():
+def test_final_v8_yaml_composes_kueue_cache_scratch_and_readiness():
     projection = _worker_projection(
-        protocol_version=7,
+        protocol_version=8,
         scheduler_name='trusted-batch-scheduler',
         kueue_admission={
             'local_queue_name': 'inference',
@@ -2174,7 +2598,9 @@ def test_final_v7_yaml_composes_kueue_cache_scratch_and_readiness():
 
     assert cluster_yaml == first
     assert cluster_yaml['provider'][
-        'serve_worker_projection_protocol_version'] == 7
+        'serve_worker_projection_protocol_version'] == 8
+    assert cluster_yaml['provider']['serve_worker_expected_cache'] == (
+        _node_local_cache())
     assert cluster_yaml['provider']['timeout'] == -1
     assert cluster_yaml['provider'][
         'serve_worker_expected_runtime_bootstrap_sha256'] == bootstrap_sha256
@@ -2193,7 +2619,7 @@ def test_final_v7_yaml_composes_kueue_cache_scratch_and_readiness():
     assert node['spec']['volumes'] == [{
         'name': 'phx-cache',
         'hostPath': {
-            'path': '/mnt/local-nvme/sky-cache',
+            'path': '/mnt/local-nvme',
             'type': 'Directory',
         },
     }, {
@@ -2207,6 +2633,7 @@ def test_final_v7_yaml_composes_kueue_cache_scratch_and_readiness():
     assert runtime['volumeMounts'] == [{
         'name': 'phx-cache',
         'mountPath': '/mnt/sky-cache',
+        'subPath': 'boltz-platform/sky-cache',
     }, {
         'name': 'skypilot-serve-worker-tmp',
         'mountPath': '/tmp',
@@ -2225,6 +2652,19 @@ def test_final_v7_yaml_composes_kueue_cache_scratch_and_readiness():
         'SKYPILOT_SERVE_SCRATCH_MOUNT_PATH': '/tmp',
         'SKYPILOT_SERVE_SCRATCH_SIZE_LIMIT_BYTES': str(20 * 1024**3),
     }
+    cache_bootstrap = node['spec']['initContainers'][0]
+    assert cache_bootstrap['name'] == (
+        kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_INIT_CONTAINER_NAME)
+    assert cache_bootstrap['image'] == _node_local_cache()['bootstrap_image']
+    assert cache_bootstrap['command'] == list(
+        kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_COMMAND)
+    assert cache_bootstrap['args'] == [
+        kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT
+    ]
+    assert cache_bootstrap['volumeMounts'] == [{
+        'name': 'phx-cache',
+        'mountPath': ('/var/lib/skypilot/serve-cache-parent'),
+    }]
     assert {
         key: environment[key]
         for key in kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENVIRONMENT
@@ -2269,14 +2709,14 @@ def test_final_v7_yaml_composes_kueue_cache_scratch_and_readiness():
     }
 
 
-@pytest.mark.parametrize('protocol_version', [1, 2, 3, 4, 5, 6])
+@pytest.mark.parametrize('protocol_version', [1, 2, 3, 4, 5, 6, 7])
 def test_final_yaml_rejects_historical_projection_before_mutation(
         protocol_version):
     cluster_yaml = _projected_worker_cluster_yaml()
     original = copy.deepcopy(cluster_yaml)
 
     with pytest.raises(exceptions.InvalidCloudConfigs,
-                       match='does not satisfy required version 7'):
+                       match='does not satisfy required version 8'):
         backend_utils._enforce_worker_projection_on_kubernetes_yaml(
             cluster_yaml, _worker_projection(protocol_version=protocol_version))
 
@@ -2339,7 +2779,7 @@ def test_projected_runtime_readiness_rejects_owned_surface_collision(collision):
         },
     }),
 ])
-def test_final_v7_yaml_rejects_bootstrap_producer_mutation(mutation):
+def test_final_v8_yaml_rejects_bootstrap_producer_mutation(mutation):
     cluster_yaml = _projected_worker_cluster_yaml()
     pod_spec = cluster_yaml['available_node_types']['ray_head_default'][
         'node_config']['spec']
@@ -2351,7 +2791,7 @@ def test_final_v7_yaml_rejects_bootstrap_producer_mutation(mutation):
                        match='bootstrap command|bootstrap producer'):
         backend_utils._enforce_worker_projection_on_kubernetes_yaml(
             cluster_yaml,
-            _worker_projection(protocol_version=7),
+            _worker_projection(protocol_version=8),
             expected_runtime_bootstrap_sha256=bootstrap_sha256)
 
 
@@ -2410,7 +2850,7 @@ def test_admitted_runtime_readiness_rejects_bootstrap_producer_mutation(
             pod, 'inference', 'phx', True, bootstrap_sha256, defer_cleanup=True)
 
 
-def test_admitted_v7_runtime_readiness_rejects_bootstrap_environment_drift():
+def test_admitted_v8_runtime_readiness_rejects_bootstrap_environment_drift():
     pod_spec = {
         'containers': [{
             'name': 'ray-node',
@@ -2443,7 +2883,7 @@ def test_admitted_v7_runtime_readiness_rejects_bootstrap_environment_drift():
             pod, 'inference', 'phx', True, bootstrap_sha256, defer_cleanup=True)
 
 
-def test_v7_bootstrap_contract_rejects_missing_post_runcmd_export():
+def test_v8_bootstrap_contract_rejects_missing_post_runcmd_export():
     pod_spec = {
         'containers': [{
             'name': 'ray-node',
@@ -2464,7 +2904,7 @@ def test_v7_bootstrap_contract_rejects_missing_post_runcmd_export():
 
 
 @pytest.mark.parametrize('line_kind', ['marker', 'export'])
-def test_v7_bootstrap_contract_requires_exact_full_lines(line_kind):
+def test_v8_bootstrap_contract_requires_exact_full_lines(line_kind):
     script = _current_bootstrap_script()
     if line_kind == 'marker':
         exact_line = (
@@ -2581,9 +3021,9 @@ def _worker_bootstrap_sha256(cluster_yaml):
         'devicePath': '/dev/scratch',
     }),
 ])
-def test_final_v7_yaml_rejects_existing_scratch_identity_collisions(mutate):
+def test_final_v8_yaml_rejects_existing_scratch_identity_collisions(mutate):
     projection = _worker_projection(
-        protocol_version=7,
+        protocol_version=8,
         scratch={
             'kind': 'memory',
             'mount_path': '/tmp',
@@ -2604,9 +3044,9 @@ def test_final_v7_yaml_rejects_existing_scratch_identity_collisions(mutate):
 
 
 @pytest.mark.parametrize('duplicate', ['volume', 'mount'])
-def test_final_v7_yaml_rejects_duplicate_exact_scratch_identity(duplicate):
+def test_final_v8_yaml_rejects_duplicate_exact_scratch_identity(duplicate):
     projection = _worker_projection(
-        protocol_version=7,
+        protocol_version=8,
         scratch={
             'kind': 'memory',
             'mount_path': '/tmp',
@@ -2643,9 +3083,9 @@ def test_final_v7_yaml_rejects_duplicate_exact_scratch_identity(duplicate):
             expected_runtime_bootstrap_sha256=bootstrap_sha256)
 
 
-def test_final_v7_yaml_rejects_cache_scratch_collision():
+def test_final_v8_yaml_rejects_cache_scratch_collision():
     projection = _worker_projection(
-        protocol_version=7,
+        protocol_version=8,
         scratch={
             'kind': 'memory',
             'mount_path': '/tmp',
@@ -2667,8 +3107,8 @@ def test_final_v7_yaml_rejects_cache_scratch_collision():
                 _worker_bootstrap_sha256(cluster_yaml)))
 
 
-def test_final_v7_none_rejects_cache_tmp_alias():
-    projection = _worker_projection(protocol_version=7)
+def test_final_v8_none_rejects_cache_tmp_alias():
+    projection = _worker_projection(protocol_version=8)
     projection['cache'] = {
         **_node_local_cache(),
         'mount_path': '/var/../tmp/',
@@ -2676,7 +3116,7 @@ def test_final_v7_none_rejects_cache_tmp_alias():
     cluster_yaml = _projected_worker_cluster_yaml()
 
     with pytest.raises(exceptions.InvalidCloudConfigs,
-                       match='cache and scratch'):
+                       match='cache mount_path'):
         backend_utils._enforce_worker_projection_on_kubernetes_yaml(
             cluster_yaml,
             projection,
@@ -2685,7 +3125,7 @@ def test_final_v7_none_rejects_cache_tmp_alias():
 
 
 @pytest.mark.parametrize('collision', ['volume', 'mount', 'nested_mount'])
-def test_final_v7_none_rejects_inherited_scratch_owner(collision):
+def test_final_v8_none_rejects_inherited_scratch_owner(collision):
     cluster_yaml = _projected_worker_cluster_yaml()
     spec = cluster_yaml['available_node_types']['ray_head_default'][
         'node_config']['spec']
@@ -2704,12 +3144,12 @@ def test_final_v7_none_rejects_inherited_scratch_owner(collision):
     with pytest.raises(exceptions.InvalidCloudConfigs, match='collides'):
         backend_utils._enforce_worker_projection_on_kubernetes_yaml(
             cluster_yaml,
-            _worker_projection(protocol_version=7),
+            _worker_projection(protocol_version=8),
             expected_runtime_bootstrap_sha256=(
                 _worker_bootstrap_sha256(cluster_yaml)))
 
 
-@pytest.mark.parametrize('protocol_version', [1, 2, 3, 4, 5, 6, 7])
+@pytest.mark.parametrize('protocol_version', [1, 2, 3, 4, 5, 6, 7, 8])
 def test_kubernetes_deploy_vars_require_current_projected_admission(
         monkeypatch, protocol_version):
     resources = mock.MagicMock()
@@ -2735,7 +3175,7 @@ def test_kubernetes_deploy_vars_require_current_projected_admission(
             'mount_path': '/tmp',
             'volume_name': 'skypilot-serve-worker-tmp',
             'size_limit_bytes': 20 * 1024**3,
-        } if protocol_version == 7 else None))
+        } if protocol_version == 8 else None))
     cloud = kubernetes_identity.clouds.Kubernetes()
     region = mock.MagicMock()
     region.name = 'phx'
@@ -2788,7 +3228,7 @@ def test_kubernetes_deploy_vars_require_current_projected_admission(
                                 KubernetesHighPerformanceNetworkType.NONE,
                                 None)))
 
-    if protocol_version != 7:
+    if protocol_version != 8:
         with pytest.raises(
                 ValueError,
                 match='exact current worker placement projection protocol'):
@@ -2844,7 +3284,7 @@ def test_kubernetes_deploy_vars_require_current_projected_admission(
 
 def test_legacy_yaml_restore_cannot_replace_projected_identity_or_cache():
     projection = {
-        'projection_version': 7,
+        'projection_version': 8,
         'candidate_id': 'kubernetes-0002',
         'kubernetes_context': 'phx',
         'namespace': 'inference',
@@ -2856,24 +3296,7 @@ def test_legacy_yaml_restore_cannot_replace_projected_identity_or_cache():
         'accelerator_name': 'H200',
         'accelerator_count': 1,
         'accelerator_scheduling': _accelerator_scheduling(),
-        'cache': {
-            'kind': 'node_local',
-            'mount_path': '/mnt/sky-cache',
-            'volume_name': 'phx-cache',
-            'host_path': '/mnt/local-nvme/sky-cache',
-            'attestation': {
-                'attestation_id': 'phx-cache-v1',
-                'device_source_pattern': '^/dev/nvme[0-9]+n[0-9]+$',
-                'filesystem_type': 'xfs',
-                'required_bytes_per_replica': 100,
-                'required_inodes_per_replica': 10,
-                'max_replicas_per_node': 1,
-                'reserved_bytes_per_node': 0,
-                'reserved_inodes_per_node': 0,
-                'usable_bytes_per_node': 100,
-                'usable_inodes_per_node': 10,
-            },
-        },
+        'cache': _node_local_cache(),
         'scheduler_name': 'default-scheduler',
         'kueue_admission': None,
         'provision_timeout': -1,
@@ -3000,7 +3423,7 @@ def test_legacy_yaml_restore_cannot_replace_projected_identity_or_cache():
     assert final_spec['volumes'] == [{
         'name': 'phx-cache',
         'hostPath': {
-            'path': '/mnt/local-nvme/sky-cache',
+            'path': '/mnt/local-nvme',
             'type': 'Directory',
         },
     }]
@@ -3008,7 +3431,10 @@ def test_legacy_yaml_restore_cannot_replace_projected_identity_or_cache():
     assert ray_node['volumeMounts'] == [{
         'name': 'phx-cache',
         'mountPath': '/mnt/sky-cache',
+        'subPath': 'boltz-platform/sky-cache',
     }]
+    assert final_spec['initContainers'][0]['name'] == (
+        kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_INIT_CONTAINER_NAME)
     assert any(entry == {
         'name': 'SKYPILOT_SERVE_CACHE_KIND',
         'value': 'node_local',
@@ -3020,9 +3446,9 @@ def test_legacy_yaml_restore_cannot_replace_projected_identity_or_cache():
     assert 'inject-sidecar' not in serialized
 
 
-def test_legacy_yaml_restore_reasserts_v7_kueue_admission():
+def test_legacy_yaml_restore_reasserts_v8_kueue_admission():
     projection = _worker_projection(
-        protocol_version=7,
+        protocol_version=8,
         kueue_admission={
             'local_queue_name': 'inference',
             'workload_priority_class_name': 'inference-low',
@@ -3094,9 +3520,9 @@ def test_legacy_yaml_restore_reasserts_v7_kueue_admission():
     assert labels['kueue.x-k8s.io/priority-class'] == 'inference-low'
 
 
-def test_legacy_yaml_restore_reasserts_v7_memory_scratch():
+def test_legacy_yaml_restore_reasserts_v8_memory_scratch():
     projection = _worker_projection(
-        protocol_version=7,
+        protocol_version=8,
         scratch={
             'kind': 'memory',
             'mount_path': '/tmp',
@@ -3675,7 +4101,7 @@ def test_admitted_worker_namespace_mismatch_is_deleted(monkeypatch):
 
 def test_final_kubernetes_yaml_requires_one_runtime_container():
     projection = _worker_projection(
-        protocol_version=7,
+        protocol_version=8,
         scratch={
             'kind': 'memory',
             'mount_path': '/tmp',
