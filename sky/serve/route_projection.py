@@ -46,6 +46,12 @@ ALIAS_RETENTION_SECONDS = 430
 MAX_ALIASES_PER_RECORD = 8
 MAX_ROUTE_IDENTITIES = 100_000
 MAX_ROUTE_TTL_SECONDS = 24 * 60 * 60
+# A promotion read runs after the bounded Kubernetes role snapshot and inside
+# the external eight-second role-heartbeat budget.  Waiting briefly joins the
+# PostgreSQL row-lock queue instead of repeatedly losing to a stream of short
+# capacity-admission writers, while the database timeout keeps the role channel
+# fail closed and bounded if a writer is genuinely stuck.
+PROMOTION_OWNER_LOCK_TIMEOUT_MS = 1_000
 
 _SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
 _SESSION_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$')
@@ -2516,11 +2522,18 @@ class RouteProjectionRepository:
                 # Every route publisher locks this row FOR UPDATE before it
                 # advances the head.  A shared lock therefore gives the owner
                 # and indexed head/snapshot join one coherent view while still
-                # allowing both LB slots to report concurrently.  Contention
-                # is advisory: fail fast and retry on the next role heartbeat.
+                # allowing both LB slots to report concurrently.  Join the
+                # PostgreSQL lock queue for one short bounded interval so a
+                # continuous stream of short writers cannot starve every role
+                # heartbeat.  Timeout remains advisory and fail closed; the
+                # next role heartbeat retries without changing the selected
+                # slot.
+                session.execute(
+                    sqlalchemy.text('SET LOCAL lock_timeout = '
+                                    f"'{PROMOTION_OWNER_LOCK_TIMEOUT_MS}ms'"))
                 owner = session.execute(
                     self._owner_query(identity.service_name).with_for_update(
-                        read=True, nowait=True)).mappings().one_or_none()
+                        read=True)).mappings().one_or_none()
                 if owner is None or not _owner_matches(identity, owner):
                     raise RouteProjectionConflict(
                         'Route promotion reader no longer owns this service.')

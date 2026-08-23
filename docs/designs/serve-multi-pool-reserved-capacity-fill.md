@@ -4094,10 +4094,14 @@ reason enum, route mode/version/epoch/generation, expected/reported/fresh/missin
 backend counts, planned-upgrade decision, transition-attempted bit, and CAS
 result. It never exports URLs, route digests, tokens, Pod IDs, or request IDs.
 
-The promotion read is one fail-fast shared owner-lock statement plus one indexed
-PostgreSQL head/generation join. It copies the immutable row and releases the
-lock before bounded canonical decoding; the cutover CAS revalidates the exact
-head. Tests pin that two-statement shape and instrument provider/Kubernetes
+The promotion read first installs a one-second transaction-local PostgreSQL
+lock timeout, then performs one shared owner-lock statement plus one indexed
+head/generation join. Joining the row-lock queue for this bounded interval
+prevents a stream of short capacity-admission writers from starving every role
+heartbeat; expiry remains fail closed and retries on the next heartbeat without
+disturbing the selected slot. It copies the immutable row and releases the lock
+before bounded canonical decoding; the cutover CAS revalidates the exact head.
+Tests pin that three-statement shape and instrument provider/Kubernetes
 adapters to require zero calls, complete owner replacement, exact successor
 isolation, and one poisoned launch association among hundreds without blocking
 fresh route publication for healthy rows. The generous regression ceilings are
