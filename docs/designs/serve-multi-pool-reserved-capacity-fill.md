@@ -7,8 +7,9 @@ Serve057 policy-admission feedback, exact protocol-v2 resource replay,
 provider-proof readiness, lock-free proof publication, the unique protocol-v6
 memory-scratch projection, and stable claim/conserved-capacity-hint source are
 deployed, but end-to-end reserved backfill is **not yet production-converged**.
-PR #1675 is merged at
-`364b7b8c699f1a757b4e2bc5b398db6d6881746b`. Release `1.1.1445` and Helm
+PR #1676 has merged the historical teardown source correction; its bounded
+capability hardening, immutable publication, and deployment remain open.
+Release `1.1.1445` and Helm
 revision 563 run the exact immutable image digest
 `sha256:b3f8f2bafb3886df6ef27d6d6ce662947f95bb954470d39770c8ff538be3827f`
 on two API, two controller, and three executor Pods. The controller hold is
@@ -113,10 +114,14 @@ identity of those retained v5 rows. The check fails before the existing
 uncached, physical-cluster-UID-fenced provider absence probe can run, so normal
 retirement conservatively retains the graph.
 
-The fix is an explicit read-versus-act boundary, not a fallback. Fresh
+The fix is an explicit teardown-versus-act boundary, not a fallback. Fresh
 admission, capacity accounting, and every provider-effect start continue to
-require exact-current protocol v6. Only the two teardown/retirement readers may
-decode the exact historical strict projection already bound to a retained row.
+require exact-current protocol v6. A separately named classifier is callable
+only by the two teardown/retirement readers. It accepts the exact strict
+projection already bound to a retained row only within the current and two
+immediately preceding projection protocols; N-3, future, mixed, malformed, or
+digest-divergent bytes fail closed. It returns only scheduler-lane mode and the
+existing immutable Kueue identity, never fresh admission or provider authority.
 Historical decoding still validates the canonical projection digest, service
 lifecycle/version, protocol-v2 pool identity, physical cluster UID, allowed
 location, replica/intent/association graph, terminal execution quiescence, and
@@ -142,7 +147,9 @@ historical decode, digest-tamper rejection, end-to-end v5 absence publication
 and whole-service retirement, unchanged current-protocol retirement, and the
 capacity reader retaining v5 as exact-shape unknown. Independent adversarial
 review found no permission path from historical decode into fresh admission,
-capacity authority, or provider effects.
+capacity authority, or provider effects. The follow-up capability hardening
+adds dynamic N/N-1/N-2 and N-3 rejection tests and removes the reusable boolean
+escape hatch; it changes no cleanup evidence or provider behavior.
 
 Normal evidence-backed teardown removed lifecycle 89. Lifecycle 90's 22
 protocol-v5/cohort-4 launch graphs were retained until durable quiescence and
@@ -233,9 +240,10 @@ resource, or Kueue object/change.
 The protocol-v6/cohort-6 source patch is merged and deployed. Focused tests
 cover fresh-write rejection for v1-v5, exact v5 version retry, adjacent-cohort
 cleanup, mixed-fleet refusal, exact-current render/create/adopt fencing, and
-the v5/v6 bootstrap identities. The historical teardown decoder regression,
-normal purge, held homogeneous reauthorization, clean service recreation, and
-production convergence proof remain open.
+the v5/v6 bootstrap identities. PR #1676 merges the historical teardown decoder
+regression fix; bounded hardening, immutable publication, normal purge, held
+homogeneous reauthorization, clean service recreation, and production
+convergence proof remain open.
 
 PHX success is defined exclusively by Simone's unchanged Kueue policy. SkyPilot
 must submit every fresh reserved grant; every Workload that Kueue marks
@@ -246,17 +254,18 @@ is not scheduler-fit. SkyPilot must not change ClusterQueues, LocalQueues,
 Cohorts, ResourceFlavors, quotas, borrowing, preemption, priorities, scheduler,
 or research workload specifications to improve occupancy. East has no Kueue
 boundary and uses its existing scheduler-fit compatible-capacity denominator.
-The reproducible normalized baseline over PHX ClusterQueues, LocalQueues,
+The reproducible normalized snapshot over PHX ClusterQueues, LocalQueues,
 ResourceFlavors, WorkloadPriorityClasses, Cohorts, Pod PriorityClasses, and the
 Kueue manager ConfigMap/Deployment is
 `fd5af31d5d1570701e2a7b636691fa4efbf15d6efdba3ee8277d7f5b982d170d`.
 It covers 40 objects and retains only `apiVersion`, `kind`, name, namespace,
 `spec`, and `data`, removes null fields, sorts by API version/kind/namespace/name,
 then hashes canonical compact JSON. The 2026-08-23 read-only audit reproduced
-that exact pre-deploy hash and byte-identical key queue specs. The previously
-recorded `b231f36e...` value had no reproducible normalization recipe and is not
-valid drift evidence. Post-deploy verification must reproduce `fd5af31d...`
-with the same object set and recipe exactly.
+that exact current PRE hash and byte-identical key queue specs. Before each
+deployment gate the same recipe must take a new PRE snapshot, and POST must
+equal that PRE value; no historical hash is a desired-state target. The
+previously recorded `b231f36e...` value had no reproducible normalization
+recipe and must never be restored.
 
 Stable claim identity, unchanged-policy convergence, paid-residual suppression,
 telemetry, takeover, and the full production horizon remain open.
@@ -268,10 +277,12 @@ compatibility.
 The permanent rolling-compatibility floor is exact-current for new admission
 and provider-effect start, plus guaranteed N-1 read, route, settlement,
 recovery, and teardown. Projection decoders for older versions may remain, but
-they do not by themselves authorize an older capability cohort. Before any
-cleanup removes historical decoders, a separate tested contract may expand
-settlement-only compatibility to N-2; until that change is implemented and
-qualified, operators must not assume N-2 operational compatibility.
+they do not by themselves authorize an older capability cohort. The cleanup
+classifier bounds immutable projection decoding to N/N-1/N-2, but the generic
+capability fence still authorizes only N/N-1 cohorts. Full N-2 operational
+cleanup therefore requires a separate terminal-cleanup-only cohort predicate
+and profile/receipt qualification; operators must not infer N-2 recovery or
+effect authority from projection decodability.
 
 The following lifecycle-84 cleanup account is retained as incident history,
 not current service state. Before the `1.1.1436` correction, normal fenced down
@@ -1358,43 +1369,43 @@ deployed through PR #1659, release `1.1.1431`, and Helm revision 508.
 PRs #1663--#1669 subsequently closed the provider-free whole-service
 retirement gap, exact-request replay, proof-readiness, and selected-context
 deserialization defects. Production readback, not source state, establishes
-the live authority facts above. Lifecycle 89 is now normally purged and
-lifecycle 91 is active. PR #1670 and fix-forward PR #1671 changed only SkyPilot
+the live authority facts above. Lifecycle 89 is normally purged and lifecycle
+91 awaits final evidence-backed retirement. PR #1670 and fix-forward PR #1671 changed only SkyPilot
 manager, request-executor, and projected-worker runtime behavior; they did not
 change admission policy, task placement, Kueue, paid-residual accounting,
 shared infrastructure, or database schema.
 
 Remaining work, in exact order:
 
-1. Let the already-started supported whole-service teardown finish through
-   fresh provider absence and durable quiescence. Do not manually delete
-   lifecycle-91 rows or recreate the service under the transitional authority.
-2. Merge the reviewed canonical claim-identity and conserved spendable-free
-   correction, publish one immutable image/chart, and direct-Helm deploy the
-   exact API/controller/executor protocol-v6 cohort under the hold. Preserve
-   PR #1673, v1-v5 read/settle/teardown, and the flat Kueue topology; do not add
-   a Kueue Cohort, priority class, scheduler, EFS authority,
-   Terraform/Terragrunt change, platform runtime pin, admission backfill, or
-   manual row repair. Wait out predecessor authority, activate only the
-   complete homogeneous successor, release the hold, and reauthorize the final
-   stable writer generation. Re-prove every executor's 48 GiB downward-API
-   input and 64 long workers. Prove claim generation does not rotate on runtime
-   budget heartbeats and both observers publish conserved exact-card hints.
-3. Recreate the canonical no-EFS, `min_replicas: 0`, zero-floor service.
+1. Merge the bounded cleanup-capability hardening and publish one immutable
+   image/chart. Fresh/provider-effect paths stay exact-current; only the two
+   final-retirement call sites receive bounded historical projection decode.
+2. Direct-Helm deploy the exact API/controller/executor protocol-v6 cohort
+   under the hold, release it only long enough for one normal lifecycle-91
+   purge, and prove all 160 retained rows retire without manual SQL repair.
+   Preserve the flat Kueue topology; do not add a Kueue Cohort, priority class,
+   scheduler, EFS authority, Terraform/Terragrunt change, platform runtime pin,
+   or admission backfill.
+3. Re-hold, wait out predecessor authority, activate only the complete
+   homogeneous successor, release the hold, and reauthorize the final stable
+   writer generation. Re-prove every executor's 48 GiB downward-API input and
+   64 long workers. Prove claim generation does not rotate on runtime budget
+   heartbeats and both observers publish conserved exact-card hints.
+4. Recreate the canonical no-EFS, `min_replicas: 0`, zero-floor service.
    Same-name recreation creates a new resource scope and may rotate the test
    endpoint. Require fresh generic-bound, `DURABLE_PROJECTED`, `DURABLE_FEED`,
    and `DURABLE_INTENT` authority.
-4. Prove automatic backfill across every compatible
+5. Prove automatic backfill across every compatible
    free pool. The performance gate remains 80--90 H200 workloads submitted
    within a few minutes with concurrent initialization and cross-pool
    independence.
-5. Prove each fresh reserved grant is committed before paid residual is
+6. Prove each fresh reserved grant is committed before paid residual is
    calculated. No new paid/Spot launch may occur while fresh policy-admitted
    compatible reserved capacity covers demand, or while admission evidence is
    unknown. Fresh exact policy-waiting capacity is not serving supply;
    genuinely uncovered demand may receive one fresh
    paid residual and existing paid capacity must drain and terminate normally.
-6. Verify dashboard processing, queued, in-flight, rejected, and freshness
+7. Verify dashboard processing, queued, in-flight, rejected, and freshness
    fields remain available during controller restart and provider stalls.
    Expose exact completed HTTP exchanges only under an explicit completeness
    contract; exact model-job completion remains gated on an at-least-once
@@ -1403,7 +1414,7 @@ Remaining work, in exact order:
    matches the service's durable `controller_ip`; require owner epoch/IP/PID
    advancement and service `READY`. Prove a post-TTL worker bootstrap completes
    its later guarded read without `POST_EFFECT_AMBIGUOUS`.
-7. Repeat capacity, paid-spill, historical-state, telemetry, and takeover
+8. Repeat capacity, paid-spill, historical-state, telemetry, and takeover
    checks immediately, at +10, at +30, and through the full stale/quiescence
    horizon. Only then merge the separate deletion-only cleanup for
    compatibility decoders and transition artifacts.
@@ -6876,11 +6887,15 @@ legacy activation.
   release `1.1.1445` / Helm revision 563. The source and complete seven-Pod
   cohort are deployed, but production claim-stability/conservation evidence is
   intentionally deferred to the clean lifecycle.
-- [ ] Merge and deploy the narrow adjacent-v5 historical teardown decoder,
-  finish lifecycle-91 normal purge, then hold and authorize only the complete
-  homogeneous protocol-v6 cohort. Gate generation 30 intentionally remains
-  bound to `1.1.1443` until that transition is complete. The decoder permission
-  must not reach fresh admission, capacity accounting, or provider effects.
+- [x] Merge PR #1676's narrow adjacent-v5 historical teardown decoder. Its
+  PostgreSQL tests prove normal exact-digest cleanup while capacity remains
+  conservative and provider effects remain current-only.
+- [ ] Merge the bounded capability hardening, publish and deploy the combined
+  correction, finish lifecycle-91 normal purge, then hold and authorize only
+  the complete homogeneous protocol-v6 cohort. Gate generation 30
+  intentionally remains bound to `1.1.1443` until that transition is complete.
+  Historical permission must not reach fresh admission, capacity accounting,
+  or provider effects.
 
 - [x] Prove all three successor executors receive the exact 48 GiB downward-API
   input, publish 64 long-request workers each, and remain healthy for memory,

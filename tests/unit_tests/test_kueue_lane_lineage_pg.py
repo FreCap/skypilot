@@ -1,5 +1,5 @@
 """Real-PostgreSQL contracts for three-state Kueue admissions."""
-# pylint: disable=not-callable,redefined-outer-name,unused-import
+# pylint: disable=not-callable,protected-access,redefined-outer-name,unused-import
 
 import concurrent.futures
 import contextlib
@@ -224,7 +224,7 @@ def _canonical_intent_key(**overrides) -> str:
 
 
 @pytest.fixture
-def admission_database(empty_postgres):
+def admission_database(empty_postgres):  # noqa: F811
     config = migration_utils.get_alembic_config(empty_postgres,
                                                 migration_utils.SERVE_DB_NAME)
     alembic_command.upgrade(config, '057')
@@ -535,12 +535,14 @@ def _install_retirable_materialized_graph(
     replica_id: int,
     cleanup_marker: bool = True,
     effect_phase: str | None = None,
+    worker_projection_sha256: str = _PROJECTION,
 ) -> tuple[uuid.UUID, uuid.UUID, str]:
     """Install the exact terminal, quiesced, provider-absent delete graph."""
-    identity = _identity()
+    identity = _identity(worker_projection_sha256=worker_projection_sha256)
     _insert_intent(engine,
                    intent_key,
                    ordinal=replica_id - 1,
+                   worker_projection_sha256=worker_projection_sha256,
                    observation_sequence=replica_id - 1,
                    ordinary_zero_cost_admission_sequence=replica_id - 1)
     with engine.begin() as connection:
@@ -572,7 +574,7 @@ def _install_retirable_materialized_graph(
     info.reserved_fill_reclaim_fleet_bundle_sha256 = 'b' * 64
     info.reserved_fill_reclaim_policy_revision = 'reclaim-v1'
     info.reserved_fill_reclaim_provider_inventory_sha256 = 'c' * 64
-    info.reserved_fill_worker_projection_sha256 = _PROJECTION
+    info.reserved_fill_worker_projection_sha256 = worker_projection_sha256
     info.reserved_fill_observation_generation = 1
     info.reserved_fill_observation_sequence = replica_id - 1
     info.reserved_fill_intent_idempotency_key = intent_key
@@ -1088,18 +1090,15 @@ def _configure_serve_state_for_kueue_retirement(
     def _resolve_historical_projection(
         _connection,
         _intent,
-        *,
-        require_current_protocol=True,
     ):
         # Teardown validates the exact immutable projection which admitted the
         # retained row.  It must decode released historical protocols instead
         # of applying the fresh-admission current-protocol gate.
-        assert require_current_protocol is False
         return _identity()
 
     monkeypatch.setattr(
         zero_cost_actuation,
-        'kueue_admission_identity_for_locked_intent_in_connection',
+        'kueue_teardown_identity_for_locked_intent_in_connection',
         _resolve_historical_projection)
 
 
@@ -1700,15 +1699,12 @@ def test_live_east_missing_admission_fallback_is_not_applicable(
     def _resolve_historical_east(
         _connection,
         _intent,
-        *,
-        require_current_protocol=True,
     ):
-        assert require_current_protocol is False
         return None
 
     monkeypatch.setattr(
         zero_cost_actuation,
-        'kueue_admission_identity_for_locked_intent_in_connection',
+        'kueue_teardown_identity_for_locked_intent_in_connection',
         _resolve_historical_east)
     provider_probe = mock.Mock()
     monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
@@ -1864,8 +1860,8 @@ def test_historical_v5_teardown_retires_provider_absent_graph(
                  connection, intent)
         historical_identity = (
             zero_cost_actuation.
-            kueue_admission_identity_for_locked_intent_in_connection(
-                connection, intent, require_current_protocol=False))
+            kueue_teardown_identity_for_locked_intent_in_connection(
+                connection, intent))
     assert historical_identity is not None
     assert historical_identity.worker_projection_sha256 == projection_sha256
 
@@ -2426,6 +2422,54 @@ def test_whole_service_retires_marker_free_pre_job_provider_absence(
     provider_phase.assert_not_called()
     provider_probe.assert_not_called()
 
+    assert serve_state.remove_service_completely(
+        _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+    _assert_retired_graph(admission_database,
+                          intent_keys=(key,),
+                          replica_ids=(1,),
+                          association_ids=(association_id,))
+
+
+def test_historical_v5_retires_marker_free_pre_job_provider_absence(
+        admission_database, monkeypatch) -> None:
+    """Retire lifecycle-91's v5 pending-admission shape without replay."""
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    projection_sha256 = _install_historical_v5_worker_projections(
+        admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0,
+                                worker_projection_sha256=projection_sha256)
+    record_id, association_id, _ = _install_retirable_materialized_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        cleanup_marker=False,
+        effect_phase='PROVIDER_IO',
+        worker_projection_sha256=projection_sha256)
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _set_physical_provider_evidence(
+        admission_database, association_id,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
+    monkeypatch.setattr(serve_state._db_manager, '_engine', admission_database)
+    _mark_service_shutting_down(admission_database)
+
+    provider_phase = mock.Mock(
+        side_effect=AssertionError('v5 pre-job replay entered provider phase'))
+    provider_probe = mock.Mock(
+        side_effect=AssertionError('v5 pre-job replay read the provider'))
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        provider_phase)
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        provider_probe)
+
+    assert kueue_lane_observer.project_exact_pod_absence_after_teardown(
+        _SERVICE, 1, record_id)
+    provider_phase.assert_not_called()
+    provider_probe.assert_not_called()
     assert serve_state.remove_service_completely(
         _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
     _assert_retired_graph(admission_database,

@@ -22,6 +22,7 @@ from sky.serve import ordinary_launch_binding
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_projection_authority
+from sky.serve import reserved_fill_reclaim_attestation
 from sky.server.requests import request_names
 from sky.utils import common
 from sky.utils import dag_utils
@@ -500,6 +501,43 @@ def test_historical_v5_decodes_but_cannot_publish_reclaim_admission():
             accelerator_names=('H200',),
             accelerator_count=1,
             require_current_protocol=True)
+
+
+@pytest.mark.parametrize(
+    'protocol_version',
+    range(kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION - 2,
+          kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION + 1))
+def test_teardown_projection_decode_accepts_only_bounded_window(
+        protocol_version):
+    projection = _worker_projection(protocol_version)
+    projection_sha256 = kubernetes_identity.worker_projection_sha256(projection)
+
+    admission_mode = (reserved_fill_projection_authority.
+                      projected_admission_mode_for_teardown_candidate(
+                          [projection],
+                          kubernetes_context='phx-context',
+                          accelerator='H200',
+                          accelerator_count=1,
+                          expected_sha256=projection_sha256))
+
+    assert admission_mode is (
+        reserved_fill_reclaim_attestation.ReclaimAdmissionMode.KUEUE)
+
+
+def test_teardown_projection_decode_rejects_n_minus_three():
+    protocol_version = (
+        kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION - 3)
+    projection = _worker_projection(protocol_version)
+
+    with pytest.raises(ValueError, match='two immediate predecessors'):
+        (reserved_fill_projection_authority.
+         projected_admission_mode_for_teardown_candidate)(
+             [projection],
+             kubernetes_context='phx-context',
+             accelerator='H200',
+             accelerator_count=1,
+             expected_sha256=kubernetes_identity.worker_projection_sha256(
+                 projection))
 
 
 @pytest.mark.parametrize('mutation', ['digest', 'protocol'])

@@ -170,19 +170,21 @@ def _plan(
         capacity_unit=capacity_unit)
 
 
-def test_locked_intent_projection_decode_is_current_by_default(monkeypatch):
-    """Historical decode is explicit and cannot weaken fresh admission."""
-    projection = _worker_projection('phx', 1, kueue=True)
-    projection['projection_version'] = 5
+@pytest.mark.parametrize(('context', 'kueue'), [('phx', True), ('east', False)])
+def test_locked_teardown_decodes_exact_n_minus_one_without_fresh_authority(
+        monkeypatch, context, kueue):
+    projection = _worker_projection(context, 1, kueue=kueue)
+    projection['projection_version'] = (
+        kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION - 1)
     projection_sha256 = kubernetes_identity.worker_projection_sha256(projection)
-    physical_uid = 'uid-phx'
+    physical_uid = f'uid-{context}'
     pool_key = reserved_capacity_broker.make_pool_key(
-        'phx',
+        context,
         'L4',
         protocol_version=reserved_capacity_broker.PROTOCOL_V2,
         physical_cluster_uid=physical_uid)
     location = spot_placer.Location(cloud=clouds.Kubernetes(),
-                                    region='phx',
+                                    region=context,
                                     zone=None,
                                     accelerators={'L4': 1},
                                     use_spot=False)
@@ -194,7 +196,7 @@ def test_locked_intent_projection_decode_is_current_by_default(monkeypatch):
         'pool_key': pool_key,
         'pool_epoch': 7,
         'physical_cluster_uid': physical_uid,
-        'kubernetes_context': 'phx',
+        'kubernetes_context': context,
         'accelerator': 'L4',
         'accelerator_count': 1,
         'worker_projection_sha256': projection_sha256,
@@ -215,22 +217,25 @@ def test_locked_intent_projection_decode_is_current_by_default(monkeypatch):
                                                                    intent)
 
     identity = (zero_cost_actuation.
-                kueue_admission_identity_for_locked_intent_in_connection(
-                    connection, intent, require_current_protocol=False))
-    assert identity is not None
-    assert identity.worker_projection_sha256 == projection_sha256
+                kueue_teardown_identity_for_locked_intent_in_connection(
+                    connection, intent))
+    if kueue:
+        assert identity is not None
+        assert identity.worker_projection_sha256 == projection_sha256
+    else:
+        assert identity is None
 
     tampered_intent = dict(intent)
     tampered_intent['worker_projection_sha256'] = '0' * 64
     with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict,
                        match='no longer resolves'):
         (zero_cost_actuation.
-         kueue_admission_identity_for_locked_intent_in_connection)(
-             connection, tampered_intent, require_current_protocol=False)
+         kueue_teardown_identity_for_locked_intent_in_connection)(
+             connection, tampered_intent)
 
 
 @pytest.fixture
-def actuation_database(empty_postgres, monkeypatch):
+def actuation_database(empty_postgres, monkeypatch):  # noqa: F811
     config = migration_utils.get_alembic_config(empty_postgres,
                                                 migration_utils.SERVE_DB_NAME)
     # Exercise retained pre-Serve056 rows through the current canonical
