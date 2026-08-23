@@ -1,4 +1,5 @@
 """Tests for schemas.py"""
+import copy
 import unittest
 from unittest import mock
 
@@ -505,6 +506,43 @@ class TestWorkspaceSchema(unittest.TestCase):
 
         for config in configs:
             jsonschema.validate(instance=config, schema=self.workspaces_schema)
+
+    def test_workspace_kubernetes_accepts_cache_bootstrap_inputs(self):
+        """The optional v8 construction inputs require an immutable image."""
+        cache = {
+            'kind': 'node_local',
+            'mount_path': '/mnt/model-cache',
+            'volume_name': 'model-cache',
+            'host_mount_path': '/opt/dlami/nvme',
+            'bootstrap_image':
+                ('registry.example/serve-helper@sha256:' + 'a' * 64),
+            'attestation': {
+                'attestation_id': 'phx-cache-v1',
+                'device_source_pattern': '^/dev/mapper/vg\\.01-lv_ephemeral$',
+                'filesystem_type': 'ext4',
+                'required_bytes_per_replica': 1,
+                'required_inodes_per_replica': 1,
+                'max_replicas_per_node': 1,
+                'reserved_bytes_per_node': 0,
+                'reserved_inodes_per_node': 0,
+                'usable_bytes_per_node': 1,
+                'usable_inodes_per_node': 1,
+            },
+        }
+        config = {
+            'my-workspace': {
+                'kubernetes': {
+                    'serve_worker_cache': cache,
+                },
+            },
+        }
+        jsonschema.validate(instance=config, schema=self.workspaces_schema)
+
+        invalid = copy.deepcopy(config)
+        invalid['my-workspace']['kubernetes']['serve_worker_cache'][
+            'bootstrap_image'] = 'registry.example/serve-helper:latest'
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(instance=invalid, schema=self.workspaces_schema)
 
     def test_workspace_kubernetes_context_configs_preserves_kueue_quota(self):
         """Backward-compat: `kueue` and `quota` still validate alongside `namespace`."""

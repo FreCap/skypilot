@@ -166,7 +166,7 @@ def _config_snapshot(config: bytes,
 
 
 def _placement_projection_args(
-        worker_projection_version: int = 7) -> dict[str, object]:
+        worker_projection_version: int = 8) -> dict[str, object]:
     """Return a complete valid set of immutable placement projections."""
     worker_role = 'arn:aws:iam::123456789012:role/skyserve-worker-east'
     return {
@@ -2253,13 +2253,13 @@ def test_identical_projection_retry_is_idempotent_at_db_boundary(
     assert _read_version_row(_mock_serve_db, service_name, 2) == row_before
 
 
-@pytest.mark.parametrize('historical_protocol_version', [5, 6])
+@pytest.mark.parametrize('historical_protocol_version', [5, 6, 7])
 def test_fresh_writes_reject_historical_worker_projections(
         _mock_serve_db, historical_protocol_version):
     projections = _placement_projection_args(
         worker_projection_version=historical_protocol_version)
     error = (f'protocol version {historical_protocol_version} does not '
-             'satisfy required version 7')
+             'satisfy required version 8')
 
     with pytest.raises(ValueError, match=error):
         _add_minimal_service(f'svc-v{historical_protocol_version}-registration',
@@ -2287,7 +2287,7 @@ def test_fresh_writes_reject_historical_worker_projections(
     assert _read_version_row(_mock_serve_db, service_name, 3) is None
 
 
-@pytest.mark.parametrize('historical_protocol_version', [5, 6])
+@pytest.mark.parametrize('historical_protocol_version', [5, 6, 7])
 def test_identical_historical_projection_retry_remains_idempotent(
         _mock_serve_db, historical_protocol_version):
     service_name = f'svc-v{historical_protocol_version}-projection-retry'

@@ -116,15 +116,18 @@ def _configure_current_projection_runtime(config, *, scratch=None):
                      expected_bootstrap_sha256=bootstrap_sha256))
     assert readiness.matches
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 7,
+        'serve_worker_projection_protocol_version': 8,
+        'serve_worker_expected_cache': {
+            'kind': 'none',
+        },
         'serve_worker_expected_scratch': copy.deepcopy(scratch),
         'serve_worker_expected_runtime_bootstrap_sha256': bootstrap_sha256,
     })
 
 
 @pytest.mark.parametrize(('protocol_version', 'scratch', 'message'), [
-    (7, None, 'v3/v4/v5/v6/v7 requires the complete worker scratch'),
-    (7, {
+    (8, None, 'v3/v4/v5/v6/v7/v8 requires the complete worker scratch'),
+    (8, {
         'kind': 'memory',
         'size_limit_bytes': 1024,
     }, 'must be exactly none or memory-backed /tmp'),
@@ -146,8 +149,8 @@ def test_create_pods_rejects_invalid_worker_scratch_provider_contract(
 
 
 @pytest.mark.parametrize(('protocol_version', 'bootstrap_sha256', 'message'), [
-    (7, None, 'v4/v5/v6/v7 requires the complete worker runtime bootstrap'),
-    (7, 'A' * 64, '64 lowercase hexadecimal'),
+    (8, None, 'v4/v5/v6/v7/v8 requires the complete worker runtime bootstrap'),
+    (8, 'A' * 64, '64 lowercase hexadecimal'),
 ])
 def test_create_pods_rejects_invalid_worker_runtime_bootstrap_contract(
         monkeypatch, protocol_version, bootstrap_sha256, message):
@@ -161,6 +164,9 @@ def test_create_pods_rejects_invalid_worker_runtime_bootstrap_contract(
         'serve_worker_expected_scratch': {
             'kind': 'none',
         },
+        'serve_worker_expected_cache': {
+            'kind': 'none',
+        },
     })
     if bootstrap_sha256 is not None:
         config.provider_config[
@@ -171,7 +177,31 @@ def test_create_pods_rejects_invalid_worker_runtime_bootstrap_contract(
         instance._create_pods('us', 'cluster', 'cluster', config)
 
 
-@pytest.mark.parametrize('protocol_version', [1, 2, 3, 4, 5, 6])
+@pytest.mark.parametrize(('cache', 'message'), [
+    (None, 'protocol v8 requires the complete worker cache'),
+    ({
+        'kind': 'node_local',
+        'bootstrap_image': 'mutable:latest',
+    }, 'complete node_local contract'),
+])
+def test_create_pods_rejects_invalid_worker_cache_provider_contract(
+        monkeypatch, cache, message):
+    monkeypatch.setattr(kubernetes_utils, 'get_namespace_from_config',
+                        lambda *_args, **_kwargs: 'ns')
+    monkeypatch.setattr(kubernetes_utils, 'get_context_from_config',
+                        lambda *_args, **_kwargs: 'ctx')
+    config = _make_provision_config(count=1)
+    _configure_current_projection_runtime(config)
+    if cache is None:
+        config.provider_config.pop('serve_worker_expected_cache')
+    else:
+        config.provider_config['serve_worker_expected_cache'] = cache
+
+    with pytest.raises(config_lib.KubernetesError, match=message):
+        instance._create_pods('us', 'cluster', 'cluster', config)
+
+
+@pytest.mark.parametrize('protocol_version', [1, 2, 3, 4, 5, 6, 7])
 def test_create_pods_rejects_historical_projection_before_mutation(
         monkeypatch, protocol_version):
     monkeypatch.setattr(kubernetes_utils, 'get_namespace_from_config',
@@ -400,7 +430,7 @@ def test_create_pods_rejects_finalizer_runtime_bootstrap_drift_before_create(
     config = _make_provision_config(count=1)
     config.node_config['spec'] = pod_spec
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 7,
+        'serve_worker_projection_protocol_version': 8,
         'serve_worker_expected_priority_class_name': None,
         'serve_worker_expected_priority_value': None,
         'serve_worker_expected_preemption_policy': None,
@@ -411,6 +441,9 @@ def test_create_pods_rejects_finalizer_runtime_bootstrap_drift_before_create(
         'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
         'serve_worker_expected_accelerator_count': 1,
         'serve_worker_expected_scratch': {
+            'kind': 'none',
+        },
+        'serve_worker_expected_cache': {
             'kind': 'none',
         },
         'serve_worker_expected_runtime_bootstrap_sha256': bootstrap_sha256,
@@ -1322,7 +1355,7 @@ def test_current_projection_create_pods_waits_for_runtime_ready_before_final_rea
 
     config = _make_provision_config(count=1)
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 7,
+        'serve_worker_projection_protocol_version': 8,
         'serve_worker_expected_priority_class_name': None,
         'serve_worker_expected_priority_value': None,
         'serve_worker_expected_preemption_policy': None,
@@ -1333,6 +1366,9 @@ def test_current_projection_create_pods_waits_for_runtime_ready_before_final_rea
         'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
         'serve_worker_expected_accelerator_count': 1,
         'serve_worker_expected_scratch': {
+            'kind': 'none',
+        },
+        'serve_worker_expected_cache': {
             'kind': 'none',
         },
         'serve_worker_expected_runtime_bootstrap_sha256': '0' * 64,
@@ -1652,6 +1688,8 @@ def test_parallel_create_attests_each_pod_before_sibling_batch_returns(
                         record_attestation('accelerator'))
     monkeypatch.setattr(instance, '_attest_serve_worker_scheduler_and_binding',
                         record_attestation('scheduler'))
+    monkeypatch.setattr(instance, '_attest_serve_worker_cache',
+                        record_attestation('cache'))
     monkeypatch.setattr(instance, '_attest_serve_worker_scratch',
                         record_attestation('scratch'))
     monkeypatch.setattr(instance, '_attest_serve_worker_runtime_readiness',
@@ -1703,7 +1741,7 @@ def test_parallel_create_attests_each_pod_before_sibling_batch_returns(
     assert record.head_instance_id == head_name
     assert [kind for name, kind in events if name == head_name] == [
         'api-response', 'kueue', 'priority', 'service-account', 'accelerator',
-        'scheduler', 'scratch', 'runtime-readiness', 'create-return'
+        'scheduler', 'cache', 'scratch', 'runtime-readiness', 'create-return'
     ]
 
 

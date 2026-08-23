@@ -11,7 +11,7 @@ from sky.utils import controller_constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 90  # Lazy SkyServe version YAML
+API_VERSION = 91  # Attested SkyServe worker cache bootstrap
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -188,8 +188,10 @@ def is_serve_controller_api_request(method: str, path: str) -> bool:
 # advanced new writes to protocol 3 with typed worker scratch. Protocol 4 uses
 # the same response shape and advances projected workers to UID-bound runtime
 # readiness. Protocol 5 is historical after two released renderers shared its
-# discriminator. Protocol 6 is the sole current renderer and binds bootstrap
-# write roots to the projected memory-backed scratch contract.
+# discriminator. Protocol 6 binds bootstrap write roots to projected
+# memory-backed scratch; protocol 7 is historical after its node-local cache
+# leaf bootstrap gap. Protocol 8 adds the attested, server-owned cache leaf
+# initializer without changing this API response shape.
 MIN_SERVE_PLACEMENT_PROJECTION_API_VERSION = 77
 
 # Kubernetes node info includes the SkyServe-attributed subset of preemptible

@@ -1270,6 +1270,14 @@ _SERVE_WORKER_CACHE_SCHEMA = {
                 'type': 'string',
                 'minLength': 1,
             },
+            'host_mount_path': {
+                'type': 'string',
+                'pattern': '^/',
+            },
+            'bootstrap_image': {
+                'type': 'string',
+                'pattern': r'^[^\s@]+@sha256:[0-9a-f]{64}$',
+            },
             'attestation': _SERVE_CACHE_ATTESTATION_SCHEMA,
         },
     }],

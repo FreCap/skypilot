@@ -427,7 +427,7 @@ def _builtin_kubernetes_writer_kwargs(monkeypatch, tmp_path, test_name):
     }, output_path)
 
 
-def _projected_h200_worker(protocol_version=7):
+def _projected_h200_worker(protocol_version=8):
     return {
         'projection_version': protocol_version,
         'candidate_id': 'kubernetes-0000',
@@ -458,7 +458,7 @@ def _projected_h200_worker(protocol_version=7):
 
 
 def _projected_h200_worker_memory(protocol_version):
-    assert protocol_version in (5, 6, 7)
+    assert protocol_version in (5, 6, 7, 8)
     projection = _projected_h200_worker(protocol_version)
     projection['scratch'] = {
         'kind': 'memory',
@@ -728,16 +728,17 @@ def test_projected_worker_persists_authenticated_bootstrap_through_finalizer(
     assert contract.matches
 
 
-def test_projected_v6_worker_is_rejected_before_renderer(monkeypatch, tmp_path):
+def test_projected_v7_worker_is_rejected_before_v8_renderer(
+        monkeypatch, tmp_path):
     writer_kwargs, output_path = _builtin_kubernetes_writer_kwargs(
         monkeypatch, tmp_path, 'projected-v6-decode-only')
     writer_kwargs['to_provision'] = Resources(
         cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
     writer_kwargs['worker_placement_projections'] = [
-        _projected_h200_worker_memory(6)
+        _projected_h200_worker_memory(7)
     ]
 
-    with pytest.raises(ValueError, match='does not satisfy required version 7'):
+    with pytest.raises(ValueError, match='does not satisfy required version 8'):
         backend_utils.write_cluster_config(**writer_kwargs)
 
     assert not pathlib.Path(f'{output_path}.tmp').exists()
@@ -781,7 +782,7 @@ def test_legacy_v5_bootstrap_identity_hash_remains_decode_stable():
             pod_spec, {})
 
 
-def test_legacy_v6_bootstrap_identity_decodes_but_fresh_v7_rejects_it():
+def test_legacy_v6_bootstrap_identity_decodes_but_fresh_v8_rejects_it():
     legacy_marker = 'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V6'
     environment = [{
         'name': key,
@@ -820,14 +821,14 @@ def test_legacy_v6_bootstrap_identity_decodes_but_fresh_v7_rejects_it():
             pod_spec, kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENVIRONMENT)
 
 
-def test_projected_v7_bootstrap_env_is_inherited_by_fresh_kubectl_exec(
+def test_projected_v8_bootstrap_env_is_inherited_by_fresh_kubectl_exec(
         monkeypatch, tmp_path):
     writer_kwargs, _ = _builtin_kubernetes_writer_kwargs(
-        monkeypatch, tmp_path, 'projected-v7-bootstrap-environment')
+        monkeypatch, tmp_path, 'projected-v8-bootstrap-environment')
     writer_kwargs['to_provision'] = Resources(
         cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
     writer_kwargs['worker_placement_projections'] = [
-        _projected_h200_worker_memory(7)
+        _projected_h200_worker_memory(8)
     ]
 
     result = backend_utils.write_cluster_config(**writer_kwargs)

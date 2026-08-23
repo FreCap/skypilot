@@ -871,7 +871,7 @@ def test_current_paid_effect_accepts_current_worker_projection(
         binding_database) -> None:
     current_protocol = (
         kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
-    assert current_protocol == 7
+    assert current_protocol == 8
     with binding_database.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.version_specs_table).where(
@@ -933,11 +933,11 @@ def test_historical_cohort_cannot_start_provider_effect(
     assert phase == binding.EffectPhase.NOT_STARTED.value
 
 
-@pytest.mark.parametrize('historical_protocol', [5, 6])
-def test_historical_projection_retry_is_idempotent_but_effect_requires_v7(
+@pytest.mark.parametrize('historical_protocol', [6, 7])
+def test_historical_projection_retry_is_idempotent_but_effect_requires_v8(
         binding_database, monkeypatch, historical_protocol) -> None:
     """A lost-ACK retry survives N-1/N-2 without new provider I/O."""
-    assert kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION == 7
+    assert kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION == 8
     with binding_database.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.version_specs_table).where(
@@ -1047,7 +1047,7 @@ def _reserved_fill_cleanup_rows(
 def test_reserved_fill_cleanup_accepts_exact_adjacent_cohort_tuple(
         binding_database, monkeypatch) -> None:
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
-    assert current_cohort == 7
+    assert current_cohort == 8
     service, replica, association, expected_profile = (
         _reserved_fill_cleanup_rows(current_cohort - 1, current_cohort - 1))
     validated: list[binding.NonPoolLaunchProfile] = []
@@ -1070,13 +1070,13 @@ def test_reserved_fill_cleanup_accepts_exact_adjacent_cohort_tuple(
 
 
 @pytest.mark.parametrize('history_distance', [1, 2])
-def test_retained_v5_v6_reserved_fill_graph_settles_provider_absence(
+def test_retained_v6_v7_reserved_fill_graph_settles_provider_absence(
         binding_database, monkeypatch, history_distance) -> None:
     """N-1/N-2 terminal state cleans without new provider authority."""
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
     current_projection = (
         kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
-    assert (current_cohort, current_projection) == (7, 7)
+    assert (current_cohort, current_projection) == (8, 8)
     historical_cohort = current_cohort - history_distance
     historical_projection = current_projection - history_distance
     info = _reserved_fill_replica_info()
@@ -1088,9 +1088,9 @@ def test_retained_v5_v6_reserved_fill_graph_settles_provider_absence(
         authorization_generation=info.reserved_fill_allocation_generation,
         authorization_payload=profile_payload)
 
-    # Reproduce one retained v5/v6 graph using its original writer. Its JSON-
+    # Reproduce one retained v6/v7 graph using its original writer. Its JSON-
     # only intent edge may later be cleaned, but never re-rendered or granted
-    # a new provider effect by v7.
+    # a new provider effect by v8.
     with monkeypatch.context() as historical_code:
         historical_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
                                 historical_cohort)
@@ -1543,7 +1543,7 @@ def test_retained_v5_v6_reserved_fill_graph_settles_provider_absence(
     if history_distance == 2:
         # N-2 cannot perform AMBIGUOUS -> PROJECTED or release the pin. The
         # fixture's projection is committed under its original cohort before
-        # v7 is restored solely for terminal retirement validation.
+        # v8 is restored solely for terminal retirement validation.
         with pytest.raises(binding.OrdinaryLaunchBindingConflict,
                            match='retained generic cleanup cohort'):
             with binding_database.begin() as connection:
@@ -2022,14 +2022,14 @@ def test_retained_v5_v6_reserved_fill_graph_settles_provider_absence(
 
 
 @pytest.mark.parametrize(('service_cohort', 'association_cohort'), (
-    (4, 4),
-    (6, 5),
-    (5, 6),
+    (5, 5),
+    (7, 6),
+    (6, 7),
 ))
 def test_reserved_fill_cleanup_rejects_older_or_mismatched_cohorts(
         binding_database, monkeypatch, service_cohort,
         association_cohort) -> None:
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 7
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 8
     service, replica, association, _ = _reserved_fill_cleanup_rows(
         service_cohort, association_cohort)
     profile_validation_called = False

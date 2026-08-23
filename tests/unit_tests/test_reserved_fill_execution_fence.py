@@ -457,7 +457,7 @@ def test_policy_fill_reloads_and_authenticates_exact_current_projection():
     ]
 
 
-@pytest.mark.parametrize('protocol_version', [2, 3, 4, 5, 6])
+@pytest.mark.parametrize('protocol_version', [2, 3, 4, 5, 6, 7])
 def test_policy_fill_rejects_historical_projection_before_provider(
         protocol_version):
     projection = _worker_projection(protocol_version=protocol_version)
@@ -484,8 +484,8 @@ def test_worker_projection_versions_cannot_mix_in_one_persisted_record():
              _worker_projection(3)])
 
 
-def test_historical_v6_decodes_but_cannot_publish_reclaim_admission():
-    projection = _worker_projection(6)
+def test_historical_v7_decodes_but_cannot_publish_reclaim_admission():
+    projection = _worker_projection(7)
     decoded, _ = (
         reserved_fill_projection_authority.projected_admission_for_candidate(
             [projection],
@@ -494,7 +494,7 @@ def test_historical_v6_decodes_but_cannot_publish_reclaim_admission():
             accelerator_count=1))
     assert decoded == projection
 
-    with pytest.raises(ValueError, match='required version 7'):
+    with pytest.raises(ValueError, match='required version 8'):
         reserved_fill_projection_authority.projected_admissions_for_edge(
             [projection],
             access_context='phx-context',

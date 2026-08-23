@@ -1,6 +1,6 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-23 07:48 UTC
+Last updated: 2026-08-23 09:20 UTC
 
 Status: the canonical PostgreSQL-authoritative reserved-capacity admission and
 assignment path is source-complete. PR #1679 merged at
@@ -37,6 +37,45 @@ retained 438 historical `grant_expired` rows. These counts are a point-in-time
 safety receipt, not a fixed occupancy denominator; every later proof must
 re-read the capacity admitted by the unchanged scheduler policy.
 
+PR #1682 merged at
+`73c40a3fea07864b5765c9e9ff40830a733df9bb` and is deployed as immutable
+release `1.1.1452` / Helm revision 576 on the same seven writers at image
+`sha256:999f781a4a44899370fe9d25f55ac5ed2d6b625aed7b34b5849ca0cc55ed75f3`
+and chart digest
+`sha256:79349939d77a11a54c97d8bd71567019ee3cd40925b669528477fa0dfaf12d46`.
+Its generation-fenced pre-job adjudication was authorized by the separately
+reviewed generation-36-to-37 CAS. A direct PostgreSQL read at allocation
+generation 57 and claim generation 7779 proves the live gate is exactly
+`SEQUENCED_ACTIVE` generation 37, with zero paid claims and zero paid waiters.
+That activation is complete and must never be repeated. On this cohort PHX has
+194 of 194 Kueue-admitted fleet Workloads Ready and four additional Workloads
+withheld by unchanged topology fit; East has all 328 physical GPUs assigned
+(90 fleet and 238 other workloads). These are dynamic point-in-time
+denominators, not new quota or scheduler policy.
+
+The next PHX refill exposed a narrower SkyPilot projection defect. Healthy
+nodes have the attested `/opt/dlami/nvme` filesystem, but some do not yet have
+the registered per-service cache leaf. Protocol v7 mounts that leaf directly
+with `hostPath.type: Directory`, so kubelet blocks those Pods before model
+startup can attest or create it. This is neither Kueue denial nor unavailable
+GPU capacity. Protocol v8 is the single-happy-path correction: mount only the
+attested parent, run a digest-pinned server-owned init which verifies the mount
+and full-packing budget and safely creates the strict descendant, then mount
+that descendant into the model container through `subPath`. Protocol v7 is
+decode/settlement/cleanup-only and has no retained renderer. The v8 source is
+committed on the successor branch and its focused qualification is complete.
+Exact pre-rollout
+init-plus-`subPath` canaries passed in both PHX and East against Kubernetes API
+readback and were removed together with their unique empty cache leaves.
+Merge, publication, homogeneous deployment, clean service recreation,
+generation-37-to-38 activation, and fresh-service occupancy proof remain open.
+
+The rollout-selected bootstrap artifact is
+`699626303757.dkr.ecr.us-east-1.amazonaws.com/boltz-platform-models@sha256:a78258a38cfab1ec6aae09a9c1b19c34c205949563b844dfcff105adcf83b883`.
+It is a trusted server-owned worker artifact, not a task-selected image; the
+deployment gate still requires a PHX pull plus bash, Python 3, and `findmnt`
+checks before activation.
+
 ## Current executable closeout
 
 This is the only executable rollout sequence in this document. Every later
@@ -47,28 +86,41 @@ says otherwise.
 
 1. Keep Platform disconnected and re-read the exact service, writer, provider,
    paid, route, and unchanged 40-object Kueue gates.
-2. Treat the generation-35-to-36 activation as complete. Never repeat it and
-   never reopen legacy/direct authority.
-3. Merge and Helm-deploy the reviewed normal-service historical-cleanup
-   correction homogeneously across the same seven writers. Before any later
-   activation, verify every writer has the exact new digest and lifecycle
-   94/version 1 remains status-compatible with cleanup.
-4. Only after that deployment and a fresh zero-paid/provider/status readback,
-   perform exactly one active-to-active rotation from generation 36 to 37 to
-   bind the cleanup-capable writer inventory. This is a future deployment gate,
-   not authority for the patch author to operate production or to rotate early.
-5. Prove both load-balancer slots repeatedly resolve an eligible fresh route
+2. Treat every already-recorded activation through generation 37 as complete.
+   Never repeat one and never reopen legacy/direct authority. Re-read the live
+   generation before any mutation and require it to be exactly 37.
+3. Merge, publish, and direct-Helm deploy protocol v8 homogeneously across the
+   same seven writers with `--reuse-values`. Set the construction-only parent
+   mount and bootstrap image to `/opt/dlami/nvme` and an exact digest-pinned
+   trusted helper/worker artifact. Render both values identically into the API,
+   controller, and executor roles so every consolidated controller subprocess
+   inherits the same construction inputs. Verify that image contains bash,
+   Python 3, and `findmnt` and can be pulled by PHX workers.
+4. After homogeneous deployment, normally delete the test-only
+   `boltz-l4-fleet` service and wait for typed whole-service absence, then
+   recreate it from the canonical zero-minimum/no-EFS definition so version 1
+   freezes protocol v8/cohort 8. Do not add a projection migration and do not
+   manually delete rows, Pods, or Workloads. While the live gate remains 37,
+   the new cohort must fail closed for fresh provider effects.
+5. Re-read the fresh protocol-v8 service, its complete durable claim scope,
+   the homogeneous seven-writer inventory, and zero-paid/provider status. Only
+   then perform exactly one active-to-active rotation from generation 37 to
+   38. Do not activate during mixed-version overlap or before recreation; the
+   activation preflight requires exact-current protocol-v8 projections. V7 may
+   settle/clean only. Then prove a PHX Pod on an attested parent with a missing
+   leaf completes the v8 init and main-container `subPath` mount.
+6. Prove both load-balancer slots repeatedly resolve an eligible fresh route
    contract while fill writes continue, and prove every eligible retained
    pre-job row reaches its existing typed terminal outcome without provider I/O
    or historical-row deletion.
-6. Prove the fresh East scheduler-fit denominator and the fresh PHX
+7. Prove the fresh East scheduler-fit denominator and the fresh PHX
    Kueue-admitted denominator are fully assigned. Exclude PHX Workloads that
    Simone's unchanged Kueue configuration has not admitted; make no Kueue,
    Terraform/Terragrunt, KubeRay, EFS, IAM, or platform-runtime-pin change.
-7. Require zero paid claims, zero paid waiters, and zero provider Spot capacity
+8. Require zero paid claims, zero paid waiters, and zero provider Spot capacity
    whenever compatible reserved supply covers demand. Then reconnect only the
    endpoint value, send the harmless authenticated read, and repeat the census.
-8. Run immediate, +10, +30, and full stale/quiescence-horizon verification and
+9. Run immediate, +10, +30, and full stale/quiescence-horizon verification and
    record the exact dynamic denominators and evidence here.
 
 Before the historical supported teardown, lifecycle 93/version 1 had
@@ -133,6 +185,8 @@ boundaries.
 | Paid residual | Complete | Complete | Complete | Source/real-PostgreSQL tests qualify commit-before-residual and drain; idle plus harmless-request production proof created no paid capacity |
 | Protocol-v7 bootstrap and N-1 terminal-cleanup correction (#1679) | Complete at `40a0832bd` | Complete in `1.1.1449` / Helm 573 | Complete at gate 35 | Complete: lifecycle 93 purged and lifecycle 94 recreated without manual deletion |
 | Fill throughput and HA lock-starvation correction (#1680) | Complete at `b311dd277` | Complete in `1.1.1450` / Helm 575 | Complete at gate 36 | East batch proof complete: 16 intents committed together, all 16 became Ready, and generation 36 created zero `grant_expired` intents; PHX awaits the reviewed historical-cleanup deployment |
+| Generation-fenced pre-job cleanup (#1682) | Complete at `73c40a3fe` | Complete in `1.1.1452` / Helm 576 | Complete at gate 37 | Complete: PHX 194/194 Kueue-admitted Ready plus four topology-withheld; East 328/328 physical GPUs assigned; zero paid claims/waiters |
+| Protocol-v8 attested cache-leaf bootstrap | Committed on successor branch; merge pending | Pending | Pending one 37-to-38 CAS after clean v8 recreation | Exact PHX and East init/`subPath` canaries passed and were fully removed; fresh-service proof pending |
 
 At approximately 03:07 UTC, after takeover and gate-34 activation,
 `sky serve status` reported 133 Ready of 136 current reserved units after
@@ -466,11 +520,13 @@ cross-Pod takeover, Kueue non-mutation, node-pressure health, and the full
 180-second stale/quiescence interval were production-proven on the historical
 lifecycle. Lifecycle-93 cleanup, fresh lifecycle-94 recreation, and the
 generation 35-to-36 authorization of the homogeneous `1.1.1450`/Helm-575
-writer cohort are complete; that rotation must not be repeated. Overall
-closeout now requires the reviewed historical-cleanup deployment, a fresh
-status/zero-paid preflight, exactly one later generation 36-to-37 authorization
-for that new homogeneous cohort, repeated HA promotability without lock
-starvation, fast fresh-capacity assignment against the current dynamic
+writer cohort are complete; that rotation must not be repeated. PR #1682's
+historical-cleanup deployment and generation-36-to-37 authorization are also
+complete and non-repeatable. Overall closeout now requires homogeneous
+protocol-v8 deployment, normal lifecycle-94 teardown, clean protocol-v8
+same-name recreation while gate 37 remains closed to the new cohort, exactly
+one later generation-37-to-38 authorization, repeated HA promotability without
+lock starvation, fast fresh-capacity assignment against the current dynamic
 denominators, a zero-paid census, endpoint reconnection, and the
 immediate/+10/+30/full-stale horizon.
 The
@@ -567,10 +623,10 @@ exact `INTENT_PENDING` admissions with no Pod fields; one retained an exact
 strictly newer sequenced gate, so the whole-service-only validator correctly
 refused them and the normal exact-Pod loader incorrectly required a recorded
 service job. This is diagnostic evidence for cleanup adjudication, not an
-instruction to advance or otherwise mutate the now-active generation-36 gate.
-The current executable closeout above requires the cleanup source to be
-deployed and status-verified before one separately authorized 36-to-37
-rotation.
+instruction to advance or otherwise mutate the then-active generation-36 gate.
+Historical note: PR #1682 subsequently deployed this cleanup source and the
+separately reviewed 36-to-37 rotation completed. The current executable
+closeout is the protocol-v8 37-to-38 sequence at the top of this document.
 
 The local source correction adds one narrow validation-only adjudication
 before the existing exact-Pod probe. It requires the exact current Kueue
@@ -1824,10 +1880,12 @@ committed-intent profile for nine provider-present associations, and draft
 cleanup PR #1615 removed its enumerated historical-digest verifier after the
 documented horizon. Those rows are not the cause of the revision-470 incident;
 the former cold-controller retirement shelter is deployed and exercised. The
-protocol-v7 purge/recreate rollout completed in PR #1679; lifecycle 94 and gate
-36 are current. The `1.1.1450` generation-35-to-36 authorization is complete
-and non-repeatable. The executable closeout is the reviewed historical-cleanup
-deployment followed by its separately preflighted one-shot generation-36-to-37
+protocol-v7 purge/recreate rollout completed in PR #1679; lifecycle 94 remains
+the pre-v8 service, while gate 37 is current. The `1.1.1450`
+generation-35-to-36 authorization and PR #1682's generation-36-to-37
+authorization are complete and non-repeatable. The executable closeout is the
+homogeneous protocol-v8 deployment, typed teardown and clean v8 recreation,
+followed by its separately preflighted one-shot generation-37-to-38
 authorization and proof at the top of this document. Historical
 `1.1.1448` deployment, gate-34 reauthorization, live duplicate-up/takeover,
 Kueue non-mutation, node health, fresh telemetry, the complete 180-second stale

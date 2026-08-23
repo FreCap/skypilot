@@ -123,7 +123,7 @@ def test_non_pool_profile_envelope_is_closed_and_canonical() -> None:
 
 def test_supported_non_pool_profile_set_digest_is_stable_and_complete() -> None:
     digest = binding.supported_non_pool_profile_set_digest()
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 7
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 8
     assert len(digest) == 64
     assert digest == binding.supported_non_pool_profile_set_digest()
     assert set(binding._PROFILE_AUTHORIZATION_KIND) == set(  # pylint: disable=protected-access
@@ -1230,7 +1230,7 @@ def test_api014_serve051_lineage_and_sqlite_stays_at_serve037(
         server_constants.MIN_EXECUTOR_TERMINATION_EVIDENCE_API_VERSION == 87)
     assert (
         server_constants.MIN_SERVE_INCREMENTAL_ROUTE_LEASES_API_VERSION == 88)
-    assert server_constants.API_VERSION == 90
+    assert server_constants.API_VERSION == 91
 
     alembic_command.upgrade(serve_config, '037')
     inspector = sqlalchemy.inspect(sqlite)

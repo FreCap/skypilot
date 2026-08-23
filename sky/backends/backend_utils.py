@@ -946,6 +946,22 @@ def _enforce_worker_scratch_on_pod_spec(
             f'{contract.actual!r}; expected {contract.expected!r}.')
 
 
+def _enforce_worker_cache_on_pod_spec(
+    pod_spec: dict[str, Any],
+    cache: dict[str, Any],
+) -> None:
+    """Install the one attested protocol-v8 cache-leaf bootstrap."""
+    try:
+        contract = k8s_pod_spec.enforce_projected_worker_cache_contract(
+            pod_spec, cache, rewrite=True)
+    except k8s_pod_spec.ProjectedCacheContractError as error:
+        raise exceptions.InvalidCloudConfigs(str(error)) from error
+    if not contract.matches:
+        raise exceptions.InvalidCloudConfigs(
+            'Projected SkyServe worker cache canonicalization failed: '
+            f'{contract.actual!r}; expected {contract.expected!r}.')
+
+
 def _projected_worker_runtime_bootstrap_sha256_for_cluster_yaml(
     cluster_yaml: dict[str, Any],
     expected_bootstrap_environment: dict[str, str],
@@ -1029,6 +1045,14 @@ def _enforce_worker_projection_on_kubernetes_yaml(
     has_projected_runtime_readiness = (
         k8s_pod_spec.serve_worker_projection_protocol_has_runtime_readiness(
             projection_version))
+    has_projected_cache_bootstrap = (
+        k8s_pod_spec.serve_worker_projection_protocol_has_cache_bootstrap(
+            projection_version))
+    if has_projected_cache_bootstrap:
+        cluster_yaml['provider']['serve_worker_expected_cache'] = (
+            copy.deepcopy(projection['cache']))
+    else:
+        cluster_yaml['provider'].pop('serve_worker_expected_cache', None)
     if has_projected_runtime_readiness:
         try:
             expected_runtime_bootstrap_sha256 = (
@@ -1042,7 +1066,8 @@ def _enforce_worker_projection_on_kubernetes_yaml(
     else:
         if expected_runtime_bootstrap_sha256 is not None:
             raise exceptions.InvalidCloudConfigs(
-                'Only projection protocol v4/v5/v6/v7 may carry a worker runtime '
+                'Only projection protocol v4/v5/v6/v7/v8 may carry a worker '
+                'runtime '
                 'bootstrap SHA256 contract.')
         cluster_yaml['provider'].pop(
             'serve_worker_expected_runtime_bootstrap_sha256', None)
@@ -1245,32 +1270,8 @@ def _enforce_worker_projection_on_kubernetes_yaml(
                 'name': key,
                 'value': value
             } for key, value in scratch_env.items())
-            if cache['kind'] == 'node_local':
-                mounts = [
-                    mount for mount in container.setdefault('volumeMounts', [])
-                    if mount.get('name') != cache['volume_name'] and
-                    mount.get('mountPath') != cache['mount_path']
-                ]
-                mounts.append({
-                    'name': cache['volume_name'],
-                    'mountPath': cache['mount_path'],
-                })
-                container['volumeMounts'] = mounts
-        if cache['kind'] == 'node_local':
-            volumes = [
-                volume for volume in pod_spec.setdefault('volumes', [])
-                if volume.get('name') != cache['volume_name']
-            ]
-            # Directory (not DirectoryOrCreate) fails closed when the attested
-            # platform mount is absent instead of silently using node rootfs.
-            volumes.append({
-                'name': cache['volume_name'],
-                'hostPath': {
-                    'path': cache['host_path'],
-                    'type': 'Directory',
-                },
-            })
-            pod_spec['volumes'] = volumes
+        assert has_projected_cache_bootstrap
+        _enforce_worker_cache_on_pod_spec(pod_spec, cache)
         if has_projected_scratch:
             _enforce_worker_scratch_on_pod_spec(pod_spec, projection['scratch'])
         if has_projected_runtime_readiness:
