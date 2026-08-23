@@ -3964,8 +3964,10 @@ def _validate_system_recovery_transition(
             'A capable recovery disposition cannot be demoted or reset.')
 
 
-def _lock_zero_cost_protocol_sequence_for_update(
+def _lock_zero_cost_protocol_sequence(
     executor: orm.Session | sqlalchemy.engine.Connection,
+    *,
+    read: bool,
 ) -> sqlalchemy.engine.RowMapping:
     """Lock and validate the global zero-cost event sequencer.
 
@@ -3975,9 +3977,9 @@ def _lock_zero_cost_protocol_sequence_for_update(
     must acquire it before lifecycle/service/replica rows.
     """
     table = pool_capacity_observation_schema.protocol_state_sequence_table
+    statement = sqlalchemy.select(table).where(table.c.id == 1)
     row = executor.execute(
-        sqlalchemy.select(table).where(
-            table.c.id == 1).with_for_update()).mappings().one_or_none()
+        statement.with_for_update(read=read)).mappings().one_or_none()
     if row is None:
         raise RuntimeError('Reserved-fill sequencer singleton is missing at '
                            'zero-cost replica mutation.')
@@ -3990,6 +3992,13 @@ def _lock_zero_cost_protocol_sequence_for_update(
         raise RuntimeError('Reserved-fill zero-cost event sequences are '
                            'malformed.')
     return row
+
+
+def _lock_zero_cost_protocol_sequence_for_update(
+    executor: orm.Session | sqlalchemy.engine.Connection,
+) -> sqlalchemy.engine.RowMapping:
+    """Take the exclusive protocol mutex used by sequence writers."""
+    return _lock_zero_cost_protocol_sequence(executor, read=False)
 
 
 def lock_zero_cost_protocol_for_bound_launch_projection(
@@ -4005,6 +4014,21 @@ def lock_zero_cost_protocol_for_bound_launch_projection(
     if connection.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
         return
     _lock_zero_cost_protocol_sequence_for_update(connection)
+
+
+def lock_zero_cost_protocol_for_bound_launch_observation(
+        connection: sqlalchemy.engine.Connection) -> None:
+    """Share-lock protocol authority for provider-free graph validation.
+
+    Admission observers never allocate or advance an event sequence.  A
+    PostgreSQL ``FOR SHARE`` lock keeps protocol/gate writers fenced while
+    allowing independent observers to validate distinct materializations in
+    parallel.  Sequence writers and bound-result reducers deliberately retain
+    the exclusive helper above.
+    """
+    if connection.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return
+    _lock_zero_cost_protocol_sequence(connection, read=True)
 
 
 def _replica_write_may_touch_zero_cost_sequence(

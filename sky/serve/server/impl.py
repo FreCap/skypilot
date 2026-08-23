@@ -463,8 +463,19 @@ def up(
             'is active.')
     if service_name is None:
         service_name = serve_utils.generate_service_name(pool)
-    lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name)
+    # A named creation must inspect the durable name under the same mutex that
+    # serializes lifecycle mutations before minting a new epoch.  Claiming the
+    # epoch in ``ServiceLifecycleLock.acquire()`` would let a rejected
+    # duplicate ``up`` fence the healthy controller it found.
+    lifecycle_lock = serve_utils.get_service_lifecycle_lock(service_name,
+                                                            advance_epoch=None)
     with lifecycle_lock:
+        if (serve_utils.is_consolidation_mode(pool) and
+                serve_state.get_service_hash(service_name) is not None):
+            noun = 'pool' if pool else 'service'
+            raise RuntimeError(f'{noun.capitalize()} {service_name!r} already '
+                               'exists; choose a new name or update it.')
+        serve_utils.advance_service_lifecycle_epoch(lifecycle_lock)
         return _up_impl(task, service_name, pool, lifecycle_lock,
                         submitted_yaml_content)
 

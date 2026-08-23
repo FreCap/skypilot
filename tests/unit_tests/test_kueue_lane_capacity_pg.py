@@ -325,8 +325,8 @@ def test_each_copied_admission_identity_mismatch_is_exact_shape_unknown(
     original = (kueue_lane_lineage.KueueAdmissionRepository.
                 lock_service_admissions_in_connection)
 
-    def _corrupt(self, connection, service_name, service_hash):
-        rows = original(self, connection, service_name, service_hash)
+    def _corrupt(self, connection, service_name, service_hash, **kwargs):
+        rows = original(self, connection, service_name, service_hash, **kwargs)
         return tuple(
             dataclasses.replace(row, **{field: value}) if row.
             intent_idempotency_key == key else row for row in rows)
@@ -466,8 +466,8 @@ def test_each_real_copied_mismatch_blocks_autoscaler_retirement(
     original = (kueue_lane_lineage.KueueAdmissionRepository.
                 lock_service_admissions_in_connection)
 
-    def _corrupt(self, connection, service_name, service_hash):
-        rows = original(self, connection, service_name, service_hash)
+    def _corrupt(self, connection, service_name, service_hash, **kwargs):
+        rows = original(self, connection, service_name, service_hash, **kwargs)
         return tuple(
             dataclasses.replace(row, **{field: value}) if row.
             intent_idempotency_key == key else row for row in rows)

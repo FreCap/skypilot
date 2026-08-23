@@ -1092,11 +1092,13 @@ class KueueAdmissionRepository:
         connection: sqlalchemy.engine.Connection,
         service_name: str,
         service_hash: str,
+        *,
+        read: bool = False,
     ) -> None:
         owner = connection.execute(
             sqlalchemy.select(_SERVICES.c.hash).where(
-                _SERVICES.c.name ==
-                service_name).with_for_update()).scalar_one_or_none()
+                _SERVICES.c.name == service_name).with_for_update(
+                    read=read)).scalar_one_or_none()
         if owner != service_hash:
             raise KueueAdmissionConflict(
                 'Kueue admission lost its exact service incarnation.')
@@ -1106,17 +1108,23 @@ class KueueAdmissionRepository:
         connection: sqlalchemy.engine.Connection,
         service_name: str,
         service_hash: str,
+        *,
+        read: bool = False,
     ) -> tuple[KueueAdmissionRow, ...]:
         """Lock the service gap and every admission in canonical order."""
         _require_postgres_connection(connection)
         _require_nonempty(service_name, 'service_name')
         _require_nonempty(service_hash, 'service_hash')
-        self._lock_service_owner(connection, service_name, service_hash)
+        self._lock_service_owner(connection,
+                                 service_name,
+                                 service_hash,
+                                 read=read)
+        statement = sqlalchemy.select(_ADMISSIONS).where(
+            _ADMISSIONS.c.service_name == service_name).order_by(
+                _ADMISSIONS.c.unresolved_domain_sha256,
+                _ADMISSIONS.c.intent_idempotency_key)
         rows = connection.execute(
-            sqlalchemy.select(_ADMISSIONS).where(
-                _ADMISSIONS.c.service_name == service_name).order_by(
-                    _ADMISSIONS.c.unresolved_domain_sha256, _ADMISSIONS.c.
-                    intent_idempotency_key).with_for_update()).mappings().all()
+            statement.with_for_update(read=read)).mappings().all()
         if any(row['service_hash'] != service_hash for row in rows):
             raise KueueAdmissionConflict(
                 'A retained admission belongs to another service lifecycle.')

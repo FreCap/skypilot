@@ -1414,6 +1414,11 @@ class TestServeControllerHold:
         with mock.patch.object(impl.serve_utils,
                                'get_service_lifecycle_lock',
                                return_value=lifecycle_lock), \
+             mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode',
+                               return_value=False), \
+             mock.patch.object(impl.serve_utils,
+                               'advance_service_lifecycle_epoch'), \
              mock.patch.object(impl,
                                '_up_impl',
                                return_value=('pool-a', 'endpoint')) as up_impl:
@@ -1546,14 +1551,92 @@ class TestLifecycleLocking:
             side_effect=lambda *a: calls.append('unlock'))
         with mock.patch.object(impl.serve_utils,
                                'get_service_lifecycle_lock',
-                               return_value=lifecycle_lock), \
+                               return_value=lifecycle_lock) \
+             as get_lifecycle_lock, \
+             mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode',
+                               side_effect=lambda pool: calls.append(
+                                   'mode') or True), \
+             mock.patch.object(impl.serve_state,
+                               'get_service_hash',
+                               side_effect=lambda name: calls.append(
+                                   'read') or None), \
+             mock.patch.object(impl.serve_utils,
+                               'advance_service_lifecycle_epoch',
+                               side_effect=lambda lock: calls.append(
+                                   'advance')) as advance_epoch, \
              mock.patch.object(
                  impl,
                  '_up_impl',
                  side_effect=lambda *a, **k: calls.append('impl') or
                  ('svc', 'endpoint')):
             assert impl.up(mock.Mock(), 'svc') == ('svc', 'endpoint')
-        assert calls == ['lock', 'impl', 'unlock']
+        get_lifecycle_lock.assert_called_once_with('svc', advance_epoch=None)
+        advance_epoch.assert_called_once_with(lifecycle_lock)
+        assert calls == ['lock', 'mode', 'read', 'advance', 'impl', 'unlock']
+
+    def test_duplicate_up_does_not_advance_epoch_or_start_cleanup(self):
+        calls = []
+        lifecycle_lock = mock.MagicMock()
+        lifecycle_lock.__enter__ = mock.Mock(
+            side_effect=lambda *a: calls.append('lock'))
+        lifecycle_lock.__exit__ = mock.Mock(
+            side_effect=lambda *a: calls.append('unlock'))
+        with mock.patch.object(
+                impl.serve_utils,
+                'get_service_lifecycle_lock',
+                return_value=lifecycle_lock) as get_lifecycle_lock, \
+             mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode',
+                               side_effect=lambda pool: calls.append(
+                                   'mode') or True), \
+             mock.patch.object(impl.serve_state,
+                               'get_service_hash',
+                               side_effect=lambda name: calls.append(
+                                   'read') or 'incarnation-a'), \
+             mock.patch.object(
+                 impl.serve_utils,
+                 'advance_service_lifecycle_epoch') as advance_epoch, \
+             mock.patch.object(
+                 impl,
+                 '_up_impl') as up_impl, \
+             mock.patch.object(
+                 impl,
+                 '_cleanup_provisional_storage_intents') as cleanup_intents, \
+             pytest.raises(RuntimeError, match='already exists'):
+            impl.up(mock.Mock(), 'svc')
+
+        get_lifecycle_lock.assert_called_once_with('svc', advance_epoch=None)
+        advance_epoch.assert_not_called()
+        up_impl.assert_not_called()
+        cleanup_intents.assert_not_called()
+        assert calls == ['lock', 'mode', 'read', 'unlock']
+
+    def test_nonconsolidated_pool_up_preserves_remote_name_check(self):
+        lifecycle_lock = mock.MagicMock()
+        with mock.patch.object(
+                impl.serve_utils,
+                'get_service_lifecycle_lock',
+                return_value=lifecycle_lock) as get_lifecycle_lock, \
+             mock.patch.object(impl.serve_utils,
+                               'is_consolidation_mode',
+                               return_value=False), \
+             mock.patch.object(
+                 impl.serve_state,
+                 'get_service_hash') as get_service_hash, \
+             mock.patch.object(
+                 impl.serve_utils,
+                 'advance_service_lifecycle_epoch') as advance_epoch, \
+             mock.patch.object(impl,
+                               '_up_impl',
+                               return_value=('pool', 'endpoint')) as up_impl:
+            result = impl.up(mock.Mock(), 'pool', pool=True)
+
+        assert result == ('pool', 'endpoint')
+        get_lifecycle_lock.assert_called_once_with('pool', advance_epoch=None)
+        get_service_hash.assert_not_called()
+        advance_epoch.assert_called_once_with(lifecycle_lock)
+        up_impl.assert_called_once()
 
     def test_nonconsolidated_pool_failure_never_cleans_api_local_intents(self):
         lifecycle_lock = mock.MagicMock()

@@ -21,6 +21,7 @@ from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.serve import capacity_admission
 from sky.serve import kubernetes_identity
+from sky.serve import kueue_lane_capacity
 from sky.serve import kueue_lane_lineage
 from sky.serve import kueue_lane_lineage_schema
 from sky.serve import kueue_lane_observer
@@ -525,6 +526,247 @@ def _materialize(
             provider_cluster_generation=provider_generation,
             association_id=association_id)
     return record_id, association_id
+
+
+def _observation_authority(
+    *,
+    intent_key: str,
+    replica_id: int,
+    record_id: uuid.UUID,
+    association_id: uuid.UUID,
+    provider_generation: int,
+) -> kueue_lane_observer._ObservationAuthority:
+    fence = reserved_capacity.ProtocolV2LaunchFence(
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        pool_key=_POOL_KEY,
+        service_generation=1,
+        service_version=_SERVICE_VERSION,
+        physical_cluster_uid=_PHYSICAL_UID,
+        kubernetes_context=_CONTEXT,
+        accelerator=_ACCELERATOR,
+        accelerator_count=_ACCELERATOR_COUNT,
+        reconciliation_gate_generation=1,
+        reclaim_fleet_bundle_sha256='b' * 64,
+        reclaim_policy_revision='reclaim-v1',
+        reclaim_provider_inventory_sha256='c' * 64,
+        worker_projection_sha256=_PROJECTION)
+    return kueue_lane_observer._ObservationAuthority(
+        service_name=_SERVICE,
+        service_hash=_SERVICE_HASH,
+        service_lifecycle_epoch=_LIFECYCLE_EPOCH,
+        service_version=_SERVICE_VERSION,
+        intent_key=intent_key,
+        replica_id=replica_id,
+        replica_record_id=record_id,
+        association_id=association_id,
+        provider_cluster_generation=provider_generation,
+        fence=fence)
+
+
+def _install_observation_graphs(
+    engine: sqlalchemy.engine.Engine,
+    count: int,
+) -> tuple[tuple[kueue_lane_observer._ObservationAuthority, ...], tuple[
+        replica_managers.ReplicaInfo, ...]]:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(engine)
+    authorities = []
+    for offset in range(count):
+        replica_id = offset + 1
+        provider_generation = offset + 9
+        intent_key = f'{replica_id:064x}'
+        _insert_intent(engine,
+                       intent_key,
+                       ordinal=offset,
+                       observation_sequence=replica_id,
+                       ordinary_zero_cost_admission_sequence=replica_id)
+        with engine.begin() as connection:
+            repository.insert_intent_pending_in_connection(
+                connection, _identity(), intent_key)
+        record_id, association_id = _materialize(
+            engine,
+            repository,
+            _identity(),
+            intent_key,
+            replica_id=replica_id,
+            provider_generation=provider_generation)
+        authorities.append(
+            _observation_authority(intent_key=intent_key,
+                                   replica_id=replica_id,
+                                   record_id=record_id,
+                                   association_id=association_id,
+                                   provider_generation=provider_generation))
+    with engine.connect() as connection:
+        states = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.replica_state).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    _SERVICE).order_by(serve_state_schema.replicas_table.c.
+                                       replica_id)).scalars().all()
+    infos = tuple(
+        replica_managers.ReplicaInfo.from_storage_dict(dict(state))
+        for state in states)
+    return tuple(authorities), infos
+
+
+def test_materialization_observers_parallelize_but_fence_prefix_writers(
+        admission_database, monkeypatch) -> None:
+    """Twenty-four callbacks share read fences; writers remain exclusive."""
+    observer_count = 24
+    authorities, _ = _install_observation_graphs(admission_database,
+                                                 observer_count)
+    parallel_engine = sqlalchemy.create_engine(admission_database.url,
+                                               pool_size=observer_count + 5,
+                                               max_overflow=0)
+    original_prefix = (
+        kueue_lane_observer._lock_materialization_validation_prefix)
+    all_prefixes_locked = threading.Event()
+    release_observers = threading.Event()
+    count_lock = threading.Lock()
+    locked_count = 0
+
+    def hold_shared_prefix(connection, authority):
+        nonlocal locked_count
+        original_prefix(connection, authority)
+        with count_lock:
+            locked_count += 1
+            if locked_count == observer_count:
+                all_prefixes_locked.set()
+        assert release_observers.wait(timeout=10)
+
+    monkeypatch.setattr(kueue_lane_observer,
+                        '_lock_materialization_validation_prefix',
+                        hold_shared_prefix)
+
+    def validate(authority):
+        with parallel_engine.begin() as connection:
+            _, _, admission = (
+                kueue_lane_observer._lock_and_validate_materialization(
+                    connection, authority))
+            return admission.intent_idempotency_key
+
+    writer_pids: dict[str, int] = {}
+    writer_connected = {
+        'protocol': threading.Event(),
+        'lifecycle': threading.Event(),
+        'service': threading.Event(),
+    }
+
+    def take_writer_lock(target: str) -> None:
+        with parallel_engine.begin() as connection:
+            writer_pids[target] = connection.execute(
+                sqlalchemy.text('SELECT pg_backend_pid()')).scalar_one()
+            writer_connected[target].set()
+            if target == 'protocol':
+                table = (pool_capacity_observation_schema.
+                         protocol_state_sequence_table)
+                statement = sqlalchemy.select(table.c.id).where(table.c.id == 1)
+            elif target == 'lifecycle':
+                table = serve_state_schema.service_lifecycle_fences_table
+                statement = sqlalchemy.select(
+                    table.c.epoch).where(table.c.name == _SERVICE)
+            else:
+                table = serve_state_schema.services_table
+                statement = sqlalchemy.select(
+                    table.c.hash).where(table.c.name == _SERVICE)
+            connection.execute(statement.with_for_update()).one()
+
+    def wait_until_blocked(target: str) -> None:
+        assert writer_connected[target].wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with parallel_engine.connect() as connection:
+                blockers = connection.execute(
+                    sqlalchemy.text('SELECT pg_blocking_pids(:pid)'), {
+                        'pid': writer_pids[target]
+                    }).scalar_one()
+            if blockers:
+                return
+            time.sleep(0.02)
+        raise AssertionError(f'{target} writer was not fenced')
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=observer_count +
+                                                   3) as executor:
+            observer_futures = [
+                executor.submit(validate, authority)
+                for authority in authorities
+            ]
+            assert all_prefixes_locked.wait(timeout=10)
+            writer_futures = {
+                target: executor.submit(take_writer_lock, target)
+                for target in writer_connected
+            }
+            for target in writer_futures:
+                wait_until_blocked(target)
+            release_observers.set()
+            observed_keys = {
+                future.result(timeout=15) for future in observer_futures
+            }
+            for future in writer_futures.values():
+                future.result(timeout=15)
+    finally:
+        release_observers.set()
+        parallel_engine.dispose()
+
+    assert observed_keys == {authority.intent_key for authority in authorities}
+
+
+def test_capacity_snapshot_and_materialization_observer_have_one_lock_order(
+        admission_database, monkeypatch) -> None:
+    """Force the production intent/service overlap without a deadlock."""
+    (authority,), infos = _install_observation_graphs(admission_database, 1)
+    parallel_engine = sqlalchemy.create_engine(admission_database.url,
+                                               pool_size=4,
+                                               max_overflow=0)
+    monkeypatch.setattr(serve_state_schema, 'get_database_engine',
+                        lambda: parallel_engine)
+    observer_prefix_locked = threading.Event()
+    snapshot_intents_locked = threading.Event()
+    original_prefix = (
+        kueue_lane_observer._lock_materialization_validation_prefix)
+    original_projection = (
+        kueue_lane_capacity.lock_capacity_projection_in_connection)
+
+    def pause_observer_after_prefix(connection, observed_authority):
+        original_prefix(connection, observed_authority)
+        observer_prefix_locked.set()
+        assert snapshot_intents_locked.wait(timeout=10)
+
+    def mark_snapshot_intents_locked(*args, **kwargs):
+        snapshot_intents_locked.set()
+        return original_projection(*args, **kwargs)
+
+    monkeypatch.setattr(kueue_lane_observer,
+                        '_lock_materialization_validation_prefix',
+                        pause_observer_after_prefix)
+    monkeypatch.setattr(kueue_lane_capacity,
+                        'lock_capacity_projection_in_connection',
+                        mark_snapshot_intents_locked)
+
+    def validate() -> str:
+        with parallel_engine.begin() as connection:
+            _, _, admission = (
+                kueue_lane_observer._lock_and_validate_materialization(
+                    connection, authority))
+            return admission.intent_idempotency_key
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            observer = executor.submit(validate)
+            assert observer_prefix_locked.wait(timeout=5)
+            snapshot = executor.submit(
+                kueue_lane_capacity.snapshot_replica_capacity_classes, _SERVICE,
+                list(infos))
+            capacity = snapshot.result(timeout=10)
+            assert observer.result(timeout=10) == authority.intent_key
+    finally:
+        snapshot_intents_locked.set()
+        parallel_engine.dispose()
+
+    assert capacity.by_replica_id == {
+        authority.replica_id:
+            kueue_lane_capacity.KueueReplicaCapacityClass.UNKNOWN,
+    }
 
 
 def _install_retirable_materialized_graph(
