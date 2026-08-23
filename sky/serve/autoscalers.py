@@ -115,6 +115,25 @@ _RESERVED_CAPACITY_MAX_FUTURE_SKEW_SECONDS = (
     constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS)
 
 
+def _canonical_additional_supply(
+    configured_cards: Iterable[str],
+    supply: Mapping[str, int],
+) -> dict[str, int]:
+    """Validate capacity-unit supply against the configured exact cards."""
+    canonical_by_name = {card.casefold(): card for card in configured_cards}
+    result: dict[str, int] = {}
+    for raw_card, count in supply.items():
+        if not isinstance(raw_card, str):
+            raise ValueError('Additional zero-cost supply is malformed.')
+        canonical = canonical_by_name.get(raw_card.casefold())
+        if (canonical is None or canonical in result or
+                not isinstance(count, int) or isinstance(count, bool) or
+                count < 0):
+            raise ValueError('Additional zero-cost supply is malformed.')
+        result[canonical] = count
+    return result
+
+
 def _validate_reserved_fill_pool_topology(
     edges: Iterable[tuple[str, str, Iterable[str]]],) -> None:
     """Validate one complete v2 map using physical UID/card identity."""
@@ -2790,6 +2809,25 @@ class Autoscaler:
         """
         return True
 
+    def economic_capacity_target_by_accelerator(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        additional_zero_cost_supply_by_accelerator: Mapping[str, int],
+        *,
+        kueue_capacity_by_replica_id: Mapping[
+            int, kueue_lane_capacity.KueueReplicaCapacityClass] | None = None,
+    ) -> dict[str, int] | None:
+        """Return a non-actuating target after compatible reserved supply."""
+        del (replica_infos, additional_zero_cost_supply_by_accelerator,
+             kueue_capacity_by_replica_id)
+        if self.configured_accelerator_shapes:
+            return None
+        return {'*': max(0, int(self.get_final_target_num_replicas()))}
+
+    def supports_reserved_supply_economic_target(self) -> bool:
+        """Whether pending/tail supply has a work-conserving target proof."""
+        return False
+
     def info(self) -> dict[str, Any]:
         """Get information about the autoscaler."""
         info: dict[str, Any] = {
@@ -4936,6 +4974,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         min_replicas_override: int | None = None,
         max_replicas_override: int | None = None,
         use_existing_supply: bool = False,
+        additional_zero_cost_supply_by_accelerator: (Mapping[str, int] |
+                                                     None) = None,
     ) -> dict[str, int]:
         """Allocate recent demand to exact cards, priority first."""
         configured_cards = self._configured_cards_from_profiles()
@@ -4954,7 +4994,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         provisioning: dict[str, int] = {card: 0 for card in configured_cards}
         for info in replica_infos:
             if (info.is_terminal or info.version != self.latest_version or
-                    _replica_is_retiring_card_supply(info)):
+                    _replica_is_retiring_card_supply(info) or
+                    not self._kueue_counts_as_assigned(info)):
                 continue
             card, _ = self._get_gpu_shape_from_replica_info(info)
             if card not in ready:
@@ -4982,6 +5023,10 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             # supply-aware allocator compose it with hard per-card floors.
             profiles.append(
                 (0, tuple(configured_cards), fallback_aggregate_qps))
+        free_reserved = self.free_reserved_slots_by_accelerator
+        if additional_zero_cost_supply_by_accelerator is not None:
+            free_reserved = _canonical_additional_supply(
+                configured_cards, additional_zero_cost_supply_by_accelerator)
         return _allocate_compatibility_target(
             configured_cards=configured_cards,
             capacities=capacities,
@@ -4995,9 +5040,28 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             ready_zero_cost=ready_zero_cost,
             ready=ready,
             provisioning=provisioning,
-            free_reserved=self.free_reserved_slots_by_accelerator,
+            free_reserved=free_reserved,
             cold_order=cold_order,
             use_existing_supply=use_existing_supply)
+
+    def economic_capacity_target_by_accelerator(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        additional_zero_cost_supply_by_accelerator: Mapping[str, int],
+        *,
+        kueue_capacity_by_replica_id: Mapping[
+            int, kueue_lane_capacity.KueueReplicaCapacityClass] | None = None,
+    ) -> dict[str, int] | None:
+        """Keep heterogeneous-throughput QPS economics fail closed.
+
+        Replica-count conservation is not work conservation when cards have
+        different QPS.  The production reserved-fill path uses logical
+        concurrency units; QPS services retain their ordinary target and gain
+        no allocation-tail paid authority until a work-coverage proof exists.
+        """
+        del (replica_infos, additional_zero_cost_supply_by_accelerator,
+             kueue_capacity_by_replica_id)
+        return None
 
     def _set_target_num_replicas_with_instance_aware_logic(
             self, replica_infos: list['replica_managers.ReplicaInfo']) -> None:
@@ -7271,8 +7335,20 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         use_existing_supply: bool = False,
         pin_running_work: bool = False,
         use_free_reserved: bool = True,
+        additional_zero_cost_supply_by_accelerator: (Mapping[str, int] |
+                                                     None) = None,
+        economic_supply_snapshot: bool = False,
     ) -> _CompatibilityTargetResult:
-        """Allocate the concurrency target in physical or logical units."""
+        """Allocate the concurrency target in physical or logical units.
+
+        ``economic_supply_snapshot`` is used only by ordered paid admission.
+        It counts immutable planned width from the locked PostgreSQL graph,
+        independent of process-local LB degradation state.  A Kueue-assigned
+        old-version zero-cost row is included too, matching the admission
+        repository's conservative inventory accounting.  This makes the
+        economic result a function of the same durable facts revalidated at
+        provider start instead of controller-local observation caches.
+        """
         configured_cards = self._configured_cards_from_profiles()
         if not configured_cards:
             self.warm_retention_target_by_accelerator = {}
@@ -7293,15 +7369,24 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         provisioning = {card: 0 for card in configured_cards}
         canonical_by_name = {card.casefold(): card for card in configured_cards}
         for info in replica_infos:
-            if (info.is_terminal or info.version != self.latest_version or
-                    _replica_is_retiring_card_supply(info)):
+            kueue_assigned = self._kueue_counts_as_assigned(info)
+            assigned_historical_zero_cost = bool(
+                economic_supply_snapshot and info.is_zero_cost is True and
+                info.version != self.latest_version and kueue_assigned)
+            if (info.is_terminal or _replica_is_retiring_card_supply(info) or
+                (info.version != self.latest_version and
+                 not assigned_historical_zero_cost)):
                 continue
             raw_card, _ = self._get_gpu_shape_from_replica_info(info)
             card = canonical_by_name.get(raw_card.casefold())
             if card is None:
                 continue
-            width = (max(0, self._committed_capacity(info))
-                     if self.replica_unit == 'logical' else 1)
+            if economic_supply_snapshot:
+                width = (max(0, int(self._replica_capacity(info)))
+                         if kueue_assigned else 0)
+            else:
+                width = (max(0, self._committed_capacity(info))
+                         if self.replica_unit == 'logical' else 1)
             if width == 0:
                 continue
             if info.is_ready:
@@ -7390,7 +7475,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         }
         free_reserved = (dict(self.free_reserved_slots_by_accelerator)
                          if use_free_reserved else {})
-        if self.replica_unit == 'logical':
+        supplied_in_capacity_units = (additional_zero_cost_supply_by_accelerator
+                                      is not None)
+        if supplied_in_capacity_units:
+            assert additional_zero_cost_supply_by_accelerator is not None
+            free_reserved = _canonical_additional_supply(
+                configured_cards, additional_zero_cost_supply_by_accelerator)
+        if self.replica_unit == 'logical' and not supplied_in_capacity_units:
             free_reserved = {
                 card: count * self._configured_gpu_count(card)
                 for card, count in free_reserved.items()
@@ -7449,6 +7540,52 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self.warm_retention_target_by_accelerator = {}
         return _CompatibilityTargetResult(target, explicit_target, paid_target,
                                           attribution_complete)
+
+    def economic_capacity_target_by_accelerator(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        additional_zero_cost_supply_by_accelerator: Mapping[str, int],
+        *,
+        kueue_capacity_by_replica_id: Mapping[
+            int, kueue_lane_capacity.KueueReplicaCapacityClass] | None = None,
+    ) -> dict[str, int] | None:
+        """Place demand against pending/allocation supply without actuating."""
+        final_target = self.get_final_target_num_replicas()
+        prior_retention = dict(self.warm_retention_target_by_accelerator)
+        prior_kueue = self._kueue_capacity_by_replica_id_for_tick
+        if kueue_capacity_by_replica_id is not None:
+            if (set(kueue_capacity_by_replica_id) -
+                {info.replica_id for info in replica_infos} or not all(
+                    isinstance(value,
+                               kueue_lane_capacity.KueueReplicaCapacityClass)
+                    for value in kueue_capacity_by_replica_id.values())):
+                return None
+            self._kueue_capacity_by_replica_id_for_tick = dict(
+                kueue_capacity_by_replica_id)
+        try:
+            allocation = self._calculate_concurrency_target_by_accelerator(
+                replica_infos,
+                target_ceiling=final_target,
+                min_replicas_override=final_target,
+                use_existing_supply=True,
+                pin_running_work=False,
+                use_free_reserved=False,
+                additional_zero_cost_supply_by_accelerator=(
+                    additional_zero_cost_supply_by_accelerator),
+                economic_supply_snapshot=True)
+        finally:
+            # This target is economic accounting only.  It must not become
+            # rollout, retirement, or ordinary actuation ownership.
+            self.warm_retention_target_by_accelerator = prior_retention
+            self._kueue_capacity_by_replica_id_for_tick = prior_kueue
+        if (not allocation.card_attribution_complete or
+                sum(allocation.target_by_accelerator.values()) != final_target):
+            return None
+        return allocation.target_by_accelerator
+
+    def supports_reserved_supply_economic_target(self) -> bool:
+        """Logical GPU slots conserve work across compatible card choices."""
+        return self.replica_unit == 'logical'
 
     def _logical_committed_capacity_by_accelerator(
         self,

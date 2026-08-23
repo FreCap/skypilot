@@ -31,6 +31,10 @@ WAITING_OBSERVATION_TTL_SECONDS = 15
 
 _SHA256_RE = re.compile(r'[0-9a-f]{64}')
 _TERMINAL_STATUSES = frozenset({'SUCCEEDED', 'FAILED', 'CANCELLED'})
+_PROVIDER_FREE_UNEXPIRED_TERMINAL_REASONS = frozenset({
+    'allocation_superseded',
+    'insufficient_actuation_window',
+})
 _TERMINAL_PROFILE_FIELDS = ('binding_protocol_version', 'profile_kind',
                             'profile_version', 'profile_digest',
                             'capability_cohort_epoch',
@@ -63,7 +67,6 @@ class _ProviderAbsentPreJobAdmissionMode(enum.Enum):
     """Admission receipts accepted by one provider-clean pre-job proof."""
 
     PENDING_ONLY = enum.auto()
-    PENDING_OR_POLICY_ADMITTED = enum.auto()
     PENDING_OR_RETAINED_POD = enum.auto()
 
 
@@ -606,12 +609,12 @@ def _terminal_request_matches_association(
 def _is_provider_absent_pre_job_association(
         association: Mapping[str, Any]) -> bool:
     """Whether one settled association is the closed pre-job ABSENT shape."""
-    return bool(
-        association['resolution'] == 'PROJECTED' and
-        association['reconciliation_outcome'] == 'PROJECTED' and
-        association['effect_phase'] in {'NOT_STARTED', 'PROVIDER_IO'} and
-        association['service_job_id'] is None and
-        association['provider_evidence'] == 'ABSENT')
+    return bool(association['resolution'] == 'PROJECTED' and
+                association['reconciliation_outcome'] == 'PROJECTED' and
+                association['effect_phase']
+                in {'NOT_STARTED', 'PROVIDER_IO', 'SERVICE_JOB_IO'} and
+                association['service_job_id'] is None and
+                association['provider_evidence'] == 'ABSENT')
 
 
 def _validate_provider_absent_pre_job_admission(
@@ -1012,7 +1015,14 @@ def _validate_generation_fenced_normal_failure_in_connection(
     service: Mapping[str, Any],
     intent: Mapping[str, Any],
 ) -> None:
-    """Prove that a live service has superseded one failed pre-job launch."""
+    """Prove a live sequenced service may replace a failed pre-job launch.
+
+    A strictly newer gate remains sufficient, but it is not necessary once
+    the launch request is terminal and execution-quiesced and canonical
+    provider evidence proves the physical effect absent.  The surrounding
+    graph validator establishes those stronger facts.  Requiring a gate bump
+    as well strands failed attempts from the current allocation forever.
+    """
     active_service_statuses = frozenset({
         'CONTROLLER_INIT',
         'REPLICA_INIT',
@@ -1034,9 +1044,10 @@ def _validate_generation_fenced_normal_failure_in_connection(
             != pool_capacity_observation_schema.SEQUENCED_ACTIVE or
             type(frozen_generation) is not int or frozen_generation < 1 or
             type(current['reconciliation_gate_generation']) is not int or
-            current['reconciliation_gate_generation'] <= frozen_generation):
+            current['reconciliation_gate_generation'] < frozen_generation):
         raise KueueAdmissionConflict(
-            'Normal pre-job retirement lacks a newer active generation fence.')
+            'Normal pre-job retirement lacks a current active generation '
+            'fence.')
 
 
 def _validate_admissionless_retirement_rows_in_connection(
@@ -1709,10 +1720,9 @@ class KueueAdmissionRepository:
                     'Whole-service pre-job retirement lost its exact retained '
                     'Pod receipt.')
             admission_mode = (
-                _ProviderAbsentPreJobAdmissionMode.PENDING_OR_RETAINED_POD
-                if allow_whole_service_retained_pod_receipt else
-                _ProviderAbsentPreJobAdmissionMode.PENDING_OR_POLICY_ADMITTED
-                if allow_generation_fenced_normal_failure else
+                _ProviderAbsentPreJobAdmissionMode.PENDING_OR_RETAINED_POD if
+                (allow_whole_service_retained_pod_receipt or
+                 allow_generation_fenced_normal_failure) else
                 _ProviderAbsentPreJobAdmissionMode.PENDING_ONLY)
             _validate_provider_absent_pre_job_admission(
                 connection,
@@ -1762,13 +1772,14 @@ class KueueAdmissionRepository:
         replica_id: int,
         replica_record_id: uuid.UUID,
     ) -> ExactPodAbsenceLoadResult:
-        """Prove an old-generation pre-job failure is already provider-clean.
+        """Prove a replaceable pre-job failure is already provider-clean.
 
         This is a read-only normal-service adjudication boundary.  It accepts
-        only an exact retained INTENT_PENDING or POLICY_ADMITTED Kueue row
-        whose launch is terminal, quiesced, canonically provider-ABSENT, and
-        strictly older than the live sequenced reconciliation gate.  It never
-        authorizes a provider read or deletes durable history.
+        only an exact retained INTENT_PENDING, expired POD_WAITING, or
+        POLICY_ADMITTED Kueue row whose launch is terminal, quiesced,
+        canonically provider-ABSENT, and fenced by the current or a successor
+        sequenced reconciliation gate.  It never authorizes a provider read
+        or deletes durable history.
         """
         graph = self._load_admissionless_teardown_graph_in_connection(
             connection,
@@ -2329,7 +2340,8 @@ class KueueAdmissionRepository:
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
         terminal_eligibility = sqlalchemy.or_(
             _INTENTS.c.valid_until <= discovery_now,
-            _INTENTS.c.last_error == 'insufficient_actuation_window')
+            _INTENTS.c.last_error.in_(
+                tuple(_PROVIDER_FREE_UNEXPIRED_TERMINAL_REASONS)))
         if teardown_service:
             terminal_eligibility = sqlalchemy.or_(
                 terminal_eligibility,
@@ -2488,8 +2500,8 @@ class KueueAdmissionRepository:
             teardown_authorized = bool(
                 teardown_service and intent['last_error'] == 'service_teardown')
             unexpired_cleanup_authorized = bool(
-                teardown_authorized or
-                intent['last_error'] == 'insufficient_actuation_window')
+                teardown_authorized or intent['last_error']
+                in _PROVIDER_FREE_UNEXPIRED_TERMINAL_REASONS)
             if (identity.service_name != service_name or
                     identity.service_hash != service_hash):
                 raise KueueAdmissionConflict(
@@ -2557,7 +2569,7 @@ class KueueAdmissionRepository:
             service_status in ('SHUTTING_DOWN', 'FAILED_CLEANUP'))
         unexpired_cleanup_authorized = bool(
             teardown_authorized or
-            intent['last_error'] == 'insufficient_actuation_window')
+            intent['last_error'] in _PROVIDER_FREE_UNEXPIRED_TERMINAL_REASONS)
         empty_fields = ('replica_id', 'replica_record_id',
                         'provider_cluster_generation', 'association_id',
                         'pod_namespace', 'pod_name', 'pod_uid', 'pod_receipt',
@@ -2602,6 +2614,7 @@ class KueueAdmissionRepository:
         service_hash: str,
         service_lifecycle_epoch: int,
         targets: tuple[MaterializedAdmissionRetirementTarget, ...],
+        allow_active_provider_free_pre_job: bool = False,
     ) -> tuple[MaterializedRetirementProof, ...]:
         """Lock and prove the provider-clean Kueue subset of a delete batch.
 
@@ -2616,6 +2629,9 @@ class KueueAdmissionRepository:
         _require_nonempty(service_name, 'service_name')
         _require_nonempty(service_hash, 'service_hash')
         _require_positive(service_lifecycle_epoch, 'service_lifecycle_epoch')
+        if type(allow_active_provider_free_pre_job) is not bool:
+            raise ValueError(
+                'Active provider-free retirement scope must be boolean.')
         if not isinstance(targets, tuple):
             raise TypeError('targets must be an immutable tuple.')
         for target in targets:
@@ -2839,8 +2855,10 @@ class KueueAdmissionRepository:
                     checked_info):
                 checked_associations[replica_id] = checked
                 continue
-            if (service['status'] in ('SHUTTING_DOWN', 'FAILED_CLEANUP') and
-                    _is_provider_absent_pre_job_association(checked)):
+            active_service = service['status'] not in ('SHUTTING_DOWN',
+                                                       'FAILED_CLEANUP')
+            if (_is_provider_absent_pre_job_association(checked) and
+                (not active_service or allow_active_provider_free_pre_job)):
                 checked_associations[replica_id] = checked
                 provider_free_pre_job_ids.add(replica_id)
                 continue
@@ -2961,6 +2979,8 @@ class KueueAdmissionRepository:
             provider_free_pre_job = replica_id in provider_free_pre_job_ids
             provider_free_graph: _AdmissionlessTeardownGraph | None = None
             if provider_free_pre_job:
+                active_service = service['status'] not in ('SHUTTING_DOWN',
+                                                           'FAILED_CLEANUP')
                 provider_free_graph = (
                     _validate_admissionless_retirement_rows_in_connection(
                         connection,
@@ -2973,7 +2993,8 @@ class KueueAdmissionRepository:
                         association=association,
                         request=request,
                         replica_id=replica_id,
-                        replica_record_id=expected_records[replica_id]))
+                        replica_record_id=expected_records[replica_id],
+                        allow_generation_fenced_normal_failure=active_service))
                 if (provider_free_graph.provider_absence_state
                         is not PhysicalAbsenceLoadState.ALREADY_PROVEN):
                     raise KueueAdmissionConflict(

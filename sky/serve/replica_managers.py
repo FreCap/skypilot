@@ -3345,6 +3345,14 @@ class ReplicaManager:
         time.sleep(timeout_seconds)
         return False
 
+    def set_scale_reconcile_notifier(
+            self, notify_reconcile: Callable[[], int]) -> None:
+        """Install an optional controller wakeup sink.
+
+        Non-SkyPilot managers have no typed provider feedback to publish.
+        """
+        del notify_reconcile
+
     def scale_down(self,
                    replica_id: int,
                    purge: bool = False,
@@ -3582,6 +3590,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._ownership_lost = threading.Event()
         self._manager_daemon_stop = threading.Event()
         self._scale_reconciliation_event = threading.Event()
+        # The controller installs its single generation coordinator after the
+        # manager is constructed.  Keep the legacy event as a compatibility
+        # signal for direct embedders, but route every committed feedback wake
+        # to that coordinator when it is present.
+        self._scale_reconcile_notifier: Callable[[], int] | None = None
         self._system_recovery_route_epoch = str(uuid.uuid4())
         self._ordinary_launch_handoff_route_epoch = str(uuid.uuid4())
         self._system_recovery_route_registry = (
@@ -3913,6 +3926,20 @@ class SkyPilotReplicaManager(ReplicaManager):
     def wait_for_scale_reconciliation(self, timeout_seconds: float) -> bool:
         """Wait interruptibly for committed typed provider feedback."""
         return self._scale_reconciliation_event.wait(timeout_seconds)
+
+    def set_scale_reconcile_notifier(
+            self, notify_reconcile: Callable[[], int]) -> None:
+        """Bind committed manager feedback to the controller coordinator."""
+        if not callable(notify_reconcile):
+            raise TypeError('notify_reconcile must be callable.')
+        self._scale_reconcile_notifier = notify_reconcile
+
+    def _notify_scale_reconciliation(self) -> None:
+        """Wake compatibility consumers and the canonical controller loop."""
+        self._scale_reconciliation_event.set()
+        notifier = getattr(self, '_scale_reconcile_notifier', None)
+        if notifier is not None:
+            notifier()
 
     def _db_fence_kwargs(self) -> dict[str, Any]:
         """Exact owner predicates, omitted for legacy/direct test managers."""
@@ -4710,7 +4737,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     ordinary_launch_binding.PreAdmissionRetirementDisposition.
                     RETIRED, ordinary_launch_binding.
                     PreAdmissionRetirementDisposition.ABSENT):
-                self._scale_reconciliation_event.set()
+                self._notify_scale_reconciliation()
                 return True
             return False
         prior_planned_capacity = info.planned_capacity
@@ -5567,7 +5594,13 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._persist_replicas(updates)
         return confirmed
 
-    def _remove_replica(self, replica_id: int, replica_record_id: str) -> None:
+    def _remove_replica(
+        self,
+        replica_id: int,
+        replica_record_id: str,
+        *,
+        allow_active_provider_free_pre_job: bool = False,
+    ) -> None:
         suspension = self._route_lease_registry().suspend_record(
             replica_id, replica_record_id)
         try:
@@ -5575,7 +5608,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._service_name,
                 replica_id,
                 **self._db_fence_kwargs(),
-                expected_replica_record_id=replica_record_id)
+                expected_replica_record_id=replica_record_id,
+                allow_active_provider_free_pre_job=(
+                    allow_active_provider_free_pre_job))
         except BaseException:
             if suspension is not None:
                 self._resolve_ambiguous_system_recovery_route_suspensions(
@@ -9233,7 +9268,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         handled_intent_keys: set[str] = set()
         preflights: _ReservedFillPhysicalPreflightBatch | None = None
         materialization_committed = False
-        submitted_count = 0
+        window_released = False
         ambiguous_error: Exception | None = None
         actuation_error: BaseException | None = None
         try:
@@ -9309,7 +9344,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     # graph.  Later batch members remain
                                     # independently actionable.
                                     materialization_committed = True
-                                    submitted_count += 1
+                                    window_released = True
                                     handled_intent_keys.add(intent_key)
                                     if ambiguous_error is None:
                                         ambiguous_error = error
@@ -9333,10 +9368,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 except (exceptions.
                                         KubernetesPhysicalClusterIdentityError
                                        ) as error:
-                                    (self._zero_cost_actuation_repository.
-                                     terminate(
-                                         lease,
-                                         'physical_cluster_identity_changed'))
+                                    transitioned = (
+                                        self._zero_cost_actuation_repository.
+                                        terminate(
+                                            lease,
+                                            'physical_cluster_identity_changed')
+                                    )
+                                    window_released |= transitioned
                                     handled_intent_keys.add(intent_key)
                                     logger.info(
                                         'Terminalized zero-cost actuation for '
@@ -9370,7 +9408,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     handled_intent_keys.add(intent_key)
                                     continue
                                 materialization_committed = True
-                                submitted_count += 1
+                                window_released = True
                                 handled_intent_keys.add(intent_key)
                                 used_replica_ids.add(result.replica_id)
                 except BaseException as error:
@@ -9392,7 +9430,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # the sole reconciliation signal and preserves BaseException
                 # precedence without retrying the provider effect.
                 raise ambiguous_error
-            self._scale_reconciliation_event.set()
+            if window_released:
+                self._notify_scale_reconciliation()
         except BaseException as error:  # pylint: disable=broad-except
             actuation_error = error
             unresolved = tuple(
@@ -9409,7 +9448,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'preserving its intent without cleanup: %s', pool_key,
                     formatted_error)
                 try:
-                    self._scale_reconciliation_event.set()
+                    self._notify_scale_reconciliation()
                 except BaseException as signal_error:  # pylint: disable=broad-except
                     if not isinstance(error, Exception):
                         raise error from signal_error
@@ -9432,8 +9471,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             elif isinstance(error,
                             exceptions.KubernetesPhysicalClusterIdentityError):
                 for lease in unresolved:
-                    self._zero_cost_actuation_repository.terminate(
-                        lease, 'physical_cluster_identity_changed')
+                    transitioned = (
+                        self._zero_cost_actuation_repository.terminate(
+                            lease, 'physical_cluster_identity_changed'))
+                    window_released |= transitioned
                 logger.info('Terminalized zero-cost actuation for pool %s: %s',
                             pool_key, common_utils.format_exception(error))
             elif not isinstance(error, Exception):
@@ -9450,6 +9491,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                             'lease for pool %s.', pool_key)
                 logger.exception('Zero-cost actuation failed for pool %s: %s',
                                  pool_key, common_utils.format_exception(error))
+            if window_released and not materialization_committed:
+                self._notify_scale_reconciliation()
         finally:
             if preflights is not None:
                 try:
@@ -9473,7 +9516,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             # before the next bounded wave.  All provider and graph work is
             # complete at this point, so removing only our exact thread hands
             # actuation ownership to the next wave without overlapping work.
-            if (submitted_count > 0 and len(leases)
+            if (window_released and len(leases)
                     == zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE):
                 current_thread = threading.current_thread()
                 with self._zero_cost_actuation_lane_lock:
@@ -10379,6 +10422,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 format_exc: str | None) -> None:
         # This is the current down-result projection owner.  It is not
         # deprecated by the retired action-authority proposal.
+        provider_free_failed_launch = bool(
+            format_exc is None and info.reserved_fill is True and
+            info.zero_cost_materialization_sequence is None and
+            info.service_job_id is None and info.status in {
+                serve_state.ReplicaStatus.SHUTTING_DOWN,
+                serve_state.ReplicaStatus.FAILED_CLEANUP,
+            })
         if format_exc is not None:
             logger.error(f'Down thread for replica {info.replica_id} '
                          f'exited abnormally with exception {format_exc}.')
@@ -10420,7 +10470,15 @@ class SkyPilotReplicaManager(ReplicaManager):
         # initial_delay_seconds is not supported. We should add it
         # later when we support `sky serve update`.
         removal_reason = None
-        if info.status_property.is_scale_down:
+        if provider_free_failed_launch:
+            # The exact removal transaction revalidates the terminal,
+            # execution-quiesced request and association, canonical
+            # post-receipt provider ABSENT evidence, and the absence of any
+            # queue, pin, or paid claim.  Retaining this current-version
+            # diagnostic row after that proof would debit the Kueue slot
+            # forever and prevent the same allocation from replacing it.
+            removal_reason = 'for a provider-free failed launch replacement'
+        elif info.status_property.is_scale_down:
             # This means the cluster is deleted due to an autoscaler
             # decision or the cluster is recovering from preemption.
             # Delete the replica info so it won't count as a replica.
@@ -10452,7 +10510,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'failure detected.')
             self._persist_replica(info.replica_id, info)
         if removal_reason is not None:
-            self._remove_replica(info.replica_id, info.replica_record_id)
+            self._remove_replica(info.replica_id,
+                                 info.replica_record_id,
+                                 allow_active_provider_free_pre_job=(
+                                     provider_free_failed_launch))
             logger.info(f'Replica {info.replica_id} removed from the '
                         f'replica table {removal_reason}.')
 
@@ -13764,7 +13825,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # matching exact paid pool and released that claim; the
                 # controller then performs one ordinary target-fenced
                 # autoscaler tick.
-                self._scale_reconciliation_event.set()
+                self._notify_scale_reconciliation()
             for replica_id, info, _ in completed_launches:
                 self._emit_ordinary_launch_handoff_event(
                     info,
@@ -13780,7 +13841,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         # a stale pre-reducer snapshot.
         if bound_completed_launches or bound_pre_effect_retries:
             if (bound_capacity_launch_failures or bound_quota_launch_failures):
-                self._scale_reconciliation_event.set()
+                self._notify_scale_reconciliation()
             for replica_id, info, _, _ in bound_completed_launches:
                 self._emit_ordinary_launch_handoff_event(
                     info,

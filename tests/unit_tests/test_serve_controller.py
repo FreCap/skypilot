@@ -4275,16 +4275,16 @@ class TestAutoscalerRuntimeSnapshot:
                 ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
 
     @staticmethod
-    def _reserved_fill_allocation(*, grant: int = 1):
-        location = reserved_fill_planner.LocationSnapshot(cloud='Kubernetes',
-                                                          region='context-a',
-                                                          zone=None,
-                                                          accelerators=(('L4',
-                                                                         1),),
-                                                          use_spot=False)
+    def _reserved_fill_allocation(*, grant: int = 1, accelerator: str = 'L4'):
+        location = reserved_fill_planner.LocationSnapshot(
+            cloud='Kubernetes',
+            region='context-a',
+            zone=None,
+            accelerators=((accelerator, 1),),
+            use_spot=False)
         pool_key = reserved_capacity_broker.make_pool_key(
             'context-a',
-            'L4',
+            accelerator,
             protocol_version=reserved_capacity_broker.PROTOCOL_V2,
             physical_cluster_uid='uid-a')
         snapshot = reserved_fill_planner.PoolFillSnapshot(
@@ -4292,11 +4292,12 @@ class TestAutoscalerRuntimeSnapshot:
             pool_key=pool_key,
             physical_cluster_uid='uid-a',
             service_generation=7,
-            worker_projection_sha256_by_accelerator=(('l4', 'e' * 64),),
+            worker_projection_sha256_by_accelerator=((accelerator.casefold(),
+                                                      'e' * 64),),
             edge_cap=grant,
             broker_slot_width=1,
             free_slots=grant,
-            free_slots_by_accelerator=(('l4', grant),),
+            free_slots_by_accelerator=((accelerator.casefold(), grant),),
             grant=grant,
             grant_epoch=23,
             observation_generation=13,
@@ -4365,6 +4366,17 @@ class TestAutoscalerRuntimeSnapshot:
         repository = mock.Mock()
         expected = object()
         repository.publish.return_value = expected
+        repository.project_reserved_supply.return_value = (
+            controller.capacity_admission.ReservedSupplyProjection(
+                pending_zero_cost_capacity_by_accelerator={'l4': 0},
+                allocation_reserved_capacity_by_accelerator={'l4': target},
+                economic_replica_infos=(),
+                economic_kueue_capacity_by_replica_id={},
+                economic_capacity_graph_sha256='f' * 64))
+        scaler.supports_reserved_supply_economic_target.return_value = True
+        scaler.economic_capacity_target_by_accelerator.return_value = {
+            'l4': target
+        }
 
         with mock.patch.object(controller.capacity_admission,
                                'CapacityAdmissionRepository',
@@ -4384,6 +4396,86 @@ class TestAutoscalerRuntimeSnapshot:
             assert plan.reserved_fill_authority.allocation == allocation.identity
         else:
             assert plan.reserved_fill_authority.allocation is None
+
+    def test_ordered_paid_publication_uses_compatibility_aware_tail_target(
+            self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._durable_demand_snapshot = self._durable_snapshot()  # pylint: disable=protected-access
+        ctrl._ordinary_launch_binding_authority = types.SimpleNamespace(  # pylint: disable=protected-access
+            service_lifecycle_epoch=3)
+        scaler = self._durable_autoscaler(1)
+        scaler.reserved_capacity_fill = True
+        scaler.configured_accelerator_shapes = {'L4': 1, 'H200': 1}
+        scaler.capacity_target_by_accelerator = {'L4': 1}
+        scaler.economic_capacity_target_by_accelerator.return_value = {
+            'H200': 1
+        }
+        allocation, _ = self._reserved_fill_allocation(accelerator='H200')
+        repository = mock.Mock()
+        repository.project_reserved_supply.return_value = (
+            controller.capacity_admission.ReservedSupplyProjection(
+                pending_zero_cost_capacity_by_accelerator={
+                    'l4': 0,
+                    'h200': 0,
+                },
+                allocation_reserved_capacity_by_accelerator={
+                    'l4': 0,
+                    'h200': 1,
+                },
+                economic_replica_infos=(),
+                economic_kueue_capacity_by_replica_id={},
+                economic_capacity_graph_sha256='f' * 64))
+        scaler.supports_reserved_supply_economic_target.return_value = True
+        repository.publish.return_value = object()
+
+        with mock.patch.object(controller.capacity_admission,
+                               'CapacityAdmissionRepository',
+                               return_value=repository):
+            result = ctrl._publish_ordered_paid_authority(  # pylint: disable=protected-access
+                scaler,
+                1,
+                sequenced_reserved_fill=True,
+                reserved_fill_allocation_map=allocation)
+
+        assert result is repository.publish.return_value
+        plan = repository.publish.call_args.args[0]
+        assert plan.capacity_target_by_accelerator == {
+            'l4': 0,
+            'h200': 1,
+        }
+        assert plan.allocation_reserved_capacity_by_accelerator == {
+            'l4': 0,
+            'h200': 1,
+        }
+        # Economic accounting never mutates the ordinary actuation target.
+        assert scaler.capacity_target_by_accelerator == {'L4': 1}
+
+    def test_ordered_paid_publication_rejects_unsupported_economic_target(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._durable_demand_snapshot = self._durable_snapshot()  # pylint: disable=protected-access
+        ctrl._ordinary_launch_binding_authority = types.SimpleNamespace(  # pylint: disable=protected-access
+            service_lifecycle_epoch=3)
+        scaler = self._durable_autoscaler(1)
+        scaler.reserved_capacity_fill = True
+        scaler.supports_reserved_supply_economic_target.return_value = False
+        allocation, _ = self._reserved_fill_allocation()
+        repository = mock.Mock()
+
+        with mock.patch.object(controller.capacity_admission,
+                               'CapacityAdmissionRepository',
+                               return_value=repository):
+            result = ctrl._publish_ordered_paid_authority(  # pylint: disable=protected-access
+                scaler,
+                1,
+                sequenced_reserved_fill=True,
+                reserved_fill_allocation_map=allocation)
+
+        assert result is None
+        repository.project_reserved_supply.assert_not_called()
+        repository.publish.assert_not_called()
+        scaler.economic_capacity_target_by_accelerator.assert_not_called()
 
     def test_promoted_durable_demand_unavailable_suppresses_all_actuation(self):
         ctrl = _make_controller()

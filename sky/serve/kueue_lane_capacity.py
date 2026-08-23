@@ -233,6 +233,52 @@ class KueueAdmissionCapacityProjection:
         return self.unbounded_unknown or bool(self.unknown_domains)
 
 
+def replica_capacity_snapshot_from_projection(
+    replica_infos: list[Any] | tuple[Any, ...],
+    projection: KueueAdmissionCapacityProjection,
+) -> KueueReplicaCapacitySnapshot:
+    """Classify exact replica rows from the same locked admission projection."""
+    if not isinstance(projection, KueueAdmissionCapacityProjection):
+        raise TypeError('projection must be a Kueue admission projection.')
+    reserved_infos = [
+        info for info in replica_infos if
+        isinstance(getattr(info, 'reserved_fill_intent_idempotency_key', None),
+                   str) and bool(info.reserved_fill_intent_idempotency_key)
+    ]
+    classes: dict[int, KueueReplicaCapacityClass] = {}
+    for info in reserved_infos:
+        intent_key = info.reserved_fill_intent_idempotency_key
+        if intent_key not in projection.row_by_intent_key:
+            # Existing non-Kueue reserved-fill pools retain their historical
+            # semantics. The atomic grant path guarantees every Kueue intent
+            # has an admission row.
+            continue
+        try:
+            record = (int(info.replica_id),
+                      uuid.UUID(str(info.replica_record_id)))
+        except (TypeError, ValueError, AttributeError):
+            classes[int(info.replica_id)] = KueueReplicaCapacityClass.UNKNOWN
+            continue
+        if record in projection.fresh_waiting_replica_record_ids:
+            value = KueueReplicaCapacityClass.FRESH_WAITING
+        elif record in projection.admitted_replica_record_ids:
+            value = KueueReplicaCapacityClass.POLICY_ADMITTED
+        else:
+            value = KueueReplicaCapacityClass.UNKNOWN
+        classes[int(info.replica_id)] = value
+    surge_replica_ids = {
+        replica_id for replica_id, record_id in
+        projection.replacement_surge_replica_record_ids if any(
+            int(info.replica_id) == replica_id and
+            str(getattr(info, 'replica_record_id', '')) == str(record_id)
+            for info in reserved_infos)
+    }
+    return KueueReplicaCapacitySnapshot(classes, projection.unknown_shapes,
+                                        projection.unbounded_unknown,
+                                        frozenset(surge_replica_ids),
+                                        projection.replacement_surge_shapes)
+
+
 def _db_now(connection: sqlalchemy.engine.Connection) -> datetime.datetime:
     return connection.execute(
         sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
@@ -693,39 +739,7 @@ def snapshot_replica_capacity_classes(
             kueue_lane_lineage.KueueAdmissionError) as error:
         raise KueueAdmissionCapacityConflict(
             'Kueue admission snapshot is unavailable.') from error
-
-    classes: dict[int, KueueReplicaCapacityClass] = {}
-    for info in reserved_infos:
-        intent_key = info.reserved_fill_intent_idempotency_key
-        if intent_key not in projection.row_by_intent_key:
-            # Existing non-Kueue reserved-fill pools retain their historical
-            # semantics. The atomic grant path guarantees every Kueue intent
-            # has an admission row.
-            continue
-        try:
-            record = (int(info.replica_id),
-                      uuid.UUID(str(info.replica_record_id)))
-        except (TypeError, ValueError, AttributeError):
-            classes[int(info.replica_id)] = KueueReplicaCapacityClass.UNKNOWN
-            continue
-        if record in projection.fresh_waiting_replica_record_ids:
-            value = KueueReplicaCapacityClass.FRESH_WAITING
-        elif record in projection.admitted_replica_record_ids:
-            value = KueueReplicaCapacityClass.POLICY_ADMITTED
-        else:
-            value = KueueReplicaCapacityClass.UNKNOWN
-        classes[int(info.replica_id)] = value
-    surge_replica_ids = {
-        replica_id for replica_id, record_id in
-        projection.replacement_surge_replica_record_ids if any(
-            int(info.replica_id) == replica_id and
-            str(getattr(info, 'replica_record_id', '')) == str(record_id)
-            for info in reserved_infos)
-    }
-    return KueueReplicaCapacitySnapshot(classes, projection.unknown_shapes,
-                                        projection.unbounded_unknown,
-                                        frozenset(surge_replica_ids),
-                                        projection.replacement_surge_shapes)
+    return replica_capacity_snapshot_from_projection(reserved_infos, projection)
 
 
 def _replica_accelerator(info: Any) -> str | None:

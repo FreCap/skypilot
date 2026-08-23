@@ -1206,8 +1206,14 @@ def _install_canonical_cleanup_profile_authority(
     replica_id: int,
     association_id: uuid.UUID,
     initialize_protocol: bool = True,
+    install_observation: bool | None = None,
+    protocol_sequence: int | None = None,
 ) -> None:
     """Replace the generic fixture profile with production fill authority."""
+    if install_observation is None:
+        install_observation = initialize_protocol
+    if protocol_sequence is None:
+        protocol_sequence = replica_id
     associations = ordinary_launch_binding.ordinary_launch_associations_table
     requests = request_postgres_schema.REQUESTS
     replicas = serve_state_schema.replicas_table
@@ -1224,9 +1230,10 @@ def _install_canonical_cleanup_profile_authority(
                                              intent_key)).mappings().one()
         protocol_values: dict[str, object] = {
             'zero_cost_admission_sequence': sqlalchemy.func.greatest(
-                protocol.c.zero_cost_admission_sequence, replica_id),
+                protocol.c.zero_cost_admission_sequence, protocol_sequence),
             'ordinary_zero_cost_admission_sequence': sqlalchemy.func.greatest(
-                protocol.c.ordinary_zero_cost_admission_sequence, replica_id),
+                protocol.c.ordinary_zero_cost_admission_sequence,
+                protocol_sequence),
         }
         if initialize_protocol:
             protocol_values.update({
@@ -1250,7 +1257,7 @@ def _install_canonical_cleanup_profile_authority(
         connection.execute(
             sqlalchemy.update(protocol).where(protocol.c.id == 1).values(
                 **protocol_values))
-        if initialize_protocol:
+        if install_observation:
             observation_payload = {
                 'fixture': 'canonical-reserved-fill-cleanup',
             }
@@ -1376,6 +1383,7 @@ def _install_generation_fenced_pre_job_graph(
     *,
     admission_state: kueue_lane_lineage.KueueAdmissionState = (
         kueue_lane_lineage.KueueAdmissionState.INTENT_PENDING),
+    effect_phase: str = 'PROVIDER_IO',
     replica_id: int = 1,
     expire_waiting_receipt: bool = True,
     initialize_protocol: bool = True,
@@ -1396,7 +1404,7 @@ def _install_generation_fenced_pre_job_graph(
             intent_key=key,
             replica_id=replica_id,
             cleanup_marker=False,
-            effect_phase='PROVIDER_IO',
+            effect_phase=effect_phase,
             admission_state=admission_state,
             observation_generation=1,
             observation_sequence=(observation_sequence),
@@ -1621,9 +1629,17 @@ def _assert_retired_graph(
 def test_serve_state_single_replica_retirement_is_atomic_and_retains_history(
         admission_database, monkeypatch) -> None:
     repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
-    key = '8' * 64
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
     record_id, association_id, _ = _install_retirable_materialized_graph(
         admission_database, repository, intent_key=key, replica_id=1)
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _set_physical_provider_evidence(
+        admission_database, association_id,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
     _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
 
     assert serve_state.remove_replica(_SERVICE,
@@ -1851,12 +1867,23 @@ def test_association_gc_skips_live_kueue_admission_and_collects_other_tombstone(
             replica_id=1,
             is_scale_down=True,
             down_status=common_utils.ProcessStatus.SCHEDULED))
-    collectible_key = 'e' * 64
+    collectible_key = _canonical_intent_key(
+        ordinal=1,
+        observation_sequence=1,
+        ordinary_zero_cost_admission_sequence=1)
     collectible_record, collectible_association, _ = (
         _install_retirable_materialized_graph(admission_database,
                                               repository,
                                               intent_key=collectible_key,
                                               replica_id=2))
+    _install_canonical_cleanup_profile_authority(
+        admission_database,
+        intent_key=collectible_key,
+        replica_id=2,
+        association_id=collectible_association)
+    _set_physical_provider_evidence(
+        admission_database, collectible_association,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
     _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
     assert serve_state.remove_replica(
         _SERVICE,
@@ -1925,15 +1952,39 @@ def test_association_gc_compiles_before_serve057_relation(
 def test_serve_state_batch_retirement_is_atomic_and_retains_history(
         admission_database, monkeypatch) -> None:
     repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
-    first_key = '8' * 64
-    second_key = '9' * 64
+    first_key = _canonical_intent_key(observation_sequence=0,
+                                      ordinary_zero_cost_admission_sequence=0)
+    second_key = _canonical_intent_key(ordinal=1,
+                                       observation_generation=2,
+                                       observation_sequence=1,
+                                       ordinary_zero_cost_admission_sequence=1)
     first_record, first_association, _ = (_install_retirable_materialized_graph(
         admission_database, repository, intent_key=first_key, replica_id=1))
     second_record, second_association, _ = (
         _install_retirable_materialized_graph(admission_database,
                                               repository,
                                               intent_key=second_key,
-                                              replica_id=2))
+                                              replica_id=2,
+                                              observation_generation=2))
+    _install_canonical_cleanup_profile_authority(
+        admission_database,
+        intent_key=first_key,
+        replica_id=1,
+        association_id=first_association,
+        protocol_sequence=2)
+    _install_canonical_cleanup_profile_authority(
+        admission_database,
+        intent_key=second_key,
+        replica_id=2,
+        association_id=second_association,
+        initialize_protocol=False,
+        install_observation=True)
+    _set_physical_provider_evidence(
+        admission_database, first_association,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
+    _set_physical_provider_evidence(
+        admission_database, second_association,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
     _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
 
     assert serve_state.remove_replicas(
@@ -1954,15 +2005,39 @@ def test_serve_state_batch_retirement_is_atomic_and_retains_history(
 def test_serve_state_batch_ambiguous_evidence_rolls_back_every_graph(
         admission_database, monkeypatch) -> None:
     repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
-    first_key = '8' * 64
-    second_key = '9' * 64
+    first_key = _canonical_intent_key(observation_sequence=0,
+                                      ordinary_zero_cost_admission_sequence=0)
+    second_key = _canonical_intent_key(ordinal=1,
+                                       observation_generation=2,
+                                       observation_sequence=1,
+                                       ordinary_zero_cost_admission_sequence=1)
     first_record, first_association, _ = (_install_retirable_materialized_graph(
         admission_database, repository, intent_key=first_key, replica_id=1))
     second_record, second_association, _ = (
         _install_retirable_materialized_graph(admission_database,
                                               repository,
                                               intent_key=second_key,
-                                              replica_id=2))
+                                              replica_id=2,
+                                              observation_generation=2))
+    _install_canonical_cleanup_profile_authority(
+        admission_database,
+        intent_key=first_key,
+        replica_id=1,
+        association_id=first_association,
+        protocol_sequence=2)
+    _install_canonical_cleanup_profile_authority(
+        admission_database,
+        intent_key=second_key,
+        replica_id=2,
+        association_id=second_association,
+        initialize_protocol=False,
+        install_observation=True)
+    _set_physical_provider_evidence(
+        admission_database, first_association,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
+    _set_physical_provider_evidence(
+        admission_database, second_association,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
     associations = ordinary_launch_binding.ordinary_launch_associations_table
     with admission_database.begin() as connection:
         connection.exec_driver_sql(
@@ -2018,7 +2093,8 @@ def test_serve_state_batch_ambiguous_evidence_rolls_back_every_graph(
 def test_serve_state_missing_kueue_admission_fails_closed_without_mutation(
         admission_database, monkeypatch) -> None:
     repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
-    key = '8' * 64
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
     record_id, _, _ = _install_retirable_materialized_graph(admission_database,
                                                             repository,
                                                             intent_key=key,
@@ -2110,6 +2186,9 @@ def test_whole_service_teardown_retires_provider_absent_admissionless_graph(
                                                  intent_key=key,
                                                  replica_id=1,
                                                  association_id=association_id)
+    _set_physical_provider_evidence(
+        admission_database, association_id,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
     _stamp_canonical_materialization_receipt(admission_database, replica_id=1)
     _delete_kueue_admission(admission_database, key)
     if not retain_request:
@@ -2193,16 +2272,15 @@ def test_whole_service_teardown_retires_provider_absent_admissionless_graph(
                 serve_state_schema.services_table)).scalar_one() == 0
 
 
-def test_historical_v5_teardown_retires_provider_absent_graph(
-        admission_database, monkeypatch) -> None:
-    """Cleanup decodes retained v5 authority without weakening fresh paths."""
+def test_historical_v5_teardown_fails_closed(admission_database) -> None:
+    """Cleanup accepts only the current projection and two predecessors."""
     repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
     projection_sha256 = _install_historical_v5_worker_projections(
         admission_database)
     key = _canonical_intent_key(observation_sequence=0,
                                 ordinary_zero_cost_admission_sequence=0,
                                 worker_projection_sha256=projection_sha256)
-    record_id, association_id, _ = _install_normal_admitted_teardown_graph(
+    _install_normal_admitted_teardown_graph(
         admission_database,
         repository,
         intent_key=key,
@@ -2212,13 +2290,6 @@ def test_historical_v5_teardown_retires_provider_absent_graph(
         observation_sequence=0,
         ordinary_zero_cost_admission_sequence=0,
         worker_projection_sha256=projection_sha256)
-    _install_canonical_cleanup_profile_authority(admission_database,
-                                                 intent_key=key,
-                                                 replica_id=1,
-                                                 association_id=association_id)
-    _stamp_canonical_materialization_receipt(admission_database, replica_id=1)
-    _delete_kueue_admission(admission_database, key)
-    monkeypatch.setattr(serve_state._db_manager, '_engine', admission_database)
 
     intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
     with admission_database.connect() as connection:
@@ -2230,33 +2301,11 @@ def test_historical_v5_teardown_retires_provider_absent_graph(
             (zero_cost_actuation.
              kueue_admission_identity_for_locked_intent_in_connection)(
                  connection, intent)
-        historical_identity = (
-            zero_cost_actuation.
-            kueue_teardown_identity_for_locked_intent_in_connection(
-                connection, intent))
-    assert historical_identity is not None
-    assert historical_identity.worker_projection_sha256 == projection_sha256
-
-    _mark_service_shutting_down(admission_database)
-    _claim_restricted_teardown_owner()
-    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
-                        lambda _mode: contextlib.nullcontext())
-    monkeypatch.setattr(kubernetes_adaptor, 'physical_cluster_uid_fence',
-                        lambda *_args, **_kwargs: contextlib.nullcontext())
-    probe = mock.Mock(
-        return_value=reserved_capacity.PhysicalReplicaPresence.ABSENT)
-    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
-                        probe)
-
-    assert (kueue_lane_observer.
-            project_admissionless_physical_absence_after_teardown(
-                _SERVICE, 1, record_id))
-    assert serve_state.remove_service_completely(
-        _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
-    _assert_retired_graph(admission_database,
-                          intent_keys=(key,),
-                          replica_ids=(1,),
-                          association_ids=(association_id,))
+        with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict,
+                           match='no longer resolves'):
+            (zero_cost_actuation.
+             kueue_teardown_identity_for_locked_intent_in_connection)(
+                 connection, intent)
 
 
 def test_admissionless_probe_and_retirement_share_exact_row_validator(
@@ -2699,9 +2748,17 @@ def test_whole_service_admissionless_retirement_requires_exact_absence(
 def test_serve_state_whole_service_teardown_retires_exact_graph(
         admission_database, monkeypatch) -> None:
     repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
-    key = '8' * 64
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
     _, association_id, _ = _install_retirable_materialized_graph(
         admission_database, repository, intent_key=key, replica_id=1)
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _set_physical_provider_evidence(
+        admission_database, association_id,
+        ordinary_launch_binding.ProviderEvidence.ABSENT)
     _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
     _mark_service_shutting_down(admission_database)
 
@@ -2717,16 +2774,25 @@ def test_serve_state_whole_service_teardown_retires_exact_graph(
                 serve_state_schema.services_table)).scalar_one() == 0
 
 
-@pytest.mark.parametrize('policy_admitted', (False, True))
-def test_normal_failure_retires_generation_fenced_pre_job_provider_absence(
-        admission_database, monkeypatch, policy_admitted) -> None:
-    """A newer gate adjudicates only already-proven pre-job failures."""
-    _, record_id, _, _ = _install_generation_fenced_pre_job_graph(
-        admission_database,
-        admission_state=(kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED
-                         if policy_admitted else
-                         kueue_lane_lineage.KueueAdmissionState.INTENT_PENDING))
-    _advance_reconciliation_gate(admission_database)
+@pytest.mark.parametrize(('admission_state', 'effect_phase'), (
+    (kueue_lane_lineage.KueueAdmissionState.INTENT_PENDING, 'PROVIDER_IO'),
+    (kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED, 'PROVIDER_IO'),
+    (kueue_lane_lineage.KueueAdmissionState.POD_WAITING, 'PROVIDER_IO'),
+    (kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED, 'SERVICE_JOB_IO'),
+))
+@pytest.mark.parametrize('gate_generation', (1, 2))
+def test_normal_failure_atomically_retires_provider_free_pre_job_absence(
+        admission_database, monkeypatch, admission_state, effect_phase,
+        gate_generation) -> None:
+    """The current or a newer gate replaces an exactly absent failed try."""
+    key, record_id, association_id, _ = (
+        _install_generation_fenced_pre_job_graph(
+            admission_database,
+            admission_state=admission_state,
+            effect_phase=effect_phase))
+    if gate_generation > 1:
+        _advance_reconciliation_gate(admission_database,
+                                     generation=gate_generation)
     _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
 
     provider_phase = mock.Mock(side_effect=AssertionError(
@@ -2746,22 +2812,101 @@ def test_normal_failure_retires_generation_fenced_pre_job_provider_absence(
     provider_phase.assert_not_called()
     pod_probe.assert_not_called()
     cluster_probe.assert_not_called()
+    assert serve_state.remove_replica(_SERVICE,
+                                      1,
+                                      expected_service_hash=_SERVICE_HASH,
+                                      expected_lifecycle_epoch=_LIFECYCLE_EPOCH,
+                                      expected_controller_owner=(1, '10.0.0.1'),
+                                      expected_replica_record_id=str(record_id),
+                                      allow_active_provider_free_pre_job=True)
+    _assert_retired_graph(admission_database,
+                          intent_keys=(key,),
+                          replica_ids=(1,),
+                          association_ids=(association_id,))
 
 
-def test_normal_pre_job_absence_requires_newer_active_generation_gate(
+def test_active_provider_free_pre_job_rejects_unexpired_waiting_receipt(
+        admission_database, monkeypatch) -> None:
+    key, record_id, association_id, _ = (
+        _install_generation_fenced_pre_job_graph(
+            admission_database,
+            admission_state=(
+                kueue_lane_lineage.KueueAdmissionState.POD_WAITING),
+            expire_waiting_receipt=False))
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
+                       match='has not expired'):
+        serve_state.remove_replica(_SERVICE,
+                                   1,
+                                   expected_service_hash=_SERVICE_HASH,
+                                   expected_lifecycle_epoch=_LIFECYCLE_EPOCH,
+                                   expected_controller_owner=(1, '10.0.0.1'),
+                                   expected_replica_record_id=str(record_id),
+                                   allow_active_provider_free_pre_job=True)
+
+    with admission_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                kueue_lane_lineage_schema.serve_kueue_admissions_table).where(
+                    kueue_lane_lineage_schema.serve_kueue_admissions_table.c.
+                    intent_idempotency_key == key)).scalar_one() == 1
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    _SERVICE, serve_state_schema.replicas_table.c.replica_id ==
+                    1)).scalar_one() == 1
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == association_id)).scalar_one() == 1
+
+
+def test_provider_free_pre_job_rejects_nonnull_service_job_identity(
+        admission_database) -> None:
+    """SERVICE_JOB_IO/null is accepted; a job identity is never pre-job."""
+    _, _, association_id, _ = _install_generation_fenced_pre_job_graph(
+        admission_database,
+        admission_state=(
+            kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED),
+        effect_phase='SERVICE_JOB_IO')
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with admission_database.connect() as connection:
+        association = dict(
+            connection.execute(
+                sqlalchemy.select(associations).where(
+                    associations.c.association_id ==
+                    association_id)).mappings().one())
+    association['service_job_id'] = 91
+    assert not kueue_lane_lineage._is_provider_absent_pre_job_association(  # pylint: disable=protected-access
+        association)
+
+    # The durable schema makes the rejected SERVICE_JOB_IO/non-null shape
+    # unrepresentable as well: a non-null job id requires RECORDED phase.
+    with pytest.raises(sqlalchemy.exc.DBAPIError):
+        with admission_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(associations).where(
+                    associations.c.association_id == association_id).values(
+                        service_job_id=91))
+
+
+def test_normal_pre_job_absence_accepts_same_active_generation_gate(
         admission_database) -> None:
     _, record_id, _, _ = _install_generation_fenced_pre_job_graph(
         admission_database)
     repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
 
     with admission_database.connect() as connection:
-        with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
-                           match='newer active generation fence'):
-            repository.load_generation_fenced_pre_job_absence_in_connection(
-                connection,
-                service_name=_SERVICE,
-                replica_id=1,
-                replica_record_id=record_id)
+        decision = repository.load_generation_fenced_pre_job_absence_in_connection(
+            connection,
+            service_name=_SERVICE,
+            replica_id=1,
+            replica_record_id=record_id)
+    assert decision.state is (
+        kueue_lane_lineage.PhysicalAbsenceLoadState.ALREADY_PROVEN)
 
 
 @pytest.mark.parametrize('invalid_evidence', (
@@ -2887,7 +3032,6 @@ def test_normal_pre_job_absence_rejects_incomplete_durable_graph(
                             _SERVICE, 1, info)))
             connection.exec_driver_sql(
                 f'ALTER TABLE {replicas.name} ENABLE TRIGGER USER')
-    _advance_reconciliation_gate(admission_database)
     repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
 
     with admission_database.connect() as connection:
@@ -3058,54 +3202,6 @@ def test_whole_service_retires_mixed_retained_pre_job_provider_absence(
         assert connection.execute(
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
                 serve_state_schema.services_table)).scalar_one() == 0
-
-
-def test_historical_v5_retires_marker_free_pre_job_provider_absence(
-        admission_database, monkeypatch) -> None:
-    """Retire lifecycle-91's v5 pending-admission shape without replay."""
-    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
-    projection_sha256 = _install_historical_v5_worker_projections(
-        admission_database)
-    key = _canonical_intent_key(observation_sequence=0,
-                                ordinary_zero_cost_admission_sequence=0,
-                                worker_projection_sha256=projection_sha256)
-    record_id, association_id, _ = _install_retirable_materialized_graph(
-        admission_database,
-        repository,
-        intent_key=key,
-        replica_id=1,
-        cleanup_marker=False,
-        effect_phase='PROVIDER_IO',
-        worker_projection_sha256=projection_sha256)
-    _install_canonical_cleanup_profile_authority(admission_database,
-                                                 intent_key=key,
-                                                 replica_id=1,
-                                                 association_id=association_id)
-    _set_physical_provider_evidence(
-        admission_database, association_id,
-        ordinary_launch_binding.ProviderEvidence.ABSENT)
-    monkeypatch.setattr(serve_state._db_manager, '_engine', admission_database)
-    _mark_service_shutting_down(admission_database)
-
-    provider_phase = mock.Mock(
-        side_effect=AssertionError('v5 pre-job replay entered provider phase'))
-    provider_probe = mock.Mock(
-        side_effect=AssertionError('v5 pre-job replay read the provider'))
-    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
-                        provider_phase)
-    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
-                        provider_probe)
-
-    assert kueue_lane_observer.project_exact_pod_absence_after_teardown(
-        _SERVICE, 1, record_id)
-    provider_phase.assert_not_called()
-    provider_probe.assert_not_called()
-    assert serve_state.remove_service_completely(
-        _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
-    _assert_retired_graph(admission_database,
-                          intent_keys=(key,),
-                          replica_ids=(1,),
-                          association_ids=(association_id,))
 
 
 @pytest.mark.parametrize('admission_state', (

@@ -1507,6 +1507,7 @@ class DeferredFillReason(enum.Enum):
     CHANGED_EPOCH = 'changed_epoch'
     PHYSICAL_CLUSTER_UID_MISMATCH = 'physical_cluster_uid_mismatch'
     MAX_REPLICAS_EXHAUSTED = 'max_replicas_exhausted'
+    ACTUATION_WINDOW_FULL = 'actuation_window_full'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1831,3 +1832,38 @@ class ReservedFillPlanner:
             capacity_unit=capacity_unit,
             intents=tuple(intents),
         )
+
+    @staticmethod
+    def project_remaining_capacity_by_accelerator(
+        *,
+        allocation_map: AuthenticatedAllocationMap,
+        max_replicas: int,
+        planned_replicas: int,
+        capacity_unit: FillCapacityUnit,
+        committed_fill_debits: tuple[CommittedFillDebit, ...] = (),
+    ) -> dict[str, int]:
+        """Return the canonical exact-card tail through the real planner.
+
+        Capacity admission has no process-local fairness cursor, so this uses
+        canonical pool order.  The caller must reject a ceiling-clipped
+        mixed-card tail whose totals could depend on the live rotation anchor.
+        """
+        projection = ReservedFillPlanner.plan(
+            policy_revision=1,
+            reconcile_generation=1,
+            allocation_map=allocation_map,
+            service_incarnation='capacity-projection',
+            service_version=allocation_map.service_version,
+            controller_owner='capacity-projection',
+            max_replicas=max_replicas,
+            planned_replicas=planned_replicas,
+            capacity_unit=capacity_unit,
+            committed_fill_debits=committed_fill_debits,
+            rotation_anchor=None)
+        capacity: dict[str, int] = {}
+        for intent in projection.intents:
+            card = intent.accelerator.casefold()
+            capacity[card] = (
+                capacity.get(card, 0) +
+                capacity_unit.intent_cost(intent.accelerator_count))
+        return dict(sorted(capacity.items()))

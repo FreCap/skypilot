@@ -36,6 +36,7 @@ from sky.utils.db import db_utils
 
 if TYPE_CHECKING:
     from sky.serve.reserved_fill_planner import AuthenticatedAllocationMap
+    from sky.serve.reserved_fill_planner import FillCapacityUnit
     from sky.serve.reserved_fill_planner import ReservedFillAllocationIdentity
 
 reserved_fill_allocation = adaptors_common.LazyImport(
@@ -44,6 +45,8 @@ reserved_fill_planner = adaptors_common.LazyImport(
     'sky.serve.reserved_fill_planner')
 serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
 service_spec = adaptors_common.LazyImport('sky.serve.service_spec')
+zero_cost_actuation = adaptors_common.LazyImport(
+    'sky.serve.zero_cost_actuation')
 
 PROTOCOL_VERSION = 1
 CAPABILITY_COHORT_EPOCH = 1
@@ -251,12 +254,19 @@ class CapacityPlanInput:
     normalized_demand: Mapping[str, Any]
     capacity_target_by_accelerator: Mapping[str, int]
     reserved_fill_authority: ReservedFillPlanAuthority
+    allocation_reserved_capacity_by_accelerator: Mapping[str, int] = (
+        dataclasses.field(default_factory=dict))
+    expected_pending_zero_cost_capacity_by_accelerator: Mapping[str, int] = (
+        dataclasses.field(default_factory=dict))
+    expected_economic_capacity_graph_sha256: str | None = None
 
     def payload(
         self,
         *,
         existing_zero_cost_capacity_by_accelerator: Mapping[str, int],
         pending_zero_cost_capacity_by_accelerator: Mapping[str, int] |
+        None = None,
+        allocation_reserved_capacity_by_accelerator: Mapping[str, int] |
         None = None,
         existing_paid_capacity_by_accelerator: Mapping[str, int],
         paid_residual_by_accelerator: Mapping[str, int],
@@ -285,13 +295,20 @@ class CapacityPlanInput:
             } if pending_zero_cost_capacity_by_accelerator is None else
              pending_zero_cost_capacity_by_accelerator),
             'pending_zero_cost_capacity_by_accelerator')
+        allocation_reserved = _canonical_counts(
+            ({
+                card: 0 for card in capacity_target
+            } if allocation_reserved_capacity_by_accelerator is None else
+             allocation_reserved_capacity_by_accelerator),
+            'allocation_reserved_capacity_by_accelerator')
         existing_paid = _canonical_counts(
             existing_paid_capacity_by_accelerator,
             'existing_paid_capacity_by_accelerator')
         paid = _canonical_counts(paid_residual_by_accelerator,
                                  'paid_residual_by_accelerator')
         cards = (set(capacity_target) | set(existing_zero_cost) |
-                 set(pending_zero_cost) | set(existing_paid) | set(paid))
+                 set(pending_zero_cost) | set(allocation_reserved) |
+                 set(existing_paid) | set(paid))
         if AGGREGATE_ACCELERATOR in cards and len(cards) != 1:
             raise ValueError('A capacity plan cannot mix aggregate and '
                              'exact-card accounting.')
@@ -300,6 +317,7 @@ class CapacityPlanInput:
                 0,
                 capacity_target.get(card, 0) - existing_zero_cost.get(card, 0) -
                 pending_zero_cost.get(card, 0) -
+                allocation_reserved.get(card, 0) -
                 existing_paid.get(card, 0)) for card in cards
         }
         expected_paid = {
@@ -313,6 +331,15 @@ class CapacityPlanInput:
         if not isinstance(authority, ReservedFillPlanAuthority):
             raise ValueError('Capacity plan has no typed reserved-fill '
                              'authority.')
+        economic_graph_sha256 = self.expected_economic_capacity_graph_sha256
+        if authority.mode is ReservedFillPlanAuthorityMode.ALLOCATION_BOUND:
+            if (not isinstance(economic_graph_sha256, str) or
+                    _SHA256_RE.fullmatch(economic_graph_sha256) is None):
+                raise ValueError('Allocation-bound capacity plan has no exact '
+                                 'economic capacity graph digest.')
+        elif economic_graph_sha256 is not None:
+            raise ValueError('An unbound capacity plan must not carry an '
+                             'economic capacity graph digest.')
         if (authority.mode
                 is ReservedFillPlanAuthorityMode.UNBOUND_ZERO_REVOCATION and
                 any(capacity_target.values())):
@@ -325,7 +352,7 @@ class CapacityPlanInput:
         _canonical_watermark(self.receipt_watermark)
         normalized_demand = json.loads(
             _canonical_json(dict(self.normalized_demand)).decode('utf-8'))
-        return {
+        payload = {
             'protocol_version': PROTOCOL_VERSION,
             'service': {
                 'name': self.service_name,
@@ -343,10 +370,15 @@ class CapacityPlanInput:
             'capacity_target_by_accelerator': capacity_target,
             'existing_zero_cost_capacity_by_accelerator': existing_zero_cost,
             'pending_zero_cost_capacity_by_accelerator': pending_zero_cost,
+            'allocation_reserved_capacity_by_accelerator':
+                (allocation_reserved),
             'existing_paid_capacity_by_accelerator': existing_paid,
             'paid_residual_by_accelerator': paid,
             'reserved_fill_authority': authority.to_mapping(),
         }
+        if economic_graph_sha256 is not None:
+            payload['economic_capacity_graph_sha256'] = economic_graph_sha256
+        return payload
 
 
 @dataclasses.dataclass(frozen=True)
@@ -381,6 +413,28 @@ class PaidLaunchAuthority:
             'demand_source_epoch': self.demand_source_epoch,
             'capacity_plan_accelerator': debit_card,
             'capacity_plan_units': units,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ReservedSupplyProjection:
+    """Exact additional zero-cost supply used by economic demand placement."""
+
+    pending_zero_cost_capacity_by_accelerator: Mapping[str, int]
+    allocation_reserved_capacity_by_accelerator: Mapping[str, int]
+    economic_replica_infos: tuple[Any, ...]
+    economic_kueue_capacity_by_replica_id: Mapping[
+        int, kueue_lane_capacity.KueueReplicaCapacityClass]
+    economic_capacity_graph_sha256: str
+
+    def additional_capacity_by_accelerator(self) -> dict[str, int]:
+        cards = (set(self.pending_zero_cost_capacity_by_accelerator) |
+                 set(self.allocation_reserved_capacity_by_accelerator))
+        return {
+            card: (
+                self.pending_zero_cost_capacity_by_accelerator.get(card, 0) +
+                self.allocation_reserved_capacity_by_accelerator.get(card, 0)
+            ) for card in sorted(cards)
         }
 
 
@@ -462,11 +516,18 @@ def _validate_reserved_fill_authority_in_connection(
     return current
 
 
-def _reserved_fill_binding_required_in_connection(
+@dataclasses.dataclass(frozen=True)
+class _ReservedFillServiceConfig:
+    binding_required: bool
+    max_capacity: int
+    capacity_unit: FillCapacityUnit
+
+
+def _reserved_fill_service_config_in_connection(
     connection: sqlalchemy.engine.Connection,
     service: Mapping[str, Any],
-) -> bool:
-    """Read the elected immutable service-spec discriminator under lock."""
+) -> _ReservedFillServiceConfig:
+    """Read the immutable fill discriminator and ceiling under lock."""
     version_row = connection.execute(
         sqlalchemy.select(_VERSION_SPECS.c.spec).where(
             _VERSION_SPECS.c.service_name == service['name'],
@@ -489,6 +550,9 @@ def _reserved_fill_binding_required_in_connection(
         if type(spec) is not service_spec.SkyServiceSpec:
             raise TypeError('Unexpected persisted service-spec type.')
         fill_enabled = spec.reserved_capacity_fill
+        maximum = (spec.max_replicas
+                   if spec.max_replicas is not None else spec.min_replicas)
+        replica_unit = spec.replica_unit
     except Exception as error:  # pylint: disable=broad-except
         raise CapacityAdmissionConflict(
             'Current service version reserved-fill spec is malformed.'
@@ -500,7 +564,26 @@ def _reserved_fill_binding_required_in_connection(
     if mode not in ('DIRECT_REPLICA', 'DURABLE_INTENT'):
         raise CapacityAdmissionConflict(
             'Service reserved-fill actuation mode is malformed.')
-    return fill_enabled and mode == 'DURABLE_INTENT'
+    if (not isinstance(maximum, int) or isinstance(maximum, bool) or
+            maximum < 0 or replica_unit not in ('physical_backend', 'logical')):
+        raise CapacityAdmissionConflict(
+            'Current service reserved-fill ceiling is malformed.')
+    capacity_unit = (reserved_fill_planner.FillCapacityUnit.LOGICAL
+                     if replica_unit == 'logical' else
+                     reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+    return _ReservedFillServiceConfig(binding_required=fill_enabled and
+                                      mode == 'DURABLE_INTENT',
+                                      max_capacity=maximum,
+                                      capacity_unit=capacity_unit)
+
+
+def _reserved_fill_binding_required_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+) -> bool:
+    """Read the elected immutable service-spec discriminator under lock."""
+    return _reserved_fill_service_config_in_connection(connection,
+                                                       service).binding_required
 
 
 def _require_postgres(connection: sqlalchemy.engine.Connection) -> None:
@@ -749,6 +832,330 @@ def _project_capacity_inventory(
     return zero_cost, paid, pending_zero_cost
 
 
+def _economic_capacity_graph_snapshot(
+    locked: _LockedCapacityRows,
+    lane_projection: kueue_lane_capacity.KueueAdmissionCapacityProjection,
+    *,
+    service_version: int,
+) -> tuple[tuple[Any, ...], dict[
+        int, kueue_lane_capacity.KueueReplicaCapacityClass], str]:
+    """Decode supply and fingerprint only reserved-side economic semantics.
+
+    Paid replicas are deliberately absent from the fingerprint.  Publishing a
+    positive plan is followed by inserting its own paid replica row, so a
+    digest of the complete replica table would revoke the authority it just
+    minted.  Paid baseline plus exact claim delta is checked separately at
+    provider start.  This digest instead freezes every durable zero-cost fact
+    consumed by compatible-card placement: immutable replica identity and
+    width, current/historical contribution class, intent edges, and Kueue
+    assignment semantics.  Volatile JSON fields and timestamps are omitted.
+    """
+    replica_infos: list[Any] = []
+    replica_rows_by_id: dict[int, Mapping[str, Any]] = {}
+    for row in locked.replica_rows:
+        state = row['replica_state']
+        if not isinstance(state, dict):
+            raise CapacityAdmissionConflict(
+                'Economic capacity graph contains malformed replica state.')
+        try:
+            info = serve_state.decode_replica_state_for_authority(
+                int(row['replica_state_version']), state)
+        except (RuntimeError, TypeError, ValueError) as error:
+            raise CapacityAdmissionConflict(
+                'Economic capacity graph cannot decode a replica row.') from (
+                    error)
+        if (info.replica_id != row['replica_id'] or
+                info.version != row['version'] or
+                info.status.value != row['status']):
+            raise CapacityAdmissionConflict(
+                'Economic capacity graph replica columns disagree.')
+        replica_infos.append(info)
+        replica_rows_by_id[int(row['replica_id'])] = row
+    capacity_snapshot = (
+        kueue_lane_capacity.replica_capacity_snapshot_from_projection(
+            tuple(replica_infos), lane_projection))
+    classes = dict(capacity_snapshot.by_replica_id)
+
+    reserved_replicas: list[dict[str, Any]] = []
+    for info in replica_infos:
+        row = replica_rows_by_id[int(info.replica_id)]
+        state, planned_capacity, is_zero_cost, is_scale_down = (
+            _validated_replica_attribution(row))
+        if not is_zero_cost:
+            continue
+        try:
+            record_id = str(uuid.UUID(str(info.replica_record_id)))
+        except (TypeError, ValueError, AttributeError) as error:
+            raise CapacityAdmissionConflict(
+                'Reserved economic replica has no exact record identity.'
+            ) from error
+        intent_key = row['reserved_fill_intent_idempotency_key']
+        if intent_key is not None and (not isinstance(intent_key, str) or
+                                       not intent_key):
+            raise CapacityAdmissionConflict(
+                'Reserved economic replica has a malformed intent edge.')
+        admission_class = classes.get(int(info.replica_id))
+        kueue_assigned = (
+            admission_class
+            is not kueue_lane_capacity.KueueReplicaCapacityClass.FRESH_WAITING)
+        terminal = row['status'] in _TERMINAL_REPLICA_STATUSES
+        historical = int(row['version']) != service_version
+        contributes = (not terminal and not is_scale_down and kueue_assigned and
+                       (not historical or admission_class is not None))
+        reserved_replicas.append({
+            'replica_id': int(row['replica_id']),
+            'replica_record_id': record_id,
+            'service_version': int(row['version']),
+            'historical': historical,
+            'intent_idempotency_key': intent_key,
+            'accelerator': _replica_card(state),
+            'planned_capacity': planned_capacity,
+            'lifecycle':
+                ('terminal' if terminal else 'retiring' if is_scale_down else
+                 'ready' if info.is_ready else 'provisioning'),
+            'kueue_capacity_class':
+                (None if admission_class is None else admission_class.value),
+            'economic_contribution': (planned_capacity if contributes else 0),
+        })
+
+    intents: list[dict[str, Any]] = []
+    for row in locked.intent_rows:
+        state = str(row['state'])
+        live = (state == 'COMMITTED' or
+                (state in _PENDING_ZERO_COST_INTENT_STATES and
+                 row['valid_until'] > lane_projection.now))
+        intents.append({
+            'intent_idempotency_key': str(row['intent_idempotency_key']),
+            'service_version': int(row['service_version']),
+            'state': state,
+            'live': live,
+            'pool_key': str(row['pool_key']),
+            'accelerator': str(row['accelerator']).casefold(),
+            'accelerator_count': int(row['accelerator_count']),
+            'capacity_unit': str(row['capacity_unit']),
+            'planned_capacity': int(row['planned_capacity']),
+            'allocation_generation': int(row['allocation_generation']),
+            'allocation_input_sha256': str(row['allocation_input_sha256']),
+            'allocation_claim_generation': int(
+                row['allocation_claim_generation']),
+            'reconciliation_gate_generation': int(
+                row['reconciliation_gate_generation']),
+            'reclaim_fleet_bundle_sha256': str(
+                row['reclaim_fleet_bundle_sha256']),
+            'reclaim_policy_revision': str(row['reclaim_policy_revision']),
+            'reclaim_provider_inventory_sha256': str(
+                row['reclaim_provider_inventory_sha256']),
+            'replica_id':
+                (None if row['replica_id'] is None else int(row['replica_id'])),
+            'replica_record_id': (None if row['replica_record_id'] is None else
+                                  str(row['replica_record_id'])),
+        })
+
+    admissions: list[dict[str, Any]] = []
+    for row in lane_projection.rows:
+        intent_key = str(row.intent_idempotency_key)
+        if intent_key in lane_projection.fresh_waiting_intent_keys:
+            capacity_class = 'FRESH_WAITING'
+        elif intent_key in lane_projection.admitted_intent_keys:
+            capacity_class = 'POLICY_ADMITTED'
+        elif intent_key in lane_projection.unknown_intent_keys:
+            capacity_class = 'UNKNOWN'
+        else:
+            capacity_class = 'INTENT_PENDING'
+        admissions.append({
+            'intent_idempotency_key': intent_key,
+            'service_version': int(row.service_version),
+            'pool_key': str(row.pool_key),
+            'accelerator': str(row.accelerator).casefold(),
+            'accelerator_count': int(row.accelerator_count),
+            'capacity_unit': str(row.capacity_unit),
+            'planned_capacity': int(row.planned_capacity),
+            'capacity_class': capacity_class,
+            'assigned_gpu': (intent_key
+                             in lane_projection.assigned_gpu_intent_keys),
+            'demand_supply': (intent_key
+                              in lane_projection.demand_supply_intent_keys),
+            'replica_id':
+                (None if row.replica_id is None else int(row.replica_id)),
+            'replica_record_id': (None if row.replica_record_id is None else
+                                  str(row.replica_record_id)),
+            'replacement_surge_units': int(row.replacement_surge_units),
+        })
+    digest = _sha256({
+        'protocol': 'reserved-economic-supply-v1',
+        'service_version': service_version,
+        'reserved_replicas': reserved_replicas,
+        'zero_cost_intents': intents,
+        'kueue_admissions': admissions,
+        'unknown_shapes': sorted(
+            [list(shape) for shape in lane_projection.unknown_shapes]),
+        'unbounded_unknown': lane_projection.unbounded_unknown,
+    })
+    return tuple(replica_infos), classes, digest
+
+
+def _replica_service_ceiling_capacity(
+    row: Mapping[str, Any],
+    capacity_unit: FillCapacityUnit,
+) -> int:
+    """Project one cleanup-unproven row into the service's configured unit."""
+    state = row['replica_state']
+    status = (state.get('status_property')
+              if isinstance(state, Mapping) else None)
+    if (isinstance(status, Mapping) and
+            status.get('sky_down_status') == 'SUCCEEDED'):
+        return 0
+    try:
+        return zero_cost_actuation.replica_capacity_for_unit(
+            row['replica_state_version'], state, capacity_unit)
+    except zero_cost_actuation.ZeroCostActuationConflict as error:
+        raise CapacityAdmissionConflict(
+            'Service ceiling contains malformed replica capacity.') from error
+
+
+def _project_allocation_reserved_capacity(
+    allocation: AuthenticatedAllocationMap | None,
+    locked: _LockedCapacityRows,
+    *,
+    service_hash: str,
+    service_version: int,
+    accounting_cards: set[str],
+    now: datetime.datetime,
+    config: _ReservedFillServiceConfig,
+    lane_projection: kueue_lane_capacity.KueueAdmissionCapacityProjection,
+) -> dict[str, int]:
+    """Project the locked current-allocation tail without double counting."""
+    zero = {card: 0 for card in accounting_cards}
+    if allocation is None or not allocation.pool_snapshots:
+        return zero
+    if not isinstance(allocation,
+                      reserved_fill_planner.AuthenticatedAllocationMap):
+        raise CapacityAdmissionConflict(
+            'Current reserved-fill allocation has an invalid type.')
+    if allocation.service_version != service_version:
+        raise CapacityAdmissionConflict(
+            'Current reserved-fill allocation names another service version.')
+
+    provider_replica_keys: set[str] = set()
+    materialized_capacity = 0
+    for row in locked.replica_rows:
+        capacity = _replica_service_ceiling_capacity(row, config.capacity_unit)
+        materialized_capacity += capacity
+        key = row['reserved_fill_intent_idempotency_key']
+        if capacity > 0 and isinstance(key, str) and key:
+            provider_replica_keys.add(key)
+
+    pending_capacity = 0
+    debit_counts: dict[tuple[str, str], int] = {}
+    admission_keys = {
+        str(row.intent_idempotency_key) for row in lane_projection.rows
+    }
+    represented_replica_keys = {
+        str(row['reserved_fill_intent_idempotency_key'])
+        for row in locked.replica_rows
+        if isinstance(row['reserved_fill_intent_idempotency_key'], str) and
+        row['reserved_fill_intent_idempotency_key']
+    }
+    allocation_identity = (
+        allocation.allocation_generation,
+        allocation.allocation_input_sha256,
+        allocation.allocation_claim_generation,
+        allocation.reconciliation_gate_generation,
+        allocation.reclaim_fleet_bundle_sha256,
+        allocation.reclaim_policy_revision,
+        allocation.reclaim_provider_inventory_sha256,
+    )
+    for row in locked.intent_rows:
+        state = row['state']
+        live_pending = (state in _PENDING_ZERO_COST_INTENT_STATES and
+                        row['valid_until'] > now)
+        if (live_pending and
+                row['intent_idempotency_key'] not in admission_keys):
+            try:
+                pending_capacity += zero_cost_actuation.intent_capacity_for_unit(
+                    row, config.capacity_unit)
+            except zero_cost_actuation.ZeroCostActuationConflict as error:
+                raise CapacityAdmissionConflict(
+                    'Service ceiling contains malformed intent capacity.'
+                ) from error
+        row_identity = (row['allocation_generation'],
+                        row['allocation_input_sha256'],
+                        row['allocation_claim_generation'],
+                        row['reconciliation_gate_generation'],
+                        row['reclaim_fleet_bundle_sha256'],
+                        row['reclaim_policy_revision'],
+                        row['reclaim_provider_inventory_sha256'])
+        current_materialized = (state == 'COMMITTED' and
+                                row['intent_idempotency_key']
+                                in provider_replica_keys)
+        current_unrepresented_admission = (
+            row['intent_idempotency_key'] in admission_keys and
+            row['intent_idempotency_key'] not in represented_replica_keys)
+        if (row['service_hash'] != service_hash or
+                row['service_version'] != service_version or
+                row_identity != allocation_identity or
+                not (live_pending or current_materialized or
+                     current_unrepresented_admission)):
+            continue
+        key = (str(row['pool_key']), str(row['accelerator']).casefold())
+        debit_counts[key] = debit_counts.get(key, 0) + 1
+
+    try:
+        unresolved_admission_capacity = (
+            zero_cost_actuation.unrepresented_kueue_admission_capacity(
+                lane_projection.rows,
+                capacity_unit=config.capacity_unit,
+                represented_intent_keys=frozenset(represented_replica_keys)))
+    except zero_cost_actuation.ZeroCostActuationConflict as error:
+        raise CapacityAdmissionConflict(
+            'Kueue admission service ceiling debit is malformed.') from error
+
+    debits = tuple(
+        reserved_fill_planner.CommittedFillDebit(
+            allocation_generation=allocation.allocation_generation,
+            allocation_input_sha256=allocation.allocation_input_sha256,
+            allocation_claim_generation=(
+                allocation.allocation_claim_generation),
+            pool_key=pool_key,
+            accelerator=accelerator,
+            replica_slots=count)
+        for (pool_key, accelerator), count in sorted(debit_counts.items()))
+    planned_capacity = (materialized_capacity + pending_capacity +
+                        unresolved_admission_capacity)
+    allocation_upper_bound = planned_capacity
+    for snapshot in allocation.pool_snapshots:
+        slot_cost = max(
+            config.capacity_unit.intent_cost(location.accelerator_count)
+            for location in snapshot.locations)
+        allocation_upper_bound += (
+            min(snapshot.free_slots, snapshot.grant, snapshot.edge_cap) *
+            slot_cost)
+    try:
+        exact = (reserved_fill_planner.ReservedFillPlanner.
+                 project_remaining_capacity_by_accelerator(
+                     allocation_map=allocation,
+                     max_replicas=allocation_upper_bound,
+                     planned_replicas=planned_capacity,
+                     capacity_unit=config.capacity_unit,
+                     committed_fill_debits=debits))
+    except ValueError as error:
+        raise CapacityAdmissionConflict(
+            'Current allocation tail cannot be projected exactly.') from error
+    if sum(exact.values()) > max(0, config.max_capacity - planned_capacity):
+        # The fairness rotation anchor is process-local.  Under a binding
+        # mixed-card ceiling it can change the exact-card tail selected by the
+        # planner, so positive paid authority must wait instead of guessing.
+        raise CapacityAdmissionConflict(
+            'Current allocation tail exceeds rotation-independent service '
+            'headroom.')
+    if accounting_cards == {AGGREGATE_ACCELERATOR}:
+        return {AGGREGATE_ACCELERATOR: sum(exact.values())}
+    if set(exact) - accounting_cards:
+        raise CapacityAdmissionConflict(
+            'Current allocation tail is outside the plan accounting classes.')
+    return {card: exact.get(card, 0) for card in sorted(accounting_cards)}
+
+
 def _claim_units_for_plan(
     connection: sqlalchemy.engine.Connection,
     *,
@@ -793,15 +1200,39 @@ def _paid_residual(
     existing_zero_cost: Mapping[str, int],
     pending_zero_cost: Mapping[str, int],
     existing_paid: Mapping[str, int],
+    allocation_reserved: Mapping[str, int] | None = None,
 ) -> dict[str, int]:
+    if allocation_reserved is None:
+        allocation_reserved = {}
     cards = (set(demand) | set(existing_zero_cost) | set(pending_zero_cost) |
-             set(existing_paid))
+             set(allocation_reserved) | set(existing_paid))
     return {
         card: residual for card in sorted(cards) if (residual := max(
             0,
             demand.get(card, 0) - existing_zero_cost.get(card, 0) -
-            pending_zero_cost.get(card, 0) - existing_paid.get(card, 0))) > 0
+            pending_zero_cost.get(card, 0) - allocation_reserved.get(card, 0) -
+            existing_paid.get(card, 0))) > 0
     }
+
+
+def _validate_optimistic_capacity_projection(
+    raw_expected: Mapping[str, int],
+    current: Mapping[str, int],
+    accounting_cards: set[str],
+    *,
+    field: str,
+    changed: str,
+) -> None:
+    """Compare one controller read with the locked publication snapshot."""
+    if not raw_expected:
+        raw_expected = {card: 0 for card in accounting_cards}
+    try:
+        expected = _canonical_counts(raw_expected, field)
+    except ValueError as error:
+        raise CapacityAdmissionConflict(
+            f'Controller {field} projection is malformed.') from error
+    if set(expected) != accounting_cards or expected != current:
+        raise CapacityAdmissionConflict(changed)
 
 
 def get_service_source_mode(
@@ -945,6 +1376,84 @@ class CapacityAdmissionRepository:
                 raise CapacityAdmissionConflict(
                     'Demand report does not name the exact fresh route.')
 
+    def project_reserved_supply(
+        self,
+        *,
+        service_name: str,
+        service_hash: str,
+        service_lifecycle_epoch: int,
+        service_version: int,
+        accounting_cards: Mapping[str, int],
+        authority: ReservedFillPlanAuthority,
+    ) -> ReservedSupplyProjection:
+        """Read the optimistic supply input later compared by publication."""
+        cards = set(
+            _canonical_counts(accounting_cards,
+                              'capacity_target_by_accelerator'))
+        if (not cards or authority.mode
+                is not ReservedFillPlanAuthorityMode.ALLOCATION_BOUND):
+            raise ValueError(
+                'Reserved supply projection requires allocation-bound cards.')
+        with self.engine.begin() as connection:
+            serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+                connection)
+            service = connection.execute(
+                sqlalchemy.select(_SERVICES).where(
+                    _SERVICES.c.name ==
+                    service_name).with_for_update()).mappings().one_or_none()
+            if (service is None or service['hash'] != service_hash or
+                    service['lifecycle_epoch'] != service_lifecycle_epoch or
+                    service['current_version'] != service_version):
+                raise CapacityAdmissionConflict(
+                    'Service changed before reserved-supply projection.')
+            config = _reserved_fill_service_config_in_connection(
+                connection, service)
+            allocation = _validate_reserved_fill_authority_in_connection(
+                connection,
+                service,
+                authority,
+                reserved_fill_binding_required=config.binding_required,
+                protocol_and_service_prelocked=True)
+            now = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.clock_timestamp())).scalar_one()
+            locked = _lock_capacity_rows(connection,
+                                         service_name=service_name,
+                                         service_hash=service_hash,
+                                         now=now)
+            lane_projection = _lock_kueue_projection(
+                connection,
+                service_name=service_name,
+                service_hash=service_hash,
+                service_lifecycle_epoch=service_lifecycle_epoch,
+                service_version=service_version,
+                accounting_cards=cards,
+                locked=locked)
+            _, _, pending = _project_capacity_inventory(
+                locked,
+                service_version=service_version,
+                accounting_cards=cards,
+                now=now,
+                lane_projection=lane_projection)
+            tail = _project_allocation_reserved_capacity(
+                allocation,
+                locked,
+                service_hash=service_hash,
+                service_version=service_version,
+                accounting_cards=cards,
+                now=now,
+                config=config,
+                lane_projection=lane_projection)
+            economic_infos, economic_kueue, economic_digest = (
+                _economic_capacity_graph_snapshot(
+                    locked, lane_projection, service_version=service_version))
+        return ReservedSupplyProjection(
+            pending_zero_cost_capacity_by_accelerator=pending,
+            allocation_reserved_capacity_by_accelerator=tail,
+            economic_replica_infos=economic_infos,
+            economic_kueue_capacity_by_replica_id=economic_kueue,
+            economic_capacity_graph_sha256=economic_digest)
+
     def publish(
         self,
         plan: CapacityPlanInput,
@@ -978,9 +1487,9 @@ class CapacityAdmissionRepository:
             ).mappings().one_or_none()
             if service is None:
                 raise CapacityAdmissionConflict('Service no longer exists.')
-            reserved_fill_binding_required = (
-                _reserved_fill_binding_required_in_connection(
-                    connection, service))
+            fill_config = _reserved_fill_service_config_in_connection(
+                connection, service)
+            reserved_fill_binding_required = fill_config.binding_required
             positive_target = any(capacity_target.values())
             authority_mode = plan.reserved_fill_authority.mode
             expected_authority_mode = (
@@ -994,14 +1503,16 @@ class CapacityAdmissionRepository:
                     'Capacity plan reserved-fill authority does not match its '
                     'service actuation mode and target.')
             self._validate_sources(connection, plan, service)
+            validated_allocation = None
             if allocation_bound:
-                _validate_reserved_fill_authority_in_connection(
-                    connection,
-                    service,
-                    plan.reserved_fill_authority,
-                    reserved_fill_binding_required=(
-                        reserved_fill_binding_required),
-                    protocol_and_service_prelocked=True)
+                validated_allocation = (
+                    _validate_reserved_fill_authority_in_connection(
+                        connection,
+                        service,
+                        plan.reserved_fill_authority,
+                        reserved_fill_binding_required=(
+                            reserved_fill_binding_required),
+                        protocol_and_service_prelocked=True))
             now = connection.execute(
                 sqlalchemy.select(
                     sqlalchemy.func.clock_timestamp())).scalar_one()
@@ -1025,6 +1536,40 @@ class CapacityAdmissionRepository:
                     accounting_cards=accounting_cards,
                     now=now,
                     lane_projection=lane_projection))
+            if allocation_bound:
+                _, _, economic_digest = _economic_capacity_graph_snapshot(
+                    locked_capacity,
+                    lane_projection,
+                    service_version=plan.service_version)
+                if (plan.expected_economic_capacity_graph_sha256
+                        != economic_digest):
+                    raise CapacityAdmissionConflict(
+                        'Economic capacity graph changed before plan '
+                        'publication.')
+                _validate_optimistic_capacity_projection(
+                    plan.expected_pending_zero_cost_capacity_by_accelerator,
+                    pending_zero_cost,
+                    accounting_cards,
+                    field=(
+                        'expected_pending_zero_cost_capacity_by_accelerator'),
+                    changed=('Pending zero-cost supply changed before plan '
+                             'publication.'))
+            allocation_reserved = _project_allocation_reserved_capacity(
+                validated_allocation,
+                locked_capacity,
+                service_hash=plan.service_hash,
+                service_version=plan.service_version,
+                accounting_cards=accounting_cards,
+                now=now,
+                config=fill_config,
+                lane_projection=lane_projection)
+            _validate_optimistic_capacity_projection(
+                plan.allocation_reserved_capacity_by_accelerator,
+                allocation_reserved,
+                accounting_cards,
+                field='allocation_reserved_capacity_by_accelerator',
+                changed=('Reserved-fill allocation tail changed before plan '
+                         'publication.'))
             head = connection.execute(
                 sqlalchemy.select(_HEADS).where(
                     _HEADS.c.service_name == plan.service_name).with_for_update(
@@ -1057,10 +1602,12 @@ class CapacityAdmissionRepository:
                     existing_zero_cost_capacity_by_accelerator=full_zero_cost,
                     pending_zero_cost_capacity_by_accelerator=(
                         pending_zero_cost),
+                    allocation_reserved_capacity_by_accelerator=(
+                        allocation_reserved),
                     existing_paid_capacity_by_accelerator=prior_paid_baseline,
                     paid_residual_by_accelerator=_paid_residual(
                         capacity_target, full_zero_cost, pending_zero_cost,
-                        prior_paid_baseline))
+                        prior_paid_baseline, allocation_reserved))
                 duplicate_digest = _sha256(duplicate_payload)
             duplicate = bool(previous is not None and
                              duplicate_digest == previous['content_sha256'])
@@ -1074,10 +1621,12 @@ class CapacityAdmissionRepository:
                     existing_zero_cost_capacity_by_accelerator=full_zero_cost,
                     pending_zero_cost_capacity_by_accelerator=(
                         pending_zero_cost),
+                    allocation_reserved_capacity_by_accelerator=(
+                        allocation_reserved),
                     existing_paid_capacity_by_accelerator=full_paid,
                     paid_residual_by_accelerator=_paid_residual(
                         capacity_target, full_zero_cost, pending_zero_cost,
-                        full_paid))
+                        full_paid, allocation_reserved))
                 digest = _sha256(payload)
                 maximum = connection.execute(
                     sqlalchemy.select(sqlalchemy.func.max(
@@ -1207,12 +1756,13 @@ def validate_paid_claim_in_connection(
             'Capacity plan digest no longer matches its payload.')
     reserved_fill_authority_present = 'reserved_fill_authority' in payload
     raw_reserved_fill_authority = payload.get('reserved_fill_authority')
+    fill_config = _reserved_fill_service_config_in_connection(
+        connection, service)
     try:
         plan_reserved_fill_authority = (
             ReservedFillPlanAuthority.from_mapping(raw_reserved_fill_authority))
     except ValueError as error:
-        reserved_fill_binding_required = (
-            _reserved_fill_binding_required_in_connection(connection, service))
+        reserved_fill_binding_required = fill_config.binding_required
         if (reserved_fill_binding_required or reserved_fill_authority_present):
             raise CapacityAdmissionConflict(
                 'Paid claim has no valid reserved-fill plan authority.'
@@ -1224,8 +1774,7 @@ def validate_paid_claim_in_connection(
         plan_reserved_fill_authority = (
             ReservedFillPlanAuthority.not_applicable())
     else:
-        reserved_fill_binding_required = (
-            _reserved_fill_binding_required_in_connection(connection, service))
+        reserved_fill_binding_required = fill_config.binding_required
     validated_allocation = _validate_reserved_fill_authority_in_connection(
         connection,
         service,
@@ -1338,18 +1887,38 @@ def validate_paid_claim_in_connection(
             raw_pending_zero = {card: 0 for card in capacity_target}
         baseline_pending_zero = _canonical_counts(
             raw_pending_zero, 'pending_zero_cost_capacity_by_accelerator')
+        raw_allocation_reserved = payload.get(
+            'allocation_reserved_capacity_by_accelerator')
+        if raw_allocation_reserved is None:
+            if validated_allocation is not None:
+                raise ValueError(
+                    'Allocation-bound plan predates allocation-tail '
+                    'accounting.')
+            raw_allocation_reserved = {card: 0 for card in capacity_target}
+        baseline_allocation_reserved = _canonical_counts(
+            raw_allocation_reserved,
+            'allocation_reserved_capacity_by_accelerator')
         baseline_paid = _canonical_counts(
             payload.get('existing_paid_capacity_by_accelerator', {}),
             'existing_paid_capacity_by_accelerator')
         paid = _canonical_counts(
             payload.get('paid_residual_by_accelerator', {}),
             'paid_residual_by_accelerator')
+        economic_graph_sha256 = payload.get('economic_capacity_graph_sha256')
+        if validated_allocation is not None and (
+                not isinstance(economic_graph_sha256, str) or
+                _SHA256_RE.fullmatch(economic_graph_sha256) is None):
+            raise ValueError(
+                'Allocation-bound plan lacks its economic capacity graph.')
+        if validated_allocation is None and economic_graph_sha256 is not None:
+            raise ValueError('Unbound plan carries an economic capacity graph.')
     except ValueError as error:
         raise CapacityAdmissionConflict(
             'Capacity plan accounting is malformed.') from error
     accounting_cards = set(capacity_target)
     if (not accounting_cards or set(baseline_zero) != accounting_cards or
             set(baseline_pending_zero) != accounting_cards or
+            set(baseline_allocation_reserved) != accounting_cards or
             set(baseline_paid) != accounting_cards or
             set(paid) - accounting_cards):
         raise CapacityAdmissionConflict(
@@ -1366,6 +1935,15 @@ def validate_paid_claim_in_connection(
         service_version=int(service['current_version']),
         accounting_cards=accounting_cards,
         locked=locked_capacity)
+    if validated_allocation is not None:
+        _, _, current_economic_digest = _economic_capacity_graph_snapshot(
+            locked_capacity,
+            lane_projection,
+            service_version=int(service['current_version']))
+        if current_economic_digest != economic_graph_sha256:
+            raise CapacityAdmissionConflict(
+                'Reserved economic supply changed after the ordered plan '
+                'snapshot.')
     current_zero, current_paid, current_pending_zero = (
         _project_capacity_inventory(locked_capacity,
                                     service_version=int(
@@ -1373,6 +1951,15 @@ def validate_paid_claim_in_connection(
                                     accounting_cards=accounting_cards,
                                     now=now,
                                     lane_projection=lane_projection))
+    current_allocation_reserved = _project_allocation_reserved_capacity(
+        validated_allocation,
+        locked_capacity,
+        service_hash=str(service['hash']),
+        service_version=int(service['current_version']),
+        accounting_cards=accounting_cards,
+        now=now,
+        config=fill_config,
+        lane_projection=lane_projection)
     claim_units_by_card = _claim_units_for_plan(
         connection,
         service_name=service['name'],
@@ -1385,9 +1972,15 @@ def validate_paid_claim_in_connection(
     }
     if (current_zero != baseline_zero or
             current_pending_zero != baseline_pending_zero or
+            current_allocation_reserved != baseline_allocation_reserved or
             current_paid != expected_paid):
         raise CapacityAdmissionConflict(
             'Committed capacity changed after the ordered plan snapshot.')
+    if paid != _paid_residual(capacity_target, baseline_zero,
+                              baseline_pending_zero, baseline_paid,
+                              baseline_allocation_reserved):
+        raise CapacityAdmissionConflict(
+            'Paid residual is not the exact post-reserved deficit.')
     authorized = paid.get(accelerator, 0)
     claimed = claim_units_by_card.get(accelerator, 0)
     if prospective:
