@@ -59,6 +59,14 @@ class KueueAdmissionState(str, enum.Enum):
     POLICY_ADMITTED = 'POLICY_ADMITTED'
 
 
+class _ProviderAbsentPreJobAdmissionMode(enum.Enum):
+    """Admission receipts accepted by one provider-clean pre-job proof."""
+
+    PENDING_ONLY = enum.auto()
+    PENDING_OR_POLICY_ADMITTED = enum.auto()
+    PENDING_OR_RETAINED_POD = enum.auto()
+
+
 class KueueAdmissionError(RuntimeError):
     """Base error for durable Kueue admission authority."""
 
@@ -615,9 +623,12 @@ def _validate_provider_absent_pre_job_admission(
     *,
     replica_id: int,
     replica_record_id: uuid.UUID,
-    allow_policy_admitted: bool = False,
+    mode: _ProviderAbsentPreJobAdmissionMode = (
+        _ProviderAbsentPreJobAdmissionMode.PENDING_ONLY),
 ) -> None:
     """Accept only an exact pending or admitted pre-job Kueue receipt."""
+    if not isinstance(mode, _ProviderAbsentPreJobAdmissionMode):
+        raise TypeError('Pre-job admission mode is invalid.')
     checked_identity = _validate_admission_intent_identity(admission, intent)
     if (checked_identity != identity or admission['replica_id'] != replica_id or
             admission['replica_record_id'] != replica_record_id or
@@ -638,31 +649,92 @@ def _validate_provider_absent_pre_job_admission(
             raise KueueAdmissionConflict(
                 'Pending pre-job teardown retained Pod authority.')
         return
+    if state == KueueAdmissionState.POD_WAITING.value:
+        if mode is not (
+                _ProviderAbsentPreJobAdmissionMode.PENDING_OR_RETAINED_POD):
+            raise KueueAdmissionConflict(
+                'Provider-absent pre-job teardown has an unresolved Kueue '
+                'state.')
+        _validate_provider_absent_pre_job_pod_receipt(
+            connection,
+            admission,
+            identity,
+            association,
+            replica_record_id=replica_record_id,
+            state=KueueAdmissionState.POD_WAITING)
+        return
     if (state == KueueAdmissionState.POLICY_ADMITTED.value and
-            not allow_policy_admitted):
+            mode is _ProviderAbsentPreJobAdmissionMode.PENDING_ONLY):
         raise KueueAdmissionConflict(
             'Provider-absent pre-job teardown found live or mismatched '
             'admission authority.')
     if state != KueueAdmissionState.POLICY_ADMITTED.value:
         raise KueueAdmissionConflict(
             'Provider-absent pre-job teardown has an unresolved Kueue state.')
+    _validate_provider_absent_pre_job_pod_receipt(
+        connection,
+        admission,
+        identity,
+        association,
+        replica_record_id=replica_record_id,
+        state=KueueAdmissionState.POLICY_ADMITTED)
+
+
+def _validate_provider_absent_pre_job_pod_receipt(
+    connection: sqlalchemy.engine.Connection,
+    admission: Mapping[str, Any],
+    identity: KueueAdmissionIdentity,
+    association: Mapping[str, Any],
+    *,
+    replica_record_id: uuid.UUID,
+    state: KueueAdmissionState,
+) -> None:
+    """Validate one closed Pod receipt dominated by physical absence."""
+    if state not in (KueueAdmissionState.POD_WAITING,
+                     KueueAdmissionState.POLICY_ADMITTED):
+        raise ValueError('Retained pre-job Pod receipt state is invalid.')
     pod_namespace = admission['pod_namespace']
     pod_name = admission['pod_name']
     pod_uid = admission['pod_uid']
     receipt = admission['pod_receipt']
     receipt_digest = admission['pod_receipt_sha256']
+    observed_at = admission['observed_at']
+    admission_updated_at = admission['updated_at']
+    provider_absence_observed_at = association['provider_evidence_observed_at']
     if (not all(
             isinstance(value, str) and value
             for value in (pod_namespace, pod_name, pod_uid)) or
             not isinstance(receipt, Mapping) or
-            not isinstance(receipt_digest, str) or
-            admission['observed_at'] is None or
-            admission['valid_until'] is not None or
-            admission['admitted_at'] is None):
+            not isinstance(receipt_digest, str) or observed_at is None or
+            admission_updated_at is None):
         raise KueueAdmissionConflict(
-            'Admitted pre-job teardown lost its exact Pod receipt.')
+            'Retained pre-job teardown lost its exact Pod receipt.')
+    if (association['provider_evidence'] != 'ABSENT' or
+            provider_absence_observed_at is None or
+            provider_absence_observed_at < admission_updated_at):
+        raise KueueAdmissionConflict(
+            'Retained pre-job Pod receipt is newer than provider absence.')
+    if state is KueueAdmissionState.POD_WAITING:
+        valid_until = admission['valid_until']
+        if (valid_until is None or admission['admitted_at'] is not None or
+                valid_until != observed_at +
+                datetime.timedelta(seconds=WAITING_OBSERVATION_TTL_SECONDS) or
+                not observed_at <= admission_updated_at < valid_until):
+            raise KueueAdmissionConflict(
+                'Waiting pre-job teardown has a malformed receipt lifetime.')
+        database_now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        if database_now < valid_until:
+            raise KueueAdmissionConflict(
+                'Waiting pre-job teardown receipt has not expired.')
+    elif (admission['valid_until'] is not None or
+          admission['admitted_at'] is None or
+          admission['admitted_at'] > observed_at or
+          observed_at > admission_updated_at):
+        raise KueueAdmissionConflict(
+            'Admitted pre-job teardown has a malformed receipt lifetime.')
     _validate_receipt(receipt,
-                      state=KueueAdmissionState.POLICY_ADMITTED,
+                      state=state,
                       identity=identity,
                       intent_idempotency_key=str(
                           admission['intent_idempotency_key']),
@@ -675,7 +747,7 @@ def _validate_provider_absent_pre_job_admission(
         sqlalchemy.select(digest_expression)).scalar_one()
     if receipt_digest != canonical_receipt_digest:
         raise KueueAdmissionConflict(
-            'Admitted pre-job teardown receipt digest is not canonical.')
+            'Retained pre-job teardown receipt digest is not canonical.')
 
 
 def _validate_provider_absent_pre_job_replica(replica_info: Any) -> None:
@@ -1424,6 +1496,7 @@ class KueueAdmissionRepository:
         replica_record_id: uuid.UUID,
         for_update: bool,
         allow_generation_fenced_normal_failure: bool = False,
+        allow_whole_service_retained_pod_receipt: bool = False,
     ) -> _AdmissionlessTeardownGraph | None:
         """Validate one provider-free missing/never-admitted teardown graph."""
         _require_postgres_connection(connection)
@@ -1431,6 +1504,10 @@ class KueueAdmissionRepository:
         _require_positive(replica_id, 'replica_id')
         if not isinstance(replica_record_id, uuid.UUID):
             raise ValueError('replica_record_id must be a UUID.')
+        if (allow_generation_fenced_normal_failure and
+                allow_whole_service_retained_pod_receipt):
+            raise ValueError(
+                'Pre-job retirement scopes are mutually exclusive.')
 
         def _locked(statement: Any) -> Any:
             return statement.with_for_update() if for_update else statement
@@ -1554,6 +1631,9 @@ class KueueAdmissionRepository:
                 not provider_absent_pre_job):
             # A materialized service job retains the normal exact-Pod path.
             return None
+        if (allow_whole_service_retained_pod_receipt and materialized_launch):
+            # A materialized service job retains the normal exact-Pod path.
+            return None
         if not materialized_launch and not provider_absent_pre_job:
             raise KueueAdmissionConflict(
                 'Admissionless teardown is neither a materialized service '
@@ -1620,6 +1700,20 @@ class KueueAdmissionRepository:
                 raise KueueAdmissionConflict(
                     'Admissionless teardown found materialized admission '
                     'authority.')
+            if (allow_whole_service_retained_pod_receipt and
+                    admission_rows[0]['state'] not in {
+                        KueueAdmissionState.POD_WAITING.value,
+                        KueueAdmissionState.POLICY_ADMITTED.value,
+                    }):
+                raise KueueAdmissionConflict(
+                    'Whole-service pre-job retirement lost its exact retained '
+                    'Pod receipt.')
+            admission_mode = (
+                _ProviderAbsentPreJobAdmissionMode.PENDING_OR_RETAINED_POD
+                if allow_whole_service_retained_pod_receipt else
+                _ProviderAbsentPreJobAdmissionMode.PENDING_OR_POLICY_ADMITTED
+                if allow_generation_fenced_normal_failure else
+                _ProviderAbsentPreJobAdmissionMode.PENDING_ONLY)
             _validate_provider_absent_pre_job_admission(
                 connection,
                 admission_rows[0],
@@ -1628,10 +1722,11 @@ class KueueAdmissionRepository:
                 association,
                 replica_id=replica_id,
                 replica_record_id=replica_record_id,
-                allow_policy_admitted=(allow_generation_fenced_normal_failure))
-        elif allow_generation_fenced_normal_failure:
+                mode=admission_mode)
+        elif (allow_generation_fenced_normal_failure or
+              allow_whole_service_retained_pod_receipt):
             raise KueueAdmissionConflict(
-                'Normal pre-job retirement lost its exact Kueue admission.')
+                'Pre-job retirement lost its exact Kueue admission.')
         if claim_rows or queue_rows or pin_rows:
             raise KueueAdmissionConflict(
                 'Admissionless teardown found paid, queued, or pinned '
@@ -1688,6 +1783,70 @@ class KueueAdmissionRepository:
                 state is not PhysicalAbsenceLoadState.ALREADY_PROVEN):
             raise KueueAdmissionConflict(
                 'Normal pre-job retirement requires canonical provider '
+                'absence.')
+        result = ExactPodAbsenceLoadResult(state)
+        result.validate()
+        return result
+
+    def load_whole_service_pre_job_absence_in_connection(
+        self,
+        connection: sqlalchemy.engine.Connection,
+        *,
+        service_name: str,
+        replica_id: int,
+        replica_record_id: uuid.UUID,
+    ) -> ExactPodAbsenceLoadResult:
+        """Prove one admitted pre-job launch is already provider-clean.
+
+        This read-only path applies only to an exact retained POLICY_ADMITTED
+        or expired POD_WAITING row during irreversible whole-service teardown.
+        It accepts no provider probe: the terminal, quiesced association must
+        already own canonical post-quiescence provider-ABSENT evidence newer
+        than the final receipt.  Materialized service jobs remain on the normal
+        exact-Pod path.
+        """
+        _require_postgres_connection(connection)
+        _require_nonempty(service_name, 'service_name')
+        _require_positive(replica_id, 'replica_id')
+        if not isinstance(replica_record_id, uuid.UUID):
+            raise ValueError('replica_record_id must be a UUID.')
+        admission_rows = connection.execute(
+            sqlalchemy.select(_ADMISSIONS).where(
+                _ADMISSIONS.c.service_name == service_name,
+                _ADMISSIONS.c.replica_id == replica_id,
+                _ADMISSIONS.c.replica_record_id == replica_record_id).order_by(
+                    _ADMISSIONS.c.intent_idempotency_key)).mappings().all()
+        if not admission_rows:
+            result = ExactPodAbsenceLoadResult(
+                PhysicalAbsenceLoadState.NOT_APPLICABLE)
+            result.validate()
+            return result
+        if len(admission_rows) != 1:
+            raise KueueAdmissionConflict(
+                'Whole-service pre-job retirement requires one exact Kueue '
+                'admission.')
+        if admission_rows[0]['state'] not in {
+                KueueAdmissionState.POD_WAITING.value,
+                KueueAdmissionState.POLICY_ADMITTED.value,
+        }:
+            result = ExactPodAbsenceLoadResult(
+                PhysicalAbsenceLoadState.NOT_APPLICABLE)
+            result.validate()
+            return result
+
+        graph = self._load_admissionless_teardown_graph_in_connection(
+            connection,
+            service_name=service_name,
+            replica_id=replica_id,
+            replica_record_id=replica_record_id,
+            for_update=True,
+            allow_whole_service_retained_pod_receipt=True)
+        state = (PhysicalAbsenceLoadState.NOT_APPLICABLE
+                 if graph is None else graph.provider_absence_state)
+        if (graph is not None and
+                state is not PhysicalAbsenceLoadState.ALREADY_PROVEN):
+            raise KueueAdmissionConflict(
+                'Whole-service pre-job retirement requires canonical provider '
                 'absence.')
         result = ExactPodAbsenceLoadResult(state)
         result.validate()
@@ -2879,7 +3038,9 @@ class KueueAdmissionRepository:
                     identity,
                     association,
                     replica_id=replica_id,
-                    replica_record_id=expected_records[replica_id])
+                    replica_record_id=expected_records[replica_id],
+                    mode=_ProviderAbsentPreJobAdmissionMode.
+                    PENDING_OR_RETAINED_POD)
             else:
                 checked_identity = _validate_admission_intent_identity(
                     admission, intent)
