@@ -19,11 +19,17 @@ production's grant to 57 on the very next round, which is what proved the
 arbitration itself was healthy and the cap was the binding constraint.
 """
 # pylint: disable=protected-access
+import json
 import time
 from unittest import mock
+import uuid
 
+import pytest
+
+from sky.serve import pool_capacity_observation
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_allocation as allocation
+from sky.serve import reserved_capacity_broker
 
 _POOL = 'pool'
 
@@ -219,3 +225,336 @@ class TestTheReclaimSignalActuallyAppears:
         # 65 is odd, so an exact tie is impossible; largest-remainder gives
         # 33/32. What matters is that holding 63 buys no advantage.
         assert abs(entitlements['a'] - entitlements['b']) <= 1
+
+
+_MISSING = object()
+
+
+def _sequenced_spec(shapes=(('h200', 1),)):
+    return reserved_capacity.FillPoolSpec(position=0,
+                                          context='prod_research_cluster_eks',
+                                          shapes=shapes,
+                                          locations=(),
+                                          physical_cluster_uid='physical-uid',
+                                          pool_key='sequenced-pool',
+                                          legacy_pool_key='legacy-pool')
+
+
+def _committed_observation(spec,
+                           raw_gpus_by_accelerator,
+                           *,
+                           observed_at=1000.0,
+                           valid_until=1100.0):
+    payload = pool_capacity_observation.PoolCapacitySuccess.from_counts(
+        sum(raw_gpus_by_accelerator.values()), raw_gpus_by_accelerator)
+    return pool_capacity_observation.PoolCapacityObservation(
+        pool_key=spec.pool_key,
+        physical_cluster_uid=spec.physical_cluster_uid,
+        accelerator_names=tuple(sorted(raw_gpus_by_accelerator)),
+        access_context=spec.context,
+        observation_generation=7,
+        lease_token=uuid.UUID('00000000-0000-0000-0000-000000000007'),
+        lease_expires_at=valid_until,
+        observation_sequence=19,
+        ordinary_admission_sequence=13,
+        materialization_sequence=17,
+        payload=payload,
+        payload_sha256='a' * 64,
+        observed_at=observed_at,
+        completed_at=observed_at,
+        valid_until=valid_until,
+        published_at=observed_at)
+
+
+def _sequenced_round(spec,
+                     observation,
+                     observed_slots,
+                     spendable_slots=_MISSING,
+                     *,
+                     sum_holdings=0):
+    envelope = {
+        'service': {},
+        reserved_capacity_broker.OBSERVED_FREE_BY_ACCELERATOR_KEY: observed_slots,
+        reserved_capacity_broker.BROKER_SLOT_WIDTH_KEY: spec.gpus_per_replica,
+    }
+    if spendable_slots is not _MISSING:
+        envelope[reserved_capacity_broker.SPENDABLE_FREE_BY_ACCELERATOR_KEY] = (
+            spendable_slots)
+    return {
+        'protocol_version': reserved_capacity_broker.PROTOCOL_V2,
+        'observation_generation': observation.observation_generation,
+        'observation_sequence': observation.observation_sequence,
+        'observation_materialization_sequence':
+            (observation.materialization_sequence),
+        'observation_payload_sha256': observation.payload_sha256,
+        'feed_by_accelerator': json.dumps(envelope, sort_keys=True),
+        'last_observed_free': sum(observed_slots.values()),
+        'last_observed_free_ts': observation.observed_at,
+        'snapshot_time': observation.observed_at,
+        'sum_holdings': sum_holdings,
+    }
+
+
+def _repository(observation):
+    repository = mock.Mock(
+        spec=pool_capacity_observation.PoolCapacityObservationRepository)
+    repository.read_exact_completed.return_value = observation
+    return repository
+
+
+def _sequenced_hint(spec,
+                    row,
+                    observation,
+                    *,
+                    holdings=0,
+                    previous_cap=0,
+                    now=1001.0):
+    # The source change and its tests coexist in this uninstalled worktree;
+    # pylint resolves the installed predecessor signature instead.
+    return reserved_capacity._pool_capacity_hint(
+        spec,
+        holdings=holdings,
+        launchable=True,
+        previous_cap=previous_cap,
+        now=now,
+        round_row=row,
+        observation_repository=_repository(  # pylint: disable=unexpected-keyword-arg
+            observation))
+
+
+class TestSequencedCapacityHint:
+    """Sequenced discovery consumes only authenticated spendable slots."""
+
+    def test_committed_single_card_conserves_holdings_and_spendable(self):
+        spec = _sequenced_spec()
+        observation = _committed_observation(spec, {'h200': 31})
+        row = _sequenced_round(spec,
+                               observation, {'h200': 31}, {'h200': 2},
+                               sum_holdings=48)
+
+        assert _sequenced_hint(spec, row, observation, holdings=48) == 50
+
+    def test_newer_local_holdings_are_not_added_to_stale_round_free(self):
+        spec = _sequenced_spec()
+        observation = _committed_observation(spec, {'h200': 5})
+        row = _sequenced_round(spec,
+                               observation, {'h200': 5}, {'h200': 5},
+                               sum_holdings=10)
+
+        hint = _sequenced_hint(spec, row, observation, holdings=40)
+        budgets = reserved_capacity.allocate_fill_pool_budgets(
+            100, 0,
+            (reserved_capacity.FillPoolBudgetInput(holdings=40,
+                                                   capacity_hint=hint),))
+
+        assert hint == 15
+        assert budgets[0].edge_cap == 40
+
+    def test_closed_all_zero_mapping_is_authoritative(self):
+        spec = _sequenced_spec()
+        observation = _committed_observation(spec, {'h200': 5})
+        row = _sequenced_round(spec,
+                               observation, {'h200': 5}, {'h200': 0},
+                               sum_holdings=7)
+
+        assert _sequenced_hint(spec,
+                               row,
+                               observation,
+                               holdings=2,
+                               previous_cap=20) == 7
+
+    def test_literal_empty_mapping_is_malformed_and_withholds(self):
+        spec = _sequenced_spec()
+        observation = _committed_observation(spec, {'h200': 5})
+        row = _sequenced_round(spec,
+                               observation, {'h200': 5}, {},
+                               sum_holdings=7)
+
+        assert _sequenced_hint(spec,
+                               row,
+                               observation,
+                               holdings=3,
+                               previous_cap=20) == 3
+
+    def test_missing_n_minus_one_key_carries_existing_cap(self):
+        spec = _sequenced_spec()
+        observation = _committed_observation(spec, {'h200': 5})
+        row = _sequenced_round(spec, observation, {'h200': 5}, sum_holdings=7)
+
+        assert _sequenced_hint(spec,
+                               row,
+                               observation,
+                               holdings=3,
+                               previous_cap=9) == 9
+
+    @pytest.mark.parametrize('observed_slots,spendable_slots', [
+        ({
+            'h200': 2
+        }, {
+            'a100': 1
+        }),
+        ({
+            'h200': 2
+        }, {
+            'H200': 1,
+            'h200': 1
+        }),
+        ({
+            'h200': 2
+        }, {
+            'h200': True
+        }),
+        ({
+            'h200': 2
+        }, {
+            'h200': 3
+        }),
+    ])
+    def test_malformed_spendable_mapping_withholds(self, observed_slots,
+                                                   spendable_slots):
+        spec = _sequenced_spec()
+        observation = _committed_observation(spec, {'h200': 2})
+        row = _sequenced_round(spec,
+                               observation,
+                               observed_slots,
+                               spendable_slots,
+                               sum_holdings=7)
+
+        assert _sequenced_hint(spec,
+                               row,
+                               observation,
+                               holdings=3,
+                               previous_cap=20) == 3
+
+    def test_pointwise_card_fabrication_with_same_total_withholds(self):
+        spec = _sequenced_spec((('a100', 1), ('h200', 1)))
+        observation = _committed_observation(spec, {'a100': 0, 'h200': 4})
+        row = _sequenced_round(spec,
+                               observation, {
+                                   'a100': 0,
+                                   'h200': 4
+                               }, {
+                                   'a100': 1,
+                                   'h200': 3
+                               },
+                               sum_holdings=2)
+
+        assert _sequenced_hint(spec,
+                               row,
+                               observation,
+                               holdings=2,
+                               previous_cap=20) == 2
+
+    def test_forged_observed_sentinel_withholds(self):
+        spec = _sequenced_spec()
+        observation = _committed_observation(spec, {'h200': 4})
+        row = _sequenced_round(spec,
+                               observation, {'h200': 5}, {'h200': 2},
+                               sum_holdings=7)
+
+        assert _sequenced_hint(spec,
+                               row,
+                               observation,
+                               holdings=3,
+                               previous_cap=20) == 3
+
+    def test_composite_zero_free_card_is_preserved(self):
+        spec = _sequenced_spec((('a100', 1), ('h200', 1)))
+        observation = _committed_observation(spec, {'a100': 0, 'h200': 4})
+        row = _sequenced_round(spec,
+                               observation, {
+                                   'a100': 0,
+                                   'h200': 4
+                               }, {
+                                   'a100': 0,
+                                   'h200': 3
+                               },
+                               sum_holdings=1)
+
+        assert _sequenced_hint(spec, row, observation, holdings=1) == 4
+
+    def test_ambiguous_composite_debit_remains_conservative(self):
+        spec = _sequenced_spec((('a100', 1), ('h200', 1)))
+        observation = _committed_observation(spec, {'a100': 5, 'h200': 5})
+        row = _sequenced_round(spec,
+                               observation, {
+                                   'a100': 5,
+                                   'h200': 5
+                               }, {
+                                   'a100': 4,
+                                   'h200': 4
+                               },
+                               sum_holdings=1)
+
+        hint = _sequenced_hint(spec, row, observation, holdings=1)
+
+        assert hint == 9
+        assert hint < 10  # Aggregate one-slot debit would conserve ten.
+
+    def test_multi_gpu_width_uses_replica_slots(self):
+        spec = _sequenced_spec((('h200', 2),))
+        observation = _committed_observation(spec, {'h200': 9})
+        row = _sequenced_round(spec,
+                               observation, {'h200': 4}, {'h200': 3},
+                               sum_holdings=1)
+
+        assert _sequenced_hint(spec, row, observation, holdings=1) == 4
+
+    def test_stale_committed_observation_carries_previous_cap(self):
+        spec = _sequenced_spec()
+        observation = _committed_observation(spec, {'h200': 5},
+                                             observed_at=999.0,
+                                             valid_until=999.5)
+        row = _sequenced_round(spec,
+                               observation, {'h200': 5}, {'h200': 3},
+                               sum_holdings=7)
+
+        assert _sequenced_hint(spec,
+                               row,
+                               observation,
+                               holdings=3,
+                               previous_cap=9,
+                               now=1000.0) == 9
+
+    def test_protocol_v1_keeps_the_historical_formula(self):
+        spec = _sequenced_spec()
+        now = time.time()
+        row = {
+            'protocol_version': reserved_capacity_broker.PROTOCOL_V1,
+            'last_observed_free': 8,
+            'last_observed_free_ts': now,
+            'sum_holdings': 65,
+            'feed_by_accelerator': 'legacy bytes are not parsed',
+        }
+
+        assert reserved_capacity._pool_capacity_hint(spec,
+                                                     holdings=2,
+                                                     launchable=True,
+                                                     previous_cap=0,
+                                                     now=now,
+                                                     round_row=row) == 73
+
+
+def test_spendable_metadata_is_not_part_of_exact_feed_epoch_identity():
+    base = {
+        'service': {
+            'h200': 2
+        },
+        reserved_capacity_broker.OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+            'h200': 5
+        },
+        reserved_capacity_broker.BROKER_SLOT_WIDTH_KEY: 1,
+    }
+    first = dict(base)
+    first[reserved_capacity_broker.SPENDABLE_FREE_BY_ACCELERATOR_KEY] = {
+        'h200': 3
+    }
+    second = dict(base)
+    second[reserved_capacity_broker.SPENDABLE_FREE_BY_ACCELERATOR_KEY] = {
+        'h200': 1
+    }
+
+    assert reserved_capacity_broker._service_feed_payload_for_epoch(
+        json.dumps(first, sort_keys=True)) == (
+            reserved_capacity_broker._service_feed_payload_for_epoch(
+                json.dumps(second, sort_keys=True)))

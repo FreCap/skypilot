@@ -1038,7 +1038,10 @@ def _claim_edge() -> dict[str, object]:
 def _replace_claim_set(claim_authorization_executor=None,) -> int | None:
     return broker.replace_claim_set(
         'svc',
-        semantic_hash='semantic-v1',
+        configured_max_replicas=3,
+        utilization_gate=False,
+        service_floor=0,
+        service_weight=1,
         global_headroom=3,
         utilization_ceiling=3,
         utilization_state={},

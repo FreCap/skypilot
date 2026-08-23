@@ -96,6 +96,8 @@ _SUPPORTED_PROTOCOLS = frozenset((PROTOCOL_V1, PROTOCOL_V2))
 # not understand.
 OBSERVED_FREE_BY_ACCELERATOR_KEY = '$skypilot-observed-free-v1'
 _OBSERVED_FREE_BY_ACCELERATOR_KEY = OBSERVED_FREE_BY_ACCELERATOR_KEY
+SPENDABLE_FREE_BY_ACCELERATOR_KEY = '$skypilot-spendable-free-v1'
+_SPENDABLE_FREE_BY_ACCELERATOR_KEY = SPENDABLE_FREE_BY_ACCELERATOR_KEY
 BROKER_SLOT_WIDTH_KEY = '$skypilot-slot-width-v1'
 _BROKER_SLOT_WIDTH_KEY = BROKER_SLOT_WIDTH_KEY
 
@@ -2031,7 +2033,10 @@ def _authorize_reclaim_claim_set_in_boundary(
 def replace_claim_set(
     service_name: str,
     *,
-    semantic_hash: str,
+    configured_max_replicas: int,
+    utilization_gate: bool,
+    service_floor: int,
+    service_weight: int | float,
     global_headroom: int,
     utilization_ceiling: int,
     utilization_state: Any,
@@ -2047,13 +2052,27 @@ def replace_claim_set(
     returns the authoritative service generation and invalidates every cached
     edge absent from that set or produced by an earlier generation.
     """
-    if expected_service_hash is None:
+    if (not isinstance(service_name, str) or not service_name or
+            not isinstance(expected_service_hash, str) or
+            not expected_service_hash):
         _clear_service_cache(service_name)
         logger.error('Protocol-v2 claim-set replacement requires an exact '
                      f'service owner hash for {service_name!r}.')
         return None
-    if not semantic_hash:
-        raise ValueError('Protocol-v2 claim sets require a semantic hash.')
+    if (isinstance(configured_max_replicas, bool) or
+            not isinstance(configured_max_replicas, int) or
+            configured_max_replicas < 0 or isinstance(service_floor, bool) or
+            not isinstance(service_floor, int) or service_floor < 0):
+        raise ValueError('Protocol-v2 configured replica limits must be '
+                         'nonnegative integers.')
+    if type(utilization_gate) is not bool:
+        raise ValueError('Protocol-v2 utilization_gate must be a boolean.')
+    if (isinstance(service_weight, bool) or
+            not isinstance(service_weight, (int, float)) or
+            not math.isfinite(float(service_weight)) or service_weight <= 0):
+        raise ValueError('Protocol-v2 service_weight must be a positive finite '
+                         'number.')
+    normalized_service_weight = float(service_weight)
     if (isinstance(global_headroom, bool) or
             not isinstance(global_headroom, int) or global_headroom < 0 or
             isinstance(utilization_ceiling, bool) or
@@ -2062,6 +2081,7 @@ def replace_claim_set(
         raise ValueError('Protocol-v2 global budgets must be nonnegative.')
     normalized_edges: list[dict[str, Any]] = []
     pool_keys: set[str] = set()
+    pool_positions: set[int] = set()
     physical_uid_by_access_context: dict[str, str] = {}
     identities: list[tuple[str, PoolIdentity]] = []
     for raw_edge in edges:
@@ -2077,6 +2097,19 @@ def replace_claim_set(
             raise ValueError('A protocol-v2 complete set cannot contain '
                              f'duplicate pool edge {pool_key!r}.')
         pool_keys.add(pool_key)
+        legacy_pool_key = edge.get('legacy_pool_key')
+        if not isinstance(legacy_pool_key, str) or not legacy_pool_key:
+            raise ValueError('Every protocol-v2 edge requires a legacy pool '
+                             f'key: {pool_key!r}.')
+        pool_position = edge.get('pool_position')
+        if (isinstance(pool_position, bool) or
+                not isinstance(pool_position, int) or pool_position < 0):
+            raise ValueError('Every protocol-v2 edge requires a nonnegative '
+                             f'pool position: {pool_key!r}.')
+        if pool_position in pool_positions:
+            raise ValueError('A protocol-v2 complete set cannot contain '
+                             f'duplicate pool position {pool_position!r}.')
+        pool_positions.add(pool_position)
         physical_uid = edge.get('physical_cluster_uid')
         if (not isinstance(physical_uid, str) or not physical_uid or
                 physical_uid != identity.physical_cluster_uid):
@@ -2102,6 +2135,11 @@ def replace_claim_set(
                                  f'physical cluster: {prior_key!r} and '
                                  f'{pool_key!r}.')
         identities.append((pool_key, identity))
+        gpus_per_replica = edge.get('gpus_per_replica')
+        if (isinstance(gpus_per_replica, bool) or
+                not isinstance(gpus_per_replica, int) or gpus_per_replica <= 0):
+            raise ValueError('Every protocol-v2 edge requires a positive '
+                             f'replica slot width: {pool_key!r}.')
         effective_cap = edge.get('effective_cap')
         if (isinstance(effective_cap, bool) or
                 not isinstance(effective_cap, int)):
@@ -2111,11 +2149,52 @@ def replace_claim_set(
             raise ValueError('Protocol-v2 edge caps must be nonnegative: '
                              f'{pool_key!r}.')
         edge['effective_cap'] = effective_cap
+        # These fields have one canonical source.  The pool key owns the card
+        # identity, and every edge persists the configured service weight only
+        # as a runtime copy for round arbitration.
+        edge['accelerator_names'] = list(identity.gpu_names)
+        edge['weight'] = normalized_service_weight
+        edge['worker_projection_sha256_by_accelerator'] = None
         normalized_edges.append(edge)
+
+    def _semantic_hash(current_service_version: int | None) -> str:
+        """Hash the sole closed, static claim identity."""
+        semantic_edges = []
+        for edge in sorted(normalized_edges,
+                           key=lambda item: int(item['pool_position'])):
+            identity = parse_pool_identity(str(edge['pool_key']))
+            semantic_edges.append({
+                'pool_key': edge['pool_key'],
+                'legacy_pool_key': edge['legacy_pool_key'],
+                'pool_position': edge['pool_position'],
+                'access_context': edge['access_context'],
+                'physical_cluster_uid': edge['physical_cluster_uid'],
+                'accelerator_names': list(identity.gpu_names),
+                'gpus_per_replica': edge['gpus_per_replica'],
+                'worker_projection_sha256_by_accelerator':
+                    edge['worker_projection_sha256_by_accelerator'],
+            })
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    'protocol_version': PROTOCOL_V2,
+                    'service_name': service_name,
+                    'service_incarnation': expected_service_hash,
+                    'service_version': current_service_version,
+                    'configured_max_replicas': configured_max_replicas,
+                    'service_floor': service_floor,
+                    'service_weight': normalized_service_weight,
+                    'utilization_gate': utilization_gate,
+                    'edges': semantic_edges,
+                },
+                sort_keys=True,
+                separators=(',', ':'),
+                allow_nan=False).encode('utf-8')).hexdigest()
 
     claim_scope = None
     claim_authorization = None
     service_version = None
+    semantic_hash = _semantic_hash(service_version)
     try:
         gate = (pool_capacity_observation.PoolCapacityObservationRepository().
                 read_reconciliation_gate())
@@ -2148,10 +2227,18 @@ def replace_claim_set(
                         accelerator_names=identity.gpu_names,
                         accelerator_count=int(edge['gpus_per_replica']),
                         require_current_protocol=True))
-                edge['worker_projection_sha256_by_accelerator'] = {
-                    admission.accelerator: admission.worker_projection_sha256
+                projection_map = {
+                    admission.accelerator.casefold():
+                        admission.worker_projection_sha256
                     for admission in projected_admissions
                 }
+                if (len(projection_map) != len(projected_admissions) or
+                        set(projection_map) != set(identity.gpu_names)):
+                    raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
+                        'Sequenced worker projections do not exactly cover the '
+                        f'pool accelerators for {edge["pool_key"]!r}.')
+                edge['worker_projection_sha256_by_accelerator'] = dict(
+                    sorted(projection_map.items()))
                 claim_edges.append(
                     reserved_fill_reclaim_attestation.ReclaimClaimEdge(
                         pool_key=str(edge['pool_key']),
@@ -2159,26 +2246,11 @@ def replace_claim_set(
                         physical_cluster_uid=str(edge['physical_cluster_uid']),
                         accelerator_names=tuple(sorted(identity.gpu_names)),
                         projected_admissions=projected_admissions))
-            # The broker is the sole point that combines caller-owned pool
-            # semantics with the exact immutable version/projection authority.
-            # Hash that completed payload so either a version or one candidate
-            # projection advances the durable claim generation.
-            semantic_hash = hashlib.sha256(
-                json.dumps(
-                    {
-                        'base_semantic_hash': semantic_hash,
-                        'service_version': service_version,
-                        'worker_projection_sha256_by_pool': {
-                            str(edge['pool_key']):
-                                edge['worker_projection_sha256_by_accelerator']
-                            for edge in sorted(
-                                normalized_edges,
-                                key=lambda item: str(item['pool_key']))
-                        },
-                    },
-                    sort_keys=True,
-                    separators=(',', ':'),
-                    allow_nan=False).encode('utf-8')).hexdigest()
+            # The broker is the sole point that combines configured service
+            # policy with exact immutable version/projection authority.  The
+            # closed payload below deliberately excludes heartbeat-owned
+            # allocation inputs.
+            semantic_hash = _semantic_hash(service_version)
             claim_scope = (
                 reserved_fill_reclaim_attestation.ReclaimClaimSetScope(
                     service_name=service_name,
@@ -2712,6 +2784,7 @@ def _service_feed_payload_for_epoch(raw_payload: str | None) -> str | None:
     if not isinstance(decoded, dict):
         return raw_payload
     decoded.pop(_OBSERVED_FREE_BY_ACCELERATOR_KEY, None)
+    decoded.pop(_SPENDABLE_FREE_BY_ACCELERATOR_KEY, None)
     decoded.pop(_BROKER_SLOT_WIDTH_KEY, None)
     return json.dumps(decoded, sort_keys=True)
 
@@ -4492,6 +4565,9 @@ def _run_round_locked(
             # convergence proof. Keeping legacy rounds byte-compatible avoids
             # mixed-binary epoch churn during the feature-image rollout.
             assert pool_gpus_per_replica is not None
+            assert spendable_by_accelerator is not None
+            feed_envelope[_SPENDABLE_FREE_BY_ACCELERATOR_KEY] = dict(
+                spendable_by_accelerator)
             feed_envelope[_BROKER_SLOT_WIDTH_KEY] = pool_gpus_per_replica
     serialized_feed_by_accelerator = (json.dumps(feed_envelope, sort_keys=True)
                                       if feed_envelope is not None else None)

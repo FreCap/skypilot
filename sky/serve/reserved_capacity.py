@@ -25,7 +25,6 @@ import contextlib
 import dataclasses
 import enum
 import functools
-import hashlib
 import json
 import math
 import os
@@ -2306,12 +2305,175 @@ def _pool_round_sum_holdings(round_row: dict[str, Any] | None) -> int:
     return raw
 
 
-def _pool_capacity_hint(spec: FillPoolSpec,
-                        holdings: int,
-                        launchable: bool,
-                        previous_cap: int,
-                        now: float,
-                        round_row: dict[str, Any] | None = None) -> int:
+class _SpendableFreeState(enum.Enum):
+    """Trust state for additive protocol-v2 capacity discovery metadata."""
+
+    LEGACY = 'legacy'
+    ABSENT = 'absent'
+    MALFORMED = 'malformed'
+    VALID = 'valid'
+
+
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build a JSON object while rejecting duplicate wire keys."""
+    decoded: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in decoded:
+            raise ValueError(f'Duplicate JSON key {key!r}.')
+        decoded[key] = value
+    return decoded
+
+
+def _closed_pool_slot_counts(value: Any, spec: FillPoolSpec) -> dict[str, int]:
+    """Decode one closed exact-card slot mapping without dropping zeroes."""
+    if type(value) is not dict:
+        raise ValueError('Exact-card slot counts must be an exact object.')
+    expected_cards = {
+        accelerator.casefold() for accelerator in spec.accelerator_names
+    }
+    if not expected_cards:
+        raise ValueError('A reserved-fill pool must contain an accelerator.')
+    normalized: dict[str, int] = {}
+    for raw_card, raw_count in value.items():
+        if (type(raw_card) is not str or not raw_card or
+                type(raw_count) is not int or raw_count < 0):
+            raise ValueError('Exact-card slot counts contain a malformed '
+                             'entry.')
+        card = raw_card.casefold()
+        if card in normalized:
+            raise ValueError('Exact-card slot counts contain a case-folded '
+                             'duplicate.')
+        normalized[card] = raw_count
+    if set(normalized) != expected_cards:
+        raise ValueError('Exact-card slot counts must exactly cover the pool.')
+    return normalized
+
+
+def _sequenced_round_spendable_free(  # pylint: disable=too-many-return-statements
+    spec: FillPoolSpec,
+    round_row: dict[str, Any],
+    now: float,
+    observation_repository: (
+        pool_capacity_observation.PoolCapacityObservationRepository | None),
+) -> tuple[_SpendableFreeState, int]:
+    """Validate additive spendable slots against exact committed evidence.
+
+    Protocol-v1 and pre-sequencer protocol-v2 rows keep their historical
+    discovery behavior.  Once a round carries sequenced provenance, malformed
+    metadata cannot widen capacity and a predecessor row missing only the
+    additive key is distinguishable from an authoritative closed all-zero map.
+    """
+    protocol_version = round_row.get('protocol_version')
+    if protocol_version is None or protocol_version == (
+            reserved_capacity_broker.PROTOCOL_V1):
+        return _SpendableFreeState.LEGACY, 0
+    if (type(protocol_version) is not int or
+            protocol_version != reserved_capacity_broker.PROTOCOL_V2):
+        return _SpendableFreeState.MALFORMED, 0
+
+    provenance_names = ('observation_generation', 'observation_sequence',
+                        'observation_materialization_sequence',
+                        'observation_payload_sha256')
+    provenance_values = tuple(round_row.get(name) for name in provenance_names)
+    if all(value is None for value in provenance_values):
+        return _SpendableFreeState.LEGACY, 0
+    generation, sequence, materialization_sequence, payload_sha256 = (
+        provenance_values)
+    if (type(generation) is not int or generation <= 0 or
+            type(sequence) is not int or sequence < 0 or
+            type(materialization_sequence) is not int or
+            materialization_sequence < 0 or type(payload_sha256) is not str or
+            re.fullmatch(r'[0-9a-f]{64}', payload_sha256) is None):
+        return _SpendableFreeState.MALFORMED, 0
+
+    raw_envelope = round_row.get('feed_by_accelerator')
+    if type(raw_envelope) is not str:
+        return _SpendableFreeState.MALFORMED, 0
+    try:
+        envelope = json.loads(raw_envelope,
+                              object_pairs_hook=_strict_json_object)
+    except (TypeError, ValueError):
+        return _SpendableFreeState.MALFORMED, 0
+    if type(envelope) is not dict:
+        return _SpendableFreeState.MALFORMED, 0
+    slot_width = envelope.get(reserved_capacity_broker.BROKER_SLOT_WIDTH_KEY)
+    if (type(slot_width) is not int or slot_width <= 0 or
+            slot_width != spec.gpus_per_replica):
+        return _SpendableFreeState.MALFORMED, 0
+    try:
+        observed_slots = _closed_pool_slot_counts(
+            envelope.get(
+                reserved_capacity_broker.OBSERVED_FREE_BY_ACCELERATOR_KEY),
+            spec)
+    except ValueError:
+        return _SpendableFreeState.MALFORMED, 0
+
+    if observation_repository is None:
+        return _SpendableFreeState.MALFORMED, 0
+    try:
+        observation = observation_repository.read_exact_completed(
+            spec.pool_key, generation)
+    except Exception as error:  # pylint: disable=broad-except
+        logger.debug('Reserved-fill exact spendable observation read failed '
+                     f'closed for {spec.pool_key!r}: '
+                     f'{common_utils.format_exception(error)}')
+        return _SpendableFreeState.MALFORMED, 0
+    if (observation is None or
+            not isinstance(observation.payload,
+                           pool_capacity_observation.PoolCapacitySuccess) or
+            observation.observation_generation != generation or
+            observation.observation_sequence != sequence or
+            observation.materialization_sequence != materialization_sequence or
+            observation.payload_sha256 != payload_sha256 or
+            observation.physical_cluster_uid != spec.physical_cluster_uid):
+        return _SpendableFreeState.MALFORMED, 0
+    if not observation.is_authoritative_at(now):
+        return _SpendableFreeState.ABSENT, 0
+    try:
+        committed_slots = _closed_pool_slot_counts(
+            dict(observation.payload.slot_counts(slot_width)), spec)
+    except ValueError:
+        return _SpendableFreeState.MALFORMED, 0
+    last_observed_free = round_row.get('last_observed_free')
+    last_observed_free_ts = round_row.get('last_observed_free_ts')
+    snapshot_time = round_row.get('snapshot_time')
+    if (type(last_observed_free) is not int or last_observed_free < 0 or
+            type(last_observed_free_ts) not in (int, float) or
+            type(snapshot_time) not in (int, float)):
+        return _SpendableFreeState.MALFORMED, 0
+    observed_timestamp = float(typing.cast(int | float, last_observed_free_ts))
+    round_snapshot_time = float(typing.cast(int | float, snapshot_time))
+    if (observed_slots != committed_slots or
+            sum(observed_slots.values()) != last_observed_free or
+            observed_timestamp != observation.observed_at or
+            round_snapshot_time != observation.observed_at):
+        return _SpendableFreeState.MALFORMED, 0
+
+    spendable_key = (reserved_capacity_broker.SPENDABLE_FREE_BY_ACCELERATOR_KEY)
+    if spendable_key not in envelope:
+        return _SpendableFreeState.ABSENT, 0
+    try:
+        spendable_slots = _closed_pool_slot_counts(envelope[spendable_key],
+                                                   spec)
+    except ValueError:
+        return _SpendableFreeState.MALFORMED, 0
+    if any(spendable_slots[card] > observed_slot_count
+           for card, observed_slot_count in observed_slots.items()):
+        return _SpendableFreeState.MALFORMED, 0
+    return _SpendableFreeState.VALID, sum(spendable_slots.values())
+
+
+def _pool_capacity_hint(
+    spec: FillPoolSpec,
+    holdings: int,
+    launchable: bool,
+    previous_cap: int,
+    now: float,
+    round_row: dict[str, Any] | None = None,
+    observation_repository: (
+        pool_capacity_observation.PoolCapacityObservationRepository |
+        None) = None
+) -> int:
     """Return the bounded discovery/blackout hint for one pool edge."""
     if not launchable:
         return holdings
@@ -2321,6 +2483,21 @@ def _pool_capacity_hint(spec: FillPoolSpec,
         return holdings + 1
     observed = _fresh_round_observation(round_row, now)
     if observed is not None:
+        spendable_state, spendable_free = _sequenced_round_spendable_free(
+            spec, round_row, now, observation_repository)
+        if spendable_state == _SpendableFreeState.VALID:
+            # One round-consistent total.  The outer pool-budget allocator
+            # separately takes max(current holdings, capacity_hint), so local
+            # rows materialized after this round are never added to stale free.
+            return _pool_round_sum_holdings(round_row) + spendable_free
+        if spendable_state == _SpendableFreeState.ABSENT:
+            # A committed predecessor round lacks only the additive metadata,
+            # or its exact observation is now stale.  Carry existing authority
+            # without widening it from the old observed-free sentinel.
+            return max(holdings, previous_cap)
+        if spendable_state == _SpendableFreeState.MALFORMED:
+            # Present-but-invalid sequenced metadata is not compatibility.
+            return holdings
         # Size the hint to the WHOLE pool, not to this claimant's own corner
         # of it. Slots held by peers are reclaimable: that is precisely what
         # the weighted arbitration in compute_entitlements exists to do, and
@@ -2582,20 +2759,21 @@ def _broker_cycle_v2(
                 previous_edges.get(spec.pool_key, {}).get('effective_cap') or
                 0))
         budget_inputs.append(
-            FillPoolBudgetInput(holdings=holdings_fill,
-                                capacity_hint=_pool_capacity_hint(
-                                    spec,
-                                    holdings_fill,
-                                    launchable[spec.pool_key],
-                                    previous_cap,
-                                    now,
-                                    round_row=round_rows[spec.pool_key])))
+            FillPoolBudgetInput(
+                holdings=holdings_fill,
+                capacity_hint=_pool_capacity_hint(
+                    spec,
+                    holdings_fill,
+                    launchable[spec.pool_key],
+                    previous_cap,
+                    now,
+                    round_row=round_rows[spec.pool_key],
+                    observation_repository=(observation_repository))))
     budgets = allocate_fill_pool_budgets(
         global_budget, autoscaler.reserved_fill_floor_replicas,
         tuple(budget_inputs))
 
     edges: list[dict[str, Any]] = []
-    semantic_edges: list[dict[str, Any]] = []
     for spec, budget in zip(specs, budgets):
         holdings_fill = holdings_by_pool.get(spec.pool_key, (0, 0))[0]
         edge = {
@@ -2613,26 +2791,12 @@ def _broker_cycle_v2(
             'launchable': launchable[spec.pool_key],
         }
         edges.append(edge)
-        semantic_edges.append({
-            key: value
-            for key, value in edge.items()
-            if key not in ('holdings_fill', 'launchable')
-        })
-    semantic_payload = {
-        'protocol_version': reserved_capacity_broker.PROTOCOL_V2,
-        'global_headroom': global_headroom,
-        'utilization_ceiling': utilization_ceiling,
-        'utilization_gate': autoscaler.reserved_fill_utilization_gate,
-        'service_floor': autoscaler.reserved_fill_floor_replicas,
-        'service_weight': autoscaler.reserved_fill_weight,
-        'edges': semantic_edges,
-    }
-    semantic_hash = hashlib.sha256(
-        json.dumps(semantic_payload, sort_keys=True,
-                   separators=(',', ':')).encode('utf-8')).hexdigest()
     generation = reserved_capacity_broker.replace_claim_set(
         service_name,
-        semantic_hash=semantic_hash,
+        configured_max_replicas=autoscaler.max_replicas,
+        utilization_gate=autoscaler.reserved_fill_utilization_gate,
+        service_floor=autoscaler.reserved_fill_floor_replicas,
+        service_weight=autoscaler.reserved_fill_weight,
         global_headroom=global_headroom,
         utilization_ceiling=utilization_ceiling,
         utilization_state=utilization_state,
