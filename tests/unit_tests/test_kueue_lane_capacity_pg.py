@@ -9,11 +9,13 @@ import sqlalchemy
 from test_concurrency_autoscaler import _make_autoscaler
 from test_concurrency_autoscaler import _replica
 from test_kueue_lane_lineage_pg import _assert_retired_graph
+from test_kueue_lane_lineage_pg import _canonical_intent_key
 from test_kueue_lane_lineage_pg import (
     _configure_serve_state_for_kueue_retirement)
 from test_kueue_lane_lineage_pg import _EAST_PROJECTION
 from test_kueue_lane_lineage_pg import _identity
 from test_kueue_lane_lineage_pg import _insert_intent
+from test_kueue_lane_lineage_pg import _install_historical_v5_worker_projections
 from test_kueue_lane_lineage_pg import _install_retirable_materialized_graph
 from test_kueue_lane_lineage_pg import _materialize
 from test_kueue_lane_lineage_pg import _receipt
@@ -289,6 +291,27 @@ def test_missing_kueue_admission_is_exact_shape_unknown(
     assert projection.unknown_shapes == {('h200', 1)}
     assert not projection.unbounded_unknown
     assert inventory == ({'h200': 1}, {'h200': 0}, {'h200': 0})
+
+
+def test_historical_v5_live_intent_is_exact_shape_unknown(
+        admission_database) -> None:
+    """Fresh accounting cannot reinterpret cleanup-only v5 as admission."""
+    projection_sha256 = _install_historical_v5_worker_projections(
+        admission_database)
+    key = _canonical_intent_key(worker_projection_sha256=projection_sha256)
+    _insert_intent(admission_database,
+                   key,
+                   worker_projection_sha256=projection_sha256)
+
+    with admission_database.begin() as connection:
+        projection, inventory = _locked_projection(connection)
+
+    assert projection.demand_supply_for_intent(key) is False
+    assert projection.assigned_gpu_for_intent(key) is True
+    assert projection.unknown_intent_keys == {key}
+    assert projection.unknown_shapes == {('h200', 1)}
+    assert not projection.unbounded_unknown
+    assert inventory == ({'h200': 0}, {'h200': 0}, {'h200': 1})
 
 
 @pytest.mark.parametrize(('field', 'value'), _COPIED_ADMISSION_MUTATIONS)

@@ -409,8 +409,11 @@ def _kueue_lane_identity_from_projection(
     accelerator: str,
     accelerator_count: int,
     worker_projection_sha256: str,
+    require_current_protocol: bool = True,
 ) -> kueue_lane_lineage.KueueAdmissionIdentity | None:
     """Resolve scheduler mode and identity from one immutable projection."""
+    if type(require_current_protocol) is not bool:
+        raise TypeError('Projection protocol requirement must be boolean.')
     try:
         _, admission = (reserved_fill_projection_authority.
                         projected_admission_for_candidate(
@@ -419,7 +422,8 @@ def _kueue_lane_identity_from_projection(
                             accelerator=accelerator,
                             accelerator_count=accelerator_count,
                             expected_sha256=worker_projection_sha256,
-                            require_current_protocol=True))
+                            require_current_protocol=(
+                                require_current_protocol)))
     except (IndexError, TypeError, ValueError) as error:
         raise ZeroCostActuationConflict(
             'Durable fill intent no longer resolves its exact worker '
@@ -570,12 +574,16 @@ def _intent_from_row(
 def kueue_admission_identity_for_locked_intent_in_connection(
     connection: sqlalchemy.engine.Connection,
     intent_row: Mapping[str, Any],
+    *,
+    require_current_protocol: bool = True,
 ) -> kueue_lane_lineage.KueueAdmissionIdentity | None:
     """Resolve an already-locked intent row to its exact Kueue identity.
 
     This is the provider-free adapter used by the admission repository's
     graph validator.  It deliberately accepts the complete locked row rather
-    than independently re-reading mutable intent authority.
+    than independently re-reading mutable intent authority. Fresh admission
+    requires the current projection protocol by default; teardown may decode
+    the exact released historical projection already bound to a retained row.
     """
     _require_postgres(connection)
     if not isinstance(intent_row, Mapping):
@@ -644,7 +652,8 @@ def kueue_admission_identity_for_locked_intent_in_connection(
         kubernetes_context=kubernetes_context,
         accelerator=identity.accelerator,
         accelerator_count=accelerator_count,
-        worker_projection_sha256=projection_sha256)
+        worker_projection_sha256=projection_sha256,
+        require_current_protocol=require_current_protocol)
 
 
 def _row_matches_values(row: Mapping[str, Any], values: Mapping[str,

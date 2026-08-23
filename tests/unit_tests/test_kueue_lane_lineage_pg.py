@@ -703,11 +703,12 @@ def _install_normal_admitted_teardown_graph(
     projection_owner: str = 'manager',
     observation_sequence: int | None = None,
     ordinary_zero_cost_admission_sequence: int | None = None,
+    worker_projection_sha256: str = _PROJECTION,
 ) -> tuple[uuid.UUID, uuid.UUID, str]:
     """Run the production projector for a launch with one admitted Pod."""
     if projection_owner not in ('manager', 'service'):
         raise ValueError('projection_owner must be manager or service.')
-    identity = _identity()
+    identity = _identity(worker_projection_sha256=worker_projection_sha256)
     ordinary_high_water = (0 if ordinary_zero_cost_admission_sequence is None
                            else ordinary_zero_cost_admission_sequence)
     observation_high_water = (0 if observation_sequence is None else
@@ -715,6 +716,7 @@ def _install_normal_admitted_teardown_graph(
     _insert_intent(engine,
                    intent_key,
                    ordinal=replica_id - 1,
+                   worker_projection_sha256=worker_projection_sha256,
                    observation_sequence=observation_high_water,
                    ordinary_zero_cost_admission_sequence=ordinary_high_water)
     with engine.begin() as connection:
@@ -768,7 +770,7 @@ def _install_normal_admitted_teardown_graph(
     info.reserved_fill_reclaim_fleet_bundle_sha256 = 'b' * 64
     info.reserved_fill_reclaim_policy_revision = 'reclaim-v1'
     info.reserved_fill_reclaim_provider_inventory_sha256 = 'c' * 64
-    info.reserved_fill_worker_projection_sha256 = _PROJECTION
+    info.reserved_fill_worker_projection_sha256 = worker_projection_sha256
     info.reserved_fill_observation_generation = 1
     info.reserved_fill_observation_sequence = observation_high_water
     info.reserved_fill_intent_idempotency_key = intent_key
@@ -1055,15 +1057,50 @@ def _stamp_canonical_materialization_receipt(
                     protocol.c.zero_cost_materialization_sequence, replica_id)))
 
 
+def _install_historical_v5_worker_projections(
+        engine: sqlalchemy.engine.Engine) -> str:
+    """Install the exact projections under which a retained v5 row formed."""
+    historical_projection = dict(_WORKER_PROJECTION)
+    historical_projection['projection_version'] = 5
+    historical_east_projection = dict(_EAST_WORKER_PROJECTION)
+    historical_east_projection['projection_version'] = 5
+    projection_sha256 = kubernetes_identity.worker_projection_sha256(
+        historical_projection)
+    versions = serve_state_schema.version_specs_table
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(versions).where(
+                versions.c.service_name == _SERVICE,
+                versions.c.version == _SERVICE_VERSION).values(
+                    worker_placement_projections=[
+                        historical_projection,
+                        historical_east_projection,
+                    ]))
+    return projection_sha256
+
+
 def _configure_serve_state_for_kueue_retirement(
     monkeypatch: pytest.MonkeyPatch,
     engine: sqlalchemy.engine.Engine,
 ) -> None:
     monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
+
+    def _resolve_historical_projection(
+        _connection,
+        _intent,
+        *,
+        require_current_protocol=True,
+    ):
+        # Teardown validates the exact immutable projection which admitted the
+        # retained row.  It must decode released historical protocols instead
+        # of applying the fresh-admission current-protocol gate.
+        assert require_current_protocol is False
+        return _identity()
+
     monkeypatch.setattr(
         zero_cost_actuation,
         'kueue_admission_identity_for_locked_intent_in_connection',
-        lambda _connection, _intent: _identity())
+        _resolve_historical_projection)
 
 
 def _mark_service_shutting_down(engine: sqlalchemy.engine.Engine) -> None:
@@ -1656,12 +1693,23 @@ def test_live_east_missing_admission_fallback_is_not_applicable(
         ordinary_zero_cost_admission_sequence=0)
     _delete_kueue_admission(admission_database, key)
     _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+
     # The immutable worker projection is the scheduler authority: ``None``
     # classifies the ordinary East path, which owns no Kueue admission row.
+
+    def _resolve_historical_east(
+        _connection,
+        _intent,
+        *,
+        require_current_protocol=True,
+    ):
+        assert require_current_protocol is False
+        return None
+
     monkeypatch.setattr(
         zero_cost_actuation,
         'kueue_admission_identity_for_locked_intent_in_connection',
-        lambda _connection, _intent: None)
+        _resolve_historical_east)
     provider_probe = mock.Mock()
     monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
                         provider_probe)
@@ -1731,8 +1779,8 @@ def test_whole_service_teardown_retires_provider_absent_admissionless_graph(
                                   associations.c.association_id ==
                                   association_id)).mappings().one()
         assert evidence['provider_evidence'] == 'ABSENT'
-        assert (evidence['provider_evidence_observed_at'] >=
-                evidence['execution_quiesced_at'])
+        assert (evidence['provider_evidence_observed_at']
+                >= evidence['execution_quiesced_at'])
         assert evidence['provider_evidence_payload'] == {
             'association_id': str(association_id),
             'cluster_name': f'{_SERVICE}-1',
@@ -1775,6 +1823,72 @@ def test_whole_service_teardown_retires_provider_absent_admissionless_graph(
         assert connection.execute(
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
                 serve_state_schema.services_table)).scalar_one() == 0
+
+
+def test_historical_v5_teardown_retires_provider_absent_graph(
+        admission_database, monkeypatch) -> None:
+    """Cleanup decodes retained v5 authority without weakening fresh paths."""
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    projection_sha256 = _install_historical_v5_worker_projections(
+        admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0,
+                                worker_projection_sha256=projection_sha256)
+    record_id, association_id, _ = _install_normal_admitted_teardown_graph(
+        admission_database,
+        repository,
+        intent_key=key,
+        replica_id=1,
+        is_scale_down=False,
+        down_status=None,
+        observation_sequence=0,
+        ordinary_zero_cost_admission_sequence=0,
+        worker_projection_sha256=projection_sha256)
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _stamp_canonical_materialization_receipt(admission_database, replica_id=1)
+    _delete_kueue_admission(admission_database, key)
+    monkeypatch.setattr(serve_state._db_manager, '_engine', admission_database)
+
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    with admission_database.connect() as connection:
+        intent = connection.execute(
+            sqlalchemy.select(intents).where(
+                intents.c.intent_idempotency_key == key)).mappings().one()
+        with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict,
+                           match='no longer resolves'):
+            (zero_cost_actuation.
+             kueue_admission_identity_for_locked_intent_in_connection)(
+                 connection, intent)
+        historical_identity = (
+            zero_cost_actuation.
+            kueue_admission_identity_for_locked_intent_in_connection(
+                connection, intent, require_current_protocol=False))
+    assert historical_identity is not None
+    assert historical_identity.worker_projection_sha256 == projection_sha256
+
+    _mark_service_shutting_down(admission_database)
+    _claim_restricted_teardown_owner()
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        lambda _mode: contextlib.nullcontext())
+    monkeypatch.setattr(kubernetes_adaptor, 'physical_cluster_uid_fence',
+                        lambda *_args, **_kwargs: contextlib.nullcontext())
+    probe = mock.Mock(
+        return_value=reserved_capacity.PhysicalReplicaPresence.ABSENT)
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        probe)
+
+    assert (kueue_lane_observer.
+            project_admissionless_physical_absence_after_teardown(
+                _SERVICE, 1, record_id))
+    assert serve_state.remove_service_completely(
+        _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+    _assert_retired_graph(admission_database,
+                          intent_keys=(key,),
+                          replica_ids=(1,),
+                          association_ids=(association_id,))
 
 
 def test_admissionless_probe_and_retirement_share_exact_row_validator(
