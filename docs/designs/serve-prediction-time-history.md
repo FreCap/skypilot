@@ -8,13 +8,17 @@ replace full HTTP response-time history with customer-facing prediction time.
 Updated 2026-08-23. The reporter-minute histogram is implemented, but its
 asynchronous completion count is explicitly approximate. The PostgreSQL
 ledger, stable API ingest path, load-balancer bind/lookup/transition
-integration, and coverage-aware status/dashboard summary are implemented and
-locally qualified. They are not deployed or production proven. Adversarial
-review of the separate Boltz caller found open activation blockers: transient
-presigned URLs were included in the supposedly stable intent digest, two
-caller paths lacked durable terminal delivery, and mixed old/new callers could
-fall back to legacy replay or spill. The caller must satisfy the corrected
-contract below before activation. The
+integration, and coverage-aware status/dashboard summary are implemented,
+locally qualified, and deployed dark in SkyPilot 1.1.1460 / Helm revision 588.
+Serve058 is at the live PostgreSQL head and both load-balancer slots run the
+same immutable 1.1.1460 image. Read-only receipt probes and the fresh dashboard
+summary are production proven; a live exact asynchronous request and the
+10,000-request qualification are not. Adversarial review of the separate Boltz
+caller found that caller-maintained first-attempt and heartbeat authority was
+both more complicated and less reliable than the already-transactional server
+boundary. The corrected contract below makes the stable exact request identity
+and intent digest the retry-idempotency boundary, while requiring homogeneous
+server and platform activation and a stable service incarnation. The
 ledger is the single additive Serve058 migration directly after released
 Serve057; the unrelated draft immutable-owner cleanup and sequencing migration
 are not part of this feature.
@@ -151,7 +155,7 @@ sync upstream dispatch -> terminal upstream headers -> measured duration
 selected async route -> exact projection-fenced bind -> PostgreSQL ledger
           |                         |
           |                         +-> conservative dispatch receipt
-retry submit -> read-only current-attempt lookup -> receipt before queue/route
+same request/digest retry -> same bind -> existing receipt, no second send
 lost submit ack -> authenticated receipt lookup -> existing receipt or wait
           v
      upstream send -> accepted / ambiguous transition
@@ -205,25 +209,84 @@ conflict.
 An authenticated `POST /_lb/async-request-receipt` recovers a lost receipt
 without queueing, route selection, provider dispatch, or a ledger mutation. Its
 exact body is `ledger_protocol_version`, execution `request_id`, and
-`intent_sha256`. A found attempt returns the complete seven-field receipt plus
-the protocol and four receipt headers. An absent attempt returns 404 with only
-the protocol header and `No durable request attempt exists.`; that observation
-never authorizes replay because it can race an in-flight bind. The caller polls
-or remains ambiguous until it recovers a receipt. Only a rigorous no-send
-failure or a durable `REJECTED_PRE_DISPATCH` receipt can authorize a new send.
-An old load balancer has no dedicated route and therefore no protocol
-advertisement, which is also an ambiguous outcome rather than replay authority.
+`intent_sha256`; the expected incarnation is the required
+`X-SkyServe-Service-Incarnation` header and therefore does not add a fourth body
+field. A found attempt returns the complete seven-field receipt plus the
+protocol, incarnation, and four attempt receipt headers. An absent attempt
+returns 404 with the protocol and matching incarnation headers and `No durable
+request attempt exists.` A 404 is a
+point-in-time observation and is never standalone proof that a concurrent bind
+did not commit immediately afterward. The endpoint is therefore recovery and
+diagnostics, not dispatch authority. An old load balancer has no dedicated
+route and no protocol advertisement; allowing an exact caller to reach one is
+an activation-gate violation.
 
-The caller invokes that read-only endpoint before every dispatch POST. On the
-first attempt of a newly patched exact Temporal activity only, an advertised
-protocol-1 404 is the capability proof that permits the one initial POST. A
-found receipt recovers without a POST; no advertisement fails before any send.
-After any possible-send boundary or Temporal activity retry, a 404 is no longer
-initial-admission evidence and never permits another POST. The caller may send
-again only from a full matching durable `REJECTED_PRE_DISPATCH` receipt or from
-a rigorously classified local pre-connect/no-send result scheduled as a new
-explicit dispatch attempt. This first-attempt distinction is durable Temporal
-history, not process memory.
+The exact request identity and semantic intent digest are the retry-idempotency
+boundary. A no-dispatch prepare activity first creates one append-once,
+encrypted PostgreSQL `SkyPilotDispatchIntentV1` record keyed by the stable
+execution attempt ID. The row contains the complete canonical semantic
+projection, protocol version, stable job ID, recorded provider and service
+name, the exact SkyServe service incarnation, stable object identities, every
+dispatch-affecting wire option, and its digest; it never contains expiring
+presigned credentials or bearer tokens. Prepare requires the authenticated
+capacity response to attest the exact `(service_name, service_incarnation)`
+tuple and rejects a name different from the selected deployment. The LB echoes
+the incarnation on every protocol-1 response. Every exact POST, receipt lookup,
+and completion carries it in exactly one
+`X-SkyServe-Service-Incarnation` header; the receipt parser requires the echoed
+value to equal the prepared value, not merely to be present. The LB compares
+the request value with its immutable local service hash before
+reading or writing the ledger or selecting a route. Create is idempotent: a retry reads an existing row
+before consulting live inputs, and concurrent creators race on the unique key
+and then read the winner. Consequently mutable pipeline input, feature flags,
+provider configuration, and later code deployment cannot rewrite an already
+prepared intent. The Temporal workflow records only the bounded row reference,
+digest, provider, service name, and execution attempt ID, not the potentially
+large or sensitive model input.
+
+The separate exact-submit activity accepts that recorded handle, loads and
+decrypts the append-once projection, verifies its version and digest, and uses
+only it to build the body and sends only through the row's recorded
+`endpoint_authority`; current deployment configuration is neither a target nor
+a fallback. It may refresh transport fields explicitly excluded
+from the semantic digest, such as an expired presigned query credential for the
+same stable object identity. It must not re-read prediction, pipeline, feature-
+flag, provider, or service-selection state. Missing, changed, undecryptable, or
+digest-mismatched prepared state fails closed before any network send.
+Each load balancer checks the current attempt before queue and route selection
+and commits a projection-fenced bind before transport.
+The PostgreSQL logical-request lock serializes concurrent binders: exactly one
+fresh bind has `dispatch_authorized: true`; every concurrent or later matching
+POST receives the complete existing receipt and performs no worker send. A
+current `REJECTED_PRE_DISPATCH` receipt is the only state from which the same
+POST may append a successor transport attempt. No caller heartbeat,
+process-memory `possible_send` bit, or Temporal attempt number participates in
+that decision.
+
+The protocol-1 prepare activity, exact-submit activity, PostgreSQL record shape,
+and their dedicated projection/body builders are one frozen compatibility unit.
+They must not delegate semantic construction to mutable shared provider
+helpers. Compute API currently runs Temporal without worker versioning, so an
+activity retry may execute on a later deployment. A later binary must load the
+same prepared row and produce the same protocol-1 semantic projection and
+digest. Golden vectors cover every semantic field, all five supported caller
+paths, and the allowed refreshed transport credentials. Any future semantic
+projection change uses a new row version, newly named prepare and submit
+activities, and a workflow patch. The current and preceding two protocol
+handlers remain registered, and a handler remains longer while any workflow or
+nonterminal ledger row can still reference it. Changing V1 semantics behind
+the existing names or through a shared helper is forbidden.
+
+This simplification is valid only after both load-balancer slots are
+homogeneous Serve058 writers and old platform workers are drained or fenced
+from the newly named exact activities. A normal update preserves the service
+hash. A delete/recreate changes it, so every older prepared intent fails closed
+at the LB even if an address is accidentally reused; it cannot silently create
+a same-name attempt in the new ledger namespace. Operators still avoid
+recreation while prepared intents are open because it strands rather than
+duplicates them. A crash after bind and before worker transport deliberately remains
+`DISPATCH_MAY_HAVE_OCCURRED`; a matching retry recovers that receipt and does
+not send again. This provides at-most-once dispatch, not guaranteed execution.
 
 The load balancer keeps a bounded dictionary keyed by observation-minute epoch.
 Each value contains two fixed-length integer arrays, `succeeded` and `failed`.
@@ -332,8 +395,13 @@ the lowercase SHA-256 over UTF-8 RFC 8785/JCS bytes for this object:
 {
   "version": 1,
   "service_name": "...",
+  "service_incarnation": "...",
   "stable_job_id": "...",
   "execution_request_id": "...",
+  "http_method": "POST",
+  "request_path": "/v1/models/model:predict",
+  "priority": 0,
+  "accelerator_compatibility": ["..."],
   "payload": {},
   "results_url": "s3://...",
   "completion_marker_url": "s3://..."
@@ -341,10 +409,15 @@ the lowercase SHA-256 over UTF-8 RFC 8785/JCS bytes for this object:
 ```
 
 `payload` is the pre-encryption logical compute payload. Canonical S3 URIs are
-included; encrypted bytes, IVs, presigned HTTPS URLs/query strings, telemetry,
-priority, accelerator preference, selected route, HTTP URL, and ledger receipt
-are excluded. SkyPilot cannot decrypt or recompute this digest. The authenticated
-platform owns it and PostgreSQL enforces equality for the execution ID.
+included. The projection also includes the exact service incarnation, request
+path/method, priority, accelerator-compatibility claim, and any other header or
+option that can affect queueing, route selection, or worker behavior. Encrypted
+bytes, IVs, presigned HTTPS URLs/query strings, rotating bearer credentials,
+telemetry-only fields, the private selected route URL, and the ledger receipt
+are excluded. Those excluded transport capabilities may change only while
+remaining derivable from a frozen identity. SkyPilot cannot decrypt or
+recompute this digest. The authenticated platform owns it and PostgreSQL
+enforces equality for the execution ID.
 
 The ledger's `attempt_no` is a transport-dispatch attempt inside that one
 logical compute attempt. It advances only when the previous dispatch has an
@@ -447,6 +520,61 @@ a late-receipt grace interval. Service-hash predicates prevent same-name
 recreation leakage in current reads and writes, but do not by themselves make
 deletion safe.
 
+### Boltz prepared dispatch intent
+
+The platform database adds one PostgreSQL-only, insert/read-only table before
+exact caller activation. This is caller recovery state, distinct from the
+SkyServe receipt ledger:
+
+```text
+sky_pilot_dispatch_intent_v1
+  organization_id        text        primary key
+  workspace_id           text        primary key
+  execution_request_id   text        primary key
+  workflow_id            text        not null
+  workflow_run_id        text        not null
+  stable_job_id           text        not null
+  path_kind               text        not null
+  provider                text        not null check = 'skypilot'
+  service_name            text        not null
+  service_incarnation     uuid        not null
+  endpoint_authority      text        not null
+  projection_version      integer     not null check = 1
+  projection_sha256       text        not null
+  intent_sha256           text        not null
+  wrapped_dek             jsonb       not null
+  encrypted_projection    jsonb       not null
+  plaintext_size_bytes    integer     not null check between 1 and 1048576
+  created_at              timestamptz not null
+```
+
+The ownership tuple is the tenant scope plus execution request ID. Text fields
+use the same explicit UTF-8 and length bounds as their corresponding workflow
+and SkyServe headers; both digests are lowercase 64-character SHA-256. The
+projection is JCS-canonical before hashing, LZ4-compressed when useful, and
+sealed with the platform payload codec's versioned AES-256-GCM envelope. The
+same PostgreSQL row stores the dedicated random DEK wrapped under a KEK derived
+from the retained platform `SECRET_KEY` and its recorded `KEK_VERSION`; no S3,
+EFS, PVC, or process cache is needed to recover the key. The base secret and
+every historical KEK version remain available for the full row lifetime. Key
+loss, authentication failure, unknown envelope/version, tenant
+mismatch, oversized plaintext, or digest mismatch is a permanent fail-closed
+error before receipt lookup or network send. No raw secret, bearer token,
+presigned query credential, or EFS path is stored.
+
+Database constraints and a trigger reject every `UPDATE` and `DELETE`; the
+application exposes only create-if-absent and scoped read operations. An insert
+loser reads, decrypts, and validates the winning row rather than trusting
+`skipDuplicates` or rebuilding from current inputs. The initial implementation
+has no garbage collector and never shreds its dedicated key, so a lost prepare
+acknowledgement cannot outlive its retry authority and recreate mutable state.
+A future retention design requires a separate reviewed migration proving the
+owning Temporal workflow is durably closed, every SkyServe receipt is terminal,
+the complete workflow-history/retry retention plus late-delivery horizon has
+elapsed, and deletion cannot authorize a new attempt. A mutable `closed_at`
+field is intentionally absent from the frozen row; lifecycle indexing, if
+needed later, belongs in a separately fenced table.
+
 ## Controller compatibility
 
 During a mixed rollout, new controllers accept both the legacy
@@ -477,14 +605,15 @@ Protocol negotiation is explicit in both directions:
 
 - old caller to new server: absent request opt-in headers select the unchanged
   legacy path during the dark server-first rollout;
-- new exact caller to old server: a response without protocol advertisement
-  fails during the read-only preflight before any dispatch POST. A bare legacy
-  response never authorizes acknowledgement, replay, or provider spill. The exact caller is
-  activated only after both live load-balancer slots advertise protocol 1;
+- new exact caller to a pre-Serve058 server is intentionally unsupported: that
+  server cannot reject the new headers before forwarding the body. The exact
+  caller is therefore activated only after both live load-balancer slots are
+  proven to run the same Serve058+ image, and activation is fix-forward;
 - new caller to new server: once the server advertises protocol 1, every exact
   response must carry the same protocol advertisement plus attempt UUID,
   attempt number, revision, and state; a missing or malformed receipt fails
-  closed;
+  closed and the same exact request is recovered or retried without changing
+  provider, request identity, body semantics, or service incarnation;
 - mixed API/controller/LB Pods: an LB does not accept protocol-1 requests until
   its controller sync advertises schema-backed protocol 1.
 
@@ -500,11 +629,15 @@ The existing worker may return any 2xx acknowledgement, including the live HTTP
 
 The execution ID and intent are retry-stable application identities. The intent
 digest covers a documented JCS semantic projection: model inputs, options,
-stable object identities, and the execution request ID. It excludes expiring
-transport credentials such as presigned URL query parameters. The actual
-canonical request body may therefore contain refreshed credentials on a
-Temporal activity retry, but receipt recovery occurs before any second provider
-send. A semantic change requires a new execution ID and digest.
+stable object identities, all dispatch-affecting feature decisions, the
+recorded provider and service name, and the execution request ID. It excludes
+expiring transport credentials such as presigned URL query parameters. The
+actual canonical request body may therefore contain refreshed credentials on a
+Temporal activity retry only when those refreshed fields are derived from the
+frozen object identity and remain outside the semantic digest. The caller
+repeats the same exact POST contract; the PostgreSQL bind decides whether it
+may dispatch or must return the existing receipt. A semantic change requires a
+new execution ID, prepared-intent row, protocol version, and digest.
 
 Once the Boltz SkyPilot provider is activated in exact mode, its execution
 identity is mandatory and the legacy 429/503 spill branch is removed for that
@@ -513,11 +646,14 @@ paid fallback. The selected provider is also stable across Temporal activity
 retries: an execution carrying a SkyPilot exact identity remains restricted to
 SkyPilot even if live warm/load signals would reorder Baseten or another
 provider on the retry. Only SkyPilot's reserved-first, Spot-only residual
-policy may add paid capacity for that execution. Platform workers must be homogeneously exact-capable (or fenced
-from new work) before activation. Existing Temporal histories use a patched
-legacy branch or a new activity name so replay does not change recorded command
-arguments. Activation is fix-forward; an old caller binary is not a safe
-rollback after exact work has been accepted.
+policy may add paid capacity for that execution. Platform workers must be
+homogeneously exact-capable (or fenced from new work) before activation. The
+workflow records the provider choice before selecting the newly named exact
+activity; Baseten and other providers retain their existing activity and
+cancellation behavior. Existing Temporal histories remain on their recorded
+legacy activity, so replay does not change command arguments. Activation is
+fix-forward; an old caller binary is not a safe rollback after exact work has
+been accepted.
 
 A completion-marker polling timeout is not permission to resubmit and is not
 allowed to abandon an `ACCEPTED` ledger row. The workflow retains the same
@@ -548,7 +684,9 @@ with `allow_new_attempt: true`; only that second operation may create a new
 dispatch attempt. `DISPATCH_MAY_HAVE_OCCURRED`, `ACCEPTED`, `AMBIGUOUS`, and
 terminal receipts never authorize another provider send. Service-hash isolation
 keeps late writes from an older incarnation fenced if the service is ever
-explicitly recreated, but recreation is not part of this rollout.
+explicitly recreated. The operator must not recreate the service while exact
+rows are nonterminal, because the new incarnation cannot recover the old
+namespace and repeating application work against it could dispatch again.
 
 ## API and dashboard
 
@@ -621,6 +759,17 @@ ledger migration has no garbage collector; retained old incarnations continue to
 request-rate-scaled storage until a separately designed guarded maintenance
 migration is implemented.
 
+The Boltz caller additionally retains one encrypted prepared projection per
+logical execution. The plaintext ceiling is 1 MiB, so the deliberately
+conservative upper bound for the 10,000-request qualification is approximately
+10 GiB plus JSON/encryption/index overhead; LZ4 makes the expected scientific
+payload footprint materially smaller but is not used for capacity planning.
+This is the explicit cost of making mutable pipeline state retry-stable without
+placing sensitive bodies in Temporal history. Initial retention is indefinite
+and PostgreSQL-authoritative. The small versioned wrapped DEK lives in the same
+row; no EFS/PVC, S3 object, or process-local cache participates in prepared-
+intent recovery.
+
 ## Alternatives considered
 
 Keeping full HTTP latency was rejected because it answers a different product
@@ -668,16 +817,35 @@ a migration ceiling, introduce EFS, or require a separate activation restart.
 3. Prove both load-balancer slots, the API server, controllers, executors,
    ordinary traffic, reserved-fill placement, and dashboard history stay
    healthy. Verify the service and existing compatible replicas were retained.
-4. Deploy the boltz-platform caller that emits the canonical request body,
-   retry-stable semantic intent digest, and protocol request headers, validates
-   the full response receipt, persists the fence, recovers a lost receipt
+4. Build and qualify the boltz-platform caller that emits the canonical request body,
+   retry-stable semantic intent digest, and protocol request headers. Before
+   possible send, its no-dispatch prepare activity atomically creates or reads
+   the encrypted, append-once PostgreSQL V1 intent and returns the bounded
+   handle recorded in workflow history. Prepare requires the authenticated
+   capacity response's exact service-name/incarnation tuple; every later exact
+   operation presents the expected incarnation header, requires the echoed
+   value, targets only the recorded endpoint authority, and refuses a
+   recreated or wrong-name service. Its dedicated V1 submit activity loads
+   only that row, validates the full response receipt, persists the fence,
+   recovers a lost receipt
    through the read-only authenticated endpoint, and includes it in the
-   existing completion callback. Every compute-api path retains and retries
-   terminal delivery until PostgreSQL acknowledges the exact transition;
+   existing completion callback. Automatic retries repeat the same exact
+   request identity and intent and rely on the PostgreSQL bind—not Temporal
+   attempt or heartbeat state—to prevent another worker send. Every compute-api
+   path retains and retries terminal delivery until PostgreSQL acknowledges the exact transition;
    terminalization is not a three-attempt best-effort side effect. The backend
    TIO router rejects SkyPilot and contains no copy of this protocol. Fence or
-   drain old platform workers before routing new work through exact mode.
-5. Ramp from a bounded smoke to the 10,000-request qualification. Fix forward
+   drain old platform workers before routing new work through exact mode, and
+   record the SkyPilot provider choice before selecting the new exact activity.
+5. Activate the test compute-api cohort without a mixed-worker interval. The
+   current Temporal deployment has no worker versioning and uses one task
+   queue, so first scale its workers to zero and wait for every old Pod to
+   terminate, then deploy and start only the qualified image. Existing workflow
+   histories retain their patched legacy branch; only workflows first executed
+   by the new homogeneous cohort select the newly named exact activity. This is
+   a one-time bounded test outage, not a Terraform, Kueue, or shared scheduler
+   change.
+6. Ramp from a bounded smoke to the 10,000-request qualification. Fix forward
    if a defect appears; do not drop Serve058 tables or roll an old writer across
    the committed schema.
 
@@ -686,20 +854,22 @@ to omit opt-in headers. After caller activation, rollback to an old caller is
 unsafe because it can replay after a lost acknowledgement and cannot complete
 exact rows. Fix forward instead. Already-bound exact attempts remain in
 PostgreSQL and their owning workflows retry exact completion until acknowledged;
-the durable tables are never deleted.
+the durable tables are never deleted. Do not roll a pre-Serve058 load balancer
+into the service or recreate the service while any exact request is nonterminal.
 
-A submission first performs a read-only current-attempt bind lookup before
-queueing or route selection. A valid 409 receipt is a protocol response, not a
-generic failure: ACCEPTED or terminal means the outcome was recovered;
-DISPATCH_MAY_HAVE_OCCURRED or AMBIGUOUS requires reconciliation and never
-retry; only REJECTED_PRE_DISPATCH permits a new selected-route bind. Every exact
-response includes the protocol advertisement plus attempt UUID, attempt number,
-revision, and state. After bind, the LB forwards only the nonsecret attempt UUID,
-attempt number, and revision needed to correlate the selected worker path. A
-later terminal reporter presents the request ID, intent digest, attempt UUID,
-attempt number, and last observed revision; the LB reads the current receipt
-before committing the terminal transition, so a revision-1 dispatch response is
-not stranded after the LB commits ACCEPTED revision 2.
+Each exact submission enters the same server bind path. Its initial read-only
+lookup happens inside the load balancer before queueing or route selection. A
+valid 409 receipt is a protocol response, not a generic failure: ACCEPTED or
+terminal means the outcome was recovered; DISPATCH_MAY_HAVE_OCCURRED or
+AMBIGUOUS remains unresolved and never dispatches again; only
+REJECTED_PRE_DISPATCH permits a new selected-route bind. Every exact response
+includes the protocol advertisement plus attempt UUID, attempt number,
+revision, and state. After bind, the LB forwards only the nonsecret attempt
+UUID, attempt number, and revision needed to correlate the selected worker
+path. A later terminal reporter presents the request ID, intent digest, attempt
+UUID, attempt number, and last observed revision; the LB reads the current
+receipt before committing the terminal transition, so a revision-1 dispatch
+response is not stranded after the LB commits ACCEPTED revision 2.
 
 The exact coverage gate remains independent from protocol activation. Until the
 entire producer cohort is proven, the dashboard labels ledger counts partial and
@@ -711,8 +881,9 @@ writers and both LB slots, one synchronous sample, one exact asynchronous
 terminal sample over the live HTTP-200 async acknowledgement path, duplicate
 terminal delivery producing one completion, PostgreSQL/API/UI agreement, and
 the 10,000-request qualification. The load test must show that only durable
-pre-dispatch rejections are resubmitted and accepted/ambiguous work is never
-replayed. Reserved-capacity qualification separately proves every configured
+pre-dispatch rejections produce a successor dispatch attempt; repeated exact
+POSTs for accepted/ambiguous work recover the receipt and never reach a worker
+again. Reserved-capacity qualification separately proves every configured
 card and location is selectable and every GPU on wider replicas performs work;
 the request ledger does not manufacture that evidence.
 
@@ -750,7 +921,7 @@ the request ledger does not manufacture that evidence.
 - Prove the bounded data-plane receipt lookup is authenticated and read-only,
   returns a full validated receipt when found, advertises an exact 404 without
   receipt headers when absent, rejects malformed and duplicate-key bodies, and
-  never treats new-server 404 or old-server no-advertisement as replay
+  never treats a 404 or old-server no-advertisement as standalone replay
   authority.
 - Prove stable job ID and execution request ID are independent, the execution
   header exactly matches canonical duplicate-free `async_predict` JSON, and
@@ -776,22 +947,51 @@ the request ledger does not manufacture that evidence.
   coverage preserves legacy live request telemetry and labels exact subset
   counts rather than replacing them with zero.
 - Rehearse the additive dark Helm rollout from schema057: prove one migration,
-  schema-backed advertisement, old-caller legacy behavior, new-caller/old-server
-  fail-closed behavior without replay or spill, new-caller/new-server exact receipts, retained service
-  identity and replicas, and late old-hash rejection. No precursor ceiling,
+  schema-backed advertisement, old-caller legacy behavior, homogeneous
+  Serve058 load-balancer and platform-worker activation gates,
+  new-caller/new-server exact receipts, retained service identity and replicas,
+  and late old-hash rejection. Prove the gate refuses activation when any old
+  load-balancer slot or old exact-activity worker remains. No precursor ceiling,
   owner-cleanup migration, EFS, or second activation deployment participates.
 - Run focused Serve and PostgreSQL tests, dashboard tests and production build,
   formatter and type checks, and the complete visible PR CI rollup.
 - In boltz-platform, test recursively canonical request bytes and the stable
   semantic intent digest across refreshed presigned URLs, HTTP 200
-  `IN_PROGRESS` acceptance, complete receipt parsing, old-server bare 2xx
-  failing closed, a replay-authorizing `REJECTED_PRE_DISPATCH` requiring a
-  matching full body and non-2xx response, malformed receipts failing closed,
-  lost-ack receipt recovery without replay, first-attempt advertised 404
-  permitting exactly one initial POST, retry-attempt 404 remaining ambiguous,
-  mandatory exact identity with no legacy spill, provider pinning when live
-  dispatch signals change across an activity retry, successful and failed durable
-  completion from every caller path, Temporal history replay compatibility,
+  `IN_PROGRESS` acceptance, complete receipt parsing, a replay-authorizing
+  `REJECTED_PRE_DISPATCH` requiring a matching full body and non-2xx response,
+  malformed receipts failing closed, and lost-ack recovery by retrying the same
+  request identity and intent. Race concurrent matching POSTs and prove exactly
+  one gets dispatch authority; lose the first response and prove an automatic
+  activity retry recovers the same receipt without another worker send. Exercise a
+  bind-before-send crash and preserve its unresolved fail-closed receipt.
+  Mutate pipeline input, feature flags, live provider order, and the configured
+  service name after prepare and before an activity retry; prove the retry
+  loads the same encrypted append-once V1 projection and sends the same intent
+  to the recorded service. Crash prepare after its PostgreSQL insert but before
+  its Temporal result and prove the retry recovers that row rather than
+  rebuilding from live state. Corrupt, delete, or digest-mismatch the prepared
+  row and prove exact submit fails before a receipt lookup or network send.
+  Recreate a same-name service after prepare, including a test that reuses the
+  old endpoint authority, and prove its different incarnation rejects POST,
+  lookup, and completion before ledger access or route selection. A normal
+  policy update must retain the incarnation and continue successfully.
+  Point the selected deployment at a different service's healthy LB and prove
+  prepare rejects the capacity response's service-name mismatch. Change live
+  endpoint configuration after prepare and prove submit still targets only the
+  recorded authority and never falls back.
+  Prove activation is refused for a mixed old LB slot, an old platform worker,
+  or a pending service recreation; mandatory exact identity never regains
+  legacy spill. Re-run a protocol-1 activity retry on a newer worker binary and
+  prove its golden semantic projection and digest remain unchanged; prove a
+  semantic change requires a new activity name while the old handler remains
+  registered. Rehearse the test-worker scale-to-zero activation and prove no
+  old and new worker Pods overlap. Prove provider pinning when live dispatch
+  signals change across an activity retry and for every supported
+  accelerator-backed SkyPilot route, with no L4-only exact-mode assumption.
+  Test successful and failed durable
+  completion from every caller path, golden vectors for each V1 projection,
+  Temporal history replay compatibility across the current and preceding two
+  registered protocol handlers,
   provider routing to the recorded SkyServe service, and indefinite
   at-least-once terminal delivery across an unavailable load balancer. Exercise
   a committed completion whose response headers are lost or mismatched and
