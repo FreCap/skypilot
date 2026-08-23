@@ -2,6 +2,7 @@
 # pylint: disable=protected-access
 
 import asyncio
+import json
 from typing import List, Optional, Tuple
 from unittest import mock
 
@@ -16,6 +17,12 @@ from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve.server import controller_proxy
 from sky.server import server
+
+
+@pytest.fixture(autouse=True)
+def _installed_async_ledger_schema(monkeypatch):
+    monkeypatch.setattr(controller_proxy.async_request_ledger,
+                        'schema_available', lambda: True)
 
 
 def _request(path: str,
@@ -110,6 +117,11 @@ def _patch_owner_reads(monkeypatch, owners: List[Optional[Tuple[str, int, str,
     monkeypatch.setattr(controller_proxy, '_read_controller_owner', read_owner)
 
 
+def _install_async_ledger_schema(monkeypatch) -> None:
+    monkeypatch.setattr(controller_proxy.async_request_ledger,
+                        'schema_available', lambda: True)
+
+
 def _owner(controller_pid=1234,
            controller_ip='10.2.3.4',
            controller_port=20001,
@@ -161,6 +173,7 @@ def test_proxy_forwards_raw_body_once_and_preserves_response(monkeypatch):
 
 
 def test_projected_sync_terminates_at_api_server(monkeypatch):
+    _install_async_ledger_schema(monkeypatch)
     response_body = {
         'replica_info': {},
         'route_projection_generation': 9,
@@ -187,9 +200,37 @@ def test_projected_sync_terminates_at_api_server(monkeypatch):
     assert response.body == (
         b'{"replica_info":{},"route_projection_generation":9,'
         b'"route_projection_sha256":"' + b'a' * 64 +
-        b'","route_source_epoch":2}')
+        b'","route_source_epoch":2,'
+        b'"async_request_ledger_protocol_version":1}')
     resolve.assert_called_once_with('svc', 'service-incarnation-a', 'pod-a')
     owner_read.assert_not_awaited()
+
+
+def test_projected_sync_does_not_advertise_protocol_without_schema(monkeypatch):
+    monkeypatch.setattr(controller_proxy.async_request_ledger,
+                        'schema_available', lambda: False)
+    response_body = {
+        'replica_info': {},
+        # Prove a stale repository field is removed as well as omitted.
+        'async_request_ledger_protocol_version': 1,
+    }
+    repository = mock.Mock(resolve_sync=mock.Mock(
+        return_value=(route_projection.RouteSyncDecision(
+            mode=route_projection.RouteSourceMode.DURABLE_PROJECTED,
+            response=response_body))))
+    monkeypatch.setattr(controller_proxy.route_projection,
+                        'RouteProjectionRepository',
+                        mock.Mock(return_value=repository))
+
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_sync(
+            'svc',
+            _request('/api/internal/serve/svc/controller/load_balancer_sync',
+                     body=b'{"lb_session_id":"pod-a"}')))
+
+    assert response.status_code == 200
+    assert 'async_request_ledger_protocol_version' not in json.loads(
+        response.body)
 
 
 def test_projected_sync_unavailable_never_falls_back_to_controller(monkeypatch):
@@ -247,6 +288,221 @@ def test_demand_report_rejects_oversize_body_before_ingestion(monkeypatch):
 
     assert response.status_code == 413
     ingest.assert_not_called()
+
+
+def test_async_ledger_route_terminates_at_api_server(monkeypatch):
+    _install_async_ledger_schema(monkeypatch)
+    receipt = controller_proxy.async_request_ledger.AsyncRequestReceipt(
+        request_key_sha256='b' * 64,
+        attempt_id='11111111-1111-4111-8111-111111111111',
+        attempt_no=1,
+        state='DISPATCH_MAY_HAVE_OCCURRED',
+        revision=1,
+        duplicate=False,
+        dispatch_authorized=True)
+    repository = mock.Mock()
+    repository.bind.return_value = receipt
+    monkeypatch.setattr(controller_proxy.async_request_ledger,
+                        'AsyncRequestLedgerRepository',
+                        mock.Mock(return_value=repository))
+    payload = {
+        'protocol_version': 1,
+        'operation': 'bind',
+        'request_id': 'request-1',
+        'intent_sha256': 'a' * 64,
+        'route_contract_service_version': 1,
+        'route_projection_generation': 2,
+        'route_projection_sha256': 'c' * 64,
+        'route_source_epoch': 3,
+        'selected_route_url': 'http://10.0.0.1:8080',
+        'allow_new_attempt': True,
+    }
+    body = json.dumps(payload).encode()
+
+    response = asyncio.run(
+        controller_proxy.record_async_request_ledger(
+            'svc',
+            _request('/api/internal/serve/svc/async-request-ledger',
+                     body=body)))
+
+    assert response.status_code == 200
+    assert b'"dispatch_authorized":true' in response.body
+    expected_bind = dict(payload)
+    expected_bind.pop('operation')
+    repository.bind.assert_called_once_with('svc', 'service-incarnation-a',
+                                            expected_bind)
+
+
+def test_async_ledger_route_rejects_oversize_before_repository(monkeypatch):
+    _install_async_ledger_schema(monkeypatch)
+    repository_factory = mock.Mock()
+    monkeypatch.setattr(controller_proxy.async_request_ledger,
+                        'AsyncRequestLedgerRepository', repository_factory)
+
+    response = asyncio.run(
+        controller_proxy.record_async_request_ledger(
+            'svc',
+            _request('/api/internal/serve/svc/async-request-ledger',
+                     body=b'x' *
+                     (constants.LB_ASYNC_REQUEST_LEDGER_MAX_BYTES + 1))))
+
+    assert response.status_code == 413
+    repository_factory.assert_not_called()
+
+
+def test_async_ledger_route_never_touches_tables_before_schema(monkeypatch):
+    _install_async_ledger_schema(monkeypatch)
+    monkeypatch.setattr(controller_proxy.async_request_ledger,
+                        'schema_available', lambda: False)
+    repository_factory = mock.Mock()
+    monkeypatch.setattr(controller_proxy.async_request_ledger,
+                        'AsyncRequestLedgerRepository', repository_factory)
+
+    response = asyncio.run(
+        controller_proxy.record_async_request_ledger(
+            'svc',
+            _request('/api/internal/serve/svc/async-request-ledger',
+                     body=json.dumps({
+                         'protocol_version': 1,
+                         'operation': 'accepted',
+                     }).encode())))
+
+    assert response.status_code == 503
+    assert json.loads(response.body)['detail'] == (
+        'Async request ledger schema is unavailable.')
+    repository_factory.assert_not_called()
+
+
+def test_async_ledger_route_transitions_existing_attempt(monkeypatch):
+    receipt = controller_proxy.async_request_ledger.AsyncRequestReceipt(
+        request_key_sha256='b' * 64,
+        attempt_id='11111111-1111-4111-8111-111111111111',
+        attempt_no=1,
+        state='ACCEPTED',
+        revision=2,
+        duplicate=False,
+        dispatch_authorized=False)
+    repository = mock.Mock()
+    repository.transition.return_value = receipt
+    monkeypatch.setattr(controller_proxy.async_request_ledger,
+                        'AsyncRequestLedgerRepository',
+                        mock.Mock(return_value=repository))
+    payload = {
+        'protocol_version': 1,
+        'operation': 'accepted',
+        'request_id': 'request-1',
+        'intent_sha256': 'a' * 64,
+        'attempt_id': receipt.attempt_id,
+        'attempt_no': receipt.attempt_no,
+        'expected_revision': 1,
+    }
+
+    response = asyncio.run(
+        controller_proxy.record_async_request_ledger(
+            'svc',
+            _request('/api/internal/serve/svc/async-request-ledger',
+                     body=json.dumps(payload).encode())))
+
+    assert response.status_code == 200
+    assert json.loads(response.body)['state'] == 'ACCEPTED'
+    repository.transition.assert_called_once_with('svc',
+                                                  'service-incarnation-a',
+                                                  payload)
+
+
+def test_async_ledger_bind_can_be_read_only(monkeypatch):
+    receipt = controller_proxy.async_request_ledger.AsyncRequestReceipt(
+        request_key_sha256='b' * 64,
+        attempt_id='11111111-1111-4111-8111-111111111111',
+        attempt_no=1,
+        state='ACCEPTED',
+        revision=2,
+        duplicate=True,
+        dispatch_authorized=False)
+    repository = mock.Mock()
+    repository.lookup_current.return_value = receipt
+    monkeypatch.setattr(controller_proxy.async_request_ledger,
+                        'AsyncRequestLedgerRepository',
+                        mock.Mock(return_value=repository))
+    payload = {
+        'protocol_version': 1,
+        'operation': 'bind',
+        'request_id': 'request-1',
+        'intent_sha256': 'a' * 64,
+        'allow_new_attempt': False,
+    }
+
+    response = asyncio.run(
+        controller_proxy.record_async_request_ledger(
+            'svc',
+            _request('/api/internal/serve/svc/async-request-ledger',
+                     body=json.dumps(payload).encode())))
+
+    assert response.status_code == 200
+    lookup_payload = dict(payload)
+    lookup_payload.pop('operation')
+    repository.lookup_current.assert_called_once_with('svc',
+                                                      'service-incarnation-a',
+                                                      lookup_payload)
+    repository.bind.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ('error', 'expected_status'),
+    [(controller_proxy.async_request_ledger.AsyncRequestLedgerConflict(
+        'conflict'), 409),
+     (controller_proxy.async_request_ledger.AsyncRequestLedgerError('invalid'),
+      400),
+     (controller_proxy.async_request_ledger.AsyncRequestLedgerUnavailable(
+         'unavailable'), 503)])
+def test_async_ledger_route_preserves_domain_error_status(
+        monkeypatch, error, expected_status):
+    _install_async_ledger_schema(monkeypatch)
+    repository = mock.Mock()
+    repository.bind.side_effect = error
+    monkeypatch.setattr(controller_proxy.async_request_ledger,
+                        'AsyncRequestLedgerRepository',
+                        mock.Mock(return_value=repository))
+    payload = {
+        'protocol_version': 1,
+        'operation': 'bind',
+        'request_id': 'request-1',
+        'intent_sha256': 'a' * 64,
+        'route_contract_service_version': 1,
+        'route_projection_generation': 2,
+        'route_projection_sha256': 'c' * 64,
+        'route_source_epoch': 3,
+        'selected_route_url': 'http://10.0.0.1:8080',
+        'allow_new_attempt': True,
+    }
+
+    response = asyncio.run(
+        controller_proxy.record_async_request_ledger(
+            'svc',
+            _request('/api/internal/serve/svc/async-request-ledger',
+                     body=json.dumps(payload).encode())))
+
+    assert response.status_code == expected_status
+    assert json.loads(response.body)['detail'] == str(error)
+
+
+def test_async_ledger_route_keeps_json_errors_separate_from_validation(
+        monkeypatch):
+    _install_async_ledger_schema(monkeypatch)
+    repository_factory = mock.Mock()
+    monkeypatch.setattr(controller_proxy.async_request_ledger,
+                        'AsyncRequestLedgerRepository', repository_factory)
+
+    response = asyncio.run(
+        controller_proxy.record_async_request_ledger(
+            'svc',
+            _request('/api/internal/serve/svc/async-request-ledger',
+                     body=b'{not-json')))
+
+    assert response.status_code == 400
+    assert json.loads(
+        response.body)['detail'] == ('Ledger request must be valid JSON.')
+    repository_factory.assert_not_called()
 
 
 def test_proxy_forwards_history_only_sync_to_distinct_controller_path(
@@ -507,12 +763,14 @@ def test_proxy_connection_failure_is_503_without_retry(monkeypatch):
     ('/api/internal/serve/svc/controller/'
      'load_balancer_request_history_sync', True),
     ('/api/internal/serve/svc/demand', True),
+    ('/api/internal/serve/svc/async-request-ledger', True),
     ('/api/internal/serve//controller/load_balancer_sync', False),
     ('/api/internal/serve//controller/'
      'load_balancer_request_history_sync', False),
     ('/api/internal/serve//controller/load_balancer_role', False),
     ('/api/internal/serve//controller/system_recovery_route_lease', False),
     ('/api/internal/serve//demand', False),
+    ('/api/internal/serve//async-request-ledger', False),
     ('/api/internal/serve/a/b/controller/load_balancer_sync', False),
     ('/api/internal/serve/svc/controller/load_balancer_sync/more', False),
     ('/api/internal/serve/svc/controller/update_service', False),
@@ -533,6 +791,8 @@ def test_internal_route_is_hidden_from_openapi():
     assert (controller_proxy.CONTROLLER_HISTORY_SYNC_ROUTE_PATH
             not in app.openapi()['paths'])
     assert controller_proxy.DEMAND_REPORT_ROUTE_PATH not in app.openapi(
+    )['paths']
+    assert controller_proxy.ASYNC_REQUEST_LEDGER_ROUTE_PATH not in app.openapi(
     )['paths']
 
 
@@ -568,6 +828,51 @@ def test_api_server_demand_route_uses_sync_auth(monkeypatch):
     assert response.json()['generation'] == 7
     ingest.assert_called_once_with('svc', 'service-incarnation-a',
                                    {'sequence': 1})
+
+
+def test_api_server_async_ledger_route_uses_sync_auth(monkeypatch):
+    _install_async_ledger_schema(monkeypatch)
+    monkeypatch.setattr(server.serve_utils,
+                        'get_lb_sync_auth_tokens',
+                        lambda required=False: ('sync-token',))
+    receipt = controller_proxy.async_request_ledger.AsyncRequestReceipt(
+        request_key_sha256='b' * 64,
+        attempt_id='11111111-1111-4111-8111-111111111111',
+        attempt_no=1,
+        state='REJECTED_PRE_DISPATCH',
+        revision=1,
+        duplicate=False,
+        dispatch_authorized=False)
+    repository = mock.Mock()
+    repository.reject_before_dispatch.return_value = receipt
+    repository_factory = mock.Mock(return_value=repository)
+    monkeypatch.setattr(controller_proxy.async_request_ledger,
+                        'AsyncRequestLedgerRepository', repository_factory)
+    path = '/api/internal/serve/svc/async-request-ledger'
+    payload = {
+        'protocol_version': 1,
+        'operation': 'reject_before_dispatch',
+        'request_id': 'request-1',
+        'intent_sha256': 'a' * 64,
+    }
+    client = testclient.TestClient(server.app)
+
+    rejected = client.post(path,
+                           headers={'Authorization': 'Bearer wrong'},
+                           json=payload)
+    assert rejected.status_code == 401
+    repository_factory.assert_not_called()
+
+    response = client.post(
+        path,
+        headers={
+            'Authorization': 'Bearer sync-token',
+            constants.SERVICE_HASH_HEADER: 'service-incarnation-a',
+        },
+        json=payload)
+    assert response.status_code == 200
+    repository.reject_before_dispatch.assert_called_once_with(
+        'svc', 'service-incarnation-a', 'request-1', 'a' * 64)
 
 
 def test_api_server_route_authenticates_and_proxies(monkeypatch):

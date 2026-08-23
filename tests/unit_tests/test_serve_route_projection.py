@@ -7,6 +7,8 @@ import json
 import types
 import uuid
 
+import pytest
+
 from sky.serve import constants
 from sky.serve import route_projection
 from sky.serve import serve_state
@@ -105,11 +107,32 @@ def test_builds_existing_full_response_with_private_exact_identity():
     assert result.identities[material.url] == {
         'replica_id': 1,
         'replica_record_id': info.replica_record_id,
+        'service_version': 1,
         'gpu_type': 'L4',
         'gpu_count': 1,
         'advertised': True,
         'alias_expires_at': None,
     }
+
+
+def test_legacy_identity_is_readable_but_cannot_be_republished():
+    legacy_identity = {
+        'http://10.0.0.1:8000': {
+            'replica_id': 1,
+            'replica_record_id': str(uuid.uuid4()),
+            'gpu_type': 'L4',
+            'gpu_count': 1,
+            'advertised': True,
+            'alias_expires_at': None,
+        }
+    }
+
+    assert route_projection._validate_identities(
+        legacy_identity) == legacy_identity
+    with pytest.raises(route_projection.RouteProjectionValidationError,
+                       match='invalid shape'):
+        route_projection._validate_identities(legacy_identity,
+                                              require_service_version=True)
 
 
 def test_unresolved_verified_ready_preserves_spurious_empty_signal():

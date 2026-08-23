@@ -157,6 +157,7 @@ def _identity_payload(record_id, url='http://10.0.0.1:8000'):
         url: {
             'replica_id': 1,
             'replica_record_id': record_id,
+            'service_version': 1,
             'gpu_type': 'L4',
             'gpu_count': 1,
             'advertised': True,

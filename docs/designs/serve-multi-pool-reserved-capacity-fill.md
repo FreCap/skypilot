@@ -1,6 +1,6 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-23 19:40 UTC
+Last updated: 2026-08-23 22:15 UTC
 
 Status: **reserved-capacity convergence is production-complete; request-level
 qualification remains open.** PR #1686 merged and release `1.1.1456` proved
@@ -14,13 +14,19 @@ and chart digest
 All seven control-plane Pods are Ready with zero restarts. Lifecycle 96/version
 1 remained unchanged through both fix-forward deployments.
 
-The final PostgreSQL census is 372 `READY` and four `PENDING`, with zero paid
-claims and zero Spot replicas. East has all 328 of 328 GPUs assigned: 154 to
-the fleet and 174 to research. PHX has 508 of 512 GPUs running: 218 fleet and
-290 research. SkyPilot has already submitted four additional fill Workloads;
-they are waiting because unchanged Kueue topology reports 64 total nodes with
-six excluded for CPU and 58 excluded for GPU, so the four raw GPU slots are not
-currently scheduler-fit. They are not unclaimed admissible capacity.
+The current PostgreSQL service census is 167 `READY` and one `PENDING`. This is
+a dynamic scheduler outcome rather than a fixed fleet floor: research reclaimed
+capacity after the earlier 372-replica snapshot. East has all 328 of 328 GPUs
+assigned, with 90 one-GPU fleet workers and 238 research GPU requests. All 41
+eight-GPU nodes are fully packed, including nine nodes with all eight devices
+assigned to distinct fleet workers. PHX has 511 of 512 GPUs running, with 77
+one-GPU H200 fleet workers and 434 research GPU requests. The remaining fleet
+Workload uses the existing `be` LocalQueue and the existing `-1000` Pod
+priority, but Kueue reports `WaitingForQuota` / `NoReservation`; the raw final
+GPU is therefore not presently admitted to SkyPilot by the unchanged policy.
+All admitted fleet Workloads are running, including eight PHX nodes with eight
+fleet workers apiece. SkyPilot must not change research ClusterQueues, cohorts,
+quotas, priorities, borrowing, or preemption to claim that last raw device.
 
 PR #1687 atomically retired the exact orphaned replica 465, its admission, and
 its committed intent after proving the associated launch was `NOT_STARTED`,
@@ -33,11 +39,14 @@ EFS is not a correctness dependency. The API returns HTTP 200 and the dashboard
 returns the expected HTTP 307 SSO redirect.
 
 The remaining gates are deliberately separate from reserved-capacity
-convergence: durable/exact asynchronous request telemetry, actual worker/device
-completion evidence, a guarded 10,000-logical-request campaign, and a
-production exercise of genuinely uncovered paid Spot residual and drain. None
-of those gates authorizes changing Kueue or claiming HTTP admission as model
-completion.
+convergence: deploy the stale-demand census and current-route demand fixes,
+durably qualify exact asynchronous request telemetry, collect actual
+worker/device completion evidence, run a guarded 10,000-logical-request
+campaign, and exercise genuinely uncovered paid Spot residual and drain. The
+campaign must first replace the current broad multi-cloud Spot alternative set
+with an explicitly disclosed bounded Spot envelope; ordinary on-demand is not
+an allowed fallback. None of those gates authorizes changing Kueue or claiming
+HTTP admission as model completion.
 
 ## Historical rollout record
 

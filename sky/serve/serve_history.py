@@ -9,6 +9,7 @@ from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
 
 from sky import sky_logging
+from sky.serve import async_request_ledger
 from sky.serve import constants
 from sky.serve import serve_state
 from sky.utils import common_utils
@@ -1909,6 +1910,9 @@ def unavailable_status_history(reason: str,
         })
     if 'autoscaler' in requested_sections:
         response['autoscaler_samples'] = []
+    if requested_sections & {'requests', 'prediction'}:
+        response['async_request_summary'] = (
+            async_request_ledger.unavailable_summary(reason))
     return response
 
 
@@ -2143,4 +2147,21 @@ def get_status_history(
         })
     if 'autoscaler' in requested_sections:
         response['autoscaler_samples'] = autoscaler_samples
+    if requested_sections & {'requests', 'prediction'}:
+        if not async_request_ledger.schema_available(engine):
+            response['async_request_summary'] = (
+                async_request_ledger.unavailable_summary('schema_unavailable'))
+        else:
+            try:
+                response['async_request_summary'] = (
+                    async_request_ledger.AsyncRequestLedgerRepository(
+                        engine).summary(service_name, service_hash))
+            except async_request_ledger.AsyncRequestLedgerConflict:
+                response['async_request_summary'] = (
+                    async_request_ledger.unavailable_summary(
+                        'service_incarnation_mismatch'))
+            except async_request_ledger.AsyncRequestLedgerUnavailable:
+                response['async_request_summary'] = (
+                    async_request_ledger.unavailable_summary(
+                        'database_read_failed'))
     return response

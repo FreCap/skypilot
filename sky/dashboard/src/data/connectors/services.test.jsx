@@ -22,6 +22,7 @@ import {
   getServiceVersions,
   getServices,
   normalizeAcceleratorBreakdown,
+  normalizeAsyncRequestSummary,
   normalizeReplicaHistory,
   normalizeService,
   normalizeServiceDemand,
@@ -1644,6 +1645,65 @@ describe('normalizeReplicaHistory', () => {
 
     expect(history.available).toBe(false);
     expect(history.requestsLastHour).toBeNull();
+  });
+});
+
+describe('normalizeAsyncRequestSummary', () => {
+  const exactSummary = {
+    available: true,
+    coverage: 'partial',
+    protocol_version: 1,
+    observed_at: 100,
+    service_hash: 'hash-a',
+    state_counts: {
+      REJECTED_PRE_DISPATCH: 2,
+      DISPATCH_MAY_HAVE_OCCURRED: 1,
+      ACCEPTED: 3,
+      AMBIGUOUS: 1,
+      SUCCEEDED: 5,
+      FAILED: 2,
+      CANCELLED: 1,
+      EXPIRED: 0,
+    },
+    operational_terminal_receipt_total: 8,
+    operational_terminal_receipts_by_status: {
+      SUCCEEDED: 5,
+      FAILED: 2,
+      CANCELLED: 1,
+      EXPIRED: 0,
+    },
+  };
+
+  it('keeps exact protocol-covered states and terminal totals', () => {
+    expect(normalizeAsyncRequestSummary(exactSummary)).toEqual({
+      available: true,
+      coverage: 'partial',
+      protocolVersion: 1,
+      observedAt: 100,
+      serviceHash: 'hash-a',
+      stateCounts: exactSummary.state_counts,
+      operationalTerminalReceiptTotal: 8,
+      operationalTerminalReceiptsByStatus:
+        exactSummary.operational_terminal_receipts_by_status,
+    });
+  });
+
+  it.each([
+    { protocol_version: 2 },
+    { coverage: 'unknown' },
+    { observed_at: -1 },
+    { service_hash: '' },
+    { operational_terminal_receipt_total: 7 },
+    {
+      state_counts: {
+        ...exactSummary.state_counts,
+        UNKNOWN: 1,
+      },
+    },
+  ])('rejects an internally inconsistent exact summary: %p', (patch) => {
+    expect(
+      normalizeAsyncRequestSummary({ ...exactSummary, ...patch })
+    ).toBeNull();
   });
 });
 

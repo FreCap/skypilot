@@ -9,6 +9,9 @@ capacity.
 """
 # pylint: disable=protected-access
 import asyncio
+import dataclasses
+import hashlib
+import json
 import threading
 import unittest
 from unittest import mock
@@ -16,6 +19,7 @@ from unittest import mock
 import fastapi
 import httpx
 
+from sky.serve import async_request_ledger_client as ledger_client
 from sky.serve import load_balancer as lb_module
 from sky.serve import load_balancing_policies as lb_policies
 
@@ -36,6 +40,47 @@ def _request(method='POST'):
     request.body = _body
     request.is_disconnected = _is_disconnected
     return request
+
+
+def _exact_ledger_request(body: bytes,
+                          *,
+                          execution_request_id: str = 'execution-1',
+                          extra_headers=()):
+    headers = [
+        (lb_module.constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER.lower().encode(),
+         b'1'),
+        (lb_module.constants.LB_ASYNC_INTENT_SHA256_HEADER.lower().encode(),
+         b'a' * 64),
+        (lb_module.constants.LB_ASYNC_EXECUTION_REQUEST_ID_HEADER.lower().
+         encode(), execution_request_id.encode()),
+        (lb_module.constants.LB_JOB_ID_HEADER.lower().encode(),
+         b'durable-job-1'),
+        (b'content-type', b'application/json'),
+        (b'content-length', str(len(body)).encode()),
+        *extra_headers,
+    ]
+    scope = {
+        'type': 'http',
+        'http_version': '1.1',
+        'method': 'POST',
+        'scheme': 'https',
+        'path': '/predict',
+        'raw_path': b'/predict',
+        'query_string': b'',
+        'headers': headers,
+        'client': ('127.0.0.1', 1234),
+        'server': ('test', 443),
+    }
+    sent = False
+
+    async def _receive():
+        nonlocal sent
+        if sent:
+            return {'type': 'http.disconnect'}
+        sent = True
+        return {'type': 'http.request', 'body': body, 'more_body': False}
+
+    return fastapi.Request(scope, _receive)
 
 
 class TestRetryExclusion(unittest.TestCase):
@@ -115,6 +160,145 @@ class TestRetryExclusion(unittest.TestCase):
         self.assertEqual(attempts, ['http://dead:8080', 'http://busy:8080'])
 
 
+class TestExactLedgerPredispatch(unittest.TestCase):
+    """Identity failures are inert; admitted failures carry exact receipts."""
+
+    @staticmethod
+    def _body(*, action='async_predict', request_id='execution-1'):
+        return json.dumps(
+            {
+                'action': action,
+                'payload': {
+                    'input': 's3://bucket/input'
+                },
+                'request_id': request_id,
+            },
+            sort_keys=True,
+            separators=(',', ':')).encode()
+
+    @staticmethod
+    def _balancer():
+        balancer = lb_module.SkyServeLoadBalancer('http://controller:8001', 0)
+        balancer._async_request_ledger_protocol_version = 1
+        balancer._lookup_async_ledger = mock.AsyncMock(return_value=None)
+        balancer._post_async_ledger = mock.AsyncMock()
+        return balancer
+
+    def test_identity_validation_failures_never_write_ledger(self):
+        malformed = (
+            self._body(action='async_status'),
+            self._body(request_id='different-execution'),
+            (b'{"action":"async_predict","payload":{},'
+             b'"request_id":"execution-1","request_id":"execution-1"}'),
+            (b'{"action": "async_predict", "payload": {}, '
+             b'"request_id": "execution-1"}'),
+        )
+        for body in malformed:
+            with self.subTest(body=body):
+                balancer = self._balancer()
+                request = _exact_ledger_request(body)
+                with self.assertRaises(fastapi.HTTPException) as raised:
+                    asyncio.run(balancer._proxy_with_retries(request))
+                self.assertEqual(raised.exception.status_code, 400)
+                balancer._post_async_ledger.assert_not_awaited()
+                self.assertIsNone(ledger_client.get_identity(request))
+
+    def test_no_replica_rejection_returns_exact_durable_receipt(self):
+        balancer = self._balancer()
+        receipt = ledger_client.AsyncLedgerReceipt(
+            request_key_sha256=hashlib.sha256(b'execution-1').hexdigest(),
+            attempt_id='11111111-1111-4111-8111-111111111111',
+            attempt_no=1,
+            state='REJECTED_PRE_DISPATCH',
+            revision=1,
+            duplicate=False,
+            dispatch_authorized=False)
+        balancer._post_async_ledger.return_value = receipt
+
+        response = asyncio.run(
+            balancer._proxy_with_retries(_exact_ledger_request(self._body())))
+        payload = json.loads(response.body)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.headers[lb_module.constants.LB_ASYNC_LEDGER_STATE_HEADER],
+            'REJECTED_PRE_DISPATCH')
+        self.assertEqual(payload['async_request_ledger_receipt'],
+                         dataclasses.asdict(receipt))
+        self.assertEqual(
+            balancer._post_async_ledger.await_args.args[0]['request_id'],
+            'execution-1')
+
+    def test_lost_ack_recovers_existing_attempt_without_ready_route(self):
+        balancer = self._balancer()
+        receipt = ledger_client.AsyncLedgerReceipt(
+            request_key_sha256=hashlib.sha256(b'execution-1').hexdigest(),
+            attempt_id='11111111-1111-4111-8111-111111111111',
+            attempt_no=1,
+            state='ACCEPTED',
+            revision=2,
+            duplicate=True,
+            dispatch_authorized=False)
+        balancer._lookup_async_ledger.return_value = receipt
+
+        response = asyncio.run(
+            balancer._proxy_with_retries(_exact_ledger_request(self._body())))
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.headers[
+                lb_module.constants.LB_ASYNC_LEDGER_REVISION_HEADER], '2')
+        self.assertEqual(
+            response.headers[lb_module.constants.LB_ASYNC_ATTEMPT_NO_HEADER],
+            '1')
+        self.assertEqual(
+            json.loads(response.body)['async_request_ledger_receipt'],
+            dataclasses.asdict(receipt))
+        balancer._post_async_ledger.assert_not_awaited()
+        self.assertEqual(balancer._queue_depth, 0)
+
+    def test_retryable_lookup_receipt_needs_no_new_rejection_row(self):
+        balancer = self._balancer()
+        receipt = ledger_client.AsyncLedgerReceipt(
+            request_key_sha256=hashlib.sha256(b'execution-1').hexdigest(),
+            attempt_id='11111111-1111-4111-8111-111111111111',
+            attempt_no=1,
+            state='REJECTED_PRE_DISPATCH',
+            revision=1,
+            duplicate=True,
+            dispatch_authorized=False)
+
+        async def _lookup(request, unused_identity):
+            ledger_client.set_receipt(request, receipt)
+            return receipt
+
+        balancer._lookup_async_ledger = _lookup
+        response = asyncio.run(
+            balancer._proxy_with_retries(_exact_ledger_request(self._body())))
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.headers[lb_module.constants.LB_ASYNC_LEDGER_STATE_HEADER],
+            'REJECTED_PRE_DISPATCH')
+        balancer._post_async_ledger.assert_not_awaited()
+
+    def test_rejection_persistence_failure_is_unknown_and_not_retryable(self):
+        balancer = self._balancer()
+        balancer._post_async_ledger.side_effect = (
+            ledger_client.AsyncLedgerTransportError(503, 'database down'))
+
+        response = asyncio.run(
+            balancer._proxy_with_retries(_exact_ledger_request(self._body())))
+        payload = json.loads(response.body)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(payload['state'], 'ledger_outcome_unknown')
+        self.assertNotIn('retry-after', response.headers)
+        self.assertNotIn(
+            lb_module.constants.LB_ASYNC_LEDGER_STATE_HEADER.lower(),
+            response.headers)
+
+
 class TestRetriableStatusCodes(unittest.TestCase):
     """Configured response statuses participate safely in retry routing."""
 
@@ -129,18 +313,36 @@ class TestRetriableStatusCodes(unittest.TestCase):
         balancer._retriable_status_codes = frozenset(retriable)
         return balancer
 
-    def _client_returning(self, status_code):
+    def _client_returning(self,
+                          status_code,
+                          body=b'',
+                          content_encoding='identity',
+                          chunks=None):
         client = mock.MagicMock()
         setattr(client, lb_module._INFLIGHT_ATTR, 0)
         client.build_request = mock.Mock(return_value=mock.Mock())
         response = mock.MagicMock()
         response.status_code = status_code
+        headers = {
+            'content-type': 'application/json',
+            'content-length': str(len(body)),
+        }
+        if content_encoding:
+            headers['content-encoding'] = content_encoding
+        response.headers = httpx.Headers(headers)
         closed = {'v': False}
 
         async def _aclose():
             closed['v'] = True
 
         response.aclose = _aclose
+        response_chunks = ([body] if body else []) if chunks is None else chunks
+
+        async def _aiter_raw():
+            for chunk in response_chunks:
+                yield chunk
+
+        response.aiter_raw = _aiter_raw
 
         async def _send(*args, **kwargs):
             del args, kwargs
@@ -174,6 +376,160 @@ class TestRetriableStatusCodes(unittest.TestCase):
         result = asyncio.run(
             balancer._proxy_request_to('http://a:8080', _request()))
         self.assertNotIsInstance(result, Exception)
+
+    @staticmethod
+    def _install_ledger_request(request,
+                                *,
+                                attempt_id=None,
+                                request_id='request-1'):
+        identity = ledger_client.AsyncLedgerIdentity(request_id, 'a' * 64,
+                                                     'stable-job-1')
+        receipt = ledger_client.AsyncLedgerReceipt(
+            request_key_sha256=identity.request_key_sha256,
+            attempt_id=attempt_id or '11111111-1111-4111-8111-111111111111',
+            attempt_no=1,
+            state='DISPATCH_MAY_HAVE_OCCURRED',
+            revision=1,
+            duplicate=False,
+            dispatch_authorized=True)
+        vars(request)[ledger_client.IDENTITY_REQUEST_ATTR] = identity
+        ledger_client.set_receipt(request, receipt)
+        return receipt
+
+    def test_ledger_bind_precedes_provider_send(self):
+        client, _ = self._client_returning(200)
+        balancer = self._balancer([], client)
+        request = _request()
+        events = []
+        bound = self._install_ledger_request(request)
+
+        async def _bind(*_args):
+            events.append('bind')
+            return bound
+
+        original_send = client.send
+
+        async def _send(*args, **kwargs):
+            events.append('send')
+            return await original_send(*args, **kwargs)
+
+        async def _transition(_request, operation):
+            events.append(operation)
+            return ledger_client.AsyncLedgerReceipt(
+                request_key_sha256=bound.request_key_sha256,
+                attempt_id=bound.attempt_id,
+                attempt_no=1,
+                state='ACCEPTED',
+                revision=2,
+                duplicate=False,
+                dispatch_authorized=False)
+
+        balancer._bind_async_ledger = _bind
+        balancer._transition_async_ledger = _transition
+        client.send = _send
+
+        result = asyncio.run(
+            balancer._proxy_request_to('http://a:8080', request))
+        self.assertNotIsInstance(result, Exception)
+        self.assertEqual(events[:3], ['bind', 'send', 'accepted'])
+
+    def test_concurrent_bind_race_returns_complete_recovery_receipt(self):
+        client, _ = self._client_returning(200)
+        client.send = mock.AsyncMock()
+        balancer = self._balancer([], client)
+        request = _request()
+        initial = self._install_ledger_request(request)
+        duplicate = dataclasses.replace(initial,
+                                        state='ACCEPTED',
+                                        revision=2,
+                                        duplicate=True,
+                                        dispatch_authorized=False)
+
+        async def _bind(*_args):
+            return duplicate
+
+        balancer._bind_async_ledger = _bind
+        result = asyncio.run(
+            balancer._proxy_request_to('http://a:8080', request))
+
+        self.assertEqual(result.status_code, 409)
+        self.assertEqual(
+            json.loads(result.body)['async_request_ledger_receipt'],
+            dataclasses.asdict(duplicate))
+        client.send.assert_not_awaited()
+
+    def test_ledger_qualified_retriable_status_is_ambiguous_not_replayed(self):
+        client, closed = self._client_returning(503)
+        balancer = self._balancer([503], client)
+        request = _request()
+        bound = self._install_ledger_request(request)
+        transitions = []
+
+        async def _bind(*_args):
+            return bound
+
+        async def _transition(_request, operation):
+            transitions.append(operation)
+            return ledger_client.AsyncLedgerReceipt(
+                request_key_sha256=bound.request_key_sha256,
+                attempt_id=bound.attempt_id,
+                attempt_no=1,
+                state='AMBIGUOUS',
+                revision=2,
+                duplicate=False,
+                dispatch_authorized=False)
+
+        balancer._bind_async_ledger = _bind
+        balancer._transition_async_ledger = _transition
+
+        result = asyncio.run(
+            balancer._proxy_request_to('http://a:8080', request))
+        self.assertNotIsInstance(result, lb_module._RetriableStatusError)
+        self.assertNotIsInstance(result, Exception)
+        self.assertEqual(transitions, ['ambiguous'])
+        self.assertFalse(closed['v'])
+
+    def test_ledger_transport_outcome_controls_replay_state(self):
+
+        def _handlers(bound_receipt, transition_log):
+
+            async def _bind(*_args):
+                return bound_receipt
+
+            async def _transition(_request, operation):
+                transition_log.append(operation)
+                return ledger_client.AsyncLedgerReceipt(
+                    request_key_sha256=bound_receipt.request_key_sha256,
+                    attempt_id=bound_receipt.attempt_id,
+                    attempt_no=1,
+                    state=('REJECTED_PRE_DISPATCH'
+                           if operation == 'rejected' else 'AMBIGUOUS'),
+                    revision=2,
+                    duplicate=False,
+                    dispatch_authorized=False)
+
+            return _bind, _transition
+
+        for transport_error, expected_transition in (
+            (httpx.ConnectError('not connected'), 'rejected'),
+            (httpx.ReadTimeout('outcome unknown'), 'ambiguous'),
+        ):
+            client = mock.MagicMock()
+            setattr(client, lb_module._INFLIGHT_ATTR, 0)
+            client.build_request.return_value = mock.Mock()
+            client.send = mock.AsyncMock(side_effect=transport_error)
+            balancer = self._balancer([], client)
+            request = _request()
+            bound = self._install_ledger_request(request)
+            transitions = []
+            _bind, _transition = _handlers(bound, transitions)
+            balancer._bind_async_ledger = _bind
+            balancer._transition_async_ledger = _transition
+            result = asyncio.run(
+                balancer._proxy_request_to('http://a:8080', request))
+
+            self.assertIs(result, transport_error)
+            self.assertEqual(transitions, [expected_transition])
 
 
 class TestRetryTuning(unittest.TestCase):

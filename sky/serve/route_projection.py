@@ -649,6 +649,7 @@ def _identity_entry(info: Any, material: ResolvedRouteMaterial, *,
     return {
         'replica_id': _positive_int(info.replica_id, 'replica_id'),
         'replica_record_id': _canonical_record_id(info.replica_record_id),
+        'service_version': _positive_int(info.version, 'service_version'),
         'gpu_type': material.gpu_type,
         'gpu_count': material.gpu_count,
         'advertised': bool(advertised),
@@ -868,6 +869,7 @@ def build_incremental_route_view(
             identity = {
                 'replica_id': replica.replica_id,
                 'replica_record_id': replica.replica_record_id,
+                'service_version': replica.service_version,
                 'gpu_type': material.gpu_type,
                 'gpu_count': material.gpu_count,
                 'advertised': False,
@@ -1003,7 +1005,18 @@ def _validate_response(raw: object) -> dict[str, Any]:
     return copy.deepcopy(raw)
 
 
-def _validate_identities(raw: object) -> dict[str, dict[str, Any]]:
+def _validate_identities(
+    raw: object,
+    *,
+    require_service_version: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Validate private route identities.
+
+    Snapshots written before exact async dispatch did not carry a selected
+    worker version.  They remain readable for one rolling control-plane upgrade,
+    but cannot be published as a new current identity set or authorize an exact
+    bind.  Every newly composed identity is versioned.
+    """
     if not isinstance(raw, dict) or len(raw) > MAX_ROUTE_IDENTITIES:
         raise RouteProjectionValidationError(
             'Route identity payload must be a bounded object.')
@@ -1014,16 +1027,20 @@ def _validate_identities(raw: object) -> dict[str, dict[str, Any]]:
         if url != raw_url or not isinstance(raw_entry, dict):
             raise RouteProjectionValidationError(
                 'Route identity entry is invalid.')
-        expected = {
+        legacy_expected = {
             'replica_id', 'replica_record_id', 'gpu_type', 'gpu_count',
             'advertised', 'alias_expires_at'
         }
-        if set(raw_entry) != expected:
+        versioned_expected = legacy_expected | {'service_version'}
+        if (set(raw_entry) != versioned_expected and
+            (require_service_version or set(raw_entry) != legacy_expected)):
             raise RouteProjectionValidationError(
                 'Route identity entry has an invalid shape.')
         entry = dict(raw_entry)
         _positive_int(entry['replica_id'], 'replica_id')
         record_id = _canonical_record_id(entry['replica_record_id'])
+        if 'service_version' in entry:
+            _positive_int(entry['service_version'], 'service_version')
         _nonempty(entry['gpu_type'], 'gpu_type')
         _positive_int(entry['gpu_count'], 'gpu_count')
         if type(entry['advertised']) is not bool:
@@ -2201,7 +2218,8 @@ class RouteProjectionRepository:
                 not 1 <= ttl_seconds <= MAX_ROUTE_TTL_SECONDS):
             raise RouteProjectionValidationError('Route TTL is invalid.')
         validated_response = _validate_response(response)
-        validated_current = _validate_identities(current_identities)
+        validated_current = _validate_identities(current_identities,
+                                                 require_service_version=True)
         canonical_records = {
             _canonical_record_id(record_id) for record_id in current_record_ids
         }
@@ -2353,7 +2371,7 @@ class RouteProjectionRepository:
                 capacity_hint=capacity_hint)
             response = _validate_response(prepared_route_view.response)
             current_identities = _validate_identities(
-                prepared_route_view.identities)
+                prepared_route_view.identities, require_service_version=True)
 
             # The publish transaction has one fixed lock order and performs no
             # decoding, import, provider call, capacity callback, or route JSON

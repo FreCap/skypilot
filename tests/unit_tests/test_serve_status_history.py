@@ -149,7 +149,35 @@ def test_selected_history_sections_skip_unrequested_queries(monkeypatch):
         'rejection_history_available',
         'request_window_seconds',
         'requests_last_hour',
+        'async_request_summary',
     }
+    assert history['async_request_summary']['reason'] == 'schema_unavailable'
+    assert history['async_request_summary']['coverage'] == 'none'
+
+
+def test_history_never_reads_ledger_before_schema(monkeypatch):
+    engine = mock.MagicMock()
+    monkeypatch.setattr(serve_history, '_postgres_engine', lambda: engine)
+    monkeypatch.setattr(serve_history.async_request_ledger, 'schema_available',
+                        lambda unused: False)
+    repository = mock.Mock()
+    monkeypatch.setattr(serve_history.async_request_ledger,
+                        'AsyncRequestLedgerRepository', repository)
+    service_result = mock.MagicMock()
+    service_result.scalar_one_or_none.return_value = 'hash-a'
+    request_result = mock.MagicMock()
+    request_result.all.return_value = []
+    session = mock.MagicMock()
+    session.__enter__.return_value = session
+    session.execute.side_effect = [service_result, request_result]
+    monkeypatch.setattr(serve_history.orm, 'Session', lambda unused: session)
+
+    history = serve_history.get_status_history('svc',
+                                               timestamp=120,
+                                               sections={'requests'})
+
+    assert history['async_request_summary']['reason'] == 'schema_unavailable'
+    repository.assert_not_called()
 
 
 def test_default_history_sections_keep_all_queries_and_fields(monkeypatch):
@@ -271,6 +299,9 @@ def test_missing_central_service_is_unavailable(monkeypatch):
         'rejection_history_available': False,
         'request_window_seconds': 3600,
         'requests_last_hour': 0,
+        'async_request_summary':
+            serve_history.async_request_ledger.unavailable_summary(
+                'service_not_found'),
     }
 
 

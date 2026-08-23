@@ -339,6 +339,7 @@ EXTERNAL_LB_SERVICE_ANNOTATIONS_ENV_VAR = (
 LB_HEALTH_ENDPOINT_PATH = '/_lb/health'
 LB_LIVENESS_ENDPOINT_PATH = '/_lb/liveness'
 LB_PREDICTION_COMPLETION_ENDPOINT_PATH = '/_lb/prediction-completed'
+LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH = '/_lb/async-request-receipt'
 
 # Hard cap on the number of request timestamps the LB retains between successful
 # controller syncs. The batch is retained (not dropped) across a failed sync so
@@ -431,6 +432,20 @@ LB_ASYNC_PREDICTION_DEDUP_CAP = 100_000
 # past the load balancer memory limit). Real ids are UUID-shaped; this is a
 # generous ceiling that keeps worst-case retention within a few tens of MiB.
 LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS = 256
+# Explicit opt-in contract for the PostgreSQL dispatch/replay ledger.  Older
+# callers omit these headers and retain the aggregate-only compatibility path;
+# once a caller opts in, every missing receipt fails closed.
+LB_ASYNC_LEDGER_PROTOCOL_VERSION = 1
+LB_ASYNC_LEDGER_PROTOCOL_HEADER = 'X-SkyServe-Async-Ledger-Protocol'
+LB_ASYNC_INTENT_SHA256_HEADER = 'X-SkyServe-Async-Intent-Sha256'
+# The durable platform job ID and the prediction execution ID are different
+# identities.  The former deduplicates autoscaling pressure; the latter is the
+# exact immutable request key returned by the worker and stored in the ledger.
+LB_ASYNC_EXECUTION_REQUEST_ID_HEADER = 'X-SkyServe-Execution-Request-Id'
+LB_ASYNC_ATTEMPT_ID_HEADER = 'X-SkyServe-Async-Attempt-Id'
+LB_ASYNC_ATTEMPT_NO_HEADER = 'X-SkyServe-Async-Attempt-No'
+LB_ASYNC_LEDGER_REVISION_HEADER = 'X-SkyServe-Async-Ledger-Revision'
+LB_ASYNC_LEDGER_STATE_HEADER = 'X-SkyServe-Async-Ledger-State'
 
 # [boltz fork] Compatibility time budget for controllers predating the
 # commit-then-reconcile update protocol. Their handler can wait on the
@@ -481,6 +496,11 @@ LB_CONTROLLER_SYNC_PATH = '/controller/load_balancer_sync'
 # routes above, this path terminates at the stable API server and must never be
 # proxied to the per-service controller process.
 LB_DEMAND_REPORT_PATH = '/demand'
+# Controller-independent, PostgreSQL-backed async dispatch receipts.  This
+# terminates at the stable API server and is authenticated by the LB-sync ring.
+LB_ASYNC_REQUEST_LEDGER_PATH = '/async-request-ledger'
+LB_ASYNC_REQUEST_LEDGER_MAX_BYTES = 16 * 1024
+LB_ASYNC_REQUEST_LEDGER_TIMEOUT_SECONDS = 10
 LB_DEMAND_REPORT_PROTOCOL_VERSION = 2
 LB_DEMAND_REPORT_MIN_PROTOCOL_VERSION = 1
 LB_DEMAND_REPORT_INTERVAL_SECONDS = 5

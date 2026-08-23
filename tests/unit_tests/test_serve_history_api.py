@@ -99,6 +99,9 @@ def test_direct_history_reports_non_consolidated_capability():
         'rejection_history_available': False,
         'request_window_seconds': 3600,
         'requests_last_hour': 0,
+        'async_request_summary':
+            (server.serve_history.async_request_ledger.unavailable_summary(
+                'non_consolidated')),
     }
     get_service.assert_not_called()
     get_history.assert_not_called()

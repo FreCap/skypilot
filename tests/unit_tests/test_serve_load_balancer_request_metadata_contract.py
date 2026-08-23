@@ -43,7 +43,7 @@ _CALLABLE_CONTRACT = {
     '_headers_without_request_priority': (
         staticmethod,
         '(request: starlette.requests.Request) -> Any',
-        'c3ec5bf75fff52fc966b56a79118d4566c49d08a63df2a5b171a3181e10e802a',
+        'f101768fccc16883bca71e1414e362d47dc23914ad0d2a494719d575cbe8a165',
     ),
 }
 
@@ -177,6 +177,11 @@ def test_request_metadata_error_and_translation_contract() -> None:
         (b'x-keep', b'first'),
         (b'X-SkyServe-Priority', b'7'),
         (b'x-skyserve-compatible-accelerators', b'L4'),
+        (b'x-skyserve-async-attempt-id',
+         b'11111111-1111-4111-8111-111111111111'),
+        (b'x-skyserve-async-attempt-no', b'1'),
+        (b'x-skyserve-async-ledger-revision', b'1'),
+        (b'x-skyserve-async-ledger-state', b'ACCEPTED'),
         (b'x-keep', b'second'),
     ])
     assert lb._headers_without_request_priority(request) == [

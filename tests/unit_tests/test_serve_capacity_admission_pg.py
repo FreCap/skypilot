@@ -160,6 +160,7 @@ def _route_identities(record_id: str):
         _URL: {
             'replica_id': 1,
             'replica_record_id': record_id,
+            'service_version': 1,
             'gpu_type': 'L4',
             'gpu_count': 1,
             'advertised': True,

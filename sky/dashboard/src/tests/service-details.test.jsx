@@ -71,6 +71,7 @@ import ServiceDetailsPage, {
   ReplicasCard,
   ServiceDetailCard,
   getLatestTerminalObservationReportAgeSeconds,
+  getTerminalPredictionObservationSummaryLastHour,
   getTerminalPredictionObservationsLastHour,
   sortReplicas,
   useServiceDetails,
@@ -3301,7 +3302,15 @@ describe('ServiceDetails route ownership rendering', () => {
     expect(getDetailValue('Endpoint')).toHaveTextContent('Loading...');
     expect(
       screen.getByText(
-        '0.50 req/s recent · 30 requests in 60s · 3 terminal prediction observations recorded in last hour · latest terminal-observation report was 2s old at this history snapshot · 1 queued · 1 backend with unknown occupancy · 0 rejected · activity report 2s old'
+        '0.50 req/s recent · 30 requests in 60s · 1 queued · 1 backend with unknown occupancy · 0 rejected · activity report 2s old'
+      )
+    ).toBeVisible();
+    expect(
+      getDetailValue('Compatibility terminal observations (last hour)')
+    ).toHaveTextContent('3 recorded');
+    expect(
+      screen.getByText(
+        '2 succeeded · 1 failed · latest terminal-observation report was 2s old at this history snapshot · load-balancer observations, not unique logical requests'
       )
     ).toBeVisible();
     expect(getServiceDemand).toHaveBeenCalledWith({
@@ -4026,6 +4035,24 @@ describe('ServiceDetails route ownership rendering', () => {
 });
 
 describe('terminal prediction observation summary', () => {
+  it('reports the succeeded and failed observation breakdown', () => {
+    expect(
+      getTerminalPredictionObservationSummaryLastHour({
+        available: true,
+        bucketSeconds: 60,
+        windowEnd: 7200,
+        predictionTimeHistogramVersion: 1,
+        predictionTimeBucketUpperBoundsSeconds: [1],
+        predictionTimeSamples: [
+          {
+            timestamp: 7140,
+            outcomeCounts: { succeeded: [2, 0], failed: [0, 1] },
+          },
+        ],
+      })
+    ).toEqual({ succeeded: 2, failed: 1, total: 3 });
+  });
+
   it('sums only terminal outcomes in the latest 60 history buckets', () => {
     expect(
       getTerminalPredictionObservationsLastHour({
@@ -4158,10 +4185,205 @@ describe('ServiceDetailCard cost and request estimates', () => {
     );
 
     expect(
+      getDetailValue('Compatibility terminal observations (last hour)')
+    ).toHaveTextContent('3 recorded');
+    expect(
       screen.getByText(
-        '3 terminal prediction observations recorded in last hour · latest terminal-observation report time unavailable'
+        '2 succeeded · 1 failed · latest terminal-observation report time unavailable · load-balancer observations, not unique logical requests'
       )
     ).toBeVisible();
+  });
+
+  it('keeps aggregate processing primary over exact lifecycle coverage', () => {
+    render(
+      <ServiceDetailCard
+        requestHistory={{
+          available: true,
+          asyncRequestSummary: {
+            available: true,
+            coverage: 'partial',
+            stateCounts: {
+              REJECTED_PRE_DISPATCH: 2,
+              DISPATCH_MAY_HAVE_OCCURRED: 1,
+              ACCEPTED: 3,
+              AMBIGUOUS: 1,
+              SUCCEEDED: 5,
+              FAILED: 2,
+              CANCELLED: 1,
+              EXPIRED: 0,
+            },
+            operationalTerminalReceiptTotal: 8,
+            operationalTerminalReceiptsByStatus: {
+              SUCCEEDED: 5,
+              FAILED: 2,
+              CANCELLED: 1,
+              EXPIRED: 0,
+            },
+          },
+        }}
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          replicasReady: 1,
+          replicasTotal: 1,
+          replicasFailed: 0,
+          targetReplicas: 1,
+          activeVersions: [1],
+          inFlightRequests: 6,
+        }}
+      />
+    );
+
+    expect(getDetailValue('Requests now')).toHaveTextContent('6 processing');
+    expect(
+      screen.getByText(
+        'protocol-covered 2 pre-dispatch · protocol-covered 2 dispatch outcome uncertain · protocol-covered 3 accepted (not confirmed processing)'
+      )
+    ).toBeVisible();
+    expect(getDetailValue('Unique async terminal receipts')).toHaveTextContent(
+      '8 protocol-covered (partial)'
+    );
+    expect(
+      screen.getByText('5 succeeded · 2 failed · 1 cancelled · 0 expired')
+    ).toBeVisible();
+  });
+
+  it('keeps legacy processing telemetry when exact coverage is partial', () => {
+    render(
+      <ServiceDetailCard
+        requestHistory={{
+          available: true,
+          asyncRequestSummary: {
+            available: true,
+            coverage: 'partial',
+            stateCounts: {
+              REJECTED_PRE_DISPATCH: 0,
+              DISPATCH_MAY_HAVE_OCCURRED: 1,
+              ACCEPTED: 2,
+              AMBIGUOUS: 0,
+              SUCCEEDED: 1,
+              FAILED: 0,
+              CANCELLED: 0,
+              EXPIRED: 0,
+            },
+            operationalTerminalReceiptTotal: 1,
+            operationalTerminalReceiptsByStatus: {
+              SUCCEEDED: 1,
+              FAILED: 0,
+              CANCELLED: 0,
+              EXPIRED: 0,
+            },
+          },
+        }}
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          replicasReady: 1,
+          replicasTotal: 1,
+          replicasFailed: 0,
+          targetReplicas: 1,
+          activeVersions: [1],
+          inFlightRequests: 7,
+        }}
+      />
+    );
+
+    expect(getDetailValue('Requests now')).toHaveTextContent('7 processing');
+    expect(getDetailValue('Unique async terminal receipts')).toHaveTextContent(
+      '1 protocol-covered (partial)'
+    );
+    expect(
+      screen.getByText(
+        'protocol-covered 0 pre-dispatch · protocol-covered 1 dispatch outcome uncertain · protocol-covered 2 accepted (not confirmed processing)'
+      )
+    ).toBeVisible();
+  });
+
+  it('marks a retained completion snapshot stale after refresh failure', () => {
+    render(
+      <ServiceDetailCard
+        requestHistory={{
+          available: true,
+          refreshUnavailable: true,
+          bucketSeconds: 60,
+          windowEnd: 7200,
+          predictionTimeHistogramVersion: 1,
+          predictionTimeLatestHourReportedAt: 7198,
+          predictionTimeBucketUpperBoundsSeconds: [1],
+          predictionTimeSamples: [
+            {
+              timestamp: 7140,
+              outcomeCounts: { succeeded: [1, 0] },
+            },
+          ],
+        }}
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          replicasReady: 1,
+          replicasTotal: 1,
+          replicasFailed: 0,
+          targetReplicas: 1,
+          activeVersions: [1],
+        }}
+      />
+    );
+
+    expect(
+      screen.getByText(
+        '1 succeeded · 0 failed · history refresh failed; showing the last persisted one-hour snapshot · load-balancer observations, not unique logical requests'
+      )
+    ).toBeVisible();
+  });
+
+  it('shows exact ledger snapshot age and retained-refresh failure', () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(200_000);
+    render(
+      <ServiceDetailCard
+        requestHistory={{
+          available: true,
+          refreshUnavailable: true,
+          asyncRequestSummary: {
+            available: true,
+            coverage: 'partial',
+            observedAt: 100,
+            stateCounts: {
+              REJECTED_PRE_DISPATCH: 0,
+              DISPATCH_MAY_HAVE_OCCURRED: 0,
+              ACCEPTED: 0,
+              AMBIGUOUS: 0,
+              SUCCEEDED: 1,
+              FAILED: 0,
+              CANCELLED: 0,
+              EXPIRED: 0,
+            },
+            operationalTerminalReceiptTotal: 1,
+            operationalTerminalReceiptsByStatus: {
+              SUCCEEDED: 1,
+              FAILED: 0,
+              CANCELLED: 0,
+              EXPIRED: 0,
+            },
+          },
+        }}
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          replicasReady: 1,
+          replicasTotal: 1,
+          replicasFailed: 0,
+          targetReplicas: 1,
+          activeVersions: [1],
+        }}
+      />
+    );
+
+    expect(
+      screen.getByText(
+        'Exact ledger refresh failed; showing a snapshot observed 100s ago.'
+      )
+    ).toBeVisible();
+    now.mockRestore();
   });
 
   it('labels partial version-catalog totals as a known lower bound', () => {

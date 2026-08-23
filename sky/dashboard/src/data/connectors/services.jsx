@@ -389,6 +389,9 @@ export function normalizeReplicaHistory(history) {
         .filter(Boolean)
     : [];
   const requestsLastHour = Number(history.requests_last_hour);
+  const asyncRequestSummary = normalizeAsyncRequestSummary(
+    history.async_request_summary
+  );
   return {
     available,
     reason: history.reason || null,
@@ -417,6 +420,103 @@ export function normalizeReplicaHistory(history) {
       available && Number.isInteger(requestsLastHour) && requestsLastHour >= 0
         ? requestsLastHour
         : null,
+    asyncRequestSummary,
+  };
+}
+
+const ASYNC_REQUEST_STATES = [
+  'REJECTED_PRE_DISPATCH',
+  'DISPATCH_MAY_HAVE_OCCURRED',
+  'ACCEPTED',
+  'AMBIGUOUS',
+  'SUCCEEDED',
+  'FAILED',
+  'CANCELLED',
+  'EXPIRED',
+];
+
+const ASYNC_REQUEST_TERMINAL_STATES = [
+  'SUCCEEDED',
+  'FAILED',
+  'CANCELLED',
+  'EXPIRED',
+];
+
+function normalizeExactCounts(value, expectedKeys) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (
+    Object.keys(value).length !== expectedKeys.length ||
+    expectedKeys.some(
+      (key) =>
+        !Object.prototype.hasOwnProperty.call(value, key) ||
+        !Number.isInteger(Number(value[key])) ||
+        Number(value[key]) < 0
+    )
+  ) {
+    return null;
+  }
+  return Object.fromEntries(
+    expectedKeys.map((key) => [key, Number(value[key])])
+  );
+}
+
+export function normalizeAsyncRequestSummary(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  if (raw.available === false) {
+    return {
+      available: false,
+      reason: typeof raw.reason === 'string' ? raw.reason : 'unavailable',
+      coverage: ['none', 'partial'].includes(raw.coverage)
+        ? raw.coverage
+        : 'none',
+    };
+  }
+  if (raw.available !== true) return null;
+  const protocolVersion = Number(raw.protocol_version);
+  const observedAt = Number(raw.observed_at);
+  const stateCounts = normalizeExactCounts(
+    raw.state_counts,
+    ASYNC_REQUEST_STATES
+  );
+  const terminalReceiptsByStatus = normalizeExactCounts(
+    raw.operational_terminal_receipts_by_status,
+    ASYNC_REQUEST_TERMINAL_STATES
+  );
+  const terminalTotal = Number(raw.operational_terminal_receipt_total);
+  const coverage = raw.coverage;
+  const operationalTerminalStateTotal = ASYNC_REQUEST_TERMINAL_STATES.reduce(
+    (sum, state) => sum + (stateCounts?.[state] ?? 0),
+    0
+  );
+  if (
+    protocolVersion !== 1 ||
+    coverage !== 'partial' ||
+    !Number.isFinite(observedAt) ||
+    observedAt < 0 ||
+    typeof raw.service_hash !== 'string' ||
+    !raw.service_hash ||
+    !stateCounts ||
+    !terminalReceiptsByStatus ||
+    !Number.isInteger(terminalTotal) ||
+    terminalTotal < 0 ||
+    terminalTotal !==
+      Object.values(terminalReceiptsByStatus).reduce(
+        (sum, count) => sum + count,
+        0
+      ) ||
+    terminalTotal !== operationalTerminalStateTotal
+  ) {
+    return null;
+  }
+  return {
+    available: true,
+    coverage,
+    protocolVersion,
+    observedAt,
+    serviceHash: raw.service_hash,
+    stateCounts,
+    operationalTerminalReceiptTotal: terminalTotal,
+    operationalTerminalReceiptsByStatus: terminalReceiptsByStatus,
   };
 }
 

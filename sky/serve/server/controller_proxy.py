@@ -17,6 +17,7 @@ import aiohttp
 import fastapi
 
 from sky import sky_logging
+from sky.serve import async_request_ledger
 from sky.serve import constants
 from sky.serve import demand_state
 from sky.serve import lb_ha_observability as lb_ha_obs
@@ -40,6 +41,8 @@ CONTROLLER_HISTORY_SYNC_ROUTE_PATH = (_CONTROLLER_PROXY_ROUTE_PREFIX +
                                       constants.LB_CONTROLLER_HISTORY_SYNC_PATH)
 DEMAND_REPORT_ROUTE_PATH = (_CONTROLLER_PROXY_ROUTE_PREFIX +
                             constants.LB_DEMAND_REPORT_PATH)
+ASYNC_REQUEST_LEDGER_ROUTE_PATH = (_CONTROLLER_PROXY_ROUTE_PREFIX +
+                                   constants.LB_ASYNC_REQUEST_LEDGER_PATH)
 _CONTROLLER_SYNC_ROUTE_PREFIX = '/api/internal/serve/'
 _CONTROLLER_SYNC_ROUTE_SUFFIXES = (
     constants.LB_CONTROLLER_SYNC_PATH,
@@ -47,8 +50,8 @@ _CONTROLLER_SYNC_ROUTE_SUFFIXES = (
     constants.LB_CONTROLLER_SYSTEM_RECOVERY_LEASE_PATH,
     constants.LB_CONTROLLER_HISTORY_SYNC_PATH,
     constants.LB_DEMAND_REPORT_PATH,
+    constants.LB_ASYNC_REQUEST_LEDGER_PATH,
 )
-
 # (durable service incarnation, controller process, normalized IP, port).
 # Every member participates in the before/after comparison so same-name
 # replacement, PID reuse, and controller migration all fail closed.
@@ -305,8 +308,13 @@ async def proxy_load_balancer_sync(
                                               content={'detail': str(error)})
     if decision.mode == route_projection.RouteSourceMode.DURABLE_PROJECTED:
         assert decision.response is not None
-        return fastapi.responses.JSONResponse(status_code=200,
-                                              content=decision.response)
+        response = dict(decision.response)
+        # A stored or process-local stale field cannot survive deactivation.
+        response.pop('async_request_ledger_protocol_version', None)
+        if async_request_ledger.schema_available():
+            response['async_request_ledger_protocol_version'] = (
+                async_request_ledger.PROTOCOL_VERSION)
+        return fastapi.responses.JSONResponse(status_code=200, content=response)
     return await _proxy_controller_sync(service_name, request,
                                         constants.LB_CONTROLLER_SYNC_PATH)
 
@@ -357,6 +365,107 @@ async def record_load_balancer_demand(
             'prediction_time_history_accepted':
                 receipt.prediction_time_history_accepted,
         })
+
+
+@router.post(ASYNC_REQUEST_LEDGER_ROUTE_PATH, include_in_schema=False)
+async def record_async_request_ledger(
+        service_name: str, request: fastapi.Request) -> fastapi.Response:
+    """Commit exact dispatch receipts at the stable PostgreSQL boundary."""
+    service_hash = request.headers.get(constants.SERVICE_HASH_HEADER)
+    if not service_hash:
+        return fastapi.responses.JSONResponse(
+            status_code=409,
+            content={'detail': 'Service incarnation header is required.'})
+    media_type = request.headers.get('content-type', '').partition(';')[0]
+    if media_type.strip().lower() != 'application/json':
+        return fastapi.responses.JSONResponse(
+            status_code=415,
+            content={'detail': 'Ledger requests must use application/json.'})
+    try:
+        content_length = request.headers.get('content-length')
+        if (content_length is not None and int(content_length)
+                > constants.LB_ASYNC_REQUEST_LEDGER_MAX_BYTES):
+            return fastapi.responses.JSONResponse(
+                status_code=413,
+                content={'detail': 'Ledger request exceeds the size limit.'})
+    except ValueError:
+        pass
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > constants.LB_ASYNC_REQUEST_LEDGER_MAX_BYTES:
+            return fastapi.responses.JSONResponse(
+                status_code=413,
+                content={'detail': 'Ledger request exceeds the size limit.'})
+    try:
+        payload = json.loads(bytes(body))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError,
+            RecursionError):
+        return fastapi.responses.JSONResponse(
+            status_code=400,
+            content={'detail': 'Ledger request must be valid JSON.'})
+    if not isinstance(payload, dict):
+        return fastapi.responses.JSONResponse(
+            status_code=400,
+            content={'detail': 'Ledger request must be an object.'})
+    operation = payload.get('operation')
+    if not async_request_ledger.schema_available():
+        return fastapi.responses.JSONResponse(
+            status_code=503,
+            content={'detail': 'Async request ledger schema is unavailable.'})
+    read_only_bind = (operation == 'bind' and
+                      payload.get('allow_new_attempt') is False)
+    try:
+        repository = async_request_ledger.AsyncRequestLedgerRepository()
+        if operation == 'bind':
+            bind_payload = dict(payload)
+            bind_payload.pop('operation')
+            if read_only_bind:
+                receipt = await asyncio.to_thread(repository.lookup_current,
+                                                  service_name, service_hash,
+                                                  bind_payload)
+            else:
+                receipt = await asyncio.to_thread(repository.bind, service_name,
+                                                  service_hash, bind_payload)
+        elif operation == 'reject_before_dispatch':
+            if set(payload) != {
+                    'protocol_version', 'operation', 'request_id',
+                    'intent_sha256'
+            } or payload.get('protocol_version') != (
+                    async_request_ledger.PROTOCOL_VERSION):
+                raise async_request_ledger.AsyncRequestLedgerError(
+                    'Pre-dispatch rejection has an unsupported shape.')
+            receipt = await asyncio.to_thread(repository.reject_before_dispatch,
+                                              service_name, service_hash,
+                                              payload.get('request_id'),
+                                              payload.get('intent_sha256'))
+        else:
+            receipt = await asyncio.to_thread(repository.transition,
+                                              service_name, service_hash,
+                                              payload)
+    except async_request_ledger.AsyncRequestLedgerNotFound as error:
+        return fastapi.responses.JSONResponse(status_code=404,
+                                              content={'detail': str(error)})
+    except async_request_ledger.AsyncRequestLedgerConflict as error:
+        return fastapi.responses.JSONResponse(status_code=409,
+                                              content={'detail': str(error)})
+    except async_request_ledger.AsyncRequestLedgerError as error:
+        return fastapi.responses.JSONResponse(status_code=400,
+                                              content={'detail': str(error)})
+    except async_request_ledger.AsyncRequestLedgerUnavailable as error:
+        return fastapi.responses.JSONResponse(status_code=503,
+                                              content={'detail': str(error)})
+    except Exception as error:  # pylint: disable=broad-except
+        logger.exception('Failed to commit an async request receipt for %r.',
+                         service_name)
+        return fastapi.responses.JSONResponse(
+            status_code=503,
+            content={
+                'detail': 'Ledger persistence failed: '
+                          f'{type(error).__name__}'
+            })
+    return fastapi.responses.JSONResponse(status_code=200,
+                                          content=receipt.to_dict())
 
 
 @router.post(CONTROLLER_ROLE_ROUTE_PATH, include_in_schema=False)

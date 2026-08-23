@@ -2426,6 +2426,7 @@ function ServiceDetails() {
               <ServiceDetailCard
                 serviceData={currentServiceData}
                 requestHistory={replicaHistory}
+                historyLoading={historyLoading}
                 pricingLoading={pricingData.aggregateLoading}
               />
               <AcceleratorCapacityCard serviceData={currentServiceData} />
@@ -2640,7 +2641,7 @@ function formatRequestRate(value) {
   })} req/s`;
 }
 
-export function getTerminalPredictionObservationsLastHour(history) {
+export function getTerminalPredictionObservationSummaryLastHour(history) {
   if (
     history?.available !== true ||
     history?.predictionTimeHistogramVersion !== 1 ||
@@ -2665,7 +2666,7 @@ export function getTerminalPredictionObservationsLastHour(history) {
     Math.floor(history.windowEnd / bucketSeconds) * bucketSeconds;
   const windowStart = currentBucket - (60 * 60 - bucketSeconds);
   const bucketCount = history.predictionTimeBucketUpperBoundsSeconds.length + 1;
-  let total = 0;
+  const observations = { succeeded: 0, failed: 0 };
   for (const sample of history.predictionTimeSamples) {
     if (
       !Number.isFinite(sample?.timestamp) ||
@@ -2684,10 +2685,19 @@ export function getTerminalPredictionObservationsLastHour(history) {
       ) {
         return null;
       }
-      total += counts.reduce((sum, count) => sum + count, 0);
+      observations[outcome] += counts.reduce((sum, count) => sum + count, 0);
     }
   }
-  return total;
+  return {
+    ...observations,
+    total: observations.succeeded + observations.failed,
+  };
+}
+
+export function getTerminalPredictionObservationsLastHour(history) {
+  return (
+    getTerminalPredictionObservationSummaryLastHour(history)?.total ?? null
+  );
 }
 
 export function getLatestTerminalObservationReportAgeSeconds(history) {
@@ -2705,6 +2715,7 @@ export function getLatestTerminalObservationReportAgeSeconds(history) {
 export function ServiceDetailCard({
   serviceData,
   requestHistory = null,
+  historyLoading = false,
   pricingLoading = false,
 }) {
   const pastAttemptCount = getPastAttemptCount(serviceData);
@@ -2764,8 +2775,37 @@ export function ServiceDetailCard({
   const requestDetails = [];
   const requestTelemetryIsStale = serviceData.requestTelemetryState === 'stale';
   const lastReportedPrefix = requestTelemetryIsStale ? 'last reported ' : '';
+  const terminalPredictionObservationSummaryLastHour =
+    getTerminalPredictionObservationSummaryLastHour(requestHistory);
   const terminalPredictionObservationsLastHour =
-    getTerminalPredictionObservationsLastHour(requestHistory);
+    terminalPredictionObservationSummaryLastHour?.total ?? null;
+  const exactAsyncSummary =
+    requestHistory?.asyncRequestSummary?.available === true
+      ? requestHistory.asyncRequestSummary
+      : null;
+  const exactAsyncStateCounts = exactAsyncSummary?.stateCounts;
+  const exactDispatchUncertain = exactAsyncStateCounts
+    ? exactAsyncStateCounts.DISPATCH_MAY_HAVE_OCCURRED +
+      exactAsyncStateCounts.AMBIGUOUS
+    : null;
+  const exactAsyncSnapshotAgeSeconds = Number.isFinite(
+    exactAsyncSummary?.observedAt
+  )
+    ? Math.max(0, Date.now() / 1000 - exactAsyncSummary.observedAt)
+    : null;
+  const exactAsyncFreshness = exactAsyncSummary
+    ? requestHistory?.refreshUnavailable
+      ? `Exact ledger refresh failed; showing a snapshot observed ${
+          exactAsyncSnapshotAgeSeconds == null
+            ? 'at an unknown time'
+            : `${Math.round(exactAsyncSnapshotAgeSeconds)}s ago`
+        }.`
+      : exactAsyncSnapshotAgeSeconds == null
+        ? 'Exact ledger snapshot time unavailable.'
+        : `Exact ledger snapshot observed ${Math.round(
+            exactAsyncSnapshotAgeSeconds
+          )}s ago.`
+    : null;
   const latestTerminalObservationReportAgeSeconds =
     terminalPredictionObservationsLastHour == null
       ? null
@@ -2819,21 +2859,17 @@ export function ServiceDetailCard({
       `${requestHistory.requestsLastHour.toLocaleString()} requests in last hour`
     );
   }
-  if (terminalPredictionObservationsLastHour != null) {
-    requestDetails.push(
-      `${terminalPredictionObservationsLastHour.toLocaleString()} terminal prediction observations recorded in last hour`
-    );
-    requestDetails.push(
-      latestTerminalObservationReportAgeSeconds == null
-        ? 'latest terminal-observation report time unavailable'
-        : `latest terminal-observation report was ${Math.round(
-            latestTerminalObservationReportAgeSeconds
-          )}s old at this history snapshot`
-    );
-  }
   if (serviceData.requestQueueDepth != null) {
     requestDetails.push(
       `${lastReportedPrefix}${serviceData.requestQueueDepth} queued`
+    );
+  }
+  if (exactAsyncStateCounts) {
+    const coveragePrefix = 'protocol-covered ';
+    requestDetails.push(
+      `${coveragePrefix}${exactAsyncStateCounts.REJECTED_PRE_DISPATCH.toLocaleString()} pre-dispatch`,
+      `${coveragePrefix}${exactDispatchUncertain.toLocaleString()} dispatch outcome uncertain`,
+      `${coveragePrefix}${exactAsyncStateCounts.ACCEPTED.toLocaleString()} accepted (not confirmed processing)`
     );
   }
   if (serviceData.unknownInFlightReplicaCount > 0) {
@@ -2866,6 +2902,29 @@ export function ServiceDetailCard({
           : '';
     requestDetails.push(
       `request telemetry ${serviceData.requestTelemetryState}${legacySuffix}`
+    );
+  }
+  const terminalObservationDetails = [];
+  if (terminalPredictionObservationSummaryLastHour != null) {
+    terminalObservationDetails.push(
+      `${terminalPredictionObservationSummaryLastHour.succeeded.toLocaleString()} succeeded`,
+      `${terminalPredictionObservationSummaryLastHour.failed.toLocaleString()} failed`
+    );
+    if (requestHistory?.refreshUnavailable) {
+      terminalObservationDetails.push(
+        'history refresh failed; showing the last persisted one-hour snapshot'
+      );
+    } else {
+      terminalObservationDetails.push(
+        latestTerminalObservationReportAgeSeconds == null
+          ? 'latest terminal-observation report time unavailable'
+          : `latest terminal-observation report was ${Math.round(
+              latestTerminalObservationReportAgeSeconds
+            )}s old at this history snapshot`
+      );
+    }
+    terminalObservationDetails.push(
+      'load-balancer observations, not unique logical requests'
     );
   }
 
@@ -3066,6 +3125,51 @@ export function ServiceDetailCard({
               {requestDetails.length > 0 && (
                 <div className="text-xs text-gray-500 mt-1">
                   {requestDetails.join(' · ')}
+                </div>
+              )}
+            </div>
+            <div>
+              <div className="text-gray-600 font-medium text-base">
+                Unique async terminal receipts
+              </div>
+              <div className="text-base mt-1">
+                {exactAsyncSummary
+                  ? `${exactAsyncSummary.operationalTerminalReceiptTotal.toLocaleString()} protocol-covered (partial)`
+                  : historyLoading
+                    ? 'Loading...'
+                    : 'Unavailable'}
+              </div>
+              {exactAsyncSummary && (
+                <div className="text-xs text-gray-500 mt-1">
+                  {`${exactAsyncSummary.operationalTerminalReceiptsByStatus.SUCCEEDED.toLocaleString()} succeeded · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.FAILED.toLocaleString()} failed · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.CANCELLED.toLocaleString()} cancelled · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.EXPIRED.toLocaleString()} expired`}
+                </div>
+              )}
+              {exactAsyncFreshness && (
+                <div
+                  className={`text-xs mt-1 ${
+                    requestHistory?.refreshUnavailable
+                      ? 'text-amber-700'
+                      : 'text-gray-500'
+                  }`}
+                >
+                  {exactAsyncFreshness}
+                </div>
+              )}
+            </div>
+            <div>
+              <div className="text-gray-600 font-medium text-base">
+                Compatibility terminal observations (last hour)
+              </div>
+              <div className="text-base mt-1">
+                {terminalPredictionObservationsLastHour != null
+                  ? `${terminalPredictionObservationsLastHour.toLocaleString()} recorded`
+                  : historyLoading
+                    ? 'Loading...'
+                    : 'Unavailable'}
+              </div>
+              {terminalObservationDetails.length > 0 && (
+                <div className="text-xs text-gray-500 mt-1">
+                  {terminalObservationDetails.join(' · ')}
                 </div>
               )}
             </div>

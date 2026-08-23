@@ -20,6 +20,8 @@ import pytest
 import sqlalchemy
 from test_reserved_fill_allocation_pg import _commit_evidence
 from test_reserved_fill_allocation_pg import _CONTEXT
+from test_reserved_fill_allocation_pg import _CREATOR_ID
+from test_reserved_fill_allocation_pg import _CREATOR_NAME
 from test_reserved_fill_allocation_pg import _OWNER
 from test_reserved_fill_allocation_pg import _POOL_KEY
 from test_reserved_fill_allocation_pg import _publish_current_allocation
@@ -27,6 +29,7 @@ from test_reserved_fill_allocation_pg import _SERVICE
 from test_reserved_fill_allocation_pg import _SERVICE_HASH
 from test_reserved_fill_allocation_pg import _typed_fill_replica
 from test_reserved_fill_allocation_pg import _UID
+from test_reserved_fill_allocation_pg import _WORKSPACE
 from test_reserved_fill_allocation_pg import allocation_engine  # noqa: F401
 from test_reserved_fill_allocation_pg import observation_engine  # noqa: F401
 from test_reserved_fill_allocation_pg import pg_server  # noqa: F401
@@ -72,9 +75,6 @@ _CONTROLLER_PORT = 8123
 _CONTROLLER_INCARNATION = uuid.UUID('11111111-1111-4111-8111-111111111111')
 _CONTROLLER_OWNER_EPOCH = 2
 _BINDING_EPOCH = 1
-_CREATOR_ID = 'creator-tenant'
-_CREATOR_NAME = 'alice@example.com'
-_WORKSPACE = 'workspace-a'
 
 
 class _InjectedAdmissionFault(BaseException):
@@ -100,20 +100,13 @@ def atomic_database(allocation_engine, monkeypatch):
     profile_digest = ordinary_launch_binding.supported_non_pool_profile_set_digest(
     )
     with allocation_engine.begin() as connection:
-        # The allocation fixture creates a current central-birth service with a
-        # frozen owner.  This fixture specifically exercises a retained
-        # pre-Serve055 service, whose owner starts NULL and is attested once by
-        # the elected controller.  Reproduce that migration input before
-        # restoring the production immutability trigger.
-        connection.execute(
-            sqlalchemy.text('DROP TRIGGER skyserve055_service_owner_guard '
-                            'ON services'))
+        # The allocation fixture creates the permanent Serve058 owner tuple.
+        # Keep it immutable while specializing the controller/fill authority
+        # used by this suite.
         connection.execute(
             sqlalchemy.update(serve_state_schema.services_table).
             where(serve_state_schema.services_table.c.name == _SERVICE).values(
                 workspace=_WORKSPACE,
-                owner_user_id=None,
-                owner_user_name=None,
                 lifecycle_epoch=4,
                 controller_port=_CONTROLLER_PORT,
                 controller_incarnation=_CONTROLLER_INCARNATION,
@@ -146,12 +139,6 @@ def atomic_database(allocation_engine, monkeypatch):
                     _CONTROLLER_INCARNATION),
                 reserved_fill_actuation_protocol_version=1))
         connection.execute(
-            sqlalchemy.text('CREATE TRIGGER '
-                            'skyserve055_service_owner_guard BEFORE UPDATE OF '
-                            'owner_user_id, owner_user_name ON services FOR '
-                            'EACH ROW EXECUTE FUNCTION '
-                            'skyserve055_guard_service_owner()'))
-        connection.execute(
             sqlalchemy.update(
                 serve_state_schema.service_lifecycle_fences_table).where(
                     serve_state_schema.service_lifecycle_fences_table.c.name ==
@@ -162,10 +149,6 @@ def atomic_database(allocation_engine, monkeypatch):
                 _SERVICE,
                 serve_state_schema.version_specs_table.c.version == 1).values(
                     created_by=_CREATOR_NAME))
-        connection.execute(
-            sqlalchemy.insert(global_user_state_schema.user_table).values(
-                id=_CREATOR_ID, name=_CREATOR_NAME,
-                created_at=int(time.time())))
     _publish_fresh_provider_proof(allocation_engine)
     return allocation_engine
 
@@ -239,7 +222,7 @@ def _authority():
 def _atomic_specs(engine, count=1, *, image_id=None, authority=None):
     if authority is None:
         authority = _authority()
-    serve_state.attest_service_owner_user_id(authority, _CREATOR_ID,
+    serve_state.verify_service_owner_user_id(authority, _CREATOR_ID,
                                              _CREATOR_NAME)
     _publish_fresh_provider_proof(engine)
     _, snapshot = _commit_evidence(engine)
@@ -880,16 +863,17 @@ def _use_real_broker(monkeypatch, engine):
                         get_postgres_lock)
 
 
-def test_serve056_lineage_and_sqlite_ceiling() -> None:
+def test_serve058_lineage_and_sqlite_ceiling() -> None:
     sqlite = sqlalchemy.create_engine('sqlite://')
     config = migration_utils.get_alembic_config(sqlite,
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['057']
+    assert scripts.get_heads() == ['058']
+    assert scripts.get_revision('058').down_revision == '057'
     assert scripts.get_revision('056').down_revision == '055'
     assert scripts.get_revision('055').down_revision == '054'
-    assert migration_utils.SERVE_VERSION == '057'
+    assert migration_utils.SERVE_VERSION == '058'
     assert migration_utils.serve_target_version(sqlite) == '037'
     with pytest.raises(RuntimeError, match='PostgreSQL-only'):
         alembic_command.upgrade(config, '056')
@@ -916,8 +900,6 @@ def test_retained_serve054_row_migrates_null_and_055_is_forward_only(
         column['name'] for column in sqlalchemy.inspect(
             observation_engine).get_columns('services')
     })
-    assert serve_state.service_owner_attestation_transition_active()
-
     global_user_state_schema.user_table.drop(observation_engine,
                                              checkfirst=True)
     with pytest.raises(
@@ -948,7 +930,6 @@ def test_retained_serve054_row_migrates_null_and_055_is_forward_only(
                 "SELECT owner_user_id, owner_user_name FROM services "
                 "WHERE name = 'retained-svc'")).one()
     assert owner == (None, None)
-    assert serve_state.service_owner_attestation_transition_active()
     inspector = sqlalchemy.inspect(observation_engine)
     assert {'owner_user_id', 'owner_user_name'} <= {
         column['name'] for column in inspector.get_columns('services')
@@ -1048,34 +1029,27 @@ def test_serve056_retains_json_only_rows_but_rejects_new_old_writer_rows(
                     replica_state=new_state))
 
 
-def test_not_null_owner_schema_ends_global_user_deletion_transition(
-        atomic_database) -> None:
-    assert serve_state.service_owner_attestation_transition_active()
-    serve_state.attest_service_owner_user_id(_authority(), _CREATOR_ID,
-                                             _CREATOR_NAME)
-    with atomic_database.begin() as connection:
-        connection.execute(
-            sqlalchemy.text('ALTER TABLE services ALTER COLUMN '
-                            'owner_user_id SET NOT NULL'))
-        connection.execute(
-            sqlalchemy.text('ALTER TABLE services ALTER COLUMN '
-                            'owner_user_name SET NOT NULL'))
+def test_serve058_removes_owner_transition_symbols(atomic_database) -> None:
+    del atomic_database
+    assert not hasattr(serve_state, 'attest_service_owner_user_id')
+    assert not hasattr(serve_state,
+                       'service_owner_attestation_transition_active')
+    assert hasattr(serve_state, 'verify_service_owner_user_id')
 
-    assert not serve_state.service_owner_attestation_transition_active()
+
+def test_service_owner_verification_is_read_only_and_restart_safe(
+        atomic_database) -> None:
+    authority = _authority()
+    before = _owner_tuple(atomic_database)
+    assert before == (_CREATOR_ID, _CREATOR_NAME)
+    serve_state.verify_service_owner_user_id(authority, _CREATOR_ID,
+                                             _CREATOR_NAME)
+    serve_state.verify_service_owner_user_id(authority, _CREATOR_ID,
+                                             _CREATOR_NAME)
+    assert _owner_tuple(atomic_database) == before
     assert serve_state.get_service_names_owned_by_user_id(_CREATOR_ID) == [
         _SERVICE
     ]
-
-
-def test_service_owner_attestation_is_one_shot_and_restart_safe(
-        atomic_database) -> None:
-    authority = _authority()
-    assert _owner_tuple(atomic_database) == (None, None)
-    serve_state.attest_service_owner_user_id(authority, _CREATOR_ID,
-                                             _CREATOR_NAME)
-    serve_state.attest_service_owner_user_id(authority, _CREATOR_ID,
-                                             _CREATOR_NAME)
-    assert _owner_tuple(atomic_database) == (_CREATOR_ID, _CREATOR_NAME)
 
     with atomic_database.connect() as connection:
         transaction = connection.begin()
@@ -1172,19 +1146,16 @@ def test_service_owner_fk_serializes_concurrent_delete_and_service_create(
 
 @pytest.mark.parametrize('failure',
                          ['stale_controller', 'wrong_owner', 'deleted_owner'])
-def test_service_owner_attestation_fails_closed(atomic_database,
-                                                failure) -> None:
+def test_service_owner_verification_fails_closed(atomic_database,
+                                                 failure) -> None:
     authority = _authority()
     owner_id, owner_name = _CREATOR_ID, _CREATOR_NAME
-    expected_owner = (None, None)
+    expected_owner = (_CREATOR_ID, _CREATOR_NAME)
     if failure == 'stale_controller':
         authority = dataclasses.replace(
             authority,
             controller_owner_epoch=authority.controller_owner_epoch + 1)
     elif failure == 'wrong_owner':
-        serve_state.attest_service_owner_user_id(authority, _CREATOR_ID,
-                                                 _CREATOR_NAME)
-        expected_owner = (_CREATOR_ID, _CREATOR_NAME)
         owner_id, owner_name = 'wrong-owner', 'wrong@example.com'
         with atomic_database.begin() as connection:
             connection.execute(
@@ -1193,16 +1164,18 @@ def test_service_owner_attestation_fails_closed(atomic_database,
     else:
         with atomic_database.begin() as connection:
             connection.execute(
+                sqlalchemy.text('ALTER TABLE services DROP CONSTRAINT '
+                                'serve055_service_owner_user_fk'))
+            connection.execute(
                 sqlalchemy.delete(global_user_state_schema.user_table).where(
                     global_user_state_schema.user_table.c.id == _CREATOR_ID))
     with pytest.raises(serve_state.ServiceOwnerAuthorityError):
-        serve_state.attest_service_owner_user_id(authority, owner_id,
+        serve_state.verify_service_owner_user_id(authority, owner_id,
                                                  owner_name)
     assert _owner_tuple(atomic_database) == expected_owner
 
 
-def test_partial_historical_owner_tuple_is_never_auto_repaired(
-        atomic_database) -> None:
+def test_missing_owner_tuple_is_never_auto_repaired(atomic_database) -> None:
     with atomic_database.begin() as connection:
         connection.execute(
             sqlalchemy.text('DROP TRIGGER skyserve055_service_owner_guard '
@@ -1211,15 +1184,21 @@ def test_partial_historical_owner_tuple_is_never_auto_repaired(
             sqlalchemy.text('ALTER TABLE services DROP CONSTRAINT '
                             'serve055_owner_user_id_nonempty'))
         connection.execute(
+            sqlalchemy.text('ALTER TABLE services ALTER COLUMN '
+                            'owner_user_id DROP NOT NULL'))
+        connection.execute(
+            sqlalchemy.text('ALTER TABLE services ALTER COLUMN '
+                            'owner_user_name DROP NOT NULL'))
+        connection.execute(
             sqlalchemy.update(serve_state_schema.services_table).where(
                 serve_state_schema.services_table.c.name == _SERVICE).values(
-                    owner_user_id=_CREATOR_ID))
+                    owner_user_id=None, owner_user_name=None))
 
     with pytest.raises(serve_state.ServiceOwnerAuthorityError,
-                       match='malformed'):
-        serve_state.attest_service_owner_user_id(_authority(), _CREATOR_ID,
+                       match='does not match'):
+        serve_state.verify_service_owner_user_id(_authority(), _CREATOR_ID,
                                                  _CREATOR_NAME)
-    assert _owner_tuple(atomic_database) == (_CREATOR_ID, None)
+    assert _owner_tuple(atomic_database) == (None, None)
 
 
 @pytest.mark.parametrize('rejection', [

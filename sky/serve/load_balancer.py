@@ -25,6 +25,7 @@ from starlette import background
 import uvicorn
 
 from sky import sky_logging
+from sky.serve import async_request_ledger_client
 from sky.serve import constants
 from sky.serve import lb_ha
 from sky.serve import lb_ha_observability as lb_ha_obs
@@ -88,7 +89,6 @@ _REQUEST_ACTION_ATTR = '_skyserve_request_action'
 # facade used by tests and extensions while still carrying an object-identity
 # checkout across the body-buffering awaits inside that method.
 _SELECTED_REPLICA_ATTR = '_skyserve_selected_replica'
-
 _ASYNC_ACTION_PREDICT = 'async_predict'
 _ASYNC_ACTION_STATUS = 'async_status'
 _ASYNC_ACTIONS = frozenset((_ASYNC_ACTION_PREDICT, _ASYNC_ACTION_STATUS,
@@ -106,6 +106,14 @@ _ASYNC_TERMINAL_OUTCOMES = {
 # cannot later consume a replica slot. Request bodies are bounded and cached
 # before admission, so this poll cannot consume an unread body message.
 _REQUEST_QUEUE_DISCONNECT_POLL_SECONDS = 1.0
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Decode one JSON object without silently accepting duplicate members."""
+    payload = dict(pairs)
+    if len(payload) != len(pairs):
+        raise ValueError('Duplicate JSON member.')
+    return payload
 
 
 @dataclasses.dataclass
@@ -132,6 +140,10 @@ class _SelectedReplica:
     route_marker: system_recovery_route_lease.RouteMarker | None
     route_marker_generation: int | None
     require_current_route: bool
+    route_contract_service_version: int | None
+    route_projection_generation: int | None
+    route_projection_sha256: str | None
+    route_source_epoch: int | None
 
 
 class SkyServeLoadBalancer:
@@ -156,6 +168,9 @@ class SkyServeLoadBalancer:
     _lb_ha_rollout_evidence: dict[str, Any] | None
     _armed_generation: int | None
     _routing_version: int | None
+    _async_request_ledger_protocol_version: int | None
+    _async_request_ledger_client: (
+        async_request_ledger_client.AsyncRequestLedgerClient | None)
     _background_tasks: set[asyncio.Task]
     _load_balancing_policy_name: str
     _load_balancing_policy: lb_policies.LoadBalancingPolicy
@@ -324,6 +339,8 @@ class SkyServeLoadBalancer:
         # hints that do not change any backend or occupancy contract.
         self._route_occupancy_context_sha256: str | None = None
         self._route_source_epoch: int | None = None
+        self._async_request_ledger_protocol_version: int | None = None
+        self._async_request_ledger_client = None
         # Strong references to owned background tasks (the event loop only
         # holds weak references to tasks).
         self._background_tasks: set[asyncio.Task] = set()
@@ -627,12 +644,17 @@ class SkyServeLoadBalancer:
         marker = self._system_recovery_route_markers.get(url)
         marker_generation = self._system_recovery_route_marker_generations.get(
             url)
-        return _SelectedReplica(url=url,
-                                client=client,
-                                client_generation=client_generation,
-                                route_marker=marker,
-                                route_marker_generation=marker_generation,
-                                require_current_route=require_current_route)
+        return _SelectedReplica(
+            url=url,
+            client=client,
+            client_generation=client_generation,
+            route_marker=marker,
+            route_marker_generation=marker_generation,
+            require_current_route=require_current_route,
+            route_contract_service_version=self._routing_version,
+            route_projection_generation=(self._route_projection_generation),
+            route_projection_sha256=(self._route_projection_sha256),
+            route_source_epoch=self._route_source_epoch)
 
     def _checkout_selected_replica_locked(
             self, selected: _SelectedReplica) -> httpx.AsyncClient | None:
@@ -1923,16 +1945,31 @@ class SkyServeLoadBalancer:
         if drop_body:
             request_state.pop(_BOUNDED_REQUEST_BODY_ATTR, None)
 
-    async def _request_body(self, request: fastapi.Request) -> bytes:
+    async def _request_body(self,
+                            request: fastapi.Request,
+                            *,
+                            max_bytes: int | None = None) -> bytes:
         """Read a request body with the configured hard memory bound."""
         config = self._request_queue_config
-        if config is None:
-            return await request.body()
         request_state = vars(request)
         cached = request_state.get(_BOUNDED_REQUEST_BODY_ATTR)
         if cached is not None:
+            if max_bytes is not None and len(cached) > max_bytes:
+                raise fastapi.HTTPException(
+                    status_code=413,
+                    detail=f'Request body exceeds the {max_bytes}-byte load '
+                    'balancer limit.')
             return cached
-        limit = config['max_request_body_bytes']
+        configured_limit = (None if config is None else
+                            config['max_request_body_bytes'])
+        if max_bytes is None:
+            limit = configured_limit
+        elif configured_limit is None:
+            limit = max_bytes
+        else:
+            limit = min(configured_limit, max_bytes)
+        if limit is None:
+            return await request.body()
         content_length = request.headers.get('content-length')
         if content_length is not None:
             try:
@@ -1953,21 +1990,23 @@ class SkyServeLoadBalancer:
                         status_code=413,
                         detail=f'Request body exceeds the {limit}-byte load '
                         'balancer limit.')
-                next_total = self._waiting_request_body_bytes + len(chunk)
-                waiting_budget = (
-                    constants.LB_REQUEST_QUEUE_WAITING_BODY_MEMORY_BUDGET_BYTES)
-                if next_total > waiting_budget:
-                    self._record_rejection(request)
-                    raise fastapi.HTTPException(
-                        status_code=503,
-                        detail=('Load balancer request-body buffer is full '
-                                f'({waiting_budget} bytes).'),
-                        headers={
-                            'Retry-After': str(
-                                constants.LB_503_RETRY_AFTER_SECONDS)
-                        })
-                self._waiting_request_body_bytes = next_total
-                reserved += len(chunk)
+                if config is not None:
+                    next_total = self._waiting_request_body_bytes + len(chunk)
+                    waiting_budget = (
+                        constants.
+                        LB_REQUEST_QUEUE_WAITING_BODY_MEMORY_BUDGET_BYTES)
+                    if next_total > waiting_budget:
+                        self._record_rejection(request)
+                        raise fastapi.HTTPException(
+                            status_code=503,
+                            detail=('Load balancer request-body buffer is full '
+                                    f'({waiting_budget} bytes).'),
+                            headers={
+                                'Retry-After': str(
+                                    constants.LB_503_RETRY_AFTER_SECONDS)
+                            })
+                    self._waiting_request_body_bytes = next_total
+                    reserved += len(chunk)
                 body.extend(chunk)
             result = bytes(body)
             request_state[_BOUNDED_REQUEST_BODY_ATTR] = result
@@ -2332,6 +2371,218 @@ class SkyServeLoadBalancer:
         stable_job_id = request.headers.get(constants.LB_JOB_ID_HEADER)
         return isinstance(stable_job_id, str) and bool(stable_job_id)
 
+    def _parse_async_ledger_identity(
+        self,
+        request: fastapi.Request,
+        body: bytes | None = None,
+        max_body_bytes: int = constants.LB_REQUEST_QUEUE_MAX_BODY_BYTES,
+    ) -> async_request_ledger_client.AsyncLedgerIdentity | None:
+        return async_request_ledger_client.parse_identity(
+            request, self._async_request_ledger_protocol_version, body,
+            max_body_bytes)
+
+    async def _post_async_ledger(
+        self,
+        payload: dict[str,
+                      Any]) -> async_request_ledger_client.AsyncLedgerReceipt:
+        service_hash = self._service_hash
+        if service_hash is None:
+            raise async_request_ledger_client.AsyncLedgerTransportError(
+                503, 'The load balancer has no service incarnation fence.')
+        client = self._get_async_ledger_client()
+        return await client.post(payload, service_hash)
+
+    def _get_async_ledger_client(
+            self) -> async_request_ledger_client.AsyncRequestLedgerClient:
+        if self._service_hash is None:
+            raise async_request_ledger_client.AsyncLedgerTransportError(
+                503, 'The load balancer has no service incarnation fence.')
+        client = self._async_request_ledger_client
+        if client is None:
+            client = async_request_ledger_client.AsyncRequestLedgerClient(
+                self._controller_url)
+            self._async_request_ledger_client = client
+        return client
+
+    async def _lookup_async_ledger(
+        self, request: fastapi.Request,
+        identity: async_request_ledger_client.AsyncLedgerIdentity
+    ) -> async_request_ledger_client.AsyncLedgerReceipt | None:
+        receipt = await self._lookup_async_ledger_receipt(
+            identity.request_id, identity.intent_sha256)
+        if receipt is None:
+            return None
+        receipt = async_request_ledger_client.validate_lookup_receipt(
+            identity, receipt)
+        async_request_ledger_client.set_receipt(request, receipt)
+        return receipt
+
+    async def _lookup_async_ledger_receipt(
+        self, request_id: str, intent_sha256: str
+    ) -> async_request_ledger_client.AsyncLedgerReceipt | None:
+        service_hash = self._service_hash
+        if service_hash is None:
+            raise async_request_ledger_client.AsyncLedgerTransportError(
+                503, 'The load balancer has no service incarnation fence.')
+        client = self._get_async_ledger_client()
+        receipt = await client.lookup(
+            {
+                'protocol_version': constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION,
+                'operation': 'bind',
+                'request_id': request_id,
+                'intent_sha256': intent_sha256,
+                'allow_new_attempt': False,
+            }, service_hash)
+        return receipt
+
+    async def _bind_async_ledger(
+        self, request: fastapi.Request, selected: _SelectedReplica,
+        identity: async_request_ledger_client.AsyncLedgerIdentity
+    ) -> async_request_ledger_client.AsyncLedgerReceipt:
+        fields = (selected.route_contract_service_version,
+                  selected.route_projection_generation,
+                  selected.route_projection_sha256, selected.route_source_epoch)
+        if not (type(fields[0]) is int and fields[0] > 0 and type(fields[1])
+                is int and fields[1] > 0 and isinstance(fields[2], str) and
+                re.fullmatch(r'[0-9a-f]{64}', fields[2]) is not None and
+                type(fields[3]) is int and fields[3] > 0):
+            raise async_request_ledger_client.AsyncLedgerTransportError(
+                503, 'The selected route has no durable projection fence.')
+        prior_receipt = async_request_ledger_client.get_receipt(request)
+        receipt = await self._post_async_ledger({
+            'protocol_version': constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION,
+            'operation': 'bind',
+            'request_id': identity.request_id,
+            'intent_sha256': identity.intent_sha256,
+            'route_contract_service_version': fields[0],
+            'route_projection_generation': fields[1],
+            'route_projection_sha256': fields[2],
+            'route_source_epoch': fields[3],
+            'selected_route_url': selected.url,
+            'allow_new_attempt': True,
+        })
+        receipt = async_request_ledger_client.validate_bind_receipt(
+            identity, receipt, prior_receipt)
+        async_request_ledger_client.set_receipt(request, receipt)
+        return receipt
+
+    async def _transition_async_ledger(
+        self,
+        request: fastapi.Request,
+        operation: str,
+        *,
+        processing_time_us: int | None = None,
+        terminal_status: str | None = None,
+    ) -> async_request_ledger_client.AsyncLedgerReceipt:
+        identity = async_request_ledger_client.get_identity(request)
+        receipt = async_request_ledger_client.get_receipt(request)
+        if identity is None or receipt is None:
+            raise async_request_ledger_client.AsyncLedgerTransportError(
+                503, 'No exact async ledger attempt is bound.')
+        payload: dict[str, Any] = {
+            'protocol_version': constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION,
+            'operation': operation,
+            'request_id': identity.request_id,
+            'intent_sha256': identity.intent_sha256,
+            'attempt_id': receipt.attempt_id,
+            'attempt_no': receipt.attempt_no,
+            'expected_revision': receipt.revision,
+        }
+        if operation == 'terminal':
+            payload.update(processing_time_us=processing_time_us,
+                           terminal_status=terminal_status)
+        next_receipt = await self._post_async_ledger(payload)
+        next_receipt = async_request_ledger_client.validate_transition_receipt(
+            identity, receipt, next_receipt, operation)
+        async_request_ledger_client.set_receipt(request, next_receipt)
+        return next_receipt
+
+    async def _reject_async_ledger_before_dispatch(
+        self, request: fastapi.Request
+    ) -> async_request_ledger_client.AsyncLedgerReceipt | None:
+        identity = async_request_ledger_client.get_identity(request)
+        if (identity is None or
+                async_request_ledger_client.get_receipt(request) is not None):
+            return None
+        receipt = await self._post_async_ledger({
+            'protocol_version': constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION,
+            'operation': 'reject_before_dispatch',
+            'request_id': identity.request_id,
+            'intent_sha256': identity.intent_sha256,
+        })
+        receipt = async_request_ledger_client.validate_predispatch_rejection(
+            identity, receipt)
+        async_request_ledger_client.set_receipt(request, receipt)
+        return receipt
+
+    async def _predispatch_error_response(
+            self, request: fastapi.Request,
+            error: fastapi.HTTPException) -> fastapi.responses.Response:
+        """Attach an exact durable rejection or fail closed as unknown."""
+        identity = async_request_ledger_client.get_identity(request)
+        if identity is None:
+            raise error
+        receipt = async_request_ledger_client.get_receipt(request)
+        if receipt is None:
+            try:
+                receipt = await self._reject_async_ledger_before_dispatch(
+                    request)
+            except async_request_ledger_client.AsyncLedgerTransportError as ledger_error:
+                logger.warning(
+                    'Failed to persist an exact pre-dispatch '
+                    'rejection: %s', ledger_error.detail)
+                return self._unknown_ledger_outcome_response()
+        if receipt is None:
+            # A bound attempt means this exception did not precede provider
+            # dispatch.  Its existing exact transition owns the response.
+            raise error
+        if receipt.state != 'REJECTED_PRE_DISPATCH':
+            raise error
+        headers = dict(error.headers or {})
+        headers.update(self._async_ledger_receipt_headers(receipt))
+        return fastapi.responses.JSONResponse(
+            status_code=error.status_code,
+            content={
+                'detail': error.detail,
+                'async_request_ledger_receipt': dataclasses.asdict(receipt),
+            },
+            headers=headers)
+
+    @staticmethod
+    def _async_ledger_receipt_headers(
+        receipt: async_request_ledger_client.AsyncLedgerReceipt
+    ) -> dict[str, str]:
+        return {
+            constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: str(
+                constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION),
+            constants.LB_ASYNC_ATTEMPT_ID_HEADER: receipt.attempt_id,
+            constants.LB_ASYNC_ATTEMPT_NO_HEADER: str(receipt.attempt_no),
+            constants.LB_ASYNC_LEDGER_REVISION_HEADER: str(receipt.revision),
+            constants.LB_ASYNC_LEDGER_STATE_HEADER: receipt.state,
+        }
+
+    @staticmethod
+    def _unknown_ledger_outcome_response() -> fastapi.responses.Response:
+        return fastapi.responses.JSONResponse(
+            status_code=503,
+            content={
+                'detail': ('The ledger outcome could not be durably read or '
+                           'recorded; retry is not authorized.'),
+                'state': 'ledger_outcome_unknown',
+            })
+
+    def _existing_async_attempt_response(
+        self, receipt: async_request_ledger_client.AsyncLedgerReceipt
+    ) -> fastapi.responses.Response:
+        return fastapi.responses.JSONResponse(
+            status_code=409,
+            content={
+                'detail': ('A durable attempt already exists; dispatch was '
+                           'not replayed.'),
+                'async_request_ledger_receipt': dataclasses.asdict(receipt),
+            },
+            headers=self._async_ledger_receipt_headers(receipt))
+
     async def _request_uses_async_occupancy(self,
                                             request: fastapi.Request) -> bool:
         """Infer the deployed fast-ack request contract for compatibility.
@@ -2438,6 +2689,115 @@ class SkyServeLoadBalancer:
             return False
         return self._record_async_prediction_payload(payload)
 
+    async def _record_exact_async_prediction_payload(
+            self, payload: Any) -> fastapi.Response:
+        """Commit one authenticated terminal receipt before observing it."""
+        expected = {
+            'ledger_protocol_version', 'request_id', 'intent_sha256',
+            'attempt_id', 'attempt_no', 'expected_revision', 'status',
+            'processing_time_us'
+        }
+        if (not isinstance(payload, dict) or set(payload) != expected or
+                type(payload.get('ledger_protocol_version')) is not int or
+                payload.get('ledger_protocol_version')
+                != constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION):
+            raise fastapi.HTTPException(
+                status_code=422,
+                detail='Exact prediction completion payload is malformed.')
+        if self._async_request_ledger_protocol_version != (
+                constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION):
+            raise fastapi.HTTPException(
+                status_code=503,
+                detail='Async ledger authority is not synchronized.',
+                headers={
+                    'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
+                })
+        request_id = payload.get('request_id')
+        intent_sha256 = payload.get('intent_sha256')
+        attempt_id = payload.get('attempt_id')
+        attempt_no = payload.get('attempt_no')
+        expected_revision = payload.get('expected_revision')
+        try:
+            canonical_attempt_id = (str(uuid.UUID(attempt_id)) if isinstance(
+                attempt_id, str) else None)
+            request_id_utf8 = (request_id.encode('utf-8') if isinstance(
+                request_id, str) else b'')
+        except (UnicodeEncodeError, ValueError):
+            canonical_attempt_id = None
+            request_id_utf8 = b''
+        status = payload.get('status')
+        if (not isinstance(request_id, str) or not request_id_utf8 or
+                len(request_id)
+                > constants.LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS or
+                not isinstance(intent_sha256, str) or
+                re.fullmatch(r'[0-9a-f]{64}', intent_sha256) is None or
+                canonical_attempt_id != attempt_id or
+                type(attempt_no) is not int or not 1 <= attempt_no <=
+            (1 << 63) - 1 or type(expected_revision) is not int or
+                not 1 <= expected_revision <= (1 << 63) - 1 or
+                status not in ('SUCCEEDED', 'FAILED', 'CANCELLED', 'EXPIRED')):
+            raise fastapi.HTTPException(
+                status_code=422,
+                detail='Exact prediction completion payload is malformed.')
+        processing_time_us = payload.get('processing_time_us')
+        if (type(processing_time_us) is not int or processing_time_us < 0 or
+                processing_time_us > (1 << 63) - 1):
+            raise fastapi.HTTPException(
+                status_code=422,
+                detail='Exact prediction processing time is invalid.')
+        ledger_payload = {
+            'protocol_version': constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION,
+            'operation': 'terminal',
+            'request_id': payload.get('request_id'),
+            'intent_sha256': payload.get('intent_sha256'),
+            'attempt_id': payload.get('attempt_id'),
+            'attempt_no': payload.get('attempt_no'),
+            'expected_revision': payload.get('expected_revision'),
+            'terminal_status': status,
+            'processing_time_us': processing_time_us,
+        }
+        try:
+            current = await self._lookup_async_ledger_receipt(
+                payload['request_id'], payload['intent_sha256'])
+            if current is None:
+                raise async_request_ledger_client.AsyncLedgerTransportError(
+                    409, 'No durable request attempt exists.')
+            current = (
+                async_request_ledger_client.validate_terminal_lookup_receipt(
+                    payload['request_id'], payload['attempt_id'],
+                    payload['attempt_no'], payload['expected_revision'],
+                    current))
+            ledger_payload['expected_revision'] = current.revision
+            receipt = await self._post_async_ledger(ledger_payload)
+            receipt = (async_request_ledger_client.
+                       validate_terminal_observation_receipt(
+                           payload['request_id'], payload['attempt_id'],
+                           payload['attempt_no'], current.revision, status,
+                           receipt))
+        except async_request_ledger_client.AsyncLedgerTransportError as error:
+            raise fastapi.HTTPException(
+                status_code=(error.status_code
+                             if 400 <= error.status_code < 600 else 503),
+                detail=error.detail,
+                headers=({
+                    'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
+                } if error.status_code >= 500 else None)) from error
+        if not receipt.duplicate:
+            outcome = _ASYNC_TERMINAL_OUTCOMES[status]
+            self._record_prediction_time(processing_time_us / 1_000_000.0,
+                                         outcome)
+        return fastapi.Response(
+            status_code=204,
+            headers={
+                constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: str(
+                    constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION),
+                constants.LB_ASYNC_ATTEMPT_ID_HEADER: receipt.attempt_id,
+                constants.LB_ASYNC_ATTEMPT_NO_HEADER: str(receipt.attempt_no),
+                constants.LB_ASYNC_LEDGER_REVISION_HEADER: str(receipt.revision
+                                                              ),
+                constants.LB_ASYNC_LEDGER_STATE_HEADER: receipt.state,
+            })
+
     async def _prediction_completed(
             self, request: fastapi.Request) -> fastapi.Response:
         """Accept an out-of-band terminal prediction observation."""
@@ -2468,7 +2828,7 @@ class SkyServeLoadBalancer:
                                             detail='Payload is too large.')
             body.extend(chunk)
         try:
-            payload = json.loads(body)
+            payload = json.loads(body, object_pairs_hook=_unique_json_object)
         except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
             # Deeply nested JSON raises RecursionError, which is a RuntimeError
             # rather than a ValueError: an under-cap malformed body has to stay
@@ -2476,11 +2836,111 @@ class SkyServeLoadBalancer:
             raise fastapi.HTTPException(
                 status_code=422,
                 detail='Invalid prediction completion payload.') from None
+        if (isinstance(payload, dict) and 'ledger_protocol_version' in payload):
+            return await self._record_exact_async_prediction_payload(payload)
         if not self._record_async_prediction_payload(payload):
             raise fastapi.HTTPException(
                 status_code=422,
                 detail='Invalid prediction completion payload.')
         return fastapi.Response(status_code=204)
+
+    async def _async_request_receipt(
+            self, request: fastapi.Request) -> fastapi.Response:
+        """Recover one exact receipt without routing or mutating its attempt."""
+        content_type = request.headers.get('content-type', '')
+        if content_type.partition(';')[0].strip().lower() != 'application/json':
+            raise fastapi.HTTPException(status_code=415,
+                                        detail='Expected application/json.')
+        content_encoding = request.headers.get('content-encoding', '')
+        if content_encoding.strip().lower() not in ('', 'identity'):
+            raise fastapi.HTTPException(
+                status_code=415,
+                detail='Compressed receipt lookups are not supported.')
+        try:
+            content_length = request.headers.get('content-length')
+            if (content_length is not None and int(content_length)
+                    > constants.LB_ASYNC_REQUEST_LEDGER_MAX_BYTES):
+                raise fastapi.HTTPException(status_code=413,
+                                            detail='Payload is too large.')
+        except ValueError:
+            pass
+
+        body = bytearray()
+        async for chunk in request.stream():
+            if (len(body) + len(chunk)
+                    > constants.LB_ASYNC_REQUEST_LEDGER_MAX_BYTES):
+                raise fastapi.HTTPException(status_code=413,
+                                            detail='Payload is too large.')
+            body.extend(chunk)
+
+        try:
+            payload = json.loads(body, object_pairs_hook=_unique_json_object)
+        except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
+            raise fastapi.HTTPException(
+                status_code=422,
+                detail='Invalid async request receipt lookup.') from None
+        expected = {'ledger_protocol_version', 'request_id', 'intent_sha256'}
+        if (not isinstance(payload, dict) or set(payload) != expected or
+                type(payload.get('ledger_protocol_version')) is not int or
+                payload.get('ledger_protocol_version')
+                != constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION):
+            raise fastapi.HTTPException(
+                status_code=422, detail='Invalid async request receipt lookup.')
+        request_id = payload['request_id']
+        intent_sha256 = payload['intent_sha256']
+        if (not isinstance(request_id, str) or not request_id or len(request_id)
+                > constants.LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS or
+                not isinstance(intent_sha256, str) or
+                re.fullmatch(r'[0-9a-f]{64}', intent_sha256) is None):
+            raise fastapi.HTTPException(
+                status_code=422, detail='Invalid async request receipt lookup.')
+        try:
+            request_id.encode('utf-8')
+        except UnicodeEncodeError:
+            raise fastapi.HTTPException(
+                status_code=422,
+                detail='Invalid async request receipt lookup.') from None
+        if self._async_request_ledger_protocol_version != (
+                constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION):
+            raise fastapi.HTTPException(
+                status_code=503,
+                detail='Async ledger authority is not synchronized.',
+                headers={
+                    'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
+                })
+
+        protocol_headers = {
+            constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: str(
+                constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION)
+        }
+        try:
+            receipt = await self._lookup_async_ledger_receipt(
+                request_id, intent_sha256)
+            if receipt is None:
+                return fastapi.responses.JSONResponse(
+                    status_code=404,
+                    content={'detail': 'No durable request attempt exists.'},
+                    headers=protocol_headers)
+            identity = async_request_ledger_client.AsyncLedgerIdentity(
+                request_id=request_id,
+                intent_sha256=intent_sha256,
+                stable_job_id='')
+            receipt = async_request_ledger_client.validate_lookup_receipt(
+                identity, receipt)
+        except async_request_ledger_client.AsyncLedgerTransportError as error:
+            headers = dict(protocol_headers)
+            if error.status_code >= 500:
+                headers['Retry-After'] = str(
+                    constants.LB_503_RETRY_AFTER_SECONDS)
+            raise fastapi.HTTPException(
+                status_code=(error.status_code
+                             if 400 <= error.status_code < 600 else 503),
+                detail=error.detail,
+                headers=headers) from error
+        return fastapi.responses.JSONResponse(
+            status_code=200,
+            content=dataclasses.asdict(receipt),
+            headers=self._async_ledger_receipt_headers(receipt))
 
     def _begin_async_occupancy_attempt_locked(self, url: str,
                                               request: fastapi.Request) -> None:
@@ -3487,6 +3947,7 @@ class SkyServeLoadBalancer:
         route_projection_sha256: str | None = None
         route_occupancy_context_sha256: str | None = None
         route_source_epoch: int | None = None
+        async_request_ledger_protocol_version: int | None = None
 
         # Read the purpose-specific ring fresh for every sync. The primary is
         # tried first; overlap credentials are replayed only after a 401.
@@ -3643,6 +4104,16 @@ class SkyServeLoadBalancer:
                         if (isinstance(response_version, int) and
                                 not isinstance(response_version, bool)):
                             service_version = response_version
+                        raw_ledger_protocol = response_json.get(
+                            'async_request_ledger_protocol_version')
+                        if raw_ledger_protocol is not None:
+                            if raw_ledger_protocol != (
+                                    constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION):
+                                raise ValueError(
+                                    'Async request ledger protocol is '
+                                    'malformed.')
+                            async_request_ledger_protocol_version = (
+                                raw_ledger_protocol)
                         projection_fields = (
                             response_json.get('route_projection_generation'),
                             response_json.get('route_projection_sha256'),
@@ -3875,6 +4346,8 @@ class SkyServeLoadBalancer:
                     self._route_occupancy_context_sha256 = (
                         route_occupancy_context_sha256)
                     self._route_source_epoch = route_source_epoch
+                    self._async_request_ledger_protocol_version = (
+                        async_request_ledger_protocol_version)
                 for replica_url, client in client_to_close:
                     # Fire-and-forget: a drain can legitimately take as long
                     # as the longest in-flight prediction; the sync loop must
@@ -4057,7 +4530,7 @@ class SkyServeLoadBalancer:
             self._request_aggregator.prediction_time_history_snapshot())
         self._demand_report_sequence += 1
         payload = {
-            **self._ha_role_payload(),
+            **self._ha_role_payload(current_routes_only=True),
             'protocol_version': constants.LB_DEMAND_REPORT_PROTOCOL_VERSION,
             'sequence': self._demand_report_sequence,
             'reporter_session_id': self._request_history_session_id,
@@ -4235,11 +4708,24 @@ class SkyServeLoadBalancer:
                 return
             await asyncio.sleep(delay)
 
-    def _ha_role_payload(self) -> dict[str, Any]:
-        """Build a non-additive occupancy and additive HTTP role report."""
+    def _ha_role_payload(self,
+                         *,
+                         current_routes_only: bool = False) -> dict[str, Any]:
+        """Build a non-additive occupancy and additive HTTP role report.
+
+        Off-ready occupancy evidence is deliberately retained for the HA drain
+        channel: an unreachable retiring async worker is unknown, not idle.
+        The durable demand feed has a narrower identity domain, however.  Its
+        PostgreSQL route projection contains only current routing URLs, so an
+        off-ready URL there is untranslatable and invalidates the entire
+        autoscaling snapshot.  ``current_routes_only`` projects the coherent
+        locked role snapshot onto that current domain without discarding the
+        drain evidence kept in process for role heartbeats.
+        """
         with self._client_pool_lock:
             _, routing_urls, unknown_urls, sampled_urls = (
                 self._in_flight_with_draining_locked())
+            routing_set = set(routing_urls)
             http_in_flight = self._load_balancing_policy.snapshot_in_flight()
             if http_in_flight is None:
                 http_in_flight = {}
@@ -4251,6 +4737,18 @@ class SkyServeLoadBalancer:
                     getattr(client, _INFLIGHT_ATTR, 0) for client in clients)
                 if count > 0:
                     http_in_flight[url] = http_in_flight.get(url, 0) + count
+            if current_routes_only:
+                # This happens under the same routing lock as the route and
+                # projection fence snapshot below.  Contraction cannot leak a
+                # retired URL into durable demand, while expansion keeps every
+                # current unsampled async URL in the unknown set.
+                http_in_flight = {
+                    url: count
+                    for url, count in http_in_flight.items()
+                    if url in routing_set
+                }
+                unknown_urls = sorted(set(unknown_urls) & routing_set)
+                sampled_urls = sorted(set(sampled_urls) & routing_set)
             sampled_set = set(sampled_urls)
             async_occupancy = {
                 url: int(count)
@@ -4276,7 +4774,10 @@ class SkyServeLoadBalancer:
             route_projection_generation = self._route_projection_generation
             route_projection_sha256 = self._route_projection_sha256
             route_source_epoch = self._route_source_epoch
-            draining_urls = list(self._draining_clients)
+            draining_urls = [
+                url for url in self._draining_clients
+                if not current_routes_only or url in routing_set
+            ]
         # Fail closed if a live observation has generation evidence but no
         # per-url sample timestamp. The controller rejects unequal key sets.
         reported_urls = (set(async_occupancy) | set(sample_generations) |
@@ -4622,16 +5123,45 @@ class SkyServeLoadBalancer:
                 return _PreDispatchError(
                     f'Client generation or route lease for {url} is no '
                     'longer available.')
+            ledger_identity = async_request_ledger_client.get_identity(request)
+            ledger_receipt: (async_request_ledger_client.AsyncLedgerReceipt |
+                             None) = None
+            if ledger_identity is not None:
+                try:
+                    ledger_receipt = await self._bind_async_ledger(
+                        request, selected, ledger_identity)
+                except async_request_ledger_client.AsyncLedgerTransportError as error:
+                    return fastapi.responses.JSONResponse(
+                        status_code=(error.status_code if
+                                     400 <= error.status_code < 600 else 503),
+                        content={'detail': error.detail})
+                if not ledger_receipt.dispatch_authorized:
+                    # Another LB may have bound after our read-only lookup.
+                    # Return the same complete recovery receipt as the
+                    # lookup-before-route fast path; a header-only 409 would
+                    # strand the supported caller without attempt_no/state.
+                    return self._existing_async_attempt_response(ledger_receipt)
             timeout_kwargs = {
                 'connect': constants.LB_CONNECT_TIMEOUT_SECONDS,
             }
             if selected.route_marker is not None:
                 timeout_kwargs['pool'] = (
                     constants.LB_SYSTEM_RECOVERY_POOL_TIMEOUT_SECONDS)
+            upstream_headers = list(
+                self._headers_without_request_priority(request))
+            if ledger_receipt is not None:
+                upstream_headers.extend((
+                    (constants.LB_ASYNC_ATTEMPT_ID_HEADER,
+                     ledger_receipt.attempt_id),
+                    (constants.LB_ASYNC_ATTEMPT_NO_HEADER,
+                     str(ledger_receipt.attempt_no)),
+                    (constants.LB_ASYNC_LEDGER_REVISION_HEADER,
+                     str(ledger_receipt.revision)),
+                ))
             proxy_request = client.build_request(
                 request.method,
                 worker_url,
-                headers=self._headers_without_request_priority(request),
+                headers=upstream_headers,
                 content=request_body,
                 # A scalar here would ALSO set the connect timeout: with a
                 # long stream timeout (sync model servers send no bytes
@@ -4644,15 +5174,40 @@ class SkyServeLoadBalancer:
             prediction_started_at = (None
                                      if is_async_request else time.monotonic())
             proxy_response = await client.send(proxy_request, stream=True)
+            response_body_stream = proxy_response.aiter_raw()
 
-            if proxy_response.status_code in self._retriable_status_codes:
+            if (ledger_receipt is None and
+                    proxy_response.status_code in self._retriable_status_codes):
                 # "Not now" from the replica (e.g. 503 while the model
                 # warms, 429 shedding): discard and re-route. No byte has
                 # reached the client — send() returns at headers with
                 # stream=True. Slot + client refcount release via the
                 # not-released finally below.
+                # Ledger-qualified POSTs deliberately skip this branch: a
+                # provider response proves dispatch occurred but does not prove
+                # that the non-idempotent operation was rejected. They are
+                # recorded AMBIGUOUS below and returned without replay.
                 await proxy_response.aclose()
                 return _RetriableStatusError(proxy_response.status_code, url)
+
+            if ledger_receipt is not None:
+                operation = ('accepted'
+                             if 200 <= proxy_response.status_code < 300 else
+                             'ambiguous')
+                try:
+                    ledger_receipt = await self._transition_async_ledger(
+                        request, operation)
+                except async_request_ledger_client.AsyncLedgerTransportError as error:
+                    # The provider has already returned headers. Never replay
+                    # this non-idempotent request merely because the receipt
+                    # acknowledgement was lost.
+                    if operation == 'accepted':
+                        with contextlib.suppress(async_request_ledger_client.
+                                                 AsyncLedgerTransportError):
+                            await self._transition_async_ledger(
+                                request, 'ambiguous')
+                    await proxy_response.aclose()
+                    return error
 
             if prediction_started_at is not None:
                 outcome = ('succeeded'
@@ -4687,7 +5242,7 @@ class SkyServeLoadBalancer:
                     200 <= proxy_response.status_code < 300 else None)
                 stream_completed = False
                 try:
-                    async for chunk in proxy_response.aiter_raw():
+                    async for chunk in response_body_stream:
                         if status_body is not None:
                             if (len(status_body) + len(chunk) <=
                                     constants.LB_ASYNC_STATUS_BODY_MAX_BYTES):
@@ -4723,6 +5278,37 @@ class SkyServeLoadBalancer:
             upstream_raw_headers = getattr(proxy_response.headers, 'raw', None)
             if upstream_raw_headers is not None:
                 response.raw_headers = list(upstream_raw_headers)
+            if ledger_receipt is not None:
+                owned_headers = {
+                    constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER.lower().encode(
+                        'ascii'),
+                    constants.LB_ASYNC_ATTEMPT_ID_HEADER.lower().encode(
+                        'ascii'),
+                    constants.LB_ASYNC_ATTEMPT_NO_HEADER.lower().encode(
+                        'ascii'),
+                    constants.LB_ASYNC_LEDGER_REVISION_HEADER.lower().encode(
+                        'ascii'),
+                    constants.LB_ASYNC_LEDGER_STATE_HEADER.lower().encode(
+                        'ascii'),
+                }
+                response.raw_headers = [(name, value)
+                                        for name, value in response.raw_headers
+                                        if name.lower() not in owned_headers]
+                response.raw_headers.extend((
+                    (constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER.lower().encode(
+                        'ascii'),
+                     str(constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION).encode(
+                         'ascii')),
+                    (constants.LB_ASYNC_ATTEMPT_ID_HEADER.lower().encode(
+                        'ascii'), ledger_receipt.attempt_id.encode('ascii')),
+                    (constants.LB_ASYNC_ATTEMPT_NO_HEADER.lower().encode(
+                        'ascii'),
+                     str(ledger_receipt.attempt_no).encode('ascii')),
+                    (constants.LB_ASYNC_LEDGER_REVISION_HEADER.lower().encode(
+                        'ascii'), str(ledger_receipt.revision).encode('ascii')),
+                    (constants.LB_ASYNC_LEDGER_STATE_HEADER.lower().encode(
+                        'ascii'), ledger_receipt.state.encode('ascii')),
+                ))
             # Ownership of the slot transfers to the stream/background pair
             # only once the response object exists and will be returned.
             released = True
@@ -4731,6 +5317,13 @@ class SkyServeLoadBalancer:
             logger.error(f'Error when proxy request to {url}: '
                          f'{common_utils.format_exception(e)}'
                          f'\nTraceback: {traceback.format_exc()}')
+            if async_request_ledger_client.get_receipt(request) is not None:
+                operation = ('rejected' if _is_definitely_not_dispatched(e) else
+                             'ambiguous')
+                try:
+                    await self._transition_async_ledger(request, operation)
+                except async_request_ledger_client.AsyncLedgerTransportError as ledger_error:
+                    return ledger_error
             return e
         finally:
             if not released:
@@ -4743,17 +5336,59 @@ class SkyServeLoadBalancer:
     async def _proxy_with_retries(
             self, request: fastapi.Request) -> fastapi.responses.Response:
         """Try to proxy the request to the endpoint replica with retries."""
-        if self._draining:
-            # The readiness change needs time to propagate through the
-            # Kubernetes Service/ingress. Reject requests that arrive in that
-            # window instead of starting new work while this Pod terminates.
-            raise self._draining_request_error()
-        if not self._accepts_new_requests():
-            raise self._inactive_role_request_error()
-        priority = self._parse_request_priority(request)
-        setattr(request, _REQUEST_PRIORITY_ATTR, priority)
-        compatible_accelerators = self._parse_request_accelerators(request)
-        setattr(request, _REQUEST_ACCELERATORS_ATTR, compatible_accelerators)
+        ledger_body = None
+        ledger_body_max_bytes = (
+            self._request_queue_config['max_request_body_bytes']
+            if self._request_queue_config is not None else
+            constants.LB_REQUEST_QUEUE_MAX_BODY_BYTES)
+        if async_request_ledger_client.has_identity_declaration(request):
+            try:
+                ledger_body = await self._request_body(
+                    request, max_bytes=ledger_body_max_bytes)
+            except fastapi.HTTPException:
+                self._release_waiting_body_budget(request, drop_body=True)
+                raise
+        try:
+            ledger_identity = self._parse_async_ledger_identity(
+                request, ledger_body, ledger_body_max_bytes)
+        except fastapi.HTTPException:
+            # Identity is installed only after the canonical body and every
+            # header agree.  Therefore these failures have zero ledger side
+            # effects and must not be converted to durable rejections.
+            self._release_waiting_body_budget(request, drop_body=True)
+            raise
+        if ledger_identity is not None:
+            try:
+                current_receipt = await self._lookup_async_ledger(
+                    request, ledger_identity)
+            except async_request_ledger_client.AsyncLedgerTransportError as error:
+                logger.warning('Failed to read the exact current attempt: %s',
+                               error.detail)
+                self._release_waiting_body_budget(request, drop_body=True)
+                return self._unknown_ledger_outcome_response()
+            if (current_receipt is not None and
+                    current_receipt.state != 'REJECTED_PRE_DISPATCH'):
+                self._release_waiting_body_budget(request, drop_body=True)
+                return self._existing_async_attempt_response(current_receipt)
+        try:
+            if self._draining:
+                # The readiness change needs time to propagate through the
+                # Kubernetes Service/ingress. Reject requests that arrive in
+                # that window instead of starting new work while this Pod
+                # terminates.
+                raise self._draining_request_error()
+            if not self._accepts_new_requests():
+                raise self._inactive_role_request_error()
+            priority = self._parse_request_priority(request)
+            setattr(request, _REQUEST_PRIORITY_ATTR, priority)
+            compatible_accelerators = self._parse_request_accelerators(request)
+            setattr(request, _REQUEST_ACCELERATORS_ATTR,
+                    compatible_accelerators)
+        except fastapi.HTTPException as error:
+            try:
+                return await self._predispatch_error_response(request, error)
+            finally:
+                self._release_waiting_body_budget(request, drop_body=True)
         self._record_offered_arrival(request)
         # Queue-depth gauge: requests currently inside the retry handler
         # but NOT dispatched to a replica (selecting, in retry backoff).
@@ -4836,6 +5471,10 @@ class SkyServeLoadBalancer:
                 response.hold_cleanup_until_complete(_release_body)
                 body_cleanup_transferred = True
             return response
+        except fastapi.HTTPException as error:
+            if ledger_identity is not None:
+                return await self._predispatch_error_response(request, error)
+            raise
         finally:
             try:
                 if acquired_slot:
@@ -5144,6 +5783,10 @@ class SkyServeLoadBalancer:
             constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
             self._prediction_completed,
             methods=['POST'])
+        self._app.add_api_route(
+            constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
+            self._async_request_receipt,
+            methods=['POST'])
         self._app.add_api_route('/{path:path}',
                                 self._proxy_with_retries,
                                 methods=['GET', 'POST', 'PUT', 'DELETE'])
@@ -5156,6 +5799,11 @@ class SkyServeLoadBalancer:
                 handler.setFormatter(sky_logging.FORMATTER)
 
             self._start_background_loops()
+
+        @self._app.on_event('shutdown')
+        async def shutdown():
+            if self._async_request_ledger_client is not None:
+                await self._async_request_ledger_client.close()
 
         logger.info('SkyServe Load Balancer started on '
                     f'http://0.0.0.0:{self._load_balancer_port}. '

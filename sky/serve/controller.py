@@ -92,6 +92,14 @@ controller_history._bind_controller_globals(  # pylint: disable=protected-access
 
 _LbControllerFence = tuple[str, tuple[int | None, str | None], int]
 
+_REPLICA_ACCELERATOR_COUNT_FIELDS = (
+    'ready_replicas_by_accelerator',
+    'provisioning_replicas_by_accelerator',
+    'total_replicas_by_accelerator',
+    'zero_cost_ready_replicas_by_accelerator',
+    'zero_cost_total_replicas_by_accelerator',
+)
+
 
 class _StableLbRoleSnapshotRead(NamedTuple):
     """One shareable in-flight read, never a completed snapshot cache."""
@@ -741,7 +749,7 @@ class SkyServeController:
                     self._publish_route_projection)
         # Refreshed only by autoscaler/LB-sync paths that already hold a full
         # replica snapshot. Status polling reads this without new DB/API work.
-        self._replica_counts_snapshot: dict[str, int | str] | None = None
+        self._replica_counts_snapshot: dict[str, Any] | None = None
         self._app = fastapi.FastAPI(lifespan=self.lifespan)
         if not self._mark_controller_applied_version(version):
             raise RuntimeError(
@@ -1906,7 +1914,8 @@ class SkyServeController:
             raise_deferred_sync_cancellation()
             if not drain_accepted:
                 return fastapi.Response(status_code=503)
-            self._replica_counts_snapshot = replica_counts
+            replica_counts = self._snapshot_replica_counts(
+                replica_infos, replica_counts)
             capacity_hint = self._get_capacity_hint(
                 replica_infos, logical_versions, replica_counts=replica_counts)
             # Snapshot the routing contract and its version atomically.  The
@@ -3518,6 +3527,74 @@ class SkyServeController:
         counts['replica_unit'] = ('logical_slot'
                                   if logical else 'physical_backend')
         return counts
+
+    def _snapshot_replica_counts(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        replica_counts: dict[str, Any] | None = None,
+        *,
+        include_replica_capacity_projection: bool = False,
+    ) -> dict[str, Any]:
+        """Publish one demand-independent PostgreSQL replica projection.
+
+        The load-balancer report owns demand and observed routing capacity;
+        it does not own the durable replica census.  In particular, an aged
+        demand report must not freeze per-card counts or keep a pre-teardown
+        ``committed_capacity`` in ``/autoscaler/info``.
+
+        ``committed_capacity`` here is intentionally a ReplicaInfo-only
+        status projection.  It is not paid-launch authority: a fresh paid
+        planning tick independently rereads ReplicaInfo and prepares the
+        current Kueue admission classes before publishing a paid plan.  While
+        demand is stale, that planning path remains fail closed.
+        """
+        counts = (self._get_replica_counts(replica_infos)
+                  if replica_counts is None else dict(replica_counts))
+        # Explicit empty maps prevent consumers that merge status snapshots
+        # from retaining a card that disappeared from the current fleet.
+        for field in _REPLICA_ACCELERATOR_COUNT_FIELDS:
+            counts.setdefault(field, {})
+
+        autoscaler = self._autoscaler
+        if (include_replica_capacity_projection and
+                autoscaler.replica_unit == 'logical'):
+            provisioning_statuses = {
+                serve_state.ReplicaStatus.PENDING,
+                serve_state.ReplicaStatus.PROVISIONING,
+                serve_state.ReplicaStatus.STARTING,
+            }
+            committed_capacity = 0
+            provisioning_capacity = 0
+            for info in replica_infos:
+                status_property = info.status_property
+                retiring = (status_property.is_scale_down is True or getattr(
+                    status_property, 'preempted', False) is True)
+                if (info.is_terminal or
+                        info.version != autoscaler.latest_version or retiring):
+                    continue
+                width = max(0, int(info.planned_capacity))
+                committed_capacity += width
+                if info.status in provisioning_statuses:
+                    provisioning_capacity += width
+            counts['committed_capacity'] = committed_capacity
+            counts['provisioning_capacity'] = provisioning_capacity
+
+        self._replica_counts_snapshot = counts
+        return counts
+
+    def _refresh_replica_counts_snapshot(self) -> None:
+        """Refresh status from durable rows without granting actuation."""
+        try:
+            replica_infos = serve_state.get_replica_infos(self._service_name)
+            self._snapshot_replica_counts(
+                replica_infos, include_replica_capacity_projection=True)
+        except Exception as error:  # pylint: disable=broad-except
+            # A status refresh is not an authority input.  The ordinary
+            # planning path performs its own mandatory read and still fails
+            # closed if PostgreSQL is unavailable.
+            logger.warning(
+                'Could not refresh the demand-independent replica status '
+                'projection: %s', common_utils.format_exception(error))
 
     def _get_free_reserved_slots_by_accelerator(self) -> dict[str, int]:
         """Return fresh observed physical supply for cataloged free cards."""
@@ -6287,6 +6364,9 @@ class SkyServeController:
                             'Revoking durable logical reconcile authority '
                             'because its PostgreSQL snapshot is unavailable: '
                             f'{common_utils.format_exception(error)}')
+                        # Demand failure revokes actuation, but it must not
+                        # freeze the independent PostgreSQL replica census.
+                        self._refresh_replica_counts_snapshot()
                         self._durable_demand_snapshot = None
                         if not logical_reconcile_invalidated:
                             self._replica_manager.invalidate_logical_reconcile_state(
@@ -6296,6 +6376,7 @@ class SkyServeController:
                         # Stale or incomplete is unknown, never zero.  Do not
                         # reuse the last promoted snapshot for either free or
                         # paid capacity actuation.
+                        self._refresh_replica_counts_snapshot()
                         self._durable_demand_snapshot = None
                         if not logical_reconcile_invalidated:
                             self._replica_manager.invalidate_logical_reconcile_state(
@@ -6447,8 +6528,7 @@ class SkyServeController:
                 if retirement_changed:
                     replica_infos = serve_state.get_replica_infos(
                         self._service_name)
-                self._replica_counts_snapshot = self._get_replica_counts(
-                    replica_infos)
+                self._snapshot_replica_counts(replica_infos)
                 # Use the active versions set by replica manager to make
                 # sure we only scale down the outdated replicas that are
                 # not used by the load balancer.

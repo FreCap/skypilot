@@ -57,6 +57,8 @@ install_requires = [
     'pyyaml > 3.13, != 5.4.*',
     'ijson',
     'orjson',
+    # Exact pin: request-ledger identity uses this wire canonicalization.
+    'rfc8785==0.1.4',
     'requests',
     # SkyPilot inherits from uvicorn.Server to customize the behavior of
     # uvicorn, so we need to pin uvicorn version to avoid potential break

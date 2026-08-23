@@ -4480,8 +4480,33 @@ class TestAutoscalerRuntimeSnapshot:
     def test_promoted_durable_demand_unavailable_suppresses_all_actuation(self):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
-        ctrl._autoscaler = self._logical_durable_autoscaler()  # pylint: disable=protected-access
+        scaler = self._logical_durable_autoscaler()
+        scaler.get_ready_replica_capacity.side_effect = (
+            lambda info: info.planned_capacity)
+        scaler.is_replica_on_zero_cost_location.return_value = False
+        ctrl._autoscaler = scaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        ctrl._replica_counts_snapshot = {  # pylint: disable=protected-access
+            'ready_replicas': 372,
+            'total_replicas': 376,
+            'ready_replicas_by_accelerator': {
+                'L4': 372,
+            },
+            'total_replicas_by_accelerator': {
+                'L4': 376,
+            },
+            'committed_capacity': 373,
+        }
+        ready = _FakeReplicaInfo(1,
+                                 serve_state.ReplicaStatus.READY,
+                                 accelerators={'A100': 4})
+        ready.planned_capacity = 4
+        ready.resources_override = {'accelerators': {'A100': 4}}
+        provisioning = _FakeReplicaInfo(2,
+                                        serve_state.ReplicaStatus.PROVISIONING,
+                                        accelerators={'L4': 1})
+        provisioning.resources_override = {'accelerators': {'L4': 1}}
 
         with mock.patch.object(
                 controller.capacity_admission,
@@ -4492,10 +4517,32 @@ class TestAutoscalerRuntimeSnapshot:
                                'get_autoscaling_snapshot',
                                return_value=None), \
              mock.patch.object(controller.serve_state,
-                               'get_replica_infos') as get_replicas:
+                               'get_replica_infos',
+                               return_value=[ready,
+                                             provisioning]) as get_replicas, \
+             mock.patch.object(ctrl,
+                               '_publish_ordered_paid_authority') as publish:
             ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
 
-        get_replicas.assert_not_called()
+        get_replicas.assert_called_once_with('svc')
+        counts = ctrl._replica_counts_snapshot  # pylint: disable=protected-access
+        assert counts is not None
+        assert counts['ready_replicas'] == 4
+        assert counts['total_replicas'] == 5
+        assert counts['physical_ready_replicas'] == 1
+        assert counts['physical_total_replicas'] == 2
+        assert counts['ready_replicas_by_accelerator'] == {'A100': 4}
+        assert counts['provisioning_replicas_by_accelerator'] == {'L4': 1}
+        assert counts['total_replicas_by_accelerator'] == {
+            'A100': 4,
+            'L4': 1,
+        }
+        assert counts['zero_cost_ready_replicas_by_accelerator'] == {}
+        assert counts['zero_cost_total_replicas_by_accelerator'] == {}
+        assert counts['replica_unit'] == 'logical_slot'
+        assert counts['committed_capacity'] == 5
+        assert counts['provisioning_capacity'] == 1
+        publish.assert_not_called()
         ctrl._autoscaler.collect_request_information.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.update_logical_reconcile_snapshot.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.publish_logical_reconcile_state.assert_not_called()  # pylint: disable=line-too-long
@@ -4520,10 +4567,11 @@ class TestAutoscalerRuntimeSnapshot:
                                'get_autoscaling_snapshot',
                                side_effect=RuntimeError('database unavailable')), \
              mock.patch.object(controller.serve_state,
-                               'get_replica_infos') as get_replicas:
+                               'get_replica_infos',
+                               return_value=[]) as get_replicas:
             ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
 
-        get_replicas.assert_not_called()
+        get_replicas.assert_called_once_with('svc')
         assert ctrl._durable_demand_snapshot is None  # pylint: disable=protected-access
         ctrl._replica_manager.invalidate_logical_reconcile_state.assert_called_once_with()  # pylint: disable=line-too-long
 
@@ -5134,7 +5182,7 @@ class TestAutoscalerRuntimeSnapshot:
 
         accept.assert_called_once_with(allocation, scaler, 1, 0)
         read_demand.assert_called_once_with('svc', 'svc-hash')
-        get_replicas.assert_not_called()
+        get_replicas.assert_called_once_with('svc')
         get_runtime.assert_not_called()
         publish.assert_not_called()
         ctrl._replica_manager.publish_target_num_replicas.assert_not_called()

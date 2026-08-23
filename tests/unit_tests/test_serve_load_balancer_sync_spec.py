@@ -16,6 +16,7 @@ from unittest import mock
 import pytest
 
 from sky.serve import constants
+from sky.serve import lb_ha
 from sky.serve import load_balancer
 from sky.serve import load_balancing_policies as lb_policies
 
@@ -390,6 +391,87 @@ def test_durable_demand_sync_posts_directly_and_acknowledges_history():
     assert kwargs['json']['demand_window']['buckets'][0]['request_count'] == 1
     assert kwargs['timeout'].total == constants.LB_DEMAND_REPORT_TIMEOUT_SECONDS
     assert lb._request_aggregator.request_history_snapshot() is None
+
+
+@pytest.mark.parametrize('role', [lb_ha.LbRole.ACTIVE, lb_ha.LbRole.STANDBY])
+def test_durable_demand_projects_occupancy_onto_current_routes(
+        monkeypatch: pytest.MonkeyPatch, role: lb_ha.LbRole):
+    """Route contraction cannot poison demand; expansion stays unknown."""
+    monkeypatch.setenv(constants.LB_POD_UID_ENV_VAR, 'lb-pod-uid-a')
+    lb = _make_lb()
+    lb._lb_role = role
+    current = 'http://current:8080'
+    retired_sampled = 'http://retired-sampled:8080'
+    retired_unknown = 'http://retired-unknown:8080'
+    added = 'http://added:8080'
+
+    def _sync(urls):
+        _run_one_sync(
+            lb, {
+                'replica_info': {
+                    url: {
+                        'async_occupancy': 'true',
+                    } for url in urls
+                },
+                'num_ready_replicas': len(urls),
+                'routing_spec': {
+                    'load_balancing_policy_name': 'least_load',
+                },
+                'service_version': 7,
+            })
+
+    original = [current, retired_sampled, retired_unknown]
+    _sync(original)
+    with lb._client_pool_lock:
+        sample_epoch = lb._occupancy_role_epoch
+        lb._replica_occupancy = {url: 0 for url in original}
+        lb._replica_total_slots = {url: 1 for url in original}
+        lb._replica_free_slots = {url: 1 for url in original}
+        lb._occupancy_sample_generation = {url: 0 for url in original}
+        lb._occupancy_sample_time = {url: time.monotonic() for url in original}
+        lb._occupancy_sample_role_epoch = {
+            url: sample_epoch for url in original
+        }
+        lb._occupancy_current_round_sampled_urls = set(original)
+
+    _sync([current])
+    with lb._client_pool_lock:
+        # Model a post-retirement sample for one old URL and a probe miss for
+        # another. Both remain necessary drain evidence, but neither belongs
+        # to the current durable route projection.
+        lb._occupancy_sampled_off_ready = {retired_sampled}
+        lb._occupancy_current_round_sampled_urls = {current, retired_sampled}
+        draining_client = types.SimpleNamespace()
+        setattr(draining_client, load_balancer._INFLIGHT_ATTR, 2)
+        lb._draining_clients[retired_unknown] = [draining_client]
+
+    drain_report = lb._ha_role_payload()
+    assert drain_report['routing_urls'] == [current]
+    assert drain_report['unknown_in_flight_urls'] == [retired_unknown]
+    assert drain_report['occupancy_sampled_urls'] == sorted(
+        [retired_sampled, current])
+    assert drain_report['http_in_flight'][retired_unknown] == 2
+    assert drain_report['draining_urls'] == [retired_unknown]
+
+    demand_report, _, _, _ = lb._build_demand_report()
+    assert demand_report['routing_urls'] == [current]
+    assert demand_report['unknown_in_flight_urls'] == []
+    assert demand_report['occupancy_sampled_urls'] == [current]
+    assert demand_report['async_occupancy'] == {current: 0}
+    assert demand_report['occupancy_sample_generation'] == {current: 0}
+    assert demand_report['total_slots_by_url'] == {current: 1}
+    assert demand_report['http_in_flight'] == {current: 0}
+    assert demand_report['draining_urls'] == []
+
+    # A newly expanded current route has no sample yet. Filtering old URLs
+    # must not erase that uncertainty for ACTIVE or STANDBY reporters.
+    _sync([current, added])
+    expanded_report, _, _, _ = lb._build_demand_report()
+    assert expanded_report['routing_urls'] == [added, current]
+    assert expanded_report['occupancy_sampled_urls'] == [current]
+    assert expanded_report['unknown_in_flight_urls'] == [added]
+    assert expanded_report['async_occupancy'] == {current: 0}
+    assert expanded_report['total_slots_by_url'] == {current: 1}
 
 
 def test_queue_demand_capability_negotiates_and_downgrades():

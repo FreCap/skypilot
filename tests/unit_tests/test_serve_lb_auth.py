@@ -16,6 +16,8 @@ Logic-only: no assertions on log or exception message text.
 # pylint: disable=invalid-name,protected-access,missing-class-docstring
 # pylint: disable=unused-argument,use-implicit-booleaness-not-comparison
 import asyncio
+import dataclasses
+import hashlib
 import inspect
 import json
 import pickle
@@ -27,6 +29,7 @@ from fastapi.testclient import TestClient
 import httpx
 import pytest
 
+from sky.serve import async_request_ledger_client
 from sky.serve import constants
 from sky.serve import lb_ha
 from sky.serve import load_balancer
@@ -448,7 +451,9 @@ def test_sync_ring_does_not_fallback_on_non_401(monkeypatch, tmp_path):
     assert lb._request_aggregator.to_dict()['timestamps'] == [1]
 
 
-def _client_with_routes(lb) -> TestClient:
+def _client_with_routes(lb,
+                        *,
+                        include_receipt_lookup: bool = True) -> TestClient:
     """Register middleware + routes exactly like SkyServeLoadBalancer.run(), with
     a stub catch-all proxy, so tests exercise the REAL FastAPI stack (middleware
     + route matching), not just the middleware method in isolation."""
@@ -459,6 +464,10 @@ def _client_with_routes(lb) -> TestClient:
     lb._app.add_api_route(constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
                           lb._prediction_completed,
                           methods=['POST'])
+    if include_receipt_lookup:
+        lb._app.add_api_route(constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
+                              lb._async_request_receipt,
+                              methods=['POST'])
 
     async def _proxy(request: fastapi.Request):
         del request
@@ -468,6 +477,156 @@ def _client_with_routes(lb) -> TestClient:
                           _proxy,
                           methods=['GET', 'POST', 'PUT', 'DELETE'])
     return TestClient(lb._app)
+
+
+def _receipt_lookup_payload() -> dict:
+    return {
+        'ledger_protocol_version': 1,
+        'request_id': 'job-exact-1',
+        'intent_sha256': 'a' * 64,
+    }
+
+
+def test_async_receipt_lookup_is_authenticated_and_read_only(monkeypatch):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+    receipt = dataclasses.replace(_exact_completion_receipt(attempt_id),
+                                  state='ACCEPTED',
+                                  revision=2,
+                                  duplicate=True)
+    lookup = mock.AsyncMock(return_value=receipt)
+    monkeypatch.setattr(lb, '_lookup_async_ledger_receipt', lookup)
+    client = _client_with_routes(lb)
+
+    assert client.post(constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
+                       json=_receipt_lookup_payload()).status_code == 401
+    response = client.post(constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
+                           json=_receipt_lookup_payload(),
+                           headers=_edge_auth('s3cret'))
+
+    assert response.status_code == 200
+    assert response.json() == dataclasses.asdict(receipt)
+    assert response.headers[constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER] == '1'
+    assert response.headers[constants.LB_ASYNC_ATTEMPT_ID_HEADER] == attempt_id
+    assert response.headers[constants.LB_ASYNC_ATTEMPT_NO_HEADER] == '1'
+    assert response.headers[constants.LB_ASYNC_LEDGER_REVISION_HEADER] == '2'
+    assert response.headers[
+        constants.LB_ASYNC_LEDGER_STATE_HEADER] == 'ACCEPTED'
+    lookup.assert_awaited_once_with('job-exact-1', 'a' * 64)
+
+
+def test_async_receipt_lookup_advertises_exact_not_found_without_receipt(
+        monkeypatch):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    lookup = mock.AsyncMock(return_value=None)
+    monkeypatch.setattr(lb, '_lookup_async_ledger_receipt', lookup)
+    client = _client_with_routes(lb)
+
+    response = client.post(constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
+                           json=_receipt_lookup_payload(),
+                           headers=_edge_auth('s3cret'))
+
+    assert response.status_code == 404
+    assert response.json() == {'detail': 'No durable request attempt exists.'}
+    assert response.headers[constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER] == '1'
+    for header in (constants.LB_ASYNC_ATTEMPT_ID_HEADER,
+                   constants.LB_ASYNC_ATTEMPT_NO_HEADER,
+                   constants.LB_ASYNC_LEDGER_REVISION_HEADER,
+                   constants.LB_ASYNC_LEDGER_STATE_HEADER):
+        assert header not in response.headers
+    lookup.assert_awaited_once()
+
+
+def test_async_receipt_lookup_does_not_advertise_unsynchronized_authority(
+        monkeypatch):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = None
+    lookup = mock.AsyncMock()
+    monkeypatch.setattr(lb, '_lookup_async_ledger_receipt', lookup)
+    client = _client_with_routes(lb)
+
+    response = client.post(constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
+                           json=_receipt_lookup_payload(),
+                           headers=_edge_auth('s3cret'))
+
+    assert response.status_code == 503
+    assert constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER not in response.headers
+    lookup.assert_not_awaited()
+
+
+@pytest.mark.parametrize('payload', [{}, {
+    'ledger_protocol_version': True,
+    'request_id': 'job-exact-1',
+    'intent_sha256': 'a' * 64,
+}, {
+    **_receipt_lookup_payload(),
+    'extra': True,
+}, {
+    **_receipt_lookup_payload(),
+    'intent_sha256': 'not-a-digest',
+}])
+def test_async_receipt_lookup_rejects_malformed_identity(monkeypatch, payload):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    lookup = mock.AsyncMock()
+    monkeypatch.setattr(lb, '_lookup_async_ledger_receipt', lookup)
+    client = _client_with_routes(lb)
+
+    response = client.post(constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
+                           json=payload,
+                           headers=_edge_auth('s3cret'))
+
+    assert response.status_code == 422
+    lookup.assert_not_awaited()
+
+
+def test_async_receipt_lookup_rejects_duplicates_and_oversized_body(
+        monkeypatch):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    monkeypatch.setattr(constants, 'LB_ASYNC_REQUEST_LEDGER_MAX_BYTES', 256)
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    lookup = mock.AsyncMock()
+    monkeypatch.setattr(lb, '_lookup_async_ledger_receipt', lookup)
+    client = _client_with_routes(lb)
+    headers = {
+        **_edge_auth('s3cret'),
+        'content-type': 'application/json',
+    }
+
+    duplicate = client.post(
+        constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
+        content=('{' + '"ledger_protocol_version":1,' * 2 +
+                 '"request_id":"job-exact-1","intent_sha256":"' + 'a' * 64 +
+                 '"}'),
+        headers=headers)
+    oversized = client.post(constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
+                            content=b'x' * 257,
+                            headers=headers)
+
+    assert duplicate.status_code == 422
+    assert oversized.status_code == 413
+    lookup.assert_not_awaited()
+
+
+def test_old_lb_receipt_lookup_absence_never_advertises_replay_authority(
+        monkeypatch):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    client = _client_with_routes(_make_lb(), include_receipt_lookup=False)
+
+    response = client.post(constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
+                           json=_receipt_lookup_payload(),
+                           headers=_edge_auth('s3cret'))
+
+    assert response.status_code == 200
+    assert response.text == 'PROXY'
+    assert constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER not in response.headers
 
 
 def test_stack_health_get_exempt_but_proxy_requires_auth(monkeypatch):
@@ -518,6 +677,216 @@ def test_prediction_completion_callback_records_and_deduplicates(monkeypatch):
     assert counts['succeeded'][5] == 1
     assert counts['failed'][7] == 1
     assert sum(counts['succeeded']) + sum(counts['failed']) == 2
+
+
+def _exact_completion_payload(attempt_id: str) -> dict:
+    return {
+        'ledger_protocol_version': 1,
+        'request_id': 'job-exact-1',
+        'intent_sha256': 'a' * 64,
+        'attempt_id': attempt_id,
+        'attempt_no': 1,
+        'expected_revision': 4,
+        'status': 'SUCCEEDED',
+        'processing_time_us': 5_000_000,
+    }
+
+
+def _exact_completion_receipt(attempt_id: str, *, duplicate: bool = False):
+    return async_request_ledger_client.AsyncLedgerReceipt(
+        request_key_sha256=hashlib.sha256(b'job-exact-1').hexdigest(),
+        attempt_id=attempt_id,
+        attempt_no=1,
+        state='SUCCEEDED',
+        revision=5,
+        duplicate=duplicate,
+        dispatch_authorized=False)
+
+
+def _install_exact_completion_lookup(monkeypatch,
+                                     lb,
+                                     attempt_id: str,
+                                     revision: int = 4):
+    current = dataclasses.replace(_exact_completion_receipt(attempt_id),
+                                  state='ACCEPTED',
+                                  revision=revision,
+                                  duplicate=True)
+    lookup = mock.AsyncMock(return_value=current)
+    monkeypatch.setattr(lb, '_lookup_async_ledger_receipt', lookup)
+    return lookup
+
+
+def test_exact_completion_persists_before_compatibility_histogram(monkeypatch):
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+    _install_exact_completion_lookup(monkeypatch, lb, attempt_id)
+    events = []
+
+    async def _post(payload):
+        del payload
+        events.append('persist')
+        return _exact_completion_receipt(attempt_id)
+
+    monkeypatch.setattr(lb, '_post_async_ledger', _post)
+    monkeypatch.setattr(lb, '_record_prediction_time',
+                        lambda *_args: events.append('aggregate'))
+
+    response = _run(
+        lb._record_exact_async_prediction_payload(
+            _exact_completion_payload(attempt_id)))
+
+    assert response.status_code == 204
+    assert events == ['persist', 'aggregate']
+
+
+def test_exact_completion_rejects_inexact_receipt_before_histogram(monkeypatch):
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+    _install_exact_completion_lookup(monkeypatch, lb, attempt_id)
+    inexact = _exact_completion_receipt('22222222-2222-4222-8222-222222222222')
+    monkeypatch.setattr(lb, '_post_async_ledger',
+                        mock.AsyncMock(return_value=inexact))
+    record = mock.Mock()
+    monkeypatch.setattr(lb, '_record_prediction_time', record)
+
+    with pytest.raises(fastapi.HTTPException) as error:
+        _run(
+            lb._record_exact_async_prediction_payload(
+                _exact_completion_payload(attempt_id)))
+
+    assert error.value.status_code == 503
+    record.assert_not_called()
+
+
+def test_exact_completion_duplicate_does_not_double_count(monkeypatch):
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+    _install_exact_completion_lookup(monkeypatch, lb, attempt_id)
+    monkeypatch.setattr(
+        lb, '_post_async_ledger',
+        mock.AsyncMock(
+            return_value=_exact_completion_receipt(attempt_id, duplicate=True)))
+    record = mock.Mock()
+    monkeypatch.setattr(lb, '_record_prediction_time', record)
+
+    response = _run(
+        lb._record_exact_async_prediction_payload(
+            _exact_completion_payload(attempt_id)))
+
+    assert response.status_code == 204
+    record.assert_not_called()
+
+
+@pytest.mark.parametrize('status_code', [409, 503])
+def test_exact_completion_preserves_ledger_failure_status(
+        monkeypatch, status_code):
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+    _install_exact_completion_lookup(monkeypatch, lb, attempt_id)
+    monkeypatch.setattr(
+        lb, '_post_async_ledger',
+        mock.AsyncMock(
+            side_effect=(async_request_ledger_client.AsyncLedgerTransportError(
+                status_code, 'ledger failure'))))
+    record = mock.Mock()
+    monkeypatch.setattr(lb, '_record_prediction_time', record)
+
+    with pytest.raises(fastapi.HTTPException) as error:
+        _run(
+            lb._record_exact_async_prediction_payload(
+                _exact_completion_payload(attempt_id)))
+
+    assert error.value.status_code == status_code
+    assert error.value.detail == 'ledger failure'
+    if status_code == 503:
+        assert error.value.headers == {
+            'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
+        }
+    else:
+        assert error.value.headers is None
+    record.assert_not_called()
+
+
+def test_exact_completion_rejects_noncanonical_canceled_status(monkeypatch):
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+    _install_exact_completion_lookup(monkeypatch, lb, attempt_id)
+    payload = _exact_completion_payload(attempt_id)
+    payload['status'] = 'CANCELED'
+    post = mock.AsyncMock()
+    monkeypatch.setattr(lb, '_post_async_ledger', post)
+    record = mock.Mock()
+    monkeypatch.setattr(lb, '_record_prediction_time', record)
+
+    with pytest.raises(fastapi.HTTPException) as error:
+        _run(lb._record_exact_async_prediction_payload(payload))
+
+    assert error.value.status_code == 422
+    post.assert_not_awaited()
+    record.assert_not_called()
+
+
+def test_exact_completion_resolves_lb_accepted_revision_handoff(monkeypatch):
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+    lookup = _install_exact_completion_lookup(monkeypatch,
+                                              lb,
+                                              attempt_id,
+                                              revision=2)
+    payload = _exact_completion_payload(attempt_id)
+    payload['expected_revision'] = 1
+    post = mock.AsyncMock(return_value=dataclasses.replace(
+        _exact_completion_receipt(attempt_id), revision=3))
+    monkeypatch.setattr(lb, '_post_async_ledger', post)
+
+    response = _run(lb._record_exact_async_prediction_payload(payload))
+
+    assert response.status_code == 204
+    lookup.assert_awaited_once_with('job-exact-1', 'a' * 64)
+    assert post.await_args.args[0]['expected_revision'] == 2
+
+
+@pytest.mark.parametrize('body', [
+    b'{"ledger_protocol_version":true,"request_id":"job-exact-1",'
+    b'"intent_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    b'aaaaaaaaaaaaaaaa","attempt_id":"11111111-1111-4111-8111-111111111111",'
+    b'"attempt_no":1,"expected_revision":4,"status":"SUCCEEDED",'
+    b'"processing_time_us":5000000}',
+    b'{"ledger_protocol_version":1.0,"request_id":"job-exact-1",'
+    b'"intent_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    b'aaaaaaaaaaaaaaaa","attempt_id":"11111111-1111-4111-8111-111111111111",'
+    b'"attempt_no":1,"expected_revision":4,"status":"SUCCEEDED",'
+    b'"processing_time_us":5000000}',
+    b'{"ledger_protocol_version":1,"ledger_protocol_version":1,'
+    b'"request_id":"job-exact-1","intent_sha256":"aaaaaaaaaaaaaaaaaaaaaaaa'
+    b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+    b'"attempt_id":"11111111-1111-4111-8111-111111111111","attempt_no":1,'
+    b'"expected_revision":4,"status":"SUCCEEDED",'
+    b'"processing_time_us":5000000}',
+])
+def test_exact_completion_rejects_inexact_json_before_ledger(monkeypatch, body):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    lookup = mock.AsyncMock()
+    monkeypatch.setattr(lb, '_lookup_async_ledger_receipt', lookup)
+    client = _client_with_routes(lb)
+
+    response = client.post(constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+                           headers={
+                               **_edge_auth('s3cret'),
+                               'Content-Type': 'application/json',
+                           },
+                           content=body)
+
+    assert response.status_code == 422
+    lookup.assert_not_awaited()
 
 
 @pytest.mark.parametrize('payload', [{}, {
