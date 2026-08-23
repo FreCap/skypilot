@@ -24,6 +24,8 @@ LABEL org.opencontainers.image.version="${SKYPILOT_VERSION}" \
       org.opencontainers.image.revision="${SKYPILOT_COMMIT_SHA}"
 COPY --from=wheel-builder /tmp/skypilot-wheels/*.whl /tmp/skypilot-wheels/
 COPY --from=wheel-builder /tmp/policy-wheels/*.whl /tmp/policy-wheels/
-RUN python -m pip install --no-cache-dir --no-deps --force-reinstall \
+RUN python -m pip install --no-cache-dir 'rfc8785==0.1.4' && \
+    python -m pip install --no-cache-dir --no-deps --force-reinstall \
       /tmp/skypilot-wheels/*.whl /tmp/policy-wheels/*.whl && \
+    python -m pip check && \
     rm -rf /tmp/skypilot-wheels /tmp/policy-wheels
