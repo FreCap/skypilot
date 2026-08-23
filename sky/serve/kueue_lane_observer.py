@@ -280,22 +280,7 @@ def _lock_and_validate_materialization(
 ) -> tuple[kueue_lane_lineage.KueueAdmissionRepository, kueue_lane_lineage.
            KueueAdmissionIdentity, kueue_lane_lineage.KueueAdmissionRow]:
     """Lock protocol -> lifecycle/service -> intent/replica -> lineage."""
-    serve_state.lock_zero_cost_protocol_for_bound_launch_projection(connection)
-    lifecycle = connection.execute(
-        sqlalchemy.select(_LIFECYCLES.c.epoch).where(
-            _LIFECYCLES.c.name ==
-            authority.service_name).with_for_update()).scalar_one_or_none()
-    if lifecycle != authority.service_lifecycle_epoch:
-        raise kueue_lane_lineage.KueueAdmissionConflict(
-            'Kueue observation crossed the service lifecycle fence.')
-    service = connection.execute(
-        sqlalchemy.select(_SERVICES.c.hash, _SERVICES.c.lifecycle_epoch).where(
-            _SERVICES.c.name ==
-            authority.service_name).with_for_update()).one_or_none()
-    if (service is None or service.hash != authority.service_hash or
-            service.lifecycle_epoch != authority.service_lifecycle_epoch):
-        raise kueue_lane_lineage.KueueAdmissionConflict(
-            'Kueue observation lost its exact service incarnation.')
+    _lock_materialization_validation_prefix(connection, authority)
     intent = connection.execute(
         sqlalchemy.select(_INTENTS.c.intent_idempotency_key).where(
             _INTENTS.c.service_name == authority.service_name,
@@ -370,6 +355,29 @@ def _lock_and_validate_materialization(
         raise kueue_lane_lineage.KueueAdmissionConflict(
             'Kueue observation lost its complete materialized graph.')
     return repository, identity, admission
+
+
+def _lock_materialization_validation_prefix(
+    connection: sqlalchemy.engine.Connection,
+    authority: _ObservationAuthority,
+) -> None:
+    """Share-lock immutable observation fences in canonical order."""
+    serve_state.lock_zero_cost_protocol_for_bound_launch_observation(connection)
+    lifecycle = connection.execute(
+        sqlalchemy.select(_LIFECYCLES.c.epoch).where(
+            _LIFECYCLES.c.name == authority.service_name).with_for_update(
+                read=True)).scalar_one_or_none()
+    if lifecycle != authority.service_lifecycle_epoch:
+        raise kueue_lane_lineage.KueueAdmissionConflict(
+            'Kueue observation crossed the service lifecycle fence.')
+    service = connection.execute(
+        sqlalchemy.select(_SERVICES.c.hash, _SERVICES.c.lifecycle_epoch).where(
+            _SERVICES.c.name == authority.service_name).with_for_update(
+                read=True)).one_or_none()
+    if (service is None or service.hash != authority.service_hash or
+            service.lifecycle_epoch != authority.service_lifecycle_epoch):
+        raise kueue_lane_lineage.KueueAdmissionConflict(
+            'Kueue observation lost its exact service incarnation.')
 
 
 def _persisted_pod_identity_from_admission(

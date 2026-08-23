@@ -30,8 +30,10 @@ from sky.serve import zero_cost_actuation_schema
 
 zero_cost_actuation = adaptors_common.LazyImport(
     'sky.serve.zero_cost_actuation')
+serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
 
 _SERVICES = serve_state_schema.services_table
+_LIFECYCLES = serve_state_schema.service_lifecycle_fences_table
 _INTENTS = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
 _SHA256_RE = re.compile(r'[0-9a-f]{64}')
 _UNKNOWN_ADMISSION = object()
@@ -286,6 +288,7 @@ def lock_capacity_projection_in_connection(
     live_replica_record_ids: set[tuple[int, uuid.UUID]],
     provider_present_replica_record_ids: set[tuple[int, uuid.UUID]],
     live_intent_keys: set[str],
+    read: bool = False,
 ) -> KueueAdmissionCapacityProjection:
     """Lock and classify admissions against immutable intent projections.
 
@@ -305,8 +308,12 @@ def lock_capacity_projection_in_connection(
 
     repository = kueue_lane_lineage.KueueAdmissionRepository()
     try:
-        rows = repository.lock_service_admissions_in_connection(
-            connection, service_name, service_hash)
+        if read:
+            rows = repository.lock_service_admissions_in_connection(
+                connection, service_name, service_hash, read=True)
+        else:
+            rows = repository.lock_service_admissions_in_connection(
+                connection, service_name, service_hash)
     except kueue_lane_lineage.KueueAdmissionError as error:
         raise KueueAdmissionCapacityConflict(
             'Kueue admission rows could not be locked.') from error
@@ -603,14 +610,27 @@ def snapshot_replica_capacity_classes(
     try:
         engine = repository.engine
         with engine.begin() as connection:
+            # This read-only snapshot shares the same prefix as Kueue
+            # materialization observers.  Taking it before the all-intent
+            # scan removes the historical intent -> service inversion while
+            # still fencing protocol, lifecycle, and service writers.
+            serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+                connection)
+            lifecycle = connection.execute(
+                sqlalchemy.select(_LIFECYCLES.c.epoch).where(
+                    _LIFECYCLES.c.name == service_name).with_for_update(
+                        read=True)).scalar_one_or_none()
             service = connection.execute(
-                sqlalchemy.select(_SERVICES.c.hash, _SERVICES.c.lifecycle_epoch,
-                                  _SERVICES.c.current_version).where(
-                                      _SERVICES.c.name ==
-                                      service_name)).mappings().one_or_none()
-            if service is None:
+                sqlalchemy.select(
+                    _SERVICES.c.hash, _SERVICES.c.lifecycle_epoch,
+                    _SERVICES.c.current_version).where(
+                        _SERVICES.c.name == service_name).with_for_update(
+                            read=True)).mappings().one_or_none()
+            if (service is None or lifecycle is None or
+                    service['lifecycle_epoch'] != lifecycle):
                 raise KueueAdmissionCapacityConflict(
-                    'Kueue admission service owner is absent.')
+                    'Kueue admission service lifecycle owner is absent or '
+                    'inconsistent.')
             intent_rows = connection.execute(
                 sqlalchemy.select(_INTENTS).where(
                     _INTENTS.c.service_name == service_name,
@@ -667,7 +687,8 @@ def snapshot_replica_capacity_classes(
                 capacity_unit_by_intent_key=capacity_unit_by_intent,
                 live_replica_record_ids=live_records,
                 provider_present_replica_record_ids=retained_records,
-                live_intent_keys=live_intent_keys)
+                live_intent_keys=live_intent_keys,
+                read=True)
     except (sqlalchemy.exc.SQLAlchemyError,
             kueue_lane_lineage.KueueAdmissionError) as error:
         raise KueueAdmissionCapacityConflict(
