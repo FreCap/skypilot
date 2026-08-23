@@ -1,16 +1,18 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Current status (2026-08-23 07:22 UTC): `boltz-l4-fleet` lifecycle 94/version 1
+Current status (2026-08-23 07:48 UTC): `boltz-l4-fleet` lifecycle 94/version 1
 uses PostgreSQL-authoritative `DURABLE_INTENT` actuation and
-`SEQUENCED_ACTIVE` generation 35. PR #1679 is deployed as release `1.1.1449` /
+`SEQUENCED_ACTIVE` generation 36. PR #1679 is deployed as release `1.1.1449` /
 Helm revision 573 and completed the supported lifecycle-93 purge plus clean
 lifecycle-94 recreation. PR #1680 is deployed homogeneously as release
 `1.1.1450` / Helm revision 575 at merge
-`b311dd2775c150895918121cbf2b16c0ba21f5dd`; its next and only permissible
-authorization is one generation 35-to-36 active-to-active CAS after the exact
-production gates in `serve-multi-pool-reserved-capacity-fill.md`. That document
-is authoritative for live rollout state and evidence. The older phase account
-below is historical chronology and is not an executable runbook.
+`b311dd2775c150895918121cbf2b16c0ba21f5dd`; its generation-35-to-36
+active-to-active CAS is complete and must not be repeated. The next permissible
+authorization is one generation 36-to-37 CAS only after the reviewed historical-
+cleanup change is merged and deployed homogeneously and the exact preflight in
+`serve-multi-pool-reserved-capacity-fill.md` passes. That document is
+authoritative for live rollout state and evidence. The older phase account below
+is historical chronology and is not an executable runbook.
 
 Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
 #1504. PR #1521's partial-coverage in-flight observability, the complete G1S
@@ -945,6 +947,20 @@ phase. Therefore either route promotion wins while HA is STABLE and the next
 legacy cutover CAS fails its mode check, or cutover wins and route promotion
 waits then fails closed; PREPARING and MIGRATING cannot act on stale legacy
 evidence.
+
+Normal old-generation cleanup uses the same fail-closed principle without
+making the load balancer or provider part of adjudication. A pre-service-job
+reserved-fill failure may be declared already absent only when its exact
+protocol-v2 intent, replica, association, any retained terminal request, and
+`INTENT_PENDING` or `POLICY_ADMITTED` Kueue receipt remain mutually identical;
+the executor is durably quiesced; canonical provider `ABSENT` was observed no
+earlier than quiescence; no paid claim, queue row, or retention pin remains;
+the replica is off-route and unmaterialized; and the current protocol-2
+`SEQUENCED_ACTIVE` gate is strictly newer than its frozen generation. The
+decision performs no provider read and no row deletion; existing replica
+terminalization records cleanup success. Same-generation or incomplete graphs
+stay unknown. Whole-service teardown retains its separate stronger batch and
+deletion fences.
 
 Composition locks the service row; reads use one PostgreSQL transaction and
 exact-match the service hash, lifecycle epoch, controller

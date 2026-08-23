@@ -58,6 +58,17 @@ def project_exact_pod_absence_after_teardown(
     engine = serve_state_schema.get_database_engine()
     repository = kueue_lane_lineage.KueueAdmissionRepository(engine)
     with engine.connect() as connection:
+        pre_job_decision = (
+            repository.load_generation_fenced_pre_job_absence_in_connection(
+                connection,
+                service_name=service_name,
+                replica_id=replica_id,
+                replica_record_id=record_uuid))
+    pre_job_decision.validate()
+    if pre_job_decision.state is (
+            kueue_lane_lineage.PhysicalAbsenceLoadState.ALREADY_PROVEN):
+        return True
+    with engine.connect() as connection:
         decision = repository.load_exact_pod_absence_probe_target_in_connection(
             connection,
             service_name=service_name,
