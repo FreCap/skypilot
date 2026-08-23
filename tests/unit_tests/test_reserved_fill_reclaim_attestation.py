@@ -123,6 +123,43 @@ def _launch_scope(context: str = 'research') -> attestation.ReclaimLaunchScope:
     )
 
 
+def test_provider_free_pool_inventory_is_typed_and_identity_bound() -> None:
+
+    class _InventoryPolicy(_Policy):
+
+        def provider_free_pool_inventory(self):
+            return (attestation.ReclaimPoolInventoryEntry(
+                access_context='research',
+                physical_cluster_uid='uid',
+                accelerator_shapes=(('a100-80gb', 1),)),)
+
+    policy = _InventoryPolicy()
+    inventory = attestation.require_provider_free_pool_inventory(
+        policy, policy.policy_identity())
+
+    assert inventory == (attestation.ReclaimPoolInventoryEntry(
+        access_context='research',
+        physical_cluster_uid='uid',
+        accelerator_shapes=(('a100-80gb', 1),)),)
+    with pytest.raises(attestation.ReclaimAttestationError,
+                       match='does not match'):
+        attestation.require_provider_free_pool_inventory(
+            policy,
+            attestation.ReclaimPolicyIdentity(fleet_bundle_sha256='c' * 64,
+                                              policy_revision='other',
+                                              provider_inventory_sha256='d' *
+                                              64))
+
+
+def test_older_policy_without_pool_inventory_fails_closed() -> None:
+    policy = _Policy()
+
+    with pytest.raises(attestation.ReclaimAttestationError,
+                       match='could not be read'):
+        attestation.require_provider_free_pool_inventory(
+            policy, policy.policy_identity())
+
+
 def test_launch_authorization_binds_exact_provider_proof_reference() -> None:
     identity = attestation.ReclaimPolicyIdentity(
         fleet_bundle_sha256='a' * 64,

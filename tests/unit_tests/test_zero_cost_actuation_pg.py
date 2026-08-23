@@ -671,7 +671,7 @@ def test_kueue_same_domain_batch_leases_in_three_bounded_waves(
                                       lease_seconds=30)
 
 
-def test_lease_batch_requires_authority_for_complete_lease(
+def test_lease_batch_separates_execution_lease_from_grant_expiry(
         actuation_database) -> None:
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
@@ -684,11 +684,16 @@ def test_lease_batch_requires_authority_for_complete_lease(
     _install_fresh_provider_proofs(actuation_database, expiring.intents)
     owner = uuid.uuid4()
 
-    assert not repository.lease_batch(service_name='svc',
-                                      pool_key=expiring.intents[0].pool_key,
-                                      owner=owner,
-                                      lease_seconds=90)
+    leases = repository.lease_batch(service_name='svc',
+                                    pool_key=expiring.intents[0].pool_key,
+                                    owner=owner,
+                                    lease_seconds=90)
 
+    assert len(leases) == 1
+    lease = leases[0]
+    assert lease.intent.idempotency_key == expiring.intents[0].idempotency_key
+    assert lease.expires_at > zero_cost_actuation._utc_from_epoch(  # pylint: disable=protected-access
+        lease.intent.valid_until)
     intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
     admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
     with actuation_database.connect() as connection:
@@ -699,35 +704,52 @@ def test_lease_batch_requires_authority_for_complete_lease(
         retained_admission = connection.execute(
             sqlalchemy.select(admissions)).mappings().one()
     assert expiring_row[
-        'state'] == zero_cost_actuation.IntentState.TERMINAL.value
-    assert expiring_row['last_error'] == 'insufficient_actuation_window'
+        'state'] == zero_cost_actuation.IntentState.ACTUATING.value
+    assert expiring_row['lease_owner'] == owner
+    assert expiring_row['terminal_at'] is None
     assert retained_admission['intent_idempotency_key'] == (
         expiring.intents[0].idempotency_key)
 
-    fresh = _plan(free_slots=1,
-                  context='phx',
-                  physical_uid='uid-phx',
-                  kueue=True,
-                  valid_until=time.time() + 180)
-    assert fresh.intents[0].idempotency_key != (
-        expiring.intents[0].idempotency_key)
-    assert len(_grant_plan(repository, fresh, max_capacity=1).accepted) == 1
-    _install_fresh_provider_proofs(actuation_database, fresh.intents)
-
-    fresh_leases = repository.lease_batch(service_name='svc',
-                                          pool_key=fresh.intents[0].pool_key,
-                                          owner=owner,
-                                          lease_seconds=90)
-
-    assert len(fresh_leases) == 1
-    assert fresh_leases[0].intent.idempotency_key == (
-        fresh.intents[0].idempotency_key)
+    info = _replica_for_intent(lease.intent, 1)
+    with actuation_database.begin() as connection:
+        _commit_and_insert_replica(connection, lease, info)
     with actuation_database.connect() as connection:
-        admission_keys = tuple(
-            connection.execute(
-                sqlalchemy.select(
-                    admissions.c.intent_idempotency_key)).scalars())
-    assert admission_keys == (fresh.intents[0].idempotency_key,)
+        state = connection.execute(
+            sqlalchemy.select(intents.c.state).where(
+                intents.c.intent_idempotency_key ==
+                expiring.intents[0].idempotency_key)).scalar_one()
+    assert state == zero_cost_actuation.IntentState.COMMITTED.value
+
+
+def test_short_authority_lease_cannot_commit_after_grant_expiry(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1, valid_until=time.time() + 0.3)
+    assert len(_grant_plan(repository, plan, max_capacity=1).accepted) == 1
+    _install_fresh_provider_proofs(actuation_database, plan.intents)
+    lease = repository.lease_next(service_name='svc',
+                                  pool_key=plan.intents[0].pool_key,
+                                  owner=uuid.uuid4(),
+                                  lease_seconds=90)
+    assert lease is not None
+    info = _replica_for_intent(lease.intent, 1)
+    time.sleep(0.4)
+
+    with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict):
+        with actuation_database.begin() as connection:
+            _commit_and_insert_replica(connection, lease, info)
+
+    assert not repository.actionable_pool_keys(service_name='svc')
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    with actuation_database.connect() as connection:
+        row = connection.execute(sqlalchemy.select(intents)).mappings().one()
+        replica_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.replicas_table)).scalar_one()
+    assert row['state'] == zero_cost_actuation.IntentState.TERMINAL.value
+    assert row['last_error'] == 'grant_expired'
+    assert replica_count == 0
 
 
 def test_lease_batch_preserves_active_short_authority_lease(

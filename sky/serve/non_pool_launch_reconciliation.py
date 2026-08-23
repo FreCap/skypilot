@@ -28,6 +28,23 @@ class ProviderObservation:
     payload: dict[str, Any]
 
 
+def _reserved_fill_observation_payload(
+    context: ordinary_launch_binding.BoundNonPoolLaunchContext,
+    replica_info: Any,
+    fence: reserved_capacity.ProtocolV2CleanupFence,
+) -> dict[str, Any]:
+    """Build the canonical exact reserved-fill provider evidence payload."""
+    return {
+        'association_id': str(context.association_id),
+        'cluster_name': getattr(replica_info, 'cluster_name', None),
+        'kubernetes_context': fence.kubernetes_context,
+        'physical_cluster_uid': fence.physical_cluster_uid,
+        'probe_contract': 'kubernetes-physical-replica-presence-v1',
+        'profile_kind': context.profile.kind.value,
+        'replica_record_id': str(context.replica_record_id),
+    }
+
+
 def observe_provider(
     context: ordinary_launch_binding.BoundNonPoolLaunchContext,
     replica_info: Any,
@@ -69,11 +86,7 @@ def observe_provider(
                 'reason': 'missing-provider-identity',
             })
 
-    base.update({
-        'kubernetes_context': fence.kubernetes_context,
-        'physical_cluster_uid': fence.physical_cluster_uid,
-        'probe_contract': 'kubernetes-physical-replica-presence-v1',
-    })
+    base = _reserved_fill_observation_payload(context, replica_info, fence)
     current_uid = reserved_capacity.get_kubernetes_physical_cluster_uid(
         fence.kubernetes_context, force_refresh=True)
     if current_uid is None:
@@ -106,6 +119,81 @@ def observe_provider(
     })
 
 
+def observe_post_teardown_absence_receipt(
+    context: ordinary_launch_binding.BoundNonPoolLaunchContext,
+    replica_info: Any,
+    receipt: reserved_capacity.ProtocolV2PhysicalAbsenceReceipt,
+) -> ProviderObservation:
+    """Authenticate an already-observed exact post-teardown ABSENT result.
+
+    The teardown worker obtained this receipt from the uncached provider read
+    performed under the replica's immutable physical-cluster fence. Reusing it
+    here prevents a second provider read from turning proven absence back into
+    transient UNKNOWN.
+    """
+    if not isinstance(receipt,
+                      reserved_capacity.ProtocolV2PhysicalAbsenceReceipt):
+        raise TypeError('receipt must be a protocol-v2 absence receipt.')
+    if (context.profile.kind
+            != ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Post-teardown physical absence requires a reserved-fill profile.')
+    try:
+        fence = reserved_capacity.parse_protocol_v2_cleanup_fence(replica_info)
+    except Exception as error:  # pylint: disable=broad-except
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Post-teardown physical absence lost its durable provider '
+            'identity.') from error
+    if (fence is None or
+            receipt.cleanup_fence != fence or receipt.cluster_name != getattr(
+                replica_info, 'cluster_name', None)):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Post-teardown physical absence does not match the exact '
+            'reserved-fill replica.')
+    return ProviderObservation(
+        ordinary_launch_binding.ProviderEvidence.ABSENT, {
+            **_reserved_fill_observation_payload(context, replica_info, fence),
+            'result': reserved_capacity.PhysicalReplicaPresence.ABSENT.value,
+        })
+
+
+def _reduce_observation(
+    context: ordinary_launch_binding.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding.ControllerBindingAuthority,
+    project_replica_result: Callable[..., bool],
+    observation: ProviderObservation,
+) -> None:
+    """Persist and reduce one already-completed exact provider observation."""
+    request_postgres.record_bound_non_pool_provider_evidence(
+        context, authority, observation.evidence, observation.payload)
+    if observation.evidence == ordinary_launch_binding.ProviderEvidence.ABSENT:
+        request_postgres.project_bound_non_pool_provider_absence(
+            context, authority, project_replica_result=project_replica_result)
+    elif (observation.evidence ==
+          ordinary_launch_binding.ProviderEvidence.PRESENT):
+        request_postgres.authorize_bound_non_pool_provider_present_cleanup(
+            context, authority, project_replica_result=project_replica_result)
+
+
+def reconcile_post_teardown_absence(
+    context: ordinary_launch_binding.BoundNonPoolLaunchContext,
+    replica_info: Any,
+    authority: ordinary_launch_binding.ControllerBindingAuthority,
+    project_replica_result: Callable[..., bool],
+    receipt: reserved_capacity.ProtocolV2PhysicalAbsenceReceipt,
+) -> ProviderObservation:
+    """Project one exact post-teardown receipt without provider reread."""
+    if not request_postgres.bound_non_pool_provider_reconciliation_ready(
+            context, authority):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider reconciliation is waiting for exact request '
+            'quiescence.')
+    observation = observe_post_teardown_absence_receipt(context, replica_info,
+                                                        receipt)
+    _reduce_observation(context, authority, project_replica_result, observation)
+    return observation
+
+
 def reconcile(
     context: ordinary_launch_binding.BoundNonPoolLaunchContext,
     replica_info: Any,
@@ -135,13 +223,5 @@ def reconcile(
                 'source': 'durable-provider-evidence',
             })
     observation = observe_provider(context, replica_info)
-    request_postgres.record_bound_non_pool_provider_evidence(
-        context, authority, observation.evidence, observation.payload)
-    if observation.evidence == ordinary_launch_binding.ProviderEvidence.ABSENT:
-        request_postgres.project_bound_non_pool_provider_absence(
-            context, authority, project_replica_result=project_replica_result)
-    elif (observation.evidence ==
-          ordinary_launch_binding.ProviderEvidence.PRESENT):
-        request_postgres.authorize_bound_non_pool_provider_present_cleanup(
-            context, authority, project_replica_result=project_replica_result)
+    _reduce_observation(context, authority, project_replica_result, observation)
     return observation

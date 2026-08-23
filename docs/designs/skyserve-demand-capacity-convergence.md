@@ -323,7 +323,7 @@ after P2c/P2d and receives a migration number only if its concrete diff needs
 one. Serve054 belongs solely to the reserved-fill provider-proof receipt in
 `serve-multi-pool-reserved-capacity-fill.md`.
 
-Last updated: 2026-08-20
+Last updated: 2026-08-23
 
 Canonical owner: this file for request telemetry ingestion, paid-capacity
 admission, and the user-visible demand/capacity contract. Durable non-pool
@@ -751,6 +751,41 @@ generation's head with the newest receipt generation/watermark, and preserves
 bounded queued work. Every fresh promoted reconcile publishes, including a
 zero target; a demand drop therefore mints a zero-residual generation that
 revokes the prior head.
+
+For a `DURABLE_INTENT` service, every positive plan is
+`ALLOCATION_BOUND`: its content-hashed payload contains the canonical full
+`ReservedFillAllocationIdentity` that was current for that reconcile. An
+all-zero plan is instead an explicit `UNBOUND_ZERO_REVOCATION`, so revoking a
+stale paid head never depends on retaining an allocation. Non-durable services
+and elected immutable service versions with reserved fill disabled use the
+explicit `NOT_APPLICABLE` mode. Publication and claim validation lock and
+decode the server-owned current `version_specs.spec`; they never infer feature
+enablement from the always-durable mechanism column or reparse task YAML.
+These modes are exact: a positive fill-enabled plan without an allocation
+binding, including a plan written before this field existed, fails closed after
+durable-intent promotion; zero revocations cannot authorize a paid claim.
+
+Positive plan publication, initial paid-claim admission, and every paid
+provider-start validation linearize with allocation replacement under the
+canonical lock order: protocol observation `SHARE`, lifecycle when applicable,
+service `FOR UPDATE`, service-local rows, exact current-allocation validation,
+then capacity and plan-head rows. This includes retained protocol-v1 effects
+and replacement or recovery profiles whose locked funding is a paid claim;
+direct-mode legacy claims retain their existing compatibility only until the
+durable selectors activate. Validation uses
+`read_current_in_connection()` in that transaction and requires the bound
+identity to equal the complete current identity, including generation and
+digest. If allocation replacement owns the protocol lock first, the old plan
+or claim is rejected after the successor commits. If provider-start validation
+owns it first, that already-validated effect may start and the writer follows.
+The validator carries the minimum plan-head, route-head, demand-report, and
+allocation-snapshot freshness horizon through request/queue and retention-pin
+locking, then samples the PostgreSQL clock once more at the literal provider
+boundary; time spent waiting on any downstream lock cannot outlive authority.
+The controller publishes an unbound zero revocation and returns before
+optimistic planning whenever a sequenced durable observation has no current
+allocation, preventing a planning early-return from preserving an obsolete
+positive paid head.
 
 A paid claim persists plan generation/digest, source demand receipt generation,
 demand-source epoch, canonical accelerator accounting class, and positive
@@ -1560,6 +1595,9 @@ Automated tests must cover:
 - zero-cost acceptance before paid planning, commit races, deferred fill,
   stale broker observation, demand expiry before provider I/O, and strict
   reserved-fill no-paid-spill;
+- allocation-bound positive plan publication, explicit unbound zero
+  revocation, pre-binding durable-plan rejection, successor-allocation races,
+  and provider-start protocol-lock linearization;
 - no paid Spot or On-Demand request at zero/stale/unavailable demand;
 - provider-free route reads and publication, per-replica lease expiry/revocation,
   atomic generation replacement, one poisoned row, provider stall, controller

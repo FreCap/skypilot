@@ -5696,6 +5696,11 @@ def try_add_replica_with_paid_capacity_claim(
     engine = _db_manager.get_engine()
     reconcile_waiters = False
     with orm.Session(engine) as session:
+        # A planner-bound claim may carry reserved-fill allocation authority.
+        # Share-lock the global protocol before the service/pool rows so claim
+        # admission composes with allocation writers in canonical order.
+        lock_zero_cost_protocol_for_bound_launch_observation(
+            session.connection())
         if not _lock_service_owner_in_session(session,
                                               service_name,
                                               service_hash,
@@ -5832,7 +5837,8 @@ def try_add_replica_with_paid_capacity_claim(
                 is not None or
                 transaction_replica_info.unknown_capacity_replacement or
                 transaction_replica_info.system_recovery_launch_intent
-                is not None))
+                is not None),
+            protocol_and_service_prelocked=True)
         if is_existing_claim:
             existing_replica = session.execute(
                 sqlalchemy.select(

@@ -3,6 +3,7 @@
 
 import dataclasses
 import datetime
+import pickle
 import threading
 import time
 import types
@@ -32,6 +33,7 @@ from sky.serve import route_projection
 from sky.serve import route_projection_schema
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
+from sky.serve import service_spec
 from sky.serve import zero_cost_actuation_schema
 from sky.utils import common_utils
 from sky.utils.db import migration_utils
@@ -84,6 +86,23 @@ _CAPACITY_EAST_PROJECTION = {
 }
 _CAPACITY_EAST_PROJECTION_SHA256 = (
     kubernetes_identity.worker_projection_sha256(_CAPACITY_EAST_PROJECTION))
+
+
+def _capacity_service_spec(
+        reserved_fill_enabled: bool) -> service_spec.SkyServiceSpec:
+    return service_spec.SkyServiceSpec(
+        readiness_path='/health',
+        initial_delay_seconds=0,
+        readiness_timeout_seconds=5,
+        endpoint_probe_interval_seconds=1,
+        lb_stream_timeout_seconds=10,
+        min_replicas=0,
+        max_replicas=10,
+        target_concurrency_per_replica=1,
+        lb_high_availability=False,
+        reserved_capacity_fill=reserved_fill_enabled)
+
+
 _COPIED_ADMISSION_MUTATIONS = (
     ('intent_idempotency_key', '0' * 64),
     ('unresolved_domain_sha256', '0' * 64),
@@ -254,6 +273,12 @@ def capacity_database(empty_postgres, monkeypatch):
                 ordinary_launch_binding_capable=True,
                 ordinary_launch_binding_mode='bound',
                 ordinary_launch_binding_epoch=2))
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.version_specs_table).values(
+                service_name='svc',
+                version=1,
+                spec=pickle.dumps(_capacity_service_spec(False), protocol=4),
+                yaml_content='service: {}\n'))
         ordinary_launch_binding.promote_non_pool_launch_service_in_connection(
             connection,
             service_name='svc',
@@ -303,7 +328,9 @@ def capacity_database(empty_postgres, monkeypatch):
 def _plan(
     demand_target: int,
     *,
-    normalized_demand: dict | None = None
+    normalized_demand: dict | None = None,
+    reserved_fill_authority: (capacity_admission.ReservedFillPlanAuthority |
+                              None) = None,
 ) -> capacity_admission.CapacityPlanInput:
     snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
     assert snapshot is not None
@@ -320,7 +347,10 @@ def _plan(
         route_source_epoch=snapshot.route_source_epoch,
         normalized_demand=(snapshot.normalized_demand
                            if normalized_demand is None else normalized_demand),
-        capacity_target_by_accelerator={'l4': demand_target})
+        capacity_target_by_accelerator={'l4': demand_target},
+        reserved_fill_authority=(
+            capacity_admission.ReservedFillPlanAuthority.not_applicable()
+            if reserved_fill_authority is None else reserved_fill_authority))
 
 
 def _replica_values(replica_id: int,
@@ -690,6 +720,73 @@ def _allocation_identity(
         reclaim_provider_inventory_sha256='b' * 64)
 
 
+def _enable_durable_intent(engine,
+                           incarnation,
+                           *,
+                           reserved_fill_enabled: bool = True) -> None:
+    with engine.begin() as connection:
+        result = connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    reserved_fill_actuation_mode='DURABLE_INTENT',
+                    reserved_fill_actuation_epoch=1,
+                    reserved_fill_actuation_capable=True,
+                    reserved_fill_actuation_controller_incarnation=incarnation,
+                    reserved_fill_actuation_protocol_version=1))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version ==
+                1).values(spec=pickle.dumps(
+                    _capacity_service_spec(reserved_fill_enabled), protocol=4)))
+    assert result.rowcount == 1
+
+
+def _validate_prospective_claim(engine, claim) -> None:
+    with engine.begin() as connection:
+        serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+            connection)
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        capacity_admission.validate_paid_claim_in_connection(
+            connection,
+            service,
+            claim,
+            prospective=True,
+            protocol_and_service_prelocked=True)
+
+
+def _mock_current_allocation(monkeypatch,
+                             identity,
+                             *,
+                             callback=None,
+                             pool_snapshots=()) -> None:
+
+    def _read_current(_repository,
+                      connection,
+                      service_name,
+                      expected_service_hash,
+                      expected_controller_owner,
+                      *,
+                      protocol_and_service_prelocked=False):
+        assert connection.in_transaction()
+        assert service_name == 'svc'
+        assert expected_service_hash == 'svc-hash'
+        assert expected_controller_owner == (123, '10.0.0.5')
+        assert protocol_and_service_prelocked is True
+        if callback is not None:
+            callback()
+        current_identity = identity() if callable(identity) else identity
+        return types.SimpleNamespace(identity=current_identity,
+                                     pool_snapshots=pool_snapshots)
+
+    monkeypatch.setattr(
+        serve_state.reserved_fill_allocation.ReservedFillAllocationRepository,
+        'read_current_in_connection', _read_current)
+
+
 def test_serve050_schema_and_promotion_are_explicit(capacity_database):
     engine, incarnation, _ = capacity_database
     inspector = sqlalchemy.inspect(engine)
@@ -711,6 +808,264 @@ def test_serve050_schema_and_promotion_are_explicit(capacity_database):
                 serve_state_schema.services_table.c.
                 demand_authority_controller_incarnation)).one()
     assert service == ('DURABLE_FEED', 1, incarnation)
+
+
+@pytest.mark.parametrize('target', [0, 1])
+def test_fill_disabled_durable_service_uses_not_applicable(
+        capacity_database, target):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(target))
+
+    assert (authority.reserved_fill_authority.mode
+            is capacity_admission.ReservedFillPlanAuthorityMode.NOT_APPLICABLE)
+
+
+def test_fill_enabled_direct_plan_fails_after_durable_activation(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).
+            values(spec=pickle.dumps(_capacity_service_spec(True), protocol=4)))
+    direct_authority = (
+        capacity_admission.CapacityAdmissionRepository(engine).publish(
+            _plan(1)))
+    assert (direct_authority.reserved_fill_authority.mode
+            is capacity_admission.ReservedFillPlanAuthorityMode.NOT_APPLICABLE)
+
+    _enable_durable_intent(engine, incarnation)
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='exact current reserved-fill allocation'):
+        _validate_prospective_claim(engine, direct_authority.claim_values('l4'))
+
+
+def test_durable_plan_modes_are_exact(capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    identity = _allocation_identity()
+    _enable_durable_intent(engine, incarnation)
+    _mock_current_allocation(monkeypatch, identity)
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='actuation mode and target'):
+        capacity_admission.CapacityAdmissionRepository(engine).publish(_plan(1))
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='actuation mode and target'):
+        capacity_admission.CapacityAdmissionRepository(engine).publish(
+            _plan(0,
+                  reserved_fill_authority=(
+                      capacity_admission.ReservedFillPlanAuthority.
+                      not_applicable())))
+
+    zero = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(
+            0,
+            reserved_fill_authority=(
+                capacity_admission.ReservedFillPlanAuthority.zero_revocation()
+            )))
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                **_replica_values(17, zero_cost=True)))
+    positive = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(
+            1,
+            reserved_fill_authority=(
+                capacity_admission.ReservedFillPlanAuthority.bound(identity))))
+
+    assert (zero.reserved_fill_authority.mode is capacity_admission.
+            ReservedFillPlanAuthorityMode.UNBOUND_ZERO_REVOCATION)
+    assert positive.reserved_fill_authority.allocation == identity
+    assert not positive.paid_residual_by_accelerator
+
+
+def test_pre_binding_positive_plan_fails_closed_after_durable_promotion(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+    plans = capacity_admission_schema.serve_capacity_plans_table
+    with engine.begin() as connection:
+        payload = dict(
+            connection.execute(
+                sqlalchemy.select(plans.c.payload).where(
+                    plans.c.service_name == 'svc',
+                    plans.c.generation == authority.generation)).scalar_one())
+        payload.pop('reserved_fill_authority')
+        legacy_digest = capacity_admission._sha256(payload)
+        connection.execute(
+            sqlalchemy.update(plans).where(
+                plans.c.service_name == 'svc',
+                plans.c.generation == authority.generation).values(
+                    payload=payload, content_sha256=legacy_digest))
+    _enable_durable_intent(engine, incarnation)
+    claim = authority.claim_values('l4')
+    claim['capacity_plan_sha256'] = legacy_digest
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='reserved-fill plan authority'):
+        _validate_prospective_claim(engine, claim)
+
+
+def test_present_null_binding_is_not_legacy_compatible(capacity_database):
+    engine, _, _ = capacity_database
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+    plans = capacity_admission_schema.serve_capacity_plans_table
+    with engine.begin() as connection:
+        payload = dict(
+            connection.execute(
+                sqlalchemy.select(plans.c.payload).where(
+                    plans.c.service_name == 'svc',
+                    plans.c.generation == authority.generation)).scalar_one())
+        payload['reserved_fill_authority'] = None
+        malformed_digest = capacity_admission._sha256(payload)
+        connection.execute(
+            sqlalchemy.update(plans).where(
+                plans.c.service_name == 'svc',
+                plans.c.generation == authority.generation).values(
+                    payload=payload, content_sha256=malformed_digest))
+    claim = authority.claim_values('l4')
+    claim['capacity_plan_sha256'] = malformed_digest
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='reserved-fill plan authority'):
+        _validate_prospective_claim(engine, claim)
+
+
+def test_allocation_bound_paid_validation_holds_protocol_share(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    identity = _allocation_identity()
+    _enable_durable_intent(engine, incarnation)
+    validation_entered = threading.Event()
+    release_validation = threading.Event()
+
+    def _pause_validation():
+        if threading.current_thread().name == 'paid-validator':
+            validation_entered.set()
+            assert release_validation.wait(timeout=10)
+
+    _mock_current_allocation(monkeypatch, identity, callback=_pause_validation)
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(
+            1,
+            reserved_fill_authority=(
+                capacity_admission.ReservedFillPlanAuthority.bound(identity))))
+    claim = authority.claim_values('l4')
+    validation_errors: list[BaseException] = []
+
+    def _validate():
+        try:
+            _validate_prospective_claim(engine, claim)
+        except BaseException as error:  # pylint: disable=broad-except
+            validation_errors.append(error)
+
+    validator = threading.Thread(target=_validate, name='paid-validator')
+    validator.start()
+    assert validation_entered.wait(timeout=10)
+    try:
+        with pytest.raises(sqlalchemy.exc.DBAPIError):
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.text("SET LOCAL lock_timeout = '100ms'"))
+                serve_state.lock_zero_cost_protocol_for_bound_launch_projection(
+                    connection)
+    finally:
+        release_validation.set()
+        validator.join(timeout=10)
+
+    assert not validator.is_alive()
+    assert not validation_errors
+
+
+def test_delayed_allocation_validation_rechecks_final_expiry(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    identity = _allocation_identity()
+    _enable_durable_intent(engine, incarnation)
+    delay_validation = threading.Event()
+
+    def _delay_after_initial_clock():
+        if delay_validation.is_set():
+            time.sleep(1.2)
+
+    _mock_current_allocation(
+        monkeypatch,
+        identity,
+        callback=_delay_after_initial_clock,
+        pool_snapshots=(types.SimpleNamespace(valid_until=time.time() + 1),))
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(
+            1,
+            reserved_fill_authority=(
+                capacity_admission.ReservedFillPlanAuthority.bound(identity))))
+    delay_validation.set()
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='expired while validation waited'):
+        _validate_prospective_claim(engine, authority.claim_values('l4'))
+
+
+def test_allocation_successor_wins_before_paid_validation(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    planned_identity = _allocation_identity(1)
+    successor_identity = _allocation_identity(2)
+    current_identity = [planned_identity]
+    _enable_durable_intent(engine, incarnation)
+    _mock_current_allocation(monkeypatch, lambda: current_identity[0])
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1,
+              reserved_fill_authority=(
+                  capacity_admission.ReservedFillPlanAuthority.bound(
+                      planned_identity))))
+    claim = authority.claim_values('l4')
+    validator_pid: list[int] = []
+    pid_ready = threading.Event()
+    validation_errors: list[BaseException] = []
+
+    def _validate():
+        try:
+            with engine.begin() as connection:
+                validator_pid.append(
+                    connection.execute(
+                        sqlalchemy.text(
+                            'SELECT pg_backend_pid()')).scalar_one())
+                pid_ready.set()
+                serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+                    connection)
+                service = connection.execute(
+                    sqlalchemy.select(serve_state_schema.services_table).where(
+                        serve_state_schema.services_table.c.name ==
+                        'svc').with_for_update()).mappings().one()
+                capacity_admission.validate_paid_claim_in_connection(
+                    connection,
+                    service,
+                    claim,
+                    prospective=True,
+                    protocol_and_service_prelocked=True)
+        except BaseException as error:  # pylint: disable=broad-except
+            validation_errors.append(error)
+
+    with engine.begin() as writer:
+        serve_state.lock_zero_cost_protocol_for_bound_launch_projection(writer)
+        current_identity[0] = successor_identity
+        validator = threading.Thread(target=_validate, name='paid-validator')
+        validator.start()
+        assert pid_ready.wait(timeout=10)
+        _wait_for_blocked_postgres_backend(engine, validator_pid[0])
+
+    validator.join(timeout=10)
+    assert not validator.is_alive()
+    assert len(validation_errors) == 1
+    assert isinstance(validation_errors[0],
+                      capacity_admission.CapacityAdmissionConflict)
+    assert 'exact current reserved-fill allocation' in str(validation_errors[0])
 
 
 def test_autoscaling_snapshot_is_one_repeatable_read_generation(
@@ -983,8 +1338,8 @@ def test_logical_retirement_serializes_with_lifecycle_takeover(
     assert not errors
     assert lifecycle_epochs == [4]
     assert len(retirement_results) == 1
-    assert (retirement_results[0].state is
-            serve_state.LogicalRetirementCommitState.COMMITTED)
+    assert (retirement_results[0].state
+            is serve_state.LogicalRetirementCommitState.COMMITTED)
 
 
 @pytest.mark.parametrize('first', ['report', 'retirement'])

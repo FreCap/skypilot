@@ -809,12 +809,13 @@ class Kubernetes(clouds.Cloud):
         except ValueError as error:
             raise ValueError('Unsupported worker placement projection '
                              f'version {projection_version!r}.') from error
-        if (worker_placement_projection is not None and projection_version !=
-                kubernetes_pod_spec.SERVE_WORKER_PROJECTION_PROTOCOL_VERSION):
+        if (worker_placement_projection is not None and not kubernetes_pod_spec.
+                serve_worker_projection_protocol_is_renderable(
+                    projection_version)):
             raise ValueError(
-                'Only the exact current worker placement projection protocol '
-                'may render Kubernetes deployment resources; historical '
-                'projections are decode-only.')
+                'Kubernetes deployment resources require a byte-exact worker '
+                'placement projection renderer; only protocols 8 and 9 are '
+                'renderable.')
         has_strict_worker_admission = (
             kubernetes_pod_spec.
             serve_worker_projection_protocol_has_strict_admission(

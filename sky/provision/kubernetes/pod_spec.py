@@ -24,18 +24,19 @@ from sky.utils import config_utils
 
 PodRole = Literal['head', 'worker']
 
-SERVE_WORKER_PROJECTION_PROTOCOL_VERSION = 8
+SERVE_WORKER_PROJECTION_PROTOCOL_VERSION = 9
 _SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
-    {1, 2, 3, 4, 5, 6, 7, 8})
+    {1, 2, 3, 4, 5, 6, 7, 8, 9})
 _STRICT_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
-    {2, 3, 4, 5, 6, 7, 8})
+    {2, 3, 4, 5, 6, 7, 8, 9})
 _SCRATCH_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
-    {3, 4, 5, 6, 7, 8})
+    {3, 4, 5, 6, 7, 8, 9})
 _RUNTIME_READY_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
-    {4, 5, 6, 7, 8})
+    {4, 5, 6, 7, 8, 9})
 _SCRATCH_BOOTSTRAP_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
-    {6, 7, 8})
-_CACHE_BOOTSTRAP_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({8})
+    {6, 7, 8, 9})
+_CACHE_BOOTSTRAP_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({8, 9})
+_RENDERABLE_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({8, 9})
 SERVE_WORKER_SCRATCH_MOUNT_PATH = '/tmp'
 SERVE_WORKER_SCRATCH_VOLUME_NAME = 'skypilot-serve-worker-tmp'
 SERVE_WORKER_BOOTSTRAP_ENV_MARKER = 'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V8'
@@ -57,7 +58,7 @@ SERVE_WORKER_CACHE_BOOTSTRAP_PARENT_MOUNT_PATH = (
     '/var/lib/skypilot/serve-cache-parent')
 SERVE_WORKER_CACHE_BOOTSTRAP_ENV_PREFIX = ('SKYPILOT_SERVE_CACHE_BOOTSTRAP_')
 SERVE_WORKER_CACHE_BOOTSTRAP_COMMAND = ('/bin/bash', '-c', '--')
-SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT = r'''set -euo pipefail
+SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT_V8 = r'''set -euo pipefail
 # SKYPILOT_SERVE_WORKER_CACHE_BOOTSTRAP_V8
 exec python3 - <<'PY'
 import json
@@ -206,6 +207,169 @@ finally:
     os.close(directory_fd)
 PY
 '''
+
+SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT_V9 = r'''set -euo pipefail
+# SKYPILOT_SERVE_WORKER_CACHE_BOOTSTRAP_V9
+exec python3 - <<'PY'
+import json
+import os
+import re
+import stat
+import subprocess
+
+
+def required(name):
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f'missing projected cache bootstrap {name}')
+    return value
+
+
+def positive(name):
+    raw = required(name)
+    value = int(raw)
+    if value < 1 or str(value) != raw:
+        raise RuntimeError(f'{name} must be a canonical positive integer')
+    return value
+
+
+def nonnegative(name):
+    raw = required(name)
+    value = int(raw)
+    if value < 0 or str(value) != raw:
+        raise RuntimeError(f'{name} must be a canonical nonnegative integer')
+    return value
+
+
+def directory_metadata(file_descriptor, label):
+    metadata = os.fstat(file_descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(f'{label} is not a directory')
+    return metadata
+
+
+def require_safe_parent_directory(file_descriptor):
+    metadata = directory_metadata(file_descriptor, 'cache parent')
+    mode = stat.S_IMODE(metadata.st_mode)
+    writable_by_others = bool(mode & 0o022)
+    if (metadata.st_uid != 0 or metadata.st_gid != 0 or
+            mode & 0o700 != 0o700 or mode & 0o6000 or
+            (writable_by_others and not mode & stat.S_ISVTX)):
+        raise RuntimeError('cache parent has unsafe owner or permissions')
+
+
+def require_owned_path_component(file_descriptor, *, final_component):
+    metadata = directory_metadata(file_descriptor, 'cache path component')
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (final_component and metadata.st_uid == 0 and metadata.st_gid == 0 and
+            mode != 0o755 and mode & 0o7000 == 0 and
+            mode & 0o755 == 0o755):
+        # A prior trusted worker may have left the exact service leaf more
+        # permissive than the current projection allows.  The parent walk and
+        # O_NOFOLLOW descriptor prove this is the root-owned final component;
+        # remove only excess write bits and validate the result afresh.  Never
+        # repair an intermediate component or add missing permissions.
+        os.fchmod(file_descriptor, 0o755)
+        metadata = directory_metadata(file_descriptor,
+                                      'normalized cache path component')
+        mode = stat.S_IMODE(metadata.st_mode)
+    if (metadata.st_uid != 0 or metadata.st_gid != 0 or mode != 0o755):
+        raise RuntimeError(
+            'cache path component has unexpected owner or permissions')
+
+
+prefix = 'SKYPILOT_SERVE_CACHE_BOOTSTRAP_'
+parent = required(prefix + 'PARENT_MOUNT_PATH')
+relative_path = required(prefix + 'RELATIVE_PATH')
+components = relative_path.split('/')
+if (not components or any(component in ('', '.', '..') or '\\' in component
+                          for component in components)):
+    raise RuntimeError('projected cache relative path is not canonical')
+
+result = subprocess.run(
+    ['findmnt', '--json', '--output', 'SOURCE,FSTYPE,TARGET', '--target',
+     str(parent)],
+    check=True,
+    capture_output=True,
+    text=True,
+)
+payload = json.loads(result.stdout)
+filesystems = payload.get('filesystems')
+if not isinstance(filesystems, list) or len(filesystems) != 1:
+    raise RuntimeError('cache parent has ambiguous mount evidence')
+filesystem = filesystems[0]
+if not isinstance(filesystem, dict):
+    raise RuntimeError('cache parent has malformed mount evidence')
+source = filesystem.get('source')
+filesystem_type = filesystem.get('fstype')
+target = filesystem.get('target')
+if not all(isinstance(item, str) and item
+           for item in (source, filesystem_type, target)):
+    raise RuntimeError('cache parent has incomplete mount evidence')
+if target != parent:
+    raise RuntimeError('cache parent target differs from its projected mount')
+if filesystem_type in {'overlay', 'tmpfs', 'ramfs'}:
+    raise RuntimeError(f'cache parent uses forbidden {filesystem_type!r}')
+expected_filesystem = required(prefix + 'FILESYSTEM_TYPE')
+if filesystem_type != expected_filesystem:
+    raise RuntimeError('cache parent filesystem differs from its attestation')
+source_pattern = required(prefix + 'DEVICE_SOURCE_PATTERN')
+if re.fullmatch(source_pattern, source) is None:
+    raise RuntimeError('cache parent source differs from its attestation')
+
+required(prefix + 'ATTESTATION_ID')
+required_bytes = positive(prefix + 'REQUIRED_BYTES_PER_REPLICA')
+required_inodes = positive(prefix + 'REQUIRED_INODES_PER_REPLICA')
+max_packing = positive(prefix + 'MAX_REPLICAS_PER_NODE')
+reserved_bytes = nonnegative(prefix + 'RESERVED_BYTES_PER_NODE')
+reserved_inodes = nonnegative(prefix + 'RESERVED_INODES_PER_NODE')
+usable_bytes = positive(prefix + 'USABLE_BYTES_PER_NODE')
+usable_inodes = positive(prefix + 'USABLE_INODES_PER_NODE')
+if required_bytes * max_packing > usable_bytes:
+    raise RuntimeError('cache bootstrap byte budget is inconsistent')
+if required_inodes * max_packing > usable_inodes:
+    raise RuntimeError('cache bootstrap inode budget is inconsistent')
+filesystem_stats = os.statvfs(parent)
+total_bytes = filesystem_stats.f_blocks * filesystem_stats.f_frsize
+free_bytes = filesystem_stats.f_bavail * filesystem_stats.f_frsize
+total_inodes = filesystem_stats.f_files
+free_inodes = filesystem_stats.f_favail
+if total_bytes < usable_bytes + reserved_bytes:
+    raise RuntimeError('cache parent is smaller than its attested byte budget')
+if total_inodes < usable_inodes + reserved_inodes:
+    raise RuntimeError('cache parent is smaller than its attested inode budget')
+if free_bytes < required_bytes * max_packing + reserved_bytes:
+    raise RuntimeError('cache parent lacks the projected free byte reserve')
+if free_inodes < required_inodes * max_packing + reserved_inodes:
+    raise RuntimeError('cache parent lacks the projected free inode reserve')
+
+os.umask(0o022)
+directory_fd = os.open(parent,
+                       os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    # PHX is root-owned sticky 1777. Other platform mounts may be stricter;
+    # writable-by-others is accepted only with the sticky bit.
+    require_safe_parent_directory(directory_fd)
+    for index, component in enumerate(components):
+        try:
+            os.mkdir(component, mode=0o755, dir_fd=directory_fd)
+        except FileExistsError:
+            pass
+        child_fd = os.open(component,
+                           os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                           dir_fd=directory_fd)
+        try:
+            require_owned_path_component(
+                child_fd, final_component=index == len(components) - 1)
+        except Exception:
+            os.close(child_fd)
+            raise
+        os.close(directory_fd)
+        directory_fd = child_fd
+finally:
+    os.close(directory_fd)
+PY
+'''
 # The startup probe starts only after image pull and container creation.  This
 # bound covers the in-container SSH, environment, SkyPilot, and Ray bootstrap;
 # provider scheduling retains its separate projected provision_timeout.
@@ -314,8 +478,19 @@ def validate_serve_worker_projection_protocol_version(
     if (type(value) is not int or
             value not in _SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS):
         raise ValueError('SkyServe worker projection protocol version must be '
-                         '1, 2, 3, 4, 5, 6, 7, or 8.')
+                         '1, 2, 3, 4, 5, 6, 7, 8, or 9.')
     return value
+
+
+def serve_worker_cache_bootstrap_script(protocol_version: object) -> str:
+    """Return the byte-exact cache bootstrap owned by one protocol."""
+    version = validate_serve_worker_projection_protocol_version(
+        protocol_version)
+    if version == 8:
+        return SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT_V8
+    if version == 9:
+        return SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT_V9
+    raise ValueError('Worker cache bootstrap requires protocol 8 or 9.')
 
 
 def serve_worker_projection_protocol_has_strict_admission(
@@ -364,8 +539,15 @@ def serve_worker_projection_protocol_has_cache_bootstrap(value: object) -> bool:
     return version in _CACHE_BOOTSTRAP_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS
 
 
+def serve_worker_projection_protocol_is_renderable(value: object) -> bool:
+    """Whether current code has one byte-exact renderer for this protocol."""
+    version = validate_serve_worker_projection_protocol_version(value,
+                                                                allow_none=True)
+    return version in _RENDERABLE_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS
+
+
 def validate_projected_worker_provision_timeout(value: object) -> int:
-    """Validate the closed v3-v8 provisioning-wait contract."""
+    """Validate the closed v3-v9 provisioning-wait contract."""
     if type(value) is not int or value < -1:
         raise ValueError('Projected worker provision_timeout must be -1 or a '
                          'non-negative integer.')
@@ -791,7 +973,7 @@ def enforce_projected_worker_scratch_contract(
 
 
 def validate_projected_worker_cache(value: object) -> dict[str, object]:
-    """Validate the provider-side protocol-v8 cache bootstrap contract."""
+    """Validate the provider-side protocol-v8/v9 cache bootstrap contract."""
     if not isinstance(value, dict):
         raise ProjectedCacheContractError(
             'Worker cache contract must be a mapping.')
@@ -899,7 +1081,7 @@ def validate_projected_worker_cache(value: object) -> dict[str, object]:
 
 def projected_worker_cache_mount_and_relative_path(
         cache: object) -> tuple[str, str] | None:
-    """Return the attested mount and relative path created by protocol v8."""
+    """Return the attested mount and relative path created by v8/v9."""
     expected = validate_projected_worker_cache(cache)
     if expected['kind'] == 'none':
         return None
@@ -1086,7 +1268,8 @@ def _observe_projected_worker_cache(
 
 
 def _projected_worker_cache_matches(actual: dict[str, object],
-                                    expected: dict[str, object]) -> bool:
+                                    expected: dict[str, object],
+                                    bootstrap_script: str) -> bool:
     if actual['malformed']:
         return False
     bootstrap_inits = actual['bootstrap_inits']
@@ -1153,7 +1336,7 @@ def _projected_worker_cache_matches(actual: dict[str, object],
         'image': expected['bootstrap_image'],
         'image_pull_policy': 'IfNotPresent',
         'command': list(SERVE_WORKER_CACHE_BOOTSTRAP_COMMAND),
-        'args': [SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT],
+        'args': [bootstrap_script],
         'env': _cache_bootstrap_environment(expected, relative_path),
         'security_context': {
             'allowPrivilegeEscalation': False,
@@ -1178,9 +1361,14 @@ def enforce_projected_worker_cache_contract(
     expected_cache: object,
     *,
     rewrite: bool,
+    protocol_version: object = SERVE_WORKER_PROJECTION_PROTOCOL_VERSION,
 ) -> ProjectedCacheContract:
-    """Own the protocol-v8 attested cache-leaf bootstrap Pod surface."""
+    """Own one versioned attested cache-leaf bootstrap Pod surface."""
     expected = validate_projected_worker_cache(expected_cache)
+    try:
+        bootstrap_script = serve_worker_cache_bootstrap_script(protocol_version)
+    except ValueError as error:
+        raise ProjectedCacheContractError(str(error)) from error
     if rewrite:
         if not isinstance(pod_spec, dict):
             raise ProjectedCacheContractError(
@@ -1288,7 +1476,7 @@ def enforce_projected_worker_cache_contract(
                 'image': expected['bootstrap_image'],
                 'imagePullPolicy': 'IfNotPresent',
                 'command': list(SERVE_WORKER_CACHE_BOOTSTRAP_COMMAND),
-                'args': [SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT],
+                'args': [bootstrap_script],
                 'env': _cache_bootstrap_environment(expected, relative_path),
                 'securityContext': {
                     'allowPrivilegeEscalation': False,
@@ -1316,7 +1504,7 @@ def enforce_projected_worker_cache_contract(
             pod_spec.pop('initContainers', None)
     actual = _observe_projected_worker_cache(pod_spec, expected)
     return ProjectedCacheContract(matches=_projected_worker_cache_matches(
-        actual, expected),
+        actual, expected, bootstrap_script),
                                   expected=expected,
                                   actual=actual)
 
@@ -1583,17 +1771,18 @@ def validate_projected_worker_bootstrap_environment(
     if any(marker in script
            for marker in SERVE_WORKER_LEGACY_BOOTSTRAP_ENV_MARKERS):
         raise ProjectedRuntimeReadinessContractError(
-            'Protocol-v8 scratch bootstrap cannot carry a historical marker.')
+            'Protocol-v8/v9 scratch bootstrap cannot carry a historical marker.'
+        )
     marker_line = f'# {SERVE_WORKER_BOOTSTRAP_ENV_MARKER}'
     script_lines = script.splitlines()
     if script_lines.count(marker_line) != 1:
         raise ProjectedRuntimeReadinessContractError(
-            'Protocol-v8 scratch bootstrap must carry one exact marker.')
+            'Protocol-v8/v9 scratch bootstrap must carry one exact marker.')
     marker_offset = script_lines.index(marker_line)
     env = _pod_api_field(runtime, 'env', 'env')
     if not isinstance(env, (list, tuple)):
         raise ProjectedRuntimeReadinessContractError(
-            'Protocol-v8 scratch bootstrap environment must be a list.')
+            'Protocol-v8/v9 scratch bootstrap environment must be a list.')
     observed_entries = []
     for entry in env:
         if _pod_api_field(entry, 'name', 'name') not in expected:
@@ -1609,14 +1798,14 @@ def validate_projected_worker_bootstrap_environment(
     } for key in sorted(expected)]
     if observed_entries != expected_entries:
         raise ProjectedRuntimeReadinessContractError(
-            'Protocol-v8 scratch bootstrap Pod environment differs from the '
+            'Protocol-v8/v9 scratch bootstrap Pod environment differs from the '
             'exact server-owned paths.')
     for key, value in expected.items():
         export = f'export {key}={json.dumps(value)}'
         if (script_lines.count(export) != 1 or
                 script_lines.index(export) < marker_offset):
             raise ProjectedRuntimeReadinessContractError(
-                'Protocol-v8 scratch bootstrap script must re-export every '
+                'Protocol-v8/v9 scratch bootstrap script must re-export every '
                 'exact server-owned path once after its post-runcmd marker.')
     return {key: expected[key] for key in sorted(expected)}
 

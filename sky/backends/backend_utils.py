@@ -909,16 +909,20 @@ def _select_worker_projection(
             isinstance(cloud, clouds.SSH)):
         return None
     projection = kubernetes_identity.worker_projection_for_context(
-        projections,
-        region.name,
-        to_provision.accelerators,
-        require_protocol_version=(
-            kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION))
+        projections, region.name, to_provision.accelerators)
     if projection is None:
         raise exceptions.InvalidCloudConfigs(
             'SkyServe Kubernetes placement has no exact immutable worker '
             f'projection for context {region.name!r} and accelerator '
             f'{to_provision.accelerators!r}.')
+    projection_version = (
+        kubernetes_identity.worker_projection_protocol_version(projection))
+    if not k8s_pod_spec.serve_worker_projection_protocol_is_renderable(
+            projection_version):
+        raise exceptions.InvalidCloudConfigs(
+            'SkyServe Kubernetes placement requires a byte-exact renderer for '
+            f'projection protocol {projection_version}; only protocols 8 and 9 '
+            'are renderable.')
     try:
         kubernetes_identity.validate_no_resource_worker_projection_overrides(
             to_provision,
@@ -949,11 +953,12 @@ def _enforce_worker_scratch_on_pod_spec(
 def _enforce_worker_cache_on_pod_spec(
     pod_spec: dict[str, Any],
     cache: dict[str, Any],
+    protocol_version: int,
 ) -> None:
-    """Install the one attested protocol-v8 cache-leaf bootstrap."""
+    """Install the versioned attested cache-leaf bootstrap."""
     try:
         contract = k8s_pod_spec.enforce_projected_worker_cache_contract(
-            pod_spec, cache, rewrite=True)
+            pod_spec, cache, rewrite=True, protocol_version=protocol_version)
     except k8s_pod_spec.ProjectedCacheContractError as error:
         raise exceptions.InvalidCloudConfigs(str(error)) from error
     if not contract.matches:
@@ -1024,10 +1029,12 @@ def _enforce_worker_projection_on_kubernetes_yaml(
         projection_version = (
             kubernetes_identity.worker_projection_protocol_version(projection))
         validated = kubernetes_identity.validate_worker_placement_projections(
-            [projection],
-            allow_none=False,
-            require_protocol_version=(
-                kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION))
+            [projection], allow_none=False)
+        if not k8s_pod_spec.serve_worker_projection_protocol_is_renderable(
+                projection_version):
+            raise ValueError(
+                'Worker placement projection requires a byte-exact renderer; '
+                'only protocols 8 and 9 are renderable.')
     except ValueError as error:
         raise exceptions.InvalidCloudConfigs(str(error)) from error
     assert validated is not None
@@ -1066,7 +1073,7 @@ def _enforce_worker_projection_on_kubernetes_yaml(
     else:
         if expected_runtime_bootstrap_sha256 is not None:
             raise exceptions.InvalidCloudConfigs(
-                'Only projection protocol v4/v5/v6/v7/v8 may carry a worker '
+                'Only projection protocol v4/v5/v6/v7/v8/v9 may carry a worker '
                 'runtime '
                 'bootstrap SHA256 contract.')
         cluster_yaml['provider'].pop(
@@ -1271,7 +1278,7 @@ def _enforce_worker_projection_on_kubernetes_yaml(
                 'value': value
             } for key, value in scratch_env.items())
         assert has_projected_cache_bootstrap
-        _enforce_worker_cache_on_pod_spec(pod_spec, cache)
+        _enforce_worker_cache_on_pod_spec(pod_spec, cache, projection_version)
         if has_projected_scratch:
             _enforce_worker_scratch_on_pod_spec(pod_spec, projection['scratch'])
         if has_projected_runtime_readiness:

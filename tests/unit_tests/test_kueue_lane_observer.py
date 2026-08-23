@@ -462,12 +462,17 @@ def test_identity_or_shape_mismatch_fails_before_durable_state(mutation):
 
 
 @pytest.mark.parametrize(
-    ('admission_mode', 'expects_runtime'),
-    [(reserved_fill_reclaim_attestation.ReclaimAdmissionMode.KUEUE, True),
+    ('admission_mode', 'expects_runtime', 'projection_version', 'error_match'),
+    [(reserved_fill_reclaim_attestation.ReclaimAdmissionMode.KUEUE, True, 9,
+      None),
      (reserved_fill_reclaim_attestation.ReclaimAdmissionMode.
-      KUBERNETES_SCHEDULER, False)])
+      KUBERNETES_SCHEDULER, False, 9, None),
+     (reserved_fill_reclaim_attestation.ReclaimAdmissionMode.KUEUE, True, 8,
+      None),
+     (reserved_fill_reclaim_attestation.ReclaimAdmissionMode.
+      KUBERNETES_SCHEDULER, False, 8, 'no durable Pod identity')])
 def test_runtime_is_derived_only_for_projected_kueue_admission(
-        admission_mode, expects_runtime):
+        admission_mode, expects_runtime, projection_version, error_match):
     fence = _fence()
     profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
         ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
@@ -511,6 +516,10 @@ def test_runtime_is_derived_only_for_projected_kueue_admission(
              'require_reclaim_worker_projection',
              return_value=({}, admission)), \
          mock.patch.object(
+             kueue_lane_observer.kubernetes_identity,
+             'worker_projection_protocol_version',
+             return_value=projection_version), \
+         mock.patch.object(
              kueue_lane_observer.serve_state_schema,
              'get_database_engine',
              return_value=_transaction_engine(transaction_events)), \
@@ -519,8 +528,16 @@ def test_runtime_is_derived_only_for_projected_kueue_admission(
              '_lock_and_validate_materialization',
              return_value=(mock.sentinel.repository, mock.sentinel.identity,
                            durable_admission)) as validate:
-        runtime = kueue_lane_observer.runtime_for_reserved_fill_launch(
-            launch_context, fence)
+        if error_match is None:
+            runtime = kueue_lane_observer.runtime_for_reserved_fill_launch(
+                launch_context, fence)
+        else:
+            with pytest.raises(ValueError, match=error_match):
+                kueue_lane_observer.runtime_for_reserved_fill_launch(
+                    launch_context, fence)
+            validate.assert_not_called()
+            assert not transaction_events
+            return
 
     if not expects_runtime:
         assert runtime is None

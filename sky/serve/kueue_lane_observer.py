@@ -14,7 +14,9 @@ import sqlalchemy
 from sky import sky_logging
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.provision import common as provision_common
+from sky.provision.kubernetes import pod_spec as kubernetes_pod_spec
 from sky.serve import constants as serve_constants
+from sky.serve import kubernetes_identity
 from sky.serve import kueue_lane_lineage
 from sky.serve import ordinary_launch_binding
 from sky.serve import provider_phase
@@ -527,10 +529,21 @@ def runtime_for_reserved_fill_launch(
         raise ValueError('Reserved-fill intent reference is malformed.')
     projections = launch_context.get(
         serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY)
-    _, admission = reserved_capacity.require_reclaim_worker_projection(
-        fence, projections, require_current_protocol=True)
+    projection, admission = (
+        reserved_capacity.require_reclaim_worker_projection(fence, projections))
+    projection_version = (
+        kubernetes_identity.worker_projection_protocol_version(projection))
+    current_projection_version = (
+        kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
+    if not (kubernetes_pod_spec.serve_worker_projection_protocol_is_renderable
+           )(projection_version):
+        raise ValueError('Kueue lane runtime has no byte-exact worker '
+                         'projection renderer.')
     if admission.admission_mode is (reserved_fill_reclaim_attestation.
                                     ReclaimAdmissionMode.KUBERNETES_SCHEDULER):
+        if projection_version != current_projection_version:
+            raise ValueError('Historical Kubernetes-scheduler fill has no '
+                             'durable Pod identity for exact adoption.')
         return None
     if admission.admission_mode is not (
             reserved_fill_reclaim_attestation.ReclaimAdmissionMode.KUEUE):
@@ -572,6 +585,10 @@ def runtime_for_reserved_fill_launch(
             connection, authority)
     persisted_pod_identity = _persisted_pod_identity_from_admission(
         durable_admission)
+    if (projection_version != current_projection_version and
+            persisted_pod_identity is None):
+        raise ValueError('Historical Kueue fill may only adopt its exact '
+                         'persisted Pod identity.')
 
     return provision_common.KueuePodAdmissionRuntime(
         identity=identity,

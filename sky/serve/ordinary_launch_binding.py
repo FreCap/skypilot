@@ -2695,11 +2695,13 @@ def _unknown_capacity_replacement_payload(
     }, generation)
 
 
-def resolve_non_pool_launch_profile_in_connection(
+def _resolve_non_pool_launch_profile_in_connection(
     connection: sqlalchemy.engine.Connection,
     service: Mapping[str, Any],
     replica: Mapping[str, Any],
-) -> NonPoolLaunchProfile:
+    *,
+    protocol_and_service_prelocked: bool = False,
+) -> tuple[NonPoolLaunchProfile, datetime.datetime | None]:
     """Recompute one profile from planner-owned durable authority."""
     _require_postgres(connection)
     info = _locked_replica_info(replica)
@@ -2709,6 +2711,13 @@ def resolve_non_pool_launch_profile_in_connection(
             'Replica does not have one complete non-pool launch profile.')
     pool_key, paid_claim = _paid_claim_payload(connection, service, replica,
                                                info)
+    paid_fresh_until = None
+    if paid_claim is not None:
+        paid_fresh_until = capacity_admission.validate_paid_claim_in_connection(
+            connection,
+            service,
+            paid_claim,
+            protocol_and_service_prelocked=(protocol_and_service_prelocked))
     placement = _replica_placement_payload(info)
     record_id = _nonempty(str(info.replica_record_id), 'replica_record_id')
     payload: dict[str, Any]
@@ -2717,8 +2726,6 @@ def resolve_non_pool_launch_profile_in_connection(
         if paid_claim is None:
             raise OrdinaryLaunchBindingConflict(
                 'Ordinary paid profile has no paid-capacity claim.')
-        capacity_admission.validate_paid_claim_in_connection(
-            connection, service, paid_claim)
         reference = f'paid-capacity:{service["hash"]}:{record_id}:{pool_key}'
         generation = 0
         payload = {'claim': paid_claim, 'placement': placement}
@@ -2766,10 +2773,27 @@ def resolve_non_pool_launch_profile_in_connection(
         }
         reference = f'system-oom:{intent.launch_nonce}'
         generation = intent.launch_generation
-    return NonPoolLaunchProfile.create(kind,
-                                       authorization_reference=reference,
-                                       authorization_generation=generation,
-                                       authorization_payload=payload)
+    return (NonPoolLaunchProfile.create(kind,
+                                        authorization_reference=reference,
+                                        authorization_generation=generation,
+                                        authorization_payload=payload),
+            paid_fresh_until)
+
+
+def resolve_non_pool_launch_profile_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    replica: Mapping[str, Any],
+    *,
+    protocol_and_service_prelocked: bool = False,
+) -> NonPoolLaunchProfile:
+    """Recompute one profile from planner-owned durable authority."""
+    profile, _ = _resolve_non_pool_launch_profile_in_connection(
+        connection,
+        service,
+        replica,
+        protocol_and_service_prelocked=protocol_and_service_prelocked)
+    return profile
 
 
 def resolve_non_pool_launch_profile(
@@ -2785,7 +2809,12 @@ def resolve_non_pool_launch_profile(
     if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
         raise OrdinaryLaunchBindingUnavailable(
             'Generic non-pool launch profiles require PostgreSQL.')
-    with engine.connect() as connection:
+    with engine.begin() as connection:
+        # Profile resolution may discover a paid claim.  Take the protocol
+        # prefix before reading the service so allocation-bound validation
+        # never has to invert the writer's canonical lock order.
+        serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+            connection)
         service = connection.execute(
             sqlalchemy.select(serve_state_schema.services_table).where(
                 serve_state_schema.services_table.c.name ==
@@ -2800,7 +2829,7 @@ def resolve_non_pool_launch_profile(
             raise OrdinaryLaunchBindingConflict(
                 'Generic profile target no longer names the exact replica.')
         return resolve_non_pool_launch_profile_in_connection(
-            connection, service, replica)
+            connection, service, replica, protocol_and_service_prelocked=True)
 
 
 def get_existing_non_pool_launch_profile(
@@ -3268,13 +3297,19 @@ def _validate_profile_authority_in_connection(
     service: Mapping[str, Any],
     replica: Mapping[str, Any],
     expected: NonPoolLaunchProfile,
-) -> None:
+    *,
+    protocol_and_service_prelocked: bool = False,
+) -> datetime.datetime | None:
     """Recompute and exact-match planner authority at a commit boundary."""
-    actual = resolve_non_pool_launch_profile_in_connection(
-        connection, service, replica)
+    actual, paid_fresh_until = _resolve_non_pool_launch_profile_in_connection(
+        connection,
+        service,
+        replica,
+        protocol_and_service_prelocked=protocol_and_service_prelocked)
     if actual != expected:
         raise OrdinaryLaunchBindingConflict(
             'Non-pool planner authorization changed before provider effect.')
+    return paid_fresh_until
 
 
 def _validate_committed_reserved_fill_profile_in_connection(
@@ -3540,7 +3575,8 @@ def _validate_admission_target(connection: sqlalchemy.engine.Connection,
                                                                          Any],
                                replica: Mapping[str,
                                                 Any], identity: BindingIdentity,
-                               *, validate_profile_authority: bool) -> None:
+                               *, validate_profile_authority: bool,
+                               protocol_and_service_prelocked: bool) -> None:
     derived = derive_binding_ids(identity.tenant_scope,
                                  identity.service_workspace,
                                  identity.submission_id)
@@ -3596,8 +3632,12 @@ def _validate_admission_target(connection: sqlalchemy.engine.Connection,
         if validate_profile_authority:
             _require_current_non_pool_worker_projection_in_connection(
                 connection, identity.service_name, identity.service_version)
-            _validate_profile_authority_in_connection(connection, service,
-                                                      replica, identity.profile)
+            _validate_profile_authority_in_connection(
+                connection,
+                service,
+                replica,
+                identity.profile,
+                protocol_and_service_prelocked=(protocol_and_service_prelocked))
 
 
 def _require_current_non_pool_worker_projection_in_connection(
@@ -3656,6 +3696,12 @@ def insert_or_get_locked(
     _require_postgres(connection)
     if not isinstance(identity, BindingIdentity):
         raise ValueError('identity must be a BindingIdentity.')
+    planner_funding_candidate = (
+        isinstance(identity, NonPoolBindingIdentity) and
+        identity.profile.kind is not NonPoolLaunchProfileKind.RESERVED_FILL)
+    if planner_funding_candidate:
+        serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+            connection)
     lifecycle, service, replica, current = _lock_admission_rows(
         connection, identity)
     existing = current
@@ -3670,12 +3716,14 @@ def insert_or_get_locked(
     # would make a committed request lose idempotency after a lost ACK.  The
     # shared pre-provider guard independently revalidates live authority before
     # any external effect.
-    _validate_admission_target(connection,
-                               lifecycle,
-                               service,
-                               replica,
-                               identity,
-                               validate_profile_authority=existing is None)
+    _validate_admission_target(
+        connection,
+        lifecycle,
+        service,
+        replica,
+        identity,
+        validate_profile_authority=existing is None,
+        protocol_and_service_prelocked=(planner_funding_candidate))
     if existing is not None:
         if not _existing_identity_matches(existing, identity):
             raise OrdinaryLaunchBindingConflict(
@@ -4313,6 +4361,17 @@ def validate_effect_authority_in_connection(
             not getattr(claim, 'worker_instance_id', None)):
         raise OrdinaryLaunchBindingConflict(
             'The exact API request execution claim is no longer active.')
+    legacy_context = not isinstance(context, BoundNonPoolLaunchContext)
+    planner_funding_candidate = (
+        isinstance(context, BoundNonPoolLaunchContext) and
+        context.profile.kind is not NonPoolLaunchProfileKind.RESERVED_FILL)
+    if legacy_context or planner_funding_candidate:
+        # A retained protocol-v1 association has no typed profile from which
+        # to determine funding before lifecycle/service locks.  Conservatively
+        # share the protocol prefix; its locked paid claim below determines
+        # whether planner revalidation is required.
+        serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+            connection)
     lifecycle, service, replica, association = _lock_effect_rows(
         connection, context)
     _validate_effect_rows(lifecycle,
@@ -4321,6 +4380,17 @@ def validate_effect_authority_in_connection(
                           association,
                           context,
                           require_launch_authorized=True)
+    paid_fresh_until = None
+    if legacy_context:
+        _, legacy_paid_claim = _paid_claim_payload(
+            connection, service, replica, _locked_replica_info(replica))
+        if legacy_paid_claim is not None:
+            paid_fresh_until = (
+                capacity_admission.validate_paid_claim_in_connection(
+                    connection,
+                    service,
+                    legacy_paid_claim,
+                    protocol_and_service_prelocked=True))
     if isinstance(context, BoundNonPoolLaunchContext):
         _require_current_non_pool_worker_projection_in_connection(
             connection, context.service_name,
@@ -4329,8 +4399,12 @@ def validate_effect_authority_in_connection(
             _validate_committed_reserved_fill_profile_in_connection(
                 connection, service, replica, context.profile)
         else:
-            _validate_profile_authority_in_connection(connection, service,
-                                                      replica, context.profile)
+            paid_fresh_until = _validate_profile_authority_in_connection(
+                connection,
+                service,
+                replica,
+                context.profile,
+                protocol_and_service_prelocked=(planner_funding_candidate))
         if launch_context is None:
             raise OrdinaryLaunchBindingConflict(
                 'Generic provider effect has no immutable launch context.')
@@ -4344,6 +4418,12 @@ def validate_effect_authority_in_connection(
     if not claim_validator(connection, context.association_id, claim):
         raise OrdinaryLaunchBindingConflict(
             'The exact API request execution claim is no longer active.')
+    if paid_fresh_until is not None:
+        provider_start_now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        if paid_fresh_until <= provider_start_now:
+            raise OrdinaryLaunchBindingConflict(
+                'Paid provider authority expired while locking its request.')
     return EffectAuthoritySnapshot(dict(association),
                                    _locked_replica_info(replica))
 

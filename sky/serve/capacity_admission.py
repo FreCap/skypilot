@@ -13,13 +13,15 @@ import datetime
 import enum
 import hashlib
 import json
+import pickle
 import re
-from typing import Any
+from typing import Any, TYPE_CHECKING
 import uuid
 
 import sqlalchemy
 from sqlalchemy.dialects import postgresql
 
+from sky.adaptors import common as adaptors_common
 from sky.serve import capacity_admission_schema
 from sky.serve import constants
 from sky.serve import demand_state
@@ -32,11 +34,23 @@ from sky.serve import serve_statuses
 from sky.serve import zero_cost_actuation_schema
 from sky.utils.db import db_utils
 
+if TYPE_CHECKING:
+    from sky.serve.reserved_fill_planner import AuthenticatedAllocationMap
+    from sky.serve.reserved_fill_planner import ReservedFillAllocationIdentity
+
+reserved_fill_allocation = adaptors_common.LazyImport(
+    'sky.serve.reserved_fill_allocation')
+reserved_fill_planner = adaptors_common.LazyImport(
+    'sky.serve.reserved_fill_planner')
+serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
+service_spec = adaptors_common.LazyImport('sky.serve.service_spec')
+
 PROTOCOL_VERSION = 1
 CAPABILITY_COHORT_EPOCH = 1
 AGGREGATE_ACCELERATOR = '*'
 _SHA256_RE = re.compile(r'[0-9a-f]{64}')
 _SERVICES = serve_state_schema.services_table
+_VERSION_SPECS = serve_state_schema.version_specs_table
 _CLAIMS = serve_state_schema.paid_capacity_claims_table
 _PLANS = capacity_admission_schema.serve_capacity_plans_table
 _HEADS = capacity_admission_schema.serve_capacity_plan_heads_table
@@ -63,6 +77,14 @@ _TERMINAL_REPLICA_STATUSES = frozenset({
 class DemandSourceMode(str, enum.Enum):
     LEGACY_CONTROLLER = 'LEGACY_CONTROLLER'
     DURABLE_FEED = 'DURABLE_FEED'
+
+
+class ReservedFillPlanAuthorityMode(str, enum.Enum):
+    """How one immutable capacity plan relates to reserved-fill authority."""
+
+    NOT_APPLICABLE = 'NOT_APPLICABLE'
+    ALLOCATION_BOUND = 'ALLOCATION_BOUND'
+    UNBOUND_ZERO_REVOCATION = 'UNBOUND_ZERO_REVOCATION'
 
 
 class CapacityAdmissionError(RuntimeError):
@@ -146,6 +168,67 @@ def _canonical_watermark(value: Any) -> list[dict[str, Any]]:
 
 
 @dataclasses.dataclass(frozen=True)
+class ReservedFillPlanAuthority:
+    """Explicit allocation binding or explicit unbound plan disposition."""
+
+    mode: ReservedFillPlanAuthorityMode
+    allocation: ReservedFillAllocationIdentity | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mode, ReservedFillPlanAuthorityMode):
+            raise ValueError('Reserved-fill plan authority mode is invalid.')
+        if ((self.mode is ReservedFillPlanAuthorityMode.ALLOCATION_BOUND)
+                != (self.allocation is not None)):
+            raise ValueError('Only an allocation-bound plan may carry a '
+                             'reserved-fill allocation identity.')
+
+    @classmethod
+    def not_applicable(cls) -> 'ReservedFillPlanAuthority':
+        return cls(ReservedFillPlanAuthorityMode.NOT_APPLICABLE)
+
+    @classmethod
+    def zero_revocation(cls) -> 'ReservedFillPlanAuthority':
+        return cls(ReservedFillPlanAuthorityMode.UNBOUND_ZERO_REVOCATION)
+
+    @classmethod
+    def bound(cls, identity: Any) -> 'ReservedFillPlanAuthority':
+        if not isinstance(identity,
+                          reserved_fill_planner.ReservedFillAllocationIdentity):
+            raise ValueError(
+                'Reserved-fill allocation identity has the wrong type.')
+        return cls(ReservedFillPlanAuthorityMode.ALLOCATION_BOUND, identity)
+
+    @classmethod
+    def from_mapping(cls, value: Any) -> 'ReservedFillPlanAuthority':
+        if not isinstance(value,
+                          Mapping) or set(value) - {'mode', 'allocation'}:
+            raise ValueError('Reserved-fill plan authority is malformed.')
+        try:
+            mode = ReservedFillPlanAuthorityMode(value.get('mode'))
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                'Reserved-fill plan authority mode is invalid.') from error
+        if mode is ReservedFillPlanAuthorityMode.ALLOCATION_BOUND:
+            if set(value) != {'mode', 'allocation'}:
+                raise ValueError(
+                    'Allocation-bound plan authority is incomplete.')
+            allocation = (reserved_fill_planner.ReservedFillAllocationIdentity.
+                          from_mapping(value['allocation']))
+        else:
+            if set(value) != {'mode'}:
+                raise ValueError(
+                    'Unbound plan authority must not carry an allocation.')
+            allocation = None
+        return cls(mode, allocation)
+
+    def to_mapping(self) -> dict[str, Any]:
+        result: dict[str, Any] = {'mode': self.mode.value}
+        if self.allocation is not None:
+            result['allocation'] = self.allocation.to_mapping()
+        return result
+
+
+@dataclasses.dataclass(frozen=True)
 class CapacityPlanInput:
     """Demand-side planner input after the zero-cost commit boundary.
 
@@ -167,6 +250,7 @@ class CapacityPlanInput:
     route_source_epoch: int
     normalized_demand: Mapping[str, Any]
     capacity_target_by_accelerator: Mapping[str, int]
+    reserved_fill_authority: ReservedFillPlanAuthority
 
     def payload(
         self,
@@ -225,6 +309,19 @@ class CapacityPlanInput:
         if paid != expected_paid:
             raise ValueError('Paid residual is not the exact post-zero-cost '
                              'capacity deficit.')
+        authority = self.reserved_fill_authority
+        if not isinstance(authority, ReservedFillPlanAuthority):
+            raise ValueError('Capacity plan has no typed reserved-fill '
+                             'authority.')
+        if (authority.mode
+                is ReservedFillPlanAuthorityMode.UNBOUND_ZERO_REVOCATION and
+                any(capacity_target.values())):
+            raise ValueError('An unbound revocation plan must have an all-zero '
+                             'capacity target.')
+        if (authority.allocation is not None and
+                authority.allocation.service_version != self.service_version):
+            raise ValueError('Capacity plan and reserved-fill allocation '
+                             'versions disagree.')
         _canonical_watermark(self.receipt_watermark)
         normalized_demand = json.loads(
             _canonical_json(dict(self.normalized_demand)).decode('utf-8'))
@@ -248,6 +345,7 @@ class CapacityPlanInput:
             'pending_zero_cost_capacity_by_accelerator': pending_zero_cost,
             'existing_paid_capacity_by_accelerator': existing_paid,
             'paid_residual_by_accelerator': paid,
+            'reserved_fill_authority': authority.to_mapping(),
         }
 
 
@@ -262,6 +360,7 @@ class PaidLaunchAuthority:
     demand_feed_generation: int
     demand_source_epoch: int
     paid_residual_by_accelerator: tuple[tuple[str, int], ...]
+    reserved_fill_authority: ReservedFillPlanAuthority
 
     def remaining(self) -> dict[str, int]:
         return dict(self.paid_residual_by_accelerator)
@@ -295,6 +394,12 @@ def _authority(
         raise CapacityAdmissionConflict('Capacity plan payload is malformed.')
     paid = _canonical_counts(payload.get('paid_residual_by_accelerator', {}),
                              'paid_residual_by_accelerator')
+    try:
+        reserved_fill_authority = ReservedFillPlanAuthority.from_mapping(
+            payload.get('reserved_fill_authority'))
+    except ValueError as error:
+        raise CapacityAdmissionConflict(
+            'Capacity plan has no valid reserved-fill authority.') from error
     return PaidLaunchAuthority(
         service_name=str(row['service_name']),
         service_hash=str(row['service_hash']),
@@ -304,7 +409,98 @@ def _authority(
             row['demand_feed_generation'] if demand_feed_generation is
             None else demand_feed_generation),
         demand_source_epoch=int(row['demand_source_epoch']),
-        paid_residual_by_accelerator=tuple(paid.items()))
+        paid_residual_by_accelerator=tuple(paid.items()),
+        reserved_fill_authority=reserved_fill_authority)
+
+
+def _validate_reserved_fill_authority_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    authority: ReservedFillPlanAuthority,
+    *,
+    reserved_fill_binding_required: bool,
+    protocol_and_service_prelocked: bool,
+) -> AuthenticatedAllocationMap | None:
+    """Validate one positive plan's exact reserved-fill allocation identity."""
+    if authority.mode is ReservedFillPlanAuthorityMode.NOT_APPLICABLE:
+        if reserved_fill_binding_required:
+            raise CapacityAdmissionConflict(
+                'Durable-intent paid authority must name its exact current '
+                'reserved-fill allocation.')
+        return None
+    if authority.mode is ReservedFillPlanAuthorityMode.UNBOUND_ZERO_REVOCATION:
+        raise CapacityAdmissionConflict(
+            'An unbound zero revocation cannot authorize a paid claim.')
+    binding = authority.allocation
+    assert binding is not None
+    if not reserved_fill_binding_required:
+        raise CapacityAdmissionConflict(
+            'An allocation-bound paid plan requires enabled durable intent '
+            'actuation.')
+    if not protocol_and_service_prelocked:
+        # Every production call path takes the shared protocol mutex before
+        # lifecycle/service locks.  Acquiring it here after the service row
+        # would invert the sequencer's canonical lock order.
+        raise CapacityAdmissionConflict(
+            'Allocation-bound paid validation lacks its protocol-first lock.')
+    try:
+        current = reserved_fill_allocation.ReservedFillAllocationRepository(
+            connection.engine).read_current_in_connection(
+                connection,
+                str(service['name']),
+                str(service['hash']),
+                (service.get('controller_pid'), service.get('controller_ip')),
+                protocol_and_service_prelocked=True)
+    except (TypeError, ValueError,
+            reserved_fill_allocation.ReservedFillAllocationError) as error:
+        raise CapacityAdmissionConflict(
+            'Reserved-fill allocation validation failed closed.') from error
+    if current is None or binding != current.identity:
+        raise CapacityAdmissionConflict(
+            'Paid plan no longer names the exact current reserved-fill '
+            'allocation.')
+    return current
+
+
+def _reserved_fill_binding_required_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+) -> bool:
+    """Read the elected immutable service-spec discriminator under lock."""
+    version_row = connection.execute(
+        sqlalchemy.select(_VERSION_SPECS.c.spec).where(
+            _VERSION_SPECS.c.service_name == service['name'],
+            _VERSION_SPECS.c.version == service['current_version'],
+            _VERSION_SPECS.c.yaml_content.isnot(None),
+            _VERSION_SPECS.c.quarantined_at.is_(None),
+            _VERSION_SPECS.c.retired_at.is_(None)).with_for_update(
+                read=True)).one_or_none()
+    if version_row is None:
+        raise CapacityAdmissionConflict(
+            'Current service version has no immutable reserved-fill spec.')
+    serialized_spec = version_row[0]
+    if isinstance(serialized_spec, memoryview):
+        serialized_spec = serialized_spec.tobytes()
+    if not isinstance(serialized_spec, bytes):
+        raise CapacityAdmissionConflict(
+            'Current service version has no immutable reserved-fill spec.')
+    try:
+        spec = pickle.loads(serialized_spec)
+        if type(spec) is not service_spec.SkyServiceSpec:
+            raise TypeError('Unexpected persisted service-spec type.')
+        fill_enabled = spec.reserved_capacity_fill
+    except Exception as error:  # pylint: disable=broad-except
+        raise CapacityAdmissionConflict(
+            'Current service version reserved-fill spec is malformed.'
+        ) from error
+    if type(fill_enabled) is not bool:
+        raise CapacityAdmissionConflict(
+            'Current service version reserved-fill selector is malformed.')
+    mode = service.get('reserved_fill_actuation_mode')
+    if mode not in ('DIRECT_REPLICA', 'DURABLE_INTENT'):
+        raise CapacityAdmissionConflict(
+            'Service reserved-fill actuation mode is malformed.')
+    return fill_enabled and mode == 'DURABLE_INTENT'
 
 
 def _require_postgres(connection: sqlalchemy.engine.Connection) -> None:
@@ -766,13 +962,46 @@ class CapacityAdmissionRepository:
         if not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
             raise ValueError('ttl_seconds must be positive.')
         with self.engine.begin() as connection:
+            allocation_bound = (
+                plan.reserved_fill_authority.mode
+                is ReservedFillPlanAuthorityMode.ALLOCATION_BOUND)
+            if allocation_bound:
+                # Allocation writers take the exclusive protocol mutex before
+                # service-local rows.  Publication shares that exact prefix so
+                # a positive plan and the allocation it names linearize in one
+                # PostgreSQL transaction.
+                serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+                    connection)
             service = connection.execute(
                 sqlalchemy.select(_SERVICES).where(
                     _SERVICES.c.name == plan.service_name).with_for_update()
             ).mappings().one_or_none()
             if service is None:
                 raise CapacityAdmissionConflict('Service no longer exists.')
+            reserved_fill_binding_required = (
+                _reserved_fill_binding_required_in_connection(
+                    connection, service))
+            positive_target = any(capacity_target.values())
+            authority_mode = plan.reserved_fill_authority.mode
+            expected_authority_mode = (
+                ReservedFillPlanAuthorityMode.ALLOCATION_BOUND
+                if reserved_fill_binding_required and positive_target else
+                ReservedFillPlanAuthorityMode.UNBOUND_ZERO_REVOCATION
+                if reserved_fill_binding_required else
+                ReservedFillPlanAuthorityMode.NOT_APPLICABLE)
+            if authority_mode is not expected_authority_mode:
+                raise CapacityAdmissionConflict(
+                    'Capacity plan reserved-fill authority does not match its '
+                    'service actuation mode and target.')
             self._validate_sources(connection, plan, service)
+            if allocation_bound:
+                _validate_reserved_fill_authority_in_connection(
+                    connection,
+                    service,
+                    plan.reserved_fill_authority,
+                    reserved_fill_binding_required=(
+                        reserved_fill_binding_required),
+                    protocol_and_service_prelocked=True)
             now = connection.execute(
                 sqlalchemy.select(
                     sqlalchemy.func.clock_timestamp())).scalar_one()
@@ -924,7 +1153,8 @@ def validate_paid_claim_in_connection(
     *,
     prospective: bool = False,
     require_planner: bool = True,
-) -> None:
+    protocol_and_service_prelocked: bool = False,
+) -> datetime.datetime | None:
     """Revalidate one planner-bound claim before provider I/O."""
     fields = ('capacity_plan_generation', 'capacity_plan_sha256',
               'demand_feed_generation', 'demand_source_epoch',
@@ -934,7 +1164,7 @@ def validate_paid_claim_in_connection(
                 == DemandSourceMode.DURABLE_FEED.value):
             raise CapacityAdmissionConflict(
                 'Durable-demand service retained an unbound paid claim.')
-        return
+        return None
     # Legacy controller-sourced admission remains supported by the local
     # controller SQLite catalog, whose migration head intentionally predates
     # Serve050.  Only a complete planner tuple crosses the PostgreSQL-only
@@ -961,14 +1191,51 @@ def validate_paid_claim_in_connection(
             'Paid claim planner tuple is malformed.')
     now = connection.execute(
         sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
-    head = connection.execute(
-        sqlalchemy.select(_HEADS).where(
-            _HEADS.c.service_name ==
-            service['name']).with_for_update()).mappings().one_or_none()
     plan = connection.execute(
         sqlalchemy.select(_PLANS).where(
             _PLANS.c.service_name == service['name'],
             _PLANS.c.generation == generation)).mappings().one_or_none()
+    if (plan is None or plan['service_hash'] != service['hash'] or
+            plan['content_sha256'] != claim_sha256):
+        raise CapacityAdmissionConflict(
+            'Paid claim lost its current fresh capacity-plan authority.')
+    payload = plan['payload']
+    if not isinstance(payload, Mapping):
+        raise CapacityAdmissionConflict('Capacity plan payload is malformed.')
+    if _sha256(payload) != plan['content_sha256']:
+        raise CapacityAdmissionConflict(
+            'Capacity plan digest no longer matches its payload.')
+    reserved_fill_authority_present = 'reserved_fill_authority' in payload
+    raw_reserved_fill_authority = payload.get('reserved_fill_authority')
+    try:
+        plan_reserved_fill_authority = (
+            ReservedFillPlanAuthority.from_mapping(raw_reserved_fill_authority))
+    except ValueError as error:
+        reserved_fill_binding_required = (
+            _reserved_fill_binding_required_in_connection(connection, service))
+        if (reserved_fill_binding_required or reserved_fill_authority_present):
+            raise CapacityAdmissionConflict(
+                'Paid claim has no valid reserved-fill plan authority.'
+            ) from error
+        # Plans published before the allocation-binding contract may finish
+        # only while this exact elected service version does not require a
+        # binding. Enabling fill under DURABLE_INTENT makes the same bytes fail
+        # closed above; a fill-disabled durable birth remains compatible.
+        plan_reserved_fill_authority = (
+            ReservedFillPlanAuthority.not_applicable())
+    else:
+        reserved_fill_binding_required = (
+            _reserved_fill_binding_required_in_connection(connection, service))
+    validated_allocation = _validate_reserved_fill_authority_in_connection(
+        connection,
+        service,
+        plan_reserved_fill_authority,
+        reserved_fill_binding_required=reserved_fill_binding_required,
+        protocol_and_service_prelocked=protocol_and_service_prelocked)
+    head = connection.execute(
+        sqlalchemy.select(_HEADS).where(
+            _HEADS.c.service_name ==
+            service['name']).with_for_update()).mappings().one_or_none()
     current_demand_generation = connection.execute(
         sqlalchemy.select(_DEMAND_GENERATIONS.c.generation).where(
             _DEMAND_GENERATIONS.c.service_name == service['name'],
@@ -983,7 +1250,7 @@ def validate_paid_claim_in_connection(
             _ROUTE_SNAPSHOTS.c.service_name == service['name'],
             _ROUTE_SNAPSHOTS.c.generation
             == route_head['generation'])).mappings().one_or_none())
-    if (head is None or plan is None or head['generation'] != generation or
+    if (head is None or head['generation'] != generation or
             head['valid_until'] <= now or
             plan['service_hash'] != service['hash'] or
             plan['content_sha256'] != claim_sha256 or
@@ -1055,12 +1322,6 @@ def validate_paid_claim_in_connection(
                 report.get('route_source_epoch') != plan['route_source_epoch']):
             raise CapacityAdmissionConflict(
                 'Paid claim demand receipts no longer name its exact route.')
-    payload = plan['payload']
-    if not isinstance(payload, Mapping):
-        raise CapacityAdmissionConflict('Capacity plan payload is malformed.')
-    if _sha256(payload) != plan['content_sha256']:
-        raise CapacityAdmissionConflict(
-            'Capacity plan digest no longer matches its payload.')
     try:
         capacity_target = _canonical_counts(
             payload.get('capacity_target_by_accelerator', {}),
@@ -1134,6 +1395,23 @@ def validate_paid_claim_in_connection(
     if authorized <= 0 or claimed > authorized:
         raise CapacityAdmissionConflict(
             'Paid claims exceed the exact post-zero-cost residual.')
+    # The first clock sample selects rows conservatively, but allocation,
+    # route, capacity, and claim locks may all wait.  Provider-start authority
+    # therefore ends on a fresh database-clock sample taken after every lock.
+    final_now = connection.execute(
+        sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+    freshness_horizons = [head['valid_until'], route_head['valid_until']]
+    freshness_horizons.extend(row['valid_until'] for row in fresh_reports)
+    if validated_allocation is not None:
+        freshness_horizons.extend(
+            datetime.datetime.fromtimestamp(snapshot.valid_until,
+                                            datetime.timezone.utc)
+            for snapshot in validated_allocation.pool_snapshots)
+    paid_fresh_until = min(freshness_horizons)
+    if paid_fresh_until <= final_now:
+        raise CapacityAdmissionConflict(
+            'Paid claim freshness expired while validation waited.')
+    return paid_fresh_until
 
 
 def promote_service_in_connection(

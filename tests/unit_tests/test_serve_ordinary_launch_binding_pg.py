@@ -871,7 +871,7 @@ def test_current_paid_effect_accepts_current_worker_projection(
         binding_database) -> None:
     current_protocol = (
         kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
-    assert current_protocol == 8
+    assert current_protocol == 9
     with binding_database.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.version_specs_table).where(
@@ -933,11 +933,11 @@ def test_historical_cohort_cannot_start_provider_effect(
     assert phase == binding.EffectPhase.NOT_STARTED.value
 
 
-@pytest.mark.parametrize('historical_protocol', [6, 7])
-def test_historical_projection_retry_is_idempotent_but_effect_requires_v8(
+@pytest.mark.parametrize('historical_protocol', [7, 8])
+def test_historical_projection_retry_is_idempotent_but_effect_requires_v9(
         binding_database, monkeypatch, historical_protocol) -> None:
     """A lost-ACK retry survives N-1/N-2 without new provider I/O."""
-    assert kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION == 8
+    assert kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION == 9
     with binding_database.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.version_specs_table).where(
@@ -1047,7 +1047,7 @@ def _reserved_fill_cleanup_rows(
 def test_reserved_fill_cleanup_accepts_exact_adjacent_cohort_tuple(
         binding_database, monkeypatch) -> None:
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
-    assert current_cohort == 8
+    assert current_cohort == 9
     service, replica, association, expected_profile = (
         _reserved_fill_cleanup_rows(current_cohort - 1, current_cohort - 1))
     validated: list[binding.NonPoolLaunchProfile] = []
@@ -1070,13 +1070,13 @@ def test_reserved_fill_cleanup_accepts_exact_adjacent_cohort_tuple(
 
 
 @pytest.mark.parametrize('history_distance', [1, 2])
-def test_retained_v6_v7_reserved_fill_graph_settles_provider_absence(
+def test_retained_v7_v8_reserved_fill_graph_settles_provider_absence(
         binding_database, monkeypatch, history_distance) -> None:
     """N-1/N-2 terminal state cleans without new provider authority."""
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
     current_projection = (
         kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
-    assert (current_cohort, current_projection) == (8, 8)
+    assert (current_cohort, current_projection) == (9, 9)
     historical_cohort = current_cohort - history_distance
     historical_projection = current_projection - history_distance
     info = _reserved_fill_replica_info()
@@ -1088,9 +1088,9 @@ def test_retained_v6_v7_reserved_fill_graph_settles_provider_absence(
         authorization_generation=info.reserved_fill_allocation_generation,
         authorization_payload=profile_payload)
 
-    # Reproduce one retained v6/v7 graph using its original writer. Its JSON-
+    # Reproduce one retained v7/v8 graph using its original writer. Its JSON-
     # only intent edge may later be cleaned, but never re-rendered or granted
-    # a new provider effect by v8.
+    # a new provider effect by v9.
     with monkeypatch.context() as historical_code:
         historical_code.setattr(binding, 'NON_POOL_CAPABILITY_COHORT_EPOCH',
                                 historical_cohort)
@@ -1445,8 +1445,8 @@ def test_retained_v6_v7_reserved_fill_graph_settles_provider_absence(
         assert not historical_authority.retained_non_pool_settlement_allowed
         # N-2 does not enter the adopter/reconciliation or evidence-writer
         # paths, even for a real retained ambiguous association.
-        assert binding.list_provider_reconciliation_contexts(
-            historical_authority) == []
+        assert not binding.list_provider_reconciliation_contexts(
+            historical_authority)
         with binding_database.begin() as connection:
             with pytest.raises(binding.OrdinaryLaunchBindingConflict):
                 binding.record_non_pool_provider_evidence(
@@ -2029,7 +2029,7 @@ def test_retained_v6_v7_reserved_fill_graph_settles_provider_absence(
 def test_reserved_fill_cleanup_rejects_older_or_mismatched_cohorts(
         binding_database, monkeypatch, service_cohort,
         association_cohort) -> None:
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 8
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 9
     service, replica, association, _ = _reserved_fill_cleanup_rows(
         service_cohort, association_cohort)
     profile_validation_called = False
@@ -3960,6 +3960,81 @@ class _Claim:
     execution_generation: int
     claim_token: str
     worker_instance_id: str
+
+
+def test_legacy_paid_effect_revalidates_planner_under_protocol_prefix(
+        binding_database, monkeypatch) -> None:
+    state = _stored_replica_state({'paid_capacity_pool_key': 'pool-a'})
+    with binding_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id == 3).values(
+                    paid_capacity_pool_key='pool-a', replica_state=state))
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.paid_capacity_pools_table).values(
+                    pool_key='pool-a',
+                    current_limit=1,
+                    successes_since_resize=0,
+                    updated_at=time.time()))
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.paid_capacity_claims_table).values(
+                    service_name='svc',
+                    service_hash='svc-hash',
+                    replica_id=3,
+                    pool_key='pool-a',
+                    priority=1,
+                    claimed_at=time.time()))
+    identity, admission = _admit(binding_database)
+    claim = _Claim(identity.request_id, 1, str(uuid.uuid4()), str(uuid.uuid4()))
+    events = []
+    original_lock = (binding.serve_state.
+                     lock_zero_cost_protocol_for_bound_launch_observation)
+    original_validate = (
+        binding.capacity_admission.validate_paid_claim_in_connection)
+
+    def _lock(connection):
+        events.append('protocol')
+        return original_lock(connection)
+
+    def _validate(connection, service, paid_claim, **kwargs):
+        events.append('planner')
+        assert kwargs == {'protocol_and_service_prelocked': True}
+        return original_validate(connection, service, paid_claim, **kwargs)
+
+    monkeypatch.setattr(binding.serve_state,
+                        'lock_zero_cost_protocol_for_bound_launch_observation',
+                        _lock)
+    monkeypatch.setattr(binding.capacity_admission,
+                        'validate_paid_claim_in_connection', _validate)
+
+    with binding.provider_effect_guard(
+            _bound_launch_context(identity, admission.launch_generation),
+            claim,
+            claim_validator=lambda _connection, _association_id, _claim: True):
+        pass
+
+    assert events == ['protocol', 'planner']
+
+    def _expiring_validate(_connection, _service, _paid_claim, **kwargs):
+        assert kwargs == {'protocol_and_service_prelocked': True}
+        return (datetime.datetime.now(datetime.timezone.utc) +
+                datetime.timedelta(milliseconds=100))
+
+    def _delayed_claim_validator(_connection, _association_id, _claim):
+        time.sleep(0.2)
+        return True
+
+    monkeypatch.setattr(binding.capacity_admission,
+                        'validate_paid_claim_in_connection', _expiring_validate)
+    context = _bound_context(identity, admission.launch_generation)
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='expired while locking its request'):
+        with binding_database.begin() as connection:
+            binding.validate_effect_authority_in_connection(
+                connection, context, claim, _delayed_claim_validator)
 
 
 def test_effect_guard_service_job_and_projection_are_monotonic(

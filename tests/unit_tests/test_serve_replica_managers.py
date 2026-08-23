@@ -343,20 +343,18 @@ def test_provider_present_down_requires_fresh_post_down_absence():
     info = types.SimpleNamespace(cluster_name='svc-3')
     projector = mock.Mock()
     events = []
-    observation = (
-        replica_managers.non_pool_launch_reconciliation.ProviderObservation(
-            ordinary_launch_binding.ProviderEvidence.ABSENT, {
-                'result': 'ABSENT',
-            }))
+    receipt = (
+        replica_managers.reserved_capacity.ProtocolV2PhysicalAbsenceReceipt(
+            cleanup_fence=mock.sentinel.cleanup_fence, cluster_name='svc-3'))
     with mock.patch.object(replica_managers,
                            'terminate_cluster',
-                           side_effect=lambda *_args, **_kwargs: events.append(
-                               'down')) as terminate, \
+                           side_effect=lambda *_args, **_kwargs: (
+                               events.append('down') or receipt)) as terminate, \
          mock.patch.object(
              replica_managers.non_pool_launch_reconciliation,
-             'reconcile',
+             'reconcile_post_teardown_absence',
              side_effect=lambda *_args, **_kwargs: events.append(
-                 'bound-projection') or observation) as reconcile:
+                 'bound-projection')) as reconcile:
         replica_managers.terminate_bound_non_pool_provider_present_cluster(
             context,
             info,
@@ -371,39 +369,29 @@ def test_provider_present_down_requires_fresh_post_down_absence():
                                       '/tmp/replica.log',
                                       0,
                                       cleanup_fence=mock.sentinel.cleanup_fence)
-    reconcile.assert_called_once_with(context,
-                                      info,
-                                      authority,
-                                      projector,
-                                      force_provider_read=True)
+    reconcile.assert_called_once_with(context, info, authority, projector,
+                                      receipt)
     assert events == ['down', 'bound-projection']
 
 
-@pytest.mark.parametrize('evidence', [
-    ordinary_launch_binding.ProviderEvidence.UNKNOWN,
-    ordinary_launch_binding.ProviderEvidence.REPLACED,
-])
-def test_provider_present_down_quarantines_non_absent_readback(evidence):
+def test_provider_present_down_quarantines_missing_absence_receipt():
     context = _bound_non_pool_context(
         ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
-    observation = (
-        replica_managers.non_pool_launch_reconciliation.ProviderObservation(
-            evidence, {
-                'result': evidence.value,
-            }))
-    with mock.patch.object(replica_managers, 'terminate_cluster'), \
+    with mock.patch.object(replica_managers,
+                           'terminate_cluster',
+                           return_value=None), \
          mock.patch.object(
              replica_managers.non_pool_launch_reconciliation,
-             'reconcile',
-             return_value=observation), \
+             'reconcile_post_teardown_absence') as reconcile, \
          pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
-                       match='without fresh exact ABSENT'):
+                       match='returned no exact physical ABSENT'):
         replica_managers.terminate_bound_non_pool_provider_present_cluster(
             context, types.SimpleNamespace(cluster_name='svc-3'),
             _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
                                binding_epoch=2,
                                generic=True), mock.Mock(), 'svc-3',
             '/tmp/replica.log')
+    reconcile.assert_not_called()
 
 
 def test_kueue_absence_projection_runs_only_after_fenced_down():
@@ -2754,10 +2742,11 @@ def test_protocol_v2_down_waits_for_uncached_physical_absence(tmp_path):
          mock.patch('sky.core.down',
                     side_effect=lambda *_args, **_kwargs: events.append(
                         'down')) as core_down:
-        replica_managers.terminate_cluster(cluster_name,
-                                           str(tmp_path / 'replica.log'),
-                                           continue_guard=guard,
-                                           cleanup_fence=fence)
+        receipt = replica_managers.terminate_cluster(cluster_name,
+                                                     str(tmp_path /
+                                                         'replica.log'),
+                                                     continue_guard=guard,
+                                                     cleanup_fence=fence)
 
     assert events == [
         'phase-1-enter', 'down', 'phase-1-exit', 'phase-2-enter',
@@ -2769,8 +2758,108 @@ def test_protocol_v2_down_waits_for_uncached_physical_absence(tmp_path):
         _expected_cluster_hash='cluster-generation',
         _continue_guard=guard)
     assert probe.call_count == 3
+    assert receipt == (
+        replica_managers.reserved_capacity.ProtocolV2PhysicalAbsenceReceipt(
+            cleanup_fence=fence, cluster_name=cluster_name))
     # Once before down, then before and after every provider observation.
     assert guard.call_count == 7
+
+
+def test_protocol_v2_down_missing_record_proves_physical_absence(tmp_path):
+    cluster_name = 'svc-1'
+    fence, _ = _protocol_v2_cleanup_record(cluster_name)
+    guard = mock.Mock(return_value=True)
+    with mock.patch.object(replica_managers.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=None), \
+         mock.patch.object(replica_managers.provider_phase,
+                           'provider_phase',
+                           return_value=contextlib.nullcontext()), \
+         mock.patch.object(
+             replica_managers.reserved_capacity,
+             'probe_physical_replica_presence',
+             return_value=(replica_managers.reserved_capacity.
+                           PhysicalReplicaPresence.ABSENT)) as probe, \
+         mock.patch('sky.core.down') as core_down:
+        receipt = replica_managers.terminate_cluster(cluster_name,
+                                                     str(tmp_path /
+                                                         'replica.log'),
+                                                     continue_guard=guard,
+                                                     cleanup_fence=fence)
+
+    core_down.assert_not_called()
+    probe.assert_called_once_with(fence, cluster_name, use_cache=False)
+    assert receipt == (
+        replica_managers.reserved_capacity.ProtocolV2PhysicalAbsenceReceipt(
+            cleanup_fence=fence, cluster_name=cluster_name))
+    # Once before classification, then before and after the exact observation.
+    assert guard.call_count == 3
+
+
+def test_protocol_v2_down_disappeared_cluster_proves_physical_absence(tmp_path):
+    cluster_name = 'svc-1'
+    fence, cluster_record = _protocol_v2_cleanup_record(cluster_name)
+    guard = mock.Mock(return_value=True)
+    with mock.patch.object(replica_managers.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=cluster_record), \
+         mock.patch.object(replica_managers.provider_phase,
+                           'provider_phase',
+                           return_value=contextlib.nullcontext()), \
+         mock.patch.object(
+             replica_managers.kubernetes_adaptor,
+             'physical_cluster_uid_fence',
+             return_value=contextlib.nullcontext()), \
+         mock.patch.object(
+             replica_managers.reserved_capacity,
+             'probe_physical_replica_presence',
+             return_value=(replica_managers.reserved_capacity.
+                           PhysicalReplicaPresence.ABSENT)) as probe, \
+         mock.patch('sky.core.down',
+                    side_effect=exceptions.ClusterDoesNotExist) as core_down:
+        receipt = replica_managers.terminate_cluster(cluster_name,
+                                                     str(tmp_path /
+                                                         'replica.log'),
+                                                     continue_guard=guard,
+                                                     cleanup_fence=fence)
+
+    core_down.assert_called_once()
+    probe.assert_called_once_with(fence, cluster_name, use_cache=False)
+    assert receipt == (
+        replica_managers.reserved_capacity.ProtocolV2PhysicalAbsenceReceipt(
+            cleanup_fence=fence, cluster_name=cluster_name))
+    assert guard.call_count == 3
+
+
+@pytest.mark.parametrize('presence', [
+    replica_managers.reserved_capacity.PhysicalReplicaPresence.PRESENT,
+    replica_managers.reserved_capacity.PhysicalReplicaPresence.UNPROVEN
+])
+def test_protocol_v2_down_missing_record_never_infers_absence(
+        tmp_path, presence):
+    cluster_name = 'svc-1'
+    fence, _ = _protocol_v2_cleanup_record(cluster_name)
+    with mock.patch.object(replica_managers.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=None), \
+         mock.patch.object(replica_managers.provider_phase,
+                           'provider_phase',
+                           return_value=contextlib.nullcontext()), \
+         mock.patch.object(
+             replica_managers.reserved_capacity,
+             'probe_physical_replica_presence',
+             return_value=presence) as probe, \
+         mock.patch.object(replica_managers,
+                           '_POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS', 0), \
+         mock.patch('sky.core.down') as core_down, \
+         pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match=f'remained {presence.value.lower()}'):
+        replica_managers.terminate_cluster(cluster_name,
+                                           str(tmp_path / 'replica.log'),
+                                           cleanup_fence=fence)
+
+    core_down.assert_not_called()
+    probe.assert_called_once_with(fence, cluster_name, use_cache=False)
 
 
 def test_protocol_v2_down_retains_perpetual_present_uncertainty(tmp_path):
@@ -15008,7 +15097,9 @@ class TestPaidLocationLaunchBudget:
             content_sha256='a' * 64,
             demand_feed_generation=9,
             demand_source_epoch=3,
-            paid_residual_by_accelerator=(('l4', 4),))
+            paid_residual_by_accelerator=(('l4', 4),),
+            reserved_fill_authority=(
+                capacity_admission.ReservedFillPlanAuthority.not_applicable()))
 
         with mock.patch('sky.serve.replica_managers._should_use_spot',
                         return_value=True), \
@@ -15055,7 +15146,9 @@ class TestPaidLocationLaunchBudget:
             content_sha256='a' * 64,
             demand_feed_generation=9,
             demand_source_epoch=3,
-            paid_residual_by_accelerator=(('l4', 1),))
+            paid_residual_by_accelerator=(('l4', 1),),
+            reserved_fill_authority=(
+                capacity_admission.ReservedFillPlanAuthority.not_applicable()))
 
         with mock.patch('sky.serve.replica_managers._should_use_spot',
                         return_value=True), \
@@ -16152,6 +16245,8 @@ class TestZeroCostDemandProbeBudget:
         placer.zero_cost_locations.return_value = zero_cost
         placer.active_locations.return_value = active
         manager._spot_placer = placer
+        manager._service_name = 'svc'
+        manager.latest_version = 1
         return manager
 
     @staticmethod
@@ -16216,12 +16311,28 @@ class TestZeroCostDemandProbeBudget:
         })
 
     @staticmethod
-    def _observations(values):
-        return {
-            key: replica_managers.reserved_capacity.FreeGpuObservation(
-                value, 100.0
-                if value is not None else None) for key, value in values.items()
-        }
+    def _observations(
+        values,
+        authority=(replica_managers.reserved_capacity.
+                   FreeGpuObservationAuthority.LEGACY_AMBIENT),
+    ):
+        observations = {}
+        for key, value in values.items():
+            sequence_kwargs = {}
+            if (value is not None and
+                    authority is replica_managers.reserved_capacity.
+                    FreeGpuObservationAuthority.SEQUENCED_GATE):
+                sequence_kwargs = {
+                    'admission_sequence': 10,
+                    'materialization_sequence': 20,
+                }
+            observations[key] = (
+                replica_managers.reserved_capacity.FreeGpuObservation(
+                    value,
+                    100.0 if value is not None else None,
+                    authority=authority,
+                    **sequence_kwargs))
+        return observations
 
     def test_large_batch_uses_all_223_measured_gpus_then_spills(self):
         zero = self._location('Kubernetes',
@@ -16246,7 +16357,9 @@ class TestZeroCostDemandProbeBudget:
             assert manager._select_budgeted_zero_cost_location(budget) == zero
         assert budget.remaining_by_pool == {('research-ctx', 'a100'): 7}
         assert manager._select_budgeted_zero_cost_location(budget) is None
-        query.assert_called_once_with([zero])
+        query.assert_called_once_with([zero],
+                                      service_name='svc',
+                                      service_version=1)
 
     def test_pending_rows_are_debited_from_measured_free_slots(self):
         zero = self._location('Kubernetes',
@@ -16365,6 +16478,56 @@ class TestZeroCostDemandProbeBudget:
         assert budget is not None
         assert budget.remaining_by_pool == {('research-ctx', 'a100'): 215}
 
+    def test_sequenced_snapshot_debits_only_post_observation_rows(self):
+        zero = self._location('Kubernetes',
+                              'research-ctx',
+                              'A100',
+                              use_spot=False)
+        manager = self._manager([zero], [zero])
+        observed = self._info(zero, ready=True)
+        observed.zero_cost_admission_sequence = 9
+        observed.zero_cost_materialization_sequence = 19
+        admitted_after = self._info(zero)
+        admitted_after.zero_cost_admission_sequence = 11
+        admitted_after.zero_cost_materialization_sequence = None
+        materialized_after = self._info(zero, ready=True)
+        materialized_after.zero_cost_admission_sequence = 8
+        materialized_after.zero_cost_materialization_sequence = 21
+        unattributed = self._info(zero, ready=True)
+        unattributed.zero_cost_admission_sequence = None
+        unattributed.zero_cost_materialization_sequence = None
+        observation = {
+            ('research-ctx', 'a100'):
+                replica_managers.reserved_capacity.FreeGpuObservation(
+                    10,
+                    100.0,
+                    admission_sequence=10,
+                    materialization_sequence=20,
+                    authority=(replica_managers.reserved_capacity.
+                               FreeGpuObservationAuthority.SEQUENCED_GATE))
+        }
+
+        with mock.patch.object(
+                replica_managers,
+                '_placer_has_only_non_spot_kubernetes_gpu_locations',
+                return_value=False), \
+             mock.patch.object(
+                 replica_managers,
+                 '_kubernetes_context_has_configured_autoscaler',
+                 return_value=False), \
+             mock.patch.object(
+                 replica_managers.reserved_capacity,
+                 'get_cached_free_gpus_by_pool',
+                 return_value=observation):
+            budget = manager._build_zero_cost_demand_budget(
+                [], [None] * 10,
+                capacity_replica_infos=[
+                    observed, admitted_after, materialized_after, unattributed
+                ])
+
+        assert budget is not None
+        assert budget.remaining_by_pool == {('research-ctx', 'a100'): 7}
+
     def test_blackout_budget_remains_bounded_in_backend_attempts(self):
         zero = self._location('Kubernetes',
                               'research-ctx',
@@ -16387,6 +16550,53 @@ class TestZeroCostDemandProbeBudget:
         for _ in range(attempts):
             assert manager._select_budgeted_zero_cost_location(budget) == zero
         assert manager._select_budgeted_zero_cost_location(budget) is None
+
+    def test_sequenced_unknown_never_receives_speculative_allowance(self):
+        zero = self._location('Kubernetes',
+                              'research-ctx',
+                              'A100',
+                              use_spot=False,
+                              count=8)
+        paid = self._location('AWS', 'us-east-1', 'L4', use_spot=True)
+        manager = self._manager([zero], [zero, paid])
+
+        with mock.patch.object(
+                replica_managers.reserved_capacity,
+                'get_cached_free_gpus_by_pool',
+                return_value=self._observations(
+                    {('research-ctx', 'a100'): None},
+                    authority=(replica_managers.reserved_capacity.
+                               FreeGpuObservationAuthority.SEQUENCED_GATE))):
+            budget = manager._build_zero_cost_demand_budget([], [None] * 500)
+
+        assert budget is not None
+        assert budget.measured_by_pool == {('research-ctx', 'a100'): None}
+        assert budget.remaining_by_pool == {('research-ctx', 'a100'): 0}
+        assert manager._select_budgeted_zero_cost_location(budget) is None
+
+    def test_sequenced_zero_never_reopens_scale_to_zero_probes(self):
+        zero = self._location('Kubernetes',
+                              'research-ctx',
+                              'A100',
+                              use_spot=False)
+        manager = self._manager([zero], [zero])
+
+        with mock.patch.object(
+                replica_managers,
+                '_kubernetes_context_has_configured_autoscaler',
+                return_value=True), \
+             mock.patch.object(
+                 replica_managers.reserved_capacity,
+                 'get_cached_free_gpus_by_pool',
+                 return_value=self._observations(
+                     {('research-ctx', 'a100'): 0},
+                     authority=(replica_managers.reserved_capacity.
+                                FreeGpuObservationAuthority.SEQUENCED_GATE))):
+            budget = manager._build_zero_cost_demand_budget([], [None] * 500)
+
+        assert budget is not None
+        assert budget.measured_by_pool == {('research-ctx', 'a100'): 0}
+        assert budget.remaining_by_pool == {('research-ctx', 'a100'): 0}
 
     def test_measurement_blackout_falls_back_to_probe_budget(self):
         zero = self._location('Kubernetes',

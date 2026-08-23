@@ -871,6 +871,18 @@ class ReservedFillAllocationIdentity:
         _require_sha256(self.reclaim_provider_inventory_sha256,
                         'Allocation identity reclaim provider inventory hash')
 
+    def to_mapping(self) -> dict[str, Any]:
+        """Return the canonical closed identity used by dependent plans."""
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_mapping(cls, value: Any) -> 'ReservedFillAllocationIdentity':
+        """Decode the exact closed identity without accepting extensions."""
+        fields = {field.name for field in dataclasses.fields(cls)}
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError('Allocation identity mapping is malformed.')
+        return cls(**dict(value))
+
 
 @dataclasses.dataclass(frozen=True)
 class MaterializedFillHolding:

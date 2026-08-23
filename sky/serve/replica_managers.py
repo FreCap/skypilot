@@ -2129,7 +2129,7 @@ def _wait_for_post_teardown_physical_absence(
     cluster_name: str,
     cleanup_fence: reserved_capacity.ProtocolV2CleanupFence,
     continue_guard: Callable[[], bool] | None,
-) -> None:
+) -> reserved_capacity.ProtocolV2PhysicalAbsenceReceipt:
     """Wait for one successful protocol-v2 down to become observable.
 
     Kubernetes deletion is asynchronous even with a zero grace period.  Each
@@ -2166,7 +2166,8 @@ def _wait_for_post_teardown_physical_absence(
                 f'Refusing to confirm termination of {cluster_name!r} after '
                 'service lifecycle ownership was lost.')
         if last_presence is reserved_capacity.PhysicalReplicaPresence.ABSENT:
-            return
+            return reserved_capacity.ProtocolV2PhysicalAbsenceReceipt(
+                cleanup_fence=cleanup_fence, cluster_name=cluster_name)
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -2189,7 +2190,7 @@ def terminate_cluster(
     continue_guard: Callable[[], bool] | None = None,
     expected_cluster_record_uuid: str | None = None,
     cleanup_fence: reserved_capacity.ProtocolV2CleanupFence | None = None
-) -> None:
+) -> reserved_capacity.ProtocolV2PhysicalAbsenceReceipt | None:
     """Terminate the sky serve replica cluster."""
     from sky import core  # pylint: disable=import-outside-toplevel
 
@@ -2236,9 +2237,15 @@ def terminate_cluster(
                 cluster_record = global_user_state.get_cluster_from_name(
                     cluster_name)
                 if cluster_record is None and cleanup_fence is not None:
-                    raise exceptions.KubernetesPhysicalClusterIdentityError(
-                        f'Cannot prove protocol-v2 cleanup for {cluster_name!r}: '
-                        'its durable cluster record is absent.')
+                    # The provider may have completed deletion before the
+                    # central cluster row was observed.  The immutable cleanup
+                    # fence remains sufficient only to prove physical absence;
+                    # it never authorizes another name-only down.  Leave this
+                    # phase and obtain that exact uncached proof below.
+                    logger.info(
+                        f'Replica cluster {cluster_name!r} has no durable '
+                        'cluster record; proving fenced physical absence.')
+                    break
                 expected_cluster_hash = None
                 if cleanup_fence is not None:
                     assert cluster_record is not None
@@ -2307,15 +2314,21 @@ def terminate_cluster(
                                   _expected_cluster_hash=expected_cluster_hash,
                                   _continue_guard=continue_guard)
             break
-        except exceptions.ClusterDoesNotExist as error:
+        except exceptions.ClusterDoesNotExist:
             if cleanup_fence is not None:
-                raise exceptions.KubernetesPhysicalClusterIdentityError(
-                    f'Cannot prove protocol-v2 cleanup for {cluster_name!r}: '
-                    'the exact cluster disappeared during teardown.') from error
+                # ``core.down`` may race the provider or another exact cleanup
+                # owner after validating the durable record.  Do not infer
+                # absence from this exception and do not retry by name.  The
+                # fenced uncached provider observation below is the only
+                # authority that can complete this cleanup.
+                logger.info(
+                    f'Replica cluster {cluster_name!r} disappeared during '
+                    'teardown; proving fenced physical absence.')
+                break
             # The cluster is already terminated.
             logger.info(
                 f'Replica cluster {cluster_name} is already terminated.')
-            return
+            return None
         except global_user_state.ClusterRecordHandleChangedError as error:
             # A same-generation handle update is retryable: the next attempt
             # reclassifies the fresh provider before selecting its phase.
@@ -2349,10 +2362,12 @@ def terminate_cluster(
             logger.error(f'  Traceback: {traceback.format_exc()}')
             time.sleep(gap_seconds)
 
+    absence_receipt = None
     if cleanup_fence is not None:
-        _wait_for_post_teardown_physical_absence(cluster_name, cleanup_fence,
-                                                 continue_guard)
+        absence_receipt = _wait_for_post_teardown_physical_absence(
+            cluster_name, cleanup_fence, continue_guard)
     logger.info(f'Replica cluster {cluster_name} terminated.')
+    return absence_receipt
 
 
 def terminate_bound_non_pool_provider_present_cluster(
@@ -2366,19 +2381,16 @@ def terminate_bound_non_pool_provider_present_cluster(
     **terminate_kwargs: Any,
 ) -> None:
     """Down one exact PRESENT allocation, then project fresh ABSENT proof."""
-    terminate_cluster(cluster_name, log_file, replica_drain_delay_seconds,
-                      **terminate_kwargs)
-    observation = non_pool_launch_reconciliation.reconcile(
-        binding_context,
-        replica_info,
-        authority,
-        project_replica_result,
-        force_provider_read=True)
-    if (observation.evidence
-            != ordinary_launch_binding.ProviderEvidence.ABSENT):
+    absence_receipt = terminate_cluster(cluster_name, log_file,
+                                        replica_drain_delay_seconds,
+                                        **terminate_kwargs)
+    if absence_receipt is None:
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-            'Fenced provider cleanup completed without fresh exact ABSENT '
-            'evidence for the reserved-fill allocation.')
+            'Fenced provider cleanup returned no exact physical ABSENT '
+            'receipt for the reserved-fill allocation.')
+    non_pool_launch_reconciliation.reconcile_post_teardown_absence(
+        binding_context, replica_info, authority, project_replica_result,
+        absence_receipt)
 
 
 def terminate_cluster_with_kueue_absence_receipt(
@@ -8516,14 +8528,15 @@ class SkyPilotReplicaManager(ReplicaManager):
     ) -> _ZeroCostDemandBudget | None:
         """Build a nonblocking shared free-GPU budget for one demand wave.
 
-        The observation is a database-cached, background-refreshed raw GPU
-        count. Rows across every service that may not be represented in that
-        snapshot are debited under the cross-process reservation lock before
-        this budget is returned. A missing/failed observation falls back to a
-        bounded number of backend probes. A successful zero is authoritative
-        for fixed pools in mixed fallback, while all-Kubernetes placement and
-        configured autoscalers receive bounded probes so a pod can trigger
-        scheduler preemption or scale-up from zero.
+        The gate-selected observation is either the legacy context cache or an
+        exact-current-claim sequenced physical-pool record. Rows across every
+        service that may not be represented in that snapshot are debited under
+        the cross-process reservation lock before this budget is returned;
+        sequenced observations use their durable admission/materialization
+        high-waters instead of application time. Only legacy unknown/zero
+        observations may receive bounded speculative probes. Sequenced or
+        unavailable UNKNOWN grants zero, while the controller's authenticated
+        allocation fence independently withholds the later paid pass.
         """
         if self._spot_placer is None:
             return None
@@ -8540,7 +8553,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         ]
         if not zero_cost:
             return None
-        observations = reserved_capacity.get_cached_free_gpus_by_pool(zero_cost)
+        observations = reserved_capacity.get_cached_free_gpus_by_pool(
+            zero_cost,
+            service_name=self._service_name,
+            service_version=self.latest_version)
         kubernetes_only_placement = (
             _placer_has_only_non_spot_kubernetes_gpu_locations(
                 self._spot_placer))
@@ -8548,11 +8564,16 @@ class SkyPilotReplicaManager(ReplicaManager):
             key: observation.free_gpus
             for key, observation in observations.items()
         }
+        authority_by_pool = {
+            key: observation.authority
+            for key, observation in observations.items()
+        }
         for measured_pool_key, free_gpus in measured.items():
-            if (free_gpus == 0 and
-                (kubernetes_only_placement or
-                 _kubernetes_context_has_configured_autoscaler(
-                     measured_pool_key[0]))):
+            if (free_gpus == 0 and authority_by_pool.get(measured_pool_key) is
+                    reserved_capacity.FreeGpuObservationAuthority.LEGACY_AMBIENT
+                    and (kubernetes_only_placement or
+                         _kubernetes_context_has_configured_autoscaler(
+                             measured_pool_key[0]))):
                 measured[measured_pool_key] = None
         active_count_by_pool: dict[tuple[str, str], int] = {}
         for location in zero_cost:
@@ -8577,9 +8598,44 @@ class SkyPilotReplicaManager(ReplicaManager):
             observation = observations.get(pool_key)
             snapshot_time = (None if observation is None else
                              observation.snapshot_time)
+            observation_admission_sequence = (None if observation is None else
+                                              observation.admission_sequence)
+            observation_materialization_sequence = (
+                None if observation is None else
+                observation.materialization_sequence)
+            observation_authority = (
+                reserved_capacity.FreeGpuObservationAuthority.UNAVAILABLE
+                if observation is None else observation.authority)
             created_at = info.created_at
             status_property = info.status_property
-            if info.is_ready:
+            if (observation_authority is reserved_capacity.
+                    FreeGpuObservationAuthority.SEQUENCED_GATE and
+                    observation_admission_sequence is not None and
+                    observation_materialization_sequence is not None):
+                admission_sequence = info.zero_cost_admission_sequence
+                materialization_sequence = (
+                    info.zero_cost_materialization_sequence)
+                unobserved = (isinstance(admission_sequence, bool) or
+                              not isinstance(admission_sequence, int) or
+                              admission_sequence
+                              > observation_admission_sequence or
+                              isinstance(materialization_sequence, bool) or
+                              not isinstance(materialization_sequence, int) or
+                              materialization_sequence
+                              > observation_materialization_sequence)
+                if not info.is_ready:
+                    unresolved_backends_by_pool[pool_key] = (
+                        unresolved_backends_by_pool.get(pool_key, 0) + 1)
+            elif (observation_authority is not reserved_capacity.
+                  FreeGpuObservationAuthority.LEGACY_AMBIENT):
+                # No sequenced high-water means no consumable capacity. Keep
+                # the row conservatively unobserved, but never reinterpret the
+                # blackout through legacy timestamps or speculative probes.
+                unobserved = True
+                if not info.is_ready:
+                    unresolved_backends_by_pool[pool_key] = (
+                        unresolved_backends_by_pool.get(pool_key, 0) + 1)
+            elif info.is_ready:
                 first_ready_time = status_property.first_ready_time
                 if not isinstance(first_ready_time, (int, float)):
                     first_ready_time = None
@@ -8608,16 +8664,23 @@ class SkyPilotReplicaManager(ReplicaManager):
         for pool_key, location_count in active_count_by_pool.items():
             free_gpus = measured.get(pool_key)
             if free_gpus is None:
-                allowance = (_ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION *
-                             location_count)
-                remaining[pool_key] = max(
-                    0, allowance - unresolved_backends_by_pool.get(pool_key, 0))
+                if authority_by_pool.get(pool_key) is (
+                        reserved_capacity.FreeGpuObservationAuthority.
+                        LEGACY_AMBIENT):
+                    allowance = (_ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION *
+                                 location_count)
+                    remaining[pool_key] = max(
+                        0, allowance -
+                        unresolved_backends_by_pool.get(pool_key, 0))
+                else:
+                    remaining[pool_key] = 0
             else:
                 remaining[pool_key] = max(
                     0, free_gpus - unobserved_gpus_by_pool.get(pool_key, 0))
         logger.info('Zero-cost demand capacity snapshot: measured='
                     f'{measured}, unobserved_gpus='
                     f'{unobserved_gpus_by_pool}, '
+                    f'authority={authority_by_pool}, '
                     f'batch_budget={remaining}, demand={demand_count}.')
         return _ZeroCostDemandBudget(remaining, measured)
 

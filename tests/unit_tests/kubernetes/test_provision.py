@@ -84,7 +84,11 @@ def _make_provision_config(count):
     )
 
 
-def _configure_current_projection_runtime(config, *, scratch=None):
+def _configure_projection_runtime(config,
+                                  *,
+                                  protocol_version=instance.pod_spec_lib.
+                                  SERVE_WORKER_PROJECTION_PROTOCOL_VERSION,
+                                  scratch=None):
     if scratch is None:
         scratch = {'kind': 'none'}
     pod_spec = config.node_config['spec']
@@ -116,7 +120,7 @@ def _configure_current_projection_runtime(config, *, scratch=None):
                      expected_bootstrap_sha256=bootstrap_sha256))
     assert readiness.matches
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 8,
+        'serve_worker_projection_protocol_version': protocol_version,
         'serve_worker_expected_cache': {
             'kind': 'none',
         },
@@ -126,8 +130,8 @@ def _configure_current_projection_runtime(config, *, scratch=None):
 
 
 @pytest.mark.parametrize(('protocol_version', 'scratch', 'message'), [
-    (8, None, 'v3/v4/v5/v6/v7/v8 requires the complete worker scratch'),
-    (8, {
+    (9, None, 'v3/v4/v5/v6/v7/v8/v9 requires the complete worker scratch'),
+    (9, {
         'kind': 'memory',
         'size_limit_bytes': 1024,
     }, 'must be exactly none or memory-backed /tmp'),
@@ -149,8 +153,9 @@ def test_create_pods_rejects_invalid_worker_scratch_provider_contract(
 
 
 @pytest.mark.parametrize(('protocol_version', 'bootstrap_sha256', 'message'), [
-    (8, None, 'v4/v5/v6/v7/v8 requires the complete worker runtime bootstrap'),
-    (8, 'A' * 64, '64 lowercase hexadecimal'),
+    (9, None,
+     'v4/v5/v6/v7/v8/v9 requires the complete worker runtime bootstrap'),
+    (9, 'A' * 64, '64 lowercase hexadecimal'),
 ])
 def test_create_pods_rejects_invalid_worker_runtime_bootstrap_contract(
         monkeypatch, protocol_version, bootstrap_sha256, message):
@@ -178,7 +183,7 @@ def test_create_pods_rejects_invalid_worker_runtime_bootstrap_contract(
 
 
 @pytest.mark.parametrize(('cache', 'message'), [
-    (None, 'protocol v8 requires the complete worker cache'),
+    (None, 'protocol v8/v9 requires the complete worker cache'),
     ({
         'kind': 'node_local',
         'bootstrap_image': 'mutable:latest',
@@ -191,7 +196,7 @@ def test_create_pods_rejects_invalid_worker_cache_provider_contract(
     monkeypatch.setattr(kubernetes_utils, 'get_context_from_config',
                         lambda *_args, **_kwargs: 'ctx')
     config = _make_provision_config(count=1)
-    _configure_current_projection_runtime(config)
+    _configure_projection_runtime(config)
     if cache is None:
         config.provider_config.pop('serve_worker_expected_cache')
     else:
@@ -217,10 +222,27 @@ def test_create_pods_rejects_historical_projection_before_mutation(
     original_node_config = copy.deepcopy(config.node_config)
 
     with pytest.raises(config_lib.KubernetesError,
-                       match='exact current SkyServe worker projection'):
+                       match='historical SkyServe worker projection'):
         instance._create_pods('us', 'cluster', 'cluster', config)
 
     assert config.node_config == original_node_config
+    core_api.assert_not_called()
+
+
+def test_protocol_v8_without_persisted_pod_identity_cannot_create(monkeypatch):
+    monkeypatch.setattr(kubernetes_utils, 'get_namespace_from_config',
+                        lambda *_args, **_kwargs: 'ns')
+    monkeypatch.setattr(kubernetes_utils, 'get_context_from_config',
+                        lambda *_args, **_kwargs: 'ctx')
+    core_api = mock.Mock(side_effect=AssertionError(
+        'protocol v8 must fail before Kubernetes API access'))
+    monkeypatch.setattr(kubernetes, 'core_api', core_api)
+    config = _make_provision_config(count=1)
+    _configure_projection_runtime(config, protocol_version=8)
+
+    with pytest.raises(config_lib.KubernetesError, match='exact persisted Pod'):
+        instance._create_pods('us', 'cluster', 'cluster', config)
+
     core_api.assert_not_called()
 
 
@@ -253,8 +275,13 @@ def _kueue_lane_runtime(
         persisted_pod_identity=persisted_pod_identity)
 
 
-def _configure_strict_kueue_lane(config: provision_common.ProvisionConfig,
-                                 cluster_name_on_cloud: str) -> None:
+def _configure_strict_kueue_lane(
+    config: provision_common.ProvisionConfig,
+    cluster_name_on_cloud: str,
+    *,
+    protocol_version: int = instance.pod_spec_lib.
+    SERVE_WORKER_PROJECTION_PROTOCOL_VERSION,
+) -> None:
     config.provider_config.update({
         'kueue_local_queue_name': 'be',
         'kueue_require_managed': True,
@@ -269,7 +296,7 @@ def _configure_strict_kueue_lane(config: provision_common.ProvisionConfig,
         'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
         'serve_worker_expected_accelerator_count': 1,
     })
-    _configure_current_projection_runtime(config)
+    _configure_projection_runtime(config, protocol_version=protocol_version)
     config.provider_effect_guard_factory = contextlib.nullcontext
     config.kueue_admission_runtime = _kueue_lane_runtime(
         persisted_pod_identity=_kueue_persisted_pod_identity(
@@ -315,7 +342,7 @@ def test_reserved_fill_required_kueue_requires_lane_runtime(monkeypatch):
         'kueue_local_queue_name': 'be',
         'kueue_require_managed': True,
     })
-    _configure_current_projection_runtime(config)
+    _configure_projection_runtime(config)
     config.provider_effect_guard_factory = contextlib.nullcontext
 
     with pytest.raises(config_lib.KubernetesError,
@@ -379,7 +406,7 @@ def test_create_pods_rejects_finalizer_scratch_drift_before_api_create(
             'size_limit_bytes': 20 * 1024**3,
         },
     })
-    _configure_current_projection_runtime(
+    _configure_projection_runtime(
         config, scratch=config.provider_config['serve_worker_expected_scratch'])
 
     with pytest.raises(config_lib.KubernetesError,
@@ -430,7 +457,7 @@ def test_create_pods_rejects_finalizer_runtime_bootstrap_drift_before_create(
     config = _make_provision_config(count=1)
     config.node_config['spec'] = pod_spec
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 8,
+        'serve_worker_projection_protocol_version': 9,
         'serve_worker_expected_priority_class_name': None,
         'serve_worker_expected_priority_value': None,
         'serve_worker_expected_preemption_policy': None,
@@ -1214,7 +1241,7 @@ def test_persisted_kueue_pod_terminal_state_defers_without_mutation(
     monkeypatch.setattr(kubernetes, 'core_api',
                         lambda *_args, **_kwargs: core_api)
     config = _make_provision_config(count=1)
-    _configure_strict_kueue_lane(config, cluster_on_cloud)
+    _configure_strict_kueue_lane(config, cluster_on_cloud, protocol_version=8)
 
     with pytest.raises(
             sky_exceptions.ReservedFillProviderPresentError) as exc_info:
@@ -1251,7 +1278,7 @@ def test_persisted_kueue_pod_conflict_fails_before_create(
     monkeypatch.setattr(kubernetes, 'core_api',
                         lambda *_args, **_kwargs: core_api)
     config = _make_provision_config(count=1)
-    _configure_strict_kueue_lane(config, cluster_on_cloud)
+    _configure_strict_kueue_lane(config, cluster_on_cloud, protocol_version=8)
 
     with pytest.raises(
             sky_exceptions.ReservedFillProviderPresentError) as exc_info:
@@ -1355,7 +1382,7 @@ def test_current_projection_create_pods_waits_for_runtime_ready_before_final_rea
 
     config = _make_provision_config(count=1)
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 8,
+        'serve_worker_projection_protocol_version': 9,
         'serve_worker_expected_priority_class_name': None,
         'serve_worker_expected_priority_value': None,
         'serve_worker_expected_preemption_policy': None,
@@ -1654,9 +1681,9 @@ def test_create_pods_enforces_required_kueue_after_finalization(monkeypatch):
     }]
 
 
-def test_parallel_create_attests_each_pod_before_sibling_batch_returns(
+def test_fresh_protocol_v9_parallel_create_attests_before_batch_returns(
         monkeypatch):
-    """A schedulable Pod is fully attested while a sibling create is blocked."""
+    """Fresh v9 creates Pods and attests each before its sibling returns."""
     cluster_on_cloud = 'test-cluster-immediate-worker-attestation'
     _patch_create_pods_k8s_boundary(monkeypatch, {}, None)
     monkeypatch.setattr(kubernetes_utils, 'get_allowed_nodes_config',
@@ -1732,13 +1759,18 @@ def test_parallel_create_attests_each_pod_before_sibling_batch_returns(
         'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
         'serve_worker_expected_accelerator_count': 1,
     })
-    _configure_current_projection_runtime(config)
+    _configure_projection_runtime(config)
 
     record = instance._create_pods('us', cluster_on_cloud, cluster_on_cloud,
                                    config)
 
     head_name = f'{cluster_on_cloud}-head'
+    assert config.provider_config[
+        'serve_worker_projection_protocol_version'] == 9
     assert record.head_instance_id == head_name
+    assert set(record.created_instance_ids) == {
+        head_name, f'{cluster_on_cloud}-worker1'
+    }
     assert [kind for name, kind in events if name == head_name] == [
         'api-response', 'kueue', 'priority', 'service-account', 'accelerator',
         'scheduler', 'cache', 'scratch', 'runtime-readiness', 'create-return'
@@ -2149,13 +2181,15 @@ def test_required_kueue_rejects_existing_unmanaged_pod(monkeypatch):
         _request_timeout=config_lib.DELETION_TIMEOUT)
 
 
-def test_required_kueue_adopts_realistic_admitted_running_pod(monkeypatch):
-    """A Kueue v0.18 Running Pod carries a bound role and workload identity."""
+def test_protocol_v8_adopts_exact_persisted_kueue_running_pod(monkeypatch):
+    """Released v8 may reattach only through its durable exact Pod UID."""
     cluster_on_cloud = 'test-cluster-required-kueue-admitted'
     head_name = f'{cluster_on_cloud}-head'
     existing_pod = _fake_pod(head_name)
     existing_pod.status.phase = 'Running'
     existing_pod.metadata.namespace = 'ns'
+    existing_pod.metadata.uid = 'persisted-pod-uid'
+    existing_pod.metadata.deletion_timestamp = None
     existing_pod.metadata.labels = {
         k8s_constants.KUEUE_MANAGED_KEY: 'true',
         k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
@@ -2179,6 +2213,7 @@ def test_required_kueue_adopts_realistic_admitted_running_pod(monkeypatch):
                                     head_name)
 
     core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.return_value = existing_pod
     core_api.read_node.return_value = types.SimpleNamespace(
         metadata=types.SimpleNamespace(
             name='h200-node', labels={'nvidia.com/gpu.product': 'NVIDIA-H200'}))
@@ -2203,13 +2238,17 @@ def test_required_kueue_adopts_realistic_admitted_running_pod(monkeypatch):
         'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
         'serve_worker_expected_accelerator_count': 1,
     })
-    _configure_current_projection_runtime(config)
+    _configure_projection_runtime(config, protocol_version=8)
+    config.provider_effect_guard_factory = contextlib.nullcontext
+    config.kueue_admission_runtime = _kueue_lane_runtime(
+        persisted_pod_identity=_kueue_persisted_pod_identity(cluster_on_cloud))
 
     record = instance._create_pods('us', cluster_on_cloud, cluster_on_cloud,
                                    config)
 
     assert record.head_instance_id == head_name
     assert record.created_instance_ids == []
+    core_api.create_namespaced_pod.assert_not_called()
     core_api.delete_namespaced_pod.assert_not_called()
 
 
@@ -3008,7 +3047,7 @@ def test_required_kueue_rejects_mutated_existing_admitted_pod(
         'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
         'serve_worker_expected_accelerator_count': 1,
     })
-    _configure_current_projection_runtime(config)
+    _configure_projection_runtime(config)
 
     with pytest.raises(config_lib.KubernetesError,
                        match='Kueue admission contract'):

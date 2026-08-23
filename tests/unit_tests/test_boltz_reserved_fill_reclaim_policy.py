@@ -167,6 +167,61 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
                   'nvidia.com/gpu')['nominal_quota'] == '64'
 
 
+def test_policy_exposes_provider_free_physical_pool_inventory():
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+
+    assert policy.provider_free_pool_inventory() == (
+        reclaim.ReclaimPoolInventoryEntry(
+            access_context='phx_research_cluster_eks',
+            physical_cluster_uid='ba2dcdca-2a0d-447f-ad8a-31849a63c1d5',
+            accelerator_shapes=(('h200', 1),)),
+        reclaim.ReclaimPoolInventoryEntry(
+            access_context='prod_research_cluster_eks',
+            physical_cluster_uid='14de98b4-cb7b-4f82-beb7-6f754a96f1dd',
+            accelerator_shapes=(('a100', 1), ('a100-80gb', 1))),
+    )
+
+
+def test_altered_inventory_under_same_identity_cannot_authorize_claim(
+        monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    identity = policy.policy_identity()
+    context = policy._bundle.fleet_context('phx_research_cluster_eks')
+    forged_uid = '00000000-0000-4000-8000-000000000001'
+    forged_inventory = (reclaim.ReclaimPoolInventoryEntry(
+        access_context=context['kubernetes_context'],
+        physical_cluster_uid=forged_uid,
+        accelerator_shapes=(('h200', 1),)),)
+    monkeypatch.setattr(policy, 'provider_free_pool_inventory',
+                        lambda: forged_inventory)
+
+    # The generic boundary verifies the policy's exact gate identity. The
+    # independent claim callback must still validate every returned atom from
+    # the embedded bundle so an implementation bug cannot turn identity-only
+    # bootstrap data into capacity authority.
+    assert reclaim.require_provider_free_pool_inventory(
+        policy, identity) == forged_inventory
+    edge = dataclasses.replace(_edge(context),
+                               pool_key=json.dumps(['v2', forged_uid, 'h200']),
+                               physical_cluster_uid=forged_uid)
+    scope = reclaim.ReclaimClaimSetScope(service_name='service',
+                                         service_incarnation='incarnation',
+                                         service_version=1,
+                                         semantic_hash='semantic',
+                                         edges=(edge,))
+    read_provider_proof = mock.Mock()
+    monkeypatch.setattr(policy, '_read_launch_context', read_provider_proof)
+
+    with pytest.raises(reclaim.ReclaimAttestationError,
+                       match='physical-cluster identity is not allowlisted'):
+        policy.authorize_claim_set(scope,
+                                   expected_identity=identity,
+                                   expected_gate_generation=7,
+                                   deadline_monotonic=time.monotonic() + 5)
+
+    read_provider_proof.assert_not_called()
+
+
 def test_bundle_hashes_are_domain_separated_and_order_independent():
     document = _bundle_document()
     first = bundle_lib.parse_bundle_bytes(_encoded_bundle(document))

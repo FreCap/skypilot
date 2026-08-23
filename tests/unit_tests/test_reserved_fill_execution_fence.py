@@ -113,7 +113,10 @@ def _policy_fill_context(
     return context
 
 
-def _bound_policy_fill_context() -> dict[str, object]:
+def _bound_policy_fill_context(
+    protocol_version: int = kubernetes_identity.
+    PLACEMENT_PROJECTION_PROTOCOL_VERSION,
+) -> dict[str, object]:
     """Build the complete persisted envelope used by a bound fill request."""
     intent_key = 'c' * 64
     profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
@@ -121,7 +124,7 @@ def _bound_policy_fill_context() -> dict[str, object]:
         authorization_reference=f'reserved-fill:{intent_key}',
         authorization_generation=7,
         authorization_payload={'intent_key': intent_key})
-    context = _policy_fill_context()
+    context = _policy_fill_context(protocol_version)
     context.update({
         ordinary_launch_binding.ASSOCIATION_ID_KEY: '22222222-2222-4222-8222-222222222222',
         ordinary_launch_binding.BOUND_REQUEST_ID_KEY: 'request-id',
@@ -148,7 +151,9 @@ def _bound_policy_fill_context() -> dict[str, object]:
             profile.authorization_generation,
         ordinary_launch_binding.AUTHORIZATION_DIGEST_KEY:
             profile.authorization_digest,
-        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [_worker_projection()],
+        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
+            _worker_projection(protocol_version)
+        ],
     })
     return context
 
@@ -323,8 +328,10 @@ def _execute_runtime_registration(
     return backend
 
 
-def test_bound_reserved_fill_passes_kueue_runtime_to_cloud_vm_backend():
-    context = _bound_policy_fill_context()
+@pytest.mark.parametrize('protocol_version', [8, 9])
+def test_bound_reserved_fill_passes_versioned_kueue_runtime_to_cloud_vm_backend(
+        protocol_version):
+    context = _bound_policy_fill_context(protocol_version)
     fence = reserved_capacity.parse_protocol_v2_launch_fence(context)
     assert fence is not None
     backend = backends.CloudVmRayBackend()
@@ -494,7 +501,7 @@ def test_historical_v7_decodes_but_cannot_publish_reclaim_admission():
             accelerator_count=1))
     assert decoded == projection
 
-    with pytest.raises(ValueError, match='required version 8'):
+    with pytest.raises(ValueError, match='required version 9'):
         reserved_fill_projection_authority.projected_admissions_for_edge(
             [projection],
             access_context='phx-context',

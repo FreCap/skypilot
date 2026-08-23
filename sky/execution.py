@@ -33,6 +33,7 @@ from sky.execution_autostop import (
     _compute_set_autostop_args_for_hooks_only_relaunch)
 from sky.execution_autostop import apply_launch_autostop
 from sky.execution_autostop import autostop_requested_features
+from sky.provision.kubernetes import pod_spec as kubernetes_pod_spec
 from sky.serve import constants as serve_constants
 from sky.serve import kubernetes_identity
 from sky.serve import kueue_lane_observer
@@ -151,15 +152,25 @@ def _load_service_worker_projections(
         projections = kubernetes_identity.validate_worker_placement_projections(
             stored_projections,
             require_protocol_version=(
+                None if reserved_fill_fence is not None and
+                reserved_fill_fence.policy_bound else
                 kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION))
         if (reserved_fill_fence is not None and
                 reserved_fill_fence.policy_bound):
-            # Historical projection rows are decode/settle/teardown-only. The
-            # exact-current check above runs before a bound request can reach
-            # provider I/O; the reclaim adapter then authenticates the stored
-            # current projection digest.
-            _, admission = reserved_capacity.require_reclaim_worker_projection(
-                reserved_fill_fence, projections)
+            # A bound retry may carry released protocol v8 only for exact
+            # persisted-Pod adoption. The runtime builder proves that durable
+            # identity before provider I/O; fresh effects remain current-only.
+            projection, admission = (
+                reserved_capacity.require_reclaim_worker_projection(
+                    reserved_fill_fence, projections))
+            projection_version = (
+                kubernetes_identity.worker_projection_protocol_version(
+                    projection))
+            if not (kubernetes_pod_spec.
+                    serve_worker_projection_protocol_is_renderable
+                   )(projection_version):
+                raise ValueError('Reserved fill has no byte-exact worker '
+                                 'projection renderer.')
             if admission.admission_mode is (reserved_fill_reclaim_attestation.
                                             ReclaimAdmissionMode.KUEUE):
                 placement_catalog = serve_state.get_placement_catalog(
@@ -241,15 +252,18 @@ def _apply_service_worker_runtime_projection_to_task(
             'A projected SkyServe replica launch must pin its Kubernetes '
             'context.')
     projection = kubernetes_identity.worker_projection_for_context(
-        projections,
-        resource.region,
-        resource.accelerators,
-        require_protocol_version=(
-            kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION))
+        projections, resource.region, resource.accelerators)
     if projection is None:
         raise exceptions.RequestCancelled(
             'SkyServe replica launch does not match a frozen worker '
             'placement.')
+    projection_version = (
+        kubernetes_identity.worker_projection_protocol_version(projection))
+    if not (kubernetes_pod_spec.serve_worker_projection_protocol_is_renderable
+           )(projection_version):
+        raise exceptions.RequestCancelled(
+            'SkyServe replica launch has no byte-exact worker projection '
+            'renderer.')
     has_projected_scratch = (
         kubernetes_identity.worker_projection_has_scratch(projection))
     bootstrap_environment = kubernetes_identity.bootstrap_environment(
@@ -294,6 +308,8 @@ def _validate_reserved_fill_final_resources(
     task: 'sky.Task',
     fence: reserved_capacity.ProtocolV2LaunchFence,
     worker_projections: Any | None,
+    *,
+    allow_historical_adoption: bool = False,
 ) -> None:
     """Revalidate a queued fill pin immediately before provider actuation."""
     best_resources = task.best_resources
@@ -310,8 +326,19 @@ def _validate_reserved_fill_final_resources(
     if not fence.policy_bound:
         return
     try:
-        _, admission = reserved_capacity.require_reclaim_worker_projection(
-            fence, worker_projections, require_current_protocol=True)
+        projection, admission = (
+            reserved_capacity.require_reclaim_worker_projection(
+                fence, worker_projections))
+        projection_version = (
+            kubernetes_identity.worker_projection_protocol_version(projection))
+        if (projection_version
+                != kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION and
+            (not allow_historical_adoption or
+             not (kubernetes_pod_spec.
+                  serve_worker_projection_protocol_is_renderable
+                 )(projection_version))):
+            raise ValueError('Historical worker projection lacks exact '
+                             'persisted-Pod adoption authority.')
     except ValueError as error:
         raise reserved_capacity.ReservedFillLaunchFenceError(
             'Reserved-fill launch lost its immutable worker projection.') \
@@ -979,6 +1006,20 @@ def _execute_dag_under_provider_fence(
             provider_phase.provider_phase(
                 provider_phase.ProviderPhaseMode.AMBIENT_LEGACY))
 
+    kueue_admission_runtime = None
+    bound_reserved_fill = bool(
+        reserved_fill_launch_fence is not None and
+        ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY
+        in _extra_launch_context)
+    if bound_reserved_fill:
+        if not isinstance(backend, backends.CloudVmRayBackend):
+            raise reserved_capacity.ReservedFillLaunchFenceError(
+                'Reserved-fill Kueue observation requires CloudVmRayBackend.')
+        assert reserved_fill_launch_fence is not None
+        kueue_admission_runtime = (
+            kueue_lane_observer.runtime_for_reserved_fill_launch(
+                _extra_launch_context, reserved_fill_launch_fence))
+
     if (ordinary_launch_request._has_bound_context_fields(  # pylint: disable=protected-access
             _extra_launch_context) and task.storage_mounts):
         # Storage construction may create/check buckets and synchronize local
@@ -1000,9 +1041,13 @@ def _execute_dag_under_provider_fence(
         # identity read, then keep the resulting immutable capture alive for
         # registration, provisioning, setup, and job submission below.
         _validate_reserved_fill_final_resources(
-            task, reserved_fill_launch_fence,
+            task,
+            reserved_fill_launch_fence,
             _extra_launch_context.get(
-                serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY))
+                serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY),
+            allow_historical_adoption=bool(
+                kueue_admission_runtime is not None and
+                kueue_admission_runtime.persisted_pod_identity is not None))
         # Capture/UID verification is one bounded provider effect. Retain only
         # the immutable kubeconfig token across the later passive wait; the
         # service advisory lock and provider phase retire immediately after
@@ -1012,20 +1057,6 @@ def _execute_dag_under_provider_fence(
                 kubernetes_adaptor.physical_cluster_uid_fence(
                     reserved_fill_launch_fence.kubernetes_context,
                     reserved_fill_launch_fence.physical_cluster_uid))
-
-    kueue_admission_runtime = None
-    bound_reserved_fill = bool(
-        reserved_fill_launch_fence is not None and
-        ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY
-        in _extra_launch_context)
-    if bound_reserved_fill:
-        if not isinstance(backend, backends.CloudVmRayBackend):
-            raise reserved_capacity.ReservedFillLaunchFenceError(
-                'Reserved-fill Kueue observation requires CloudVmRayBackend.')
-        assert reserved_fill_launch_fence is not None
-        kueue_admission_runtime = (
-            kueue_lane_observer.runtime_for_reserved_fill_launch(
-                _extra_launch_context, reserved_fill_launch_fence))
 
     kueue_registration = {}
     if isinstance(backend, backends.CloudVmRayBackend):

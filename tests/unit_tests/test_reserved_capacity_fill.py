@@ -10,6 +10,7 @@ when none is available -- fill must never spill to paid capacity).
 # pylint: disable=protected-access
 import concurrent.futures
 import contextlib
+import copy
 import dataclasses
 import functools
 import os
@@ -35,10 +36,12 @@ from sky.serve import autoscalers
 from sky.serve import constants
 from sky.serve import ordinary_launch_binding
 from sky.serve import placement_policy
+from sky.serve import pool_capacity_observation
 from sky.serve import provider_phase
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
+from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import service_spec
@@ -1725,6 +1728,589 @@ class TestPollerClaimLifecycle(unittest.TestCase):
     class _Stop(Exception):
         pass
 
+    @staticmethod
+    def _policy_identity():
+        return reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
+            fleet_bundle_sha256='1' * 64,
+            policy_revision='test-policy',
+            provider_inventory_sha256='2' * 64)
+
+    @staticmethod
+    def _sequenced_claim(*, width=1, version=1):
+        context = 'research-ctx'
+        card = 'a100'
+        physical_uid = 'research-uid'
+        return {
+            'integrity_valid': True,
+            'service_version': version,
+            'edges': [{
+                'access_context': context,
+                'pool_key': reserved_capacity_broker.make_pool_key(
+                    context,
+                    card,
+                    protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+                    physical_cluster_uid=physical_uid),
+                'legacy_pool_key': reserved_capacity_broker.make_pool_key(
+                    context, card),
+                'physical_cluster_uid': physical_uid,
+                'accelerator_names': [card],
+                'gpus_per_replica': width,
+                'pool_position': 0,
+                'worker_projection_sha256_by_accelerator': {
+                    card: 'a' * 64
+                },
+            }],
+        }
+
+    def test_sequenced_restart_bootstraps_exact_claim_without_uid_discovery(
+            self):
+        autoscaler = _make_autoscaler(fill=True)
+        location = spot_placer.Location.from_pickleable(_K8S_KEY)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = [location]
+        repository = mock.Mock()
+        repository.read_reconciliation_gate.return_value = types.SimpleNamespace(
+            sequenced_active=True,
+            state=pool_capacity_observation.ReconciliationGateState.
+            SEQUENCED_ACTIVE)
+        observer = mock.Mock()
+        executor = mock.Mock()
+
+        with mock.patch.object(
+                reserved_capacity.reserved_capacity_broker,
+                'get_protocol_version',
+                return_value=reserved_capacity_broker.PROTOCOL_V2), \
+             mock.patch.object(reserved_capacity,
+                               '_open_observation_repository',
+                               return_value=repository), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_allocation,
+                 'ReservedFillAllocationRepository', return_value=mock.Mock()), \
+             mock.patch.object(
+                 reserved_capacity.pool_capacity_observer,
+                 'PoolCapacityObserver', return_value=observer), \
+             mock.patch.object(
+                 reserved_capacity.request_process,
+                 'DisposableExecutor', return_value=executor), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_reserved_fill_service_claim_set',
+                 return_value=self._sequenced_claim()), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_placement_projection_record',
+                 return_value=(True, None, None, [])), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'reserved_fill_reclaim_projected_admissions',
+                 return_value=(types.SimpleNamespace(
+                     accelerator='a100',
+                     worker_projection_sha256='a' * 64),)), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_authoritative_reserved_fill_claims', return_value=[]), \
+             mock.patch.object(
+                 reserved_capacity,
+                 'discover_fill_pool_specs') as legacy_discovery, \
+             mock.patch.object(
+                 reserved_capacity,
+                 'get_kubernetes_physical_cluster_uid') as uid_discovery, \
+             mock.patch.object(reserved_capacity,
+                               '_broker_cycle_v2') as broker_cycle, \
+             mock.patch.object(reserved_capacity.time,
+                               'sleep',
+                               side_effect=self._Stop):
+            with self.assertRaises(self._Stop):
+                reserved_capacity.poller_loop(
+                    lambda: autoscaler,
+                    lambda: placer,
+                    service_name='svc',
+                    get_actuation_generation=lambda: 2,
+                    actuation_generation_is_current=lambda _generation: True)
+
+        legacy_discovery.assert_not_called()
+        uid_discovery.assert_not_called()
+        observer.observe_once.assert_called_once()
+        targets = observer.observe_once.call_args.args[0]
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0].physical_cluster_uid, 'research-uid')
+        specs = broker_cycle.call_args.kwargs['resolved_specs']
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].locations, (location,))
+        self.assertEqual(specs[0].shapes, (('a100', 1),))
+        observer.close.assert_called_once()
+
+    def test_sequenced_clean_creation_bootstraps_deployment_inventory(self):
+        location = spot_placer.Location.from_pickleable(_K8S_KEY)
+        identity = self._policy_identity()
+        inventory = (
+            reserved_fill_reclaim_attestation.ReclaimPoolInventoryEntry(
+                access_context='research-ctx',
+                physical_cluster_uid='research-uid',
+                accelerator_shapes=(('a100', 1),)),)
+
+        with mock.patch.object(
+                reserved_capacity.serve_state,
+                'get_reserved_fill_service_claim_set', return_value=None), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_placement_projection_record',
+                 return_value=(True, None, None, [])), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'reserved_fill_reclaim_projected_admissions',
+                 return_value=(types.SimpleNamespace(
+                     accelerator='a100',
+                     worker_projection_sha256='a' * 64),)), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_unique_policy', return_value=object()), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_provider_free_pool_inventory',
+                 return_value=inventory) as read_inventory, \
+             mock.patch.object(
+                 reserved_capacity,
+                 'get_kubernetes_physical_cluster_uid') as uid_discovery:
+            specs = reserved_capacity.sequenced_fill_pool_specs(
+                [location],
+                service_name='svc',
+                service_version=1,
+                expected_policy_identity=identity)
+
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].context, 'research-ctx')
+        self.assertEqual(specs[0].physical_cluster_uid, 'research-uid')
+        self.assertEqual(specs[0].shapes, (('a100', 1),))
+        read_inventory.assert_called_once_with(mock.ANY, identity)
+        uid_discovery.assert_not_called()
+
+    def test_sequenced_new_claim_observes_uid_before_broker_publication(self):
+        autoscaler = _make_autoscaler(fill=True)
+        location = spot_placer.Location.from_pickleable(_K8S_KEY)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = [location]
+        identity = self._policy_identity()
+        repository = mock.Mock()
+        repository.read_reconciliation_gate.return_value = (
+            types.SimpleNamespace(sequenced_active=True,
+                                  state=pool_capacity_observation.
+                                  ReconciliationGateState.SEQUENCED_ACTIVE,
+                                  reclaim_policy_identity=identity))
+        spec = reserved_capacity.FillPoolSpec(
+            position=0,
+            context='research-ctx',
+            shapes=(('a100', 1),),
+            locations=(location,),
+            physical_cluster_uid='research-uid',
+            pool_key=reserved_capacity_broker.make_pool_key(
+                'research-ctx',
+                'a100',
+                protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+                physical_cluster_uid='research-uid'),
+            legacy_pool_key=reserved_capacity_broker.make_pool_key(
+                'research-ctx', 'a100'))
+        observer = mock.Mock()
+        executor = mock.Mock()
+        order = []
+        observer.observe_once.side_effect = lambda _targets: order.append(
+            'v2-observe')
+
+        with mock.patch.object(
+                reserved_capacity.reserved_capacity_broker,
+                'get_protocol_version',
+                return_value=reserved_capacity_broker.PROTOCOL_V2), \
+             mock.patch.object(reserved_capacity,
+                               '_open_observation_repository',
+                               return_value=repository), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_allocation,
+                 'ReservedFillAllocationRepository', return_value=mock.Mock()), \
+             mock.patch.object(
+                 reserved_capacity.pool_capacity_observer,
+                 'PoolCapacityObserver', return_value=observer), \
+             mock.patch.object(
+                 reserved_capacity.request_process,
+                 'DisposableExecutor', return_value=executor), \
+             mock.patch.object(reserved_capacity,
+                               'sequenced_fill_pool_specs',
+                               return_value=(spec,)) as bootstrap, \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_authoritative_reserved_fill_claims', return_value=[]), \
+             mock.patch.object(
+                 reserved_capacity,
+                 '_broker_cycle_v2',
+                 side_effect=lambda *_args, **_kwargs: order.append('broker')), \
+             mock.patch.object(reserved_capacity.time,
+                               'sleep',
+                               side_effect=self._Stop):
+            with self.assertRaises(self._Stop):
+                reserved_capacity.poller_loop(
+                    lambda: autoscaler,
+                    lambda: placer,
+                    service_name='svc',
+                    get_actuation_generation=lambda: 2,
+                    actuation_generation_is_current=lambda _generation: True)
+
+        self.assertEqual(order, ['v2-observe', 'broker'])
+        bootstrap.assert_called_once_with(
+            [location],
+            service_name='svc',
+            service_version=autoscaler.latest_version,
+            expected_policy_identity=identity)
+
+    def test_sequenced_version_update_uses_inventory_not_old_claim(self):
+        location = spot_placer.Location.from_pickleable(_K8S_KEY)
+        identity = self._policy_identity()
+        inventory = (
+            reserved_fill_reclaim_attestation.ReclaimPoolInventoryEntry(
+                access_context='research-ctx',
+                physical_cluster_uid='research-uid',
+                accelerator_shapes=(('a100', 1),)),)
+
+        with mock.patch.object(
+                reserved_capacity.serve_state,
+                'get_reserved_fill_service_claim_set',
+                return_value=self._sequenced_claim(version=1)), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_placement_projection_record',
+                 return_value=(True, None, None, [])), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'reserved_fill_reclaim_projected_admissions',
+                 return_value=(types.SimpleNamespace(
+                     accelerator='a100',
+                     worker_projection_sha256='b' * 64),)), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_unique_policy', return_value=object()), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_provider_free_pool_inventory',
+                 return_value=inventory) as read_inventory:
+            specs = reserved_capacity.sequenced_fill_pool_specs(
+                [location],
+                service_name='svc',
+                service_version=2,
+                expected_policy_identity=identity)
+
+        self.assertEqual(len(specs), 1)
+        read_inventory.assert_called_once_with(mock.ANY, identity)
+
+    def test_sequenced_future_claim_never_bootstraps_inventory(self):
+        location = spot_placer.Location.from_pickleable(_K8S_KEY)
+
+        with mock.patch.object(
+                reserved_capacity.serve_state,
+                'get_reserved_fill_service_claim_set',
+                return_value=self._sequenced_claim(version=2)), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_placement_projection_record',
+                 return_value=(True, None, None, [])), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_unique_policy') as load_policy:
+            specs = reserved_capacity.sequenced_fill_pool_specs(
+                [location],
+                service_name='svc',
+                service_version=1,
+                expected_policy_identity=self._policy_identity())
+
+        self.assertEqual(specs, ())
+        load_policy.assert_not_called()
+
+    def test_sequenced_bootstrap_database_error_never_widens_to_inventory(self):
+        location = spot_placer.Location.from_pickleable(_K8S_KEY)
+
+        with mock.patch.object(
+                reserved_capacity.serve_state,
+                'get_reserved_fill_service_claim_set',
+                side_effect=RuntimeError('database unavailable')), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_unique_policy') as load_policy:
+            specs = reserved_capacity.sequenced_fill_pool_specs(
+                [location],
+                service_name='svc',
+                service_version=1,
+                expected_policy_identity=self._policy_identity())
+
+        self.assertEqual(specs, ())
+        load_policy.assert_not_called()
+
+    def test_sequenced_malformed_current_claim_never_uses_inventory(self):
+        location = spot_placer.Location.from_pickleable(_K8S_KEY)
+        malformed = self._sequenced_claim()
+        malformed['integrity_valid'] = False
+
+        with mock.patch.object(
+                reserved_capacity.serve_state,
+                'get_reserved_fill_service_claim_set',
+                return_value=malformed), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_placement_projection_record',
+                 return_value=(True, None, None, [])), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_unique_policy') as load_policy:
+            specs = reserved_capacity.sequenced_fill_pool_specs(
+                [location],
+                service_name='svc',
+                service_version=1,
+                expected_policy_identity=self._policy_identity())
+
+        self.assertEqual(specs, ())
+        load_policy.assert_not_called()
+
+    def test_sequenced_restart_mismatch_feeds_zero_without_erasing_claim(self):
+        autoscaler = _make_autoscaler(fill=True)
+        autoscaler.collect_reserved_capacity_pools = mock.Mock()
+        location = spot_placer.Location.from_pickleable(_K8S_KEY)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = [location]
+        repository = mock.Mock()
+        repository.read_reconciliation_gate.return_value = types.SimpleNamespace(
+            sequenced_active=True,
+            state=pool_capacity_observation.ReconciliationGateState.
+            SEQUENCED_ACTIVE)
+        observer = mock.Mock()
+        executor = mock.Mock()
+
+        with mock.patch.object(
+                reserved_capacity.reserved_capacity_broker,
+                'get_protocol_version',
+                return_value=reserved_capacity_broker.PROTOCOL_V2), \
+             mock.patch.object(reserved_capacity,
+                               '_open_observation_repository',
+                               return_value=repository), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_allocation,
+                 'ReservedFillAllocationRepository', return_value=mock.Mock()), \
+             mock.patch.object(
+                 reserved_capacity.pool_capacity_observer,
+                 'PoolCapacityObserver', return_value=observer), \
+             mock.patch.object(
+                 reserved_capacity.request_process,
+                 'DisposableExecutor', return_value=executor), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_reserved_fill_service_claim_set',
+                 return_value=self._sequenced_claim(width=2)), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_placement_projection_record',
+                 return_value=(True, None, None, [])), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'reserved_fill_reclaim_projected_admissions',
+                 return_value=(types.SimpleNamespace(
+                     accelerator='a100',
+                     worker_projection_sha256='a' * 64),)), \
+             mock.patch.object(
+                 reserved_capacity,
+                 'discover_fill_pool_specs') as legacy_discovery, \
+             mock.patch.object(
+                 reserved_capacity,
+                 'get_kubernetes_physical_cluster_uid') as uid_discovery, \
+             mock.patch.object(reserved_capacity,
+                               '_broker_cycle_v2') as broker_cycle, \
+             mock.patch.object(
+                 reserved_capacity.reserved_capacity_broker,
+                 'remove_claim') as remove_claim, \
+             mock.patch.object(reserved_capacity.time,
+                               'sleep',
+                               side_effect=self._Stop):
+            with self.assertRaises(self._Stop):
+                reserved_capacity.poller_loop(
+                    lambda: autoscaler,
+                    lambda: placer,
+                    service_name='svc',
+                    get_actuation_generation=lambda: 2,
+                    actuation_generation_is_current=lambda _generation: True)
+
+        legacy_discovery.assert_not_called()
+        uid_discovery.assert_not_called()
+        observer.observe_once.assert_not_called()
+        broker_cycle.assert_not_called()
+        remove_claim.assert_not_called()
+        autoscaler.collect_reserved_capacity_pools.assert_called_once_with({})
+        observer.close.assert_called_once()
+
+    def test_sequenced_bootstrap_rejects_every_current_identity_mismatch(self):
+        location = spot_placer.Location.from_pickleable(_K8S_KEY)
+        cases = {}
+        for name in ('version', 'context', 'width', 'position', 'pool_key',
+                     'projection'):
+            cases[name] = copy.deepcopy(self._sequenced_claim())
+        cases['version']['service_version'] = 2
+        cases['context']['edges'][0]['access_context'] = 'other-context'
+        cases['width']['edges'][0]['gpus_per_replica'] = 2
+        cases['position']['edges'][0]['pool_position'] = 1
+        cases['pool_key']['edges'][0]['pool_key'] = (
+            reserved_capacity_broker.make_pool_key(
+                'research-ctx',
+                'a100',
+                protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+                physical_cluster_uid='other-uid'))
+        cases['projection']['edges'][0][
+            'worker_projection_sha256_by_accelerator'] = {
+                'a100': 'b' * 64
+            }
+
+        for name, claim in cases.items():
+            with self.subTest(name=name), \
+                 mock.patch.object(
+                     reserved_capacity.serve_state,
+                     'get_reserved_fill_service_claim_set',
+                     return_value=claim), \
+                 mock.patch.object(
+                     reserved_capacity.serve_state,
+                     'get_placement_projection_record',
+                     return_value=(True, None, None, [])), \
+                 mock.patch.object(
+                     reserved_capacity.serve_state,
+                     'reserved_fill_reclaim_projected_admissions',
+                     return_value=(types.SimpleNamespace(
+                         accelerator='a100',
+                         worker_projection_sha256='a' * 64),)), \
+                 mock.patch.object(
+                     reserved_capacity,
+                     'get_kubernetes_physical_cluster_uid') as uid_discovery:
+                specs = reserved_capacity.sequenced_fill_pool_specs(
+                    [location],
+                    service_name='svc',
+                    service_version=1,
+                    expected_policy_identity=self._policy_identity())
+
+            self.assertEqual(specs, ())
+            uid_discovery.assert_not_called()
+
+    def test_postgres_gate_unavailable_never_falls_back_to_uid_discovery(self):
+        autoscaler = _make_autoscaler(fill=True)
+        autoscaler.collect_reserved_capacity_pools = mock.Mock()
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = [
+            spot_placer.Location.from_pickleable(_K8S_KEY)
+        ]
+        executor = mock.Mock()
+        postgres = types.SimpleNamespace(dialect=types.SimpleNamespace(
+            name='postgresql'))
+
+        with mock.patch.object(
+                reserved_capacity.reserved_capacity_broker,
+                'get_protocol_version',
+                return_value=reserved_capacity_broker.PROTOCOL_V2), \
+             mock.patch.object(reserved_capacity,
+                               '_open_observation_repository',
+                               return_value=None), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_database_engine',
+                               return_value=postgres), \
+             mock.patch.object(
+                 reserved_capacity.request_process,
+                 'DisposableExecutor', return_value=executor), \
+             mock.patch.object(
+                 reserved_capacity,
+                 'discover_fill_pool_specs') as legacy_discovery, \
+             mock.patch.object(
+                 reserved_capacity,
+                 'get_kubernetes_physical_cluster_uid') as uid_discovery, \
+             mock.patch.object(reserved_capacity,
+                               '_broker_cycle_v2') as broker_cycle, \
+             mock.patch.object(
+                 reserved_capacity.reserved_capacity_broker,
+                 'remove_claim') as remove_claim, \
+             mock.patch.object(reserved_capacity.time,
+                               'sleep',
+                               side_effect=self._Stop):
+            with self.assertRaises(self._Stop):
+                reserved_capacity.poller_loop(
+                    lambda: autoscaler,
+                    lambda: placer,
+                    service_name='svc',
+                    get_actuation_generation=lambda: 2,
+                    actuation_generation_is_current=lambda _generation: True)
+
+        legacy_discovery.assert_not_called()
+        uid_discovery.assert_not_called()
+        broker_cycle.assert_not_called()
+        remove_claim.assert_not_called()
+        autoscaler.collect_reserved_capacity_pools.assert_called_once_with({})
+
+    def test_generation_fenced_legacy_gate_retains_provider_discovery(self):
+        autoscaler = _make_autoscaler(fill=True)
+        location = spot_placer.Location.from_pickleable(_K8S_KEY)
+        placer = mock.Mock()
+        placer.zero_cost_locations.return_value = [location]
+        repository = mock.Mock()
+        repository.read_reconciliation_gate.return_value = types.SimpleNamespace(
+            sequenced_active=False,
+            state=pool_capacity_observation.ReconciliationGateState.
+            LEGACY_ACTIVE)
+        observer = mock.Mock()
+        executor = mock.Mock()
+        spec = reserved_capacity.FillPoolSpec(
+            position=0,
+            context='research-ctx',
+            shapes=(('a100', 1),),
+            locations=(location,),
+            physical_cluster_uid='research-uid',
+            pool_key=reserved_capacity_broker.make_pool_key(
+                'research-ctx',
+                'a100',
+                protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+                physical_cluster_uid='research-uid'),
+            legacy_pool_key=reserved_capacity_broker.make_pool_key(
+                'research-ctx', 'a100'))
+
+        with mock.patch.object(
+                reserved_capacity.reserved_capacity_broker,
+                'get_protocol_version',
+                return_value=reserved_capacity_broker.PROTOCOL_V2), \
+             mock.patch.object(reserved_capacity,
+                               '_open_observation_repository',
+                               return_value=repository), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_allocation,
+                 'ReservedFillAllocationRepository', return_value=mock.Mock()), \
+             mock.patch.object(
+                 reserved_capacity.pool_capacity_observer,
+                 'PoolCapacityObserver', return_value=observer), \
+             mock.patch.object(
+                 reserved_capacity.request_process,
+                 'DisposableExecutor', return_value=executor), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_authoritative_reserved_fill_claims', return_value=[]), \
+             mock.patch.object(
+                 reserved_capacity,
+                 'discover_fill_pool_specs', return_value=(spec,)) as discovery, \
+             mock.patch.object(
+                 reserved_capacity,
+                 'sequenced_fill_pool_specs') as bootstrap, \
+             mock.patch.object(reserved_capacity,
+                               '_broker_cycle_v2') as broker_cycle, \
+             mock.patch.object(reserved_capacity.time,
+                               'sleep',
+                               side_effect=self._Stop):
+            with self.assertRaises(self._Stop):
+                reserved_capacity.poller_loop(
+                    lambda: autoscaler,
+                    lambda: placer,
+                    service_name='svc',
+                    get_actuation_generation=lambda: 2,
+                    actuation_generation_is_current=lambda _generation: True)
+
+        discovery.assert_called_once_with([location], previous_specs=())
+        bootstrap.assert_not_called()
+        observer.observe_once.assert_called_once()
+        self.assertEqual(broker_cycle.call_args.kwargs['resolved_specs'],
+                         (spec,))
+
     def test_protocol_v2_dispatches_complete_set_cycle(self):
         autoscaler = _make_autoscaler(fill=True)
         placer = mock.Mock()
@@ -1918,6 +2504,41 @@ class TestPollerClaimLifecycle(unittest.TestCase):
 
 class TestMultiPoolBrokerCycle(unittest.TestCase):
     """One v2 poll publishes a complete service generation."""
+
+    def test_sequenced_missing_bootstrap_preserves_current_claim(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=2)
+        autoscaler.collect_reserved_capacity_pools = mock.Mock()
+        placer = mock.Mock()
+        repository = mock.Mock()
+        repository.read_reconciliation_gate.return_value = types.SimpleNamespace(
+            sequenced_active=True)
+
+        with mock.patch.object(
+                reserved_capacity,
+                'sequenced_fill_pool_specs',
+                return_value=()) as bootstrap, \
+             mock.patch.object(
+                 reserved_capacity,
+                 'discover_fill_pool_specs') as legacy_discovery, \
+             mock.patch.object(
+                 reserved_capacity.reserved_capacity_broker,
+                 'remove_claim') as remove_claim:
+            reserved_capacity._broker_cycle_v2(
+                autoscaler,
+                placer,
+                'svc', [spot_placer.Location.from_pickleable(_K8S_KEY)],
+                'service-hash', (123, 'controller-ip'),
+                observation_repository=repository,
+                allocation_repository=mock.Mock())
+
+        bootstrap.assert_called_once_with(
+            [spot_placer.Location.from_pickleable(_K8S_KEY)],
+            service_name='svc',
+            service_version=autoscaler.latest_version,
+            expected_policy_identity=None)
+        legacy_discovery.assert_not_called()
+        remove_claim.assert_not_called()
+        autoscaler.collect_reserved_capacity_pools.assert_called_once_with({})
 
     def test_cycle_accepts_same_context_exact_card_edges(self):
         context = 'research-context'
@@ -6617,6 +7238,269 @@ class TestQueryFreeSlots(unittest.TestCase):
 
         self.assertIsNone(observations[('research-ctx', 'a100')].free_gpus)
         schedule.assert_called_once_with({'research-ctx'})
+        query.assert_not_called()
+
+    def test_sequenced_demand_cache_reuses_authoritative_pool_observations(
+            self):
+        locations = [
+            self._k8s_location(gpu='A100', count=8),
+            self._k8s_location(gpu='H100', count=8),
+        ]
+        a100_pool = reserved_capacity_broker.make_pool_key(
+            'research-ctx',
+            'a100',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='physical-a')
+        h100_pool = reserved_capacity_broker.make_pool_key(
+            'research-ctx',
+            'h100',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='physical-a')
+        claim_set = {
+            'integrity_valid': True,
+            'service_version': 58,
+            'edges': [{
+                'access_context': 'research-ctx',
+                'pool_key': a100_pool,
+                'legacy_pool_key': reserved_capacity_broker.make_pool_key(
+                    'research-ctx', 'a100'),
+                'physical_cluster_uid': 'physical-a',
+                'accelerator_names': ['a100'],
+                'gpus_per_replica': 8,
+                'pool_position': 0,
+                'worker_projection_sha256_by_accelerator': {
+                    'a100': 'a' * 64
+                },
+            }, {
+                'access_context': 'research-ctx',
+                'pool_key': h100_pool,
+                'legacy_pool_key': reserved_capacity_broker.make_pool_key(
+                    'research-ctx', 'h100'),
+                'physical_cluster_uid': 'physical-a',
+                'accelerator_names': ['h100'],
+                'gpus_per_replica': 8,
+                'pool_position': 1,
+                'worker_projection_sha256_by_accelerator': {
+                    'h100': 'b' * 64
+                },
+            }],
+        }
+
+        def _observation(pool_key, accelerator, free_gpus):
+            return types.SimpleNamespace(pool_key=pool_key,
+                                         physical_cluster_uid='physical-a',
+                                         payload=pool_capacity_observation.
+                                         PoolCapacitySuccess.from_counts(
+                                             free_gpus,
+                                             {accelerator: free_gpus}),
+                                         observed_at=100.0,
+                                         observation_sequence=17,
+                                         materialization_sequence=11)
+
+        def _project(_projections, *, accelerator_names, **_kwargs):
+            card = accelerator_names[0]
+            digest = 'a' * 64 if card == 'a100' else 'b' * 64
+            return (types.SimpleNamespace(accelerator=card,
+                                          worker_projection_sha256=digest),)
+
+        repository = mock.Mock()
+        repository.read_reconciliation_gate.return_value = types.SimpleNamespace(
+            sequenced_active=True,
+            state=pool_capacity_observation.ReconciliationGateState.
+            SEQUENCED_ACTIVE)
+        repository.read_latest_authoritative.side_effect = {
+            a100_pool: _observation(a100_pool, 'a100', 223),
+            h100_pool: _observation(h100_pool, 'h100', 16),
+        }.get
+        engine = types.SimpleNamespace(dialect=types.SimpleNamespace(
+            name='postgresql'))
+        with mock.patch.object(reserved_capacity.serve_state,
+                               'get_database_engine',
+                               return_value=engine), \
+             mock.patch.object(
+                 reserved_capacity.pool_capacity_observation,
+                 'PoolCapacityObservationRepository',
+                 return_value=repository), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_reserved_fill_service_claim_set',
+                 return_value=claim_set), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_placement_projection_record',
+                 return_value=(True, None, None, [])), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'reserved_fill_reclaim_projected_admissions',
+                 side_effect=_project), \
+             mock.patch.object(
+                 reserved_capacity,
+                 '_get_legacy_cached_free_gpus_by_pool') as legacy, \
+             mock.patch.object(
+                 reserved_capacity,
+                 '_schedule_demand_capacity_refresh') as schedule:
+            observations = reserved_capacity.get_cached_free_gpus_by_pool(
+                locations, service_name='svc', service_version=58)
+
+        self.assertEqual(
+            observations[('research-ctx', 'a100')],
+            reserved_capacity.FreeGpuObservation(
+                223, 100.0, 17, 11,
+                reserved_capacity.FreeGpuObservationAuthority.SEQUENCED_GATE))
+        self.assertEqual(
+            observations[('research-ctx', 'h100')],
+            reserved_capacity.FreeGpuObservation(
+                16, 100.0, 17, 11,
+                reserved_capacity.FreeGpuObservationAuthority.SEQUENCED_GATE))
+        self.assertEqual(repository.read_latest_authoritative.call_count, 2)
+        legacy.assert_not_called()
+        schedule.assert_not_called()
+
+    def test_sequenced_demand_cache_mismatch_fails_unknown_without_ambient(
+            self):
+        location = self._k8s_location(gpu='A100', count=8)
+        repository = mock.Mock()
+        repository.read_reconciliation_gate.return_value = types.SimpleNamespace(
+            sequenced_active=True,
+            state=pool_capacity_observation.ReconciliationGateState.
+            SEQUENCED_ACTIVE)
+        engine = types.SimpleNamespace(dialect=types.SimpleNamespace(
+            name='postgresql'))
+        stale_claim_set = {
+            'integrity_valid': True,
+            'service_version': 57,
+            'edges': [],
+        }
+        with mock.patch.object(reserved_capacity.serve_state,
+                               'get_database_engine',
+                               return_value=engine), \
+             mock.patch.object(
+                 reserved_capacity.pool_capacity_observation,
+                 'PoolCapacityObservationRepository',
+                 return_value=repository), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_reserved_fill_service_claim_set',
+                 return_value=stale_claim_set), \
+             mock.patch.object(
+                 reserved_capacity,
+                 '_get_legacy_cached_free_gpus_by_pool') as legacy, \
+             mock.patch.object(
+                 reserved_capacity,
+                 '_schedule_demand_capacity_refresh') as schedule:
+            observations = reserved_capacity.get_cached_free_gpus_by_pool(
+                [location], service_name='svc', service_version=58)
+
+        self.assertEqual(
+            observations, {
+                ('research-ctx', 'a100'): reserved_capacity.FreeGpuObservation(
+                    None,
+                    None,
+                    authority=(reserved_capacity.FreeGpuObservationAuthority.
+                               SEQUENCED_GATE))
+            })
+        repository.read_latest_authoritative.assert_not_called()
+        legacy.assert_not_called()
+        schedule.assert_not_called()
+
+    def test_sequenced_preclaim_inventory_observation_is_not_demand_visible(
+            self):
+        location = self._k8s_location(gpu='A100', count=8)
+        pool_key = reserved_capacity_broker.make_pool_key(
+            'research-ctx',
+            'a100',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='physical-a')
+        repository = mock.Mock()
+        repository.read_reconciliation_gate.return_value = types.SimpleNamespace(
+            sequenced_active=True,
+            state=pool_capacity_observation.ReconciliationGateState.
+            SEQUENCED_ACTIVE)
+        repository.read_latest_authoritative.return_value = types.SimpleNamespace(
+            pool_key=pool_key,
+            physical_cluster_uid='physical-a',
+            payload=pool_capacity_observation.PoolCapacitySuccess.from_counts(
+                8, {'a100': 8}),
+            observed_at=100.0,
+            observation_sequence=17,
+            materialization_sequence=11)
+        engine = types.SimpleNamespace(dialect=types.SimpleNamespace(
+            name='postgresql'))
+        with mock.patch.object(reserved_capacity.serve_state,
+                               'get_database_engine',
+                               return_value=engine), \
+             mock.patch.object(
+                 reserved_capacity.pool_capacity_observation,
+                 'PoolCapacityObservationRepository',
+                 return_value=repository), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_reserved_fill_service_claim_set', return_value=None), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_placement_projection_record',
+                 return_value=(True, None, None, [])), \
+             mock.patch.object(
+                 reserved_capacity.reserved_fill_reclaim_attestation,
+                 'require_unique_policy') as load_policy:
+            observations = reserved_capacity.get_cached_free_gpus_by_pool(
+                [location], service_name='svc', service_version=58)
+
+        self.assertEqual(
+            observations, {
+                ('research-ctx', 'a100'): reserved_capacity.FreeGpuObservation(
+                    None,
+                    None,
+                    authority=(reserved_capacity.FreeGpuObservationAuthority.
+                               SEQUENCED_GATE))
+            })
+        repository.read_latest_authoritative.assert_not_called()
+        load_policy.assert_not_called()
+
+    def test_legacy_gate_retains_context_cache_for_old_callers(self):
+        location = self._k8s_location(gpu='A100', count=8)
+        repository = mock.Mock()
+        repository.read_reconciliation_gate.return_value = types.SimpleNamespace(
+            sequenced_active=False,
+            state=pool_capacity_observation.ReconciliationGateState.
+            LEGACY_ACTIVE)
+        engine = types.SimpleNamespace(dialect=types.SimpleNamespace(
+            name='postgresql'))
+        expected = {
+            ('research-ctx', 'a100'): reserved_capacity.FreeGpuObservation(
+                8, 100.0)
+        }
+        with mock.patch.object(reserved_capacity.serve_state,
+                               'get_database_engine',
+                               return_value=engine), \
+             mock.patch.object(
+                 reserved_capacity.pool_capacity_observation,
+                 'PoolCapacityObservationRepository',
+                 return_value=repository), \
+             mock.patch.object(
+                 reserved_capacity,
+                 '_get_legacy_cached_free_gpus_by_pool',
+                 return_value=expected) as legacy:
+            observations = reserved_capacity.get_cached_free_gpus_by_pool(
+                [location])
+
+        self.assertEqual(observations, expected)
+        legacy.assert_called_once_with({('research-ctx', 'a100')})
+
+    def test_sequenced_refresh_worker_never_enters_ambient_phase(self):
+        with mock.patch.object(
+                reserved_capacity,
+                '_ambient_demand_capacity_refresh_is_authorized',
+                return_value=False), \
+             mock.patch.object(reserved_capacity.provider_phase,
+                               'try_provider_phase') as phase, \
+             mock.patch.object(
+                 reserved_capacity.kubernetes_catalog,
+                 'list_accelerators_realtime') as query:
+            reserved_capacity._refresh_demand_capacity_contexts(
+                {'research-ctx'})
+
+        phase.assert_not_called()
         query.assert_not_called()
 
     def test_background_refresh_publishes_one_raw_context_observation(self):

@@ -116,6 +116,93 @@ def test_retargeted_reserved_fill_context_is_replaced(
         'observed_physical_cluster_uid'] == 'replacement-uid'
 
 
+def test_post_teardown_absence_receipt_reuses_exact_provider_read(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+    replica = _reserved_replica()
+    authority = object()
+    projector = lambda *_args: True
+    receipt = reserved_capacity.ProtocolV2PhysicalAbsenceReceipt(
+        cleanup_fence=reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context=replica.reserved_fill_kubernetes_context,
+            physical_cluster_uid=replica.reserved_fill_physical_cluster_uid),
+        cluster_name=replica.cluster_name)
+    calls = []
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_provider_reconciliation_ready',
+                        lambda *_args: True)
+    monkeypatch.setattr(
+        reconciliation, 'observe_provider', lambda *_args: pytest.fail(
+            'post-teardown receipt must prevent another provider read'))
+    monkeypatch.setattr(
+        reserved_capacity, 'get_kubernetes_physical_cluster_uid', lambda *_args,
+        **_kwargs: pytest.fail('receipt must prevent another UID read'))
+    monkeypatch.setattr(
+        reserved_capacity, 'probe_physical_replica_presence', lambda *_args, **
+        _kwargs: pytest.fail('receipt must prevent another Pod read'))
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'record_bound_non_pool_provider_evidence',
+                        lambda *_args: calls.append('record'))
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'project_bound_non_pool_provider_absence',
+                        lambda *_args, **_kwargs: calls.append('project'))
+
+    observed = reconciliation.reconcile_post_teardown_absence(
+        context, replica, authority, projector, receipt)
+
+    assert observed.evidence == ordinary_launch_binding.ProviderEvidence.ABSENT
+    assert observed.payload == {
+        'association_id': str(context.association_id),
+        'cluster_name': replica.cluster_name,
+        'kubernetes_context': replica.reserved_fill_kubernetes_context,
+        'physical_cluster_uid': replica.reserved_fill_physical_cluster_uid,
+        'probe_contract': 'kubernetes-physical-replica-presence-v1',
+        'profile_kind': 'RESERVED_FILL',
+        'replica_record_id': str(context.replica_record_id),
+        'result': 'ABSENT',
+    }
+    assert calls == ['record', 'project']
+
+
+@pytest.mark.parametrize('receipt', [
+    reserved_capacity.ProtocolV2PhysicalAbsenceReceipt(
+        cleanup_fence=reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='wrong-context',
+            physical_cluster_uid='physical-cluster-a'),
+        cluster_name='svc-3'),
+    reserved_capacity.ProtocolV2PhysicalAbsenceReceipt(
+        cleanup_fence=reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='on-prem-a', physical_cluster_uid='wrong-uid'),
+        cluster_name='svc-3'),
+    reserved_capacity.ProtocolV2PhysicalAbsenceReceipt(
+        cleanup_fence=reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='on-prem-a',
+            physical_cluster_uid='physical-cluster-a'),
+        cluster_name='other-replica'),
+])
+def test_post_teardown_absence_receipt_rejects_wrong_identity(
+        monkeypatch: pytest.MonkeyPatch,
+        receipt: reserved_capacity.ProtocolV2PhysicalAbsenceReceipt) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_provider_reconciliation_ready',
+                        lambda *_args: True)
+    monkeypatch.setattr(
+        reconciliation.request_postgres,
+        'record_bound_non_pool_provider_evidence', lambda *_args: pytest.fail(
+            'mismatched receipt must not reach durable evidence'))
+
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='does not match the exact'):
+        reconciliation.reconcile_post_teardown_absence(context,
+                                                       _reserved_replica(),
+                                                       object(),
+                                                       lambda *_args: True,
+                                                       receipt)
+
+
 def test_profile_without_durable_provider_uid_remains_unknown(
         monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(

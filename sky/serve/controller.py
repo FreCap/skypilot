@@ -3528,7 +3528,11 @@ class SkyServeController:
         if not isinstance(locations, list) or not locations:
             return {}
         shapes = reserved_capacity.zero_cost_pool_shapes(locations)
-        observations = reserved_capacity.get_cached_free_gpus_by_pool(locations)
+        observations = reserved_capacity.get_cached_free_gpus_by_pool(
+            locations,
+            service_name=self._service_name,
+            service_version=(None if self._autoscaler is None else
+                             self._autoscaler.latest_version))
         canonical_by_name = {
             str(card).casefold(): str(card) for location in locations
             for card in (location.accelerators or {})
@@ -6077,7 +6081,10 @@ class SkyServeController:
         decision_autoscaler: autoscalers.Autoscaler,
         decision_version: int,
         *,
+        sequenced_reserved_fill: bool,
         force_zero: bool = False,
+        reserved_fill_allocation_map: (
+            reserved_fill_planner.AuthenticatedAllocationMap | None) = None,
     ) -> capacity_admission.PaidLaunchAuthority | None:
         """Bind a post-zero-cost residual to the current durable demand."""
         snapshot = self._durable_demand_snapshot
@@ -6100,6 +6107,21 @@ class SkyServeController:
             replica_unit=decision_autoscaler.replica_unit,
             demand_target_by_accelerator=(
                 decision_autoscaler.info().get('demand_target_by_accelerator')))
+        if (sequenced_reserved_fill and
+            (force_zero or not any(capacity_target.values()))):
+            reserved_fill_authority = (
+                capacity_admission.ReservedFillPlanAuthority.zero_revocation())
+        elif force_zero or not sequenced_reserved_fill:
+            reserved_fill_authority = (
+                capacity_admission.ReservedFillPlanAuthority.not_applicable())
+        else:
+            if reserved_fill_allocation_map is None:
+                logger.warning('Suppressing paid launch because sequenced '
+                               'reserved fill has no current allocation.')
+                return None
+            reserved_fill_authority = (
+                capacity_admission.ReservedFillPlanAuthority.bound(
+                    reserved_fill_allocation_map.identity))
         plan = capacity_admission.CapacityPlanInput(
             service_name=self._service_name,
             service_hash=snapshot.service_hash,
@@ -6112,7 +6134,8 @@ class SkyServeController:
             route_sha256=snapshot.route_sha256,
             route_source_epoch=snapshot.route_source_epoch,
             normalized_demand=normalized_demand,
-            capacity_target_by_accelerator=capacity_target)
+            capacity_target_by_accelerator=capacity_target,
+            reserved_fill_authority=reserved_fill_authority)
         try:
             return capacity_admission.CapacityAdmissionRepository().publish(
                 plan)
@@ -6306,6 +6329,11 @@ class SkyServeController:
                     assert planning_state_fingerprint is not None, (
                         'No service record found for '
                         f'{self._service_name}')
+                sequenced_reserved_fill = False
+                allocation = None
+                if decision_autoscaler.reserved_capacity_fill:
+                    (sequenced_reserved_fill, allocation) = (
+                        self._read_sequenced_reserved_fill_allocation())
                 replica_infos = serve_state.get_replica_infos(
                     self._service_name)
                 ordered_paid_authority = None
@@ -6318,6 +6346,7 @@ class SkyServeController:
                         self._publish_ordered_paid_authority(
                             decision_autoscaler,
                             decision_version,
+                            sequenced_reserved_fill=sequenced_reserved_fill,
                             force_zero=True))
                     if ordered_paid_authority is None:
                         return
@@ -6364,11 +6393,30 @@ class SkyServeController:
                     'No service record found for '
                     f'{self._service_name}')
                 active_versions = runtime_snapshot['active_versions']
-                sequenced_reserved_fill = False
-                allocation = None
-                if decision_autoscaler.reserved_capacity_fill:
-                    (sequenced_reserved_fill, allocation) = (
-                        self._read_sequenced_reserved_fill_allocation())
+                if (durable_demand_promoted and sequenced_reserved_fill and
+                        allocation is None):
+                    # Revoke before planning: notification, fingerprint, or
+                    # actuation churn can make planning return early, but none
+                    # of those optimistic exits may retain an older positive
+                    # paid head while sequenced allocation is UNKNOWN.
+                    if not self._scale_actuation_is_current(
+                            actuation_generation, decision_autoscaler,
+                            decision_version):
+                        return
+                    if ordered_paid_authority is None:
+                        ordered_paid_authority = (
+                            self._publish_ordered_paid_authority(
+                                decision_autoscaler,
+                                decision_version,
+                                sequenced_reserved_fill=(
+                                    sequenced_reserved_fill),
+                                force_zero=True))
+                    self._replica_manager.invalidate_logical_reconcile_state()
+                    if ordered_paid_authority is None:
+                        logger.warning(
+                            'Unable to revoke paid authority while sequenced '
+                            'reserved capacity is unavailable.')
+                    return
                 plan = self._plan_scale_reconciliation(
                     decision_autoscaler,
                     decision_version,
@@ -6544,7 +6592,11 @@ class SkyServeController:
                     if ordered_paid_authority is None:
                         ordered_paid_authority = (
                             self._publish_ordered_paid_authority(
-                                decision_autoscaler, decision_version))
+                                decision_autoscaler,
+                                decision_version,
+                                sequenced_reserved_fill=(
+                                    sequenced_reserved_fill),
+                                reserved_fill_allocation_map=allocation))
                     if ordered_paid_authority is None:
                         return
                 # Batch consecutive SCALE_UP decisions into ONE

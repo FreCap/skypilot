@@ -6,6 +6,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite
 
 from sky.serve import capacity_admission
+from sky.serve import reserved_fill_planner
 from sky.serve import serve_state_schema
 
 
@@ -31,9 +32,25 @@ def _input(**overrides) -> capacity_admission.CapacityPlanInput:
         'capacity_target_by_accelerator': {
             'L4': 5,
         },
+        'reserved_fill_authority':
+            (capacity_admission.ReservedFillPlanAuthority.not_applicable()),
     }
     values.update(overrides)
     return capacity_admission.CapacityPlanInput(**values)
+
+
+def _allocation_identity(
+) -> reserved_fill_planner.ReservedFillAllocationIdentity:
+    return reserved_fill_planner.ReservedFillAllocationIdentity(
+        allocation_generation=7,
+        allocation_input_sha256='1' * 64,
+        allocation_claim_generation=11,
+        service_version=7,
+        ordinary_zero_cost_admission_sequence_high_water=13,
+        reconciliation_gate_generation=5,
+        reclaim_fleet_bundle_sha256='2' * 64,
+        reclaim_policy_revision='policy-v1',
+        reclaim_provider_inventory_sha256='3' * 64)
 
 
 def test_paid_claim_constraints_are_postgresql_only():
@@ -70,6 +87,44 @@ def test_capacity_plan_requires_exact_post_zero_cost_residual():
         _input().payload(existing_zero_cost_capacity_by_accelerator={'L4': 2},
                          existing_paid_capacity_by_accelerator={'L4': 1},
                          paid_residual_by_accelerator={'L4': 3})
+
+
+def test_reserved_fill_plan_authority_round_trips_canonical_identity():
+    identity = _allocation_identity()
+    authority = capacity_admission.ReservedFillPlanAuthority.bound(identity)
+
+    encoded = authority.to_mapping()
+
+    assert (capacity_admission.ReservedFillPlanAuthority.from_mapping(encoded)
+            == authority)
+    assert encoded == {
+        'mode': 'ALLOCATION_BOUND',
+        'allocation': identity.to_mapping(),
+    }
+    with pytest.raises(ValueError, match='malformed'):
+        reserved_fill_planner.ReservedFillAllocationIdentity.from_mapping({
+            **identity.to_mapping(), 'future_field': 1
+        })
+
+
+def test_zero_revocation_is_explicit_unbound_and_all_zero():
+    authority = capacity_admission.ReservedFillPlanAuthority.zero_revocation()
+    zero_input = _input(capacity_target_by_accelerator={'L4': 0},
+                        reserved_fill_authority=authority)
+
+    payload = zero_input.payload(
+        existing_zero_cost_capacity_by_accelerator={'L4': 0},
+        existing_paid_capacity_by_accelerator={'L4': 0},
+        paid_residual_by_accelerator={})
+
+    assert payload['reserved_fill_authority'] == {
+        'mode': 'UNBOUND_ZERO_REVOCATION'
+    }
+    with pytest.raises(ValueError, match='all-zero'):
+        _input(reserved_fill_authority=authority).payload(
+            existing_zero_cost_capacity_by_accelerator={'L4': 0},
+            existing_paid_capacity_by_accelerator={'L4': 0},
+            paid_residual_by_accelerator={'L4': 5})
 
 
 def test_capacity_plan_uses_supply_aware_target_not_cold_demand_card():
@@ -128,7 +183,9 @@ def test_paid_launch_authority_debits_exact_or_aggregate_units():
         content_sha256='c' * 64,
         demand_feed_generation=9,
         demand_source_epoch=2,
-        paid_residual_by_accelerator=(('l4', 4),))
+        paid_residual_by_accelerator=(('l4', 4),),
+        reserved_fill_authority=(
+            capacity_admission.ReservedFillPlanAuthority.not_applicable()))
     claim = exact.claim_values('L4', units=4)
     assert claim['capacity_plan_accelerator'] == 'l4'
     assert claim['capacity_plan_units'] == 4
@@ -142,6 +199,8 @@ def test_paid_launch_authority_debits_exact_or_aggregate_units():
         content_sha256='d' * 64,
         demand_feed_generation=10,
         demand_source_epoch=2,
-        paid_residual_by_accelerator=(('*', 2),))
+        paid_residual_by_accelerator=(('*', 2),),
+        reserved_fill_authority=(
+            capacity_admission.ReservedFillPlanAuthority.not_applicable()))
     assert aggregate.claim_values('A100',
                                   units=1)['capacity_plan_accelerator'] == '*'

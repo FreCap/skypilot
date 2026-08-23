@@ -1999,29 +1999,17 @@ class ZeroCostActuationRepository:
                                    last_error='grant_expired',
                                    updated_at=now,
                                    terminal_at=now))
-            connection.execute(
-                sqlalchemy.update(_INTENTS).where(
-                    _INTENTS.c.service_name == service_name,
-                    _INTENTS.c.pool_key == pool_key,
-                    _INTENTS.c.state.in_((IntentState.GRANTED.value,
-                                          IntentState.RETRYABLE.value)),
-                    _INTENTS.c.replica_id.is_(None),
-                    _INTENTS.c.replica_record_id.is_(None),
-                    _INTENTS.c.valid_until > now, _INTENTS.c.valid_until
-                    < expires_at).values(
-                        state=IntentState.TERMINAL.value,
-                        lease_owner=None,
-                        lease_expires_at=None,
-                        last_error='insufficient_actuation_window',
-                        updated_at=now,
-                        terminal_at=now))
 
+            # The execution lease arbitrates owners; it does not grant
+            # materialization authority.  A shorter positive grant remains
+            # useful because the atomic commit independently rechecks its
+            # ``valid_until`` boundary against PostgreSQL time.
             pending_predicates = (_INTENTS.c.service_name == service_name,
                                   _INTENTS.c.pool_key == pool_key,
                                   _INTENTS.c.state.in_(
                                       (IntentState.GRANTED.value,
                                        IntentState.RETRYABLE.value)),
-                                  _INTENTS.c.valid_until >= expires_at)
+                                  _INTENTS.c.valid_until > now)
             authority_rows = connection.execute(
                 sqlalchemy.select(
                     _INTENTS.c.reconciliation_gate_generation,

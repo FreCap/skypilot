@@ -141,6 +141,38 @@ class ReclaimPolicyIdentity:
                         'provider_inventory_sha256')
 
 
+@dataclasses.dataclass(frozen=True, order=True)
+class ReclaimPoolInventoryEntry:
+    """One provider-free physical pool identity owned by the deployment.
+
+    The inventory is an identity bootstrap, not capacity evidence.  A caller
+    must still prove the physical UID inside the protocol-v2 provider fence
+    and consume a fresh committed capacity observation before allocating or
+    launching anything.
+    """
+
+    access_context: str
+    physical_cluster_uid: str
+    accelerator_shapes: tuple[tuple[str, int], ...]
+
+    def __post_init__(self) -> None:
+        _require_bounded_text(self.access_context, 'access_context',
+                              RECLAIM_PROVIDER_CONTEXT_MAX_BYTES)
+        _require_bounded_text(self.physical_cluster_uid, 'physical_cluster_uid',
+                              1024)
+        shapes = self.accelerator_shapes
+        if (type(shapes) is not tuple or not shapes or
+                tuple(sorted(set(shapes))) != shapes):
+            raise ValueError('accelerator_shapes must be a unique sorted '
+                             'tuple.')
+        for accelerator, count in shapes:
+            if (type(accelerator) is not str or not accelerator or
+                    accelerator != accelerator.casefold()):
+                raise ValueError('Inventory accelerator names must be '
+                                 'nonempty and case-folded.')
+            _require_positive_int(count, 'inventory accelerator count')
+
+
 def reclaim_provider_proof_lock_id(
     identity: ReclaimPolicyIdentity,
     gate_generation: int,
@@ -672,6 +704,19 @@ class ReservedFillReclaimPolicy(abc.ABC):
         """Return the provider-free immutable identity implemented locally."""
         raise NotImplementedError
 
+    def provider_free_pool_inventory(
+        self,) -> tuple[ReclaimPoolInventoryEntry, ...]:
+        """Return code-owned pool identities without provider or DB reads.
+
+        This method is intentionally non-abstract so an older deployment
+        plugin remains loadable during an image transition.  Such a plugin
+        cannot bootstrap a new sequenced service and therefore fails closed
+        until the matching plugin image is present.
+        """
+        raise ReclaimAttestationError(
+            'The deployment reclaim policy does not expose the typed '
+            'provider-free pool inventory.')
+
     @abc.abstractmethod
     def attest_activation(
         self,
@@ -829,6 +874,48 @@ def require_exact_policy_identity(
             'The local deployment reclaim policy identity does not match '
             'the expected authority.')
     return identity
+
+
+def require_provider_free_pool_inventory(
+    policy: ReservedFillReclaimPolicy,
+    expected_identity: ReclaimPolicyIdentity,
+) -> tuple[ReclaimPoolInventoryEntry, ...]:
+    """Read the exact identity-bound deployment pool inventory.
+
+    This boundary accepts only the typed, canonical result.  The inventory
+    cannot grant capacity; it only supplies the physical identity expected by
+    the normal protocol-v2 fenced observer.
+    """
+    require_exact_policy_identity(policy, expected_identity)
+    try:
+        inventory = policy.provider_free_pool_inventory()
+    except Exception as error:  # pylint: disable=broad-except
+        raise ReclaimAttestationError(
+            'The deployment reclaim-policy pool inventory could not be read.'
+        ) from error
+    if (type(inventory) is not tuple or not inventory or
+            any(not isinstance(entry, ReclaimPoolInventoryEntry)
+                for entry in inventory) or
+            tuple(sorted(set(inventory))) != inventory):
+        raise ReclaimAttestationError(
+            'The deployment reclaim-policy pool inventory is not a unique '
+            'sorted typed tuple.')
+    contexts: set[str] = set()
+    physical_cards: set[tuple[str, str]] = set()
+    for entry in inventory:
+        if entry.access_context in contexts:
+            raise ReclaimAttestationError(
+                'The deployment reclaim-policy pool inventory repeats an '
+                'access context.')
+        contexts.add(entry.access_context)
+        atoms = {(entry.physical_cluster_uid, accelerator)
+                 for accelerator, _ in entry.accelerator_shapes}
+        if physical_cards.intersection(atoms):
+            raise ReclaimAttestationError(
+                'The deployment reclaim-policy pool inventory repeats a '
+                'physical accelerator pool.')
+        physical_cards.update(atoms)
+    return inventory
 
 
 def require_exact_evidence(

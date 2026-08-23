@@ -48,6 +48,22 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
             policy_revision=self._bundle.policy_revision,
             provider_inventory_sha256=(self._bundle.provider_inventory_sha256))
 
+    def provider_free_pool_inventory(
+        self,) -> tuple[reclaim.ReclaimPoolInventoryEntry, ...]:
+        """Project the embedded reviewed fleet into typed pool identities."""
+        inventory = []
+        for context_name in self._bundle.contexts:
+            context = self._bundle.fleet_context(context_name)
+            inventory.append(
+                reclaim.ReclaimPoolInventoryEntry(
+                    access_context=context_name,
+                    physical_cluster_uid=context['physical_cluster_uid'],
+                    accelerator_shapes=tuple(
+                        sorted((str(accelerator).casefold(), contract['count'])
+                               for accelerator, contract in
+                               context['accelerators'].items()))))
+        return tuple(sorted(inventory))
+
     @staticmethod
     def _require_deadline(deadline_monotonic: float) -> None:
         if (isinstance(deadline_monotonic, bool) or
