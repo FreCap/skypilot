@@ -89,6 +89,70 @@ def test_capacity_plan_requires_exact_post_zero_cost_residual():
                          paid_residual_by_accelerator={'L4': 3})
 
 
+def test_capacity_plan_subtracts_allocation_tail_before_paid_residual():
+    plan = _input(capacity_target_by_accelerator={
+        'L4': 1,
+        'H200': 2,
+    },
+                  allocation_reserved_capacity_by_accelerator={
+                      'L4': 0,
+                      'H200': 1,
+                  },
+                  expected_pending_zero_cost_capacity_by_accelerator={
+                      'L4': 0,
+                      'H200': 1,
+                  })
+
+    payload = plan.payload(existing_zero_cost_capacity_by_accelerator={
+        'L4': 0,
+        'H200': 0,
+    },
+                           pending_zero_cost_capacity_by_accelerator={
+                               'L4': 0,
+                               'H200': 1,
+                           },
+                           allocation_reserved_capacity_by_accelerator={
+                               'L4': 0,
+                               'H200': 1,
+                           },
+                           existing_paid_capacity_by_accelerator={
+                               'L4': 0,
+                               'H200': 0,
+                           },
+                           paid_residual_by_accelerator={'L4': 1})
+
+    assert payload['allocation_reserved_capacity_by_accelerator'] == {
+        'h200': 1,
+        'l4': 0,
+    }
+    assert payload['pending_zero_cost_capacity_by_accelerator'] == {
+        'h200': 1,
+        'l4': 0,
+    }
+    assert payload['paid_residual_by_accelerator'] == {'l4': 1}
+    with pytest.raises(ValueError, match='exact post-zero-cost'):
+        plan.payload(existing_zero_cost_capacity_by_accelerator={
+            'L4': 0,
+            'H200': 0,
+        },
+                     pending_zero_cost_capacity_by_accelerator={
+                         'L4': 0,
+                         'H200': 1,
+                     },
+                     allocation_reserved_capacity_by_accelerator={
+                         'L4': 0,
+                         'H200': 1,
+                     },
+                     existing_paid_capacity_by_accelerator={
+                         'L4': 0,
+                         'H200': 0,
+                     },
+                     paid_residual_by_accelerator={
+                         'L4': 1,
+                         'H200': 1,
+                     })
+
+
 def test_reserved_fill_plan_authority_round_trips_canonical_identity():
     identity = _allocation_identity()
     authority = capacity_admission.ReservedFillPlanAuthority.bound(identity)

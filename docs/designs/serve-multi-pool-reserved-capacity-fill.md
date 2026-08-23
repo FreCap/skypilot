@@ -1,6 +1,6 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-23 14:00 UTC
+Last updated: 2026-08-23 16:31 UTC
 
 Status: the canonical PostgreSQL-authoritative reserved-capacity admission and
 assignment path is source-complete. PR #1679 merged at
@@ -185,6 +185,100 @@ durable. The controller also publishes an unbound zero successor before any
 optimistic planning return when sequenced allocation is unavailable. This adds
 no table, migration, provider path, or infrastructure object and preserves
 pre-contract compatibility only where allocation binding is not required.
+
+Lifecycle-96 qualification on release `1.1.1455` exposed one remaining
+bounded-progress defect in the grant-before-row seam. The pure planner emitted
+the complete free-capacity deficit in one plan, and `grant_plan()` resolved and
+inserted every intent plus every Kueue admission while the manager held the
+global reserved-fill broker fence. Materialization and successor broker rounds
+need that same fence. A 390-intent wave therefore consumed much of its
+authenticated observation lifetime before the executor could use it, admitted
+only a prefix, and then terminalized the remaining hundreds together at
+`grant_expired`. Repeated allocation generations reproduced the same burst,
+partial drain, mass expiry, and refill gap. This is SkyPilot admission
+backpressure, not unavailable GPU capacity or a Kueue policy refusal.
+
+The steady-state correction is a per-physical-pool bounded conveyor. At most
+32 live pre-materialization intents (`GRANTED`, `ACTUATING`, or `RETRYABLE`)
+may exist for one service/pool lane, matching that lane's existing maximum
+executor lease batch. The locked grant transaction first terminalizes every
+unleased, unmaterialized `GRANTED` or `RETRYABLE` intent from a superseded
+allocation and lets the existing evidence-backed Kueue provider-free garbage
+collector remove its admission. A live `ACTUATING` row is deliberately not
+superseded: it may be between physical preflight and atomic request admission,
+so it retains its exact lease and consumes one pool-window position until its
+owner releases it or lease-expiry recovery settles it. This prevents a new
+allocation from duplicating live work or discarding the only recovery edge. The
+transaction then retires rows whose grant and execution lease have both
+expired and computes the free window before resolving Kueue identities or
+inserting new rows. It replays existing intent keys normally, walks
+deterministic planner order, accepts at most the free positions in each
+intent's own pool, and returns the remainder with the typed
+`ACTUATION_WINDOW_FULL` disposition. A Kueue-blocked PHX lane therefore cannot
+consume East's positions; East refills its 32-position lane on every drain
+while PHX remains independently bounded. The receipt-proven rotation continues
+to order each accepted subsequence. Superseded provider-free rows cannot
+monopolize a pool window for their remaining observation TTL.
+
+Window backpressure is also not permission to ignore reserved supply when
+calculating paid residual. The controller derives an exact-card
+`allocation_reserved_capacity_by_accelerator` projection from the same current
+authenticated allocation named by the plan. It subtracts every
+same-allocation committed or pending physical-slot debit and clips the
+remaining deterministic pool/card prefix in the configured physical or
+logical capacity unit. The autoscaler then reruns its existing compatibility
+allocator with exact Kueue-countable pending supply plus that tail as the final
+existing-supply tier. This is required for heterogeneous flexible demand: work
+whose cold paid attribution was L4 may be satisfied by compatible reserved A100
+or H200 supply, so subtracting only like-named cards would still spill to paid.
+
+The process-local pool rotation anchor is not itself PostgreSQL authority.
+Therefore positive paid planning may use the canonical-order tail projection
+only when service headroom can accommodate the complete remaining allocation
+after same-map debits; under that enforced gate, rotation changes order but not
+the exact-card totals. A partially binding headroom projection fails closed
+until the tail is fully representable or the rotation anchor gains a durable
+proof. The implementation does not guess a card split under a binding ceiling.
+
+`CapacityPlanInput` carries both the resulting supply-aware exact-card target
+and the exact tail used to compute it. The ordered publication transaction
+recomputes the tail under the allocation, service, intent, replica, and Kueue
+locks and rejects the plan unless it exactly matches the controller's input.
+It then content-hashes the map with the target and materialized/pending
+inventory. The per-card formula is `supply_aware_target - existing_zero_cost -
+pending_zero_cost - allocation_reserved - existing_paid`, floored at zero.
+Thus demand genuinely beyond all compatible current reserved supply can
+receive paid authority while the conveyor is full; demand covered by
+not-yet-materialized compatible reserved slots cannot spill to paid.
+
+Every initial paid claim and final provider-start validation rereads the exact
+allocation and locked capacity graph and recomputes this tail. A changed,
+expired, malformed, or unbound allocation, a changed tail, or a legacy positive
+allocation-bound payload without both the projection and its supply-aware
+target fails closed. This extension is stored only in the existing
+content-hashed JSON payload and adds no table or migration. Each atomic
+pending-to-replica materialization moves capacity from the allocation tail to
+pending and then materialized inventory while freeing one window position; the
+following capacity plan recomputes all three terms without double counting.
+Accepted grants retain the existing immediate replan. A window-only deferral
+does not self-wake while the window remains unchanged, avoiding a hot loop.
+Each committed materialization completion, including a conservatively
+maybe-committed result, and each exact terminal transition that frees a window
+position instead publishes one coalesced notification through the canonical
+reconciliation coordinator after the transaction is visible. That immediately
+replans the newly free position; the coordinator's bounded recovery tick
+remains only the lost-notification fallback. A retryable release keeps its
+window debit and emits no controller wakeup.
+
+The correction does not extend `valid_until`, renew stale observations, add a
+second allocation identity, or weaken the terminal PostgreSQL-time check.
+Successor observations retain their normal authority and expired grants remain
+terminal. It also does not remove the global broker fence or parallelize the
+shared replica graph: those changes would reopen the scan-to-publish gap or
+replica-ID overwrite races. Batching the bounded atomic materialization tuple
+may improve throughput later, but it is not part of this liveness correction.
+The source, focused PostgreSQL/controller tests, homogeneous Helm deployment,
+and a fresh full-capacity/no-paid-spill horizon are open at this design update.
 
 ## Current executable closeout
 
@@ -4300,11 +4394,37 @@ intents in plan order. Cleanup-proven replicas and unrelated terminal or
 committed intent history are not selected or locked. This call owns no provider
 phase, physical-cluster read, replica ID, API request, or worker thread.
 
+Grant admission is also the executor-backpressure boundary. After expiry
+and superseded-provider-free retirement, the transaction counts live
+pre-materialization intents by physical pool and permits at most
+`MAX_ACTUATION_LEASE_BATCH_SIZE == 32` in each pool lane. Existing plan-key
+replays do not spend another position. New intent/Kueue-admission resolution
+follows planner order while skipping a pool whose own window is full. Skipped
+intents are returned as `ACTUATION_WINDOW_FULL` without inserting a row. The
+bound keeps
+the global broker-fence critical section proportional to one drainable
+executor wave instead of total fleet capacity.
+
 `FillCommitResult` accounts for every planned intent exactly once as accepted
 or deferred. Replaying the same idempotency key returns the existing pending or
 committed intent, and the controller advances rotation only from this durable
 receipt. A changed allocation, owner, version, ceiling, or actuation authority
 fails closed before provider work.
+
+`ACTUATION_WINDOW_FULL` is a reserved-work-outstanding result, not an empty
+reserved-supply result. The controller continues to ordered demand planning;
+the capacity-plan transaction represents the unmaterialized current-allocation
+tail explicitly and authorizes only demand beyond it. A window-only deferral
+does not issue an immediate self-wakeup while no position has changed. Accepted
+grants still trigger the existing immediate replan, and every committed or
+maybe-committed materialization completion plus each exact terminal transition
+that frees a position notifies the same single reconciliation coordinator
+after its transaction is visible. Retryable releases continue to debit the
+window and do not notify. The next conveyor grant therefore follows a freed
+position immediately; the bounded recovery tick is only a lost-notification
+fallback. Thus reserved capacity remains ordered before paid residual while a
+full window neither globally suppresses genuinely uncovered demand nor lets it
+spill over reserved supply.
 
 The existing durable-intent dispatcher subsequently leases each physical pool
 on an independent lane. It performs the bounded physical preflight and then

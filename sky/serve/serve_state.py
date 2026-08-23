@@ -7062,6 +7062,7 @@ def _prelock_and_delete_materialized_kueue_admissions(
     service_hash: str,
     service_lifecycle_epoch: int,
     expected_replica_record_ids: dict[int, str],
+    allow_active_provider_free_pre_job: bool = False,
 ) -> tuple[kueue_lane_lineage.KueueAdmissionRepository | None, tuple[
         kueue_lane_lineage.MaterializedRetirementProof, ...]]:
     """Retire exact provider-clean admission children before replica rows."""
@@ -7078,7 +7079,8 @@ def _prelock_and_delete_materialized_kueue_admissions(
         service_name=service_name,
         service_hash=service_hash,
         service_lifecycle_epoch=service_lifecycle_epoch,
-        targets=targets)
+        targets=targets,
+        allow_active_provider_free_pre_job=(allow_active_provider_free_pre_job))
     repository.delete_materialized_admissions_in_connection(connection, proofs)
     return repository, proofs
 
@@ -7104,9 +7106,13 @@ def remove_replica(
     expected_controller_owner: tuple[int | None, str | None] | None = None,
     *,
     expected_replica_record_id: str,
+    allow_active_provider_free_pre_job: bool = False,
 ) -> bool:
     """Remove one replica under service and immutable-record fences."""
     _validate_expected_replica_record_id(expected_replica_record_id)
+    if type(allow_active_provider_free_pre_job) is not bool:
+        raise ValueError(
+            'Active provider-free retirement scope must be boolean.')
     with _replica_launch_authority_write_session(service_name) as (engine,
                                                                    session):
         _begin_immediate_if_sqlite(
@@ -7114,6 +7120,12 @@ def remove_replica(
             expected_lifecycle_epoch is not None or
             expected_controller_owner is not None or
             expected_replica_record_id is not None)
+        if allow_active_provider_free_pre_job:
+            # This typed path may consume the current sequencer gate as
+            # replacement authority. Fence it before lifecycle/service/intent
+            # locks. Ordinary and paid teardown avoid this global mutex.
+            lock_zero_cost_protocol_for_bound_launch_observation(
+                session.connection())
         if not _lifecycle_epoch_matches_in_session(session, service_name,
                                                    expected_lifecycle_epoch):
             session.rollback()
@@ -7157,7 +7169,9 @@ def remove_replica(
                     service_lifecycle_epoch=int(owner[1]),
                     expected_replica_record_ids={
                         replica_id: expected_replica_record_id
-                    }))
+                    },
+                    allow_active_provider_free_pre_job=(
+                        allow_active_provider_free_pre_job)))
         locked_record_ids = _lock_replica_record_ids_in_session(
             session, engine, service_name, [replica_id])
         if locked_record_ids is None:

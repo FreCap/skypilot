@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from collections.abc import Sequence
 import dataclasses
 import datetime
 import enum
@@ -761,9 +762,9 @@ def _locked_replica_capacity(
     nonretiring_paid_by_shape: dict[tuple[str, int], int] = {}
     reserved_fill_intent_keys: set[str] = set()
     for row in rows:
-        capacity = _replica_capacity_for_unit(row['replica_state_version'],
-                                              row['replica_state'],
-                                              capacity_unit)
+        capacity = replica_capacity_for_unit(row['replica_state_version'],
+                                             row['replica_state'],
+                                             capacity_unit)
         total += capacity
         intent_key = row['reserved_fill_intent_idempotency_key']
         if isinstance(intent_key, str) and intent_key:
@@ -792,7 +793,7 @@ def _locked_replica_capacity(
                                   frozenset(reserved_fill_intent_keys))
 
 
-def _replica_capacity_for_unit(
+def replica_capacity_for_unit(
     storage_version: Any,
     state: Any,
     capacity_unit: reserved_fill_planner.FillCapacityUnit,
@@ -813,7 +814,7 @@ def _replica_capacity_for_unit(
     return capacity_unit.intent_cost(accelerator_count)
 
 
-def _pending_row_capacity(
+def intent_capacity_for_unit(
     row: Mapping[str, Any],
     capacity_unit: reserved_fill_planner.FillCapacityUnit,
 ) -> int:
@@ -844,14 +845,14 @@ def _pending_capacity_for_unit(
 ) -> int:
     """Project live non-Kueue intents into the current service unit."""
     return sum(
-        _pending_row_capacity(row, capacity_unit)
+        intent_capacity_for_unit(row, capacity_unit)
         for row in rows
         if (row['state'] in _PENDING_STATES and row['valid_until'] > now and
             row['intent_idempotency_key'] not in admission_owned_intent_keys))
 
 
-def _unrepresented_kueue_admission_capacity(
-    admission_rows: list[kueue_lane_lineage.KueueAdmissionRow],
+def unrepresented_kueue_admission_capacity(
+    admission_rows: Sequence[kueue_lane_lineage.KueueAdmissionRow],
     *,
     capacity_unit: reserved_fill_planner.FillCapacityUnit,
     represented_intent_keys: frozenset[str],
@@ -878,7 +879,9 @@ def _retire_expired_locked(connection: sqlalchemy.engine.Connection,
     expired_keys = [
         row['intent_idempotency_key']
         for row in rows
-        if row['state'] in _PENDING_STATES and row['valid_until'] <= now
+        if row['state'] in _PENDING_STATES and row['valid_until'] <= now and
+        (row['state'] != IntentState.ACTUATING.value or
+         row['lease_expires_at'] is None or row['lease_expires_at'] <= now)
     ]
     if expired_keys:
         connection.execute(
@@ -889,6 +892,62 @@ def _retire_expired_locked(connection: sqlalchemy.engine.Connection,
                     lease_owner=None,
                     lease_expires_at=None,
                     last_error='grant_expired',
+                    updated_at=now,
+                    terminal_at=now))
+
+
+def _retire_superseded_provider_free_locked(
+    connection: sqlalchemy.engine.Connection,
+    rows: list[Mapping[str, Any]],
+    plan: reserved_fill_planner.FillPlan,
+    now: datetime.datetime,
+) -> None:
+    """Evict unleased provider-free rows from an obsolete allocation.
+
+    A live ``ACTUATING`` lease may be between physical preflight and atomic
+    request admission.  It must keep both its intent and window debit until
+    that owner releases it or lease recovery runs; superseding it here would
+    let the next allocation duplicate work while the old owner is still live.
+    ``GRANTED`` and ``RETRYABLE`` are provider-free only with an empty lease
+    and materialization identity, which is asserted in both the selection and
+    compare-and-update below.
+    """
+    first = plan.intents[0]
+    current = {
+        'service_hash': first.service_incarnation,
+        'service_version': first.service_version,
+        'allocation_generation': plan.allocation_generation,
+        'allocation_input_sha256': plan.allocation_input_sha256,
+        'allocation_claim_generation': plan.allocation_claim_generation,
+        'reconciliation_gate_generation': (plan.reconciliation_gate_generation),
+        'reclaim_fleet_bundle_sha256': plan.reclaim_fleet_bundle_sha256,
+        'reclaim_policy_revision': plan.reclaim_policy_revision,
+        'reclaim_provider_inventory_sha256':
+            (plan.reclaim_provider_inventory_sha256),
+    }
+    superseded_keys = [
+        str(row['intent_idempotency_key'])
+        for row in rows
+        if (row['state'] in (IntentState.GRANTED.value,
+                             IntentState.RETRYABLE.value) and
+            row['lease_owner'] is None and row['lease_expires_at'] is None and
+            row['replica_id'] is None and row['replica_record_id'] is None and
+            any(row[field] != value for field, value in current.items()))
+    ]
+    if superseded_keys:
+        connection.execute(
+            sqlalchemy.update(_INTENTS).where(
+                _INTENTS.c.intent_idempotency_key.in_(superseded_keys),
+                _INTENTS.c.state.in_(
+                    (IntentState.GRANTED.value, IntentState.RETRYABLE.value)),
+                _INTENTS.c.lease_owner.is_(None),
+                _INTENTS.c.lease_expires_at.is_(None),
+                _INTENTS.c.replica_id.is_(None),
+                _INTENTS.c.replica_record_id.is_(None)).values(
+                    state=IntentState.TERMINAL.value,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    last_error='allocation_superseded',
                     updated_at=now,
                     terminal_at=now))
 
@@ -1683,35 +1742,6 @@ class ZeroCostActuationRepository:
                     isinstance(lifecycle_epoch, bool) or lifecycle_epoch < 1):
                 raise ZeroCostActuationConflict(
                     'Service lifecycle authority is malformed.')
-            (worker_projections,
-             placement_catalog) = (_version_placement_snapshot_in_connection(
-                 connection,
-                 service_name=service_name,
-                 service_version=plan.intents[0].service_version))
-            try:
-                worker_projections = (
-                    kubernetes_identity.validate_worker_placement_projections(
-                        worker_projections,
-                        allow_none=False,
-                        require_protocol_version=(
-                            kubernetes_identity.
-                            PLACEMENT_PROJECTION_PROTOCOL_VERSION)))
-            except ValueError as error:
-                raise ZeroCostActuationConflict(
-                    'Grant admission requires the exact current worker '
-                    'projection protocol.') from error
-            assert worker_projections is not None
-            lane_identities = {
-                intent.idempotency_key:
-                    kueue_lane_identity_for_intent_in_connection(
-                        connection,
-                        service_name=service_name,
-                        service_lifecycle_epoch=lifecycle_epoch,
-                        intent=intent,
-                        worker_projections=worker_projections,
-                        placement_catalog=placement_catalog)
-                for intent in plan.intents
-            }
             lane_repository = kueue_lane_lineage.KueueAdmissionRepository(
                 self.engine)
             now = connection.execute(
@@ -1722,6 +1752,7 @@ class ZeroCostActuationRepository:
             rows = _locked_grant_intent_rows(connection,
                                              service_name=service_name,
                                              plan_keys=grant_intent_keys)
+            _retire_superseded_provider_free_locked(connection, rows, plan, now)
             _retire_expired_locked(connection, rows, now)
             locked_intent_keys = tuple(
                 str(row['intent_idempotency_key']) for row in rows)
@@ -1736,6 +1767,66 @@ class ZeroCostActuationRepository:
                             locked_intent_keys)).order_by(
                                 _INTENTS.c.intent_idempotency_key).
                     with_for_update()).mappings().all()
+            rows_by_key = {
+                str(row['intent_idempotency_key']): row for row in rows
+            }
+            live_by_pool: dict[str, int] = {}
+            for row in rows:
+                if row['state'] not in _PENDING_STATES:
+                    continue
+                pool_key = str(row['pool_key'])
+                live_by_pool[pool_key] = live_by_pool.get(pool_key, 0) + 1
+            free_by_pool = {
+                intent.pool_key: max(
+                    0, MAX_ACTUATION_LEASE_BATCH_SIZE - live_by_pool.get(
+                        intent.pool_key, 0)) for intent in plan.intents
+            }
+            eligible_new_keys: set[str] = set()
+            for intent in plan.intents:
+                if intent.idempotency_key in rows_by_key:
+                    continue
+                if free_by_pool[intent.pool_key] <= 0:
+                    continue
+                eligible_new_keys.add(intent.idempotency_key)
+                free_by_pool[intent.pool_key] -= 1
+            resolved_intent_keys = (
+                set(rows_by_key).intersection(grant_intent_keys) |
+                eligible_new_keys)
+            lane_identities: dict[str,
+                                  kueue_lane_lineage.KueueAdmissionIdentity |
+                                  None] = {}
+            if resolved_intent_keys:
+                (worker_projections, placement_catalog) = (
+                    _version_placement_snapshot_in_connection(
+                        connection,
+                        service_name=service_name,
+                        service_version=plan.intents[0].service_version))
+                try:
+                    worker_projections = (
+                        kubernetes_identity.
+                        validate_worker_placement_projections(
+                            worker_projections,
+                            allow_none=False,
+                            require_protocol_version=(
+                                kubernetes_identity.
+                                PLACEMENT_PROJECTION_PROTOCOL_VERSION)))
+                except ValueError as error:
+                    raise ZeroCostActuationConflict(
+                        'Grant admission requires the exact current worker '
+                        'projection protocol.') from error
+                assert worker_projections is not None
+                lane_identities = {
+                    intent.idempotency_key:
+                        kueue_lane_identity_for_intent_in_connection(
+                            connection,
+                            service_name=service_name,
+                            service_lifecycle_epoch=lifecycle_epoch,
+                            intent=intent,
+                            worker_projections=worker_projections,
+                            placement_catalog=placement_catalog)
+                    for intent in plan.intents
+                    if intent.idempotency_key in resolved_intent_keys
+                }
             replica_capacity = _locked_replica_capacity(
                 connection,
                 service_name=service_name,
@@ -1767,7 +1858,7 @@ class ZeroCostActuationRepository:
                 plan.capacity_unit,
                 admission_owned_intent_keys=admission_owned_intent_keys)
             unresolved_admission_capacity = (
-                _unrepresented_kueue_admission_capacity(
+                unrepresented_kueue_admission_capacity(
                     admission_rows,
                     capacity_unit=plan.capacity_unit,
                     represented_intent_keys=(
@@ -1790,11 +1881,20 @@ class ZeroCostActuationRepository:
             lane_by_intent = {
                 row.intent_idempotency_key: row for row in admission_rows
             }
-            rows_by_key = {row['intent_idempotency_key']: row for row in rows}
             surge_lease_active = any(
                 int(getattr(row, 'replacement_surge_units', 0)) > 0
                 for row in admission_rows)
             for intent in plan.intents:
+                existing = rows_by_key.get(intent.idempotency_key)
+                if (existing is None and
+                        intent.idempotency_key not in eligible_new_keys):
+                    deferred.append(
+                        reserved_fill_planner.DeferredFillIntent(
+                            intent, reserved_fill_planner.DeferredFillReason.
+                            ACTUATION_WINDOW_FULL,
+                            'the physical-pool pre-materialization window is '
+                            'full'))
+                    continue
                 values = _intent_values(
                     intent,
                     service_name=service_name,
@@ -1802,7 +1902,6 @@ class ZeroCostActuationRepository:
                     actuation_epoch=int(
                         service['reserved_fill_actuation_epoch']))
                 lane_identity = lane_identities[intent.idempotency_key]
-                existing = rows_by_key.get(intent.idempotency_key)
                 if existing is not None:
                     if not _row_matches_values(existing, values):
                         raise ZeroCostActuationConflict(
@@ -1992,13 +2091,19 @@ class ZeroCostActuationRepository:
                     _INTENTS.c.service_name == service_name,
                     _INTENTS.c.pool_key == pool_key,
                     _INTENTS.c.state.in_(tuple(_PENDING_STATES)),
-                    _INTENTS.c.valid_until
-                    <= now).values(state=IntentState.TERMINAL.value,
-                                   lease_owner=None,
-                                   lease_expires_at=None,
-                                   last_error='grant_expired',
-                                   updated_at=now,
-                                   terminal_at=now))
+                    _INTENTS.c.valid_until <= now,
+                    sqlalchemy.or_(
+                        _INTENTS.c.state.in_((IntentState.GRANTED.value,
+                                              IntentState.RETRYABLE.value)),
+                        sqlalchemy.and_(
+                            _INTENTS.c.state == IntentState.ACTUATING.value,
+                            _INTENTS.c.lease_expires_at
+                            <= now))).values(state=IntentState.TERMINAL.value,
+                                             lease_owner=None,
+                                             lease_expires_at=None,
+                                             last_error='grant_expired',
+                                             updated_at=now,
+                                             terminal_at=now))
 
             # The execution lease arbitrates owners; it does not grant
             # materialization authority.  A shorter positive grant remains
@@ -2193,7 +2298,7 @@ class ZeroCostActuationRepository:
                     _INTENTS.c.valid_until > now).order_by(
                         _INTENTS.c.intent_idempotency_key)).mappings().all()
         capacity = sum(
-            _pending_row_capacity(row, capacity_unit) for row in rows)
+            intent_capacity_for_unit(row, capacity_unit) for row in rows)
         counts: dict[tuple[str, str], int] = {}
         for row in rows:
             if (row['service_hash'] == service_hash and

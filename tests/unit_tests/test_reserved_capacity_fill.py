@@ -42,6 +42,7 @@ from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_reclaim_attestation
+from sky.serve import scale_reconciliation
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import service_spec
@@ -5833,6 +5834,120 @@ class TestFillLaunchPath(unittest.TestCase):
         self.assertIs(
             manager._zero_cost_actuation_repository.lease_batch.return_value[0],
             lease)
+
+    def test_full_actuation_wave_immediately_wakes_next_reconcile(self):
+        manager, template_lease, _ = self._actuation_harness()
+        leases = tuple(
+            types.SimpleNamespace(intent=types.SimpleNamespace(
+                allowed_locations=template_lease.intent.allowed_locations,
+                physical_cluster_uid='physical-uid',
+                idempotency_key=f'{index:064x}')) for index in range(
+                    zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE))
+        manager._zero_cost_actuation_repository.lease_batch.return_value = (
+            leases)
+        manager._scale_up_one_locked = mock.Mock(side_effect=[
+            replica_managers._ReplicaLaunchResult(
+                replica_id=index + 1,
+                planned_capacity=1,
+                funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)
+            for index in range(len(leases))
+        ])
+        manager._release_reserved_fill_physical_preflights = mock.Mock()
+        manager._zero_cost_actuation_lanes = {
+            'pool': threading.current_thread()
+        }
+
+        first_reconcile = threading.Event()
+        refill_reconcile = threading.Event()
+        reconciled_generations = []
+        coordinator = None
+
+        def _reconcile(generation):
+            reconciled_generations.append(generation)
+            if len(reconciled_generations) == 1:
+                first_reconcile.set()
+            else:
+                refill_reconcile.set()
+                assert coordinator is not None
+                coordinator.stop()
+
+        coordinator = scale_reconciliation.ScaleReconcileCoordinator(
+            _reconcile, max_idle_seconds=60)
+        manager.set_scale_reconcile_notifier(coordinator.notify)
+        reconcile_worker = threading.Thread(target=coordinator.run)
+        reconcile_worker.start()
+        try:
+            self.assertTrue(first_reconcile.wait(timeout=1))
+            with mock.patch.object(
+                    provider_phase,
+                    'try_provider_phase',
+                    return_value=contextlib.nullcontext(
+                        mock.sentinel.admission)), \
+                 mock.patch.object(serve_state,
+                                   'get_replica_infos',
+                                   return_value=[]):
+                manager._actuate_zero_cost_pool('pool')
+            # The recovery fallback is 60 seconds in this test. Observing the
+            # next generation here proves completion published the wakeup.
+            self.assertTrue(refill_reconcile.wait(timeout=1))
+        finally:
+            coordinator.stop()
+            reconcile_worker.join(timeout=1)
+
+        self.assertFalse(reconcile_worker.is_alive())
+        self.assertEqual(reconciled_generations, [0, 1])
+        self.assertEqual(manager._scale_up_one_locked.call_count, len(leases))
+        self.assertNotIn('pool', manager._zero_cost_actuation_lanes)
+        manager._zero_cost_actuation_repository.lease_batch.assert_called_once_with(
+            service_name='svc',
+            pool_key='pool',
+            owner=manager._zero_cost_actuation_executor_id,
+            lease_seconds=mock.ANY,
+            max_leases=zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE)
+
+    def test_terminal_actuation_transition_wakes_reconcile(self):
+        manager, _, _ = self._actuation_harness()
+        manager._scale_up_one_locked = mock.Mock(
+            side_effect=exceptions.KubernetesPhysicalClusterIdentityError(
+                'physical identity rotated'))
+        manager._release_reserved_fill_physical_preflights = mock.Mock()
+        manager._zero_cost_actuation_repository.terminate.return_value = True
+        notify_reconcile = mock.Mock(return_value=1)
+        manager.set_scale_reconcile_notifier(notify_reconcile)
+
+        with mock.patch.object(
+                provider_phase,
+                'try_provider_phase',
+                return_value=contextlib.nullcontext(mock.sentinel.admission)), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[]):
+            manager._actuate_zero_cost_pool('pool')
+
+        manager._zero_cost_actuation_repository.terminate.assert_called_once()
+        notify_reconcile.assert_called_once_with()
+
+    def test_retryable_actuation_transition_does_not_wake_reconcile(self):
+        manager, _, _ = self._actuation_harness()
+        manager._scale_up_one_locked = mock.Mock(
+            side_effect=exceptions.ProviderPhaseBusyError(
+                'provider phase is busy'))
+        manager._release_reserved_fill_physical_preflights = mock.Mock()
+        notify_reconcile = mock.Mock(return_value=1)
+        manager.set_scale_reconcile_notifier(notify_reconcile)
+
+        with mock.patch.object(
+                provider_phase,
+                'try_provider_phase',
+                return_value=contextlib.nullcontext(mock.sentinel.admission)), \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[]):
+            manager._actuate_zero_cost_pool('pool')
+
+        manager._zero_cost_actuation_repository.release_retryable.assert_called_once(
+        )
+        notify_reconcile.assert_not_called()
 
     def test_v2_actuation_primary_signal_baseexception_wins_cleanup_signal(
             self):

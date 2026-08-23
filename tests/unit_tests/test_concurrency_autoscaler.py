@@ -3971,6 +3971,197 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
         self.assertEqual(decisions, [])
 
+    def test_economic_target_uses_h200_before_paid_l4_residual(self):
+        autoscaler = _make_autoscaler(max_replicas=2)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=2,
+                queued_profiles=[self._profile(20, ['L4', 'H200'], 2)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        _decisions(autoscaler, [])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 2})
+        self.assertEqual(
+            autoscaler.economic_capacity_target_by_accelerator([], {'h200': 1}),
+            {
+                'L4': 1,
+                'H200': 1,
+            })
+
+    def test_economic_target_never_uses_h200_for_l4_only_work(self):
+        autoscaler = _make_autoscaler(max_replicas=1)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                queued_profiles=[self._profile(50, ['L4'], 1)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        _decisions(autoscaler, [])
+
+        self.assertEqual(
+            autoscaler.economic_capacity_target_by_accelerator([], {'h200': 1}),
+            {'L4': 1})
+
+    def test_economic_target_preserves_priority_and_compatibility(self):
+        autoscaler = _make_autoscaler(max_replicas=2)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=2,
+                queued_profiles=[
+                    self._profile(50, ['L4'], 1),
+                    self._profile(20, ['L4', 'H200'], 1),
+                ],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        _decisions(autoscaler, [])
+
+        self.assertEqual(
+            autoscaler.economic_capacity_target_by_accelerator([], {'h200': 1}),
+            {
+                'L4': 1,
+                'H200': 1,
+            })
+
+    def test_logical_economic_target_uses_multi_gpu_capacity_units(self):
+        autoscaler = _make_autoscaler(max_replicas=5, replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 4})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=5,
+                queued_profiles=[
+                    self._profile(50, ['L4'], 1),
+                    self._profile(20, ['L4', 'H200'], 4),
+                ],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        _decisions(autoscaler, [])
+
+        self.assertEqual(
+            autoscaler.economic_capacity_target_by_accelerator([], {'h200': 4}),
+            {
+                'L4': 1,
+                'H200': 4,
+            })
+
+    def test_economic_target_uses_durable_width_during_local_capacity_blackout(
+            self):
+        autoscaler = _make_autoscaler(max_replicas=1, replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
+        h200 = _replica(1, card='H200', planned_capacity=1)
+        h200.is_zero_cost = True
+        _report(autoscaler,
+                in_flight={1: 0},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['L4', 'H200'], 1)],
+                unknown_capacity=[1],
+                compatibility_complete=True)
+        _decisions(autoscaler, [h200])
+
+        self.assertEqual(
+            autoscaler.economic_capacity_target_by_accelerator(
+                [h200], {
+                    'l4': 0,
+                    'h200': 0,
+                },
+                kueue_capacity_by_replica_id={
+                    1: kueue_lane_capacity.KueueReplicaCapacityClass.
+                       POLICY_ADMITTED,
+                }), {'H200': 1})
+
+    def test_economic_target_uses_admitted_historical_reserved_width(self):
+        autoscaler = autoscalers.ConcurrencyAutoscaler(
+            'svc', _spec(max_replicas=1, replica_unit='logical'), version=2)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
+        predecessor = _replica(1,
+                               card='H200',
+                               version=1,
+                               planned_capacity=1,
+                               reserved_fill=True)
+        predecessor.is_zero_cost = True
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1,
+                queued_profiles=[self._profile(20, ['L4', 'H200'], 1)],
+                compatibility_complete=True)
+        _decisions(autoscaler, [], active_versions=(2,))
+
+        self.assertEqual(
+            autoscaler.economic_capacity_target_by_accelerator(
+                [predecessor], {
+                    'l4': 0,
+                    'h200': 0,
+                },
+                kueue_capacity_by_replica_id={
+                    1: kueue_lane_capacity.KueueReplicaCapacityClass.
+                       POLICY_ADMITTED,
+                }), {'H200': 1})
+
+    def test_only_logical_concurrency_supports_reserved_economic_authority(
+            self):
+        self.assertFalse(
+            _make_autoscaler().supports_reserved_supply_economic_target())
+        self.assertTrue(
+            _make_autoscaler(replica_unit='logical').
+            supports_reserved_supply_economic_target())
+
+    def test_economic_target_does_not_mutate_adoption_or_retirement_state(self):
+        autoscaler = _make_autoscaler(max_replicas=2, replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=2,
+                queued_profiles=[self._profile(20, ['L4', 'H200'], 2)],
+                rejected_profiles=[],
+                compatibility_complete=True)
+        _decisions(autoscaler, [])
+        autoscaler.warm_retention_target_by_accelerator = {'L4': 1}
+        autoscaler.cold_launch_authority_by_accelerator = {'L4': 2}
+        before = {
+            'target': autoscaler.target_num_replicas,
+            'target_by_card': dict(autoscaler.target_num_replicas_by_accelerator
+                                  ),
+            'warm': dict(autoscaler.warm_retention_target_by_accelerator),
+            'cold': dict(autoscaler.cold_launch_authority_by_accelerator),
+            'pending_floor': autoscaler._pending_retention_floor,
+            'pending_capacity': autoscaler._pending_capacity_at_adoption,
+            'pending_budget': autoscaler._pending_budget_spent,
+            'logical_target': dict(
+                autoscaler._logical_actuation_target_by_accelerator),
+            'logical_desired': dict(
+                autoscaler._logical_actuation_desired_by_accelerator),
+            'adopted_explicit': dict(
+                autoscaler._logical_adopted_explicit_target_by_accelerator),
+            'adopted_paid': dict(
+                autoscaler._logical_adopted_paid_target_by_accelerator),
+        }
+
+        autoscaler.economic_capacity_target_by_accelerator([], {'h200': 1})
+
+        after = {
+            'target': autoscaler.target_num_replicas,
+            'target_by_card': dict(autoscaler.target_num_replicas_by_accelerator
+                                  ),
+            'warm': dict(autoscaler.warm_retention_target_by_accelerator),
+            'cold': dict(autoscaler.cold_launch_authority_by_accelerator),
+            'pending_floor': autoscaler._pending_retention_floor,
+            'pending_capacity': autoscaler._pending_capacity_at_adoption,
+            'pending_budget': autoscaler._pending_budget_spent,
+            'logical_target': dict(
+                autoscaler._logical_actuation_target_by_accelerator),
+            'logical_desired': dict(
+                autoscaler._logical_actuation_desired_by_accelerator),
+            'adopted_explicit': dict(
+                autoscaler._logical_adopted_explicit_target_by_accelerator),
+            'adopted_paid': dict(
+                autoscaler._logical_adopted_paid_target_by_accelerator),
+        }
+        self.assertEqual(after, before)
+
     def test_retiring_warm_card_does_not_authorize_paid_replacement(self):
         interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
         autoscaler = _make_autoscaler(max_replicas=2,

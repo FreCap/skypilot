@@ -89,7 +89,12 @@ _CAPACITY_EAST_PROJECTION_SHA256 = (
 
 
 def _capacity_service_spec(
-        reserved_fill_enabled: bool) -> service_spec.SkyServiceSpec:
+    reserved_fill_enabled: bool,
+    *,
+    max_replicas: int = 10,
+    replica_unit: str = 'physical_backend',
+) -> service_spec.SkyServiceSpec:
+    assert replica_unit in ('physical_backend', 'logical')
     return service_spec.SkyServiceSpec(
         readiness_path='/health',
         initial_delay_seconds=0,
@@ -97,8 +102,12 @@ def _capacity_service_spec(
         endpoint_probe_interval_seconds=1,
         lb_stream_timeout_seconds=10,
         min_replicas=0,
-        max_replicas=10,
+        max_replicas=max_replicas,
         target_concurrency_per_replica=1,
+        spot_placer=('dynamic_fallback_per_gpu'
+                     if replica_unit == 'logical' else None),
+        graceful_drain_async_occupancy=(True
+                                        if replica_unit == 'logical' else None),
         lb_high_availability=False,
         reserved_capacity_fill=reserved_fill_enabled)
 
@@ -329,8 +338,13 @@ def _plan(
     demand_target: int,
     *,
     normalized_demand: dict | None = None,
+    capacity_target_by_accelerator: dict[str, int] | None = None,
     reserved_fill_authority: (capacity_admission.ReservedFillPlanAuthority |
                               None) = None,
+    allocation_reserved_capacity_by_accelerator: dict[str, int] | None = None,
+    expected_pending_zero_cost_capacity_by_accelerator: dict[str, int] |
+    None = None,
+    expected_economic_capacity_graph_sha256: str | None = None,
 ) -> capacity_admission.CapacityPlanInput:
     snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
     assert snapshot is not None
@@ -347,44 +361,56 @@ def _plan(
         route_source_epoch=snapshot.route_source_epoch,
         normalized_demand=(snapshot.normalized_demand
                            if normalized_demand is None else normalized_demand),
-        capacity_target_by_accelerator={'l4': demand_target},
+        capacity_target_by_accelerator=({
+            'l4': demand_target
+        } if capacity_target_by_accelerator is None else
+                                        capacity_target_by_accelerator),
         reserved_fill_authority=(
             capacity_admission.ReservedFillPlanAuthority.not_applicable()
-            if reserved_fill_authority is None else reserved_fill_authority))
+            if reserved_fill_authority is None else reserved_fill_authority),
+        allocation_reserved_capacity_by_accelerator=(
+            {} if allocation_reserved_capacity_by_accelerator is None else
+            allocation_reserved_capacity_by_accelerator),
+        expected_pending_zero_cost_capacity_by_accelerator=(
+            {} if expected_pending_zero_cost_capacity_by_accelerator is None
+            else expected_pending_zero_cost_capacity_by_accelerator),
+        expected_economic_capacity_graph_sha256=(
+            expected_economic_capacity_graph_sha256))
 
 
 def _replica_values(replica_id: int,
                     *,
                     zero_cost: bool,
                     accelerator: str = 'L4') -> dict:
+    info = replica_managers.ReplicaInfo(
+        replica_id=replica_id,
+        cluster_name=f'svc-{replica_id}',
+        replica_port='8000',
+        is_spot=not zero_cost,
+        location=None,
+        version=1,
+        resources_override={'accelerators': {
+            accelerator: 1,
+        }})
+    info.is_zero_cost = zero_cost
+    if not zero_cost:
+        info.paid_capacity_pool_key = 'gcp:L4'
     return {
         'service_name': 'svc',
         'replica_id': replica_id,
         'replica_state_version': 1,
-        'status': 'PENDING',
+        'status': info.status.value,
         'version': 1,
         'cluster_name': f'svc-{replica_id}',
-        'created_at': time.time(),
+        'created_at': info.created_at,
         'is_spot': not zero_cost,
-        'replica_state': {
-            'replica_info_version': 18,
-            'planned_capacity': 1,
-            'is_zero_cost': zero_cost,
-            'location': {
-                'accelerators': {
-                    accelerator: 1,
-                },
-            },
-            'resources_override': None,
-            'status_property': {
-                'is_scale_down': False,
-            },
-        },
+        'paid_capacity_pool_key': info.paid_capacity_pool_key,
+        'replica_state': info.to_storage_dict(),
     }
 
 
-def _install_waiting_kueue_capacity(engine) -> str:
-    """Install one exact fresh-waiting L4 intent for final accounting."""
+def _install_waiting_kueue_capacity(engine, *, admitted: bool = False) -> str:
+    """Install one exact waiting or policy-admitted Kueue L4 graph."""
     key = '9' * 64
     identity = kueue_lane_lineage.KueueAdmissionIdentity(
         service_name='svc',
@@ -432,16 +458,16 @@ def _install_waiting_kueue_capacity(engine) -> str:
     repository = kueue_lane_lineage.KueueAdmissionRepository(engine)
     with engine.begin() as connection:
         connection.execute(
-            sqlalchemy.insert(serve_state_schema.version_specs_table).values(
-                service_name='svc',
-                version=1,
-                yaml_content='service: {}',
-                placement_catalog={
-                    'schema_version': 1,
-                    'entries': [],
-                    'num_nodes': 1,
-                },
-                worker_placement_projections=[_CAPACITY_KUEUE_PROJECTION]))
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    yaml_content='service: {}',
+                    placement_catalog={
+                        'schema_version': 1,
+                        'entries': [],
+                        'num_nodes': 1,
+                    },
+                    worker_placement_projections=[_CAPACITY_KUEUE_PROJECTION]))
         connection.execute(
             sqlalchemy.insert(zero_cost_actuation_schema.
                               serve_zero_cost_actuation_intents_table).values(
@@ -535,24 +561,24 @@ def _install_waiting_kueue_capacity(engine) -> str:
             replica_record_id=record_id,
             provider_cluster_generation=provider_generation,
             association_id=association_id)
-        receipt = _kueue_receipt(
-            kueue_lane_lineage.KueueAdmissionState.POD_WAITING,
-            key,
-            record_id,
-            identity=identity)
-        repository.observe_pod_waiting_in_connection(
-            connection,
-            identity,
-            intent_idempotency_key=key,
-            replica_id=replica_id,
-            replica_record_id=record_id,
-            provider_cluster_generation=provider_generation,
-            association_id=association_id,
-            pod_namespace='skypilot',
-            pod_name='worker-1',
-            pod_uid='pod-uid-1',
-            pod_receipt=receipt,
-            provider_read_started_at=now)
+        state = (kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED
+                 if admitted else
+                 kueue_lane_lineage.KueueAdmissionState.POD_WAITING)
+        receipt = _kueue_receipt(state, key, record_id, identity=identity)
+        observe = (repository.observe_policy_admitted_in_connection if admitted
+                   else repository.observe_pod_waiting_in_connection)
+        observe(connection,
+                identity,
+                intent_idempotency_key=key,
+                replica_id=replica_id,
+                replica_record_id=record_id,
+                provider_cluster_generation=provider_generation,
+                association_id=association_id,
+                pod_namespace='skypilot',
+                pod_name='worker-1',
+                pod_uid='pod-uid-1',
+                pod_receipt=receipt,
+                provider_read_started_at=now)
     return key
 
 
@@ -592,16 +618,16 @@ def _install_pending_east_capacity(engine) -> str:
         }])
     with engine.begin() as connection:
         connection.execute(
-            sqlalchemy.insert(serve_state_schema.version_specs_table).values(
-                service_name='svc',
-                version=1,
-                yaml_content='service: {}',
-                placement_catalog={
-                    'schema_version': 1,
-                    'entries': [],
-                    'num_nodes': 1,
-                },
-                worker_placement_projections=[_CAPACITY_EAST_PROJECTION]))
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    yaml_content='service: {}',
+                    placement_catalog={
+                        'schema_version': 1,
+                        'entries': [],
+                        'num_nodes': 1,
+                    },
+                    worker_placement_projections=[_CAPACITY_EAST_PROJECTION]))
         connection.execute(
             sqlalchemy.insert(zero_cost_actuation_schema.
                               serve_zero_cost_actuation_intents_table).values(
@@ -614,17 +640,21 @@ def _insert_claim(engine, authority, replica_id: int) -> dict:
     claims = serve_state_schema.paid_capacity_claims_table
     pools = serve_state_schema.paid_capacity_pools_table
     with engine.begin() as connection:
+        serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+            connection)
         service = connection.execute(
             sqlalchemy.select(serve_state_schema.services_table).where(
                 serve_state_schema.services_table.c.name ==
                 'svc').with_for_update()).mappings().one()
-        capacity_admission.validate_paid_claim_in_connection(connection, {
-            **service, 'name': 'svc'
-        }, {
-            **claim,
-            'replica_id': replica_id,
-        },
-                                                             prospective=True)
+        capacity_admission.validate_paid_claim_in_connection(
+            connection, {
+                **service, 'name': 'svc'
+            }, {
+                **claim,
+                'replica_id': replica_id,
+            },
+            prospective=True,
+            protocol_and_service_prelocked=True)
         connection.execute(
             postgresql.insert(pools).values(
                 pool_key='gcp:L4',
@@ -723,7 +753,9 @@ def _allocation_identity(
 def _enable_durable_intent(engine,
                            incarnation,
                            *,
-                           reserved_fill_enabled: bool = True) -> None:
+                           reserved_fill_enabled: bool = True,
+                           max_replicas: int = 10,
+                           replica_unit: str = 'physical_backend') -> None:
     with engine.begin() as connection:
         result = connection.execute(
             sqlalchemy.update(serve_state_schema.services_table).where(
@@ -736,9 +768,12 @@ def _enable_durable_intent(engine,
         connection.execute(
             sqlalchemy.update(serve_state_schema.version_specs_table).where(
                 serve_state_schema.version_specs_table.c.service_name == 'svc',
-                serve_state_schema.version_specs_table.c.version ==
-                1).values(spec=pickle.dumps(
-                    _capacity_service_spec(reserved_fill_enabled), protocol=4)))
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    spec=pickle.dumps(_capacity_service_spec(
+                        reserved_fill_enabled,
+                        max_replicas=max_replicas,
+                        replica_unit=replica_unit),
+                                      protocol=4)))
     assert result.rowcount == 1
 
 
@@ -779,12 +814,214 @@ def _mock_current_allocation(monkeypatch,
         if callback is not None:
             callback()
         current_identity = identity() if callable(identity) else identity
+        if isinstance(current_identity,
+                      reserved_fill_planner.AuthenticatedAllocationMap):
+            return current_identity
         return types.SimpleNamespace(identity=current_identity,
                                      pool_snapshots=pool_snapshots)
 
     monkeypatch.setattr(
         serve_state.reserved_fill_allocation.ReservedFillAllocationRepository,
         'read_current_in_connection', _read_current)
+
+
+def _allocation_map(
+    free_by_accelerator: dict[str, int],
+    *,
+    accelerator_count: int = 1,
+    valid_until: float | None = None,
+) -> reserved_fill_planner.AuthenticatedAllocationMap:
+    """Build one exact fresh allocation for paid-admission contracts."""
+    cards = tuple(card.casefold() for card in free_by_accelerator)
+    pool_key = reserved_capacity_broker.make_pool_key(
+        'east',
+        cards,
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        physical_cluster_uid='cluster-east')
+    free_slots = sum(free_by_accelerator.values())
+    snapshot = reserved_fill_planner.PoolFillSnapshot.from_mapping({
+        'protocol_version': reserved_capacity_broker.PROTOCOL_V2,
+        'pool_key': pool_key,
+        'physical_cluster_uid': 'cluster-east',
+        'service_generation': 7,
+        'worker_projection_sha256_by_accelerator': {
+            card: f'{index + 1:064x}' for index, card in enumerate(cards)
+        },
+        'edge_cap': free_slots,
+        'broker_slot_width': accelerator_count,
+        'free_slots': free_slots,
+        'free_slots_by_accelerator': free_by_accelerator,
+        'grant': free_slots,
+        'grant_epoch': 11 if free_slots else None,
+        'observation_generation': 13,
+        'observation_sequence': 17,
+        'ordinary_zero_cost_admission_sequence': 17,
+        'valid_until':
+            (time.time() + 60 if valid_until is None else valid_until),
+        'zero_cost_location_keys': [{
+            'cloud': 'Kubernetes',
+            'region': 'east',
+            'zone': None,
+            'accelerators': {
+                card: accelerator_count,
+            },
+            'use_spot': False,
+            'image_id': None,
+            'container_image': None,
+            'disk_tier': None,
+            'ephemeral_storage': None,
+            'instance_type': None,
+        } for card in cards],
+    })
+    return reserved_fill_planner.AuthenticatedAllocationMap.create(
+        allocation_generation=5,
+        allocation_claim_generation=11,
+        service_version=1,
+        ordinary_zero_cost_admission_sequence_high_water=17,
+        reconciliation_gate_generation=19,
+        reclaim_fleet_bundle_sha256='a' * 64,
+        reclaim_policy_revision='test-policy',
+        reclaim_provider_inventory_sha256='b' * 64,
+        pool_snapshots=(snapshot,))
+
+
+def _insert_current_allocation_pending(
+    engine,
+    allocation: reserved_fill_planner.AuthenticatedAllocationMap,
+    *,
+    intent_key: str = 'e' * 64,
+) -> str:
+    """Insert one provider-free East intent from the exact allocation."""
+    snapshot = allocation.pool_snapshots[0]
+    card, free_slots = snapshot.free_slots_by_accelerator[0]
+    assert free_slots > 0
+    location = next(location for location in snapshot.locations
+                    if location.accelerator.casefold() == card)
+    projection_sha256 = dict(
+        snapshot.worker_projection_sha256_by_accelerator)[card]
+    valid_until = datetime.datetime.fromtimestamp(snapshot.valid_until,
+                                                  datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    values = _kueue_intent_values(intent_key)
+    values.update(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        actuation_epoch=1,
+        service_version=1,
+        controller_owner='controller-owner',
+        allocation_generation=allocation.allocation_generation,
+        allocation_input_sha256=allocation.allocation_input_sha256,
+        allocation_claim_generation=allocation.allocation_claim_generation,
+        reconciliation_gate_generation=(
+            allocation.reconciliation_gate_generation),
+        reclaim_fleet_bundle_sha256=allocation.reclaim_fleet_bundle_sha256,
+        reclaim_policy_revision=allocation.reclaim_policy_revision,
+        reclaim_provider_inventory_sha256=(
+            allocation.reclaim_provider_inventory_sha256),
+        service_generation=snapshot.service_generation,
+        pool_key=snapshot.pool_key,
+        pool_epoch=snapshot.grant_epoch,
+        physical_cluster_uid=snapshot.physical_cluster_uid,
+        kubernetes_context=location.region,
+        worker_projection_sha256=projection_sha256,
+        observation_generation=snapshot.observation_generation,
+        observation_sequence=snapshot.observation_sequence,
+        ordinary_zero_cost_admission_sequence=(
+            snapshot.ordinary_zero_cost_admission_sequence),
+        valid_until_epoch=snapshot.valid_until,
+        valid_until=valid_until,
+        accelerator=card,
+        accelerator_count=location.accelerator_count,
+        capacity_unit='physical',
+        planned_capacity=1,
+        allowed_locations=[location.to_pickleable()],
+        state='GRANTED',
+        created_at=now,
+        updated_at=now)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                zero_cost_actuation_schema.
+                serve_zero_cost_actuation_intents_table).values(**values))
+    return intent_key
+
+
+def _materialize_current_allocation_pending(engine, intent_key: str,
+                                            replica_id: int) -> None:
+    """Move one test intent atomically to a provider-possible replica row."""
+    intents = (
+        zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
+    replicas = serve_state_schema.replicas_table
+    record_id = uuid.uuid4()
+    with engine.begin() as connection:
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        for table in (intents.name, replicas.name):
+            connection.exec_driver_sql(
+                f'ALTER TABLE {table} DISABLE TRIGGER USER')
+        connection.execute(
+            sqlalchemy.update(intents).where(
+                intents.c.intent_idempotency_key == intent_key).values(
+                    state='COMMITTED',
+                    replica_id=replica_id,
+                    replica_record_id=record_id,
+                    committed_at=now,
+                    updated_at=now))
+        replica = _replica_values(replica_id,
+                                  zero_cost=True,
+                                  accelerator='H200')
+        replica['replica_state']['replica_record_id'] = str(record_id)
+        replica['reserved_fill_intent_idempotency_key'] = intent_key
+        connection.execute(sqlalchemy.insert(replicas).values(**replica))
+        for table in (intents.name, replicas.name):
+            connection.exec_driver_sql(
+                f'ALTER TABLE {table} ENABLE TRIGGER USER')
+
+
+def _allocation_bound_plan(
+    repository: capacity_admission.CapacityAdmissionRepository,
+    allocation: (reserved_fill_planner.AuthenticatedAllocationMap |
+                 reserved_fill_planner.ReservedFillAllocationIdentity),
+    capacity_target_by_accelerator: dict[str, int],
+) -> tuple[capacity_admission.CapacityPlanInput,
+           capacity_admission.ReservedSupplyProjection]:
+    """Project, then construct the optimistic plan compared at publication."""
+    identity = (allocation.identity if isinstance(
+        allocation, reserved_fill_planner.AuthenticatedAllocationMap) else
+                allocation)
+    projection = repository.project_reserved_supply(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards=capacity_target_by_accelerator,
+        authority=capacity_admission.ReservedFillPlanAuthority.bound(identity))
+    plan = _plan(
+        sum(capacity_target_by_accelerator.values()),
+        capacity_target_by_accelerator=capacity_target_by_accelerator,
+        reserved_fill_authority=(
+            capacity_admission.ReservedFillPlanAuthority.bound(identity)),
+        allocation_reserved_capacity_by_accelerator=dict(
+            projection.allocation_reserved_capacity_by_accelerator),
+        expected_pending_zero_cost_capacity_by_accelerator=dict(
+            projection.pending_zero_cost_capacity_by_accelerator),
+        expected_economic_capacity_graph_sha256=(
+            projection.economic_capacity_graph_sha256))
+    return plan, projection
+
+
+def _capacity_plan_payload(engine, generation: int) -> dict:
+    with engine.connect() as connection:
+        payload = connection.execute(
+            sqlalchemy.select(
+                capacity_admission_schema.serve_capacity_plans_table.c.payload).
+            where(
+                capacity_admission_schema.serve_capacity_plans_table.c.
+                service_name == 'svc',
+                capacity_admission_schema.serve_capacity_plans_table.c.
+                generation == generation)).scalar_one()
+    return dict(payload)
 
 
 def test_serve050_schema_and_promotion_are_explicit(capacity_database):
@@ -871,11 +1108,9 @@ def test_durable_plan_modes_are_exact(capacity_database, monkeypatch):
         connection.execute(
             sqlalchemy.insert(serve_state_schema.replicas_table).values(
                 **_replica_values(17, zero_cost=True)))
-    positive = capacity_admission.CapacityAdmissionRepository(engine).publish(
-        _plan(
-            1,
-            reserved_fill_authority=(
-                capacity_admission.ReservedFillPlanAuthority.bound(identity))))
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    positive_plan, _ = _allocation_bound_plan(repository, identity, {'l4': 1})
+    positive = repository.publish(positive_plan)
 
     assert (zero.reserved_fill_authority.mode is capacity_admission.
             ReservedFillPlanAuthorityMode.UNBOUND_ZERO_REVOCATION)
@@ -951,11 +1186,9 @@ def test_allocation_bound_paid_validation_holds_protocol_share(
             assert release_validation.wait(timeout=10)
 
     _mock_current_allocation(monkeypatch, identity, callback=_pause_validation)
-    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
-        _plan(
-            1,
-            reserved_fill_authority=(
-                capacity_admission.ReservedFillPlanAuthority.bound(identity))))
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    plan, _ = _allocation_bound_plan(repository, identity, {'l4': 1})
+    authority = repository.publish(plan)
     claim = authority.claim_values('l4')
     validation_errors: list[BaseException] = []
 
@@ -986,24 +1219,23 @@ def test_allocation_bound_paid_validation_holds_protocol_share(
 def test_delayed_allocation_validation_rechecks_final_expiry(
         capacity_database, monkeypatch):
     engine, incarnation, _ = capacity_database
-    identity = _allocation_identity()
+    allocation = _allocation_map({'H200': 1}, valid_until=time.time() + 1.5)
     _enable_durable_intent(engine, incarnation)
     delay_validation = threading.Event()
 
     def _delay_after_initial_clock():
         if delay_validation.is_set():
-            time.sleep(1.2)
+            time.sleep(1.7)
 
-    _mock_current_allocation(
-        monkeypatch,
-        identity,
-        callback=_delay_after_initial_clock,
-        pool_snapshots=(types.SimpleNamespace(valid_until=time.time() + 1),))
-    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
-        _plan(
-            1,
-            reserved_fill_authority=(
-                capacity_admission.ReservedFillPlanAuthority.bound(identity))))
+    _mock_current_allocation(monkeypatch,
+                             allocation,
+                             callback=_delay_after_initial_clock)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    plan, _ = _allocation_bound_plan(repository, allocation, {
+        'l4': 1,
+        'h200': 1,
+    })
+    authority = repository.publish(plan)
     delay_validation.set()
 
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
@@ -1019,11 +1251,9 @@ def test_allocation_successor_wins_before_paid_validation(
     current_identity = [planned_identity]
     _enable_durable_intent(engine, incarnation)
     _mock_current_allocation(monkeypatch, lambda: current_identity[0])
-    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
-        _plan(1,
-              reserved_fill_authority=(
-                  capacity_admission.ReservedFillPlanAuthority.bound(
-                      planned_identity))))
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    plan, _ = _allocation_bound_plan(repository, planned_identity, {'l4': 1})
+    authority = repository.publish(plan)
     claim = authority.claim_values('l4')
     validator_pid: list[int] = []
     pid_ready = threading.Event()
@@ -1508,6 +1738,21 @@ def test_zero_cost_commit_after_plan_revokes_paid_claim(capacity_database):
                 prospective=True)
 
 
+@pytest.mark.parametrize(('admitted', 'expected_paid'), [(False, 1), (True, 0)],
+                         ids=['pod-waiting', 'quota-assigned'])
+def test_only_quota_assigned_kueue_capacity_is_reserved_supply(
+        capacity_database, admitted, expected_paid):
+    engine, _, _ = capacity_database
+    _install_waiting_kueue_capacity(engine, admitted=admitted)
+
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+
+    assert authority.remaining() == ({
+        'l4': expected_paid
+    } if expected_paid else {})
+
+
 @pytest.mark.parametrize('provider_effect', [False, True],
                          ids=['final-claim', 'provider-effect'])
 def test_missing_kueue_admission_fails_closed_at_final_paid_boundaries(
@@ -1621,6 +1866,319 @@ def test_cross_card_reserved_capacity_satisfies_supply_aware_target(
         plan)
 
     assert authority.remaining() == {'a100': 1}
+
+
+def test_allocation_tail_satisfies_flexible_demand_before_paid_residual(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    allocation = _allocation_map({'H200': 1})
+    _enable_durable_intent(engine, incarnation)
+    _mock_current_allocation(monkeypatch, allocation)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    plan, projection = _allocation_bound_plan(repository, allocation, {
+        'l4': 0,
+        'h200': 1,
+    })
+
+    authority = repository.publish(plan)
+
+    assert projection.pending_zero_cost_capacity_by_accelerator == {
+        'h200': 0,
+        'l4': 0,
+    }
+    assert projection.allocation_reserved_capacity_by_accelerator == {
+        'h200': 1,
+        'l4': 0,
+    }
+    assert not authority.remaining()
+
+
+def test_allocation_tail_uses_logical_multi_gpu_card_width(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    allocation = _allocation_map({'H200': 2}, accelerator_count=4)
+    _enable_durable_intent(engine,
+                           incarnation,
+                           max_replicas=8,
+                           replica_unit='logical')
+    _mock_current_allocation(monkeypatch, allocation)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    plan, projection = _allocation_bound_plan(repository, allocation, {
+        'l4': 0,
+        'h200': 8,
+    })
+
+    authority = repository.publish(plan)
+
+    assert projection.allocation_reserved_capacity_by_accelerator == {
+        'h200': 8,
+        'l4': 0,
+    }
+    assert not authority.remaining()
+
+
+def test_allocation_tail_leaves_only_genuinely_uncovered_paid_residual(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    allocation = _allocation_map({'H200': 1})
+    _enable_durable_intent(engine, incarnation)
+    _mock_current_allocation(monkeypatch, allocation)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    plan, _ = _allocation_bound_plan(repository, allocation, {
+        'l4': 1,
+        'h200': 1,
+    })
+
+    authority = repository.publish(plan)
+
+    assert authority.remaining() == {'l4': 1}
+    _validate_prospective_claim(engine, authority.claim_values('l4'))
+
+
+def test_tail_to_pending_to_replica_never_double_counts_reserved_supply(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    allocation = _allocation_map({'H200': 2})
+    _enable_durable_intent(engine, incarnation)
+    _mock_current_allocation(monkeypatch, allocation)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    target = {'l4': 0, 'h200': 2}
+
+    plan, projection = _allocation_bound_plan(repository, allocation, target)
+    tail_authority = repository.publish(plan)
+    tail_payload = _capacity_plan_payload(engine, tail_authority.generation)
+    assert projection.additional_capacity_by_accelerator() == {
+        'h200': 2,
+        'l4': 0,
+    }
+
+    intent_key = _insert_current_allocation_pending(engine, allocation)
+    plan, projection = _allocation_bound_plan(repository, allocation, target)
+    pending_authority = repository.publish(plan)
+    pending_payload = _capacity_plan_payload(engine,
+                                             pending_authority.generation)
+    assert projection.pending_zero_cost_capacity_by_accelerator['h200'] == 1
+    assert projection.allocation_reserved_capacity_by_accelerator['h200'] == 1
+
+    _materialize_current_allocation_pending(engine, intent_key, 81)
+    plan, projection = _allocation_bound_plan(repository, allocation, target)
+    replica_authority = repository.publish(plan)
+    replica_payload = _capacity_plan_payload(engine,
+                                             replica_authority.generation)
+    assert projection.pending_zero_cost_capacity_by_accelerator['h200'] == 0
+    assert projection.allocation_reserved_capacity_by_accelerator['h200'] == 1
+
+    def _reserved_total(payload: dict) -> int:
+        return sum(payload[field].get('h200', 0)
+                   for field in ('existing_zero_cost_capacity_by_accelerator',
+                                 'pending_zero_cost_capacity_by_accelerator',
+                                 'allocation_reserved_capacity_by_accelerator'))
+
+    assert [
+        _reserved_total(payload)
+        for payload in (tail_payload, pending_payload, replica_payload)
+    ] == [2, 2, 2]
+    assert not tail_authority.remaining()
+    assert not pending_authority.remaining()
+    assert not replica_authority.remaining()
+
+
+def test_provider_start_rejects_tail_to_pending_inventory_change(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    allocation = _allocation_map({'H200': 1})
+    _enable_durable_intent(engine, incarnation)
+    _mock_current_allocation(monkeypatch, allocation)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    plan, _ = _allocation_bound_plan(repository, allocation, {
+        'l4': 1,
+        'h200': 1,
+    })
+    authority = repository.publish(plan)
+    claim = _insert_claim(engine, authority, 82)
+    _insert_current_allocation_pending(engine, allocation)
+
+    with engine.begin() as connection:
+        serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+            connection)
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                           match='Reserved economic supply changed'):
+            capacity_admission.validate_paid_claim_in_connection(
+                connection,
+                service,
+                claim,
+                prospective=False,
+                protocol_and_service_prelocked=True)
+
+
+def test_provider_start_accepts_plan_own_paid_replica_row(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    allocation = _allocation_map({'H200': 1})
+    _enable_durable_intent(engine, incarnation)
+    _mock_current_allocation(monkeypatch, allocation)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    plan, _ = _allocation_bound_plan(repository, allocation, {
+        'l4': 1,
+        'h200': 1,
+    })
+    authority = repository.publish(plan)
+    claim = _insert_claim(engine, authority, 84)
+
+    with engine.begin() as connection:
+        serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+            connection)
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        capacity_admission.validate_paid_claim_in_connection(
+            connection,
+            service,
+            claim,
+            prospective=False,
+            protocol_and_service_prelocked=True)
+
+
+def test_provider_start_rejects_reserved_lifecycle_change_at_same_inventory(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    allocation = _allocation_map({'H200': 1})
+    _enable_durable_intent(engine, incarnation)
+    _mock_current_allocation(monkeypatch, allocation)
+    zero_cost_replica_id = 85
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.replicas_table).values(**_replica_values(
+                    zero_cost_replica_id, zero_cost=True, accelerator='H200')))
+
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    plan, _ = _allocation_bound_plan(repository, allocation, {
+        'l4': 1,
+        'h200': 2,
+    })
+    authority = repository.publish(plan)
+    claim = _insert_claim(engine, authority, 86)
+
+    replicas = serve_state_schema.replicas_table
+    with engine.begin() as connection:
+        state = connection.execute(
+            sqlalchemy.select(replicas.c.replica_state).where(
+                replicas.c.service_name == 'svc', replicas.c.replica_id ==
+                zero_cost_replica_id).with_for_update()).scalar_one()
+        state['status_property'].update(
+            sky_launch_status=common_utils.ProcessStatus.SUCCEEDED.value,
+            service_ready_now=True,
+            first_ready_time=time.time())
+        connection.execute(
+            sqlalchemy.update(replicas).where(
+                replicas.c.service_name == 'svc',
+                replicas.c.replica_id == zero_cost_replica_id).values(
+                    status='READY', replica_state=state))
+
+    with engine.begin() as connection:
+        serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+            connection)
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                           match='Reserved economic supply changed'):
+            capacity_admission.validate_paid_claim_in_connection(
+                connection,
+                service,
+                claim,
+                prospective=False,
+                protocol_and_service_prelocked=True)
+
+
+def test_running_paid_replica_is_not_mutated_by_future_supply_change(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    allocation = _allocation_map({'H200': 1})
+    _enable_durable_intent(engine, incarnation)
+    _mock_current_allocation(monkeypatch, allocation)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    target = {'l4': 1, 'h200': 1}
+    plan, _ = _allocation_bound_plan(repository, allocation, target)
+    authority = repository.publish(plan)
+    _insert_claim(engine, authority, 83)
+    replicas = serve_state_schema.replicas_table
+    with engine.begin() as connection:
+        state = connection.execute(
+            sqlalchemy.select(replicas.c.replica_state).where(
+                replicas.c.service_name == 'svc',
+                replicas.c.replica_id == 83).with_for_update()).scalar_one()
+        state['status_property'].update(
+            sky_launch_status=common_utils.ProcessStatus.SUCCEEDED.value,
+            service_ready_now=True,
+            first_ready_time=time.time(),
+            is_scale_down=False)
+        connection.execute(
+            sqlalchemy.update(replicas).where(
+                replicas.c.service_name == 'svc',
+                replicas.c.replica_id == 83).values(status='READY',
+                                                    replica_state=state))
+
+    _insert_current_allocation_pending(engine, allocation)
+    plan, projection = _allocation_bound_plan(repository, allocation, target)
+    successor = repository.publish(plan)
+
+    assert projection.pending_zero_cost_capacity_by_accelerator['h200'] == 1
+    assert projection.allocation_reserved_capacity_by_accelerator['h200'] == 0
+    assert not successor.remaining()
+    with engine.connect() as connection:
+        retained = connection.execute(
+            sqlalchemy.select(
+                replicas.c.status, replicas.c.replica_state).where(
+                    replicas.c.service_name == 'svc',
+                    replicas.c.replica_id == 83)).mappings().one()
+        claim_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table).where(
+                    serve_state_schema.paid_capacity_claims_table.c.service_name
+                    == 'svc',
+                    serve_state_schema.paid_capacity_claims_table.c.replica_id
+                    == 83)).scalar_one()
+    assert retained['status'] == 'READY'
+    assert retained['replica_state']['status_property'][
+        'is_scale_down'] is False
+    assert claim_count == 1
+
+
+def test_full_allocation_tail_requires_rotation_independent_headroom(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    allocation = _allocation_map({'H200': 1})
+    _enable_durable_intent(engine, incarnation)
+    _mock_current_allocation(monkeypatch, allocation)
+    with engine.begin() as connection:
+        connection.execute(sqlalchemy.insert(serve_state_schema.replicas_table),
+                           [
+                               _replica_values(replica_id, zero_cost=False)
+                               for replica_id in range(200, 210)
+                           ])
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='rotation-independent service headroom'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).project_reserved_supply(
+                service_name='svc',
+                service_hash='svc-hash',
+                service_lifecycle_epoch=3,
+                service_version=1,
+                accounting_cards={
+                    'l4': 10,
+                    'h200': 0,
+                },
+                authority=capacity_admission.ReservedFillPlanAuthority.bound(
+                    allocation.identity))
 
 
 def test_zero_target_mints_revoking_semantic_generation(capacity_database):

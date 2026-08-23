@@ -394,6 +394,76 @@ def test_committed_fill_debit_prevents_same_allocation_replay() -> None:
     assert plan.intents[0].accelerator == 'a100'
 
 
+def test_remaining_capacity_projection_matches_canonical_plan_tail() -> None:
+    east = _snapshot('east-context', 'uid-east', {'a100': 2})
+    west = _snapshot('west-context', 'uid-west', {'h200': 1})
+    allocation = reserved_fill_planner.AuthenticatedAllocationMap.create(
+        allocation_generation=5,
+        allocation_claim_generation=11,
+        service_version=_SERVICE_VERSION,
+        ordinary_zero_cost_admission_sequence_high_water=(
+            east.ordinary_zero_cost_admission_sequence),
+        reconciliation_gate_generation=_RECONCILIATION_GATE_GENERATION,
+        reclaim_fleet_bundle_sha256=_RECLAIM_FLEET_BUNDLE_SHA256,
+        reclaim_policy_revision=_RECLAIM_POLICY_REVISION,
+        reclaim_provider_inventory_sha256=(_RECLAIM_PROVIDER_INVENTORY_SHA256),
+        pool_snapshots=(east, west))
+    debit = reserved_fill_planner.CommittedFillDebit(
+        allocation_generation=allocation.allocation_generation,
+        allocation_input_sha256=allocation.allocation_input_sha256,
+        allocation_claim_generation=allocation.allocation_claim_generation,
+        pool_key=east.pool_key,
+        accelerator='a100',
+        replica_slots=1)
+
+    projection = (reserved_fill_planner.ReservedFillPlanner.
+                  project_remaining_capacity_by_accelerator(
+                      allocation_map=allocation,
+                      max_replicas=3,
+                      planned_replicas=1,
+                      capacity_unit=(
+                          reserved_fill_planner.FillCapacityUnit.PHYSICAL),
+                      committed_fill_debits=(debit,)))
+
+    assert projection == {'a100': 1, 'h200': 1}
+
+
+def test_remaining_capacity_projection_preserves_logical_multi_gpu_width(
+) -> None:
+    snapshot = _snapshot('east-context',
+                         'uid-east', {'h200': 2},
+                         accelerator_count=4)
+    allocation = reserved_fill_planner.AuthenticatedAllocationMap.create(
+        allocation_generation=5,
+        allocation_claim_generation=11,
+        service_version=_SERVICE_VERSION,
+        ordinary_zero_cost_admission_sequence_high_water=(
+            snapshot.ordinary_zero_cost_admission_sequence),
+        reconciliation_gate_generation=_RECONCILIATION_GATE_GENERATION,
+        reclaim_fleet_bundle_sha256=_RECLAIM_FLEET_BUNDLE_SHA256,
+        reclaim_policy_revision=_RECLAIM_POLICY_REVISION,
+        reclaim_provider_inventory_sha256=(_RECLAIM_PROVIDER_INVENTORY_SHA256),
+        pool_snapshots=(snapshot,))
+    debit = reserved_fill_planner.CommittedFillDebit(
+        allocation_generation=allocation.allocation_generation,
+        allocation_input_sha256=allocation.allocation_input_sha256,
+        allocation_claim_generation=allocation.allocation_claim_generation,
+        pool_key=snapshot.pool_key,
+        accelerator='h200',
+        replica_slots=1)
+
+    projection = (reserved_fill_planner.ReservedFillPlanner.
+                  project_remaining_capacity_by_accelerator(
+                      allocation_map=allocation,
+                      max_replicas=12,
+                      planned_replicas=4,
+                      capacity_unit=(
+                          reserved_fill_planner.FillCapacityUnit.LOGICAL),
+                      committed_fill_debits=(debit,)))
+
+    assert projection == {'h200': 4}
+
+
 def test_committed_fill_debits_require_exact_allocation_and_unique_card(
 ) -> None:
     east = _snapshot('east-context', 'uid-east', {'a100': 2})

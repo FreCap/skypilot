@@ -9,6 +9,7 @@ from unittest import mock
 from sky.serve import autoscalers
 from sky.serve import constants
 from sky.serve import controller as serve_controller
+from sky.serve import kueue_lane_capacity
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -1577,6 +1578,22 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
                          {'L4': 1})
 
+    def test_qps_economic_target_is_not_work_conserving_across_cards(self):
+        autoscaler = self._autoscaler(max_replicas=2)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        now = time.time()
+        autoscaler.compatibility_profiles = self._profiles(50, ['L4', 'A100'],
+                                                           count=120)
+        autoscaler.request_timestamps = [now] * 120
+        autoscaler._compatibility_demand_complete = True
+        autoscaler._set_target_num_replicas_with_instance_aware_logic([])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 2})
+        self.assertIsNone(
+            autoscaler.economic_capacity_target_by_accelerator([], {'a100': 1}))
+        self.assertFalse(autoscaler.supports_reserved_supply_economic_target())
+
     def test_qps_shape_preload_does_not_hold_demand_state_lock(self):
         autoscaler = self._autoscaler(max_replicas=1)
         preload_started = threading.Event()
@@ -2097,6 +2114,26 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         self.assertEqual(decisions[0].operator,
                          autoscalers.AutoscalerDecisionOperator.SCALE_DOWN)
         self.assertEqual(decisions[0].target, 1)
+
+    def test_fresh_waiting_kueue_replica_does_not_cover_qps_target(self):
+        autoscaler = self._autoscaler(max_replicas=1)
+        autoscaler.set_configured_accelerator_shapes({'A100': 1})
+        autoscaler.compatibility_profiles = self._profiles(50, ['A100'])
+        autoscaler._compatibility_demand_complete = True
+        waiting = self._replica(1, 'A100', ready=False, zero_cost=True)
+        autoscaler._kueue_capacity_by_replica_id_for_tick = {
+            1: kueue_lane_capacity.KueueReplicaCapacityClass.FRESH_WAITING,
+        }
+
+        autoscaler._set_target_num_replicas_with_instance_aware_logic([waiting])
+        decisions = autoscaler._generate_scaling_decisions([waiting])
+
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'A100': 1})
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].operator,
+                         autoscalers.AutoscalerDecisionOperator.SCALE_UP)
+        self.assertEqual(decisions[0].target, {'accelerators': {'A100': 1}})
 
     def test_per_card_floor_is_independent_from_aggregate_floor(self):
         autoscaler = self._autoscaler(max_replicas=3,

@@ -622,6 +622,8 @@ class SkyServeController:
                     self._read_scale_reconcile_recovery_generation),
                 max_idle_seconds=(
                     scale_reconciliation.DEFAULT_MAX_IDLE_SECONDS)))
+        self._replica_manager.set_scale_reconcile_notifier(
+            self._notify_scale_reconcile)
         self._reserved_fill_observation_repository: (
             pool_capacity_observation.PoolCapacityObservationRepository |
             None) = None
@@ -6122,6 +6124,61 @@ class SkyServeController:
             reserved_fill_authority = (
                 capacity_admission.ReservedFillPlanAuthority.bound(
                     reserved_fill_allocation_map.identity))
+        supply_projection = None
+        repository = capacity_admission.CapacityAdmissionRepository()
+        if (reserved_fill_authority.mode is capacity_admission.
+                ReservedFillPlanAuthorityMode.ALLOCATION_BOUND):
+            if not decision_autoscaler.supports_reserved_supply_economic_target(
+            ):
+                logger.warning(
+                    'Suppressing paid launch because this autoscaler has no '
+                    'work-conserving reserved-supply economic target.')
+                return None
+            try:
+                supply_projection = repository.project_reserved_supply(
+                    service_name=self._service_name,
+                    service_hash=snapshot.service_hash,
+                    service_lifecycle_epoch=binding.service_lifecycle_epoch,
+                    service_version=decision_version,
+                    accounting_cards=capacity_target,
+                    authority=reserved_fill_authority)
+                economic_target = (
+                    decision_autoscaler.economic_capacity_target_by_accelerator(
+                        list(supply_projection.economic_replica_infos),
+                        supply_projection.additional_capacity_by_accelerator(),
+                        kueue_capacity_by_replica_id=(
+                            supply_projection.
+                            economic_kueue_capacity_by_replica_id)))
+            except (capacity_admission.CapacityAdmissionError,
+                    ValueError) as error:
+                logger.warning('Suppressing paid launch because compatible '
+                               'reserved supply could not be projected: '
+                               f'{common_utils.format_exception(error)}')
+                return None
+            if not isinstance(economic_target, dict):
+                logger.warning('Suppressing paid launch because the '
+                               'autoscaler has no compatibility-safe economic '
+                               'target.')
+                return None
+            canonical_economic: dict[str, int] = {}
+            for raw_card, count in economic_target.items():
+                card = str(raw_card).casefold()
+                if (card in canonical_economic or card not in capacity_target or
+                        not isinstance(count, int) or isinstance(count, bool) or
+                        count < 0):
+                    logger.warning('Suppressing paid launch because the '
+                                   'economic target is malformed.')
+                    return None
+                canonical_economic[card] = count
+            canonical_economic = {
+                card: canonical_economic.get(card, 0) for card in capacity_target
+            }
+            if sum(canonical_economic.values()) != sum(
+                    capacity_target.values()):
+                logger.warning('Suppressing paid launch because compatible '
+                               'economic placement changed aggregate demand.')
+                return None
+            capacity_target = canonical_economic
         plan = capacity_admission.CapacityPlanInput(
             service_name=self._service_name,
             service_hash=snapshot.service_hash,
@@ -6135,10 +6192,18 @@ class SkyServeController:
             route_source_epoch=snapshot.route_source_epoch,
             normalized_demand=normalized_demand,
             capacity_target_by_accelerator=capacity_target,
-            reserved_fill_authority=reserved_fill_authority)
+            reserved_fill_authority=reserved_fill_authority,
+            allocation_reserved_capacity_by_accelerator=(
+                {} if supply_projection is None else
+                supply_projection.allocation_reserved_capacity_by_accelerator),
+            expected_pending_zero_cost_capacity_by_accelerator=(
+                {} if supply_projection is None else
+                supply_projection.pending_zero_cost_capacity_by_accelerator),
+            expected_economic_capacity_graph_sha256=(
+                None if supply_projection is None else
+                supply_projection.economic_capacity_graph_sha256))
         try:
-            return capacity_admission.CapacityAdmissionRepository().publish(
-                plan)
+            return repository.publish(plan)
         except (capacity_admission.CapacityAdmissionError, ValueError) as error:
             logger.warning('Suppressing paid launch because ordered capacity '
                            'authority could not be published: '

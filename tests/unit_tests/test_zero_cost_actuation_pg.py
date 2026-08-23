@@ -170,6 +170,75 @@ def _plan(
         capacity_unit=capacity_unit)
 
 
+def _multi_pool_plan(
+    *,
+    free_slots: int,
+    reconcile_generation: int = 3,
+    allocation_generation: int = 5,
+    valid_until: float | None = None,
+) -> reserved_fill_planner.FillPlan:
+    if valid_until is None:
+        valid_until = time.time() + 60
+    snapshots = []
+    for context, physical_uid, kueue in (('phx', 'uid-phx', True),
+                                         ('east', 'uid-east', False)):
+        projection = _worker_projection(context, 1, kueue=kueue)
+        location = spot_placer.Location(cloud=clouds.Kubernetes(),
+                                        region=context,
+                                        zone=None,
+                                        accelerators={'L4': 1},
+                                        use_spot=False)
+        pool_key = reserved_capacity_broker.make_pool_key(
+            context,
+            'L4',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid=physical_uid)
+        snapshots.append(
+            reserved_fill_planner.PoolFillSnapshot.from_mapping({
+                'protocol_version': reserved_capacity_broker.PROTOCOL_V2,
+                'pool_key': pool_key,
+                'physical_cluster_uid': physical_uid,
+                'service_generation': 7,
+                'worker_projection_sha256_by_accelerator': {
+                    'l4': kubernetes_identity.worker_projection_sha256(
+                        projection),
+                },
+                'edge_cap': free_slots,
+                'broker_slot_width': 1,
+                'free_slots': free_slots,
+                'free_slots_by_accelerator': {
+                    'l4': free_slots,
+                },
+                'grant': free_slots,
+                'grant_epoch': 23,
+                'observation_generation': 13,
+                'observation_sequence': 17,
+                'ordinary_zero_cost_admission_sequence': 17,
+                'valid_until': valid_until,
+                'zero_cost_location_keys': [location.to_pickleable()],
+            }))
+    allocation = reserved_fill_planner.AuthenticatedAllocationMap.create(
+        allocation_generation=allocation_generation,
+        allocation_claim_generation=11,
+        service_version=19,
+        ordinary_zero_cost_admission_sequence_high_water=17,
+        reconciliation_gate_generation=1,
+        reclaim_fleet_bundle_sha256='c' * 64,
+        reclaim_policy_revision='reclaim-v1',
+        reclaim_provider_inventory_sha256='d' * 64,
+        pool_snapshots=tuple(snapshots))
+    return reserved_fill_planner.ReservedFillPlanner.plan(
+        policy_revision=2,
+        reconcile_generation=reconcile_generation,
+        allocation_map=allocation,
+        service_incarnation=_SERVICE_HASH,
+        service_version=19,
+        controller_owner=_OWNER,
+        max_replicas=2 * free_slots,
+        planned_replicas=0,
+        capacity_unit=reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+
+
 @pytest.mark.parametrize(('context', 'kueue'), [('phx', True), ('east', False)])
 def test_locked_teardown_decodes_exact_n_minus_one_without_fresh_authority(
         monkeypatch, context, kueue):
@@ -492,7 +561,7 @@ def test_grant_is_idempotent_and_allocates_no_replica(
     assert replica_count == 0
 
 
-def test_kueue_grant_accepts_full_authenticated_same_domain_batch(
+def test_kueue_grant_accepts_one_bounded_pool_window(
         actuation_database) -> None:
     config = migration_utils.get_alembic_config(actuation_database,
                                                 migration_utils.SERVE_DB_NAME)
@@ -508,8 +577,11 @@ def test_kueue_grant_accepts_full_authenticated_same_domain_batch(
     replay = _grant_plan(repository, plan, max_capacity=90)
 
     assert [item.intent_idempotency_key for item in first.accepted
-           ] == [intent.idempotency_key for intent in plan.intents]
-    assert not first.deferred
+           ] == [intent.idempotency_key for intent in plan.intents[:32]]
+    assert len(first.deferred) == 58
+    assert {item.reason for item in first.deferred} == {
+        reserved_fill_planner.DeferredFillReason.ACTUATION_WINDOW_FULL
+    }
     assert replay == first
     with actuation_database.connect() as connection:
         intent_rows = connection.execute(
@@ -519,11 +591,169 @@ def test_kueue_grant_accepts_full_authenticated_same_domain_batch(
         lane_rows = connection.execute(
             sqlalchemy.select(kueue_lane_lineage_schema.
                               serve_kueue_admissions_table)).mappings().all()
-    assert len(intent_rows) == 90
-    assert len(lane_rows) == 90
+    assert len(intent_rows) == 32
+    assert len(lane_rows) == 32
     assert {row['intent_idempotency_key'] for row in lane_rows
-           } == {intent.idempotency_key for intent in plan.intents}
+           } == {intent.idempotency_key for intent in plan.intents[:32]}
     assert {row['state'] for row in lane_rows} == {'INTENT_PENDING'}
+
+
+def test_blocked_pool_cannot_consume_another_pool_window(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    deadline = time.time() + 60
+    plan = _multi_pool_plan(free_slots=80, valid_until=deadline)
+    receipt = _grant_plan(repository, plan, max_capacity=160)
+    assert len(receipt.accepted) == 64
+    assert len(receipt.deferred) == 96
+    accepted_by_context = {
+        context: sum(1 for accepted in receipt.accepted if next(
+            intent for intent in plan.intents
+            if intent.idempotency_key == accepted.intent_idempotency_key
+        ).allowed_locations[0].region == context) for context in ('phx', 'east')
+    }
+    assert accepted_by_context == {'phx': 32, 'east': 32}
+    east_pool = next(intent.pool_key
+                     for intent in plan.intents
+                     if intent.allowed_locations[0].region == 'east')
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+
+    for reconcile_generation in (4, 5):
+        with actuation_database.begin() as connection:
+            now = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.clock_timestamp())).scalar_one()
+            connection.execute(
+                sqlalchemy.update(intents).where(
+                    intents.c.pool_key == east_pool,
+                    intents.c.state.in_(
+                        ('GRANTED', 'ACTUATING',
+                         'RETRYABLE'))).values(state='TERMINAL',
+                                               lease_owner=None,
+                                               lease_expires_at=None,
+                                               last_error='test_east_drained',
+                                               updated_at=now,
+                                               terminal_at=now))
+        successor = _multi_pool_plan(free_slots=80,
+                                     reconcile_generation=reconcile_generation,
+                                     valid_until=deadline)
+        refill = _grant_plan(repository, successor, max_capacity=160)
+        accepted_contexts = [
+            next(intent
+                 for intent in successor.intents
+                 if intent.idempotency_key ==
+                 item.intent_idempotency_key).allowed_locations[0].region
+            for item in refill.accepted
+        ]
+        assert accepted_contexts == ['east'] * 32
+        assert len(refill.deferred) == 128
+
+    with actuation_database.connect() as connection:
+        live_by_pool = dict(
+            connection.execute(
+                sqlalchemy.select(
+                    intents.c.pool_key, sqlalchemy.func.count()).where(
+                        intents.c.state.in_(
+                            ('GRANTED', 'ACTUATING',
+                             'RETRYABLE'))).group_by(intents.c.pool_key)).all())
+    assert sorted(live_by_pool.values()) == [32, 32]
+
+
+def test_successor_allocation_preserves_live_actuation_and_refills_after_release(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    deadline = time.time() + 60
+    predecessor = _multi_pool_plan(free_slots=40, valid_until=deadline)
+    first = _grant_plan(repository, predecessor, max_capacity=80)
+    assert len(first.accepted) == 64
+    accepted_keys = {item.intent_idempotency_key for item in first.accepted}
+    accepted_intents = tuple(intent for intent in predecessor.intents
+                             if intent.idempotency_key in accepted_keys)
+    _install_fresh_provider_proofs(actuation_database, accepted_intents)
+    phx_pool = next(intent.pool_key
+                    for intent in predecessor.intents
+                    if intent.allowed_locations[0].region == 'phx')
+    lease = repository.lease_next(service_name='svc',
+                                  pool_key=phx_pool,
+                                  owner=uuid.uuid4(),
+                                  lease_seconds=30)
+    assert lease is not None
+
+    successor = _multi_pool_plan(free_slots=40,
+                                 allocation_generation=6,
+                                 valid_until=deadline)
+    second = _grant_plan(repository, successor, max_capacity=80)
+    # The old live lease remains authoritative while provider preflight may be
+    # in progress and consumes one PHX window slot.  The successor may replace
+    # only the other provider-free rows, so it cannot duplicate that work.
+    assert len(second.accepted) == 63
+    assert len(second.deferred) == 17
+
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    with actuation_database.connect() as connection:
+        rows = connection.execute(
+            sqlalchemy.select(intents.c.intent_idempotency_key,
+                              intents.c.allocation_generation, intents.c.state,
+                              intents.c.lease_owner, intents.c.lease_generation,
+                              intents.c.lease_expires_at,
+                              intents.c.last_error)).all()
+        lane_generations = set(
+            connection.execute(
+                sqlalchemy.select(
+                    admissions.c.intent_idempotency_key)).scalars())
+    predecessor_rows = [row for row in rows if row.allocation_generation == 5]
+    assert predecessor_rows
+    actuating_rows = [
+        row for row in predecessor_rows if row.state == 'ACTUATING'
+    ]
+    assert len(actuating_rows) == 1
+    assert actuating_rows[0].intent_idempotency_key == (
+        lease.intent.idempotency_key)
+    assert actuating_rows[0].lease_owner == lease.owner
+    assert actuating_rows[0].lease_generation == lease.generation
+    assert actuating_rows[0].lease_expires_at == lease.expires_at
+    assert actuating_rows[0].last_error is None
+    assert {row.state for row in predecessor_rows} == {'ACTUATING', 'TERMINAL'}
+    assert {
+        row.last_error for row in predecessor_rows if row.state == 'TERMINAL'
+    } == {'allocation_superseded'}
+    successor_by_key = {
+        intent.idempotency_key: intent for intent in successor.intents
+    }
+    expected_lane_keys = {
+        item.intent_idempotency_key
+        for item in second.accepted
+        if successor_by_key[
+            item.intent_idempotency_key].allowed_locations[0].region == 'phx'
+    }
+    assert lane_generations == expected_lane_keys | {
+        lease.intent.idempotency_key
+    }
+
+    # Once the exact owner settles its pre-provider failure, the obsolete row
+    # is provider-free RETRYABLE.  A replay can retire it and fill the last
+    # successor slot without ever exceeding the per-pool window.
+    assert repository.release_retryable(lease, 'test_preflight_cancelled')
+    third = _grant_plan(repository, successor, max_capacity=80)
+    assert len(third.accepted) == 64
+    assert len(third.deferred) == 16
+    with actuation_database.connect() as connection:
+        old = connection.execute(
+            sqlalchemy.select(intents.c.state, intents.c.last_error).where(
+                intents.c.intent_idempotency_key ==
+                lease.intent.idempotency_key)).one()
+        live_by_pool = dict(
+            connection.execute(
+                sqlalchemy.select(
+                    intents.c.pool_key, sqlalchemy.func.count()).where(
+                        intents.c.state.in_(
+                            ('GRANTED', 'ACTUATING',
+                             'RETRYABLE'))).group_by(intents.c.pool_key)).all())
+    assert old == ('TERMINAL', 'allocation_superseded')
+    assert sorted(live_by_pool.values()) == [32, 32]
 
 
 @pytest.mark.parametrize(('kueue', 'expected_result'), [
@@ -620,7 +850,7 @@ def test_stale_version_precedes_older_kueue_admission_hold(
     assert candidate is None
 
 
-def test_kueue_same_domain_batch_leases_in_three_bounded_waves(
+def test_kueue_same_domain_window_matches_one_lease_wave(
         actuation_database) -> None:
     config = migration_utils.get_alembic_config(actuation_database,
                                                 migration_utils.SERVE_DB_NAME)
@@ -631,7 +861,9 @@ def test_kueue_same_domain_batch_leases_in_three_bounded_waves(
                  context='phx',
                  physical_uid='uid-phx',
                  kueue=True)
-    assert len(_grant_plan(repository, plan, max_capacity=90).accepted) == 90
+    receipt = _grant_plan(repository, plan, max_capacity=90)
+    assert len(receipt.accepted) == 32
+    assert len(receipt.deferred) == 58
     assert not repository.actionable_pool_keys(service_name='svc')
     assert not repository.lease_batch(service_name='svc',
                                       pool_key=plan.intents[0].pool_key,
@@ -648,23 +880,21 @@ def test_kueue_same_domain_batch_leases_in_three_bounded_waves(
                 sqlalchemy.select(
                     kueue_lane_lineage_schema.serve_kueue_admissions_table.c.
                     state)).scalars()) == {'INTENT_PENDING'}
-    _install_fresh_provider_proofs(actuation_database, plan.intents)
+    _install_fresh_provider_proofs(actuation_database, plan.intents[:32])
     assert repository.actionable_pool_keys(
         service_name='svc') == (plan.intents[0].pool_key,)
     owner = uuid.uuid4()
 
-    waves = tuple(
-        repository.lease_batch(service_name='svc',
-                               pool_key=plan.intents[0].pool_key,
-                               owner=owner,
-                               lease_seconds=30) for _ in range(3))
+    leases = repository.lease_batch(service_name='svc',
+                                    pool_key=plan.intents[0].pool_key,
+                                    owner=owner,
+                                    lease_seconds=30)
 
-    assert tuple(len(wave) for wave in waves) == (32, 32, 26)
-    leases = tuple(lease for wave in waves for lease in wave)
-    assert len({lease.intent.idempotency_key for lease in leases}) == 90
+    assert len(leases) == 32
+    assert len({lease.intent.idempotency_key for lease in leases}) == 32
     assert {lease.generation for lease in leases} == {1}
     assert [lease.intent.idempotency_key for lease in leases
-           ] == sorted(intent.idempotency_key for intent in plan.intents)
+           ] == sorted(intent.idempotency_key for intent in plan.intents[:32])
     assert not repository.lease_batch(service_name='svc',
                                       pool_key=plan.intents[0].pool_key,
                                       owner=owner,
@@ -1523,7 +1753,7 @@ def test_logical_capacity_rejects_noncanonical_replica_state_version(
 
     with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict,
                        match='replica state is malformed'):
-        zero_cost_actuation._replica_capacity_for_unit(
+        zero_cost_actuation.replica_capacity_for_unit(
             storage_version, state,
             reserved_fill_planner.FillCapacityUnit.LOGICAL)
 
