@@ -248,6 +248,14 @@ def get_service_schema():
                         'type': 'integer',
                         'minimum': 0,
                     },
+                    # Hard service-wide bound on cleanup-unproven paid GPU
+                    # units for the logical-per-GPU placer. Zero is the
+                    # reservation-only qualification mode; omission preserves
+                    # unlimited legacy behavior.
+                    'max_live_paid_gpu_units': {
+                        'type': 'integer',
+                        'minimum': 0,
+                    },
                     'num_overprovision': {
                         'type': 'integer',
                         'minimum': 0,

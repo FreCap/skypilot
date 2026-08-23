@@ -1026,6 +1026,7 @@ def _make_update_controller() -> controller.SkyServeController:
     ctrl._service_hash = 'incarnation-a'  # pylint: disable=protected-access
     ctrl._controller_owner = (123, '10.0.0.1')  # pylint: disable=protected-access
     ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+    ctrl._replica_manager.max_live_paid_gpu_units = None  # pylint: disable=protected-access
     ctrl._update_condition = threading.Condition()  # pylint: disable=protected-access
     ctrl._pending_update = None  # pylint: disable=protected-access
     ctrl._applying_update = None  # pylint: disable=protected-access
@@ -1339,7 +1340,8 @@ def test_placement_route_opt_in_includes_paid_admission(monkeypatch):
                                          existing_replica_infos=replicas,
                                          globally_managed=True,
                                          service_name='svc',
-                                         service_hash='incarnation-a')
+                                         service_hash='incarnation-a',
+                                         max_live_paid_gpu_units=None)
     admission_snapshot.assert_called_once_with(budget)
 
 

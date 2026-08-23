@@ -5665,6 +5665,41 @@ def _replica_has_zero_cost_authority(
         any(state.get(field) is not None for field in authority_fields))
 
 
+def _current_max_live_paid_gpu_units_in_session(
+    session: orm.Session,
+    service_name: str,
+    current_version: int,
+) -> tuple[bool, int | None]:
+    """Read the elected paid cap while the parent service row is locked."""
+    row = session.execute(
+        sqlalchemy.select(version_specs_table.c.spec).where(
+            version_specs_table.c.service_name == service_name,
+            version_specs_table.c.version == current_version,
+            version_specs_table.c.yaml_content.isnot(None),
+            version_specs_table.c.quarantined_at.is_(None),
+            version_specs_table.c.retired_at.is_(None)).with_for_update(
+                read=True)).one_or_none()
+    if row is None:
+        return False, None
+    serialized_spec = row[0]
+    if isinstance(serialized_spec, memoryview):
+        serialized_spec = serialized_spec.tobytes()
+    if not isinstance(serialized_spec, bytes):
+        return False, None
+    try:
+        spec = pickle.loads(serialized_spec)
+        cap = spec.max_live_paid_gpu_units
+        placer = spec.spot_placer
+    except Exception:  # pylint: disable=broad-except
+        return False, None
+    if cap is None:
+        return True, None
+    if (type(cap) is not int or  # pylint: disable=unidiomatic-typecheck
+            cap < 0 or placer != placement_policy.CAPACITY_AWARE_SPOT_PLACER):
+        return False, None
+    return True, cap
+
+
 def try_add_replica_with_paid_capacity_claim(
     service_name: str,
     service_hash: str,
@@ -5676,6 +5711,7 @@ def try_add_replica_with_paid_capacity_claim(
     base_limit: int,
     max_limit: int,
     service_limit: int | None = None,
+    max_live_paid_gpu_units: int | None = None,
     now: float | None,
     success_ttl_seconds: float,
     failure_cooldown_seconds: float = 10 * 60,
@@ -5694,6 +5730,11 @@ def try_add_replica_with_paid_capacity_claim(
                          'the paid-capacity claim path.')
     transaction_replica_info = copy.deepcopy(replica_info)
     engine = _db_manager.get_engine()
+    if (max_live_paid_gpu_units is not None and
+        (isinstance(max_live_paid_gpu_units, bool) or
+         not isinstance(max_live_paid_gpu_units, int) or
+         max_live_paid_gpu_units < 0)):
+        raise ValueError('max_live_paid_gpu_units must be an integer >= 0.')
     reconcile_waiters = False
     with orm.Session(engine) as session:
         # A planner-bound claim may carry reserved-fill allocation authority.
@@ -5701,13 +5742,32 @@ def try_add_replica_with_paid_capacity_claim(
         # admission composes with allocation writers in canonical order.
         lock_zero_cost_protocol_for_bound_launch_observation(
             session.connection())
-        if not _lock_service_owner_in_session(session,
-                                              service_name,
-                                              service_hash,
-                                              expected_controller_owner,
-                                              require_launch_allowed=True):
+        locked_service = _lock_service_owner_row_in_session(
+            session,
+            service_name,
+            service_hash,
+            expected_controller_owner,
+            require_launch_allowed=True)
+        if locked_service is None:
             session.rollback()
             return 'ownership_lost'
+        cap_readable, authoritative_paid_gpu_cap = (
+            _current_max_live_paid_gpu_units_in_session(
+                session, service_name, locked_service.current_version))
+        if not cap_readable:
+            # Production services always have one committed elected spec. A
+            # missing or malformed row cannot prove that paid launch is safe.
+            session.rollback()
+            return 'service_saturated'
+        # The caller's value is an advisory fast-path only. Re-read the elected
+        # immutable policy under the same service lock that serializes replica
+        # admission, so an in-flight old-version manager cannot weaken a cap
+        # that a service update has already committed.
+        max_live_paid_gpu_units = authoritative_paid_gpu_cap
+        if (max_live_paid_gpu_units is not None and engine.dialect.name
+                != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+            session.rollback()
+            return 'service_saturated'
         if service_limit is not None and service_limit <= 0:
             raise ValueError('Paid-capacity service limit must be positive.')
         if frontier_limit is not None and frontier_limit <= 0:
@@ -5739,6 +5799,49 @@ def try_add_replica_with_paid_capacity_claim(
             raise ValueError(
                 'A paid-capacity replica claim cannot move between exact '
                 'provider pools during a recovery re-drive.')
+        if (max_live_paid_gpu_units is not None and
+                not is_existing_service_claim):
+            incoming_paid_gpu_units = getattr(replica_info, 'planned_capacity',
+                                              None)
+            if (type(incoming_paid_gpu_units) is not int or  # pylint: disable=unidiomatic-typecheck
+                    incoming_paid_gpu_units < 1):
+                raise ValueError(
+                    'Paid replica planned_capacity must be a positive '
+                    'integer GPU width.')
+            # Read JSON under the already-held service lock and apply the
+            # exact conservative predicate in Python. PostgreSQL JSON casts
+            # would reject malformed retained values (for example a legacy
+            # string or object), but every value other than literal ``true``
+            # must debit the paid cap rather than fail open or abort admission.
+            live_paid_rows = session.execute(
+                sqlalchemy.select(
+                    replicas_table.c.replica_state,
+                    replicas_table.c.sky_down_status).where(
+                        replicas_table.c.service_name == service_name)).all()
+            live_paid_gpu_units = 0
+            for replica_state, sky_down_status in live_paid_rows:
+                is_paid = (not isinstance(replica_state, Mapping) or
+                           replica_state.get('is_zero_cost') is not True)
+                if (not is_paid or sky_down_status
+                        == common_utils.ProcessStatus.SUCCEEDED.value):
+                    continue
+                planned_capacity = (replica_state.get('planned_capacity')
+                                    if isinstance(replica_state, Mapping) else
+                                    None)
+                if (type(planned_capacity) is not int or  # pylint: disable=unidiomatic-typecheck
+                        planned_capacity < 1):
+                    planned_capacity = 1
+                live_paid_gpu_units += planned_capacity
+            if (live_paid_gpu_units + incoming_paid_gpu_units
+                    > max_live_paid_gpu_units):
+                # The service row is the admission lock, so this count and a
+                # subsequent replica+claim insert are one serialized decision.
+                # Cleanup-unproven rows retain their debit even after their
+                # transient paid claim has resolved.
+                _withdraw_all_paid_capacity_waiters_in_session(
+                    session, service_name, service_hash)
+                session.commit()
+                return 'service_saturated'
         frontier_owned_pool_keys: set[str] | None = None
         if (service_limit is not None and
                 len(service_claims) >= service_limit and

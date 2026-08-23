@@ -15151,6 +15151,7 @@ class TestPaidLocationLaunchBudget:
         manager.yaml_content = 'resources:\n  use_spot: true\n'
         manager.latest_version = 1
         manager._version_specs = {1: mock.Mock()}
+        manager._version_specs[1].max_live_paid_gpu_units = None
         manager._launch_thread_pool = thread_utils.ThreadSafeDict()
         manager._replica_to_request_id = thread_utils.ThreadSafeDict()
         manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()

@@ -1,6 +1,6 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-23 23:04 UTC
+Last updated: 2026-08-23 23:43 UTC
 
 Status: **reserved-capacity convergence is production-complete; request-level
 qualification remains open.** PR #1686 merged and release `1.1.1456` proved
@@ -62,6 +62,52 @@ replica placement, Kueue object, provider resource, database schema, storage,
 or service-version safety fence; recovery-capable replicas and genuinely
 changed runtime tasks retain their existing replacement behavior. Focused
 tests must cover omitted, null, empty, and nonempty mounts before deployment.
+
+Paid residual activation for the placer-backed fleet also needs one durable
+service-owned safety control, not another deployment-specific environment
+profile. An optional
+`replica_policy.max_live_paid_gpu_units` integer limits cleanup-unproven paid
+GPU capacity for one logical-per-GPU service. It is valid only with
+`spot_placer: dynamic_fallback_per_gpu`, whose persisted `planned_capacity` is
+the exact whole-GPU width of the selected backend. The value must be at least
+zero; omission means unlimited for compatibility. Phase A sets the value to
+zero, proving the complete reservation-aware path and request load without
+buying capacity. A later explicitly reviewed phase may raise it to a disclosed
+GPU-unit bound for genuinely uncovered Spot demand. Because this is a
+service-policy field, the unchanged-runtime relabel contract above applies and
+changing only the cap must not roll compatible replicas.
+
+The cap is intentionally stricter than the existing unresolved-launch window.
+A row contributes its positive integer `planned_capacity` whenever its
+persisted `is_zero_cost` value is not exactly true and its durable
+`sky_down_status` is distinct from `SUCCEEDED`; malformed or missing retained
+widths conservatively contribute at least one unit. READY, failed, ambiguous,
+and shutting-down rows therefore keep their debit until teardown has durably
+succeeded; deleting a transient paid claim or marking a row terminal cannot
+release cost authority. The advisory launch budget applies the same predicate
+to its replica snapshot, but the sole authority is the PostgreSQL transaction
+that locks the service incarnation, reloads the elected immutable spec instead
+of trusting the controller's advisory value, recounts those rows, and admits
+only when the live sum plus the incoming row's exact `planned_capacity` does
+not exceed the cap, atomically with the new replica and paid claim. This also
+fences an in-flight old-version manager after a committed cap reduction.
+Concurrent admissions cannot exceed the cap, including heterogeneous
+multi-GPU backends. Exact replay of an already durable claim remains allowed
+even at or above the limit, while a new claim is rejected. If shared
+PostgreSQL authority is unavailable and the cap is configured, paid selection
+fails closed and must never enter the legacy-local window.
+
+This placer-backed control reuses the existing service-spec pickle, replica
+JSON/scalar projection, service-row lock, and paid claim transaction. It adds
+no table, migration, EFS state, provider path, Kueue object, Terraform
+resource, or second launch implementation. It is rejected without
+`dynamic_fallback_per_gpu`, because vanilla and physical-backend Serve launches
+do not share its logical GPU-unit contract or all pass through the paid claim
+seam. Tests must cover schema and constructor validation,
+YAML/copy/old-pickle behavior, advisory counting (including null cost
+provenance and teardown success), PostgreSQL concurrency, elected-spec
+authority against a stale caller, exact replay, malformed legacy replica
+state, cap zero, and the no-PostgreSQL fail-closed path.
 
 ## Historical rollout record
 

@@ -942,6 +942,99 @@ def test_global_budget_caps_paid_selection_across_exact_pools(monkeypatch):
     assert paid_capacity.select_location(placer, budget) is None
 
 
+def test_paid_gpu_cap_counts_width_and_cleanup_provenance_conservatively():
+    one_gpu = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    eight_gpu = make_location('us-west-2', {'L4': 8}, cloud_name='GCP')
+    placer = make_placer({one_gpu: 1.0, eight_gpu: 2.0})
+    paid = _pending_info(1, one_gpu)
+    paid.planned_capacity = 2
+    missing_width = _pending_info(2, one_gpu)
+    del missing_width.planned_capacity
+    malformed_width = _pending_info(3, one_gpu)
+    malformed_width.planned_capacity = '8'
+    unknown_provenance = _pending_info(4, one_gpu)
+    unknown_provenance.is_zero_cost = None
+    zero_cost = _pending_info(5, one_gpu)
+    zero_cost.is_zero_cost = True
+    zero_cost.planned_capacity = 100
+    cleaned_paid = _pending_info(6, one_gpu)
+    cleaned_paid.planned_capacity = 100
+    cleaned_paid.status_property.sky_down_status = (
+        common_utils.ProcessStatus.SUCCEEDED)
+    states = {
+        paid_capacity.pool_key(location, workspace='w', num_nodes=1): {
+            'remaining': 16
+        } for location in (one_gpu, eight_gpu)
+    }
+
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=True), mock.patch.object(
+                               paid_capacity.serve_state,
+                               'get_paid_capacity_pool_states',
+                               return_value=states):
+        budget = paid_capacity.build_launch_budget(placer,
+                                                   workspace='w',
+                                                   existing_replica_infos=[
+                                                       paid, missing_width,
+                                                       malformed_width,
+                                                       unknown_provenance,
+                                                       zero_cost, cleaned_paid
+                                                   ],
+                                                   globally_managed=True,
+                                                   max_live_paid_gpu_units=7)
+
+    # 2 + three conservative one-unit rows. Exact true and durable teardown
+    # success do not debit the cap, regardless of their retained width.
+    assert budget.live_paid_gpu_units == 5
+    assert budget.paid_gpu_units_remaining == 2
+    assert budget.service_remaining == 16
+    assert paid_capacity.select_location(placer, budget) == one_gpu
+    paid_capacity.debit(budget, one_gpu)
+    assert budget.paid_gpu_units_remaining == 1
+    assert paid_capacity.select_location(placer,
+                                         budget,
+                                         skip_zero_cost_preference=True,
+                                         allowed_locations={eight_gpu}) is None
+    assert paid_capacity.select_location(
+        placer, budget, skip_zero_cost_preference=True) == one_gpu
+
+
+def test_paid_gpu_cap_zero_and_postgres_unavailable_fail_closed():
+    location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    placer = make_placer({location: 1.0})
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=False), mock.patch.object(
+                               paid_capacity.serve_state,
+                               'get_paid_capacity_pool_states') as get_states:
+        budget = paid_capacity.build_launch_budget(placer,
+                                                   workspace='w',
+                                                   existing_replica_infos=[],
+                                                   globally_managed=True,
+                                                   max_live_paid_gpu_units=0)
+
+    assert not budget.globally_managed
+    assert budget.remaining_by_location == {location: 0}
+    assert budget.service_remaining == 0
+    assert budget.paid_gpu_units_remaining == 0
+    assert paid_capacity.select_location(placer, budget) is None
+    get_states.assert_not_called()
+    with mock.patch.object(paid_capacity.serve_state,
+                           'try_add_replica_with_paid_capacity_claim') as claim:
+        result = paid_capacity.try_persist_claim(
+            service_name='svc',
+            service_hash='hash',
+            controller_owner=(1, '10.0.0.1'),
+            replica_id=1,
+            replica_info=_pending_info(1, location),
+            location=location,
+            budget=budget,
+            priority=20)
+    assert result is paid_capacity.ClaimResult.SERVICE_SATURATED
+    claim.assert_not_called()
+
+
 @pytest.mark.parametrize(
     'unknown_age',
     [None, float('nan'),
@@ -1095,6 +1188,9 @@ def test_claim_clamps_priority_and_returns_typed_result():
         states_by_pool_key={},
         globally_managed=True,
         service_claim_limit=24,
+        max_live_paid_gpu_units=8,
+        live_paid_gpu_units=2,
+        paid_gpu_units_remaining=6,
         frontier_limit=2,
         max_frontier_limit=3,
         frontier_key_by_location={location: ('l4',)},
@@ -1117,6 +1213,7 @@ def test_claim_clamps_priority_and_returns_typed_result():
     assert claim.call_args.kwargs['priority'] == (
         constants.LB_REQUEST_PRIORITY_MAX)
     assert claim.call_args.kwargs['service_limit'] == 24
+    assert claim.call_args.kwargs['max_live_paid_gpu_units'] == 8
     assert claim.call_args.kwargs['frontier_key'] == ('l4',)
     assert claim.call_args.kwargs['frontier_limit'] == 3
     assert claim.call_args.kwargs['frontier_default_limit'] == 2

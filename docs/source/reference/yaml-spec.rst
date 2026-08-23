@@ -1770,6 +1770,30 @@ If not specified, SkyServe will use a fixed number of replicas (the same as min_
       max_replicas: 3
 
 
+.. _yaml-spec-service-replica-policy-max-live-paid-gpu-units:
+
+``service.replica_policy.max_live_paid_gpu_units``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Maximum cleanup-unproven paid GPU capacity for the service (optional). This
+field requires ``spot_placer: dynamic_fallback_per_gpu`` and is measured in
+whole GPU units, including all GPUs on a multi-GPU backend. A paid replica
+keeps consuming the limit until its provider teardown has durably succeeded.
+Set the value to ``0`` to run in reservation-only qualification mode. If the
+field is omitted, paid capacity is unlimited for backward compatibility.
+
+The limit is enforced by PostgreSQL in the same transaction that creates the
+replica and paid-capacity claim. If that authority is unavailable, paid launch
+fails closed.
+
+.. code-block:: yaml
+
+  service:
+    replica_policy:
+      spot_placer: dynamic_fallback_per_gpu
+      max_live_paid_gpu_units: 0
+
+
 .. _yaml-spec-service-replica-policy-target-qps-per-replica:
 
 ``service.replica_policy.target_qps_per_replica``

@@ -7050,7 +7050,9 @@ class SkyServeController:
                             existing_replica_infos=replica_infos,
                             globally_managed=self._service_hash is not None,
                             service_name=self._service_name,
-                            service_hash=self._service_hash)
+                            service_hash=self._service_hash,
+                            max_live_paid_gpu_units=(
+                                self._replica_manager.max_live_paid_gpu_units))
                         paid_admission = (
                             paid_capacity.admission_snapshot_by_location(budget)
                         )

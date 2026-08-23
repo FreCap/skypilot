@@ -112,6 +112,21 @@ def _service_spec(*, pool: bool = False) -> service_spec.SkyServiceSpec:
     })
 
 
+def _paid_cap_service_spec(limit: int) -> service_spec.SkyServiceSpec:
+    return service_spec.SkyServiceSpec(
+        readiness_path='/health',
+        initial_delay_seconds=60,
+        readiness_timeout_seconds=30,
+        endpoint_probe_interval_seconds=10,
+        lb_stream_timeout_seconds=60,
+        min_replicas=0,
+        max_replicas=32,
+        target_concurrency_per_replica=1,
+        graceful_drain_async_occupancy=True,
+        spot_placer=placement_policy.CAPACITY_AWARE_SPOT_PLACER,
+        max_live_paid_gpu_units=limit)
+
+
 def _v1_service_spec() -> service_spec.SkyServiceSpec:
     spec = _service_spec()
     contract = spec.placement_contract
@@ -425,7 +440,12 @@ class TestPaidCapacityAuthorityPG:
     """Global paid launch claims use real PostgreSQL locking semantics."""
 
     @staticmethod
-    def _add_service(name: str, service_hash: str, pid: int) -> None:
+    def _add_service(
+            name: str,
+            service_hash: str,
+            pid: int,
+            *,
+            spec_override: service_spec.SkyServiceSpec | None = None) -> None:
         assert serve_state.add_service(name=name,
                                        controller_job_id=1,
                                        policy='policy',
@@ -436,7 +456,7 @@ class TestPaidCapacityAuthorityPG:
                                        pool=False,
                                        controller_pid=pid,
                                        entrypoint='entry',
-                                       spec=_service_spec(),
+                                       spec=(spec_override or _service_spec()),
                                        yaml_content='service: {}',
                                        controller_ip='10.0.0.1',
                                        service_hash=service_hash,
@@ -847,6 +867,251 @@ class TestPaidCapacityAuthorityPG:
         assert set(pool_keys) == set(claim_pool_keys)
         assert len(replica_ids) == 3
         assert waiter_count == 0
+
+    def test_paid_gpu_cap_zero_rejects_without_creating_state(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc',
+                          'hash',
+                          11,
+                          spec_override=_paid_cap_service_spec(0))
+
+        result = serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc',
+            'hash',
+            1,
+            self._info('svc', 1),
+            pool_key='pool',
+            priority=20,
+            base_limit=4,
+            max_limit=8,
+            max_live_paid_gpu_units=0,
+            now=100,
+            success_ttl_seconds=60,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1'))
+        stale_caller_result = (
+            serve_state.try_add_replica_with_paid_capacity_claim(
+                'svc',
+                'hash',
+                2,
+                self._info('svc', 2),
+                pool_key='pool',
+                priority=20,
+                base_limit=4,
+                max_limit=8,
+                max_live_paid_gpu_units=None,
+                now=100,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1')))
+
+        assert result == 'service_saturated'
+        assert stale_caller_result == 'service_saturated'
+        assert serve_state.get_replica_info_from_id('svc', 1) is None
+        assert serve_state.get_replica_info_from_id('svc', 2) is None
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            assert session.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(
+                    serve_state.paid_capacity_claims_table)).scalar_one() == 0
+            assert session.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(
+                    serve_state.paid_capacity_pools_table)).scalar_one() == 0
+
+    def test_paid_gpu_cap_conservatively_counts_legacy_json_and_width(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc',
+                          'hash',
+                          11,
+                          spec_override=_paid_cap_service_spec(8))
+        for replica_id in range(1, 7):
+            assert serve_state.add_or_update_replica(
+                'svc', replica_id, self._info('svc', replica_id))
+        retained_states = {
+            # Missing, null, string, and object provenance are all paid.
+            1: {},
+            2: {
+                'is_zero_cost': None,
+                'planned_capacity': 2,
+            },
+            3: {
+                'is_zero_cost': 'true',
+                'planned_capacity': '8',
+            },
+            4: {
+                'is_zero_cost': {},
+                'planned_capacity': 3,
+            },
+            # Only literal JSON true is zero-cost.
+            5: {
+                'is_zero_cost': True,
+                'planned_capacity': 100,
+            },
+            # Only durable provider teardown success releases a paid debit.
+            6: {
+                'is_zero_cost': False,
+                'planned_capacity': 100,
+            },
+        }
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            for replica_id, replica_state in retained_states.items():
+                sky_down_status = (common_utils.ProcessStatus.SUCCEEDED.value
+                                   if replica_id == 6 else
+                                   common_utils.ProcessStatus.FAILED.value
+                                   if replica_id == 4 else None)
+                session.execute(
+                    sqlalchemy.update(serve_state.replicas_table).where(
+                        serve_state.replicas_table.c.service_name == 'svc',
+                        serve_state.replicas_table.c.replica_id ==
+                        replica_id).values(replica_state=replica_state,
+                                           sky_down_status=sky_down_status))
+            session.commit()
+
+        candidate = self._info('svc', 7)
+        candidate.planned_capacity = 2
+
+        def _claim() -> str:
+            return serve_state.try_add_replica_with_paid_capacity_claim(
+                'svc',
+                'hash',
+                7,
+                candidate,
+                pool_key='pool',
+                priority=20,
+                base_limit=8,
+                max_limit=16,
+                max_live_paid_gpu_units=8,
+                now=100,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1'))
+
+        # Live total is 1 + 2 + 1 + 3 = 7. The incoming two-GPU backend
+        # cannot fit; the malformed width contributes one rather than failing.
+        assert _claim() == 'service_saturated'
+        assert serve_state.get_replica_info_from_id('svc', 7) is None
+
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.replicas_table).where(
+                    serve_state.replicas_table.c.service_name == 'svc',
+                    serve_state.replicas_table.c.replica_id == 4).values(
+                        sky_down_status=(
+                            common_utils.ProcessStatus.SUCCEEDED.value)))
+            session.commit()
+
+        assert _claim() == 'acquired'
+        assert serve_state.get_replica_info_from_id('svc', 7) is not None
+
+    def test_paid_gpu_cap_allows_exact_claim_replay_without_new_debit(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc',
+                          'hash',
+                          11,
+                          spec_override=_paid_cap_service_spec(8))
+        first = self._info('svc', 1)
+        first.planned_capacity = 8
+
+        def _claim(replica_id: int, info, limit: int) -> str:
+            return serve_state.try_add_replica_with_paid_capacity_claim(
+                'svc',
+                'hash',
+                replica_id,
+                info,
+                pool_key=f'pool-{replica_id}',
+                priority=20,
+                base_limit=8,
+                max_limit=16,
+                max_live_paid_gpu_units=limit,
+                now=100,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1'))
+
+        assert _claim(1, first, 8) == 'acquired'
+        assert _claim(1, first, 0) == 'acquired'
+        assert _claim(2, self._info('svc', 2), 8) == 'service_saturated'
+
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            claim_ids = session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_claims_table.c.replica_id).where(
+                        serve_state.paid_capacity_claims_table.c.service_name ==
+                        'svc')).scalars().all()
+        assert claim_ids == [1]
+
+    def test_paid_gpu_cap_serializes_multi_gpu_admission(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc',
+                          'hash',
+                          11,
+                          spec_override=_paid_cap_service_spec(6))
+        barrier = threading.Barrier(8)
+        results = []
+        errors = []
+
+        def _claim(replica_id: int) -> None:
+            try:
+                info = self._info('svc', replica_id)
+                info.planned_capacity = 2
+                barrier.wait(timeout=20)
+                results.append(
+                    serve_state.try_add_replica_with_paid_capacity_claim(
+                        'svc',
+                        'hash',
+                        replica_id,
+                        info,
+                        pool_key=f'pool-{replica_id}',
+                        priority=20,
+                        base_limit=8,
+                        max_limit=16,
+                        max_live_paid_gpu_units=6,
+                        now=100,
+                        success_ttl_seconds=60,
+                        waiter_ttl_seconds=30,
+                        expected_controller_owner=(11, '10.0.0.1')))
+            except Exception as error:  # pylint: disable=broad-except
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=_claim, args=(replica_id,))
+            for replica_id in range(1, 9)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+            assert not thread.is_alive(), 'paid GPU admission thread hung'
+
+        assert not errors, errors
+        assert results.count('acquired') == 3
+        assert results.count('service_saturated') == 5
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            claim_count = session.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(serve_state.paid_capacity_claims_table).where(
+                    serve_state.paid_capacity_claims_table.c.service_name ==
+                    'svc')).scalar_one()
+            replica_count = session.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(serve_state.replicas_table).where(
+                    serve_state.replicas_table.c.service_name ==
+                    'svc')).scalar_one()
+        assert claim_count == 3
+        assert replica_count == 3
 
     def test_stale_dynamic_snapshots_serialize_last_service_slot(
             self, broker_engine, monkeypatch):

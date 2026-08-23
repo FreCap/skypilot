@@ -144,6 +144,7 @@ class SkyServiceSpec:
         consecutive_failure_threshold_timeout: int | None = None,
         graceful_drain_seconds: int | None = None,
         graceful_drain_async_occupancy: bool | None = None,
+        max_live_paid_gpu_units: int | None = None,
         _preserved_placement_contract: (placement_policy.PlacementContract |
                                         None) = None,
         _placement_contract_copy_token: object | None = None,
@@ -157,6 +158,7 @@ class SkyServiceSpec:
             # was set internally from max_workers, so we allow it
             unsupported_fields = [
                 'num_overprovision',
+                'max_live_paid_gpu_units',
                 'target_qps_per_replica',
                 'target_concurrency_per_replica',
                 'target_utilization_percentage',
@@ -212,6 +214,22 @@ class SkyServiceSpec:
                                  'equal to min_replicas. Found: '
                                  f'min_replicas={min_replicas}, '
                                  f'max_replicas={max_replicas}')
+
+        if (max_live_paid_gpu_units is not None and
+            (isinstance(max_live_paid_gpu_units, bool) or
+             not isinstance(max_live_paid_gpu_units, int) or
+             max_live_paid_gpu_units < 0)):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError('max_live_paid_gpu_units must be an integer '
+                                 f'>= 0. Got: {max_live_paid_gpu_units!r}')
+        if (max_live_paid_gpu_units is not None and
+                spot_placer != placement_policy.CAPACITY_AWARE_SPOT_PLACER):
+            with ux_utils.print_exception_no_traceback():
+                raise ValueError(
+                    'max_live_paid_gpu_units requires spot_placer: '
+                    f'{placement_policy.CAPACITY_AWARE_SPOT_PLACER}, whose '
+                    'planned_capacity is measured in whole GPU units and '
+                    'whose paid launches use PostgreSQL admission.')
 
         accelerator_floors = dict(min_replicas_by_accelerator or {})
         normalized_floor_names: set[str] = set()
@@ -798,6 +816,7 @@ class SkyServiceSpec:
             graceful_drain_async_occupancy)
         self._min_replicas: int = min_replicas
         self._max_replicas: int | None = max_replicas
+        self._max_live_paid_gpu_units: int | None = max_live_paid_gpu_units
         self._min_replicas_by_accelerator = accelerator_floors
         self._num_overprovision: int | None = num_overprovision
         self._ports: str | None = ports
@@ -938,6 +957,9 @@ class SkyServiceSpec:
         # an API-server restart. Newly parsed specs default to 50 via the
         # property below.
         state.setdefault('_max_scale_down_rate_percentage', 100)
+        # Optional hard cap for logical-per-GPU paid capacity. Old persisted
+        # service specs retain their unlimited behavior.
+        state.setdefault('_max_live_paid_gpu_units', None)
         # Added with reserved-capacity fill; old DB rows predate it. M5 made
         # utilization gating the default for newly parsed enabled specs, but
         # old persisted bool/object forms did not make that choice. Normalize
@@ -1175,6 +1197,7 @@ class SkyServiceSpec:
             service_config['min_replicas'] = min_replicas
             service_config['min_replicas_by_accelerator'] = None
             service_config['max_replicas'] = pool_max_workers
+            service_config['max_live_paid_gpu_units'] = None
             service_config['upscale_delay_seconds'] = pool_upscale_delay
             service_config['downscale_delay_seconds'] = pool_downscale_delay
             service_config['num_overprovision'] = None
@@ -1198,6 +1221,8 @@ class SkyServiceSpec:
                 'min_replicas_by_accelerator', None)
             service_config['max_replicas'] = policy_section.get(
                 'max_replicas', None)
+            service_config['max_live_paid_gpu_units'] = policy_section.get(
+                'max_live_paid_gpu_units', None)
             service_config['num_overprovision'] = policy_section.get(
                 'num_overprovision', None)
             service_config['target_qps_per_replica'] = policy_section.get(
@@ -1419,6 +1444,8 @@ class SkyServiceSpec:
                         self.min_replicas_by_accelerator,
                         no_empty=True)
         add_if_not_none('replica_policy', 'max_replicas', self.max_replicas)
+        add_if_not_none('replica_policy', 'max_live_paid_gpu_units',
+                        self.max_live_paid_gpu_units)
         add_if_not_none('replica_policy', 'num_overprovision',
                         self.num_overprovision)
         add_if_not_none('replica_policy', 'target_qps_per_replica',
@@ -1711,6 +1738,10 @@ class SkyServiceSpec:
         return 50 if value is None else value
 
     @property
+    def max_live_paid_gpu_units(self) -> int | None:
+        return self._max_live_paid_gpu_units
+
+    @property
     def replica_unit(self) -> str:
         return self.placement_contract.replica_unit
 
@@ -1884,6 +1915,8 @@ class SkyServiceSpec:
                 'min_replicas_by_accelerator',
                 self._min_replicas_by_accelerator),
             max_replicas=override.pop('max_replicas', self._max_replicas),
+            max_live_paid_gpu_units=override.pop('max_live_paid_gpu_units',
+                                                 self._max_live_paid_gpu_units),
             num_overprovision=override.pop('num_overprovision',
                                            self._num_overprovision),
             ports=override.pop('ports', self._ports),

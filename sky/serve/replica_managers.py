@@ -6793,6 +6793,21 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._cache_task_template(version, task)
         return task
 
+    def _max_live_paid_gpu_units_for_version(self, version: int) -> int | None:
+        """Return the immutable paid cap for one committed service version."""
+        spec = self._version_specs.get(version)
+        if spec is None:
+            spec = serve_state.get_spec(self._service_name, version)
+            if spec is None:
+                raise ValueError(f'Version {version} not found.')
+            self._version_specs[version] = spec
+        return spec.max_live_paid_gpu_units
+
+    @property
+    def max_live_paid_gpu_units(self) -> int | None:
+        """Return the paid cap for the manager's active service version."""
+        return self._max_live_paid_gpu_units_for_version(self.latest_version)
+
     def _cache_task_template(self, version: int, task: task_lib.Task) -> None:
         """Retain a bounded current-plus-recovery Task parse cache."""
         self._version_task_templates.pop(version, None)
@@ -7170,6 +7185,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                             globally_managed=(self._service_hash is not None),
                             service_name=self._service_name,
                             service_hash=self._service_hash,
+                            max_live_paid_gpu_units=(
+                                launch_spec.max_live_paid_gpu_units),
                             requested_frontier_keys={
                                 paid_capacity.frontier_key(location)
                             }))
@@ -7486,6 +7503,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                             globally_managed=(self._service_hash is not None),
                             service_name=self._service_name,
                             service_hash=self._service_hash,
+                            max_live_paid_gpu_units=(
+                                launch_spec.max_live_paid_gpu_units),
                             requested_frontier_keys=(
                                 None if allowed_locations is None else {
                                     paid_capacity.frontier_key(candidate)
@@ -9863,6 +9882,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 globally_managed=(self._service_hash is not None),
                 service_name=self._service_name,
                 service_hash=self._service_hash,
+                max_live_paid_gpu_units=(
+                    self._max_live_paid_gpu_units_for_version(batch_version)),
                 requested_frontier_keys=self._requested_paid_frontier_keys(
                     resources_overrides)))
         deferred_paid_overrides: list[dict[str, Any] | None] = []
@@ -10220,6 +10241,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 globally_managed=(self._service_hash is not None),
                 service_name=self._service_name,
                 service_hash=self._service_hash,
+                max_live_paid_gpu_units=(
+                    self._max_live_paid_gpu_units_for_version(version)),
                 requested_frontier_keys=(None if not card_targets else {
                     (str(card).casefold(),) for card in paid_cards
                 }))

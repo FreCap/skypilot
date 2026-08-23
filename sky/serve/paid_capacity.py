@@ -23,6 +23,7 @@ from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.serve import constants
 from sky.serve import spot_placer
+from sky.utils import common_utils
 
 if typing.TYPE_CHECKING:
     from sky.serve import replica_managers
@@ -137,6 +138,9 @@ class LaunchBudget:
         default_factory=set)
     frontier_limit_overrides: dict[FrontierKey, int] = dataclasses.field(
         default_factory=dict)
+    max_live_paid_gpu_units: int | None = None
+    live_paid_gpu_units: int | None = None
+    paid_gpu_units_remaining: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -620,9 +624,12 @@ def central_authority_available() -> bool:
     return (serve_state.get_database_engine().dialect.name == 'postgresql')
 
 
-def _log_admission_summary(states: dict[str, dict[str,
-                                                  Any]], *, service_claims: int,
-                           service_claim_limit: int) -> None:
+def _log_admission_summary(states: dict[str, dict[str, Any]],
+                           *,
+                           service_claims: int,
+                           service_claim_limit: int,
+                           max_live_paid_gpu_units: int | None = None,
+                           live_paid_gpu_units: int | None = None) -> None:
     """Log one bounded shared-admission summary on transition or interval."""
     if not states:
         return
@@ -634,8 +641,14 @@ def _log_admission_summary(states: dict[str, dict[str,
     saturated_pools = sum(
         int(state.get('remaining', 0)) == 0 for state in states.values())
     service_remaining = max(0, service_claim_limit - service_claims)
+    paid_gpu_units_remaining = None
+    if (max_live_paid_gpu_units is not None and
+            live_paid_gpu_units is not None):
+        paid_gpu_units_remaining = max(
+            0, max_live_paid_gpu_units - live_paid_gpu_units)
     signature = (len(states), tuple(sorted(state_counts.items())), overage_pools
-                 > 0, service_remaining == 0)
+                 > 0, service_remaining == 0, max_live_paid_gpu_units,
+                 live_paid_gpu_units, paid_gpu_units_remaining)
     observed_at = time.monotonic()
     global _admission_summary_log_signature
     global _admission_summary_logged_at
@@ -659,6 +672,9 @@ def _log_admission_summary(states: dict[str, dict[str,
         f'legacy_overage_claims={sum(int(state.get("legacy_overage", 0)) for state in states.values())}, '
         f'service_claims={service_claims}, '
         f'service_limit={service_claim_limit}, '
+        f'max_live_paid_gpu_units={max_live_paid_gpu_units}, '
+        f'live_paid_gpu_units={live_paid_gpu_units}, '
+        f'paid_gpu_units_remaining={paid_gpu_units_remaining}, '
         f'service_remaining={service_remaining}.')
 
 
@@ -669,6 +685,36 @@ def _service_claim_count(
     return sum(info.status.value in _UNRESOLVED_STATUS_VALUES and
                isinstance(info.paid_capacity_pool_key, str)
                for info in existing_replica_infos)
+
+
+def _live_paid_gpu_units(
+        existing_replica_infos: Iterable['replica_managers.ReplicaInfo']
+) -> int:
+    """Sum paid GPU units whose provider cleanup is not durably complete."""
+    total = 0
+    for info in existing_replica_infos:
+        down_status = info.status_property.sky_down_status
+        down_status_value = getattr(down_status, 'value', down_status)
+        if (info.is_zero_cost is not True and down_status_value
+                != common_utils.ProcessStatus.SUCCEEDED.value):
+            planned_capacity = getattr(info, 'planned_capacity', None)
+            if (type(planned_capacity) is not int or  # pylint: disable=unidiomatic-typecheck
+                    planned_capacity < 1):
+                planned_capacity = 1
+            total += planned_capacity
+    return total
+
+
+def _location_gpu_units(location: spot_placer.Location) -> int:
+    """Return one logical placer's exact whole-GPU backend width."""
+    accelerators = location.accelerators
+    if not isinstance(accelerators, Mapping) or len(accelerators) != 1:
+        return 1
+    count = next(iter(accelerators.values()))
+    if (isinstance(count, bool) or not isinstance(count, (int, float)) or
+            count < 1 or not float(count).is_integer()):
+        return 1
+    return int(count)
 
 
 def _evidence_aware_service_limit(
@@ -751,8 +797,14 @@ def build_launch_budget(
     service_name: str | None = None,
     service_hash: str | None = None,
     requested_frontier_keys: set[FrontierKey] | None = None,
+    max_live_paid_gpu_units: int | None = None,
 ) -> LaunchBudget:
     """Read one advisory shared-capacity snapshot for all active paid pools."""
+    if (max_live_paid_gpu_units is not None and
+        (isinstance(max_live_paid_gpu_units, bool) or
+         not isinstance(max_live_paid_gpu_units, int) or
+         max_live_paid_gpu_units < 0)):
+        raise ValueError('max_live_paid_gpu_units must be an integer >= 0.')
     zero_cost = set(placer.zero_cost_locations())
     paid_locations = [
         location for location in placer.ranked_active_locations()
@@ -763,12 +815,28 @@ def build_launch_budget(
             pool_key(location, workspace=workspace, num_nodes=placer.num_nodes)
         for location in paid_locations
     }
+    live_paid_gpu_units = _live_paid_gpu_units(existing_replica_infos)
     if not globally_managed or not central_authority_available():
+        if max_live_paid_gpu_units is not None:
+            # A configured hard cost bound requires the shared PostgreSQL
+            # service lock. Never silently widen it to the legacy local
+            # unresolved-launch window.
+            return LaunchBudget(remaining_by_location={
+                location: 0 for location in paid_locations
+            },
+                                pool_key_by_location=keys,
+                                states_by_pool_key={},
+                                globally_managed=False,
+                                service_remaining=0,
+                                max_live_paid_gpu_units=max_live_paid_gpu_units,
+                                live_paid_gpu_units=live_paid_gpu_units,
+                                paid_gpu_units_remaining=0)
         return LaunchBudget(remaining_by_location=_legacy_local_remaining(
             placer, paid_locations, existing_replica_infos),
                             pool_key_by_location=keys,
                             states_by_pool_key={},
-                            globally_managed=False)
+                            globally_managed=False,
+                            live_paid_gpu_units=live_paid_gpu_units)
 
     states = serve_state.get_paid_capacity_pool_states(
         list(keys.values()),
@@ -847,15 +915,22 @@ def build_launch_budget(
                                   service_name=service_name,
                                   service_hash=service_hash),
         frontier_ceiling=configured_max_frontier)
+    service_remaining = max(0, service_claim_limit - service_claims)
+    paid_gpu_units_remaining = (None
+                                if max_live_paid_gpu_units is None else max(
+                                    0, max_live_paid_gpu_units -
+                                    live_paid_gpu_units))
     _log_admission_summary(states,
                            service_claims=service_claims,
-                           service_claim_limit=service_claim_limit)
+                           service_claim_limit=service_claim_limit,
+                           max_live_paid_gpu_units=max_live_paid_gpu_units,
+                           live_paid_gpu_units=live_paid_gpu_units)
     return LaunchBudget(
         remaining_by_location=remaining,
         pool_key_by_location=keys,
         states_by_pool_key=states,
         globally_managed=True,
-        service_remaining=max(0, service_claim_limit - service_claims),
+        service_remaining=service_remaining,
         service_claim_limit=service_claim_limit,
         frontier_limit=configured_frontier,
         max_frontier_limit=configured_max_frontier,
@@ -867,7 +942,10 @@ def build_launch_budget(
         oldest_claimed_at_by_frontier=oldest_by_frontier,
         oldest_unknown_claimed_at=oldest_unknown_claimed_at,
         newest_claimed_at_by_pool_key=newest_by_pool_key,
-        unknown_claim_age_pool_keys=unknown_claim_age_pool_keys)
+        unknown_claim_age_pool_keys=unknown_claim_age_pool_keys,
+        max_live_paid_gpu_units=max_live_paid_gpu_units,
+        live_paid_gpu_units=live_paid_gpu_units,
+        paid_gpu_units_remaining=paid_gpu_units_remaining)
 
 
 def _owned_pool_keys(budget: LaunchBudget, key: FrontierKey) -> set[str]:
@@ -1029,7 +1107,9 @@ def select_location(
     available_paid = {
         location for location in active_paid
         if budget.remaining_by_location.get(location, 0) > 0 and
-        (budget.service_remaining is None or budget.service_remaining > 0)
+        (budget.service_remaining is None or budget.service_remaining > 0) and
+        (budget.paid_gpu_units_remaining is None or
+         budget.paid_gpu_units_remaining >= _location_gpu_units(location))
     }
     eligible_paid = available_paid
     expansion_candidates: set[spot_placer.Location] = set()
@@ -1222,6 +1302,10 @@ def debit(budget: LaunchBudget | None,
             budget.remaining_by_location[candidate] = remaining - 1
     if budget.service_remaining is not None and budget.service_remaining > 0:
         budget.service_remaining -= 1
+    if (budget.paid_gpu_units_remaining is not None and
+            budget.paid_gpu_units_remaining > 0):
+        budget.paid_gpu_units_remaining = max(
+            0, budget.paid_gpu_units_remaining - _location_gpu_units(location))
     if budget.frontier_limit is not None and key is not None:
         frontier = budget.frontier_key_by_location.get(location,
                                                        frontier_key(location))
@@ -1248,15 +1332,25 @@ def exhaust(budget: LaunchBudget | None,
 
 def exhaust_service(budget: LaunchBudget | None) -> None:
     """Stop a wave after the authoritative per-service envelope is full."""
-    if budget is not None and budget.service_remaining is not None:
-        budget.service_remaining = 0
-        _record_selection_stop(budget)
+    if budget is not None:
+        exhausted = False
+        if budget.service_remaining is not None:
+            budget.service_remaining = 0
+            exhausted = True
+        if budget.paid_gpu_units_remaining is not None:
+            budget.paid_gpu_units_remaining = 0
+            exhausted = True
+        if exhausted:
+            _record_selection_stop(budget)
 
 
 def service_exhausted(budget: LaunchBudget | None) -> bool:
     """Whether fresh paid placement has no service-envelope headroom."""
-    return (budget is not None and budget.service_remaining is not None and
-            budget.service_remaining <= 0)
+    return (budget is not None and
+            ((budget.service_remaining is not None and
+              budget.service_remaining <= 0) or
+             (budget.paid_gpu_units_remaining is not None and
+              budget.paid_gpu_units_remaining <= 0)))
 
 
 def try_persist_claim(
@@ -1273,6 +1367,8 @@ def try_persist_claim(
 ) -> ClaimResult:
     """Atomically persist a replica row and exact-pool capacity claim."""
     if not budget.globally_managed or service_hash is None:
+        if budget.max_live_paid_gpu_units is not None:
+            return ClaimResult.SERVICE_SATURATED
         return ClaimResult.LEGACY_LOCAL
     key = budget.pool_key_by_location[location]
     candidate_frontier = budget.frontier_key_by_location.get(
@@ -1292,6 +1388,7 @@ def try_persist_claim(
         max_limit=max_limit(),
         service_limit=(budget.service_claim_limit if budget.service_claim_limit
                        is not None else service_limit()),
+        max_live_paid_gpu_units=budget.max_live_paid_gpu_units,
         now=None,
         success_ttl_seconds=success_ttl_seconds(),
         failure_cooldown_seconds=failure_cooldown_seconds(),
