@@ -1,5 +1,17 @@
 # SkyServe demand, capacity, and telemetry convergence
 
+Current status (2026-08-23 07:22 UTC): `boltz-l4-fleet` lifecycle 94/version 1
+uses PostgreSQL-authoritative `DURABLE_INTENT` actuation and
+`SEQUENCED_ACTIVE` generation 35. PR #1679 is deployed as release `1.1.1449` /
+Helm revision 573 and completed the supported lifecycle-93 purge plus clean
+lifecycle-94 recreation. PR #1680 is deployed homogeneously as release
+`1.1.1450` / Helm revision 575 at merge
+`b311dd2775c150895918121cbf2b16c0ba21f5dd`; its next and only permissible
+authorization is one generation 35-to-36 active-to-active CAS after the exact
+production gates in `serve-multi-pool-reserved-capacity-fill.md`. That document
+is authoritative for live rollout state and evidence. The older phase account
+below is historical chronology and is not an executable runbook.
+
 Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
 #1504. PR #1521's partial-coverage in-flight observability, the complete G1S
 executor-termination precursor stack through PR #1528, PR #1529's exact
