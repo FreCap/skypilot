@@ -54,7 +54,8 @@ def _clear_token_file_envs(monkeypatch, tmp_path):
 def _make_lb() -> load_balancer.SkyServeLoadBalancer:
     return load_balancer.SkyServeLoadBalancer(controller_url='http://ctrl:8001',
                                               load_balancer_port=8890,
-                                              service_hash='incarnation-a')
+                                              service_hash='incarnation-a',
+                                              service_name='test-service')
 
 
 def _run(coro):
@@ -74,6 +75,13 @@ def _authorized(scope) -> bool:
 
 def _edge_auth(token: str):
     return {constants.LB_AUTHORIZATION_HEADER: f'Bearer {token}'}
+
+
+def _exact_edge_auth(token: str, incarnation: str = 'incarnation-a'):
+    return {
+        **_edge_auth(token),
+        constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: incarnation,
+    }
 
 
 def test_auth_token_public_facade_contract():
@@ -504,7 +512,7 @@ def test_async_receipt_lookup_is_authenticated_and_read_only(monkeypatch):
                        json=_receipt_lookup_payload()).status_code == 401
     response = client.post(constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
                            json=_receipt_lookup_payload(),
-                           headers=_edge_auth('s3cret'))
+                           headers=_exact_edge_auth('s3cret'))
 
     assert response.status_code == 200
     assert response.json() == dataclasses.asdict(receipt)
@@ -514,6 +522,8 @@ def test_async_receipt_lookup_is_authenticated_and_read_only(monkeypatch):
     assert response.headers[constants.LB_ASYNC_LEDGER_REVISION_HEADER] == '2'
     assert response.headers[
         constants.LB_ASYNC_LEDGER_STATE_HEADER] == 'ACCEPTED'
+    assert response.headers[
+        constants.LB_ASYNC_SERVICE_INCARNATION_HEADER] == 'incarnation-a'
     lookup.assert_awaited_once_with('job-exact-1', 'a' * 64)
 
 
@@ -528,17 +538,39 @@ def test_async_receipt_lookup_advertises_exact_not_found_without_receipt(
 
     response = client.post(constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
                            json=_receipt_lookup_payload(),
-                           headers=_edge_auth('s3cret'))
+                           headers=_exact_edge_auth('s3cret'))
 
     assert response.status_code == 404
     assert response.json() == {'detail': 'No durable request attempt exists.'}
     assert response.headers[constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER] == '1'
+    assert response.headers[
+        constants.LB_ASYNC_SERVICE_INCARNATION_HEADER] == 'incarnation-a'
     for header in (constants.LB_ASYNC_ATTEMPT_ID_HEADER,
                    constants.LB_ASYNC_ATTEMPT_NO_HEADER,
                    constants.LB_ASYNC_LEDGER_REVISION_HEADER,
                    constants.LB_ASYNC_LEDGER_STATE_HEADER):
         assert header not in response.headers
     lookup.assert_awaited_once()
+
+
+def test_async_receipt_lookup_rejects_recreated_service_before_ledger(
+        monkeypatch):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    lookup = mock.AsyncMock()
+    monkeypatch.setattr(lb, '_lookup_async_ledger_receipt', lookup)
+    client = _client_with_routes(lb)
+
+    response = client.post(constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
+                           json=_receipt_lookup_payload(),
+                           headers=_exact_edge_auth('s3cret',
+                                                    'older-incarnation'))
+
+    assert response.status_code == 409
+    assert response.headers[
+        constants.LB_ASYNC_SERVICE_INCARNATION_HEADER] == 'incarnation-a'
+    lookup.assert_not_awaited()
 
 
 def test_async_receipt_lookup_does_not_advertise_unsynchronized_authority(
@@ -552,10 +584,29 @@ def test_async_receipt_lookup_does_not_advertise_unsynchronized_authority(
 
     response = client.post(constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
                            json=_receipt_lookup_payload(),
-                           headers=_edge_auth('s3cret'))
+                           headers=_exact_edge_auth('s3cret'))
 
     assert response.status_code == 503
     assert constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER not in response.headers
+    assert constants.LB_ASYNC_SERVICE_INCARNATION_HEADER not in response.headers
+    lookup.assert_not_awaited()
+
+
+def test_unsynchronized_receipt_mismatch_never_advertises_protocol(monkeypatch):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = None
+    lookup = mock.AsyncMock()
+    monkeypatch.setattr(lb, '_lookup_async_ledger_receipt', lookup)
+    client = _client_with_routes(lb)
+
+    response = client.post(constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
+                           json=_receipt_lookup_payload(),
+                           headers=_exact_edge_auth('s3cret', 'older'))
+
+    assert response.status_code == 409
+    assert constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER not in response.headers
+    assert constants.LB_ASYNC_SERVICE_INCARNATION_HEADER not in response.headers
     lookup.assert_not_awaited()
 
 
@@ -580,9 +631,12 @@ def test_async_receipt_lookup_rejects_malformed_identity(monkeypatch, payload):
 
     response = client.post(constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
                            json=payload,
-                           headers=_edge_auth('s3cret'))
+                           headers=_exact_edge_auth('s3cret'))
 
     assert response.status_code == 422
+    assert response.headers[constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER] == '1'
+    assert response.headers[
+        constants.LB_ASYNC_SERVICE_INCARNATION_HEADER] == 'incarnation-a'
     lookup.assert_not_awaited()
 
 
@@ -596,7 +650,7 @@ def test_async_receipt_lookup_rejects_duplicates_and_oversized_body(
     monkeypatch.setattr(lb, '_lookup_async_ledger_receipt', lookup)
     client = _client_with_routes(lb)
     headers = {
-        **_edge_auth('s3cret'),
+        **_exact_edge_auth('s3cret'),
         'content-type': 'application/json',
     }
 
@@ -612,6 +666,11 @@ def test_async_receipt_lookup_rejects_duplicates_and_oversized_body(
 
     assert duplicate.status_code == 422
     assert oversized.status_code == 413
+    for response in (duplicate, oversized):
+        assert response.headers[
+            constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER] == '1'
+        assert response.headers[
+            constants.LB_ASYNC_SERVICE_INCARNATION_HEADER] == 'incarnation-a'
     lookup.assert_not_awaited()
 
 
@@ -738,6 +797,26 @@ def test_exact_completion_persists_before_compatibility_histogram(monkeypatch):
 
     assert response.status_code == 204
     assert events == ['persist', 'aggregate']
+
+
+def test_exact_completion_rejects_recreated_service_before_ledger(monkeypatch):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    lookup = mock.AsyncMock()
+    monkeypatch.setattr(lb, '_lookup_async_ledger_receipt', lookup)
+    client = _client_with_routes(lb)
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+
+    response = client.post(constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+                           headers=_exact_edge_auth('s3cret',
+                                                    'older-incarnation'),
+                           json=_exact_completion_payload(attempt_id))
+
+    assert response.status_code == 409
+    assert response.headers[
+        constants.LB_ASYNC_SERVICE_INCARNATION_HEADER] == 'incarnation-a'
+    lookup.assert_not_awaited()
 
 
 def test_exact_completion_rejects_inexact_receipt_before_histogram(monkeypatch):
@@ -880,12 +959,15 @@ def test_exact_completion_rejects_inexact_json_before_ledger(monkeypatch, body):
 
     response = client.post(constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
                            headers={
-                               **_edge_auth('s3cret'),
+                               **_exact_edge_auth('s3cret'),
                                'Content-Type': 'application/json',
                            },
                            content=body)
 
     assert response.status_code == 422
+    assert response.headers[constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER] == '1'
+    assert response.headers[
+        constants.LB_ASYNC_SERVICE_INCARNATION_HEADER] == 'incarnation-a'
     lookup.assert_not_awaited()
 
 

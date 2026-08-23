@@ -161,6 +161,12 @@ def _headers_without_request_priority(request: fastapi.Request) -> Any:
         scheduling_headers = {
             constants.LB_REQUEST_PRIORITY_HEADER_BYTES,
             constants.LB_REQUEST_ACCELERATORS_HEADER_BYTES,
+            constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER.lower().encode('ascii'),
+            constants.LB_ASYNC_SERVICE_INCARNATION_HEADER.lower().encode(
+                'ascii'),
+            constants.LB_ASYNC_INTENT_SHA256_HEADER.lower().encode('ascii'),
+            constants.LB_ASYNC_EXECUTION_REQUEST_ID_HEADER.lower().encode(
+                'ascii'),
             constants.LB_ASYNC_ATTEMPT_ID_HEADER.lower().encode('ascii'),
             constants.LB_ASYNC_ATTEMPT_NO_HEADER.lower().encode('ascii'),
             constants.LB_ASYNC_LEDGER_REVISION_HEADER.lower().encode('ascii'),
@@ -173,6 +179,10 @@ def _headers_without_request_priority(request: fastapi.Request) -> Any:
     scheduling_headers_text = {
         constants.LB_REQUEST_PRIORITY_HEADER.lower(),
         constants.LB_REQUEST_ACCELERATORS_HEADER.lower(),
+        constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER.lower(),
+        constants.LB_ASYNC_SERVICE_INCARNATION_HEADER.lower(),
+        constants.LB_ASYNC_INTENT_SHA256_HEADER.lower(),
+        constants.LB_ASYNC_EXECUTION_REQUEST_ID_HEADER.lower(),
         constants.LB_ASYNC_ATTEMPT_ID_HEADER.lower(),
         constants.LB_ASYNC_ATTEMPT_NO_HEADER.lower(),
         constants.LB_ASYNC_LEDGER_REVISION_HEADER.lower(),

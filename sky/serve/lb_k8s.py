@@ -1316,6 +1316,8 @@ def _build_deployment_dict(service_name: str,
             str(constants.LOAD_BALANCER_PORT_START),
             '--service-hash',
             service_hash,
+            '--service-name',
+            service_name,
         ] + (['--lb-slot', slot.value] if slot is not None else []),
         'ports': [{
             'containerPort': constants.LOAD_BALANCER_PORT_START
