@@ -47,6 +47,7 @@ from sky.utils.db import migration_utils
 
 reserved_fill_planner = adaptors_common.LazyImport(
     'sky.serve.reserved_fill_planner')
+kueue_lane_lineage = adaptors_common.LazyImport('sky.serve.kueue_lane_lineage')
 system_oom_recovery = adaptors_common.LazyImport(
     'sky.serve.system_oom_recovery')
 zero_cost_actuation = adaptors_common.LazyImport(
@@ -2953,7 +2954,32 @@ def retire_pre_admission_non_pool_launch_intent(
     if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
         raise OrdinaryLaunchBindingUnavailable(
             'Generic pre-admission retirement requires PostgreSQL.')
+
+    # The zero-cost sequencer is a global lock and must not tax ordinary paid
+    # retirement.  This is only a routing hint; the transaction below repeats
+    # and exact-matches the immutable normalized edge before any deletion.
+    with engine.connect() as discovery_connection:
+        discovery = discovery_connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.
+                reserved_fill_intent_idempotency_key,
+                serve_state_schema.replicas_table.c.replica_state).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    authority.service_name,
+                    serve_state_schema.replicas_table.c.replica_id ==
+                    replica_id)).mappings().one_or_none()
+    reserved_fill_hint = bool(
+        discovery is not None and
+        discovery['reserved_fill_intent_idempotency_key'] is not None and
+        isinstance(discovery['replica_state'], Mapping) and
+        discovery['replica_state'].get('replica_record_id') == str(record_id))
+
     with engine.begin() as connection:
+        if reserved_fill_hint:
+            # Canonical zero-cost order: protocol, lifecycle, service, intent,
+            # replica, association, request, queue, pin, admission.
+            serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+                connection)
         lifecycle = connection.execute(
             sqlalchemy.select(
                 serve_state_schema.service_lifecycle_fences_table).where(
@@ -2994,6 +3020,104 @@ def retire_pre_admission_non_pool_launch_intent(
                 current_capability != expected_capability):
             raise OrdinaryLaunchBindingConflict(
                 'Pre-admission retirement authority is no longer current.')
+
+        # A non-locking read is stable behind the service owner lock and lets
+        # an already-won association race return ASSOCIATED without inverting
+        # the zero-cost intent-before-replica lock order.
+        replica_discovery = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                authority.service_name,
+                serve_state_schema.replicas_table.c.replica_id ==
+                replica_id)).mappings().one_or_none()
+        if replica_discovery is None:
+            return PreAdmissionRetirement(
+                PreAdmissionRetirementDisposition.ABSENT)
+        discovered_info = _locked_replica_info(replica_discovery)
+        if discovered_info.replica_record_id != str(record_id):
+            raise OrdinaryLaunchBindingConflict(
+                'Pre-admission retirement replica identity is stale.')
+
+        if reserved_fill_hint:
+            intent_key = replica_discovery[
+                'reserved_fill_intent_idempotency_key']
+            if (not isinstance(intent_key, str) or
+                    classify_non_pool_launch_profile(discovered_info)
+                    is not NonPoolLaunchProfileKind.RESERVED_FILL):
+                raise OrdinaryLaunchBindingConflict(
+                    'Pre-admission reserved fill lost its normalized intent '
+                    'edge.')
+            pointer = replica_discovery['ordinary_launch_association_id']
+            if pointer is not None:
+                replica = connection.execute(
+                    sqlalchemy.select(serve_state_schema.replicas_table).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        authority.service_name,
+                        serve_state_schema.replicas_table.c.replica_id ==
+                        replica_id).with_for_update()).mappings().one()
+                associations = connection.execute(
+                    sqlalchemy.select(ordinary_launch_associations_table).where(
+                        ordinary_launch_associations_table.c.service_name ==
+                        authority.service_name,
+                        ordinary_launch_associations_table.c.replica_id ==
+                        replica_id,
+                        ordinary_launch_associations_table.c.replica_record_id
+                        == record_id).order_by(
+                            ordinary_launch_associations_table.c.
+                            launch_generation).with_for_update()).mappings(
+                            ).all()
+                unsettled = [
+                    row for row in associations if Resolution(
+                        str(row['resolution'])) in UNSETTLED_RESOLUTIONS
+                ]
+                if (len(unsettled) == 1 and
+                        replica['ordinary_launch_association_id']
+                        == unsettled[0]['association_id']):
+                    return PreAdmissionRetirement(
+                        PreAdmissionRetirementDisposition.ASSOCIATED)
+                raise OrdinaryLaunchBindingConflict(
+                    'Replica association pointer and unsettled history '
+                    'disagree.')
+            repository = kueue_lane_lineage.KueueAdmissionRepository(engine)
+            target = kueue_lane_lineage.MaterializedAdmissionRetirementTarget(
+                replica_id=replica_id, replica_record_id=record_id)
+            try:
+                proof = (
+                    repository.prelock_pre_admission_retirement_in_connection(
+                        connection,
+                        service_name=authority.service_name,
+                        service_hash=authority.service_hash,
+                        service_lifecycle_epoch=(
+                            authority.service_lifecycle_epoch),
+                        intent_idempotency_key=intent_key,
+                        target=target))
+                proofs = (proof,)
+                repository.delete_materialized_admissions_in_connection(
+                    connection, proofs)
+                deleted = connection.execute(
+                    sqlalchemy.delete(serve_state_schema.replicas_table).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        authority.service_name,
+                        serve_state_schema.replicas_table.c.replica_id ==
+                        replica_id,
+                        serve_state_schema.replicas_table.c.
+                        ordinary_launch_association_id.is_(None),
+                        serve_state_schema.replicas_table.c.
+                        reserved_fill_intent_idempotency_key == intent_key))
+                if deleted.rowcount != 1:
+                    raise OrdinaryLaunchBindingConflict(
+                        'Pre-admission retirement lost the replica delete '
+                        'CAS.')
+                (repository.
+                 finalize_materialized_admission_retirements_in_connection(
+                     connection, proofs))
+            except kueue_lane_lineage.KueueAdmissionConflict as error:
+                raise OrdinaryLaunchBindingConflict(
+                    'Reserved-fill pre-admission retirement is not '
+                    'provider-free and exact.') from error
+            return PreAdmissionRetirement(
+                PreAdmissionRetirementDisposition.RETIRED,
+                NonPoolLaunchProfileKind.RESERVED_FILL)
 
         replica = connection.execute(
             sqlalchemy.select(serve_state_schema.replicas_table).where(
@@ -3046,6 +3170,11 @@ def retire_pre_admission_non_pool_launch_intent(
             raise OrdinaryLaunchBindingConflict(
                 'Pre-admission retirement found an incomplete generic '
                 'planner profile.')
+        if (profile_kind is NonPoolLaunchProfileKind.RESERVED_FILL or
+                replica['reserved_fill_intent_idempotency_key'] is not None):
+            raise OrdinaryLaunchBindingConflict(
+                'Reserved fill retirement requires its zero-cost protocol '
+                'prefix and committed-intent proof.')
         if associations:
             if len(associations) != 1:
                 raise OrdinaryLaunchBindingConflict(
@@ -3075,7 +3204,9 @@ def retire_pre_admission_non_pool_launch_intent(
                 authority.service_name,
                 serve_state_schema.replicas_table.c.replica_id == replica_id,
                 serve_state_schema.replicas_table.c.
-                ordinary_launch_association_id.is_(None)))
+                ordinary_launch_association_id.is_(None),
+                serve_state_schema.replicas_table.c.
+                reserved_fill_intent_idempotency_key.is_(None)))
         if deleted.rowcount != 1:
             raise OrdinaryLaunchBindingConflict(
                 'Pre-admission retirement lost the replica delete CAS.')

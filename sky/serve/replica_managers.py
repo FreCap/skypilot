@@ -4661,6 +4661,33 @@ class SkyPilotReplicaManager(ReplicaManager):
             try:
                 reduction = request_postgres.inspect_bound_ordinary_launch(
                     self._service_name, info.replica_id, info.replica_record_id)
+                if (reduction is None and ordinary_launch_binding.
+                        classify_non_pool_launch_profile(info) is not None):
+                    retirement = (ordinary_launch_binding.
+                                  retire_pre_admission_non_pool_launch_intent(
+                                      authority, info.replica_id,
+                                      info.replica_record_id))
+                    if retirement.disposition in (
+                            ordinary_launch_binding.
+                            PreAdmissionRetirementDisposition.RETIRED,
+                            ordinary_launch_binding.
+                            PreAdmissionRetirementDisposition.ABSENT):
+                        self._notify_scale_reconciliation()
+                        continue
+                    if retirement.disposition is (
+                            ordinary_launch_binding.
+                            PreAdmissionRetirementDisposition.ASSOCIATED):
+                        # Admission won the service-row race after the stale
+                        # snapshot.  Re-read its durable identity and adopt it
+                        # instead of waiting for another controller tick.
+                        reduction = (
+                            request_postgres.inspect_bound_ordinary_launch(
+                                self._service_name, info.replica_id,
+                                info.replica_record_id))
+                        if reduction is None:
+                            raise RuntimeError(
+                                'Associated launch lost its durable request '
+                                'projection.')
                 if (reduction is not None and
                         _bound_projection_classification(reduction)
                         in ('ADOPT_ACTIVE', 'WAIT_QUIESCENCE')):
