@@ -166,7 +166,7 @@ def _config_snapshot(config: bytes,
 
 
 def _placement_projection_args(
-        worker_projection_version: int = 6) -> dict[str, object]:
+        worker_projection_version: int = 7) -> dict[str, object]:
     """Return a complete valid set of immutable placement projections."""
     worker_role = 'arn:aws:iam::123456789012:role/skyserve-worker-east'
     return {
@@ -2253,18 +2253,23 @@ def test_identical_projection_retry_is_idempotent_at_db_boundary(
     assert _read_version_row(_mock_serve_db, service_name, 2) == row_before
 
 
-def test_fresh_writes_reject_protocol_v5_worker_projections(_mock_serve_db):
-    projections = _placement_projection_args(worker_projection_version=5)
-    error = 'protocol version 5 does not satisfy required version 6'
+@pytest.mark.parametrize('historical_protocol_version', [5, 6])
+def test_fresh_writes_reject_historical_worker_projections(
+        _mock_serve_db, historical_protocol_version):
+    projections = _placement_projection_args(
+        worker_projection_version=historical_protocol_version)
+    error = (f'protocol version {historical_protocol_version} does not '
+             'satisfy required version 7')
 
     with pytest.raises(ValueError, match=error):
-        _add_minimal_service('svc-v5-registration',
+        _add_minimal_service(f'svc-v{historical_protocol_version}-registration',
                              spec=_v2_service_spec('initial'),
                              **projections)
-    assert _read_row(_mock_serve_db, 'svc-v5-registration') is None
-    assert _read_version_row(_mock_serve_db, 'svc-v5-registration', 1) is None
+    registration_name = f'svc-v{historical_protocol_version}-registration'
+    assert _read_row(_mock_serve_db, registration_name) is None
+    assert _read_version_row(_mock_serve_db, registration_name, 1) is None
 
-    service_name = 'svc-v5-version'
+    service_name = f'svc-v{historical_protocol_version}-version'
     assert _add_minimal_service(service_name, spec=_v2_service_spec('initial'))
     assert serve_state.add_version(service_name) == 2
     placeholder_before = _read_version_row(_mock_serve_db, service_name, 2)
@@ -2282,9 +2287,10 @@ def test_fresh_writes_reject_protocol_v5_worker_projections(_mock_serve_db):
     assert _read_version_row(_mock_serve_db, service_name, 3) is None
 
 
-def test_identical_protocol_v5_projection_retry_remains_idempotent(
-        _mock_serve_db):
-    service_name = 'svc-v5-projection-retry'
+@pytest.mark.parametrize('historical_protocol_version', [5, 6])
+def test_identical_historical_projection_retry_remains_idempotent(
+        _mock_serve_db, historical_protocol_version):
+    service_name = f'svc-v{historical_protocol_version}-projection-retry'
     yaml_content = 'value: projected'
     assert _add_minimal_service(service_name, spec=_v2_service_spec('initial'))
     assert serve_state.add_version(service_name) == 2
@@ -2295,24 +2301,24 @@ def test_identical_protocol_v5_projection_retry_remains_idempotent(
                                               **current_projections)
             is serve_state.VersionCommitResult.COMMITTED)
 
-    # Simulate a version committed by the immediately previous release.  The
+    # Simulate a version committed by one of the two previous releases.  The
     # current controller may settle an exact lost-response retry, but must not
     # grant these historical bytes fresh write or provider authority.
-    protocol_v5_projections = _placement_projection_args(
-        worker_projection_version=5)
+    historical_projections = _placement_projection_args(
+        worker_projection_version=historical_protocol_version)
     with orm.Session(_mock_serve_db) as session:
         session.execute(
             sqlalchemy.update(serve_state.version_specs_table).where(
                 serve_state.version_specs_table.c.service_name == service_name,
                 serve_state.version_specs_table.c.version == 2).values(
-                    worker_placement_projections=protocol_v5_projections[
+                    worker_placement_projections=historical_projections[
                         'worker_placement_projections']))
         session.commit()
     row_before = _read_version_row(_mock_serve_db, service_name, 2)
 
     assert (serve_state.add_or_update_version(
         service_name, 2, _v2_service_spec('rebuilt-on-retry'), yaml_content,
-        **protocol_v5_projections)
+        **historical_projections)
             is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
     assert _read_version_row(_mock_serve_db, service_name, 2) == row_before
 

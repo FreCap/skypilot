@@ -116,15 +116,15 @@ def _configure_current_projection_runtime(config, *, scratch=None):
                      expected_bootstrap_sha256=bootstrap_sha256))
     assert readiness.matches
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 6,
+        'serve_worker_projection_protocol_version': 7,
         'serve_worker_expected_scratch': copy.deepcopy(scratch),
         'serve_worker_expected_runtime_bootstrap_sha256': bootstrap_sha256,
     })
 
 
 @pytest.mark.parametrize(('protocol_version', 'scratch', 'message'), [
-    (6, None, 'v3/v4/v5/v6 requires the complete worker scratch'),
-    (6, {
+    (7, None, 'v3/v4/v5/v6/v7 requires the complete worker scratch'),
+    (7, {
         'kind': 'memory',
         'size_limit_bytes': 1024,
     }, 'must be exactly none or memory-backed /tmp'),
@@ -146,8 +146,8 @@ def test_create_pods_rejects_invalid_worker_scratch_provider_contract(
 
 
 @pytest.mark.parametrize(('protocol_version', 'bootstrap_sha256', 'message'), [
-    (6, None, 'v4/v5/v6 requires the complete worker runtime bootstrap'),
-    (6, 'A' * 64, '64 lowercase hexadecimal'),
+    (7, None, 'v4/v5/v6/v7 requires the complete worker runtime bootstrap'),
+    (7, 'A' * 64, '64 lowercase hexadecimal'),
 ])
 def test_create_pods_rejects_invalid_worker_runtime_bootstrap_contract(
         monkeypatch, protocol_version, bootstrap_sha256, message):
@@ -171,7 +171,7 @@ def test_create_pods_rejects_invalid_worker_runtime_bootstrap_contract(
         instance._create_pods('us', 'cluster', 'cluster', config)
 
 
-@pytest.mark.parametrize('protocol_version', [1, 2, 3, 4, 5])
+@pytest.mark.parametrize('protocol_version', [1, 2, 3, 4, 5, 6])
 def test_create_pods_rejects_historical_projection_before_mutation(
         monkeypatch, protocol_version):
     monkeypatch.setattr(kubernetes_utils, 'get_namespace_from_config',
@@ -400,7 +400,7 @@ def test_create_pods_rejects_finalizer_runtime_bootstrap_drift_before_create(
     config = _make_provision_config(count=1)
     config.node_config['spec'] = pod_spec
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 6,
+        'serve_worker_projection_protocol_version': 7,
         'serve_worker_expected_priority_class_name': None,
         'serve_worker_expected_priority_value': None,
         'serve_worker_expected_preemption_policy': None,
@@ -1322,7 +1322,7 @@ def test_current_projection_create_pods_waits_for_runtime_ready_before_final_rea
 
     config = _make_provision_config(count=1)
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 6,
+        'serve_worker_projection_protocol_version': 7,
         'serve_worker_expected_priority_class_name': None,
         'serve_worker_expected_priority_value': None,
         'serve_worker_expected_preemption_policy': None,

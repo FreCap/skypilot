@@ -3,6 +3,8 @@
 import contextvars
 import copy
 import os
+import subprocess
+import tempfile
 import unittest
 from unittest import mock
 from unittest.mock import patch
@@ -1938,10 +1940,14 @@ class TestKubernetesRayTemplateAptErrorHandling(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import sky
-        template_path = os.path.join(os.path.dirname(sky.__file__), 'templates',
-                                     'kubernetes-ray.yml.j2')
-        with open(template_path, 'r', encoding='utf-8') as f:
-            cls.template = f.read()
+        template_dir = os.path.join(os.path.dirname(sky.__file__), 'templates')
+        cls.templates = {}
+        for template_name in ('kubernetes-ray.yml.j2',
+                              'kubernetes-ray-node-config.yml.j2'):
+            template_path = os.path.join(template_dir, template_name)
+            with open(template_path, 'r', encoding='utf-8') as f:
+                cls.templates[template_name] = f.read()
+        cls.template = cls.templates['kubernetes-ray.yml.j2']
 
     def _slice_between(self, begin_marker, end_marker):
         begin = self.template.index(begin_marker)
@@ -2001,6 +2007,103 @@ class TestKubernetesRayTemplateAptErrorHandling(unittest.TestCase):
         self.assertIn('dump_apt_log', snippet)
         self.assertIn('exit 1', snippet)
         self.assertLess(snippet.index('dump_apt_log'), snippet.index('exit 1'))
+
+    def test_interrupted_dpkg_is_repaired_before_apt_fix_and_retry(self):
+        """An ordinary apt failure repairs dpkg before apt and retry."""
+        for template_name, template in self.templates.items():
+            with self.subTest(template=template_name):
+                begin = template.index('apt_install_with_retries()')
+                end = template.index('apt_update_install_with_retries()', begin)
+                helper = template[begin:end]
+                install = helper.index('apt-get install $APT_OPTS')
+                dpkg_repair = helper.index(
+                    'dpkg --force-confdef --force-confold --configure -a')
+                apt_fix = helper.index('apt-get -f install $APT_OPTS')
+                self.assertLess(install, dpkg_repair)
+                self.assertLess(dpkg_repair, apt_fix)
+                self.assertNotIn('APT_INSTALL_CMD_TIMEOUT', helper)
+                self.assertNotIn('timeout', helper)
+                self.assertIn('APT_ACQUIRE_TIMEOUT=30', template)
+                self.assertIn('Acquire::http::Timeout=', template)
+                self.assertIn('Acquire::https::Timeout=', template)
+
+    @staticmethod
+    def _forced_failure_supervisor(template, step_index):
+        """Extract one exact supervisor and replace only its inner body."""
+        step_marker = f'# STEP {step_index + 1}:'
+        step_offset = template.index(step_marker)
+        outer_start = template.index('\n              (\n', step_offset) + 1
+        inner_open = template.index('\n                (\n', outer_start)
+        inner_body_start = inner_open + len('\n                (\n')
+        redirect = f') > /tmp/${{STEPS[{step_index}]}}.log 2>&1'
+        inner_body_end = template.index(redirect, inner_body_start)
+        outer_end_marker = '\n              ) &'
+        outer_end = (template.index(outer_end_marker, inner_body_end) +
+                     len(outer_end_marker))
+        forced_body = ('                set -e\n'
+                       '                false\n'
+                       '                touch "${TEST_TMP}/forbidden-success"\n'
+                       '                ')
+        supervisor = (template[outer_start:inner_body_start] + forced_body +
+                      template[inner_body_end:outer_end])
+        return supervisor.replace('/tmp/', '${TEST_TMP}/')
+
+    @staticmethod
+    def _pid1_wait_loop(template):
+        begin_marker = ('# Wait for all three background setup steps to '
+                        'complete by')
+        begin = template.index(begin_marker)
+        wait_start = template.index('STEP_COMPLETE_FILES=', begin)
+        wait_end = template.index(
+            '{% if k8s_projected_serve_worker_runtime_readiness %}', wait_start)
+        return template[wait_start:wait_end].replace('/tmp/', '${TEST_TMP}/')
+
+    def test_every_background_failure_publishes_marker_and_stops_pid1(self):
+        """Inherited errexit cannot bypass a setup failure marker."""
+        completion_files = (
+            'apt_ssh_setup_complete',
+            'ray_skypilot_installation_complete',
+            'env_setup_complete',
+        )
+        for template_name, template in self.templates.items():
+            wait_loop = self._pid1_wait_loop(template)
+            for step_index in range(3):
+                with self.subTest(template=template_name, step=step_index):
+                    supervisor = self._forced_failure_supervisor(
+                        template, step_index)
+                    with tempfile.TemporaryDirectory() as test_tmp:
+                        script = f'''set -e
+TEST_TMP="$1"
+STEPS=("apt-ssh-setup" "runtime-setup" "env-setup")
+{supervisor}
+SUPERVISOR_PID=$!
+set +e
+wait "$SUPERVISOR_PID"
+SUPERVISOR_STATUS=$?
+set -e
+test "$SUPERVISOR_STATUS" -eq 1
+test -f "${{TEST_TMP}}/${{STEPS[{step_index}]}}.failed"
+test ! -e "${{TEST_TMP}}/forbidden-success"
+test ! -e "${{TEST_TMP}}/{completion_files[step_index]}"
+set +e
+(
+  set -e
+{wait_loop}
+)
+PID1_STATUS=$?
+set -e
+test "$PID1_STATUS" -eq 1
+'''
+                        completed = subprocess.run(
+                            ['bash', '-c', script, 'bash', test_tmp],
+                            text=True,
+                            capture_output=True,
+                            check=False,
+                            timeout=5)
+                        self.assertEqual(completed.returncode,
+                                         0,
+                                         msg=(f'stdout:\n{completed.stdout}\n'
+                                              f'stderr:\n{completed.stderr}'))
 
 
 class TestEphemeralStorageValidation(unittest.TestCase):

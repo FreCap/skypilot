@@ -427,7 +427,7 @@ def _builtin_kubernetes_writer_kwargs(monkeypatch, tmp_path, test_name):
     }, output_path)
 
 
-def _projected_h200_worker(protocol_version=6):
+def _projected_h200_worker(protocol_version=7):
     return {
         'projection_version': protocol_version,
         'candidate_id': 'kubernetes-0000',
@@ -458,7 +458,7 @@ def _projected_h200_worker(protocol_version=6):
 
 
 def _projected_h200_worker_memory(protocol_version):
-    assert protocol_version in (5, 6)
+    assert protocol_version in (5, 6, 7)
     projection = _projected_h200_worker(protocol_version)
     projection['scratch'] = {
         'kind': 'memory',
@@ -695,11 +695,11 @@ def test_projected_worker_persists_authenticated_bootstrap_through_finalizer(
     assert persisted['cluster_name'] == 'display'
     assert 'skypilot:ssh_public_key_content' not in runtime_script
     assert public_key in runtime_script
-    assert len(runtime_script.encode('utf-8')) == 39363
+    assert len(runtime_script.encode('utf-8')) == 40106
     assert hashlib.sha256(runtime_script.encode('utf-8')).hexdigest() == (
-        '69bc9ab023e8a5ee164d3603f1bdae2fe318e2fc5a128139fcd063da87451704')
+        'baba26b8a7d66b911749a28610291233213db2deee70ab8ec24594f27daa9d6e')
     assert expected_bootstrap_sha256 == (
-        'b51e7c955e4abffc39c2d882672e2142822f44f2c050a0b3db58db57a7d83c2a')
+        'aced56ad9ed7bbcbea6ca27208978c0c43f844b5ec807d6ae64b4974d0527a12')
     assert expected_bootstrap_sha256 == (
         kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec))
 
@@ -728,16 +728,16 @@ def test_projected_worker_persists_authenticated_bootstrap_through_finalizer(
     assert contract.matches
 
 
-def test_projected_v5_worker_is_rejected_before_renderer(monkeypatch, tmp_path):
+def test_projected_v6_worker_is_rejected_before_renderer(monkeypatch, tmp_path):
     writer_kwargs, output_path = _builtin_kubernetes_writer_kwargs(
-        monkeypatch, tmp_path, 'projected-v5-decode-only')
+        monkeypatch, tmp_path, 'projected-v6-decode-only')
     writer_kwargs['to_provision'] = Resources(
         cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
     writer_kwargs['worker_placement_projections'] = [
-        _projected_h200_worker_memory(5)
+        _projected_h200_worker_memory(6)
     ]
 
-    with pytest.raises(ValueError, match='does not satisfy required version 6'):
+    with pytest.raises(ValueError, match='does not satisfy required version 7'):
         backend_utils.write_cluster_config(**writer_kwargs)
 
     assert not pathlib.Path(f'{output_path}.tmp').exists()
@@ -781,14 +781,53 @@ def test_legacy_v5_bootstrap_identity_hash_remains_decode_stable():
             pod_spec, {})
 
 
-def test_projected_v6_bootstrap_env_is_inherited_by_fresh_kubectl_exec(
+def test_legacy_v6_bootstrap_identity_decodes_but_fresh_v7_rejects_it():
+    legacy_marker = 'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V6'
+    environment = [{
+        'name': key,
+        'value': value,
+    } for key, value in sorted(
+        kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENVIRONMENT.items())]
+    script_lines = ['canonical bootstrap', f'# {legacy_marker}']
+    script_lines.extend(
+        f'export {key}={json.dumps(value)}' for key, value in sorted(
+            kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENVIRONMENT.items()))
+    pod_spec = {
+        'containers': [{
+            'name': 'ray-node',
+            'command': ['/bin/bash', '-c', '--'],
+            'args': ['\n'.join(script_lines)],
+            'env': environment,
+        }]
+    }
+
+    # Historical identity decoding remains exact for settlement and cleanup.
+    assert (
+        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(pod_spec)
+        == '42579b1d954c76f38caa094f818c852a3f00c74ed472d6cff25fe16fcd333bf9')
+    mutated = copy.deepcopy(pod_spec)
+    next(entry for entry in mutated['containers'][0]['env']
+         if entry['name'] == 'UV_CACHE_DIR')['value'] = '/root/.cache/uv'
+    assert (
+        kubernetes_pod_spec.projected_worker_runtime_bootstrap_sha256(mutated)
+        == '4a24d1a2869e111d0a4f25fb637aa52431af1131fe780e0823491c87adfe42a8')
+
+    # Fresh rendering is exact-current only and cannot reuse released v6.
+    with pytest.raises(
+            kubernetes_pod_spec.ProjectedRuntimeReadinessContractError,
+            match='historical marker'):
+        kubernetes_pod_spec.validate_projected_worker_bootstrap_environment(
+            pod_spec, kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENVIRONMENT)
+
+
+def test_projected_v7_bootstrap_env_is_inherited_by_fresh_kubectl_exec(
         monkeypatch, tmp_path):
     writer_kwargs, _ = _builtin_kubernetes_writer_kwargs(
-        monkeypatch, tmp_path, 'projected-v6-bootstrap-environment')
+        monkeypatch, tmp_path, 'projected-v7-bootstrap-environment')
     writer_kwargs['to_provision'] = Resources(
         cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
     writer_kwargs['worker_placement_projections'] = [
-        _projected_h200_worker_memory(6)
+        _projected_h200_worker_memory(7)
     ]
 
     result = backend_utils.write_cluster_config(**writer_kwargs)
@@ -904,7 +943,7 @@ def test_builtin_kubernetes_writer_preserves_replacement_renderer_authority(
                              'templates' / template_ref)
         source_bytes = template_path.read_bytes()
         assert hashlib.sha256(source_bytes).hexdigest() == (
-            '92f99cd27a606ad121dbd5786c0dd55f07fa68a00fda5581f9b8b0e0e0e3d6b4')
+            'f6d581517096d4074d0dd2e9d1a1aec1de48b813e5c48af4f7eefcdd67d9fa7d')
         source = source_bytes.decode('utf-8')
         assert '{{ skypilot_kubernetes_node_config_fragment_v1 }}\n' not in source
         rendered = common_utils.jinja2.Template(source).render(**variables)
@@ -1213,24 +1252,24 @@ def test_host_network_probe_is_only_builtin_render_delta(
         current_render.replace(canonical_root, b'<TMP>')).hexdigest()
     expected_hashes = {
         'kubernetes-host-network-false': (
-            '388196c00e5031bdee6d0d54545ffdc0d34a3e8d7415012b5572809cd0fa4ba5',
-            '37ecd33134e545581ace328fe4c106d04091c958cd7956cacde1cc2e0f2ed680',
+            '5da3f2f14f0cf7d2456b7f2be77cbfed36d51ec5ab7b122fe73dc91fa9f1cb44',
+            '01dbab0645bd9ec4efab9cfe2b77896fa6722a261afee25f11643993497e6ae3',
         ),
         'kubernetes-host-network-true': (
-            'e7e19f3fd1690e5dedfe94fdbf69282a144e94590f0be76eb82075a9475ada66',
-            'b4aa2a197fcb685a88383185644e4cbdb30d882506f56f90cc7177d358b86b9c',
+            'd42edfc2632f5bfb1843504d58d28c4848fad786145baf45a3e282fe1b34e948',
+            '2caf8a30e572ed7fc322f126db27a1267403a5486f36b99e615c9f98e039f61d',
         ),
         'kubernetes-oci-roce': (
-            'b078ee6bbe839458e18e0b79c044cba3126d1b803605b4b0b087fbb3b2ed20cc',
-            'f64b78f407cc1e35d2cf1201f81657bbf902a84376c5aefcf38744e5ab44ce64',
+            '6d8df32c3402642131252ce42e8867b6ea29ba41f19e9a534364c24b1c4b732b',
+            'fbb6fc73fd5e76b6c76ffd405d95c8c33927b9b8961a7312f4d0721593f968a1',
         ),
         'ssh-host-network-false': (
-            '2407f33438cd47f42d8c76e30d1197ed67950c9e51a34bd19049de457188f4ee',
-            '433d1e5c2bc88e309d15bda6ba70b5df2fa58daf07dd34d029a57c3ee5d2281f',
+            '27bc1a5e739592183508fff148e683f1fc1e63ae663bf28b35e4cc40b017de20',
+            '19d5fe906386aecc31de0d2915b80598f04e3dd342022ec7a27176c9eb3a387e',
         ),
         'ssh-host-network-true': (
-            '48945419d3f9ba8f70d9c2637079b743e4af594cfa5478f3611a1eb738f55b04',
-            '62caad95d52a724ab821702cd6b9dd52590f63a3f732395b3c58e326fd00c166',
+            '7f9e5c9d7fdc330386fd0f8ce1754c2aa4c1ccf475d2f7f32941f96a16d08662',
+            '9ab1d8d4808fad17bf264d1df1cfc83af8d3a83ac85719f9398e9b7eb69eb1f3',
         ),
     }
     assert (legacy_hash, current_hash) == expected_hashes[scenario]

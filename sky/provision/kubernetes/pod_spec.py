@@ -23,18 +23,22 @@ from sky.utils import config_utils
 
 PodRole = Literal['head', 'worker']
 
-SERVE_WORKER_PROJECTION_PROTOCOL_VERSION = 6
+SERVE_WORKER_PROJECTION_PROTOCOL_VERSION = 7
 _SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
-    {1, 2, 3, 4, 5, 6})
-_STRICT_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({2, 3, 4, 5, 6})
-_SCRATCH_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({3, 4, 5, 6})
-_RUNTIME_READY_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({4, 5, 6})
-_SCRATCH_BOOTSTRAP_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({6})
+    {1, 2, 3, 4, 5, 6, 7})
+_STRICT_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
+    {2, 3, 4, 5, 6, 7})
+_SCRATCH_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({3, 4, 5, 6, 7})
+_RUNTIME_READY_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
+    {4, 5, 6, 7})
+_SCRATCH_BOOTSTRAP_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({6, 7})
 SERVE_WORKER_SCRATCH_MOUNT_PATH = '/tmp'
 SERVE_WORKER_SCRATCH_VOLUME_NAME = 'skypilot-serve-worker-tmp'
-SERVE_WORKER_BOOTSTRAP_ENV_MARKER = 'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V6'
-SERVE_WORKER_LEGACY_BOOTSTRAP_ENV_MARKERS = frozenset(
-    {'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V5'})
+SERVE_WORKER_BOOTSTRAP_ENV_MARKER = 'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V7'
+SERVE_WORKER_LEGACY_BOOTSTRAP_ENV_MARKERS = frozenset({
+    'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V5',
+    'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V6',
+})
 SERVE_WORKER_BOOTSTRAP_ENVIRONMENT = {
     'SKY_RUNTIME_DIR': '/tmp/.skypilot-runtime/root',
     'UV_CACHE_DIR': '/tmp/.skypilot-runtime/uv-cache',
@@ -124,7 +128,7 @@ def validate_serve_worker_projection_protocol_version(
     if (type(value) is not int or
             value not in _SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS):
         raise ValueError('SkyServe worker projection protocol version must be '
-                         '1, 2, 3, 4, 5, or 6.')
+                         '1, 2, 3, 4, 5, 6, or 7.')
     return value
 
 
@@ -168,7 +172,7 @@ def serve_worker_projection_protocol_has_scratch_bootstrap(
 
 
 def validate_projected_worker_provision_timeout(value: object) -> int:
-    """Validate the closed v3-v6 provisioning-wait contract."""
+    """Validate the closed v3-v7 provisioning-wait contract."""
     if type(value) is not int or value < -1:
         raise ValueError('Projected worker provision_timeout must be -1 or a '
                          'non-negative integer.')
@@ -855,17 +859,17 @@ def validate_projected_worker_bootstrap_environment(
     if any(marker in script
            for marker in SERVE_WORKER_LEGACY_BOOTSTRAP_ENV_MARKERS):
         raise ProjectedRuntimeReadinessContractError(
-            'Protocol-v6 scratch bootstrap cannot carry a historical marker.')
+            'Protocol-v7 scratch bootstrap cannot carry a historical marker.')
     marker_line = f'# {SERVE_WORKER_BOOTSTRAP_ENV_MARKER}'
     script_lines = script.splitlines()
     if script_lines.count(marker_line) != 1:
         raise ProjectedRuntimeReadinessContractError(
-            'Protocol-v6 scratch bootstrap must carry one exact marker.')
+            'Protocol-v7 scratch bootstrap must carry one exact marker.')
     marker_offset = script_lines.index(marker_line)
     env = _pod_api_field(runtime, 'env', 'env')
     if not isinstance(env, (list, tuple)):
         raise ProjectedRuntimeReadinessContractError(
-            'Protocol-v6 scratch bootstrap environment must be a list.')
+            'Protocol-v7 scratch bootstrap environment must be a list.')
     observed_entries = []
     for entry in env:
         if _pod_api_field(entry, 'name', 'name') not in expected:
@@ -881,14 +885,14 @@ def validate_projected_worker_bootstrap_environment(
     } for key in sorted(expected)]
     if observed_entries != expected_entries:
         raise ProjectedRuntimeReadinessContractError(
-            'Protocol-v6 scratch bootstrap Pod environment differs from the '
+            'Protocol-v7 scratch bootstrap Pod environment differs from the '
             'exact server-owned paths.')
     for key, value in expected.items():
         export = f'export {key}={json.dumps(value)}'
         if (script_lines.count(export) != 1 or
                 script_lines.index(export) < marker_offset):
             raise ProjectedRuntimeReadinessContractError(
-                'Protocol-v6 scratch bootstrap script must re-export every '
+                'Protocol-v7 scratch bootstrap script must re-export every '
                 'exact server-owned path once after its post-runcmd marker.')
     return {key: expected[key] for key in sorted(expected)}
 

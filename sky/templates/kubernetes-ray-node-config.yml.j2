@@ -568,7 +568,7 @@
                 /tmp/env-setup.failed \
                 /tmp/sky_host_network_ports.env
 {% endif %}{% if k8s_projected_worker_bootstrap_environment %}              # {{k8s_projected_worker_bootstrap_env_marker}}
-              # Reassert the projection-v6 scratch paths after runcmd so
+              # Reassert the current projection scratch paths after runcmd so
               # mutable image or platform initialization cannot redirect the
               # SkyPilot runtime or uv's large writable trees to nodefs.
 {% for key, value in k8s_projected_worker_bootstrap_environment.items() %}              export {{key}}={{value | tojson}}
@@ -589,13 +589,16 @@
 
               # STEP 1: Run apt update, install missing packages, and set up ssh.
               (
+                # PID 1 runs with errexit. Disable it in this supervisor shell
+                # so an inner failure is always converted into a durable marker.
+                set +e
                 (
+                set -e
                 # Timeout (seconds) for each individual apt-get invocation.
                 # The default Acquire::http::Timeout is 120s which is too slow
                 # when mirrors are degraded but not fully down.
                 APT_ACQUIRE_TIMEOUT=30
                 APT_CMD_TIMEOUT=60
-                APT_INSTALL_CMD_TIMEOUT=90
                 APT_OPTS="-o Acquire::http::Timeout=${APT_ACQUIRE_TIMEOUT} -o Acquire::https::Timeout=${APT_ACQUIRE_TIMEOUT} -o Acquire::Retries=0"
 
                 # Helper: run apt-get update with retries
@@ -634,20 +637,24 @@
                   local delay=1
                   local i
                   for i in $(seq 1 $tries); do
-                    timeout $APT_INSTALL_CMD_TIMEOUT \
-                      $(prefix_cmd) env DEBIAN_FRONTEND=noninteractive \
+                    $(prefix_cmd) env DEBIAN_FRONTEND=noninteractive \
                       apt-get install $APT_OPTS -y \
                       -o Dpkg::Options::="--force-confdef" \
                       -o Dpkg::Options::="--force-confold" $packages
                     local rc=$?
                     if [ $rc -eq 0 ]; then
                       set -e; return 0
-                    elif [ $rc -eq 124 ]; then
-                      echo "apt-get install timed out after ${APT_INSTALL_CMD_TIMEOUT}s for: $packages (attempt $i/$tries)" >> "$log"
                     else
-                      echo "apt-get install failed for: $packages (attempt $i/$tries, rc=$rc). Running -f install and retrying..." >> "$log"
+                      echo "apt-get install failed for: $packages (attempt $i/$tries, rc=$rc). Repairing dpkg state and retrying..." >> "$log"
                     fi
-                    DEBIAN_FRONTEND=noninteractive $(prefix_cmd) apt-get -f install -y >> "$log" 2>&1 || true
+                    $(prefix_cmd) env DEBIAN_FRONTEND=noninteractive \
+                      dpkg --force-confdef --force-confold --configure -a \
+                      >> "$log" 2>&1 || true
+                    $(prefix_cmd) env DEBIAN_FRONTEND=noninteractive \
+                      apt-get -f install $APT_OPTS -y \
+                      -o Dpkg::Options::="--force-confdef" \
+                      -o Dpkg::Options::="--force-confold" \
+                      >> "$log" 2>&1 || true
                     DEBIAN_FRONTEND=noninteractive $(prefix_cmd) apt-get clean >> "$log" 2>&1 || true
                     [ $i -lt $tries ] && { echo "retrying in ${delay}s" >> "$log"; sleep $delay; delay=$((delay * 2)); }
                   done
@@ -909,11 +916,12 @@
                 touch /tmp/apt_ssh_setup_complete
                 echo "=== SSH setup completed ==="
                 ) > /tmp/${STEPS[0]}.log 2>&1
-                if [ "$?" -ne "0" ]; then
+                STEP_STATUS=$?
+                if [ "$STEP_STATUS" -ne "0" ]; then
                   {
-                  echo "Error: ${STEPS[0]} failed. Continuing anyway..." > /tmp/${STEPS[0]}.failed 2>&1
+                  echo "Error: ${STEPS[0]} failed. Publishing failure marker..." > /tmp/${STEPS[0]}.failed 2>&1
                   cat /tmp/${STEPS[0]}.log
-                  exit 1
+                  exit "$STEP_STATUS"
                   }
                 fi
               ) &
@@ -921,6 +929,9 @@
               # STEP 2: Install conda, ray and skypilot (for dependencies); start
               # ray cluster.
               (
+                # PID 1 runs with errexit. Disable it in this supervisor shell
+                # so an inner failure is always converted into a durable marker.
+                set +e
                 (
                 set -e
                 # Create $SKY_RUNTIME_DIR/.sky early — conda_installation_commands
@@ -991,11 +1002,12 @@
                 fi
                 touch /tmp/ray_skypilot_runtime_complete
 {% endif %}                ) > /tmp/${STEPS[1]}.log 2>&1
-                if [ "$?" -ne "0" ]; then
+                STEP_STATUS=$?
+                if [ "$STEP_STATUS" -ne "0" ]; then
                   {
-                  echo "Error: ${STEPS[1]} failed. Continuing anyway..." > /tmp/${STEPS[1]}.failed 2>&1
+                  echo "Error: ${STEPS[1]} failed. Publishing failure marker..." > /tmp/${STEPS[1]}.failed 2>&1
                   cat /tmp/${STEPS[1]}.log
-                  exit 1
+                  exit "$STEP_STATUS"
                   }
                 fi
               ) &
@@ -1003,6 +1015,9 @@
 
               # STEP 3: Set up environment variables; this should be relatively fast.
               (
+                # PID 1 runs with errexit. Disable it in this supervisor shell
+                # so an inner failure is always converted into a durable marker.
+                set +e
                 (
                 set -e
                 if [ $(id -u) -eq 0 ]; then
@@ -1017,11 +1032,12 @@
                 export -p > ~/container_env_var.sh && $(prefix_cmd) mv ~/container_env_var.sh /etc/profile.d/container_env_var.sh
                 touch /tmp/env_setup_complete
                 ) > /tmp/${STEPS[2]}.log 2>&1
-                if [ "$?" -ne "0" ]; then
+                STEP_STATUS=$?
+                if [ "$STEP_STATUS" -ne "0" ]; then
                   {
-                  echo "Error: ${STEPS[2]} failed. Continuing anyway..." > /tmp/${STEPS[2]}.failed 2>&1
+                  echo "Error: ${STEPS[2]} failed. Publishing failure marker..." > /tmp/${STEPS[2]}.failed 2>&1
                   cat /tmp/${STEPS[2]}.log
-                  exit 1
+                  exit "$STEP_STATUS"
                   }
                 fi
               ) &
@@ -1101,14 +1117,21 @@
               # exit the container so the pod enters a failed state instead
               # of hanging indefinitely.
               STEP_COMPLETE_FILES=(/tmp/apt_ssh_setup_complete /tmp/ray_skypilot_installation_complete /tmp/env_setup_complete)
-              for i in "${!STEPS[@]}"; do
-                until [ -f "${STEP_COMPLETE_FILES[$i]}" ] || [ -f "/tmp/${STEPS[$i]}.failed" ]; do
-                  sleep 1
+              while true; do
+                ALL_STEPS_COMPLETE=true
+                for i in "${!STEPS[@]}"; do
+                  if [ -f "/tmp/${STEPS[$i]}.failed" ]; then
+                    echo "Error: setup step '${STEPS[$i]}' failed. Pod will exit."
+                    exit 1
+                  fi
+                  if [ ! -f "${STEP_COMPLETE_FILES[$i]}" ]; then
+                    ALL_STEPS_COMPLETE=false
+                  fi
                 done
-                if [ -f "/tmp/${STEPS[$i]}.failed" ]; then
-                  echo "Error: setup step '${STEPS[$i]}' failed. Pod will exit."
-                  exit 1
+                if [ "$ALL_STEPS_COMPLETE" = true ]; then
+                  break
                 fi
+                sleep 1
               done
 {% if k8s_projected_serve_worker_runtime_readiness %}              # The historical runtime-install marker precedes Ray start.
               # Projected Serve workers additionally wait for the successful

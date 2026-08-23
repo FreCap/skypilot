@@ -98,14 +98,14 @@ def _worker_projection(*,
             'kind': 'none'
         },
     }
-    if protocol_version in (2, 3, 4, 5, 6):
+    if protocol_version in (2, 3, 4, 5, 6, 7):
         projection = {
             'projection_version': protocol_version,
             **projection,
             'scheduler_name': scheduler_name,
             'kueue_admission': kueue_admission,
         }
-    if protocol_version in (3, 4, 5, 6):
+    if protocol_version in (3, 4, 5, 6, 7):
         projection['provision_timeout'] = provision_timeout
         projection['scratch'] = ({
             'kind': 'none'
@@ -113,7 +113,7 @@ def _worker_projection(*,
     return projection
 
 
-def _v6_bootstrap_script() -> str:
+def _current_bootstrap_script() -> str:
     lines = [
         'canonical bootstrap',
         f'# {kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENV_MARKER}',
@@ -123,7 +123,7 @@ def _v6_bootstrap_script() -> str:
     return '\n'.join(lines)
 
 
-def _v6_bootstrap_pod_environment() -> list[dict[str, str]]:
+def _current_bootstrap_pod_environment() -> list[dict[str, str]]:
     return [{
         'name': key,
         'value': value,
@@ -172,7 +172,7 @@ def test_worker_projection_protocol_v2_is_explicit_and_v1_is_isolated():
         })
 
 
-def test_worker_projection_protocol_v6_is_canonical_and_older_are_isolated():
+def test_worker_projection_protocol_v7_is_canonical_and_older_are_isolated():
     admission = {
         'local_queue_name': 'inference',
         'workload_priority_class_name': 'inference-low',
@@ -198,26 +198,34 @@ def test_worker_projection_protocol_v6_is_canonical_and_older_are_isolated():
         **v3,
         'projection_version': 6,
     }
+    v7 = {
+        **v3,
+        'projection_version': 7,
+    }
 
     assert kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENV_MARKER == (
-        'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V6')
+        'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V7')
     assert kubernetes_pod_spec.SERVE_WORKER_LEGACY_BOOTSTRAP_ENV_MARKERS == {
-        'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V5'
+        'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V5',
+        'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V6',
     }
     assert kubernetes_identity.worker_projection_protocol_version(v2) == 2
     assert kubernetes_identity.worker_projection_protocol_version(v3) == 3
     assert kubernetes_identity.worker_projection_protocol_version(v4) == 4
     assert kubernetes_identity.worker_projection_protocol_version(v5) == 5
     assert kubernetes_identity.worker_projection_protocol_version(v6) == 6
+    assert kubernetes_identity.worker_projection_protocol_version(v7) == 7
     assert kubernetes_identity.worker_projection_has_strict_admission(v2)
     assert kubernetes_identity.worker_projection_has_strict_admission(v3)
     assert kubernetes_identity.worker_projection_has_strict_admission(v4)
     assert kubernetes_identity.worker_projection_has_strict_admission(v5)
     assert kubernetes_identity.worker_projection_has_strict_admission(v6)
+    assert kubernetes_identity.worker_projection_has_strict_admission(v7)
     assert kubernetes_identity.worker_projection_has_scratch(v3)
     assert kubernetes_identity.worker_projection_has_scratch(v4)
     assert kubernetes_identity.worker_projection_has_scratch(v5)
     assert kubernetes_identity.worker_projection_has_scratch(v6)
+    assert kubernetes_identity.worker_projection_has_scratch(v7)
     assert not (kubernetes_pod_spec.
                 serve_worker_projection_protocol_has_runtime_readiness(3))
     assert (kubernetes_pod_spec.
@@ -226,10 +234,14 @@ def test_worker_projection_protocol_v6_is_canonical_and_older_are_isolated():
             serve_worker_projection_protocol_has_runtime_readiness(5))
     assert (kubernetes_pod_spec.
             serve_worker_projection_protocol_has_runtime_readiness(6))
+    assert (kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_runtime_readiness(7))
     assert not (kubernetes_pod_spec.
                 serve_worker_projection_protocol_has_scratch_bootstrap(5))
     assert (kubernetes_pod_spec.
             serve_worker_projection_protocol_has_scratch_bootstrap(6))
+    assert (kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_scratch_bootstrap(7))
     assert kubernetes_identity.validate_worker_placement_projections(
         [v2], require_protocol_version=2) == [v2]
     assert kubernetes_identity.validate_worker_placement_projections(
@@ -240,15 +252,17 @@ def test_worker_projection_protocol_v6_is_canonical_and_older_are_isolated():
         [v5], require_protocol_version=5) == [v5]
     assert kubernetes_identity.validate_worker_placement_projections(
         [v6], require_protocol_version=6) == [v6]
+    assert kubernetes_identity.validate_worker_placement_projections(
+        [v7], require_protocol_version=7) == [v7]
     with pytest.raises(ValueError, match='must not mix protocol versions'):
-        kubernetes_identity.validate_worker_placement_projections([v5, v6])
-    with pytest.raises(ValueError, match='protocol-v3/v4/v5/v6 keys'):
+        kubernetes_identity.validate_worker_placement_projections([v6, v7])
+    with pytest.raises(ValueError, match='protocol-v3/v4/v5/v6/v7 keys'):
         kubernetes_identity.worker_projection_protocol_version({
-            **v6, 'unknown': True
+            **v7, 'unknown': True
         })
     missing_timeout = copy.deepcopy(v4)
     missing_timeout.pop('provision_timeout')
-    with pytest.raises(ValueError, match='protocol-v3/v4/v5/v6 keys'):
+    with pytest.raises(ValueError, match='protocol-v3/v4/v5/v6/v7 keys'):
         kubernetes_identity.worker_projection_protocol_version(missing_timeout)
     assert (kubernetes_identity.worker_projection_sha256(v3)
             != kubernetes_identity.worker_projection_sha256(v4))
@@ -256,6 +270,8 @@ def test_worker_projection_protocol_v6_is_canonical_and_older_are_isolated():
             != kubernetes_identity.worker_projection_sha256(v5))
     assert (kubernetes_identity.worker_projection_sha256(v5)
             != kubernetes_identity.worker_projection_sha256(v6))
+    assert (kubernetes_identity.worker_projection_sha256(v6)
+            != kubernetes_identity.worker_projection_sha256(v7))
 
 
 def test_worker_projection_v3_digest_covers_scratch():
@@ -1390,7 +1406,7 @@ run: echo hi
         _worker_role('east'),
         _worker_role('phx'),
     ]
-    assert all(item['projection_version'] == 6 for item in projected)
+    assert all(item['projection_version'] == 7 for item in projected)
     assert all(item['provision_timeout'] == -1 for item in projected)
     assert all(item['scratch'] == {'kind': 'none'} for item in projected)
     assert all(
@@ -1401,7 +1417,7 @@ run: echo hi
     assert projected[1]['accelerator_scheduling'] == (_accelerator_scheduling())
 
 
-def test_worker_catalog_preserves_identity_free_v6_candidates(monkeypatch):
+def test_worker_catalog_preserves_identity_free_v7_candidates(monkeypatch):
     task = task_lib.Task.from_yaml_str('''
 resources:
   infra: k8s/phx
@@ -1444,7 +1460,7 @@ run: echo hi
         task, workspace='inference', placement_catalog={})
 
     assert projected is not None
-    assert projected[0]['projection_version'] == 6
+    assert projected[0]['projection_version'] == 7
     assert projected[0]['provision_timeout'] == -1
     assert projected[0]['scratch'] == {'kind': 'none'}
     assert projected[0]['pod_identity_role_arn'] is None
@@ -1672,7 +1688,7 @@ def test_runtime_cache_uses_final_h200_choice_from_heterogeneous_task():
         'SKYPILOT_SERVE_CACHE_EVIL': 'caller-secret',
     })
     projections = [{
-        'projection_version': 6,
+        'projection_version': 7,
         'candidate_id': 'kubernetes-0000',
         'kubernetes_context': 'east',
         'namespace': 'inference',
@@ -1694,7 +1710,7 @@ def test_runtime_cache_uses_final_h200_choice_from_heterogeneous_task():
             'kind': 'none'
         },
     }, {
-        'projection_version': 6,
+        'projection_version': 7,
         'candidate_id': 'kubernetes-0001',
         'kubernetes_context': 'phx',
         'namespace': 'inference',
@@ -1747,7 +1763,7 @@ def test_runtime_cache_uses_final_h200_choice_from_heterogeneous_task():
     assert task.envs_and_secrets['SKYPILOT_SERVE_CACHE_KIND'] == 'node_local'
 
 
-def test_runtime_scratch_v6_owns_bootstrap_paths_and_overrides_caller():
+def test_runtime_scratch_v7_owns_bootstrap_paths_and_overrides_caller():
     task = task_lib.Task()
     task.set_resources(
         resources_lib.Resources(cloud=kubernetes_identity.clouds.Kubernetes(),
@@ -1765,7 +1781,7 @@ def test_runtime_scratch_v6_owns_bootstrap_paths_and_overrides_caller():
     })
     launch_context = {
         constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
-            _worker_projection(protocol_version=6,
+            _worker_projection(protocol_version=7,
                                scratch={
                                    'kind': 'memory',
                                    'mount_path': '/tmp',
@@ -1792,7 +1808,7 @@ def test_runtime_scratch_v6_owns_bootstrap_paths_and_overrides_caller():
                    for key in task.secrets)
 
 
-def test_runtime_bootstrap_paths_are_owned_only_by_v6_memory_scratch():
+def test_runtime_bootstrap_paths_are_owned_by_v6_v7_memory_scratch():
     memory_scratch = {
         'kind': 'memory',
         'mount_path': '/tmp',
@@ -1809,11 +1825,16 @@ def test_runtime_bootstrap_paths_are_owned_only_by_v6_memory_scratch():
             kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENVIRONMENT)
     assert kubernetes_identity.bootstrap_environment(
         _worker_projection(protocol_version=6)) == {}
+    assert kubernetes_identity.bootstrap_environment(
+        _worker_projection(protocol_version=7, scratch=memory_scratch)) == (
+            kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENVIRONMENT)
+    assert kubernetes_identity.bootstrap_environment(
+        _worker_projection(protocol_version=7)) == {}
 
 
 def test_final_kubernetes_yaml_enforces_platform_identity_and_cache():
     projection = {
-        'projection_version': 6,
+        'projection_version': 7,
         'candidate_id': 'kubernetes-0002',
         'kubernetes_context': 'phx',
         'namespace': 'rescluster-k8s-prod-east1-preemptible-inference',
@@ -1918,7 +1939,7 @@ def test_final_kubernetes_yaml_enforces_platform_identity_and_cache():
         'context': 'phx',
         'namespace': 'rescluster-k8s-prod-east1-preemptible-inference',
         'timeout': -1,
-        'serve_worker_projection_protocol_version': 6,
+        'serve_worker_projection_protocol_version': 7,
         'serve_worker_expected_runtime_bootstrap_sha256': bootstrap_sha256,
         'serve_worker_expected_scratch': {
             'kind': 'none'
@@ -1979,7 +2000,7 @@ def test_final_kubernetes_yaml_enforces_platform_identity_and_cache():
 
 @pytest.mark.parametrize('claim_surface', ['pod', 'runtime_container'])
 def test_final_kubernetes_yaml_rejects_dynamic_resource_claims(claim_surface):
-    projection = _worker_projection(protocol_version=6)
+    projection = _worker_projection(protocol_version=7)
     pod_spec = {
         'containers': [{
             'name': 'ray-node',
@@ -2016,9 +2037,9 @@ def test_final_kubernetes_yaml_rejects_dynamic_resource_claims(claim_surface):
             expected_runtime_bootstrap_sha256=bootstrap_sha256)
 
 
-def test_final_kubernetes_yaml_reasserts_v6_kueue_admission():
+def test_final_kubernetes_yaml_reasserts_v7_kueue_admission():
     projection = _worker_projection(
-        protocol_version=6,
+        protocol_version=7,
         scheduler_name='trusted-batch-scheduler',
         kueue_admission={
             'local_queue_name': 'inference',
@@ -2083,7 +2104,7 @@ def test_final_kubernetes_yaml_reasserts_v6_kueue_admission():
     assert 'nodeName' not in node_config['spec']
     assert node_config['spec']['schedulerName'] == 'trusted-batch-scheduler'
 
-    projection_without_kueue = _worker_projection(protocol_version=6,
+    projection_without_kueue = _worker_projection(protocol_version=7,
                                                   kueue_admission=None)
     backend_utils._enforce_worker_projection_on_kubernetes_yaml(
         cluster_yaml,
@@ -2098,9 +2119,9 @@ def test_final_kubernetes_yaml_reasserts_v6_kueue_admission():
                     'kueue.x-k8s.io/priority-class', 'kueue.x-k8s.io/managed'))
 
 
-def test_final_v6_yaml_composes_kueue_cache_scratch_and_readiness():
+def test_final_v7_yaml_composes_kueue_cache_scratch_and_readiness():
     projection = _worker_projection(
-        protocol_version=6,
+        protocol_version=7,
         scheduler_name='trusted-batch-scheduler',
         kueue_admission={
             'local_queue_name': 'inference',
@@ -2125,11 +2146,11 @@ def test_final_v6_yaml_composes_kueue_cache_scratch_and_readiness():
                         'containers': [{
                             'name': 'ray-node',
                             'command': ['/bin/bash', '-c', '--'],
-                            'args': [_v6_bootstrap_script()],
+                            'args': [_current_bootstrap_script()],
                             'env': [{
                                 'name': 'SKYPILOT_SERVE_SCRATCH_KIND',
                                 'value': 'caller',
-                            }, *_v6_bootstrap_pod_environment()],
+                            }, *_current_bootstrap_pod_environment()],
                         }],
                     },
                 },
@@ -2153,7 +2174,7 @@ def test_final_v6_yaml_composes_kueue_cache_scratch_and_readiness():
 
     assert cluster_yaml == first
     assert cluster_yaml['provider'][
-        'serve_worker_projection_protocol_version'] == 6
+        'serve_worker_projection_protocol_version'] == 7
     assert cluster_yaml['provider']['timeout'] == -1
     assert cluster_yaml['provider'][
         'serve_worker_expected_runtime_bootstrap_sha256'] == bootstrap_sha256
@@ -2248,14 +2269,14 @@ def test_final_v6_yaml_composes_kueue_cache_scratch_and_readiness():
     }
 
 
-@pytest.mark.parametrize('protocol_version', [1, 2, 3, 4, 5])
+@pytest.mark.parametrize('protocol_version', [1, 2, 3, 4, 5, 6])
 def test_final_yaml_rejects_historical_projection_before_mutation(
         protocol_version):
     cluster_yaml = _projected_worker_cluster_yaml()
     original = copy.deepcopy(cluster_yaml)
 
     with pytest.raises(exceptions.InvalidCloudConfigs,
-                       match='does not satisfy required version 6'):
+                       match='does not satisfy required version 7'):
         backend_utils._enforce_worker_projection_on_kubernetes_yaml(
             cluster_yaml, _worker_projection(protocol_version=protocol_version))
 
@@ -2318,7 +2339,7 @@ def test_projected_runtime_readiness_rejects_owned_surface_collision(collision):
         },
     }),
 ])
-def test_final_v6_yaml_rejects_bootstrap_producer_mutation(mutation):
+def test_final_v7_yaml_rejects_bootstrap_producer_mutation(mutation):
     cluster_yaml = _projected_worker_cluster_yaml()
     pod_spec = cluster_yaml['available_node_types']['ray_head_default'][
         'node_config']['spec']
@@ -2330,7 +2351,7 @@ def test_final_v6_yaml_rejects_bootstrap_producer_mutation(mutation):
                        match='bootstrap command|bootstrap producer'):
         backend_utils._enforce_worker_projection_on_kubernetes_yaml(
             cluster_yaml,
-            _worker_projection(protocol_version=6),
+            _worker_projection(protocol_version=7),
             expected_runtime_bootstrap_sha256=bootstrap_sha256)
 
 
@@ -2389,13 +2410,13 @@ def test_admitted_runtime_readiness_rejects_bootstrap_producer_mutation(
             pod, 'inference', 'phx', True, bootstrap_sha256, defer_cleanup=True)
 
 
-def test_admitted_v6_runtime_readiness_rejects_bootstrap_environment_drift():
+def test_admitted_v7_runtime_readiness_rejects_bootstrap_environment_drift():
     pod_spec = {
         'containers': [{
             'name': 'ray-node',
             'command': ['/bin/bash', '-c', '--'],
-            'args': [_v6_bootstrap_script()],
-            'env': _v6_bootstrap_pod_environment(),
+            'args': [_current_bootstrap_script()],
+            'env': _current_bootstrap_pod_environment(),
         }]
     }
     bootstrap_sha256 = (
@@ -2422,16 +2443,16 @@ def test_admitted_v6_runtime_readiness_rejects_bootstrap_environment_drift():
             pod, 'inference', 'phx', True, bootstrap_sha256, defer_cleanup=True)
 
 
-def test_v6_bootstrap_contract_rejects_missing_post_runcmd_export():
+def test_v7_bootstrap_contract_rejects_missing_post_runcmd_export():
     pod_spec = {
         'containers': [{
             'name': 'ray-node',
             'command': ['/bin/bash', '-c', '--'],
             'args': [
-                _v6_bootstrap_script().replace(
+                _current_bootstrap_script().replace(
                     'export UV_CACHE_DIR="/tmp/.skypilot-runtime/uv-cache"', '')
             ],
-            'env': _v6_bootstrap_pod_environment(),
+            'env': _current_bootstrap_pod_environment(),
         }]
     }
 
@@ -2443,8 +2464,8 @@ def test_v6_bootstrap_contract_rejects_missing_post_runcmd_export():
 
 
 @pytest.mark.parametrize('line_kind', ['marker', 'export'])
-def test_v6_bootstrap_contract_requires_exact_full_lines(line_kind):
-    script = _v6_bootstrap_script()
+def test_v7_bootstrap_contract_requires_exact_full_lines(line_kind):
+    script = _current_bootstrap_script()
     if line_kind == 'marker':
         exact_line = (
             f'# {kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENV_MARKER}')
@@ -2455,7 +2476,7 @@ def test_v6_bootstrap_contract_requires_exact_full_lines(line_kind):
             'name': 'ray-node',
             'command': ['/bin/bash', '-c', '--'],
             'args': [script.replace(exact_line, f'{exact_line} trailing')],
-            'env': _v6_bootstrap_pod_environment(),
+            'env': _current_bootstrap_pod_environment(),
         }]
     }
 
@@ -2506,12 +2527,12 @@ def _projected_worker_cluster_yaml(*, bootstrap_environment=False):
         'name': 'ray-node',
         'command': ['/bin/bash', '-c', '--'],
         'args': [
-            _v6_bootstrap_script()
+            _current_bootstrap_script()
             if bootstrap_environment else 'canonical bootstrap'
         ],
     }
     if bootstrap_environment:
-        runtime['env'] = _v6_bootstrap_pod_environment()
+        runtime['env'] = _current_bootstrap_pod_environment()
     return {
         'provider': {},
         'available_node_types': {
@@ -2560,9 +2581,9 @@ def _worker_bootstrap_sha256(cluster_yaml):
         'devicePath': '/dev/scratch',
     }),
 ])
-def test_final_v6_yaml_rejects_existing_scratch_identity_collisions(mutate):
+def test_final_v7_yaml_rejects_existing_scratch_identity_collisions(mutate):
     projection = _worker_projection(
-        protocol_version=6,
+        protocol_version=7,
         scratch={
             'kind': 'memory',
             'mount_path': '/tmp',
@@ -2583,9 +2604,9 @@ def test_final_v6_yaml_rejects_existing_scratch_identity_collisions(mutate):
 
 
 @pytest.mark.parametrize('duplicate', ['volume', 'mount'])
-def test_final_v6_yaml_rejects_duplicate_exact_scratch_identity(duplicate):
+def test_final_v7_yaml_rejects_duplicate_exact_scratch_identity(duplicate):
     projection = _worker_projection(
-        protocol_version=6,
+        protocol_version=7,
         scratch={
             'kind': 'memory',
             'mount_path': '/tmp',
@@ -2622,9 +2643,9 @@ def test_final_v6_yaml_rejects_duplicate_exact_scratch_identity(duplicate):
             expected_runtime_bootstrap_sha256=bootstrap_sha256)
 
 
-def test_final_v6_yaml_rejects_cache_scratch_collision():
+def test_final_v7_yaml_rejects_cache_scratch_collision():
     projection = _worker_projection(
-        protocol_version=6,
+        protocol_version=7,
         scratch={
             'kind': 'memory',
             'mount_path': '/tmp',
@@ -2646,8 +2667,8 @@ def test_final_v6_yaml_rejects_cache_scratch_collision():
                 _worker_bootstrap_sha256(cluster_yaml)))
 
 
-def test_final_v6_none_rejects_cache_tmp_alias():
-    projection = _worker_projection(protocol_version=6)
+def test_final_v7_none_rejects_cache_tmp_alias():
+    projection = _worker_projection(protocol_version=7)
     projection['cache'] = {
         **_node_local_cache(),
         'mount_path': '/var/../tmp/',
@@ -2664,7 +2685,7 @@ def test_final_v6_none_rejects_cache_tmp_alias():
 
 
 @pytest.mark.parametrize('collision', ['volume', 'mount', 'nested_mount'])
-def test_final_v6_none_rejects_inherited_scratch_owner(collision):
+def test_final_v7_none_rejects_inherited_scratch_owner(collision):
     cluster_yaml = _projected_worker_cluster_yaml()
     spec = cluster_yaml['available_node_types']['ray_head_default'][
         'node_config']['spec']
@@ -2683,12 +2704,12 @@ def test_final_v6_none_rejects_inherited_scratch_owner(collision):
     with pytest.raises(exceptions.InvalidCloudConfigs, match='collides'):
         backend_utils._enforce_worker_projection_on_kubernetes_yaml(
             cluster_yaml,
-            _worker_projection(protocol_version=6),
+            _worker_projection(protocol_version=7),
             expected_runtime_bootstrap_sha256=(
                 _worker_bootstrap_sha256(cluster_yaml)))
 
 
-@pytest.mark.parametrize('protocol_version', [1, 2, 3, 4, 5, 6])
+@pytest.mark.parametrize('protocol_version', [1, 2, 3, 4, 5, 6, 7])
 def test_kubernetes_deploy_vars_require_current_projected_admission(
         monkeypatch, protocol_version):
     resources = mock.MagicMock()
@@ -2714,7 +2735,7 @@ def test_kubernetes_deploy_vars_require_current_projected_admission(
             'mount_path': '/tmp',
             'volume_name': 'skypilot-serve-worker-tmp',
             'size_limit_bytes': 20 * 1024**3,
-        } if protocol_version == 6 else None))
+        } if protocol_version == 7 else None))
     cloud = kubernetes_identity.clouds.Kubernetes()
     region = mock.MagicMock()
     region.name = 'phx'
@@ -2767,7 +2788,7 @@ def test_kubernetes_deploy_vars_require_current_projected_admission(
                                 KubernetesHighPerformanceNetworkType.NONE,
                                 None)))
 
-    if protocol_version != 6:
+    if protocol_version != 7:
         with pytest.raises(
                 ValueError,
                 match='exact current worker placement projection protocol'):
@@ -2823,7 +2844,7 @@ def test_kubernetes_deploy_vars_require_current_projected_admission(
 
 def test_legacy_yaml_restore_cannot_replace_projected_identity_or_cache():
     projection = {
-        'projection_version': 6,
+        'projection_version': 7,
         'candidate_id': 'kubernetes-0002',
         'kubernetes_context': 'phx',
         'namespace': 'inference',
@@ -2999,9 +3020,9 @@ def test_legacy_yaml_restore_cannot_replace_projected_identity_or_cache():
     assert 'inject-sidecar' not in serialized
 
 
-def test_legacy_yaml_restore_reasserts_v6_kueue_admission():
+def test_legacy_yaml_restore_reasserts_v7_kueue_admission():
     projection = _worker_projection(
-        protocol_version=6,
+        protocol_version=7,
         kueue_admission={
             'local_queue_name': 'inference',
             'workload_priority_class_name': 'inference-low',
@@ -3073,9 +3094,9 @@ def test_legacy_yaml_restore_reasserts_v6_kueue_admission():
     assert labels['kueue.x-k8s.io/priority-class'] == 'inference-low'
 
 
-def test_legacy_yaml_restore_reasserts_v6_memory_scratch():
+def test_legacy_yaml_restore_reasserts_v7_memory_scratch():
     projection = _worker_projection(
-        protocol_version=6,
+        protocol_version=7,
         scratch={
             'kind': 'memory',
             'mount_path': '/tmp',
@@ -3654,7 +3675,7 @@ def test_admitted_worker_namespace_mismatch_is_deleted(monkeypatch):
 
 def test_final_kubernetes_yaml_requires_one_runtime_container():
     projection = _worker_projection(
-        protocol_version=6,
+        protocol_version=7,
         scratch={
             'kind': 'memory',
             'mount_path': '/tmp',
