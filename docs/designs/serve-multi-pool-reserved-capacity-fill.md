@@ -820,39 +820,49 @@ serialize otherwise available slots in the same domain. Replay and new intents
 in one plan obey the same locked aggregate bounds. The planner validates the
 full graph and never relies on replica status or a process-local cache.
 
-An expired, never-materialized `INTENT_PENDING` row whose intent is terminal
-may be removed without a provider read only after one locked transaction proves
-the exact admission, intent, replica, association, request, queue, and
-retention-pin graph contains no materialization or provider-effect path. The
-terminal intent remains as history. The next normal sequenced grant uses a
-fresh pool observation and the remaining durable debits; cleanup does not
-create a privileged successor or bypass capacity accounting. This independent
-maintenance may commit during replay-only or capacity-blocked reconciliation;
-its complete provider-free proof, not the presence of a successor, is deletion
-authority. Any materialized or ambiguous row requires normal evidence-backed
-provider cleanup.
+An expired, never-materialized `INTENT_PENDING` row whose intent is terminal,
+or one terminalized because its remaining authority cannot cover the requested
+actuation lease, may be removed without a provider read only after one locked
+transaction proves the exact admission, intent, replica, association, request,
+queue, and retention-pin graph contains no materialization or provider-effect
+path. The terminal intent remains as history. The next normal sequenced grant
+uses a fresh pool observation and the remaining durable debits; cleanup does
+not create a privileged successor or bypass capacity accounting. This
+independent maintenance may commit during replay-only or capacity-blocked
+reconciliation; its complete provider-free proof, not the presence of a
+successor, is deletion authority. Any materialized or ambiguous row requires
+normal evidence-backed provider cleanup.
 
 Durable submission uses one bounded executor per physical pool, not one
 provider-preflight round trip per intent and not an unbounded thread per Pod.
-The repository retains a hard safety limit of 32 leases, but the manager takes
-an actuation quantum of four oldest actionable intents per mutex turn. Every
-intent keeps its own owner, generation, and expiry. The executor opens one V2
-provider-phase admission and one deduplicated physical-UID capture for that
-quantum, then commits each exact intent/replica/request graph independently
-under the existing manager serialization. Each committed graph immediately
-starts the ordinary bound-request adopter, but the adopter does not execute
-the launch: actual provider work begins only when the generic request executor
-leases that durable request. The held rollout therefore supplies the matching
-generic long-worker capacity described below. A full four-item turn releases
-its exact pool lane before re-signalling durable work, which prevents a
-completed-but-still-live thread from consuming the wakeup and imposing the
-one-second dispatcher poll. This bounds cross-pool head-of-line blocking
-without changing the repository safety ceiling or introducing another
-scheduler. A definite failure releases or terminalizes
-only that intent; an ambiguous commit preserves only that exact graph and does
-not cancel later members. The capture is released after the last member is
-staged, without waiting for Pod scheduling or readiness. Different pools
-retain independent executor threads and compatible V2 provider phases.
+Each lane leases at most the repository's hard safety limit of 32 oldest
+actionable intents and opens one V2 provider-phase admission plus one
+deduplicated physical-UID capture for that complete bounded batch. Every intent
+keeps its own owner, generation, and expiry. The repository leases an intent
+only when its observation authority covers the complete requested lease; it
+terminalizes a never-materialized row with a positive but shorter horizon as
+`insufficient_actuation_window` so a fresh observation can issue a new key
+without repeated doomed preflights. The manager commits each exact
+intent/replica/request graph independently under its existing serialization,
+but releases and reacquires that mutex between actuation quanta of at most four
+intents. It refreshes the durable replica graph and ID set on every mutex
+acquisition, and rechecks exact actuation authority immediately before every
+materialization. Another pool is therefore permitted to interleave between
+quanta without paying another physical preflight for the same batch. Each
+committed graph immediately starts the ordinary bound-request adopter, but the
+adopter does not execute the launch: actual provider work begins only when the
+generic request executor leases that durable request. The held rollout
+therefore supplies the matching generic long-worker capacity described below.
+A full 32-item batch that stages work releases its exact pool lane before
+re-signalling durable work, which prevents a completed-but-still-live thread
+from consuming the wakeup and
+imposing the one-second dispatcher poll. This bounds cross-pool head-of-line
+blocking without changing the repository safety ceiling or introducing
+another scheduler. A definite failure releases or terminalizes only that
+intent; an ambiguous commit preserves only that exact graph and does not cancel
+later members. The capture is released after the last member is staged,
+without waiting for Pod scheduling or readiness. Different pools retain
+independent executor threads and compatible V2 provider phases.
 
 Service-version YAML is immutable and can be large. The manager therefore
 parses it once per active/recovery version, retains only the current version
@@ -4094,10 +4104,14 @@ reason enum, route mode/version/epoch/generation, expected/reported/fresh/missin
 backend counts, planned-upgrade decision, transition-attempted bit, and CAS
 result. It never exports URLs, route digests, tokens, Pod IDs, or request IDs.
 
-The promotion read is one fail-fast shared owner-lock statement plus one indexed
-PostgreSQL head/generation join. It copies the immutable row and releases the
-lock before bounded canonical decoding; the cutover CAS revalidates the exact
-head. Tests pin that two-statement shape and instrument provider/Kubernetes
+The promotion read first installs a one-second transaction-local PostgreSQL
+lock timeout, then performs one shared owner-lock statement plus one indexed
+head/generation join. Joining the row-lock queue for this bounded interval
+prevents a stream of short capacity-admission writers from starving every role
+heartbeat; expiry remains fail closed and retries on the next heartbeat without
+disturbing the selected slot. It copies the immutable row and releases the lock
+before bounded canonical decoding; the cutover CAS revalidates the exact head.
+Tests pin that three-statement shape and instrument provider/Kubernetes
 adapters to require zero calls, complete owner replacement, exact successor
 isolation, and one poisoned launch association among hundreds without blocking
 fresh route publication for healthy rows. The generous regression ceilings are

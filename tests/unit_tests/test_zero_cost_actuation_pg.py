@@ -671,6 +671,97 @@ def test_kueue_same_domain_batch_leases_in_three_bounded_waves(
                                       lease_seconds=30)
 
 
+def test_lease_batch_requires_authority_for_complete_lease(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    expiring = _plan(free_slots=1,
+                     context='phx',
+                     physical_uid='uid-phx',
+                     kueue=True,
+                     valid_until=time.time() + 30)
+    assert len(_grant_plan(repository, expiring, max_capacity=1).accepted) == 1
+    _install_fresh_provider_proofs(actuation_database, expiring.intents)
+    owner = uuid.uuid4()
+
+    assert not repository.lease_batch(service_name='svc',
+                                      pool_key=expiring.intents[0].pool_key,
+                                      owner=owner,
+                                      lease_seconds=90)
+
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
+    with actuation_database.connect() as connection:
+        expiring_row = connection.execute(
+            sqlalchemy.select(intents).where(
+                intents.c.intent_idempotency_key ==
+                expiring.intents[0].idempotency_key)).mappings().one()
+        retained_admission = connection.execute(
+            sqlalchemy.select(admissions)).mappings().one()
+    assert expiring_row[
+        'state'] == zero_cost_actuation.IntentState.TERMINAL.value
+    assert expiring_row['last_error'] == 'insufficient_actuation_window'
+    assert retained_admission['intent_idempotency_key'] == (
+        expiring.intents[0].idempotency_key)
+
+    fresh = _plan(free_slots=1,
+                  context='phx',
+                  physical_uid='uid-phx',
+                  kueue=True,
+                  valid_until=time.time() + 180)
+    assert fresh.intents[0].idempotency_key != (
+        expiring.intents[0].idempotency_key)
+    assert len(_grant_plan(repository, fresh, max_capacity=1).accepted) == 1
+    _install_fresh_provider_proofs(actuation_database, fresh.intents)
+
+    fresh_leases = repository.lease_batch(service_name='svc',
+                                          pool_key=fresh.intents[0].pool_key,
+                                          owner=owner,
+                                          lease_seconds=90)
+
+    assert len(fresh_leases) == 1
+    assert fresh_leases[0].intent.idempotency_key == (
+        fresh.intents[0].idempotency_key)
+    with actuation_database.connect() as connection:
+        admission_keys = tuple(
+            connection.execute(
+                sqlalchemy.select(
+                    admissions.c.intent_idempotency_key)).scalars())
+    assert admission_keys == (fresh.intents[0].idempotency_key,)
+
+
+def test_lease_batch_preserves_active_short_authority_lease(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1, valid_until=time.time() + 60)
+    assert len(_grant_plan(repository, plan, max_capacity=1).accepted) == 1
+    _install_fresh_provider_proofs(actuation_database, plan.intents)
+    first_owner = uuid.uuid4()
+
+    first_lease = repository.lease_batch(service_name='svc',
+                                         pool_key=plan.intents[0].pool_key,
+                                         owner=first_owner,
+                                         lease_seconds=30)
+    assert len(first_lease) == 1
+
+    assert not repository.lease_batch(service_name='svc',
+                                      pool_key=plan.intents[0].pool_key,
+                                      owner=uuid.uuid4(),
+                                      lease_seconds=90)
+
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    with actuation_database.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(intents).where(
+                intents.c.intent_idempotency_key ==
+                plan.intents[0].idempotency_key)).mappings().one()
+    assert row['state'] == zero_cost_actuation.IntentState.ACTUATING.value
+    assert row['lease_owner'] == first_owner
+    assert row['lease_generation'] == first_lease[0].generation
+    assert row['terminal_at'] is None
+
+
 def test_kueue_grant_rejects_multi_node_immutable_catalog(
         actuation_database) -> None:
     config = migration_utils.get_alembic_config(actuation_database,

@@ -202,7 +202,7 @@ class ProviderFreeTerminalAdmissionProof:
     unresolved_domain_sha256: str
     intent_updated_at: datetime.datetime
     admission_updated_at: datetime.datetime
-    teardown_authorized: bool
+    unexpired_cleanup_authorized: bool
     checked_at: datetime.datetime
 
 
@@ -2014,7 +2014,9 @@ class KueueAdmissionRepository:
         teardown_service = service_status in ('SHUTTING_DOWN', 'FAILED_CLEANUP')
         discovery_now = connection.execute(
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
-        terminal_eligibility = _INTENTS.c.valid_until <= discovery_now
+        terminal_eligibility = sqlalchemy.or_(
+            _INTENTS.c.valid_until <= discovery_now,
+            _INTENTS.c.last_error == 'insufficient_actuation_window')
         if teardown_service:
             terminal_eligibility = sqlalchemy.or_(
                 terminal_eligibility,
@@ -2172,6 +2174,9 @@ class KueueAdmissionRepository:
             identity = _validate_admission_intent_identity(admission, intent)
             teardown_authorized = bool(
                 teardown_service and intent['last_error'] == 'service_teardown')
+            unexpired_cleanup_authorized = bool(
+                teardown_authorized or
+                intent['last_error'] == 'insufficient_actuation_window')
             if (identity.service_name != service_name or
                     identity.service_hash != service_hash):
                 raise KueueAdmissionConflict(
@@ -2181,7 +2186,7 @@ class KueueAdmissionRepository:
                     intent['replica_record_id'] is not None or
                     intent['terminal_at'] is None or
                 (intent['valid_until'] > checked_at and
-                 not teardown_authorized) or admission['state']
+                 not unexpired_cleanup_authorized) or admission['state']
                     != KueueAdmissionState.INTENT_PENDING.value or
                     any(admission[field] is not None
                         for field in empty_fields)):
@@ -2197,7 +2202,7 @@ class KueueAdmissionRepository:
                     unresolved_domain_sha256=identity.unresolved_domain_sha256,
                     intent_updated_at=intent['updated_at'],
                     admission_updated_at=admission['updated_at'],
-                    teardown_authorized=teardown_authorized,
+                    unexpired_cleanup_authorized=(unexpired_cleanup_authorized),
                     checked_at=checked_at))
         return tuple(proofs)
 
@@ -2237,6 +2242,9 @@ class KueueAdmissionRepository:
         teardown_authorized = bool(
             intent['last_error'] == 'service_teardown' and
             service_status in ('SHUTTING_DOWN', 'FAILED_CLEANUP'))
+        unexpired_cleanup_authorized = bool(
+            teardown_authorized or
+            intent['last_error'] == 'insufficient_actuation_window')
         empty_fields = ('replica_id', 'replica_record_id',
                         'provider_cluster_generation', 'association_id',
                         'pod_namespace', 'pod_name', 'pod_uid', 'pod_receipt',
@@ -2251,11 +2259,12 @@ class KueueAdmissionRepository:
                 intent['state'] != 'TERMINAL' or
                 intent['replica_id'] is not None or
                 intent['replica_record_id'] is not None or
-                intent['terminal_at'] is None or
-                teardown_authorized != proof.teardown_authorized or
-            (intent['valid_until'] > now and not teardown_authorized) or
-                admission['state'] != KueueAdmissionState.INTENT_PENDING.value
-                or any(admission[field] is not None for field in empty_fields)):
+                intent['terminal_at'] is None or unexpired_cleanup_authorized
+                != proof.unexpired_cleanup_authorized or
+            (intent['valid_until'] > now and
+             not unexpired_cleanup_authorized) or admission['state']
+                != KueueAdmissionState.INTENT_PENDING.value or
+                any(admission[field] is not None for field in empty_fields)):
             raise KueueAdmissionConflict(
                 'Provider-free terminal proof no longer matches authority.')
         deleted = connection.execute(

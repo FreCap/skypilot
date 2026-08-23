@@ -781,8 +781,11 @@ def test_promotion_contract_reads_exact_fresh_snapshot(route_database):
         content_sha256=receipt.content_sha256,
         routing_urls=frozenset({route_url}),
         async_occupancy_urls=frozenset({route_url}))
-    assert len(statements) == 2
-    assert 'JOIN serve_route_snapshots' in statements[1]
+    assert len(statements) == 3
+    assert statements[0].startswith('SET LOCAL lock_timeout')
+    assert 'FOR SHARE' in statements[1]
+    assert 'NOWAIT' not in statements[1]
+    assert 'JOIN serve_route_snapshots' in statements[2]
 
 
 def test_legacy_promotion_allows_committed_version_ahead_of_applied(
@@ -810,7 +813,10 @@ def test_legacy_promotion_allows_committed_version_ahead_of_applied(
 
     assert decision == route_projection.RoutePromotionDecision(
         mode=route_projection.RouteSourceMode.LEGACY_PROXY)
-    assert len(statements) == 1
+    assert len(statements) == 2
+    assert statements[0].startswith('SET LOCAL lock_timeout')
+    assert 'FOR SHARE' in statements[1]
+    assert 'NOWAIT' not in statements[1]
 
 
 def test_promotion_contract_shared_lock_is_scoped_to_multi_read(route_database):
@@ -909,10 +915,62 @@ def test_promotion_contract_shared_lock_is_scoped_to_multi_read(route_database):
         blocker.close()
 
 
-def test_promotion_contract_fails_fast_on_owner_lock_contention(route_database):
+def test_promotion_contract_waits_for_transient_owner_lock_contention(
+        route_database):
     repository, incarnation, _, receipt = _enable_projected_contract(
         route_database)
     engine, _ = route_database
+    blocker = engine.connect()
+    transaction = blocker.begin()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    resolver_lock_attempted = threading.Event()
+    resolver_backend_pid = {}
+
+    def _record_lock_attempt(_connection, cursor, statement, *_args):
+        if 'FROM services' in statement and 'FOR SHARE' in statement:
+            resolver_backend_pid['value'] = cursor.connection.get_backend_pid()
+            resolver_lock_attempted.set()
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute',
+                            _record_lock_attempt)
+    try:
+        blocker_backend_pid = blocker.execute(
+            sqlalchemy.select(sqlalchemy.func.pg_backend_pid())).scalar_one()
+        blocker.execute(
+            sqlalchemy.select(serve_state_schema.services_table.c.name).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).scalar_one()
+        resolution = executor.submit(repository.resolve_promotion_contract,
+                                     _identity(incarnation), 1, 1,
+                                     receipt.generation, receipt.content_sha256)
+        assert resolver_lock_attempted.wait(timeout=5)
+        _wait_until_blocked_by(engine, resolver_backend_pid['value'],
+                               blocker_backend_pid)
+        assert not resolution.done()
+
+        transaction.commit()
+        decision = resolution.result(timeout=5)
+        assert decision.mode == route_projection.RouteSourceMode.DURABLE_PROJECTED
+        assert decision.contract is not None
+        assert decision.contract.generation == receipt.generation
+        assert decision.contract.content_sha256 == receipt.content_sha256
+    finally:
+        if transaction.is_active:
+            transaction.rollback()
+        executor.shutdown(wait=True)
+        sqlalchemy.event.remove(engine, 'before_cursor_execute',
+                                _record_lock_attempt)
+        blocker.close()
+
+
+def test_promotion_contract_fails_closed_after_bounded_owner_lock_contention(
+        route_database, monkeypatch):
+    repository, incarnation, _, receipt = _enable_projected_contract(
+        route_database)
+    engine, _ = route_database
+    lock_timeout_ms = 100
+    monkeypatch.setattr(route_projection, 'PROMOTION_OWNER_LOCK_TIMEOUT_MS',
+                        lock_timeout_ms)
     blocker = engine.connect()
     transaction = blocker.begin()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -921,12 +979,19 @@ def test_promotion_contract_fails_fast_on_owner_lock_contention(route_database):
             sqlalchemy.select(serve_state_schema.services_table.c.name).where(
                 serve_state_schema.services_table.c.name ==
                 'svc').with_for_update()).scalar_one()
+        started_at = time.monotonic()
         resolution = executor.submit(repository.resolve_promotion_contract,
                                      _identity(incarnation), 1, 1,
                                      receipt.generation, receipt.content_sha256)
         with pytest.raises(route_projection.RouteProjectionUnavailable,
-                           match='promotion-contract read'):
-            resolution.result(timeout=1)
+                           match='promotion-contract read') as error:
+            resolution.result(timeout=2)
+        elapsed = time.monotonic() - started_at
+        assert elapsed >= lock_timeout_ms / 1000
+        assert elapsed < 1
+        assert isinstance(error.value.__cause__,
+                          sqlalchemy.exc.OperationalError)
+        assert error.value.__cause__.orig.pgcode == '55P03'
     finally:
         if transaction.is_active:
             transaction.rollback()

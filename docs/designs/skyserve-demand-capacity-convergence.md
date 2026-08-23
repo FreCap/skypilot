@@ -921,9 +921,12 @@ Future demand authority can therefore translate URL-keyed occupancy through
 the exact immutable snapshot the reporter observed; a current URL is never
 guessed to represent an older report.
 
-The promotion reader takes a fail-fast shared lock on the service owner, then
-copies the database clock, current head, and exact immutable snapshot with one
-indexed join before releasing the lock and decoding. STABLE-to-PREPARING
+The promotion reader joins the service-owner shared-lock queue for at most one
+second, then copies the database clock, current head, and exact immutable
+snapshot with one indexed join before releasing the lock and decoding. This
+bounded wait prevents repeated short capacity-admission writers from starving
+every role heartbeat; timeout remains fail closed and the next heartbeat
+retries without disturbing the selected slot. STABLE-to-PREPARING
 revalidates the same head under the exclusive service lock. The one-way route
 promotion uses that lock too and, for an HA service, rejects every non-STABLE
 phase. Therefore either route promotion wins while HA is STABLE and the next

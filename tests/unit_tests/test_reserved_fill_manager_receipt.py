@@ -430,16 +430,38 @@ def test_durable_pool_executor_does_not_serialize_independent_pools() -> None:
     repository.terminate.assert_not_called()
 
 
-def test_durable_pool_executor_materializes_one_bounded_shared_preflight_wave(
+def test_durable_pool_executor_amortizes_preflight_across_full_lease_batch(
 ) -> None:
     manager = _manager()
-    manager.lock = threading.Lock()
+
+    class RecordingLock:
+        """Record materializations performed in each critical section."""
+
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self.chunk_sizes: list[int] = []
+            self._current_chunk_size = 0
+
+        def __enter__(self):
+            self._lock.acquire()
+            self._current_chunk_size = 0
+            return self
+
+        def record_materialization(self) -> None:
+            self._current_chunk_size += 1
+
+        def __exit__(self, *_args) -> None:
+            self.chunk_sizes.append(self._current_chunk_size)
+            self._lock.release()
+
+    recording_lock = RecordingLock()
+    manager.lock = recording_lock
     manager._workspace = 'workspace-a'  # pylint: disable=protected-access
     manager._zero_cost_actuation_executor_id = (  # pylint: disable=protected-access
         mock.sentinel.executor_id)
     manager._scale_reconciliation_event = threading.Event()  # pylint: disable=protected-access
-    plan = _plan((_snapshot('east-context', 'uid-east',
-                            replica_managers._ZERO_COST_ACTUATION_QUANTUM),))
+    lease_batch_size = zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE
+    plan = _plan((_snapshot('east-context', 'uid-east', lease_batch_size),))
     pool_key = plan.intents[0].pool_key
     lane_event = mock.Mock(spec=threading.Event)
     manager._zero_cost_actuation_event = lane_event  # pylint: disable=protected-access
@@ -459,8 +481,13 @@ def test_durable_pool_executor_materializes_one_bounded_shared_preflight_wave(
     preflights = SimpleNamespace(
         preflights={('east-context', 'uid-east'): SimpleNamespace(error=None)})
 
-    def materialize(_resources_override, used_replica_ids, *_args, **_kwargs):
-        replica_id = 100 + len(used_replica_ids)
+    next_replica_id = 100
+
+    def materialize(_resources_override, _used_replica_ids, *_args, **_kwargs):
+        nonlocal next_replica_id
+        recording_lock.record_materialization()
+        replica_id = next_replica_id
+        next_replica_id += 1
         return replica_managers._ReplicaLaunchResult(  # pylint: disable=protected-access
             replica_id=replica_id,
             planned_capacity=1,
@@ -482,7 +509,7 @@ def test_durable_pool_executor_materializes_one_bounded_shared_preflight_wave(
             mock.patch.object(
                 replica_managers.serve_state,
                 'get_replica_infos',
-                return_value=[]), mock.patch.object(
+                return_value=[]) as get_replica_infos, mock.patch.object(
                     manager,
                     '_scale_up_one_locked',
                     side_effect=materialize) as scale_one:
@@ -493,16 +520,191 @@ def test_durable_pool_executor_materializes_one_bounded_shared_preflight_wave(
         pool_key=pool_key,
         owner=mock.sentinel.executor_id,
         lease_seconds=mock.ANY,
-        max_leases=replica_managers._ZERO_COST_ACTUATION_QUANTUM)
+        max_leases=lease_batch_size)
     start_preflights.assert_called_once_with(
         tuple(intent for intent in plan.intents), mock.sentinel.admission,
         'workspace-a')
     release.assert_called_once_with(preflights)
-    assert scale_one.call_count == replica_managers._ZERO_COST_ACTUATION_QUANTUM
+    assert scale_one.call_count == lease_batch_size
+    assert recording_lock.chunk_sizes == [
+        replica_managers._ZERO_COST_ACTUATION_QUANTUM
+    ] * (lease_batch_size // replica_managers._ZERO_COST_ACTUATION_QUANTUM)
+    assert get_replica_infos.call_count == len(recording_lock.chunk_sizes)
     repository.release_retryable.assert_not_called()
     repository.terminate.assert_not_called()
     lane_event.set.assert_called_once_with()
     assert pool_key not in manager._zero_cost_actuation_lanes  # pylint: disable=protected-access
+
+
+def test_durable_pool_executor_yields_manager_lock_between_quanta() -> None:
+    manager = _manager()
+    start_second_pool = threading.Event()
+    second_pool_waiting = threading.Event()
+    second_pool_acquired = threading.Event()
+
+    class InterleavingLock:
+        """Force the waiting second pool to acquire after the first chunk."""
+
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self._owner = ''
+            self._current_chunk_size = 0
+            self._waited_after_first_chunk = False
+            self.second_pool_interleaved = False
+            self.chunks: list[tuple[str, int]] = []
+
+        def __enter__(self):
+            thread_name = threading.current_thread().name
+            if thread_name == 'actuation-pool-b':
+                second_pool_waiting.set()
+            self._lock.acquire()
+            self._owner = thread_name
+            self._current_chunk_size = 0
+            if thread_name == 'actuation-pool-b':
+                second_pool_acquired.set()
+            return self
+
+        def record_materialization(self) -> None:
+            self._current_chunk_size += 1
+
+        def __exit__(self, *_args) -> None:
+            owner = self._owner
+            self.chunks.append((owner, self._current_chunk_size))
+            wait_for_second_pool = (owner == 'actuation-pool-a' and
+                                    not self._waited_after_first_chunk)
+            if wait_for_second_pool:
+                self._waited_after_first_chunk = True
+            self._lock.release()
+            if wait_for_second_pool:
+                self.second_pool_interleaved = second_pool_acquired.wait(
+                    timeout=2)
+
+    interleaving_lock = InterleavingLock()
+    manager.lock = interleaving_lock
+    manager._workspace = 'workspace-a'  # pylint: disable=protected-access
+    manager._zero_cost_actuation_executor_id = (  # pylint: disable=protected-access
+        mock.sentinel.executor_id)
+    manager._scale_reconciliation_event = threading.Event()  # pylint: disable=protected-access
+    manager._zero_cost_actuation_event = threading.Event()  # pylint: disable=protected-access
+    manager._zero_cost_actuation_lane_lock = threading.Lock()  # pylint: disable=protected-access
+    manager._zero_cost_actuation_lanes = {}  # pylint: disable=protected-access
+    first_pool_size = replica_managers._ZERO_COST_ACTUATION_QUANTUM + 1
+    plan = _plan(
+        (_snapshot('east-context', 'uid-east',
+                   first_pool_size), _snapshot('west-context', 'uid-west', 1)))
+    leases_by_pool: dict[str, tuple[SimpleNamespace, ...]] = {}
+    for intent in plan.intents:
+        leases_by_pool.setdefault(intent.pool_key, tuple())
+        leases_by_pool[intent.pool_key] += (SimpleNamespace(intent=intent),)
+    first_pool_key = reserved_capacity_broker.make_pool_key(
+        'east-context',
+        'A100',
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        physical_cluster_uid='uid-east')
+    second_pool_key = reserved_capacity_broker.make_pool_key(
+        'west-context',
+        'A100',
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        physical_cluster_uid='uid-west')
+    assert len(leases_by_pool[first_pool_key]) == first_pool_size
+    assert len(leases_by_pool[second_pool_key]) == 1
+    repository = mock.Mock()
+    repository.lease_batch.side_effect = (
+        lambda **kwargs: leases_by_pool[kwargs['pool_key']])
+    manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
+    launch_order: list[str] = []
+    next_replica_id = 200
+    second_pool_was_waiting: list[bool] = []
+
+    def start_preflights(intents, _admission, _workspace):
+        return SimpleNamespace(
+            preflights={
+                (intent.allowed_locations[0].region, intent.physical_cluster_uid):
+                    SimpleNamespace(error=None) for intent in intents
+            })
+
+    def materialize(resources_override, _used_replica_ids, *_args, **_kwargs):
+        nonlocal next_replica_id
+        interleaving_lock.record_materialization()
+        physical_uid = resources_override[
+            replica_managers.serve_constants.
+            RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY]
+        launch_order.append(physical_uid)
+        if (physical_uid == 'uid-east' and launch_order.count('uid-east')
+                == replica_managers._ZERO_COST_ACTUATION_QUANTUM):
+            start_second_pool.set()
+            second_pool_was_waiting.append(second_pool_waiting.wait(timeout=2))
+        replica_id = next_replica_id
+        next_replica_id += 1
+        return replica_managers._ReplicaLaunchResult(  # pylint: disable=protected-access
+            replica_id=replica_id,
+            planned_capacity=1,
+            funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)  # pylint: disable=protected-access
+
+    worker_errors: list[BaseException] = []
+
+    def run_pool(pool_key: str) -> None:
+        try:
+            manager._actuate_zero_cost_pool(pool_key)
+        except BaseException as error:  # pylint: disable=broad-except
+            worker_errors.append(error)
+
+    def run_second_pool() -> None:
+        if not start_second_pool.wait(timeout=2):
+            worker_errors.append(TimeoutError('first pool did not yield'))
+            return
+        run_pool(second_pool_key)
+
+    with mock.patch.object(
+            manager,
+            '_zero_cost_actuation_authority_current',
+            return_value=True), mock.patch.object(
+                replica_managers.provider_phase,
+                'try_provider_phase',
+                side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(
+                    mock.sentinel.admission)), mock.patch.object(
+                        manager,
+                        '_start_reserved_fill_physical_preflights',
+                        side_effect=start_preflights) as start_preflight, \
+            mock.patch.object(
+                manager, '_release_reserved_fill_physical_preflights'), \
+            mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[]), mock.patch.object(
+                    manager,
+                    '_scale_up_one_locked',
+                    side_effect=materialize):
+        second_pool = threading.Thread(target=run_second_pool,
+                                       name='actuation-pool-b')
+        first_pool = threading.Thread(target=run_pool,
+                                      args=(first_pool_key,),
+                                      name='actuation-pool-a')
+        second_pool.start()
+        first_pool.start()
+        first_pool.join(timeout=5)
+        second_pool.join(timeout=5)
+
+    assert not first_pool.is_alive()
+    assert not second_pool.is_alive()
+    assert not worker_errors
+    assert second_pool_was_waiting == [True]
+    assert interleaving_lock.second_pool_interleaved
+    assert launch_order == ['uid-east'] * 4 + ['uid-west', 'uid-east']
+    assert interleaving_lock.chunks == [
+        ('actuation-pool-a', 4),
+        ('actuation-pool-b', 1),
+        ('actuation-pool-a', 1),
+    ]
+    assert max(chunk_size for _, chunk_size in interleaving_lock.chunks) <= 4
+    assert sorted(
+        len(call.args[0]) for call in start_preflight.call_args_list) == [
+            1, first_pool_size
+        ]
+    assert repository.lease_batch.call_count == 2
+    assert all(call.kwargs['max_leases'] ==
+               zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE
+               for call in repository.lease_batch.call_args_list)
 
 
 def test_durable_pool_executor_continues_after_per_intent_ambiguity() -> None:
