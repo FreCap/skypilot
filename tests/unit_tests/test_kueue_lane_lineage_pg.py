@@ -224,7 +224,7 @@ def _canonical_intent_key(**overrides) -> str:
 
 
 @pytest.fixture
-def admission_database(empty_postgres):
+def admission_database(empty_postgres):  # noqa: F811
     config = migration_utils.get_alembic_config(empty_postgres,
                                                 migration_utils.SERVE_DB_NAME)
     alembic_command.upgrade(config, '057')

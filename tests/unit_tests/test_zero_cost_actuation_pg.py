@@ -235,7 +235,7 @@ def test_locked_teardown_decodes_exact_n_minus_one_without_fresh_authority(
 
 
 @pytest.fixture
-def actuation_database(empty_postgres, monkeypatch):
+def actuation_database(empty_postgres, monkeypatch):  # noqa: F811
     config = migration_utils.get_alembic_config(empty_postgres,
                                                 migration_utils.SERVE_DB_NAME)
     # Exercise retained pre-Serve056 rows through the current canonical
