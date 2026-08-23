@@ -233,6 +233,98 @@ def test_unowned_ambiguous_non_pool_launch_schedules_provider_reconciliation(
         info, context)
 
 
+def test_live_reconciliation_retires_pointerless_pre_effect_fill(monkeypatch):
+    """A worker-loss projection is repaired without a controller restart."""
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    authority = _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                                   binding_epoch=2,
+                                   generic=True)
+    info = _fake_replica_info(
+        3, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+    runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
+    retirement = ordinary_launch_binding.PreAdmissionRetirement(
+        ordinary_launch_binding.PreAdmissionRetirementDisposition.RETIRED,
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+    manager._service_name = 'svc'
+    manager._ordinary_launch_binding_authority = authority
+    manager._non_pool_reconciliation_threads = {}
+    manager._non_pool_reconciliation_attempts = {}
+    manager._non_pool_reconciliation_retry_at = {}
+    manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
+    manager._notify_scale_reconciliation = mock.Mock()
+    manager._install_bound_launch_adopter = mock.Mock()
+    monkeypatch.setattr(
+        ordinary_launch_binding, 'classify_non_pool_launch_profile', lambda
+        _info: ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'list_provider_reconciliation_contexts',
+                        lambda actual: [] if actual is authority else None)
+
+    with mock.patch.object(
+            replica_managers.request_postgres,
+            'inspect_bound_ordinary_launch',
+            return_value=None) as inspect, \
+         mock.patch.object(
+             ordinary_launch_binding,
+             'retire_pre_admission_non_pool_launch_intent',
+             return_value=retirement) as retire:
+        manager._reconcile_unowned_bound_non_pool_launches([info])
+
+    inspect.assert_called_once_with('svc', 3, info.replica_record_id)
+    retire.assert_called_once_with(authority, 3, info.replica_record_id)
+    manager._notify_scale_reconciliation.assert_called_once_with()
+    manager._install_bound_launch_adopter.assert_not_called()
+
+
+def test_live_reconciliation_adopts_association_race(monkeypatch):
+    """Admission winning retirement's service-row race is adopted at once."""
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    authority = _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                                   binding_epoch=2,
+                                   generic=True)
+    info = _fake_replica_info(
+        3, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+    reduction = mock.sentinel.reduction
+    runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
+    retirement = ordinary_launch_binding.PreAdmissionRetirement(
+        ordinary_launch_binding.PreAdmissionRetirementDisposition.ASSOCIATED)
+    manager._service_name = 'svc'
+    manager._ordinary_launch_binding_authority = authority
+    manager._non_pool_reconciliation_threads = {}
+    manager._non_pool_reconciliation_attempts = {}
+    manager._non_pool_reconciliation_retry_at = {}
+    manager._legacy_mutation_runtime_state = mock.Mock(return_value=runtime)
+    manager._notify_scale_reconciliation = mock.Mock()
+    manager._install_bound_launch_adopter = mock.Mock()
+    monkeypatch.setattr(
+        ordinary_launch_binding, 'classify_non_pool_launch_profile', lambda
+        _info: ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'list_provider_reconciliation_contexts',
+                        lambda actual: [] if actual is authority else None)
+
+    with mock.patch.object(
+            replica_managers.request_postgres,
+            'inspect_bound_ordinary_launch',
+            side_effect=[None, reduction]) as inspect, \
+         mock.patch.object(
+             ordinary_launch_binding,
+             'retire_pre_admission_non_pool_launch_intent',
+             return_value=retirement), \
+         mock.patch.object(replica_managers,
+                           '_bound_projection_classification',
+                           return_value='ADOPT_ACTIVE'):
+        manager._reconcile_unowned_bound_non_pool_launches([info])
+
+    assert inspect.call_count == 2
+    manager._install_bound_launch_adopter.assert_called_once_with(info,
+                                                                  reduction,
+                                                                  start=True)
+    manager._notify_scale_reconciliation.assert_not_called()
+
+
 def test_unowned_recorded_absence_projects_despite_stale_cluster_record(
         monkeypatch):
     manager = replica_managers.SkyPilotReplicaManager.__new__(

@@ -617,6 +617,39 @@ def _is_provider_absent_pre_job_association(
                 association['provider_evidence'] == 'ABSENT')
 
 
+def _is_non_cancelled_pre_effect_terminal_association(
+        association: Mapping[str, Any]) -> bool:
+    """Accept only the closed provider-free request-rejection projection."""
+    try:
+        terminal_generation = association['terminal_execution_generation']
+        terminal_status = association['terminal_status']
+        terminal_cause = association['terminal_cause']
+        return bool(
+            association['resolution'] == 'PRE_EFFECT_TERMINAL' and
+            association['reconciliation_outcome'] == 'PRE_EFFECT_TERMINAL' and
+            association['effect_phase'] == 'NOT_STARTED' and
+            association['service_job_id'] is None and
+            association['result_recorded_at'] is None and
+            association['ambiguity_code'] is None and
+            association['cancel_reason'] is None and
+            association['cancel_requested_at'] is None and
+            terminal_status in _TERMINAL_STATUSES and
+            isinstance(terminal_cause, str) and bool(terminal_cause) and
+            type(terminal_generation) is int and terminal_generation >= 0 and
+            association['execution_quiescence_required'] is True and
+            association['execution_quiesced_generation'] == terminal_generation
+            and association['execution_quiesced_at'] is not None and
+            association['projected_at'] is not None and
+            association['pin_released_at'] is not None and
+            association['tombstone_not_before'] is not None and
+            association['provider_evidence'] == 'NOT_QUERIED' and
+            association['provider_evidence_observed_at'] is None and
+            association['provider_evidence_payload'] is None and
+            association['provider_evidence_digest'] is None)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def _validate_provider_absent_pre_job_admission(
     connection: sqlalchemy.engine.Connection,
     admission: Mapping[str, Any],
@@ -2605,6 +2638,273 @@ class KueueAdmissionRepository:
             raise KueueAdmissionConflict(
                 'Provider-free terminal admission changed before deletion.')
         return KueueAdmissionRow.from_mapping(deleted)
+
+    def prelock_pre_admission_retirement_in_connection(
+        self,
+        connection: sqlalchemy.engine.Connection,
+        *,
+        service_name: str,
+        service_hash: str,
+        service_lifecycle_epoch: int,
+        intent_idempotency_key: str,
+        target: MaterializedAdmissionRetirementTarget,
+    ) -> MaterializedRetirementProof:
+        """Prove one reserved-fill handoff never obtained effect authority.
+
+        The caller holds the zero-cost protocol prefix followed by the exact
+        lifecycle and service locks.  This method then locks the immutable
+        graph in its canonical parent-to-child order.  It accepts only one
+        non-cancelled terminal request whose copied execution receipt proves
+        NOT_STARTED and quiesced.  Serve056 makes a committed reserved-fill
+        handoff without that association unrepresentable and it fails closed.
+        """
+        _require_postgres_connection(connection)
+        _require_nonempty(service_name, 'service_name')
+        _require_nonempty(service_hash, 'service_hash')
+        _require_positive(service_lifecycle_epoch, 'service_lifecycle_epoch')
+        intent_idempotency_key = _require_sha256(intent_idempotency_key,
+                                                 'intent_idempotency_key')
+        if not isinstance(target, MaterializedAdmissionRetirementTarget):
+            raise TypeError(
+                'target must be a MaterializedAdmissionRetirementTarget.')
+        target.validate()
+
+        lifecycle = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.service_lifecycle_fences_table.c.epoch).
+            where(serve_state_schema.service_lifecycle_fences_table.c.name ==
+                  service_name)).scalar_one_or_none()
+        service = connection.execute(
+            sqlalchemy.select(_SERVICES).where(
+                _SERVICES.c.name == service_name)).mappings().one_or_none()
+        if (lifecycle != service_lifecycle_epoch or service is None or
+                service['hash'] != service_hash or
+                service['lifecycle_epoch'] != service_lifecycle_epoch or
+                service['pool'] != 0 or
+                service['reserved_fill_actuation_mode'] != 'DURABLE_INTENT'):
+            raise KueueAdmissionConflict(
+                'Pre-admission retirement lost its service lifecycle owner.')
+
+        intent = connection.execute(
+            sqlalchemy.select(_INTENTS).where(
+                _INTENTS.c.intent_idempotency_key == intent_idempotency_key).
+            with_for_update()).mappings().one_or_none()
+        if (intent is None or intent['service_name'] != service_name or
+                intent['service_hash'] != service_hash or
+                intent['service_lifecycle_epoch'] != service_lifecycle_epoch or
+                intent['state'] != 'COMMITTED' or
+                intent['replica_id'] != target.replica_id or
+                intent['replica_record_id'] != target.replica_record_id):
+            raise KueueAdmissionConflict(
+                'Pre-admission retirement lost its exact committed intent.')
+
+        replica = connection.execute(
+            sqlalchemy.select(_REPLICAS).where(
+                _REPLICAS.c.service_name == service_name,
+                _REPLICAS.c.replica_id ==
+                target.replica_id).with_for_update()).mappings().one_or_none()
+        if replica is None:
+            raise KueueAdmissionConflict(
+                'Pre-admission retirement lost its replica parent.')
+        try:
+            info = serve_state.decode_replica_state_for_authority(
+                replica['replica_state_version'], replica['replica_state'])
+            launch_status = getattr(info.status_property.sky_launch_status,
+                                    'value', None)
+        except (AttributeError, KeyError, RuntimeError, TypeError,
+                ValueError) as error:
+            raise KueueAdmissionConflict(
+                'Pre-admission retirement found malformed replica authority.'
+            ) from error
+        committed = zero_cost_actuation.committed_intent_for_replica_in_connection(
+            connection,
+            service_name=service_name,
+            service_hash=service_hash,
+            replica_info=info)
+        if (info.replica_id != target.replica_id or
+                info.replica_record_id != str(target.replica_record_id) or
+                info.version != replica['version'] or
+                info.cluster_name != replica['cluster_name'] or
+                info.status.value != replica['status'] or
+                info.status.value not in ('PENDING', 'PROVISIONING') or
+                replica['ordinary_launch_association_id'] is not None or
+                replica['reserved_fill_intent_idempotency_key']
+                != intent_idempotency_key or
+                ordinary_launch_binding.classify_non_pool_launch_profile(info)
+                is not ordinary_launch_binding.NonPoolLaunchProfileKind.
+                RESERVED_FILL or info.reserved_fill is not True or
+                info.is_zero_cost is not True or info.is_spot is not False or
+                info.paid_capacity_pool_key is not None or
+                info.launch_request_id is not None or
+                info.service_job_id is not None or
+                info.zero_cost_materialization_sequence is not None or
+                launch_status != 'SCHEDULED' or
+                info.status_property.service_ready_now is not False or
+                committed is None or
+                committed.idempotency_key != intent_idempotency_key):
+            raise KueueAdmissionConflict(
+                'Pre-admission retirement replica is not an exact '
+                'unmaterialized reserved-fill handoff.')
+
+        claims = serve_state_schema.paid_capacity_claims_table
+        paid_claim_rows = connection.execute(
+            sqlalchemy.select(claims).where(
+                claims.c.service_name == service_name, claims.c.replica_id ==
+                target.replica_id).with_for_update()).mappings().all()
+        if paid_claim_rows:
+            raise KueueAdmissionConflict(
+                'Pre-admission reserved fill retained paid-capacity authority.')
+
+        associations = ordinary_launch_binding.ordinary_launch_associations_table
+        association_rows = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.service_name == service_name,
+                associations.c.replica_id == target.replica_id,
+                associations.c.replica_record_id ==
+                target.replica_record_id).order_by(
+                    associations.c.launch_generation).with_for_update()
+        ).mappings().all()
+        if len(association_rows) != 1:
+            raise KueueAdmissionConflict(
+                'Pre-admission reserved fill requires one exact action '
+                'history.')
+        association = association_rows[0]
+        capability = ordinary_launch_binding._non_pool_capability_from_service(  # pylint: disable=protected-access
+            service)
+        if (not _is_non_cancelled_pre_effect_terminal_association(association)
+                or association['terminal_status'] == 'CANCELLED' or
+                association['service_hash'] != service_hash or
+                association['service_lifecycle_epoch']
+                != service_lifecycle_epoch or
+                association['service_version'] != info.version or
+                association['cluster_name'] != info.cluster_name or
+                association['binding_protocol_version'] != 2 or
+                association['profile_kind'] != 'RESERVED_FILL' or
+                association['profile_version'] != 1 or
+                association['capability_profile_set_digest'] != capability[2] or
+                association['capability_cohort_epoch'] != capability[3] or
+                association['receipt_protocol_version'] != capability[4] or
+                association['authorization_kind'] != 'RESERVED_FILL_ALLOCATION'
+                or association['authorization_reference']
+                != f'reserved-fill:{intent_idempotency_key}' or
+                association['authorization_generation']
+                != intent['allocation_generation'] or
+                association['paid_capacity_pool_key'] is not None):
+            raise KueueAdmissionConflict(
+                'Pre-admission retirement action is not exact, '
+                'non-cancelled, and pre-effect.')
+
+        requests = request_postgres_schema.REQUESTS
+        queue = request_postgres_schema.QUEUE
+        pins = request_postgres_schema.REQUEST_RETENTION_PINS
+        request_rows = connection.execute(
+            sqlalchemy.select(requests).where(
+                sqlalchemy.or_(
+                    requests.c.request_id == association['request_id'],
+                    requests.c.ordinary_launch_association_id ==
+                    association['association_id'])).
+            order_by(requests.c.request_id).with_for_update()).mappings().all()
+        if (len(request_rows) != 1 or not _terminal_request_matches_association(
+                request_rows[0], association)):
+            raise KueueAdmissionConflict(
+                'Pre-admission retirement lost its exact terminal request '
+                'receipt.')
+        request_id = str(association['request_id'])
+        queue_rows = connection.execute(
+            sqlalchemy.select(queue).where(queue.c.request_id == request_id).
+            with_for_update()).mappings().all()
+        pin_rows = connection.execute(
+            sqlalchemy.select(pins).where(
+                sqlalchemy.or_(
+                    pins.c.request_id == request_id,
+                    pins.c.pin_id == association['association_id'])).order_by(
+                        pins.c.pin_kind,
+                        pins.c.pin_id).with_for_update()).mappings().all()
+        if queue_rows or pin_rows:
+            raise KueueAdmissionConflict(
+                'Pre-admission retirement found live request authority.')
+
+        try:
+            identity = (zero_cost_actuation.
+                        kueue_teardown_identity_for_locked_intent_in_connection(
+                            connection, intent))
+        except Exception as error:  # pylint: disable=broad-except
+            raise KueueAdmissionConflict(
+                'Pre-admission retirement cannot prove its scheduler mode.'
+            ) from error
+        admission_rows = connection.execute(
+            sqlalchemy.select(_ADMISSIONS).where(
+                sqlalchemy.or_(
+                    _ADMISSIONS.c.intent_idempotency_key ==
+                    intent_idempotency_key,
+                    sqlalchemy.and_(
+                        _ADMISSIONS.c.service_name == service_name,
+                        _ADMISSIONS.c.replica_id ==
+                        target.replica_id))).order_by(
+                            _ADMISSIONS.c.intent_idempotency_key).
+            with_for_update()).mappings().all()
+        if identity is None:
+            if admission_rows:
+                raise KueueAdmissionConflict(
+                    'Pre-admission East retirement found a Kueue admission.')
+            admission = None
+        else:
+            identity.validate()
+            if len(admission_rows) != 1:
+                raise KueueAdmissionConflict(
+                    'Pre-admission PHX retirement requires one exact Kueue '
+                    'admission.')
+            admission = admission_rows[0]
+            checked_identity = _validate_admission_intent_identity(
+                admission, intent)
+            empty_pod_fields = ('pod_namespace', 'pod_name', 'pod_uid',
+                                'pod_receipt', 'pod_receipt_sha256',
+                                'observed_at', 'valid_until', 'admitted_at')
+            if (checked_identity != identity or admission['state']
+                    != KueueAdmissionState.INTENT_PENDING.value or
+                    admission['replacement_surge_units'] != 0 or
+                    admission['replacement_compatibility_sha256'] is not None or
+                    any(admission[field] is not None
+                        for field in empty_pod_fields)):
+                raise KueueAdmissionConflict(
+                    'Pre-admission PHX retirement found admitted Pod '
+                    'authority.')
+            if (admission['replica_id'] != target.replica_id or
+                    admission['replica_record_id'] != target.replica_record_id
+                    or admission['provider_cluster_generation']
+                    != association['launch_generation'] or
+                    admission['association_id']
+                    != association['association_id']):
+                raise KueueAdmissionConflict(
+                    'Pre-admission retirement Kueue graph is not exact.')
+
+        transaction_id = int(
+            connection.execute(sqlalchemy.select(
+                sqlalchemy.func.txid_current())).scalar_one())
+        checked_at = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        proof_type = (AdmissionlessMaterializedRetirementProof if admission
+                      is None else MaterializedAdmissionRetirementProof)
+        proof_values = {
+            'transaction_id': transaction_id,
+            'service_name': service_name,
+            'service_hash': service_hash,
+            'service_lifecycle_epoch': service_lifecycle_epoch,
+            'intent_idempotency_key': intent_idempotency_key,
+            'intent_updated_at': intent['updated_at'],
+            'replica_id': target.replica_id,
+            'replica_record_id': target.replica_record_id,
+            'provider_cluster_generation': int(association['launch_generation']
+                                              ),
+            'association_id': association['association_id'],
+            'association_updated_at': association['updated_at'],
+            'request_id': str(association['request_id']),
+            'request_updated_at': request_rows[0]['updated_at'],
+            'checked_at': checked_at,
+        }
+        if admission is not None:
+            proof_values['admission_updated_at'] = admission['updated_at']
+        return proof_type(**proof_values)
 
     def prelock_materialized_admission_retirements_in_connection(
         self,

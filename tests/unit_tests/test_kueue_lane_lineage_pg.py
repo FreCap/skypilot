@@ -528,6 +528,127 @@ def _materialize(
     return record_id, association_id
 
 
+def _install_pre_effect_terminal_reserved_fill_graph(
+    engine: sqlalchemy.engine.Engine,
+    repository: kueue_lane_lineage.KueueAdmissionRepository,
+    *,
+    intent_key: str,
+    replica_id: int = 1,
+    admission_state: kueue_lane_lineage.KueueAdmissionState = (
+        kueue_lane_lineage.KueueAdmissionState.INTENT_PENDING),
+    cancel_before_terminal: bool = False,
+) -> tuple[uuid.UUID, uuid.UUID, str]:
+    """Install the exact provider-free projection retained by row 465."""
+    identity = _identity()
+    _insert_intent(engine,
+                   intent_key,
+                   ordinal=replica_id - 1,
+                   observation_sequence=replica_id - 1,
+                   ordinary_zero_cost_admission_sequence=replica_id - 1)
+    with engine.begin() as connection:
+        repository.insert_intent_pending_in_connection(connection, identity,
+                                                       intent_key)
+    record_id, association_id = _materialize(engine,
+                                             repository,
+                                             identity,
+                                             intent_key,
+                                             replica_id=replica_id,
+                                             provider_generation=replica_id + 8)
+    _install_canonical_cleanup_profile_authority(engine,
+                                                 intent_key=intent_key,
+                                                 replica_id=replica_id,
+                                                 association_id=association_id)
+    if admission_state is kueue_lane_lineage.KueueAdmissionState.POD_WAITING:
+        receipt = _receipt(admission_state,
+                           intent_key,
+                           record_id,
+                           identity=identity)
+        with engine.begin() as connection:
+            repository.observe_pod_waiting_in_connection(
+                connection,
+                identity,
+                intent_idempotency_key=intent_key,
+                replica_id=replica_id,
+                replica_record_id=record_id,
+                provider_cluster_generation=replica_id + 8,
+                association_id=association_id,
+                pod_namespace='skypilot',
+                pod_name='worker-1',
+                pod_uid='pod-uid-1',
+                pod_receipt=receipt,
+                provider_read_started_at=_postgres_now(connection))
+    elif admission_state is not (
+            kueue_lane_lineage.KueueAdmissionState.INTENT_PENDING):
+        raise ValueError('Unsupported pre-effect admission fixture state.')
+
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with engine.begin() as connection:
+        association = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.association_id ==
+                association_id)).mappings().one()
+        context = ordinary_launch_binding.bound_context_from_association(
+            association)
+        if cancel_before_terminal:
+            ordinary_launch_binding.request_cancel_in_connection(
+                connection, context, 'replica-teardown')
+        now = _postgres_now(connection)
+        evidence = ordinary_launch_binding.TerminalEvidence(
+            status=ordinary_launch_binding.TerminalStatus.FAILED,
+            cause='dispatcher_submit_failed',
+            execution_generation=1,
+            quiescence_required=True,
+            quiesced_generation=1,
+            quiesced_at=now)
+        assert ordinary_launch_binding.record_terminal_in_connection(
+            connection, context,
+            evidence) is (ordinary_launch_binding.StartupClassification.
+                          PRE_EFFECT_TERMINALIZE)
+        assert ordinary_launch_binding.project_in_connection(
+            connection, context, pre_effect_terminal=True, service_job_id=None)
+        association = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.association_id ==
+                association_id)).mappings().one()
+        request_id = str(association['request_id'])
+        connection.execute(
+            sqlalchemy.insert(request_postgres_schema.REQUESTS).values(
+                request_id=request_id,
+                name='sky.launch',
+                handler_name='sky.server.requests.non_pool_launch:launch',
+                payload_type='test-payload',
+                payload_format='json',
+                payload_version=1,
+                producer_version='test',
+                payload_json={},
+                execution_class='normal',
+                status='FAILED',
+                terminal_cause='dispatcher_submit_failed',
+                created_at=now,
+                schedule_type='short',
+                user_id='test-user',
+                should_retry=False,
+                finished_at=now,
+                ignore_return_value=True,
+                retryable=False,
+                execution_generation=1,
+                execution_quiescence_required=True,
+                execution_quiesced_generation=1,
+                execution_quiesced_at=now,
+                ordinary_launch_association_id=association_id,
+                binding_protocol_version=2,
+                profile_kind='RESERVED_FILL',
+                profile_version=1,
+                profile_digest=association['profile_digest'],
+                capability_cohort_epoch=association['capability_cohort_epoch'],
+                capability_profile_set_digest=association[
+                    'capability_profile_set_digest'],
+                receipt_protocol_version=association[
+                    'receipt_protocol_version'],
+                updated_at=now))
+    return record_id, association_id, request_id
+
+
 def _observation_authority(
     *,
     intent_key: str,
@@ -1624,6 +1745,188 @@ def _assert_retired_graph(
                 associations.c.association_id.in_(
                     association_ids))).scalars().all()
         assert set(retained) == set(association_ids)
+
+
+def _current_binding_authority(
+    engine: sqlalchemy.engine.Engine
+) -> ordinary_launch_binding.ControllerBindingAuthority:
+    with engine.connect() as connection:
+        service_row = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                _SERVICE)).mappings().one()
+    return ordinary_launch_binding._authority_from_service(  # pylint: disable=protected-access
+        service_row,
+        controller_pid=service_row['controller_pid'],
+        controller_ip=service_row['controller_ip'],
+        controller_incarnation=service_row['controller_incarnation'],
+        controller_owner_epoch=service_row['controller_owner_epoch'],
+        capable=True)
+
+
+def test_live_pre_effect_fill_retirement_releases_exact_atomic_handoff(
+        admission_database, monkeypatch) -> None:
+    """Row 465's retained graph is replaced without provider discovery."""
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, request_id = (
+        _install_pre_effect_terminal_reserved_fill_graph(admission_database,
+                                                         repository,
+                                                         intent_key=key))
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    stale_association_id = uuid.uuid4()
+    with admission_database.begin() as connection:
+        current = dict(
+            connection.execute(
+                sqlalchemy.select(associations).where(
+                    associations.c.association_id ==
+                    association_id)).mappings().one())
+        now = _postgres_now(connection)
+        current.update({
+            'association_id': stale_association_id,
+            'submission_id': uuid.uuid4(),
+            'replica_record_id': uuid.uuid4(),
+            'request_id': f'stale-request-{uuid.uuid4()}',
+            'resolution': 'PROJECTED',
+            'reconciliation_outcome': 'PROJECTED',
+            'terminal_status': 'FAILED',
+            'terminal_cause': 'dispatcher_submit_failed',
+            'provider_evidence': 'ABSENT',
+            'provider_evidence_observed_at': now,
+            'provider_evidence_payload': {
+                'fixture': 'stale-predecessor-record'
+            },
+            'provider_evidence_digest': 'f' * 64,
+            'updated_at': now,
+        })
+        # Production replica 465 also has retained history for an older record
+        # with the same numeric ID.  The immutable record fence must isolate it.
+        connection.exec_driver_sql(
+            f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
+        connection.execute(sqlalchemy.insert(associations).values(**current))
+        connection.exec_driver_sql(
+            f'ALTER TABLE {associations.name} ENABLE TRIGGER USER')
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    provider_probe = mock.Mock(side_effect=AssertionError('provider I/O'))
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        provider_probe)
+
+    retired = (
+        ordinary_launch_binding.retire_pre_admission_non_pool_launch_intent(
+            _current_binding_authority(admission_database), 1, record_id))
+
+    assert retired == ordinary_launch_binding.PreAdmissionRetirement(
+        ordinary_launch_binding.PreAdmissionRetirementDisposition.RETIRED,
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+    _assert_retired_graph(admission_database,
+                          intent_keys=(key,),
+                          replica_ids=(1,),
+                          association_ids=(association_id,
+                                           stale_association_id))
+    with admission_database.connect() as connection:
+        retained = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.association_id ==
+                association_id)).mappings().one()
+        request = connection.execute(
+            sqlalchemy.select(request_postgres_schema.REQUESTS).where(
+                request_postgres_schema.REQUESTS.c.request_id ==
+                request_id)).mappings().one()
+    assert retained['resolution'] == 'PRE_EFFECT_TERMINAL'
+    assert retained['effect_phase'] == 'NOT_STARTED'
+    assert retained['provider_evidence'] == 'NOT_QUERIED'
+    assert retained['execution_quiesced_generation'] == 1
+    assert request['status'] == 'FAILED'
+    assert request['terminal_cause'] == 'dispatcher_submit_failed'
+    provider_probe.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ('admission_state', 'cancel_before_terminal'),
+    ((kueue_lane_lineage.KueueAdmissionState.INTENT_PENDING, True),
+     (kueue_lane_lineage.KueueAdmissionState.POD_WAITING, False)),
+)
+def test_live_pre_effect_fill_retirement_rejects_cancel_or_pod_authority(
+        admission_database, monkeypatch, admission_state,
+        cancel_before_terminal) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, _ = (
+        _install_pre_effect_terminal_reserved_fill_graph(
+            admission_database,
+            repository,
+            intent_key=key,
+            admission_state=admission_state,
+            cancel_before_terminal=cancel_before_terminal))
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    before = _admissionless_graph_snapshot(admission_database, association_id)
+
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='provider-free and exact'):
+        ordinary_launch_binding.retire_pre_admission_non_pool_launch_intent(
+            _current_binding_authority(admission_database), 1, record_id)
+
+    assert _admissionless_graph_snapshot(admission_database,
+                                         association_id) == before
+
+
+@pytest.mark.parametrize('effect_phase', (None, 'PROVIDER_IO'))
+def test_live_pre_effect_fill_retirement_preserves_ambiguous_action(
+        admission_database, monkeypatch, effect_phase) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    _insert_intent(admission_database,
+                   key,
+                   observation_sequence=0,
+                   ordinary_zero_cost_admission_sequence=0)
+    with admission_database.begin() as connection:
+        repository.insert_intent_pending_in_connection(connection, _identity(),
+                                                       key)
+    record_id, association_id = _materialize(admission_database,
+                                             repository,
+                                             _identity(),
+                                             key,
+                                             replica_id=1,
+                                             provider_generation=9)
+    _install_canonical_cleanup_profile_authority(admission_database,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with admission_database.begin() as connection:
+        if effect_phase is not None:
+            owner_revision = connection.execute(
+                sqlalchemy.select(associations.c.owner_revision).where(
+                    associations.c.association_id ==
+                    association_id)).scalar_one()
+            connection.execute(
+                sqlalchemy.update(associations).where(
+                    associations.c.association_id == association_id).values(
+                        effect_phase=effect_phase,
+                        effect_phase_changed_at=_postgres_now(connection),
+                        owner_revision=owner_revision + 1,
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+        row = connection.execute(
+            sqlalchemy.select(associations).where(
+                associations.c.association_id ==
+                association_id)).mappings().one()
+        context = ordinary_launch_binding.bound_context_from_association(row)
+        assert ordinary_launch_binding.mark_ambiguous_in_connection(
+            connection, context, 'provider-result-uncertain')
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    before = _admissionless_graph_snapshot(admission_database, association_id)
+
+    retired = (
+        ordinary_launch_binding.retire_pre_admission_non_pool_launch_intent(
+            _current_binding_authority(admission_database), 1, record_id))
+
+    assert retired.disposition is (
+        ordinary_launch_binding.PreAdmissionRetirementDisposition.ASSOCIATED)
+    assert _admissionless_graph_snapshot(admission_database,
+                                         association_id) == before
 
 
 def test_serve_state_single_replica_retirement_is_atomic_and_retains_history(
