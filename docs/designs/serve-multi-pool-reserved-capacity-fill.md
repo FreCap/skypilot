@@ -1,6 +1,6 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-23 22:15 UTC
+Last updated: 2026-08-23 23:04 UTC
 
 Status: **reserved-capacity convergence is production-complete; request-level
 qualification remains open.** PR #1686 merged and release `1.1.1456` proved
@@ -47,6 +47,21 @@ campaign must first replace the current broad multi-cloud Spot alternative set
 with an explicitly disclosed bounded Spot envelope; ordinary on-demand is not
 an allowed fallback. None of those gates authorizes changing Kueue or claiming
 HTTP admission as model completion.
+
+One scoped source correction precedes further service-policy iterations.
+SkyServe already relabels a live replica to a new service version when its
+runtime task is unchanged, avoiding an unnecessary replacement and drain for a
+policy-only update. Its reuse gate, however, recognizes only an explicit
+`file_mounts: {}` as empty. The canonical `boltz-l4-fleet` YAML omits
+`file_mounts`, so the equivalent absent value currently exits the reuse path
+before runtime comparison and turns a service-policy-only update into a full
+rolling replacement. The steady-state contract treats absent, explicit null,
+and an empty mapping as the same no-mount runtime. Only a nonempty mount
+mapping requires replacement. This normalization changes no task bytes,
+replica placement, Kueue object, provider resource, database schema, storage,
+or service-version safety fence; recovery-capable replicas and genuinely
+changed runtime tasks retain their existing replacement behavior. Focused
+tests must cover omitted, null, empty, and nonempty mounts before deployment.
 
 ## Historical rollout record
 

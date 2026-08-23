@@ -494,6 +494,22 @@ def _remove_nonmaterial_replica_config_metadata(config: dict[str, Any]) -> None:
         config.pop('_metadata')
 
 
+def _normalize_empty_file_mounts_for_replica_reuse(
+        config: dict[str, Any]) -> bool:
+    """Canonicalize configurations that do not mount files.
+
+    YAML omission, explicit null, and an empty mapping all describe the same
+    runtime: no file mounts.  Normalizing those representations lets a
+    service-policy-only update reuse its existing replicas.  Any other value
+    remains material and requires replacement.
+    """
+    if ('file_mounts' not in config or config['file_mounts'] is None or
+            config['file_mounts'] == {}):
+        config.pop('file_mounts', None)
+        return True
+    return False
+
+
 # TODO(tian): Backward compatibility. Remove this after 3 minor release, i.e.
 # 0.13.0. We move the ProcessStatus to common_utils.ProcessStatus in #6666, but
 # old ReplicaInfo in database will still tries to unpickle using ProcessStatus
@@ -17024,8 +17040,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         # service specs, e.g. scale down the service.
         new_config = yaml_utils.safe_load(new_yaml_content)
         # Always create new replicas and scale down old ones when file_mounts
-        # are not empty.
-        if new_config.get('file_mounts', None) != {}:
+        # are not empty.  Omitted, null, and {} are equivalent no-mount
+        # representations and are removed before comparing runtime configs.
+        if not _normalize_empty_file_mounts_for_replica_reuse(new_config):
             return
         for key in ['service', 'pool', '_user_specified_yaml']:
             new_config.pop(key, None)
@@ -17053,6 +17070,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                  f'{self._service_name} version '
                                  f'{prior_version}')
             old_config = yaml_utils.safe_load(yaml_content)
+            _normalize_empty_file_mounts_for_replica_reuse(old_config)
             for key in ['service', 'pool', '_user_specified_yaml']:
                 old_config.pop(key, None)
             _remove_nonmaterial_replica_config_metadata(old_config)
@@ -17094,10 +17112,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'to %s; launching replacement capacity.',
                         info.replica_id, info.version, version)
                     continue
-                # File mounts should both be empty, as update always
-                # create new buckets if they are not empty.
-                if (old_config == new_config and
-                        old_config.get('file_mounts', None) == {}):
+                # File mounts should both be empty, as updates always create
+                # new buckets if they are not empty.
+                if old_config == new_config:
                     if (info.system_recovery_disposition ==
                             system_recovery_state.SystemRecoveryDisposition.
                             CAPABLE):

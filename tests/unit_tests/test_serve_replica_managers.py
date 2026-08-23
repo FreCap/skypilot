@@ -6412,6 +6412,86 @@ class TestUpdateVersionBatchesPriorVersionYamls:
         assert info3.version == 2
         assert terminal.version == 1
 
+    @pytest.mark.parametrize(
+        'old_file_mounts_yaml',
+        ['', 'file_mounts: null\n', 'file_mounts: {}\n'],
+        ids=['old-omitted', 'old-null', 'old-empty'],
+    )
+    @pytest.mark.parametrize(
+        'new_file_mounts_yaml',
+        ['', 'file_mounts: null\n', 'file_mounts: {}\n'],
+        ids=['new-omitted', 'new-null', 'new-empty'],
+    )
+    def test_reuses_replica_for_equivalent_empty_file_mounts(
+            self, old_file_mounts_yaml, new_file_mounts_yaml):
+        mgr = _make_manager()
+        mgr.latest_version = 1
+        mgr.yaml_content = 'old: yaml'
+        mgr._update_mode = None
+        mgr._persist_replica = mock.Mock()
+        info = mock.Mock(replica_id=1, version=1, is_terminal=False)
+        info.system_recovery_disposition = (
+            recovery_state.SystemRecoveryDisposition.ORDINARY)
+
+        def _yaml(file_mounts_yaml):
+            return ('resources: {}\n' + file_mounts_yaml +
+                    'service: {readiness_probe: /}\n')
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_yaml_content',
+                return_value=_yaml(new_file_mounts_yaml)), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_yaml_contents',
+                 return_value={1: _yaml(old_file_mounts_yaml)}), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos',
+                 return_value=[info]):
+            mgr.update_version(2,
+                               _physical_service_spec_mock(),
+                               update_mode=serve_utils.UpdateMode.ROLLING)
+
+        assert info.version == 2
+        mgr._persist_replica.assert_called_once_with(1, info)
+
+    @pytest.mark.parametrize(('old_file_mounts_yaml', 'new_file_mounts_yaml'), [
+        ('file_mounts:\n  /data: s3://old-bucket/data\n', ''),
+        ('', 'file_mounts:\n  /data: s3://new-bucket/data\n'),
+    ],
+                             ids=['old-nonempty', 'new-nonempty'])
+    def test_nonempty_file_mounts_force_replica_replacement(
+            self, old_file_mounts_yaml, new_file_mounts_yaml):
+        mgr = _make_manager()
+        mgr.latest_version = 1
+        mgr.yaml_content = 'old: yaml'
+        mgr._update_mode = None
+        mgr._persist_replica = mock.Mock()
+        info = mock.Mock(replica_id=1, version=1, is_terminal=False)
+        info.system_recovery_disposition = (
+            recovery_state.SystemRecoveryDisposition.ORDINARY)
+        new_yaml = ('resources: {}\n' + new_file_mounts_yaml +
+                    'service: {readiness_probe: /}\n')
+        old_yaml = ('resources: {}\n' + old_file_mounts_yaml +
+                    'service: {readiness_probe: /}\n')
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_yaml_content',
+                               return_value=new_yaml), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_yaml_contents',
+                               return_value={1: old_yaml}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[info]):
+            mgr.update_version(2,
+                               _physical_service_spec_mock(),
+                               update_mode=serve_utils.UpdateMode.ROLLING)
+
+        assert info.version == 1
+        mgr._persist_replica.assert_not_called()
+
     def test_capable_replica_is_not_relabelled_to_new_readiness_contract(self):
         mgr = _make_manager()
         mgr.latest_version = 1
