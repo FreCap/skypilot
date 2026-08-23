@@ -6,6 +6,8 @@ from typing import Any
 from sky.serve import kubernetes_identity
 from sky.serve import reserved_fill_reclaim_attestation
 
+_TEARDOWN_COMPATIBILITY_PREDECESSORS = 2
+
 
 def projected_admission_for_candidate(
     worker_projections: Any,
@@ -43,6 +45,41 @@ def projected_admission_for_candidate(
                  projected_admission_from_worker_projection(
                      projection, worker_projection_sha256=projection_sha256))
     return projection, admission
+
+
+def projected_admission_mode_for_teardown_candidate(
+    worker_projections: Any,
+    *,
+    kubernetes_context: str,
+    accelerator: str,
+    accelerator_count: int,
+    expected_sha256: str,
+) -> reserved_fill_reclaim_attestation.ReclaimAdmissionMode:
+    """Classify exact immutable authority within the teardown-only window.
+
+    Fresh admission and every provider-effect start require the exact current
+    protocol. Normal teardown may classify the current protocol and its two
+    immediate predecessors so a release cannot strand already-owned durable
+    state. Older decodable projections remain evidence only and fail closed.
+    """
+    projection, admission = projected_admission_for_candidate(
+        worker_projections,
+        kubernetes_context=kubernetes_context,
+        accelerator=accelerator,
+        accelerator_count=accelerator_count,
+        expected_sha256=expected_sha256)
+    protocol_version = kubernetes_identity.worker_projection_protocol_version(
+        projection)
+    current_protocol = (
+        kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
+    oldest_protocol = max(
+        1, current_protocol - _TEARDOWN_COMPATIBILITY_PREDECESSORS)
+    if not oldest_protocol <= protocol_version <= current_protocol:
+        raise ValueError(
+            'Teardown requires the current worker projection protocol or one '
+            f'of its two immediate predecessors ({oldest_protocol}-'
+            f'{current_protocol}); found {protocol_version}.')
+    return admission.admission_mode
 
 
 def projected_admissions_for_edge(

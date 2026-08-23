@@ -54,6 +54,11 @@ class IntentState(str, enum.Enum):
     TERMINAL = 'TERMINAL'
 
 
+class _ProjectionResolutionMode(enum.Enum):
+    CURRENT_ONLY = enum.auto()
+    BOUNDED_TEARDOWN = enum.auto()
+
+
 class ZeroCostActuationError(RuntimeError):
     """Base error for durable zero-cost actuation."""
 
@@ -409,29 +414,40 @@ def _kueue_lane_identity_from_projection(
     accelerator: str,
     accelerator_count: int,
     worker_projection_sha256: str,
-    require_current_protocol: bool = True,
+    projection_resolution_mode: _ProjectionResolutionMode,
 ) -> kueue_lane_lineage.KueueAdmissionIdentity | None:
     """Resolve scheduler mode and identity from one immutable projection."""
-    if type(require_current_protocol) is not bool:
-        raise TypeError('Projection protocol requirement must be boolean.')
     try:
-        _, admission = (reserved_fill_projection_authority.
-                        projected_admission_for_candidate(
-                            worker_projections,
-                            kubernetes_context=kubernetes_context,
-                            accelerator=accelerator,
-                            accelerator_count=accelerator_count,
-                            expected_sha256=worker_projection_sha256,
-                            require_current_protocol=(
-                                require_current_protocol)))
+        if projection_resolution_mode is (
+                _ProjectionResolutionMode.CURRENT_ONLY):
+            _, admission = (reserved_fill_projection_authority.
+                            projected_admission_for_candidate(
+                                worker_projections,
+                                kubernetes_context=kubernetes_context,
+                                accelerator=accelerator,
+                                accelerator_count=accelerator_count,
+                                expected_sha256=worker_projection_sha256,
+                                require_current_protocol=True))
+            admission_mode = admission.admission_mode
+        elif projection_resolution_mode is (
+                _ProjectionResolutionMode.BOUNDED_TEARDOWN):
+            admission_mode = (reserved_fill_projection_authority.
+                              projected_admission_mode_for_teardown_candidate(
+                                  worker_projections,
+                                  kubernetes_context=kubernetes_context,
+                                  accelerator=accelerator,
+                                  accelerator_count=accelerator_count,
+                                  expected_sha256=worker_projection_sha256))
+        else:
+            raise ValueError('Unknown worker projection resolution mode.')
     except (IndexError, TypeError, ValueError) as error:
         raise ZeroCostActuationConflict(
             'Durable fill intent no longer resolves its exact worker '
             'projection.') from error
-    if admission.admission_mode is (reserved_fill_reclaim_attestation.
-                                    ReclaimAdmissionMode.KUBERNETES_SCHEDULER):
+    if admission_mode is (reserved_fill_reclaim_attestation.
+                          ReclaimAdmissionMode.KUBERNETES_SCHEDULER):
         return None
-    if admission.admission_mode is not (
+    if admission_mode is not (
             reserved_fill_reclaim_attestation.ReclaimAdmissionMode.KUEUE):
         raise ZeroCostActuationConflict(
             'Durable fill intent resolved an unknown admission authority.')
@@ -495,7 +511,8 @@ def kueue_lane_identity_for_intent_in_connection(
         kubernetes_context=intent.allowed_locations[0].region,
         accelerator=intent.accelerator,
         accelerator_count=intent.accelerator_count,
-        worker_projection_sha256=intent.worker_projection_sha256)
+        worker_projection_sha256=intent.worker_projection_sha256,
+        projection_resolution_mode=(_ProjectionResolutionMode.CURRENT_ONLY))
 
 
 def _lane_row_matches_identity(
@@ -571,19 +588,17 @@ def _intent_from_row(
     return intent
 
 
-def kueue_admission_identity_for_locked_intent_in_connection(
+def _kueue_admission_identity_for_locked_intent_in_connection(
     connection: sqlalchemy.engine.Connection,
     intent_row: Mapping[str, Any],
     *,
-    require_current_protocol: bool = True,
+    projection_resolution_mode: _ProjectionResolutionMode,
 ) -> kueue_lane_lineage.KueueAdmissionIdentity | None:
     """Resolve an already-locked intent row to its exact Kueue identity.
 
     This is the provider-free adapter used by the admission repository's
     graph validator.  It deliberately accepts the complete locked row rather
-    than independently re-reading mutable intent authority. Fresh admission
-    requires the current projection protocol by default; teardown may decode
-    the exact released historical projection already bound to a retained row.
+    than independently re-reading mutable intent authority.
     """
     _require_postgres(connection)
     if not isinstance(intent_row, Mapping):
@@ -653,7 +668,29 @@ def kueue_admission_identity_for_locked_intent_in_connection(
         accelerator=identity.accelerator,
         accelerator_count=accelerator_count,
         worker_projection_sha256=projection_sha256,
-        require_current_protocol=require_current_protocol)
+        projection_resolution_mode=projection_resolution_mode)
+
+
+def kueue_admission_identity_for_locked_intent_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    intent_row: Mapping[str, Any],
+) -> kueue_lane_lineage.KueueAdmissionIdentity | None:
+    """Resolve locked authority using the exact current projection protocol."""
+    return _kueue_admission_identity_for_locked_intent_in_connection(
+        connection,
+        intent_row,
+        projection_resolution_mode=_ProjectionResolutionMode.CURRENT_ONLY)
+
+
+def kueue_teardown_identity_for_locked_intent_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    intent_row: Mapping[str, Any],
+) -> kueue_lane_lineage.KueueAdmissionIdentity | None:
+    """Resolve exact locked authority within the N/N-1/N-2 teardown window."""
+    return _kueue_admission_identity_for_locked_intent_in_connection(
+        connection,
+        intent_row,
+        projection_resolution_mode=_ProjectionResolutionMode.BOUNDED_TEARDOWN)
 
 
 def _row_matches_values(row: Mapping[str, Any], values: Mapping[str,
