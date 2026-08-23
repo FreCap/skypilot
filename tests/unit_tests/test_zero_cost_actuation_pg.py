@@ -3,6 +3,7 @@
 
 import datetime
 import time
+import types
 import uuid
 
 from alembic import command as alembic_command
@@ -167,6 +168,65 @@ def _plan(
         max_replicas=100,
         planned_replicas=0,
         capacity_unit=capacity_unit)
+
+
+def test_locked_intent_projection_decode_is_current_by_default(monkeypatch):
+    """Historical decode is explicit and cannot weaken fresh admission."""
+    projection = _worker_projection('phx', 1, kueue=True)
+    projection['projection_version'] = 5
+    projection_sha256 = kubernetes_identity.worker_projection_sha256(projection)
+    physical_uid = 'uid-phx'
+    pool_key = reserved_capacity_broker.make_pool_key(
+        'phx',
+        'L4',
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        physical_cluster_uid=physical_uid)
+    location = spot_placer.Location(cloud=clouds.Kubernetes(),
+                                    region='phx',
+                                    zone=None,
+                                    accelerators={'L4': 1},
+                                    use_spot=False)
+    intent = {
+        'service_name': 'svc',
+        'service_hash': _SERVICE_HASH,
+        'service_lifecycle_epoch': 1,
+        'service_version': 19,
+        'pool_key': pool_key,
+        'pool_epoch': 7,
+        'physical_cluster_uid': physical_uid,
+        'kubernetes_context': 'phx',
+        'accelerator': 'L4',
+        'accelerator_count': 1,
+        'worker_projection_sha256': projection_sha256,
+        'allowed_locations': [location.to_pickleable()],
+    }
+    connection = types.SimpleNamespace(dialect=types.SimpleNamespace(
+        name='postgresql'))
+    monkeypatch.setattr(
+        zero_cost_actuation, '_version_placement_snapshot_in_connection',
+        lambda *_args, **_kwargs: ([projection], {
+            'num_nodes': 1
+        }))
+
+    with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict,
+                       match='no longer resolves'):
+        (zero_cost_actuation.
+         kueue_admission_identity_for_locked_intent_in_connection)(connection,
+                                                                   intent)
+
+    identity = (zero_cost_actuation.
+                kueue_admission_identity_for_locked_intent_in_connection(
+                    connection, intent, require_current_protocol=False))
+    assert identity is not None
+    assert identity.worker_projection_sha256 == projection_sha256
+
+    tampered_intent = dict(intent)
+    tampered_intent['worker_projection_sha256'] = '0' * 64
+    with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict,
+                       match='no longer resolves'):
+        (zero_cost_actuation.
+         kueue_admission_identity_for_locked_intent_in_connection)(
+             connection, tampered_intent, require_current_protocol=False)
 
 
 @pytest.fixture

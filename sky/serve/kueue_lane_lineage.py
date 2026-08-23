@@ -1404,7 +1404,7 @@ class KueueAdmissionRepository:
             identity = (
                 zero_cost_actuation.
                 kueue_admission_identity_for_locked_intent_in_connection(
-                    connection, intent))
+                    connection, intent, require_current_protocol=False))
         except Exception as error:  # pylint: disable=broad-except
             raise KueueAdmissionConflict(
                 'Admissionless teardown cannot prove immutable Kueue '
@@ -2398,7 +2398,7 @@ class KueueAdmissionRepository:
                 identity = (
                     zero_cost_actuation.
                     kueue_admission_identity_for_locked_intent_in_connection(
-                        connection, intent))
+                        connection, intent, require_current_protocol=False))
             except Exception as error:  # pylint: disable=broad-except
                 raise KueueAdmissionConflict(
                     'Protocol-v2 replica admission mode is not provable from '
