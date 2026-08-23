@@ -1,6 +1,6 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-23 07:22 UTC
+Last updated: 2026-08-23 07:48 UTC
 
 Status: the canonical PostgreSQL-authoritative reserved-capacity admission and
 assignment path is source-complete. PR #1679 merged at
@@ -27,6 +27,16 @@ and chart digest
 All seven Pods are Ready on that exact digest with zero restarts; Helm storage
 is disabled and PostgreSQL remains authoritative.
 
+The status-verified active-to-active rotation from generation 35 to generation
+36 is complete on that exact homogeneous release and must not be repeated.
+Immediately before rotation, lifecycle 94/version 1 was `READY`: PHX held 156
+`READY` and 18 historical `FAILED_CLEANUP` rows, East held 74 `READY` and two
+`FAILED_PROVISION` rows, and all 250 rows were reserved with zero paid claims
+or paid waiters. Generation 35 had committed 137 PHX and 32 East intents and
+retained 438 historical `grant_expired` rows. These counts are a point-in-time
+safety receipt, not a fixed occupancy denominator; every later proof must
+re-read the capacity admitted by the unchanged scheduler policy.
+
 ## Current executable closeout
 
 This is the only executable rollout sequence in this document. Every later
@@ -37,19 +47,28 @@ says otherwise.
 
 1. Keep Platform disconnected and re-read the exact service, writer, provider,
    paid, route, and unchanged 40-object Kueue gates.
-2. Perform exactly one active-to-active CAS from `SEQUENCED_ACTIVE` generation
-   35 to generation 36, binding the homogeneous `1.1.1450` seven-writer
-   inventory. Never repeat it blindly and never reopen legacy/direct authority.
-3. Prove both load-balancer slots repeatedly resolve an eligible fresh route
-   contract while fill writes continue.
-4. Prove the fresh East scheduler-fit denominator and the fresh PHX
+2. Treat the generation-35-to-36 activation as complete. Never repeat it and
+   never reopen legacy/direct authority.
+3. Merge and Helm-deploy the reviewed normal-service historical-cleanup
+   correction homogeneously across the same seven writers. Before any later
+   activation, verify every writer has the exact new digest and lifecycle
+   94/version 1 remains status-compatible with cleanup.
+4. Only after that deployment and a fresh zero-paid/provider/status readback,
+   perform exactly one active-to-active rotation from generation 36 to 37 to
+   bind the cleanup-capable writer inventory. This is a future deployment gate,
+   not authority for the patch author to operate production or to rotate early.
+5. Prove both load-balancer slots repeatedly resolve an eligible fresh route
+   contract while fill writes continue, and prove every eligible retained
+   pre-job row reaches its existing typed terminal outcome without provider I/O
+   or historical-row deletion.
+6. Prove the fresh East scheduler-fit denominator and the fresh PHX
    Kueue-admitted denominator are fully assigned. Exclude PHX Workloads that
    Simone's unchanged Kueue configuration has not admitted; make no Kueue,
    Terraform/Terragrunt, KubeRay, EFS, IAM, or platform-runtime-pin change.
-5. Require zero paid claims, zero paid waiters, and zero provider Spot capacity
+7. Require zero paid claims, zero paid waiters, and zero provider Spot capacity
    whenever compatible reserved supply covers demand. Then reconnect only the
    endpoint value, send the harmless authenticated read, and repeat the census.
-6. Run immediate, +10, +30, and full stale/quiescence-horizon verification and
+8. Run immediate, +10, +30, and full stale/quiescence-horizon verification and
    record the exact dynamic denominators and evidence here.
 
 Before the historical supported teardown, lifecycle 93/version 1 had
@@ -113,7 +132,7 @@ boundaries.
 | Kueue non-mutation | No source change | No rendered chart change | Not applicable | Complete: both normalized PRE and POST hashes are equal |
 | Paid residual | Complete | Complete | Complete | Source/real-PostgreSQL tests qualify commit-before-residual and drain; idle plus harmless-request production proof created no paid capacity |
 | Protocol-v7 bootstrap and N-1 terminal-cleanup correction (#1679) | Complete at `40a0832bd` | Complete in `1.1.1449` / Helm 573 | Complete at gate 35 | Complete: lifecycle 93 purged and lifecycle 94 recreated without manual deletion |
-| Fill throughput and HA lock-starvation correction (#1680) | Complete at `b311dd277` | Complete in `1.1.1450` / Helm 575 | Pending one exact gate-36 CAS | Production proof pending |
+| Fill throughput and HA lock-starvation correction (#1680) | Complete at `b311dd277` | Complete in `1.1.1450` / Helm 575 | Complete at gate 36 | East batch proof complete: 16 intents committed together, all 16 became Ready, and generation 36 created zero `grant_expired` intents; PHX awaits the reviewed historical-cleanup deployment |
 
 At approximately 03:07 UTC, after takeover and gate-34 activation,
 `sky serve status` reported 133 Ready of 136 current reserved units after
@@ -445,12 +464,15 @@ Stable claim identity, unchanged-policy occupancy, zero-demand paid
 suppression, fresh request telemetry, duplicate-up epoch preservation,
 cross-Pod takeover, Kueue non-mutation, node-pressure health, and the full
 180-second stale/quiescence interval were production-proven on the historical
-lifecycle. Lifecycle-93 cleanup, fresh lifecycle-94 recreation, and generation
-35 activation are complete. Overall closeout now requires exactly one
+lifecycle. Lifecycle-93 cleanup, fresh lifecycle-94 recreation, and the
 generation 35-to-36 authorization of the homogeneous `1.1.1450`/Helm-575
-writer cohort, repeated HA promotability without lock starvation, fast fresh-
-capacity assignment against the current dynamic denominators, a zero-paid
-census, endpoint reconnection, and the immediate/+10/+30/full-stale horizon.
+writer cohort are complete; that rotation must not be repeated. Overall
+closeout now requires the reviewed historical-cleanup deployment, a fresh
+status/zero-paid preflight, exactly one later generation 36-to-37 authorization
+for that new homogeneous cohort, repeated HA promotability without lock
+starvation, fast fresh-capacity assignment against the current dynamic
+denominators, a zero-paid census, endpoint reconnection, and the
+immediate/+10/+30/full-stale horizon.
 The
 rollout audit must then accept the result. Deliberately creating a billable uncovered-demand
 case is not required for this closeout: commit-before-paid-residual, exact-shape
@@ -533,6 +555,43 @@ and every live authority remain fail closed. Ordinary replica cleanup and the
 normal admitted-Pod path are unchanged. Release `1.1.1436` exercised this path
 through normal lifecycle-84 purge; the later normal lifecycle-85 purge confirms
 the obsolete retained graph is no longer the live blocker.
+
+A lifecycle-94 inspection while generation 35 was active, immediately before
+the completed generation-36 rotation, exposed a distinct normal-service case,
+not a reason to broaden that whole-service deletion contract. Three
+older-generation H200 rows were already
+`FAILED_CLEANUP`, off-route, unmaterialized, terminal and executor-quiesced
+with canonical provider `ABSENT` observed after quiescence. Two retained their
+exact `INTENT_PENDING` admissions with no Pod fields; one retained an exact
+`POLICY_ADMITTED` Pod receipt and UID. The live service already owned the
+strictly newer sequenced gate, so the whole-service-only validator correctly
+refused them and the normal exact-Pod loader incorrectly required a recorded
+service job. This is diagnostic evidence for cleanup adjudication, not an
+instruction to advance or otherwise mutate the now-active generation-36 gate.
+The current executable closeout above requires the cleanup source to be
+deployed and status-verified before one separately authorized 36-to-37
+rotation.
+
+The local source correction adds one narrow validation-only adjudication
+before the existing exact-Pod probe. It requires the exact current Kueue
+projection protocol,
+service lifecycle, committed intent, replica UUID and frozen reserved-fill
+profile; one matching protocol-v2 association and admission; terminal copied
+association evidence plus an exact request if one is still retained; exact
+executor quiescence; zero paid claims, queue entries,
+or retention pins; an off-route unmaterialized `SHUTTING_DOWN` or
+`FAILED_CLEANUP` replica; canonical provider `ABSENT` observed after
+quiescence; and a live `SEQUENCED_ACTIVE` protocol-2 gate whose generation is
+strictly greater than the intent and replica's frozen generation. A retained
+`INTENT_PENDING` row must have every Pod field null. A retained
+`POLICY_ADMITTED` row must carry its exact canonical namespace/name/UID receipt
+and digest. Passing returns only `ALREADY_PROVEN`: it performs no provider I/O,
+does not delete PostgreSQL history, and lets the existing replica manager write
+the durable cleanup-success/failed-provision result. Same-generation rows,
+materialized service jobs, absent or `POD_WAITING` admissions, live replicas,
+noncanonical or pre-quiescence evidence, and any paid/queued/pinned or divergent
+edge remain closed. Whole-service batch deletion keeps its prior behavior,
+including rejecting `POLICY_ADMITTED` pre-job rows at that boundary.
 
 The observer correction makes every explicit-context realtime Kubernetes
 accelerator query use the immutable snapshot's policy-only allowed-cloud gate
@@ -1766,8 +1825,10 @@ cleanup PR #1615 removed its enumerated historical-digest verifier after the
 documented horizon. Those rows are not the cause of the revision-470 incident;
 the former cold-controller retirement shelter is deployed and exercised. The
 protocol-v7 purge/recreate rollout completed in PR #1679; lifecycle 94 and gate
-35 are current. The executable closeout is the homogeneous `1.1.1450` one-shot
-generation-36 authorization and proof at the top of this document. Historical
+36 are current. The `1.1.1450` generation-35-to-36 authorization is complete
+and non-repeatable. The executable closeout is the reviewed historical-cleanup
+deployment followed by its separately preflighted one-shot generation-36-to-37
+authorization and proof at the top of this document. Historical
 `1.1.1448` deployment, gate-34 reauthorization, live duplicate-up/takeover,
 Kueue non-mutation, node health, fresh telemetry, the complete 180-second stale
 horizon, and the primary 133/133 occupancy proof remain valid chronology.

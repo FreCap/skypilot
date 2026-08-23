@@ -777,6 +777,7 @@ def _install_retirable_materialized_graph(
     replica_id: int,
     cleanup_marker: bool = True,
     effect_phase: str | None = None,
+    policy_admitted: bool = False,
     worker_projection_sha256: str = _PROJECTION,
 ) -> tuple[uuid.UUID, uuid.UUID, str]:
     """Install the exact terminal, quiesced, provider-absent delete graph."""
@@ -796,6 +797,29 @@ def _install_retirable_materialized_graph(
                                              intent_key,
                                              replica_id=replica_id,
                                              provider_generation=replica_id + 8)
+    if policy_admitted:
+        receipt = _receipt(
+            kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED,
+            intent_key,
+            record_id,
+            identity=identity,
+            phase='Running',
+            workload_name='worker-1',
+            unconstrained_topology='true')
+        with engine.begin() as connection:
+            repository.observe_policy_admitted_in_connection(
+                connection,
+                identity,
+                intent_idempotency_key=intent_key,
+                replica_id=replica_id,
+                replica_record_id=record_id,
+                provider_cluster_generation=replica_id + 8,
+                association_id=association_id,
+                provider_read_started_at=_postgres_now(connection),
+                pod_namespace='skypilot',
+                pod_name='worker-1',
+                pod_uid='pod-uid-1',
+                pod_receipt=receipt)
 
     info = replica_managers.ReplicaInfo(replica_id, f'{_SERVICE}-{replica_id}',
                                         '8000', False, None, _SERVICE_VERSION,
@@ -1299,6 +1323,49 @@ def _stamp_canonical_materialization_receipt(
             sqlalchemy.update(protocol).where(protocol.c.id == 1).values(
                 zero_cost_materialization_sequence=sqlalchemy.func.greatest(
                     protocol.c.zero_cost_materialization_sequence, replica_id)))
+
+
+def _advance_reconciliation_gate(
+    engine: sqlalchemy.engine.Engine,
+    *,
+    generation: int = 2,
+) -> None:
+    protocol = pool_capacity_observation_schema.protocol_state_sequence_table
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(protocol).where(protocol.c.id == 1).values(
+                protocol_version=2,
+                reconciliation_gate_state=(
+                    pool_capacity_observation_schema.SEQUENCED_ACTIVE),
+                reconciliation_gate_generation=generation,
+                reclaim_evidence_sha256=f'{generation:064x}',
+                reclaim_authorized_at=time.time(),
+                deployment_generation=f'fixture-deployment-{generation}'))
+
+
+def _install_generation_fenced_pre_job_graph(
+    engine: sqlalchemy.engine.Engine,
+    *,
+    policy_admitted: bool = False,
+) -> tuple[str, uuid.UUID, uuid.UUID, str]:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(engine)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, request_id = (
+        _install_retirable_materialized_graph(engine,
+                                              repository,
+                                              intent_key=key,
+                                              replica_id=1,
+                                              cleanup_marker=False,
+                                              effect_phase='PROVIDER_IO',
+                                              policy_admitted=policy_admitted))
+    _install_canonical_cleanup_profile_authority(engine,
+                                                 intent_key=key,
+                                                 replica_id=1,
+                                                 association_id=association_id)
+    _set_physical_provider_evidence(
+        engine, association_id, ordinary_launch_binding.ProviderEvidence.ABSENT)
+    return key, record_id, association_id, request_id
 
 
 def _install_historical_v5_worker_projections(
@@ -2585,6 +2652,182 @@ def test_serve_state_whole_service_teardown_retires_exact_graph(
         assert connection.execute(
             sqlalchemy.select(sqlalchemy.func.count()).select_from(
                 serve_state_schema.services_table)).scalar_one() == 0
+
+
+@pytest.mark.parametrize('policy_admitted', (False, True))
+def test_normal_failure_retires_generation_fenced_pre_job_provider_absence(
+        admission_database, monkeypatch, policy_admitted) -> None:
+    """A newer gate adjudicates only already-proven pre-job failures."""
+    _, record_id, _, _ = _install_generation_fenced_pre_job_graph(
+        admission_database, policy_admitted=policy_admitted)
+    _advance_reconciliation_gate(admission_database)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+
+    provider_phase = mock.Mock(side_effect=AssertionError(
+        'normal adjudication entered provider phase'))
+    pod_probe = mock.Mock(
+        side_effect=AssertionError('normal adjudication read a Pod'))
+    cluster_probe = mock.Mock(
+        side_effect=AssertionError('normal adjudication read a cluster'))
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        provider_phase)
+    monkeypatch.setattr(kubernetes_adaptor, 'core_api', pod_probe)
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        cluster_probe)
+
+    assert kueue_lane_observer.project_exact_pod_absence_after_teardown(
+        _SERVICE, 1, record_id)
+    provider_phase.assert_not_called()
+    pod_probe.assert_not_called()
+    cluster_probe.assert_not_called()
+
+
+def test_normal_pre_job_absence_requires_newer_active_generation_gate(
+        admission_database) -> None:
+    _, record_id, _, _ = _install_generation_fenced_pre_job_graph(
+        admission_database)
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+
+    with admission_database.connect() as connection:
+        with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
+                           match='newer active generation fence'):
+            repository.load_generation_fenced_pre_job_absence_in_connection(
+                connection,
+                service_name=_SERVICE,
+                replica_id=1,
+                replica_record_id=record_id)
+
+
+@pytest.mark.parametrize('invalid_evidence', (
+    'request-mismatch',
+    'queued-request',
+    'retention-pin',
+    'paid-claim',
+    'provider-digest',
+    'admission-receipt',
+    'live-replica',
+))
+def test_normal_pre_job_absence_rejects_incomplete_durable_graph(
+        admission_database, invalid_evidence) -> None:
+    _, record_id, association_id, request_id = (
+        _install_generation_fenced_pre_job_graph(
+            admission_database,
+            policy_admitted=invalid_evidence == 'admission-receipt'))
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    requests = request_postgres_schema.REQUESTS
+    if invalid_evidence == 'request-mismatch':
+        with admission_database.begin() as connection:
+            connection.exec_driver_sql(
+                f'ALTER TABLE {requests.name} DISABLE TRIGGER USER')
+            connection.execute(
+                sqlalchemy.update(requests).where(
+                    requests.c.request_id == request_id).values(
+                        terminal_cause='explicit_cancel',
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+            connection.exec_driver_sql(
+                f'ALTER TABLE {requests.name} ENABLE TRIGGER USER')
+    elif invalid_evidence == 'queued-request':
+        with admission_database.begin() as connection:
+            now = _postgres_now(connection)
+            connection.execute(
+                sqlalchemy.insert(request_postgres_schema.QUEUE).values(
+                    request_id=request_id,
+                    schedule_type='short',
+                    priority=0,
+                    available_at=now,
+                    enqueued_at=now,
+                    ignore_return_value=True,
+                    retryable=False,
+                    precondition_attempts=0,
+                    delivery_state='queued',
+                    updated_at=now))
+    elif invalid_evidence == 'retention-pin':
+        with admission_database.begin() as connection:
+            request_postgres.insert_request_retention_pin_in_transaction(
+                connection, request_id, 'reserved-fill-test.v1', association_id)
+    elif invalid_evidence == 'paid-claim':
+        with admission_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_pools_table).values(
+                        pool_key='forbidden-paid-pool',
+                        current_limit=1,
+                        successes_since_resize=0,
+                        updated_at=time.time()))
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_claims_table).values(
+                        service_name=_SERVICE,
+                        service_hash=_SERVICE_HASH,
+                        replica_id=1,
+                        pool_key='forbidden-paid-pool',
+                        priority=1,
+                        claimed_at=time.time()))
+    elif invalid_evidence == 'provider-digest':
+        with admission_database.begin() as connection:
+            connection.exec_driver_sql(
+                f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
+            connection.execute(
+                sqlalchemy.update(associations).where(
+                    associations.c.association_id == association_id).values(
+                        provider_evidence_digest='9' * 64,
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+            connection.exec_driver_sql(
+                f'ALTER TABLE {associations.name} ENABLE TRIGGER USER')
+    elif invalid_evidence == 'admission-receipt':
+        admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
+        with admission_database.begin() as connection:
+            receipt = connection.execute(
+                sqlalchemy.select(admissions.c.pod_receipt).where(
+                    admissions.c.service_name == _SERVICE,
+                    admissions.c.replica_id == 1)).scalar_one()
+            receipt = dict(receipt)
+            receipt['pod'] = dict(receipt['pod'])
+            receipt['pod']['uid'] = 'forged-pod-uid'
+            connection.exec_driver_sql(
+                f'ALTER TABLE {admissions.name} DISABLE TRIGGER USER')
+            connection.execute(
+                sqlalchemy.update(admissions).where(
+                    admissions.c.service_name == _SERVICE,
+                    admissions.c.replica_id == 1).values(
+                        pod_receipt=receipt,
+                        pod_receipt_sha256=_receipt_digest(connection, receipt),
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+            connection.exec_driver_sql(
+                f'ALTER TABLE {admissions.name} ENABLE TRIGGER USER')
+    else:
+        replicas = serve_state_schema.replicas_table
+        with admission_database.begin() as connection:
+            replica = connection.execute(
+                sqlalchemy.select(replicas).where(
+                    replicas.c.service_name == _SERVICE,
+                    replicas.c.replica_id == 1)).mappings().one()
+            info = serve_state.decode_replica_state_for_authority(
+                replica['replica_state_version'], replica['replica_state'])
+            info.status_property.sky_launch_status = (
+                common_utils.ProcessStatus.SUCCEEDED)
+            info.status_property.sky_down_status = None
+            info.status_property.service_ready_now = True
+            connection.exec_driver_sql(
+                f'ALTER TABLE {replicas.name} DISABLE TRIGGER USER')
+            connection.execute(
+                sqlalchemy.update(replicas).where(
+                    replicas.c.service_name == _SERVICE,
+                    replicas.c.replica_id == 1).values(
+                        **serve_state._replica_row_values(  # pylint: disable=protected-access
+                            _SERVICE, 1, info)))
+            connection.exec_driver_sql(
+                f'ALTER TABLE {replicas.name} ENABLE TRIGGER USER')
+    _advance_reconciliation_gate(admission_database)
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+
+    with admission_database.connect() as connection:
+        with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict):
+            repository.load_generation_fenced_pre_job_absence_in_connection(
+                connection,
+                service_name=_SERVICE,
+                replica_id=1,
+                replica_record_id=record_id)
 
 
 def test_whole_service_retires_pre_serve057_provider_absence_without_admission(
