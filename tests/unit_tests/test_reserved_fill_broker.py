@@ -9,6 +9,7 @@ downstream identity.
 # pylint: disable=protected-access,invalid-name,missing-class-docstring
 # pylint: disable=redefined-outer-name,not-callable
 import contextlib
+import copy
 import dataclasses
 import json
 import pickle
@@ -27,6 +28,7 @@ from sky.serve import constants as serve_constants
 from sky.serve import pool_capacity_observation
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker as broker
+from sky.serve import reserved_fill_reclaim_attestation as reclaim
 from sky.serve import serve_state
 from sky.serve import zero_cost_actuation
 from sky.utils import common_utils
@@ -731,16 +733,14 @@ class TestProtocolV2ReplicaPoolProvenance:
         monkeypatch.setattr(
             zero_cost_actuation, 'pending_pool_debits',
             mock.Mock(return_value=(
-                zero_cost_actuation.PendingPoolDebit(
-                    service_name='svc-a',
-                    pool_key=self._POOL,
-                    accelerator='h200',
-                    replica_slots=2),
-                zero_cost_actuation.PendingPoolDebit(
-                    service_name='svc-gone',
-                    pool_key=self._POOL,
-                    accelerator='h200',
-                    replica_slots=1),
+                zero_cost_actuation.PendingPoolDebit(service_name='svc-a',
+                                                     pool_key=self._POOL,
+                                                     accelerator='h200',
+                                                     replica_slots=2),
+                zero_cost_actuation.PendingPoolDebit(service_name='svc-gone',
+                                                     pool_key=self._POOL,
+                                                     accelerator='h200',
+                                                     replica_slots=1),
             )))
 
         result = broker._occupying_debit(['svc-a'],
@@ -1077,6 +1077,311 @@ def _install_legacy_reconciliation_gate(monkeypatch):
                         mock.Mock(return_value=repository))
 
 
+def _claim_identity_edges() -> list[dict[str, object]]:
+    h200_pool = broker.make_pool_key('phx-context',
+                                     'H200',
+                                     protocol_version=broker.PROTOCOL_V2,
+                                     physical_cluster_uid='phx-cluster')
+    a100_pool = broker.make_pool_key('east-context',
+                                     'A100',
+                                     protocol_version=broker.PROTOCOL_V2,
+                                     physical_cluster_uid='east-cluster')
+    h200_edge = _v2_edge(h200_pool)
+    a100_edge = _v2_edge(a100_pool,
+                         access_context='east-context',
+                         physical_cluster_uid='east-cluster')
+    a100_edge.update({
+        'legacy_pool_key': broker.make_pool_key('east-context', 'A100'),
+        'pool_position': 1,
+        'accelerator_names': ['A100'],
+    })
+    return [h200_edge, a100_edge]
+
+
+def _install_claim_identity_harness(monkeypatch):
+    """Install sequenced authority and a semantic generation recorder."""
+    broker.clear_caches()
+    authority = {
+        'service_hash': 'incarnation-a',
+        'service_version': 3,
+        'projection_sha256_by_accelerator': {
+            'a100': 'a' * 64,
+            'h100': 'b' * 64,
+            'h200': 'c' * 64,
+        },
+    }
+    policy_identity = reclaim.ReclaimPolicyIdentity(
+        fleet_bundle_sha256='d' * 64,
+        policy_revision='policy-v1',
+        provider_inventory_sha256='e' * 64)
+    gate = mock.Mock(sequenced_active=True,
+                     generation=11,
+                     reclaim_policy_identity=policy_identity)
+    repository = mock.Mock()
+    repository.read_reconciliation_gate.return_value = gate
+    monkeypatch.setattr(pool_capacity_observation,
+                        'PoolCapacityObservationRepository',
+                        mock.Mock(return_value=repository))
+    monkeypatch.setattr(
+        serve_state, 'get_service_status_snapshot', lambda _service_name: {
+            'hash': authority['service_hash'],
+            'controller_pid': 123,
+            'controller_ip': '10.0.0.1',
+            'version': authority['service_version'],
+        })
+    monkeypatch.setattr(
+        serve_state, 'get_placement_projection_record',
+        lambda _service_name, _version: (True, None, None, [object()]))
+
+    def _projected_admissions(_worker_projections,
+                              *,
+                              access_context,
+                              accelerator_names,
+                              accelerator_count,
+                              require_current_protocol=False):
+        assert require_current_protocol is True
+        admissions = []
+        for accelerator in accelerator_names:
+            card = accelerator.casefold()
+            admissions.append(
+                reclaim.ReclaimProjectedAdmission(
+                    worker_projection_sha256=authority[
+                        'projection_sha256_by_accelerator'][card],
+                    kubernetes_context=access_context,
+                    namespace='inference',
+                    service_account_name='skypilot-pool-sa',
+                    pod_identity_role_arn=None,
+                    scheduler_name='default-scheduler',
+                    priority_class_name='skypilot-low',
+                    priority_value=-1000,
+                    preemption_policy='Never',
+                    admission_mode=(
+                        reclaim.ReclaimAdmissionMode.KUBERNETES_SCHEDULER),
+                    local_queue_name=None,
+                    workload_priority_class_name=None,
+                    accelerator=card,
+                    accelerator_count=accelerator_count,
+                    accelerator_scheduling=(
+                        reclaim.ReclaimAcceleratorScheduling(
+                            label_key='nvidia.com/gpu.product',
+                            label_values=(accelerator.upper(),),
+                            resource_key='nvidia.com/gpu'))))
+        return tuple(sorted(admissions))
+
+    monkeypatch.setattr(serve_state,
+                        'reserved_fill_reclaim_projected_admissions',
+                        _projected_admissions)
+
+    def _authorize(_executor, scope, expected_identity,
+                   expected_gate_generation):
+        return reclaim.ReclaimClaimAuthorization(
+            identity=expected_identity,
+            gate_generation=expected_gate_generation,
+            scope=scope,
+            completed_monotonic=1.0)
+
+    monkeypatch.setattr(broker, '_authorize_reclaim_claim_set_in_boundary',
+                        _authorize)
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        mock.Mock(return_value=broker.PROTOCOL_V2))
+    monkeypatch.setattr(broker, '_prune_claims', mock.Mock(return_value=[]))
+    monkeypatch.setattr(broker, '_claim_rows', mock.Mock(return_value=[]))
+    monkeypatch.setattr(broker.locks, 'get_lock',
+                        lambda *args, **kwargs: _InertLock())
+
+    persisted = []
+    generations: dict[str, int] = {}
+
+    def _persist(_service_name, **kwargs):
+        semantic_hash = kwargs['semantic_hash']
+        if semantic_hash not in generations:
+            generations[semantic_hash] = 7 + len(generations)
+        persisted.append(kwargs)
+        return generations[semantic_hash]
+
+    monkeypatch.setattr(serve_state, 'replace_reserved_fill_claim_set',
+                        _persist)
+    return authority, persisted
+
+
+def _replace_claim_identity(authority,
+                            *,
+                            edges=None,
+                            service_name='svc-a',
+                            configured_max_replicas=8,
+                            utilization_gate=False,
+                            service_floor=0,
+                            service_weight=1,
+                            global_headroom=8,
+                            utilization_ceiling=8,
+                            utilization_state=None):
+    return broker.replace_claim_set(
+        service_name,
+        configured_max_replicas=configured_max_replicas,
+        utilization_gate=utilization_gate,
+        service_floor=service_floor,
+        service_weight=service_weight,
+        global_headroom=global_headroom,
+        utilization_ceiling=utilization_ceiling,
+        utilization_state=utilization_state,
+        edges=_claim_identity_edges() if edges is None else edges,
+        expected_service_hash=authority['service_hash'],
+        expected_controller_owner=(123, '10.0.0.1'),
+        claim_authorization_executor=mock.Mock())
+
+
+@pytest.mark.parametrize('immutable_field', [
+    'service_incarnation',
+    'configured_max_replicas',
+    'service_floor',
+    'service_weight',
+    'utilization_gate',
+    'service_version',
+    'worker_projection',
+    'legacy_pool_key',
+    'pool_position',
+    'access_context',
+    'physical_cluster_uid',
+    'accelerator_cards',
+    'gpus_per_replica',
+])
+def test_protocol_v2_claim_identity_rotates_for_every_immutable_field(
+        monkeypatch, immutable_field):
+    authority, persisted = _install_claim_identity_harness(monkeypatch)
+    baseline_edges = _claim_identity_edges()
+    baseline_generation = _replace_claim_identity(authority,
+                                                  edges=baseline_edges)
+    baseline_hash = persisted[-1]['semantic_hash']
+    edges = copy.deepcopy(baseline_edges)
+    overrides = {}
+
+    if immutable_field == 'service_incarnation':
+        authority['service_hash'] = 'incarnation-b'
+    elif immutable_field == 'configured_max_replicas':
+        overrides['configured_max_replicas'] = 9
+    elif immutable_field == 'service_floor':
+        overrides['service_floor'] = 1
+    elif immutable_field == 'service_weight':
+        overrides['service_weight'] = 2
+    elif immutable_field == 'utilization_gate':
+        overrides['utilization_gate'] = True
+    elif immutable_field == 'service_version':
+        authority['service_version'] = 4
+    elif immutable_field == 'worker_projection':
+        authority['projection_sha256_by_accelerator']['h200'] = 'f' * 64
+    elif immutable_field == 'legacy_pool_key':
+        edges[0]['legacy_pool_key'] = broker.make_pool_key(
+            'phx-context-alias', 'H200')
+    elif immutable_field == 'pool_position':
+        edges[0]['pool_position'], edges[1]['pool_position'] = (1, 0)
+    elif immutable_field == 'access_context':
+        edges[0]['access_context'] = 'phx-context-alias'
+    elif immutable_field == 'physical_cluster_uid':
+        edges[0]['physical_cluster_uid'] = 'phx-cluster-next'
+        edges[0]['pool_key'] = broker.make_pool_key(
+            'phx-context',
+            'H200',
+            protocol_version=broker.PROTOCOL_V2,
+            physical_cluster_uid='phx-cluster-next')
+    elif immutable_field == 'accelerator_cards':
+        edges[0]['pool_key'] = broker.make_pool_key(
+            'phx-context',
+            'H100',
+            protocol_version=broker.PROTOCOL_V2,
+            physical_cluster_uid='phx-cluster')
+        edges[0]['legacy_pool_key'] = broker.make_pool_key(
+            'phx-context', 'H100')
+        edges[0]['accelerator_names'] = ['H100']
+    else:
+        assert immutable_field == 'gpus_per_replica'
+        edges[0]['gpus_per_replica'] = 2
+
+    next_generation = _replace_claim_identity(authority,
+                                              edges=edges,
+                                              **overrides)
+
+    assert persisted[-1]['semantic_hash'] != baseline_hash
+    assert next_generation != baseline_generation
+
+
+@pytest.mark.parametrize('runtime_field', [
+    'holdings_fill',
+    'launchable',
+    'global_headroom',
+    'utilization_ceiling',
+    'utilization_state',
+    'derived_edge_floor',
+    'effective_cap',
+    'edge_weight_copy',
+])
+def test_protocol_v2_runtime_state_preserves_claim_identity_generation(
+        monkeypatch, runtime_field):
+    authority, persisted = _install_claim_identity_harness(monkeypatch)
+    baseline_edges = _claim_identity_edges()
+    baseline_generation = _replace_claim_identity(authority,
+                                                  edges=baseline_edges)
+    baseline_hash = persisted[-1]['semantic_hash']
+    edges = copy.deepcopy(baseline_edges)
+    overrides = {}
+
+    if runtime_field == 'holdings_fill':
+        edges[0]['holdings_fill'] = 4
+    elif runtime_field == 'launchable':
+        edges[0]['launchable'] = False
+    elif runtime_field == 'global_headroom':
+        overrides['global_headroom'] = 2
+    elif runtime_field == 'utilization_ceiling':
+        overrides['utilization_ceiling'] = 3
+    elif runtime_field == 'utilization_state':
+        overrides['utilization_state'] = {'cap': 2, 'last_release_at': 7.0}
+    elif runtime_field == 'derived_edge_floor':
+        edges[0]['floor_replicas'] = 2
+    elif runtime_field == 'effective_cap':
+        edges[0]['effective_cap'] = 4
+    else:
+        assert runtime_field == 'edge_weight_copy'
+        edges[0]['weight'] = 999
+
+    next_generation = _replace_claim_identity(authority,
+                                              edges=edges,
+                                              **overrides)
+
+    assert persisted[-1]['semantic_hash'] == baseline_hash
+    assert next_generation == baseline_generation
+
+
+def test_protocol_v2_claim_identity_is_deterministic_by_pool_position(
+        monkeypatch):
+    authority, persisted = _install_claim_identity_harness(monkeypatch)
+    edges = _claim_identity_edges()
+    baseline_generation = _replace_claim_identity(authority, edges=edges)
+    baseline_hash = persisted[-1]['semantic_hash']
+
+    reordered_generation = _replace_claim_identity(authority,
+                                                   edges=list(reversed(edges)))
+
+    assert persisted[-1]['semantic_hash'] == baseline_hash
+    assert reordered_generation == baseline_generation
+
+
+def test_protocol_v2_claim_identity_rejects_caller_semantic_hash():
+    caller_owned_identity = {
+        'semantic_hash': 'caller-chosen-authority',
+        'configured_max_replicas': 8,
+        'utilization_gate': False,
+        'service_floor': 0,
+        'service_weight': 1,
+        'global_headroom': 8,
+        'utilization_ceiling': 8,
+        'utilization_state': None,
+        'edges': _claim_identity_edges(),
+        'expected_service_hash': 'incarnation-a',
+    }
+    replace_claim_set = mock.Mock(side_effect=broker.replace_claim_set)
+    with pytest.raises(TypeError, match='semantic_hash'):
+        replace_claim_set('svc-a', **caller_owned_identity)
+
+
 def _committed_observation(
     pool_key: str,
     *,
@@ -1133,7 +1438,10 @@ def test_replace_claim_set_overlap_withdraws_previous_generation(monkeypatch):
                         lambda *args, **kwargs: _InertLock())
 
     assert broker.replace_claim_set('svc-a',
-                                    semantic_hash='changed-set',
+                                    configured_max_replicas=1,
+                                    utilization_gate=False,
+                                    service_floor=0,
+                                    service_weight=1,
                                     global_headroom=1,
                                     utilization_ceiling=1,
                                     utilization_state=None,
@@ -1171,7 +1479,10 @@ def test_replace_claim_set_overlap_withdraws_previous_generation(monkeypatch):
         1, 1000.0, 'east-context', ('h100',), 'east-cluster', 1)
 
     assert broker.replace_claim_set('svc-a',
-                                    semantic_hash='semantic-v1',
+                                    configured_max_replicas=3,
+                                    utilization_gate=False,
+                                    service_floor=0,
+                                    service_weight=1,
                                     global_headroom=3,
                                     utilization_ceiling=3,
                                     utilization_state={},
@@ -1183,7 +1494,10 @@ def test_replace_claim_set_overlap_withdraws_previous_generation(monkeypatch):
     replace.assert_called_once()
     assert replace.call_args.kwargs['heartbeat_ts'] == 1234.0
     assert (broker.replace_claim_set('svc-a',
-                                     semantic_hash='semantic-v1',
+                                     configured_max_replicas=3,
+                                     utilization_gate=False,
+                                     service_floor=0,
+                                     service_weight=1,
                                      global_headroom=3,
                                      utilization_ceiling=3,
                                      utilization_state={},
@@ -1197,7 +1511,10 @@ def test_replace_claim_set_overlap_withdraws_previous_generation(monkeypatch):
         3, 1000.0, 'phx-context', ('h200',), 'phx-cluster', 7)
     replace.return_value = None
     assert broker.replace_claim_set('svc-a',
-                                    semantic_hash='semantic-v1',
+                                    configured_max_replicas=3,
+                                    utilization_gate=False,
+                                    service_floor=0,
+                                    service_weight=1,
                                     global_headroom=3,
                                     utilization_ceiling=3,
                                     utilization_state={},
@@ -1239,7 +1556,10 @@ def test_replace_claim_set_allows_disjoint_cards_in_one_access_context(
                         lambda *args, **kwargs: _InertLock())
 
     generation = broker.replace_claim_set('svc-a',
-                                          semantic_hash='two-exact-card-edges',
+                                          configured_max_replicas=3,
+                                          utilization_gate=False,
+                                          service_floor=0,
+                                          service_weight=1,
                                           global_headroom=3,
                                           utilization_ceiling=3,
                                           utilization_state={},
@@ -1247,7 +1567,19 @@ def test_replace_claim_set_allows_disjoint_cards_in_one_access_context(
                                           expected_service_hash='owner-hash')
 
     assert generation == 7
-    assert replace.call_args.kwargs['edges'] == [h200_edge, a100_edge]
+    expected_h200_edge = {
+        **h200_edge,
+        'accelerator_names': ['h200'],
+        'worker_projection_sha256_by_accelerator': None,
+    }
+    expected_a100_edge = {
+        **a100_edge,
+        'accelerator_names': ['a100'],
+        'worker_projection_sha256_by_accelerator': None,
+    }
+    assert replace.call_args.kwargs['edges'] == [
+        expected_h200_edge, expected_a100_edge
+    ]
 
 
 def test_v2_round_single_claimant_is_integer_generation_fenced(
@@ -1402,6 +1734,9 @@ def test_committed_observation_converts_raw_gpus_once_with_broker_width(
     assert publication.last_observed_free == 1
     assert json.loads(publication.feed_by_accelerator) == {
         broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+            'h200': 1
+        },
+        broker._SPENDABLE_FREE_BY_ACCELERATOR_KEY: {
             'h200': 1
         },
         broker._BROKER_SLOT_WIDTH_KEY: 8,

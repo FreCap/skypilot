@@ -733,9 +733,7 @@ def _grant_durable_plan(
         max_capacity=max_capacity,
         expected_controller_incarnation=controller_incarnation,
         expected_controller_owner_epoch=_CONTROLLER_OWNER_EPOCH)
-    accepted_keys = {
-        item.intent_idempotency_key for item in receipt.accepted
-    }
+    accepted_keys = {item.intent_idempotency_key for item in receipt.accepted}
     if accepted_keys:
         _install_fresh_provider_proofs(
             engine,
@@ -2106,6 +2104,60 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
             """), {
                 'name': _SERVICE
             }).scalar_one() == 1
+    assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) == published
+
+    runtime_edge = dict(edge)
+    runtime_edge.update(holdings_fill=3, floor_replicas=2)
+    runtime_generation = serve_state.replace_reserved_fill_claim_set(
+        _SERVICE,
+        semantic_hash='semantic-a',
+        global_headroom=5,
+        utilization_ceiling=4,
+        utilization_state={
+            'cap': 4,
+            'stepped_at': 3.0
+        },
+        edges=(runtime_edge,),
+        heartbeat_ts=3,
+        expected_service_hash=_SERVICE_HASH,
+        service_version=1,
+        expected_controller_owner=_OWNER,
+        reclaim_claim_scope=same_scope,
+        reclaim_claim_authorization=same_authorization)
+    assert runtime_generation == 11
+    assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) == published
+
+    lower_cap_edge = dict(runtime_edge)
+    lower_cap_edge['effective_cap'] = 4
+    lower_cap_generation = serve_state.replace_reserved_fill_claim_set(
+        _SERVICE,
+        semantic_hash='semantic-a',
+        global_headroom=4,
+        utilization_ceiling=4,
+        utilization_state={
+            'cap': 4,
+            'stepped_at': 4.0
+        },
+        edges=(lower_cap_edge,),
+        heartbeat_ts=4,
+        expected_service_hash=_SERVICE_HASH,
+        service_version=1,
+        expected_controller_owner=_OWNER,
+        reclaim_claim_scope=same_scope,
+        reclaim_claim_authorization=same_authorization)
+    assert lower_cap_generation == 11
+    # Same-generation cap changes do not clear the publication row, but the
+    # schema-5 reader immediately rejects the stale edge-cap authority.
+    with allocation_engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.text("""
+                SELECT allocation_generation
+                FROM reserved_fill_service_claim_sets
+                WHERE service_name = :name
+            """), {
+                'name': _SERVICE
+            }).scalar_one() == 1
+    assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) is None
 
     next_scope, next_authorization = _claim_policy_authority('semantic-b')
     next_generation = serve_state.replace_reserved_fill_claim_set(
@@ -2115,7 +2167,7 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
         utilization_ceiling=8,
         utilization_state=None,
         edges=(edge,),
-        heartbeat_ts=3,
+        heartbeat_ts=5,
         expected_service_hash=_SERVICE_HASH,
         service_version=1,
         expected_controller_owner=_OWNER,
