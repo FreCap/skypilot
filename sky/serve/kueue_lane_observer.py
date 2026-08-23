@@ -69,6 +69,17 @@ def project_exact_pod_absence_after_teardown(
             kueue_lane_lineage.PhysicalAbsenceLoadState.ALREADY_PROVEN):
         return True
     with engine.connect() as connection:
+        teardown_pre_job_decision = (
+            repository.load_whole_service_pre_job_absence_in_connection(
+                connection,
+                service_name=service_name,
+                replica_id=replica_id,
+                replica_record_id=record_uuid))
+    teardown_pre_job_decision.validate()
+    if teardown_pre_job_decision.state is (
+            kueue_lane_lineage.PhysicalAbsenceLoadState.ALREADY_PROVEN):
+        return True
+    with engine.connect() as connection:
         decision = repository.load_exact_pod_absence_probe_target_in_connection(
             connection,
             service_name=service_name,
