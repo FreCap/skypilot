@@ -1975,6 +1975,7 @@ class ZeroCostActuationRepository:
             now = connection.execute(
                 sqlalchemy.select(
                     sqlalchemy.func.clock_timestamp())).scalar_one()
+            expires_at = now + datetime.timedelta(seconds=lease_seconds)
             connection.execute(
                 sqlalchemy.update(_INTENTS).where(
                     _INTENTS.c.service_name == service_name,
@@ -1998,13 +1999,29 @@ class ZeroCostActuationRepository:
                                    last_error='grant_expired',
                                    updated_at=now,
                                    terminal_at=now))
+            connection.execute(
+                sqlalchemy.update(_INTENTS).where(
+                    _INTENTS.c.service_name == service_name,
+                    _INTENTS.c.pool_key == pool_key,
+                    _INTENTS.c.state.in_((IntentState.GRANTED.value,
+                                          IntentState.RETRYABLE.value)),
+                    _INTENTS.c.replica_id.is_(None),
+                    _INTENTS.c.replica_record_id.is_(None),
+                    _INTENTS.c.valid_until > now, _INTENTS.c.valid_until
+                    < expires_at).values(
+                        state=IntentState.TERMINAL.value,
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        last_error='insufficient_actuation_window',
+                        updated_at=now,
+                        terminal_at=now))
 
             pending_predicates = (_INTENTS.c.service_name == service_name,
                                   _INTENTS.c.pool_key == pool_key,
                                   _INTENTS.c.state.in_(
                                       (IntentState.GRANTED.value,
                                        IntentState.RETRYABLE.value)),
-                                  _INTENTS.c.valid_until > now)
+                                  _INTENTS.c.valid_until >= expires_at)
             authority_rows = connection.execute(
                 sqlalchemy.select(
                     _INTENTS.c.reconciliation_gate_generation,
@@ -2040,7 +2057,6 @@ class ZeroCostActuationRepository:
             ]
             if not rows:
                 return ()
-            expires_at = now + datetime.timedelta(seconds=lease_seconds)
             keys = tuple(str(row['intent_idempotency_key']) for row in rows)
             result = connection.execute(
                 sqlalchemy.update(_INTENTS).where(
