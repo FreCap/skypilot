@@ -258,6 +258,10 @@ def redact_task_yaml_dict(task_yaml: dict[str, Any]) -> None:
     form are kept as-is; in dict form they are set to null so the YAML
     remains launchable.
     """
+    # This internal field is a verbatim provenance copy, not part of the
+    # display-safe task schema.  In compiled task YAML it can contain the
+    # unredacted input document, so never retain it in a redacted projection.
+    task_yaml.pop('_user_specified_yaml', None)
     raw_secrets = task_yaml.get('secrets')
     if raw_secrets is not None:
         if isinstance(raw_secrets, list):

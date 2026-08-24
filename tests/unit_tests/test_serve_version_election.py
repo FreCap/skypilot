@@ -1,6 +1,7 @@
 """Tests for retained SkyServe versions and admin election."""
 # pylint: disable=protected-access
 import contextlib
+import json
 import types
 from unittest import mock
 
@@ -63,14 +64,6 @@ def test_serve_request_retains_submitted_yaml_before_api_processing():
     assert kwargs['submitted_yaml_content'] == body.task
 
 
-def test_compiled_yaml_is_redacted_with_stable_key_order():
-    redacted = server._redact_version_yaml('z: value\na: value\n',
-                                           stable_order=True)
-
-    assert redacted is not None
-    assert redacted.index('a: value') < redacted.index('z: value')
-
-
 def test_version_history_marks_elected_and_active_versions():
     record = {
         'pool': False,
@@ -110,7 +103,7 @@ def test_version_history_marks_elected_and_active_versions():
     assert history['versions'] == [{
         'version': 3,
         'submitted_yaml_content': 'redacted-submitted-yaml-3',
-        'compiled_yaml_content': 'redacted-value: yaml-3\n',
+        'compiled_yaml_content': None,
         'created_at': 1003.0,
         'created_by': 'user-3',
         'quarantined_at': 1003.5,
@@ -124,7 +117,7 @@ def test_version_history_marks_elected_and_active_versions():
     }, {
         'version': 2,
         'submitted_yaml_content': 'redacted-submitted-yaml-2',
-        'compiled_yaml_content': 'redacted-value: yaml-2\n',
+        'compiled_yaml_content': None,
         'created_at': 1002.0,
         'created_by': 'user-2',
         'quarantined_at': None,
@@ -138,7 +131,7 @@ def test_version_history_marks_elected_and_active_versions():
     }, {
         'version': 1,
         'submitted_yaml_content': 'redacted-submitted-yaml-1',
-        'compiled_yaml_content': 'redacted-value: yaml-1\n',
+        'compiled_yaml_content': None,
         'created_at': 1001.0,
         'created_by': 'user-1',
         'quarantined_at': None,
@@ -222,7 +215,45 @@ def test_version_detail_reads_only_requested_version():
     get_version.assert_called_once_with('svc', 2)
     assert detail['version'] == 2
     assert detail['submitted_yaml_content'] == 'submitted: yaml\n'
-    assert detail['compiled_yaml_content'] == 'compiled: yaml\n'
+    assert detail['compiled_yaml_content'] is None
+
+
+def test_version_payload_never_serializes_compiled_execution_yaml():
+    secret_value = 'VALUE_THAT_MUST_NOT_BE_SERIALIZED'
+    version_record = {
+        'version': 1,
+        'spec': None,
+        'yaml_content': ('secrets:\n'
+                         f'  AUTH_TOKEN: {secret_value}\n'
+                         'service:\n'
+                         '  readiness_probe:\n'
+                         '    headers:\n'
+                         f'      Authorization: Bearer {secret_value}\n'
+                         '_user_specified_yaml: |\n'
+                         '  secrets:\n'
+                         f'    AUTH_TOKEN: {secret_value}\n'),
+        'submitted_yaml_content': ('secrets:\n'
+                                   f'  AUTH_TOKEN: {secret_value}\n'
+                                   'service:\n'
+                                   '  readiness_probe:\n'
+                                   '    headers:\n'
+                                   '      Authorization: Bearer $AUTH_TOKEN\n'),
+        'created_at': 1001.0,
+        'created_by': 'user-1',
+        'quarantined_at': None,
+        'quarantine_reason': None,
+        'controller_job_projection': None,
+        'controller_work_cache': None,
+        'worker_placement_projections': None,
+    }
+
+    payload = server._service_version_payload(version_record,
+                                              elected_version=1,
+                                              active_versions=[1],
+                                              include_yaml=True)
+
+    assert payload['compiled_yaml_content'] is None
+    assert secret_value not in json.dumps(payload)
 
 
 def test_elect_version_reuses_safe_update_path():
