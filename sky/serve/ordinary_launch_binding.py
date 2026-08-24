@@ -4460,6 +4460,32 @@ def _validate_effect_rows(
                 'Service no longer authorizes provider effects.')
 
 
+def retained_reduction_snapshot_matches(
+    lifecycle: Mapping[str, Any],
+    service: Mapping[str, Any],
+    replica: Mapping[str, Any],
+    association: Mapping[str, Any],
+    context: BoundLaunchContext,
+) -> bool:
+    """Purely validate one non-authorizing retained-reduction snapshot.
+
+    The caller may use this only to avoid an unnecessary mutation reducer pass.
+    It grants no provider, projection, cancellation, cleanup, or ownership
+    authority, and deliberately accepts only the still-bound resolution.
+    """
+    try:
+        _validate_effect_rows(lifecycle,
+                              service,
+                              replica,
+                              association,
+                              context,
+                              allowed_resolutions=frozenset({Resolution.BOUND}),
+                              require_launch_authorized=False)
+    except (KeyError, TypeError, ValueError, OrdinaryLaunchBindingConflict):
+        return False
+    return True
+
+
 def lock_reduction_authority_in_connection(
     connection: sqlalchemy.engine.Connection,
     context: BoundLaunchContext,

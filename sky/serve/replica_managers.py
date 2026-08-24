@@ -4461,8 +4461,22 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         def _reduce(_result: Any, _error: BaseException | None) -> Any:
             del _result, _error
+            # An active request has no projectable result. One conservative
+            # non-authorizing SELECT keeps its periodic adopter poll off every
+            # mutation lock. A stale result can only defer terminal reduction
+            # until the next poll; every false/error shape enters the canonical
+            # locked reducer below.
+            launch_context = _context()
+            try:
+                active = (
+                    request_postgres.read_bound_reserved_fill_active_snapshot(
+                        launch_context, authority))
+            except Exception:  # pylint: disable=broad-except
+                active = None
+            if active is not None:
+                return active
             return request_postgres.reduce_bound_ordinary_launch(
-                _context(), authority, project_replica_result=projector)
+                launch_context, authority, project_replica_result=projector)
 
         def _cancel(reason: str) -> Any:
             return request_postgres.cancel_bound_ordinary_launch_request(

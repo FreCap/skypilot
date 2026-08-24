@@ -66,6 +66,7 @@ capacity_admission = adaptors_common.LazyImport('sky.serve.capacity_admission')
 capacity_authority = adaptors_common.LazyImport('sky.serve.capacity_authority')
 serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
 serve_state_schema = adaptors_common.LazyImport('sky.serve.serve_state_schema')
+serve_statuses = adaptors_common.LazyImport('sky.serve.serve_statuses')
 kueue_lane_lineage_schema = adaptors_common.LazyImport(
     'sky.serve.kueue_lane_lineage_schema')
 zero_cost_actuation = adaptors_common.LazyImport(
@@ -3292,6 +3293,309 @@ def inspect_bound_ordinary_launch(
                         if service_job_id is None else int(service_job_id)),
         cancel_reason=locked.get('cancel_reason'),
         projected=False)
+
+
+def read_bound_reserved_fill_active_snapshot(
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+) -> OrdinaryLaunchReduction | None:
+    """Return one active reserved-fill snapshot without row/advisory locks.
+
+    This read keeps an already-adopted active request out of the mutation
+    reducer's global protocol/lifecycle lock prefix. It grants no provider,
+    projection, cancellation, cleanup, or ownership authority. A concurrent
+    transition may make the result stale immediately; the adopter will then
+    enter the canonical locked reducer on its next poll.
+
+    False negatives deliberately fall through to that reducer. Every immutable
+    identity, current controller/lifecycle tuple, replica projection, zero-paid
+    invariant, request, pin, queue, and live-claim predicate needed for a
+    positive result is checked in one PostgreSQL SELECT without FOR UPDATE or
+    an advisory lock.
+    """
+    if (not isinstance(context,
+                       ordinary_launch_binding.BoundNonPoolLaunchContext) or
+            context.profile.kind is not ordinary_launch_binding.
+            NonPoolLaunchProfileKind.RESERVED_FILL):
+        return None
+    try:
+        context.profile.validate()
+    except ValueError:
+        return None
+    if (not isinstance(authority,
+                       ordinary_launch_binding.ControllerBindingAuthority) or
+            not authority.retained_non_pool_settlement_allowed or
+            authority.service_name != context.service_name or
+            authority.non_pool_capability_cohort_epoch
+            != context.capability_cohort_epoch or
+            authority.non_pool_profile_set_digest
+            != context.capability_profile_set_digest or
+            authority.non_pool_receipt_protocol_version
+            != context.receipt_protocol_version):
+        return None
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return None
+
+    association = ordinary_launch_binding.ordinary_launch_associations_table
+    service = serve_state_schema.services_table
+    lifecycle = serve_state_schema.service_lifecycle_fences_table
+    replica = serve_state_schema.replicas_table
+    paid_claim = serve_state_schema.paid_capacity_claims_table
+    profile = context.profile
+    active_statuses = tuple(
+        status.value for status in requests_lib.RequestStatus.active_statuses())
+    executable_statuses = tuple(
+        status.value
+        for status in requests_lib.RequestStatus.executable_statuses())
+    queued = sqlalchemy.and_(
+        REQUESTS.c.status.in_(executable_statuses),
+        QUEUE.c.delivery_state == 'queued',
+        QUEUE.c.claim_generation.is_(None),
+        REQUESTS.c.claim_token.is_(None),
+        REQUESTS.c.worker_instance_id.is_(None),
+        REQUESTS.c.lease_expires_at.is_(None),
+        ~REQUESTS.c.execution_quiescence_required,
+    )
+    claimed = sqlalchemy.and_(
+        QUEUE.c.delivery_state == 'claimed',
+        QUEUE.c.claim_generation == REQUESTS.c.execution_generation,
+        REQUESTS.c.execution_generation > 0,
+        REQUESTS.c.claim_token.is_not(None),
+        REQUESTS.c.worker_instance_id.is_not(None),
+        REQUESTS.c.lease_expires_at.is_not(None),
+        REQUESTS.c.lease_expires_at > sqlalchemy.func.clock_timestamp(),
+        sqlalchemy.or_(
+            REQUESTS.c.status != requests_lib.RequestStatus.RUNNING.value,
+            REQUESTS.c.pid.is_not(None)),
+        REQUESTS.c.execution_quiescence_required,
+    )
+    joined = association.join(
+        service, service.c.name == association.c.service_name).join(
+            lifecycle, lifecycle.c.name == association.c.service_name).join(
+                replica,
+                sqlalchemy.and_(
+                    replica.c.service_name == association.c.service_name,
+                    replica.c.replica_id == association.c.replica_id,
+                    replica.c.ordinary_launch_association_id ==
+                    association.c.association_id,
+                )).join(
+                    REQUESTS,
+                    sqlalchemy.and_(
+                        REQUESTS.c.request_id == association.c.request_id,
+                        REQUESTS.c.ordinary_launch_association_id ==
+                        association.c.association_id,
+                    )).join(
+                        QUEUE,
+                        QUEUE.c.request_id == association.c.request_id).join(
+                            REQUEST_RETENTION_PINS,
+                            sqlalchemy.and_(
+                                REQUEST_RETENTION_PINS.c.request_id ==
+                                association.c.request_id,
+                                REQUEST_RETENTION_PINS.c.pin_kind ==
+                                ORDINARY_LAUNCH_RETENTION_PIN_KIND,
+                                REQUEST_RETENTION_PINS.c.pin_id ==
+                                association.c.association_id,
+                            ))
+    statement = sqlalchemy.select(
+        association,
+        lifecycle.c.epoch.label('_fence_epoch'),
+        service.c.hash.label('_service_hash'),
+        service.c.workspace.label('_service_workspace'),
+        service.c.lifecycle_epoch.label('_service_lifecycle_epoch'),
+        service.c.ordinary_launch_binding_mode.label('_service_binding_mode'),
+        service.c.ordinary_launch_binding_epoch.label('_service_binding_epoch'),
+        service.c.ordinary_launch_binding_capable.label('_service_capable'),
+        service.c.controller_incarnation.label('_service_incarnation'),
+        service.c.controller_owner_epoch.label('_service_owner_epoch'),
+        service.c.non_pool_launch_binding_capable.label(
+            '_service_non_pool_capable'),
+        service.c.non_pool_launch_controller_incarnation.label(
+            '_service_non_pool_incarnation'),
+        service.c.non_pool_launch_binding_protocol_version.label(
+            '_service_non_pool_protocol'),
+        service.c.non_pool_launch_capability_profile_set_digest.label(
+            '_service_non_pool_profile_set'),
+        service.c.non_pool_launch_capability_cohort_epoch.label(
+            '_service_non_pool_cohort'),
+        service.c.non_pool_launch_receipt_protocol_version.label(
+            '_service_non_pool_receipt'),
+        service.c.status.label('_service_status'),
+        replica.c.replica_id.label('_replica_id'),
+        replica.c.replica_state_version.label('_replica_state_version'),
+        replica.c.replica_state.label('_replica_state'),
+        replica.c.status.label('_replica_status'),
+        replica.c.version.label('_replica_version'),
+        replica.c.cluster_name.label('_replica_cluster_name'),
+        replica.c.paid_capacity_pool_key.label('_replica_paid_pool_key'),
+        REQUESTS.c.status.label('_request_status'),
+        REQUESTS.c.execution_generation.label('_request_generation'),
+        REQUESTS.c.claim_token.label('_request_claim_token'),
+        REQUESTS.c.worker_instance_id.label('_request_worker_instance_id'),
+        REQUESTS.c.lease_expires_at.label('_request_lease_expires_at'),
+        REQUESTS.c.execution_quiescence_required.label(
+            '_request_quiescence_required'),
+        QUEUE.c.delivery_state.label('_queue_delivery_state'),
+        QUEUE.c.claim_generation.label('_queue_claim_generation'),
+    ).select_from(joined).where(
+        association.c.association_id == context.association_id,
+        association.c.request_id == context.request_id,
+        association.c.service_name == context.service_name,
+        association.c.replica_id == context.replica_id,
+        association.c.replica_record_id == context.replica_record_id,
+        association.c.launch_generation == context.launch_generation,
+        association.c.input_digest == context.input_digest,
+        association.c.resolution ==
+        ordinary_launch_binding.Resolution.BOUND.value,
+        association.c.cancel_reason.is_(None),
+        association.c.cancel_requested_at.is_(None),
+        association.c.reconciliation_outcome ==
+        ordinary_launch_binding.ReconciliationOutcome.ACTIVE_ADOPT.value,
+        association.c.provider_evidence ==
+        ordinary_launch_binding.ProviderEvidence.NOT_QUERIED.value,
+        association.c.paid_capacity_pool_key.is_(None),
+        association.c.binding_protocol_version ==
+        ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION,
+        association.c.profile_kind == context.profile.kind.value,
+        association.c.profile_version == profile.version,
+        association.c.profile_digest == profile.digest,
+        association.c.capability_cohort_epoch ==
+        context.capability_cohort_epoch,
+        association.c.capability_profile_set_digest ==
+        context.capability_profile_set_digest,
+        association.c.receipt_protocol_version ==
+        context.receipt_protocol_version,
+        association.c.authorization_kind == profile.authorization_kind.value,
+        association.c.authorization_reference ==
+        profile.authorization_reference,
+        association.c.authorization_generation ==
+        profile.authorization_generation,
+        association.c.authorization_digest == profile.authorization_digest,
+        replica.c.paid_capacity_pool_key.is_(None),
+        service.c.owner_user_id == association.c.tenant_scope,
+        service.c.reserved_fill_actuation_mode ==
+        zero_cost_actuation.ActuationMode.DURABLE_INTENT.value,
+        service.c.reserved_fill_actuation_capable.is_(True),
+        service.c.reserved_fill_actuation_controller_incarnation ==
+        association.c.owner_controller_incarnation,
+        service.c.reserved_fill_actuation_protocol_version ==
+        zero_cost_actuation.PROTOCOL_VERSION,
+        REQUESTS.c.handler_name ==
+        non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME,
+        REQUESTS.c.user_id == association.c.tenant_scope,
+        REQUESTS.c.cluster_name == association.c.cluster_name,
+        REQUESTS.c.binding_protocol_version ==
+        ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION,
+        REQUESTS.c.profile_kind == context.profile.kind.value,
+        REQUESTS.c.profile_version == profile.version,
+        REQUESTS.c.profile_digest == profile.digest,
+        REQUESTS.c.capability_cohort_epoch == context.capability_cohort_epoch,
+        REQUESTS.c.capability_profile_set_digest ==
+        context.capability_profile_set_digest,
+        REQUESTS.c.receipt_protocol_version == context.receipt_protocol_version,
+        REQUESTS.c.status.in_(active_statuses),
+        REQUESTS.c.terminal_cause.is_(None),
+        REQUESTS.c.return_value.is_(None),
+        REQUESTS.c.error.is_(None),
+        REQUESTS.c.finished_at.is_(None),
+        REQUESTS.c.cancel_requested_at.is_(None),
+        REQUESTS.c.cancel_acknowledged_at.is_(None),
+        REQUESTS.c.execution_quiesced_generation.is_(None),
+        REQUESTS.c.execution_quiesced_at.is_(None),
+        sqlalchemy.or_(queued, claimed),
+        ~sqlalchemy.exists(
+            sqlalchemy.select(paid_claim.c.replica_id).where(
+                paid_claim.c.service_name == association.c.service_name,
+                paid_claim.c.replica_id == association.c.replica_id)),
+    ).limit(1)
+    with engine.connect() as connection:
+        row = connection.execute(statement).mappings().one_or_none()
+    if row is None or not _controller_authority_matches_reduction(
+            row, authority):
+        return None
+
+    lifecycle_snapshot = {'epoch': row['_fence_epoch']}
+    service_snapshot = {
+        'hash': row['_service_hash'],
+        'workspace': row['_service_workspace'],
+        'lifecycle_epoch': row['_service_lifecycle_epoch'],
+        'ordinary_launch_binding_mode': row['_service_binding_mode'],
+        'ordinary_launch_binding_epoch': row['_service_binding_epoch'],
+        'ordinary_launch_binding_capable': row['_service_capable'],
+        'controller_incarnation': row['_service_incarnation'],
+        'controller_owner_epoch': row['_service_owner_epoch'],
+        'non_pool_launch_binding_capable': row['_service_non_pool_capable'],
+        'non_pool_launch_controller_incarnation':
+            row['_service_non_pool_incarnation'],
+        'non_pool_launch_binding_protocol_version':
+            row['_service_non_pool_protocol'],
+        'non_pool_launch_capability_profile_set_digest':
+            row['_service_non_pool_profile_set'],
+        'non_pool_launch_capability_cohort_epoch':
+            row['_service_non_pool_cohort'],
+        'non_pool_launch_receipt_protocol_version':
+            row['_service_non_pool_receipt'],
+        'status': row['_service_status'],
+    }
+    replica_snapshot = {
+        'replica_id': row['_replica_id'],
+        'replica_state_version': row['_replica_state_version'],
+        'replica_state': row['_replica_state'],
+        'status': row['_replica_status'],
+        'version': row['_replica_version'],
+        'cluster_name': row['_replica_cluster_name'],
+        'paid_capacity_pool_key': row['_replica_paid_pool_key'],
+        'ordinary_launch_association_id': context.association_id,
+    }
+    if not ordinary_launch_binding.retained_reduction_snapshot_matches(
+            lifecycle_snapshot, service_snapshot, replica_snapshot, row,
+            context):
+        return None
+    try:
+        service_status = serve_statuses.ServiceStatus[str(
+            row['_service_status'])]
+    except (KeyError, TypeError):
+        return None
+    if (row['_replica_status'] not in ('PENDING', 'PROVISIONING') or
+            service_status
+            in serve_statuses.ServiceStatus.replica_launch_blocking_statuses()):
+        return None
+
+    try:
+        request_status = requests_lib.RequestStatus(str(row['_request_status']))
+        generation = int(row['_request_generation'])
+    except (TypeError, ValueError):
+        return None
+    queue_state = str(row['_queue_delivery_state'])
+    claimed_request = queue_state == 'claimed'
+    queue_generation = row['_queue_claim_generation']
+    facts = BoundOrdinaryLaunchRequestFacts(
+        association_id=context.association_id,
+        request_id=context.request_id,
+        exists=True,
+        status=request_status,
+        terminal_cause=None,
+        execution_generation=generation,
+        claim_token=row['_request_claim_token'],
+        worker_instance_id=row['_request_worker_instance_id'],
+        lease_expires_at=row['_request_lease_expires_at'],
+        claim_exists=claimed_request,
+        claim_active=claimed_request,
+        claim_expired=False,
+        queue_exists=True,
+        queue_delivery_state=queue_state,
+        queue_claim_generation=(None if queue_generation is None else
+                                int(queue_generation)),
+        execution_quiescence_required=bool(row['_request_quiescence_required']),
+        execution_quiesced_generation=None,
+        execution_quiesced_at=None,
+        quiescent=not claimed_request and generation == 0,
+        retention_pin_active=True,
+        return_value=None,
+        error=None,
+        error_decode_failed=False)
+    return _reduction_result(OrdinaryLaunchReductionDisposition.ADOPT_ACTIVE,
+                             facts, row)
 
 
 def lookup_bound_ordinary_launch_cancel_target(
