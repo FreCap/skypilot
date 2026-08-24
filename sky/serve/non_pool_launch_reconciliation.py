@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import dataclasses
+import time
 from typing import Any
 
 from sky.adaptors import common as adaptors_common
@@ -103,8 +104,9 @@ def observe_provider(
                 'reason': 'kubernetes-context-retargeted',
             })
 
+    provider_read_boundary = time.monotonic()
     presence = reserved_capacity.probe_physical_replica_presence(
-        fence, replica_info.cluster_name, use_cache=False)
+        fence, replica_info.cluster_name, observed_after=provider_read_boundary)
     classification = {
         reserved_capacity.PhysicalReplicaPresence.ABSENT:
             ordinary_launch_binding.ProviderEvidence.ABSENT,

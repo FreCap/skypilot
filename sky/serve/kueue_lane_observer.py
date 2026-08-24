@@ -6,6 +6,7 @@ import dataclasses
 import datetime
 import logging
 import re
+import time
 from typing import Any
 import uuid
 
@@ -201,8 +202,11 @@ def project_admissionless_physical_absence_after_teardown(
                     provider_read_started_at = connection.execute(
                         sqlalchemy.select(
                             sqlalchemy.func.clock_timestamp())).scalar_one()
+                provider_read_boundary = time.monotonic()
                 presence = reserved_capacity.probe_physical_replica_presence(
-                    cleanup_fence, target.cluster_name, use_cache=False)
+                    cleanup_fence,
+                    target.cluster_name,
+                    observed_after=provider_read_boundary)
                 if presence is not (
                         reserved_capacity.PhysicalReplicaPresence.ABSENT):
                     raise kueue_lane_lineage.KueueAdmissionConflict(

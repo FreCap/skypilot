@@ -47,6 +47,29 @@ def _replica_info(replica_id, probe_result):
 class TestProbeRoundBatching(unittest.TestCase):
     """Probe rounds snapshot shared state and persist bookkeeping in bulk."""
 
+    def test_readiness_executor_is_bounded_reused_and_replaced_after_shutdown(
+            self):
+        manager = self._make_manager()
+        first = mock.Mock()
+        second = mock.Mock()
+        with mock.patch.object(replica_managers.subprocess_utils,
+                               'ContextThreadPoolExecutor',
+                               side_effect=[first, second]) as executor_factory:
+            self.assertIs(manager._get_readiness_executor(), first)
+            self.assertIs(manager._get_readiness_executor(), first)
+            executor_factory.assert_called_once_with(
+                max_workers=manager._PROBE_ROUND_MAX_PARALLELISM,
+                thread_name_prefix='serve-readiness')
+
+            manager._shutdown_readiness_executor()
+            first.shutdown.assert_called_once_with(wait=True,
+                                                   cancel_futures=True)
+            self.assertIs(manager._get_readiness_executor(), second)
+            self.assertEqual(executor_factory.call_count, 2)
+            manager._shutdown_readiness_executor()
+            second.shutdown.assert_called_once_with(wait=True,
+                                                    cancel_futures=True)
+
     def test_changed_only_rollout_flag_is_default_off_and_strict(self):
         env_var = (replica_managers._CHANGED_ONLY_READINESS_PERSISTENCE_ENV_VAR)
         for value, expected in ((None, False), ('false', False),
@@ -724,10 +747,10 @@ class TestProbeRoundBatching(unittest.TestCase):
              mock.patch.object(serve_state, 'get_specs') as mock_get_specs, \
              mock.patch.object(serve_state,
                                'add_or_update_replicas') as persist, \
-             mock.patch.object(replica_managers.mp_pool,
-                               'ThreadPool') as thread_pool:
+             mock.patch.object(manager,
+                               '_get_readiness_executor') as get_executor:
             manager._probe_all_replicas()
 
         mock_get_specs.assert_not_called()
         persist.assert_not_called()
-        thread_pool.assert_not_called()
+        get_executor.assert_not_called()

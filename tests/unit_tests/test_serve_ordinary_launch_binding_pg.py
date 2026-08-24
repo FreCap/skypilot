@@ -933,11 +933,11 @@ def test_historical_cohort_cannot_start_provider_effect(
     assert phase == binding.EffectPhase.NOT_STARTED.value
 
 
-@pytest.mark.parametrize('historical_protocol', [7, 8])
-def test_historical_projection_retry_is_idempotent_but_effect_requires_v9(
+@pytest.mark.parametrize('historical_protocol', [8, 9])
+def test_historical_projection_retry_is_idempotent_but_effect_requires_v10(
         binding_database, monkeypatch, historical_protocol) -> None:
     """A lost-ACK retry survives N-1/N-2 without new provider I/O."""
-    assert kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION == 9
+    assert kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION == 10
     with binding_database.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.version_specs_table).where(
@@ -1047,7 +1047,7 @@ def _reserved_fill_cleanup_rows(
 def test_reserved_fill_cleanup_accepts_exact_adjacent_cohort_tuple(
         binding_database, monkeypatch) -> None:
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
-    assert current_cohort == 9
+    assert current_cohort == 10
     service, replica, association, expected_profile = (
         _reserved_fill_cleanup_rows(current_cohort - 1, current_cohort - 1))
     validated: list[binding.NonPoolLaunchProfile] = []
@@ -1076,7 +1076,7 @@ def test_retained_v7_v8_reserved_fill_graph_settles_provider_absence(
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
     current_projection = (
         kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
-    assert (current_cohort, current_projection) == (9, 9)
+    assert (current_cohort, current_projection) == (10, 10)
     historical_cohort = current_cohort - history_distance
     historical_projection = current_projection - history_distance
     info = _reserved_fill_replica_info()
@@ -2029,7 +2029,7 @@ def test_retained_v7_v8_reserved_fill_graph_settles_provider_absence(
 def test_reserved_fill_cleanup_rejects_older_or_mismatched_cohorts(
         binding_database, monkeypatch, service_cohort,
         association_cohort) -> None:
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 9
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 10
     service, replica, association, _ = _reserved_fill_cleanup_rows(
         service_cohort, association_cohort)
     profile_validation_called = False

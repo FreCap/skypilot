@@ -53,8 +53,8 @@ def _accelerator_scheduling(accelerator='H200'):
     }
 
 
-def _node_local_cache():
-    return {
+def _node_local_cache(budget_scope=None):
+    cache = {
         'kind': 'node_local',
         'mount_path': '/mnt/sky-cache',
         'volume_name': 'phx-cache',
@@ -75,6 +75,9 @@ def _node_local_cache():
             'usable_inodes_per_node': 10,
         },
     }
+    if budget_scope is not None:
+        cache['budget_scope'] = budget_scope
+    return cache
 
 
 def _worker_projection(*,
@@ -104,14 +107,14 @@ def _worker_projection(*,
             'kind': 'none'
         },
     }
-    if protocol_version in (2, 3, 4, 5, 6, 7, 8, 9):
+    if protocol_version in (2, 3, 4, 5, 6, 7, 8, 9, 10):
         projection = {
             'projection_version': protocol_version,
             **projection,
             'scheduler_name': scheduler_name,
             'kueue_admission': kueue_admission,
         }
-    if protocol_version in (3, 4, 5, 6, 7, 8, 9):
+    if protocol_version in (3, 4, 5, 6, 7, 8, 9, 10):
         projection['provision_timeout'] = provision_timeout
         projection['scratch'] = ({
             'kind': 'none'
@@ -380,6 +383,38 @@ def test_cache_bootstrap_reserves_full_node_packing_envelope(tmp_path):
     assert not (parent / 'boltz-platform').exists()
 
 
+def test_cache_bootstrap_v10_scopes_additive_and_shared_budgets(tmp_path):
+    parent = tmp_path / 'cache-parent'
+    parent.mkdir()
+    stats = os.statvfs(parent)
+    required_bytes = 100_000_000
+    reserved_bytes = stats.f_bavail * stats.f_frsize - 150_000_000
+    assert reserved_bytes > 0
+    attestation_updates = {
+        'required_bytes_per_replica': required_bytes,
+        'max_replicas_per_node': 2,
+        'reserved_bytes_per_node': reserved_bytes,
+        'usable_bytes_per_node': required_bytes * 2,
+        'usable_inodes_per_node': 20,
+    }
+    additive = _node_local_cache('replica_additive')
+    additive['attestation'].update(attestation_updates)
+    shared = copy.deepcopy(additive)
+    shared['budget_scope'] = 'node_shared_immutable'
+
+    additive_result, parent = _run_cache_bootstrap(tmp_path,
+                                                   additive,
+                                                   protocol_version=10)
+    shared_result, _ = _run_cache_bootstrap(tmp_path,
+                                            shared,
+                                            protocol_version=10)
+
+    assert additive_result.returncode != 0
+    assert 'free byte reserve' in additive_result.stderr
+    assert shared_result.returncode == 0, shared_result.stderr
+    assert (parent / 'boltz-platform' / 'sky-cache').is_dir()
+
+
 def test_cache_bootstrap_reserves_full_node_inode_packing_envelope(tmp_path):
     cache = _node_local_cache()
     parent = tmp_path / 'cache-parent'
@@ -443,7 +478,7 @@ def test_cache_bootstrap_is_concurrent_mkdir_safe(tmp_path):
     assert (parent / 'boltz-platform' / 'sky-cache').is_dir()
 
 
-@pytest.mark.parametrize('protocol_version', [8, 9])
+@pytest.mark.parametrize('protocol_version', [8, 9, 10])
 @pytest.mark.parametrize('mutation', [
     lambda pod: pod['volumes'][0]['hostPath'].__setitem__(
         'type', 'DirectoryOrCreate'),
@@ -459,7 +494,8 @@ def test_cache_bootstrap_is_concurrent_mkdir_safe(tmp_path):
 ])
 def test_versioned_cache_contract_rejects_every_bootstrap_mutation(
         mutation, protocol_version):
-    cache = _node_local_cache()
+    cache = _node_local_cache('node_shared_immutable' if protocol_version ==
+                              10 else None)
     pod_spec = {
         'containers': [{
             'name': 'ray-node',
@@ -486,10 +522,11 @@ def test_versioned_cache_contract_rejects_every_bootstrap_mutation(
                                                        defer_cleanup=True)
 
 
-@pytest.mark.parametrize('protocol_version', [8, 9])
+@pytest.mark.parametrize('protocol_version', [8, 9, 10])
 def test_versioned_cache_contract_accepts_kubernetes_api_model_defaults(
         protocol_version):
-    cache = _node_local_cache()
+    cache = _node_local_cache('node_shared_immutable' if protocol_version ==
+                              10 else None)
     pod_spec = {
         'containers': [{
             'name': 'ray-node',
@@ -554,8 +591,8 @@ def test_protocol_v8_cache_renderer_remains_byte_exact_and_adoptable():
                                                    defer_cleanup=True)
 
 
-def test_current_cache_renderer_is_protocol_v9_only():
-    cache = _node_local_cache()
+def test_current_cache_renderer_is_protocol_v10_only():
+    cache = _node_local_cache('node_shared_immutable')
     pod_spec = {
         'containers': [{
             'name': 'ray-node',
@@ -565,14 +602,22 @@ def test_current_cache_renderer_is_protocol_v9_only():
     rendered = kubernetes_pod_spec.enforce_projected_worker_cache_contract(
         pod_spec, cache, rewrite=True)
 
-    assert kubernetes_pod_spec.SERVE_WORKER_PROJECTION_PROTOCOL_VERSION == 9
+    assert kubernetes_pod_spec.SERVE_WORKER_PROJECTION_PROTOCOL_VERSION == 10
     assert rendered.matches
     script = pod_spec['initContainers'][0]['args'][0]
-    assert script == kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT_V9
-    assert 'SKYPILOT_SERVE_WORKER_CACHE_BOOTSTRAP_V9' in script
+    assert script == kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT_V10
+    assert 'SKYPILOT_SERVE_WORKER_CACHE_BOOTSTRAP_V10' in script
+    assert 'node_shared_immutable' in script
+    assert 'replica_additive' in script
+    assert 'SKYPILOT_SERVE_WORKER_CACHE_BOOTSTRAP_V9' not in script
     assert 'SKYPILOT_SERVE_WORKER_CACHE_BOOTSTRAP_V8' not in script
-    assert not kubernetes_pod_spec.enforce_projected_worker_cache_contract(
-        pod_spec, cache, rewrite=False, protocol_version=8).matches
+    for historical_version in (8, 9):
+        with pytest.raises(kubernetes_pod_spec.ProjectedCacheContractError):
+            kubernetes_pod_spec.enforce_projected_worker_cache_contract(
+                pod_spec,
+                cache,
+                rewrite=False,
+                protocol_version=historical_version)
 
 
 def test_historical_version_has_null_projections():
@@ -612,7 +657,7 @@ def test_worker_projection_protocol_v2_is_explicit_and_v1_is_isolated():
         })
 
 
-def test_worker_projection_protocol_v9_is_canonical_and_v8_is_preserved():
+def test_worker_projection_protocol_v10_is_canonical_and_history_is_preserved():
     admission = {
         'local_queue_name': 'inference',
         'workload_priority_class_name': 'inference-low',
@@ -650,6 +695,10 @@ def test_worker_projection_protocol_v9_is_canonical_and_v8_is_preserved():
         **v3,
         'projection_version': 9,
     }
+    v10 = {
+        **v3,
+        'projection_version': 10,
+    }
 
     assert kubernetes_pod_spec.SERVE_WORKER_BOOTSTRAP_ENV_MARKER == (
         'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V8')
@@ -666,6 +715,7 @@ def test_worker_projection_protocol_v9_is_canonical_and_v8_is_preserved():
     assert kubernetes_identity.worker_projection_protocol_version(v7) == 7
     assert kubernetes_identity.worker_projection_protocol_version(v8) == 8
     assert kubernetes_identity.worker_projection_protocol_version(v9) == 9
+    assert kubernetes_identity.worker_projection_protocol_version(v10) == 10
     assert kubernetes_identity.worker_projection_has_strict_admission(v2)
     assert kubernetes_identity.worker_projection_has_strict_admission(v3)
     assert kubernetes_identity.worker_projection_has_strict_admission(v4)
@@ -674,6 +724,7 @@ def test_worker_projection_protocol_v9_is_canonical_and_v8_is_preserved():
     assert kubernetes_identity.worker_projection_has_strict_admission(v7)
     assert kubernetes_identity.worker_projection_has_strict_admission(v8)
     assert kubernetes_identity.worker_projection_has_strict_admission(v9)
+    assert kubernetes_identity.worker_projection_has_strict_admission(v10)
     assert kubernetes_identity.worker_projection_has_scratch(v3)
     assert kubernetes_identity.worker_projection_has_scratch(v4)
     assert kubernetes_identity.worker_projection_has_scratch(v5)
@@ -681,6 +732,7 @@ def test_worker_projection_protocol_v9_is_canonical_and_v8_is_preserved():
     assert kubernetes_identity.worker_projection_has_scratch(v7)
     assert kubernetes_identity.worker_projection_has_scratch(v8)
     assert kubernetes_identity.worker_projection_has_scratch(v9)
+    assert kubernetes_identity.worker_projection_has_scratch(v10)
     assert not (kubernetes_pod_spec.
                 serve_worker_projection_protocol_has_runtime_readiness(3))
     assert (kubernetes_pod_spec.
@@ -695,6 +747,8 @@ def test_worker_projection_protocol_v9_is_canonical_and_v8_is_preserved():
             serve_worker_projection_protocol_has_runtime_readiness(8))
     assert (kubernetes_pod_spec.
             serve_worker_projection_protocol_has_runtime_readiness(9))
+    assert (kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_runtime_readiness(10))
     assert not (kubernetes_pod_spec.
                 serve_worker_projection_protocol_has_scratch_bootstrap(5))
     assert (kubernetes_pod_spec.
@@ -705,12 +759,16 @@ def test_worker_projection_protocol_v9_is_canonical_and_v8_is_preserved():
             serve_worker_projection_protocol_has_scratch_bootstrap(8))
     assert (kubernetes_pod_spec.
             serve_worker_projection_protocol_has_scratch_bootstrap(9))
+    assert (kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_scratch_bootstrap(10))
     assert not (kubernetes_pod_spec.
                 serve_worker_projection_protocol_has_cache_bootstrap(7))
     assert (kubernetes_pod_spec.
             serve_worker_projection_protocol_has_cache_bootstrap(8))
     assert (kubernetes_pod_spec.
             serve_worker_projection_protocol_has_cache_bootstrap(9))
+    assert (kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_cache_bootstrap(10))
     assert kubernetes_identity.validate_worker_placement_projections(
         [v2], require_protocol_version=2) == [v2]
     assert kubernetes_identity.validate_worker_placement_projections(
@@ -727,15 +785,19 @@ def test_worker_projection_protocol_v9_is_canonical_and_v8_is_preserved():
         [v8], require_protocol_version=8) == [v8]
     assert kubernetes_identity.validate_worker_placement_projections(
         [v9], require_protocol_version=9) == [v9]
+    assert kubernetes_identity.validate_worker_placement_projections(
+        [v10], require_protocol_version=10) == [v10]
     with pytest.raises(ValueError, match='must not mix protocol versions'):
         kubernetes_identity.validate_worker_placement_projections([v8, v9])
-    with pytest.raises(ValueError, match='protocol-v3/v4/v5/v6/v7/v8/v9 keys'):
+    with pytest.raises(ValueError,
+                       match='protocol-v3/v4/v5/v6/v7/v8/v9/v10 keys'):
         kubernetes_identity.worker_projection_protocol_version({
             **v9, 'unknown': True
         })
     missing_timeout = copy.deepcopy(v4)
     missing_timeout.pop('provision_timeout')
-    with pytest.raises(ValueError, match='protocol-v3/v4/v5/v6/v7/v8/v9 keys'):
+    with pytest.raises(ValueError,
+                       match='protocol-v3/v4/v5/v6/v7/v8/v9/v10 keys'):
         kubernetes_identity.worker_projection_protocol_version(missing_timeout)
     assert (kubernetes_identity.worker_projection_sha256(v3)
             != kubernetes_identity.worker_projection_sha256(v4))
@@ -749,6 +811,8 @@ def test_worker_projection_protocol_v9_is_canonical_and_v8_is_preserved():
             != kubernetes_identity.worker_projection_sha256(v8))
     assert (kubernetes_identity.worker_projection_sha256(v8)
             != kubernetes_identity.worker_projection_sha256(v9))
+    assert (kubernetes_identity.worker_projection_sha256(v9)
+            != kubernetes_identity.worker_projection_sha256(v10))
 
 
 @pytest.mark.parametrize(('field', 'replacement'), [
@@ -768,6 +832,35 @@ def test_worker_projection_v8_digest_covers_cache_bootstrap_identity(
 
     assert kubernetes_identity.worker_projection_sha256(
         mutated) != original_digest
+
+
+def test_worker_projection_v10_requires_exact_cache_budget_scope():
+    projection = _worker_projection(protocol_version=10)
+    projection['cache'] = _node_local_cache()
+    with pytest.raises(ValueError,
+                       match='protocol-appropriate complete node_local'):
+        kubernetes_identity.validate_worker_placement_projections(
+            [projection], require_protocol_version=10)
+
+    projection['cache']['budget_scope'] = 'unknown'
+    with pytest.raises(ValueError, match='budget_scope'):
+        kubernetes_identity.validate_worker_placement_projections(
+            [projection], require_protocol_version=10)
+
+    projection['cache']['budget_scope'] = 'node_shared_immutable'
+    validated = kubernetes_identity.validate_worker_placement_projections(
+        [projection], require_protocol_version=10)
+    assert validated == [projection]
+
+
+def test_worker_projection_v10_digest_covers_cache_budget_scope():
+    shared = _worker_projection(protocol_version=10)
+    shared['cache'] = _node_local_cache('node_shared_immutable')
+    additive = copy.deepcopy(shared)
+    additive['cache']['budget_scope'] = 'replica_additive'
+
+    assert (kubernetes_identity.worker_projection_sha256(shared)
+            != kubernetes_identity.worker_projection_sha256(additive))
 
 
 def test_worker_projection_v3_digest_covers_scratch():
@@ -932,7 +1025,8 @@ def test_worker_projection_v2_digest_covers_complete_validated_candidate():
     assert (kubernetes_identity.worker_projection_sha256(mutated_scheduler)
             != expected)
     with pytest.raises(ValueError,
-                       match='requires protocol 2, 3, 4, 5, 6, 7, 8, or 9'):
+                       match=('requires protocol 2, 3, 4, 5, 6, 7, 8, 9, '
+                              'or 10')):
         kubernetes_identity.worker_projection_sha256(_worker_projection())
 
 
@@ -1903,7 +1997,7 @@ run: echo hi
         _worker_role('east'),
         _worker_role('phx'),
     ]
-    assert all(item['projection_version'] == 9 for item in projected)
+    assert all(item['projection_version'] == 10 for item in projected)
     assert all(item['provision_timeout'] == -1 for item in projected)
     assert all(item['scratch'] == {'kind': 'none'} for item in projected)
     assert all(
@@ -1914,7 +2008,7 @@ run: echo hi
     assert projected[1]['accelerator_scheduling'] == (_accelerator_scheduling())
 
 
-def test_worker_catalog_preserves_identity_free_v9_candidates(monkeypatch):
+def test_worker_catalog_preserves_identity_free_v10_candidates(monkeypatch):
     task = task_lib.Task.from_yaml_str('''
 resources:
   infra: k8s/phx
@@ -1957,7 +2051,7 @@ run: echo hi
         task, workspace='inference', placement_catalog={})
 
     assert projected is not None
-    assert projected[0]['projection_version'] == 9
+    assert projected[0]['projection_version'] == 10
     assert projected[0]['provision_timeout'] == -1
     assert projected[0]['scratch'] == {'kind': 'none'}
     assert projected[0]['pod_identity_role_arn'] is None
@@ -1984,6 +2078,11 @@ def _mock_worker_cache_projection_sources(monkeypatch, configured):
                         lambda _names: {'phx-cache': volume})
 
 
+def _set_worker_cache_budget_scopes(monkeypatch, scope='node_shared_immutable'):
+    monkeypatch.setenv(kubernetes_identity.WORKER_CACHE_BUDGET_SCOPES_ENV_VAR,
+                       json.dumps({'phx-cache-v1': scope}))
+
+
 def test_worker_cache_projection_persists_operator_bootstrap_inputs(
         monkeypatch):
     configured = {
@@ -1999,14 +2098,17 @@ def test_worker_cache_projection_persists_operator_bootstrap_inputs(
     helper_image = 'registry.example/skypilot-api@sha256:' + 'b' * 64
     monkeypatch.setenv(kubernetes_identity.WORKER_CACHE_BOOTSTRAP_IMAGE_ENV_VAR,
                        helper_image)
+    _set_worker_cache_budget_scopes(monkeypatch)
 
     projected = kubernetes_identity._project_cache('phx', 'inference')
 
     assert projected['host_mount_path'] == '/opt/dlami/nvme'
     assert projected['relative_path'] == 'boltz-platform/boltz-l4-fleet'
     assert projected['bootstrap_image'] == helper_image
+    assert projected['budget_scope'] == 'node_shared_immutable'
     assert kubernetes_identity.validate_cache_projection(
-        projected, require_bootstrap_mount=True) == projected
+        projected, require_bootstrap_mount=True,
+        require_budget_scope=True) == projected
 
 
 def test_worker_cache_projection_requires_bootstrap_construction_inputs(
@@ -2045,12 +2147,40 @@ def test_worker_cache_projection_context_config_overrides_global_environment(
         '/wrong/global-parent')
     monkeypatch.setenv(kubernetes_identity.WORKER_CACHE_BOOTSTRAP_IMAGE_ENV_VAR,
                        'registry.example/global-helper@sha256:' + 'd' * 64)
+    _set_worker_cache_budget_scopes(monkeypatch)
 
     projected = kubernetes_identity._project_cache('phx', 'inference')
 
     assert projected['host_mount_path'] == '/opt/dlami/nvme'
     assert projected['relative_path'] == 'boltz-platform/boltz-l4-fleet'
     assert projected['bootstrap_image'] == helper_image
+
+
+@pytest.mark.parametrize('registry', [None, '{}', '{"phx-cache-v1":"bad"}'])
+def test_worker_cache_projection_requires_exact_budget_scope_registry(
+        monkeypatch, registry):
+    configured = {
+        key: value
+        for key, value in _node_local_cache().items()
+        if key not in ('host_path', 'host_mount_path', 'relative_path',
+                       'bootstrap_image')
+    }
+    _mock_worker_cache_projection_sources(monkeypatch, configured)
+    monkeypatch.setenv(
+        kubernetes_identity.WORKER_CACHE_BOOTSTRAP_HOST_MOUNT_PATH_ENV_VAR,
+        '/opt/dlami/nvme')
+    monkeypatch.setenv(kubernetes_identity.WORKER_CACHE_BOOTSTRAP_IMAGE_ENV_VAR,
+                       'registry.example/skypilot-api@sha256:' + 'b' * 64)
+    if registry is None:
+        monkeypatch.delenv(
+            kubernetes_identity.WORKER_CACHE_BUDGET_SCOPES_ENV_VAR,
+            raising=False)
+    else:
+        monkeypatch.setenv(
+            kubernetes_identity.WORKER_CACHE_BUDGET_SCOPES_ENV_VAR, registry)
+
+    with pytest.raises(ValueError, match='budget|BUDGET'):
+        kubernetes_identity._project_cache('phx', 'inference')
 
 
 @pytest.mark.parametrize('resource_config', [
@@ -2255,7 +2385,7 @@ run: echo hi
         execution._validate_projected_service_task_inputs(dag, launch_context)
 
 
-def test_runtime_cache_uses_final_h200_choice_from_heterogeneous_task():
+def test_runtime_cache_v10_uses_final_h200_choice_and_budget_scope():
     task = task_lib.Task()
     east = kubernetes_identity.clouds.Kubernetes()
     phx = kubernetes_identity.clouds.Kubernetes()
@@ -2275,7 +2405,7 @@ def test_runtime_cache_uses_final_h200_choice_from_heterogeneous_task():
         'SKYPILOT_SERVE_CACHE_EVIL': 'caller-secret',
     })
     projections = [{
-        'projection_version': 9,
+        'projection_version': 10,
         'candidate_id': 'kubernetes-0000',
         'kubernetes_context': 'east',
         'namespace': 'inference',
@@ -2297,7 +2427,7 @@ def test_runtime_cache_uses_final_h200_choice_from_heterogeneous_task():
             'kind': 'none'
         },
     }, {
-        'projection_version': 9,
+        'projection_version': 10,
         'candidate_id': 'kubernetes-0001',
         'kubernetes_context': 'phx',
         'namespace': 'inference',
@@ -2309,7 +2439,7 @@ def test_runtime_cache_uses_final_h200_choice_from_heterogeneous_task():
         'accelerator_name': 'H200',
         'accelerator_count': 1,
         'accelerator_scheduling': _accelerator_scheduling(),
-        'cache': _node_local_cache(),
+        'cache': _node_local_cache('node_shared_immutable'),
         'scheduler_name': 'default-scheduler',
         'kueue_admission': None,
         'provision_timeout': -1,
@@ -2327,6 +2457,8 @@ def test_runtime_cache_uses_final_h200_choice_from_heterogeneous_task():
     assert task.envs['SKYPILOT_SERVE_CACHE_KIND'] == 'node_local'
     assert task.envs['SKYPILOT_SERVE_CACHE_MOUNT_PATH'] == '/mnt/sky-cache'
     assert task.envs['SKYPILOT_SERVE_CACHE_ATTESTATION_ID'] == 'phx-cache-v1'
+    assert task.envs[
+        'SKYPILOT_SERVE_CACHE_BUDGET_SCOPE'] == 'node_shared_immutable'
     assert not any(
         key.startswith(kubernetes_identity.CACHE_ENV_PREFIX)
         for key in task.secrets)
@@ -2697,7 +2829,7 @@ def test_final_kubernetes_yaml_reasserts_v8_kueue_admission():
                     'kueue.x-k8s.io/priority-class', 'kueue.x-k8s.io/managed'))
 
 
-@pytest.mark.parametrize('protocol_version', [8, 9])
+@pytest.mark.parametrize('protocol_version', [8, 9, 10])
 def test_final_versioned_yaml_composes_kueue_cache_scratch_and_readiness(
         protocol_version):
     projection = _worker_projection(
@@ -2713,7 +2845,9 @@ def test_final_versioned_yaml_composes_kueue_cache_scratch_and_readiness(
             'volume_name': 'skypilot-serve-worker-tmp',
             'size_limit_bytes': 20 * 1024**3,
         })
-    projection['cache'] = _node_local_cache()
+    cache = _node_local_cache('node_shared_immutable' if protocol_version ==
+                              10 else None)
+    projection['cache'] = cache
     cluster_yaml = {
         'provider': {
             'timeout': 30,
@@ -2755,8 +2889,7 @@ def test_final_versioned_yaml_composes_kueue_cache_scratch_and_readiness(
     assert cluster_yaml == first
     assert cluster_yaml['provider'][
         'serve_worker_projection_protocol_version'] == protocol_version
-    assert cluster_yaml['provider']['serve_worker_expected_cache'] == (
-        _node_local_cache())
+    assert cluster_yaml['provider']['serve_worker_expected_cache'] == (cache)
     assert cluster_yaml['provider']['timeout'] == -1
     assert cluster_yaml['provider'][
         'serve_worker_expected_runtime_bootstrap_sha256'] == bootstrap_sha256
@@ -2808,10 +2941,12 @@ def test_final_versioned_yaml_composes_kueue_cache_scratch_and_readiness(
         'SKYPILOT_SERVE_SCRATCH_MOUNT_PATH': '/tmp',
         'SKYPILOT_SERVE_SCRATCH_SIZE_LIMIT_BYTES': str(20 * 1024**3),
     }
+    assert environment.get('SKYPILOT_SERVE_CACHE_BUDGET_SCOPE') == (
+        'node_shared_immutable' if protocol_version == 10 else None)
     cache_bootstrap = node['spec']['initContainers'][0]
     assert cache_bootstrap['name'] == (
         kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_INIT_CONTAINER_NAME)
-    assert cache_bootstrap['image'] == _node_local_cache()['bootstrap_image']
+    assert cache_bootstrap['image'] == cache['bootstrap_image']
     assert cache_bootstrap['command'] == list(
         kubernetes_pod_spec.SERVE_WORKER_CACHE_BOOTSTRAP_COMMAND)
     assert cache_bootstrap['args'] == [
@@ -2873,7 +3008,7 @@ def test_final_yaml_rejects_historical_projection_before_mutation(
     original = copy.deepcopy(cluster_yaml)
 
     with pytest.raises(exceptions.InvalidCloudConfigs,
-                       match='only protocols 8 and 9 are renderable'):
+                       match='only protocols 8, 9, and 10 are renderable'):
         backend_utils._enforce_worker_projection_on_kubernetes_yaml(
             cluster_yaml, _worker_projection(protocol_version=protocol_version))
 
@@ -3306,7 +3441,7 @@ def test_final_v8_none_rejects_inherited_scratch_owner(collision):
                 _worker_bootstrap_sha256(cluster_yaml)))
 
 
-@pytest.mark.parametrize('protocol_version', [1, 2, 3, 4, 5, 6, 7, 8, 9])
+@pytest.mark.parametrize('protocol_version', [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
 def test_kubernetes_deploy_vars_require_byte_exact_projected_renderer(
         monkeypatch, protocol_version):
     resources = mock.MagicMock()
@@ -3385,9 +3520,9 @@ def test_kubernetes_deploy_vars_require_byte_exact_projected_renderer(
                                 KubernetesHighPerformanceNetworkType.NONE,
                                 None)))
 
-    if protocol_version not in (8, 9):
+    if protocol_version not in (8, 9, 10):
         with pytest.raises(ValueError,
-                           match='only protocols 8 and 9 are renderable'):
+                           match='only protocols 8, 9, and 10 are renderable'):
             cloud.make_deploy_resources_variables(
                 resources,
                 resources_utils.ClusterName('replica', 'replica'),

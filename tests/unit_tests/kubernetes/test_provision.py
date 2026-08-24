@@ -130,8 +130,8 @@ def _configure_projection_runtime(config,
 
 
 @pytest.mark.parametrize(('protocol_version', 'scratch', 'message'), [
-    (9, None, 'v3/v4/v5/v6/v7/v8/v9 requires the complete worker scratch'),
-    (9, {
+    (10, None, 'v3/v4/v5/v6/v7/v8/v9/v10 requires the complete worker scratch'),
+    (10, {
         'kind': 'memory',
         'size_limit_bytes': 1024,
     }, 'must be exactly none or memory-backed /tmp'),
@@ -153,9 +153,9 @@ def test_create_pods_rejects_invalid_worker_scratch_provider_contract(
 
 
 @pytest.mark.parametrize(('protocol_version', 'bootstrap_sha256', 'message'), [
-    (9, None,
-     'v4/v5/v6/v7/v8/v9 requires the complete worker runtime bootstrap'),
-    (9, 'A' * 64, '64 lowercase hexadecimal'),
+    (10, None,
+     'v4/v5/v6/v7/v8/v9/v10 requires the complete worker runtime bootstrap'),
+    (10, 'A' * 64, '64 lowercase hexadecimal'),
 ])
 def test_create_pods_rejects_invalid_worker_runtime_bootstrap_contract(
         monkeypatch, protocol_version, bootstrap_sha256, message):
@@ -183,11 +183,11 @@ def test_create_pods_rejects_invalid_worker_runtime_bootstrap_contract(
 
 
 @pytest.mark.parametrize(('cache', 'message'), [
-    (None, 'protocol v8/v9 requires the complete worker cache'),
+    (None, 'protocol v8/v9/v10 requires the complete worker cache'),
     ({
         'kind': 'node_local',
         'bootstrap_image': 'mutable:latest',
-    }, 'complete node_local contract'),
+    }, 'complete protocol-appropriate node_local contract'),
 ])
 def test_create_pods_rejects_invalid_worker_cache_provider_contract(
         monkeypatch, cache, message):
@@ -457,7 +457,7 @@ def test_create_pods_rejects_finalizer_runtime_bootstrap_drift_before_create(
     config = _make_provision_config(count=1)
     config.node_config['spec'] = pod_spec
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 9,
+        'serve_worker_projection_protocol_version': 10,
         'serve_worker_expected_priority_class_name': None,
         'serve_worker_expected_priority_value': None,
         'serve_worker_expected_preemption_policy': None,
@@ -1382,7 +1382,7 @@ def test_current_projection_create_pods_waits_for_runtime_ready_before_final_rea
 
     config = _make_provision_config(count=1)
     config.provider_config.update({
-        'serve_worker_projection_protocol_version': 9,
+        'serve_worker_projection_protocol_version': 10,
         'serve_worker_expected_priority_class_name': None,
         'serve_worker_expected_priority_value': None,
         'serve_worker_expected_preemption_policy': None,
@@ -1766,7 +1766,7 @@ def test_fresh_protocol_v9_parallel_create_attests_before_batch_returns(
 
     head_name = f'{cluster_on_cloud}-head'
     assert config.provider_config[
-        'serve_worker_projection_protocol_version'] == 9
+        'serve_worker_projection_protocol_version'] == 10
     assert record.head_instance_id == head_name
     assert set(record.created_instance_ids) == {
         head_name, f'{cluster_on_cloud}-worker1'

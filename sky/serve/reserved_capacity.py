@@ -34,6 +34,8 @@ import time
 import typing
 from typing import Any, Optional
 
+import ijson
+
 from sky import backends
 from sky import clouds
 from sky import exceptions
@@ -345,16 +347,91 @@ class PhysicalReplicaPresence(enum.Enum):
 # service draining hundreds of rows would otherwise issue hundreds of
 # identical all-namespace Pod lists against the same physical cluster.
 _PHYSICAL_PRESENCE_SNAPSHOT_TTL_SECONDS = 30.0
-_physical_presence_snapshots: dict[tuple[str, str],
-                                   tuple[float, frozenset[str], frozenset[str],
-                                         bool]] = {}
+_PHYSICAL_PRESENCE_PAGE_SIZE = 500
+_PHYSICAL_PRESENCE_MAX_ITEMS = 10_000
+_PHYSICAL_PRESENCE_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+_PARTIAL_OBJECT_METADATA_LIST_ACCEPT = (
+    'application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1')
+_PhysicalPresenceSnapshot = tuple[frozenset[str], frozenset[str], bool]
+
+
+@dataclasses.dataclass(frozen=True)
+class _PhysicalPresenceObservation:
+    """One bounded provider observation and its causal timestamps."""
+
+    started_at: float
+    completed_at: float
+    snapshot: _PhysicalPresenceSnapshot
+
+
+@dataclasses.dataclass
+class _PhysicalPresenceRead:
+    """One in-flight provider read shared by concurrent cleanup workers."""
+
+    started_at: float
+    ready: threading.Event = dataclasses.field(default_factory=threading.Event)
+    observation: _PhysicalPresenceObservation | None = None
+    error: BaseException | None = None
+
+
+_physical_presence_snapshots: dict[tuple[str, str, str | None],
+                                   _PhysicalPresenceObservation] = {}
+_physical_presence_reads: dict[tuple[str, str, str | None],
+                               _PhysicalPresenceRead] = {}
 _physical_presence_lock = threading.Lock()
 
 
+class _BoundedResponseReader:
+    """File-like raw-response view enforcing one aggregate byte budget."""
+
+    def __init__(self, response: Any, remaining_bytes: int) -> None:
+        self._response = response
+        self._remaining_bytes = remaining_bytes
+        self.bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = self._remaining_bytes - self.bytes_read
+        if remaining < 0:
+            raise ValueError('Kubernetes Pod metadata response is too large.')
+        # Read at most one byte beyond the budget.  Reading an unbounded body
+        # and checking its length afterwards would enforce correctness but
+        # still permit the allocation this guard exists to prevent.
+        maximum_read = remaining + 1
+        if size < 0 or size > maximum_read:
+            size = maximum_read
+        data = self._response.read(size)
+        self.bytes_read += len(data)
+        if self.bytes_read > self._remaining_bytes:
+            raise ValueError('Kubernetes Pod metadata response is too large.')
+        return data
+
+    def readinto(self, buffer: Any) -> int:
+        data = self.read(len(buffer))
+        buffer[:len(data)] = data
+        return len(data)
+
+
+def _close_physical_presence_response(response: Any) -> None:
+    """Best-effort close of a response that was not safely consumed."""
+    try:
+        close = getattr(response, 'close', None)
+        if callable(close):
+            close()
+    except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
+        pass
+
+
 def _read_physical_replica_names(
-    fence: ProtocolV2CleanupFence
-) -> tuple[frozenset[str], frozenset[str], bool]:
+    fence: ProtocolV2CleanupFence,
+    *,
+    cluster_name_on_cloud: str | None = None,
+) -> _PhysicalPresenceSnapshot:
     """List Pod ownership on the fenced physical cluster.
+
+    When the durable handle supplied an exact on-cloud cluster name, constrain
+    the provider read to that label.  The lost-handle fallback still scans all
+    SkyPilot Pods, but streams only metadata out of the raw response instead
+    of materializing every full Pod spec/status object in controller memory.
 
     Returns the annotated logical cluster names, the on-cloud names taken
     from the SkyPilot cluster label, and whether every observed Pod carried
@@ -365,42 +442,215 @@ def _read_physical_replica_names(
     # pylint: disable=import-outside-toplevel
     from sky.provision import constants as provision_constants
 
-    with kubernetes.physical_cluster_uid_fence(fence.kubernetes_context,
-                                               fence.physical_cluster_uid,
-                                               wait_for_initializer=False):
-        pods = kubernetes.core_api(
-            fence.kubernetes_context).list_pod_for_all_namespaces(
-                label_selector=provision_constants.TAG_SKYPILOT_CLUSTER_NAME,
-                _request_timeout=kubernetes.API_TIMEOUT).items
+    label_key = provision_constants.TAG_SKYPILOT_CLUSTER_NAME
+    label_selector = label_key
+    if cluster_name_on_cloud is not None:
+        if (not isinstance(cluster_name_on_cloud, str) or
+                not cluster_name_on_cloud):
+            raise ValueError('cluster_name_on_cloud must be a nonempty string.')
+        label_selector = f'{label_key}={cluster_name_on_cloud}'
+
     annotated_names: set[str] = set()
     on_cloud_names: set[str] = set()
     fully_annotated = True
-    for pod in pods:
-        metadata = getattr(pod, 'metadata', None)
-        annotations = getattr(metadata, 'annotations', None) or {}
-        labels = getattr(metadata, 'labels', None) or {}
-        annotated_name = annotations.get(
-            provision_constants.TAG_SKYPILOT_CLUSTER_NAME)
-        on_cloud_name = labels.get(
-            provision_constants.TAG_SKYPILOT_CLUSTER_NAME)
-        if isinstance(on_cloud_name, str) and on_cloud_name:
-            on_cloud_names.add(on_cloud_name)
-        if isinstance(annotated_name, str) and annotated_name:
-            annotated_names.add(annotated_name)
-        else:
-            # A Pod predating the ownership annotation cannot be attributed
-            # to a full cluster name, so no absence claim may rely on it.
-            fully_annotated = False
+    item_count = 0
+    metadata_count = 0
+    annotated_name: str | None = None
+    on_cloud_name: str | None = None
+    annotation_prefix = f'items.item.metadata.annotations.{label_key}'
+    label_prefix = f'items.item.metadata.labels.{label_key}'
+    total_bytes = 0
+    continuation: str | None = None
+    seen_continuations: set[str] = set()
+    with kubernetes.physical_cluster_uid_fence(fence.kubernetes_context,
+                                               fence.physical_cluster_uid,
+                                               wait_for_initializer=False):
+        while True:
+            query_params: list[tuple[str, Any]] = [
+                ('labelSelector', label_selector),
+                ('limit', _PHYSICAL_PRESENCE_PAGE_SIZE),
+            ]
+            if continuation is not None:
+                query_params.append(('continue', continuation))
+            response = kubernetes.api_client(fence.kubernetes_context).call_api(
+                '/api/v1/pods',
+                'GET',
+                path_params={},
+                query_params=query_params,
+                header_params={
+                    'Accept': _PARTIAL_OBJECT_METADATA_LIST_ACCEPT,
+                },
+                body=None,
+                post_params=[],
+                files={},
+                response_type=None,
+                auth_settings=['BearerToken'],
+                async_req=False,
+                _return_http_data_only=True,
+                collection_formats={},
+                _preload_content=False,
+                _request_timeout=kubernetes.API_TIMEOUT)
+            reader = _BoundedResponseReader(
+                response, _PHYSICAL_PRESENCE_MAX_RESPONSE_BYTES - total_bytes)
+            page_items_start = False
+            page_items_end = False
+            page_item_count = 0
+            page_metadata_count = 0
+            page_kind: str | None = None
+            next_continuation: str | None = None
+            try:
+                try:
+                    for prefix, event, value in ijson.parse(reader):
+                        if prefix == 'kind' and event == 'string':
+                            page_kind = value
+                        elif prefix == 'items' and event == 'start_array':
+                            page_items_start = True
+                        elif prefix == 'items' and event == 'end_array':
+                            page_items_end = True
+                        elif (prefix == 'metadata.continue' and
+                              event == 'string'):
+                            next_continuation = value or None
+                        elif prefix == 'items.item' and event == 'start_map':
+                            page_item_count += 1
+                            item_count += 1
+                            if item_count > _PHYSICAL_PRESENCE_MAX_ITEMS:
+                                raise ValueError(
+                                    'Kubernetes Pod metadata item limit '
+                                    'exceeded.')
+                            annotated_name = None
+                            on_cloud_name = None
+                        elif prefix == annotation_prefix and event == 'string':
+                            annotated_name = value
+                        elif prefix == label_prefix and event == 'string':
+                            on_cloud_name = value
+                        elif (prefix == 'items.item.metadata' and
+                              event == 'end_map'):
+                            page_metadata_count += 1
+                            metadata_count += 1
+                            if (isinstance(on_cloud_name, str) and
+                                    on_cloud_name):
+                                on_cloud_names.add(on_cloud_name)
+                            if (isinstance(annotated_name, str) and
+                                    annotated_name):
+                                annotated_names.add(annotated_name)
+                            else:
+                                fully_annotated = False
+                            if (cluster_name_on_cloud is not None and
+                                    on_cloud_name != cluster_name_on_cloud):
+                                # Never accept a provider response that
+                                # violated the exact selector as negative
+                                # evidence.
+                                fully_annotated = False
+                    if (page_kind != 'PartialObjectMetadataList' or
+                            not page_items_start or not page_items_end or
+                            page_metadata_count != page_item_count):
+                        raise ValueError(
+                            'Kubernetes Pod metadata response is incomplete.')
+                    kubernetes.raise_if_api_call_deadline_exceeded()
+                    if (next_continuation is not None and
+                            next_continuation in seen_continuations):
+                        raise ValueError(
+                            'Kubernetes Pod metadata pagination did not '
+                            'advance.')
+                except BaseException:  # pylint: disable=broad-exception-caught
+                    # Never return a partially consumed response to the
+                    # urllib3 pool.  Cleanup failures cannot replace the
+                    # primary parse, identity, or limit error.
+                    _close_physical_presence_response(response)
+                    try:
+                        response.release_conn()
+                    except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
+                        pass
+                    raise
+                try:
+                    response.release_conn()
+                except BaseException:  # pylint: disable=broad-exception-caught
+                    _close_physical_presence_response(response)
+                    raise
+            finally:
+                total_bytes += reader.bytes_read
+            if next_continuation is None:
+                break
+            seen_continuations.add(next_continuation)
+            continuation = next_continuation
+    if metadata_count != item_count:
+        raise ValueError('Kubernetes Pod metadata response is incomplete.')
     return frozenset(annotated_names), frozenset(
         on_cloud_names), fully_annotated
 
 
+def _read_physical_replica_names_singleflight(
+    fence: ProtocolV2CleanupFence,
+    *,
+    cluster_name_on_cloud: str | None,
+    freshness_floor: float | None,
+) -> _PhysicalPresenceObservation:
+    """Share one current provider read without weakening fresh absence."""
+    key = (fence.kubernetes_context, fence.physical_cluster_uid,
+           cluster_name_on_cloud)
+    while True:
+        with _physical_presence_lock:
+            current = _physical_presence_reads.get(key)
+            if current is None:
+                current = _PhysicalPresenceRead(started_at=time.monotonic())
+                _physical_presence_reads[key] = current
+                owner = True
+                wait_then_retry = False
+            else:
+                owner = False
+                wait_then_retry = (freshness_floor is not None and
+                                   current.started_at < freshness_floor)
+        if owner:
+            try:
+                if cluster_name_on_cloud is None:
+                    snapshot = _read_physical_replica_names(fence)
+                else:
+                    snapshot = _read_physical_replica_names(
+                        fence, cluster_name_on_cloud=cluster_name_on_cloud)
+                # This timestamp is evidence about when the complete
+                # provider response became observable.  Sampling it before
+                # the read could let a slow response expire immediately or,
+                # worse, misstate the causal boundary used by cleanup.
+                completed_at = time.monotonic()
+            except BaseException as error:
+                with _physical_presence_lock:
+                    current.error = error
+                    if _physical_presence_reads.get(key) is current:
+                        _physical_presence_reads.pop(key)
+                    current.ready.set()
+                raise
+            with _physical_presence_lock:
+                current.observation = _PhysicalPresenceObservation(
+                    started_at=current.started_at,
+                    completed_at=completed_at,
+                    snapshot=snapshot)
+                _physical_presence_snapshots[key] = current.observation
+                if _physical_presence_reads.get(key) is current:
+                    _physical_presence_reads.pop(key)
+                current.ready.set()
+            return current.observation
+
+        current.ready.wait()
+        if wait_then_retry:
+            # The joined read began before this caller's teardown completed.
+            # Wait for it only to bound concurrency, then start/join a newer
+            # read rather than accepting stale ABSENT evidence.
+            continue
+        if current.error is not None:
+            raise current.error
+        if current.observation is None:
+            raise RuntimeError('Physical presence read produced no result.')
+        return current.observation
+
+
 def probe_physical_replica_presence(
-        fence: ProtocolV2CleanupFence,
-        cluster_name: str,
-        now: float | None = None,
-        *,
-        use_cache: bool = True) -> PhysicalReplicaPresence:
+    fence: ProtocolV2CleanupFence,
+    cluster_name: str,
+    now: float | None = None,
+    *,
+    observed_after: float | None = None,
+    cluster_name_on_cloud: str | None = None,
+) -> PhysicalReplicaPresence:
     """Prove whether `cluster_name` still owns Pods on the fenced cluster.
 
     A cleanup whose durable record vanished is not evidence that provider
@@ -410,17 +660,27 @@ def probe_physical_replica_presence(
     """
     if now is None:
         now = time.monotonic()
-    key = (fence.kubernetes_context, fence.physical_cluster_uid)
-    snapshot: tuple[frozenset[str], frozenset[str], bool] | None = None
-    if use_cache:
-        with _physical_presence_lock:
-            cached = _physical_presence_snapshots.get(key)
-            if (cached is not None and
-                    now - cached[0] <= _PHYSICAL_PRESENCE_SNAPSHOT_TTL_SECONDS):
-                snapshot = (cached[1], cached[2], cached[3])
-    if snapshot is None:
+    key = (fence.kubernetes_context, fence.physical_cluster_uid,
+           cluster_name_on_cloud)
+    if (observed_after is not None and
+        (isinstance(observed_after, bool) or
+         not isinstance(observed_after,
+                        (int, float)) or not math.isfinite(observed_after))):
+        raise ValueError('observed_after must be a finite monotonic timestamp.')
+    observation: _PhysicalPresenceObservation | None = None
+    with _physical_presence_lock:
+        cached = _physical_presence_snapshots.get(key)
+        cache_age = None if cached is None else now - cached.completed_at
+        if (cached is not None and cache_age is not None and
+                0 <= cache_age <= _PHYSICAL_PRESENCE_SNAPSHOT_TTL_SECONDS and
+            (observed_after is None or cached.started_at >= observed_after)):
+            observation = cached
+    if observation is None:
         try:
-            snapshot = _read_physical_replica_names(fence)
+            observation = _read_physical_replica_names_singleflight(
+                fence,
+                cluster_name_on_cloud=cluster_name_on_cloud,
+                freshness_floor=observed_after)
         except Exception as error:  # pylint: disable=broad-except
             # Contention, a retargeted kubeconfig, or an API failure all mean
             # the same thing here: nothing was proven.
@@ -428,11 +688,15 @@ def probe_physical_replica_presence(
                          f'{fence.kubernetes_context!r}: '
                          f'{common_utils.format_exception(error)}')
             return PhysicalReplicaPresence.UNPROVEN
-        with _physical_presence_lock:
-            _physical_presence_snapshots[key] = (now, snapshot[0], snapshot[1],
-                                                 snapshot[2])
+    snapshot = observation.snapshot
     annotated_names, on_cloud_names, fully_annotated = snapshot
     if cluster_name in annotated_names:
+        return PhysicalReplicaPresence.PRESENT
+    if (cluster_name_on_cloud is not None and
+            cluster_name_on_cloud in on_cloud_names):
+        # An exact selector returning that exact label is positive ownership
+        # evidence even when Kubernetes shortened the logical name enough to
+        # remove its prefix, or the Pod predates the logical-name annotation.
         return PhysicalReplicaPresence.PRESENT
     # The on-cloud name is the (possibly shortened) cluster name plus a hash
     # suffix. A hit is positive evidence; a miss alone proves nothing because
