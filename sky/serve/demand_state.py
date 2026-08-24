@@ -704,6 +704,7 @@ def _empty_summary(state: str,
                    *,
                    generation: int | None = None) -> dict[str, Any]:
     return {
+        'request_telemetry_source': 'postgresql_lb_demand_reports',
         'request_telemetry_state': state,
         'request_telemetry_reason': reason,
         'request_telemetry_generation': generation,
@@ -885,6 +886,7 @@ def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
     reason = ('compatibility_incomplete' if not complete else
               'in_flight_incomplete' if aggregate.unknown_urls else 'complete')
     return {
+        'request_telemetry_source': 'postgresql_lb_demand_reports',
         'request_telemetry_state': 'fresh',
         'request_telemetry_reason': reason,
         'request_telemetry_generation': int(generation or 0),

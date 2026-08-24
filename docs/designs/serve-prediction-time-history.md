@@ -5,14 +5,16 @@
 Accepted for implementation on 2026-07-22 after explicit product approval to
 replace full HTTP response-time history with customer-facing prediction time.
 
-Updated 2026-08-23. The reporter-minute histogram is implemented, but its
+Updated 2026-08-22. The reporter-minute histogram is implemented, but its
 asynchronous completion count is explicitly approximate. The PostgreSQL
 ledger, stable API ingest path, load-balancer bind/lookup/transition
 integration, and coverage-aware status/dashboard summary are implemented,
 locally qualified, and deployed dark in SkyPilot 1.1.1460 / Helm revision 588.
 Serve058 is at the live PostgreSQL head and both load-balancer slots run the
 same immutable 1.1.1460 image. Read-only receipt probes and the fresh dashboard
-summary are production proven; a live exact asynchronous request and the
+summary are production proven. The source now projects the exact ledger through
+the controller-free current-demand read; that API/UI revision is not yet
+deployed or production-proven. A live exact asynchronous request and the
 10,000-request qualification are not. Adversarial review of the separate Boltz
 caller found that caller-maintained first-attempt and heartbeat authority was
 both more complicated and less reliable than the already-transactional server
@@ -707,8 +709,9 @@ prediction_time_samples: [{
 The API aggregates reporter sessions by minute after a bounded,
 incarnation-scoped read. Response-time fields are removed from the new payload.
 
-The same incarnation-scoped status response adds an `async_request_summary`
-object containing the PostgreSQL observation time, freshness, exact unique
+API 92 makes `GET /serve/{service}/demand` the canonical current-activity read
+and adds an `async_request_summary` object containing the PostgreSQL observation
+time, source, exact unique
 counts by ledger state, operational terminal-receipt total, terminal-receipt
 counts by status, and protocol coverage. Caller opt-in means exact rows are only
 `partial` until a separate complete-producer-cohort proof exists. A partial or
@@ -722,11 +725,14 @@ continues to use the fresh legacy occupancy telemetry. Queue depth continues to
 come from the fresh durable LB demand feed because the in-memory service queue
 is not replaced by a PostgreSQL queue. GPU/device coverage is verified by the
 reserved-capacity and worker-runtime qualification, not inferred from request
-ledger rows.
+ledger rows. The history envelope retains the same exact summary only as a
+mixed-version compatibility field; a new current read never falls back to an
+older history value after explicitly reporting the ledger unavailable.
 
-The dashboard renders the exact summary's observation age and refresh-failure
-state beside every exact count. If a history refresh fails, retaining the last
-known counts is allowed only when they remain visibly stale; cached exact rows
+The dashboard renders the exact summary's PostgreSQL source, observation age,
+and refresh-failure state beside every exact count. If a direct-demand or
+history refresh fails, retaining the last known counts is allowed only when
+they remain visibly stale; cached exact rows
 must never look like a fresh zero or fresh current total.
 
 The dashboard replaces the `Response time` card with `Prediction time`. It
@@ -1023,3 +1029,11 @@ This is source evidence, not rollout evidence. The separate caller change,
 additive Helm deployment, live HTTP-200 acknowledgement smoke, duplicate
 terminal delivery, PostgreSQL/API/UI agreement, and 10,000-request production
 qualification remain open gates.
+
+The API-92 current-demand projection revision was locally qualified on
+2026-08-22 with 101 focused backend tests passing, 166 dashboard tests passing,
+dashboard lint and Prettier clean, changed-Python Pylint at 10/10, and an
+optimized production build. Sixteen
+real-PostgreSQL cases were skipped because this environment had neither Docker
+nor `SKYPILOT_TEST_POSTGRES_URL`; the included service-row lock-contention
+regression therefore remains a required real-PostgreSQL pre-merge gate.

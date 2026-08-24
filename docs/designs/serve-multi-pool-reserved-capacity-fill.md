@@ -68,8 +68,11 @@ and the hard paid GPU-unit cap. The remaining required gates are:
 4. prove rapid scale-out, per-device execution and completion telemetry, zero
    ordinary on-demand launches, and zero paid Spot launches while the cap is
    zero; and
-5. expose confirmed queued, dispatched, processing, completed, rejected, and
-   scheduler-blocked counts with freshness in the service UI.
+5. deploy and production-prove the source-complete controller-free request
+   projection: PostgreSQL LB reports provide queued and processing/in-flight
+   counts, the exact PostgreSQL ledger separately provides protocol-covered
+   dispatch and terminal states, and every value exposes source and freshness;
+   scheduler-blocked capacity remains a distinct placement count.
 
 The outstanding rollout-complexity defect is narrower than fill convergence.
 Today any fresh `POD_WAITING` Kueue row from the elected version globally holds

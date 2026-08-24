@@ -2,6 +2,7 @@
 # pylint: disable=not-callable,protected-access,redefined-outer-name
 # pylint: disable=unused-import
 
+import concurrent.futures
 import hashlib
 import time
 import uuid
@@ -660,6 +661,7 @@ def test_summary_reports_exact_opted_in_states_and_terminal_counts(
     accepted = repository.transition(_SERVICE_NAME, _SERVICE_HASH,
                                      _transition_payload(bound, 'accepted'))
     accepted_summary = repository.summary(_SERVICE_NAME, _SERVICE_HASH)
+    assert accepted_summary['source'] == 'postgresql_async_request_ledger'
     assert accepted_summary['coverage'] == 'partial'
     assert accepted_summary['state_counts']['ACCEPTED'] == 1
 
@@ -672,3 +674,39 @@ def test_summary_reports_exact_opted_in_states_and_terminal_counts(
     terminal_summary = repository.summary(_SERVICE_NAME, _SERVICE_HASH)
     assert terminal_summary['state_counts']['SUCCEEDED'] == 1
     assert terminal_summary['operational_terminal_receipt_total'] == 1
+
+
+def test_summary_does_not_wait_for_a_service_row_writer(ledger_database):
+    repository = async_request_ledger.AsyncRequestLedgerRepository(
+        ledger_database)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    writer = ledger_database.connect()
+    transaction = writer.begin()
+    try:
+        writer.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                _SERVICE_NAME).values(controller_pid=124))
+        future = executor.submit(repository.summary, _SERVICE_NAME,
+                                 _SERVICE_HASH)
+
+        summary = future.result(timeout=2)
+
+        assert summary['available'] is True
+        assert summary['service_hash'] == _SERVICE_HASH
+    finally:
+        transaction.rollback()
+        writer.close()
+        executor.shutdown(wait=True)
+
+
+def test_get_summary_fails_closed_before_schema(monkeypatch) -> None:
+    engine = sqlalchemy.create_mock_engine('postgresql://', lambda *args: None)
+    monkeypatch.setattr(async_request_ledger, 'schema_available',
+                        lambda unused: False)
+
+    summary = async_request_ledger.get_summary(_SERVICE_NAME, _SERVICE_HASH,
+                                               engine)
+
+    assert summary == async_request_ledger.unavailable_summary(
+        'schema_unavailable')

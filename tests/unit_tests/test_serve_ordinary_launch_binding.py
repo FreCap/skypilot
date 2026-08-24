@@ -1230,7 +1230,8 @@ def test_api014_serve051_lineage_and_sqlite_stays_at_serve037(
         server_constants.MIN_EXECUTOR_TERMINATION_EVIDENCE_API_VERSION == 87)
     assert (
         server_constants.MIN_SERVE_INCREMENTAL_ROUTE_LEASES_API_VERSION == 88)
-    assert server_constants.API_VERSION == 91
+    assert server_constants.MIN_SERVE_EXACT_REQUEST_SUMMARY_API_VERSION == 92
+    assert server_constants.API_VERSION == 92
 
     alembic_command.upgrade(serve_config, '037')
     inspector = sqlalchemy.inspect(sqlite)

@@ -6,6 +6,7 @@ import {
   SERVE_DASHBOARD_PRICING_READS_API_VERSION,
   SERVE_DASHBOARD_REPLICA_READS_API_VERSION,
   SERVE_DURABLE_DEMAND_API_VERSION,
+  SERVE_EXACT_REQUEST_SUMMARY_API_VERSION,
 } from '@/data/connectors/constants';
 
 // Normalize a raw replica_info entry from the /serve/status response.
@@ -462,9 +463,12 @@ function normalizeExactCounts(value, expectedKeys) {
 
 export function normalizeAsyncRequestSummary(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const source = raw.source ?? 'postgresql_async_request_ledger';
+  if (source !== 'postgresql_async_request_ledger') return null;
   if (raw.available === false) {
     return {
       available: false,
+      source,
       reason: typeof raw.reason === 'string' ? raw.reason : 'unavailable',
       coverage: ['none', 'partial'].includes(raw.coverage)
         ? raw.coverage
@@ -510,6 +514,7 @@ export function normalizeAsyncRequestSummary(raw) {
   }
   return {
     available: true,
+    source,
     coverage,
     protocolVersion,
     observedAt,
@@ -550,6 +555,10 @@ export function normalizeRequestTelemetry(record) {
     ? record.request_telemetry_state
     : null;
   return {
+    requestTelemetrySource:
+      record?.request_telemetry_source === 'postgresql_lb_demand_reports'
+        ? record.request_telemetry_source
+        : null,
     recentRequestCount: nullableNonnegativeInteger(
       record?.recent_request_count
     ),
@@ -609,6 +618,9 @@ export function normalizeServiceDemand(record) {
     serviceName: record.service_name ?? null,
     serviceHash: record.service_hash ?? null,
     ...normalizeRequestTelemetry(record),
+    asyncRequestSummary: normalizeAsyncRequestSummary(
+      record.async_request_summary
+    ),
     zeroCostActuationStatus: ['available', 'unavailable'].includes(
       record.zero_cost_actuation_status
     )
@@ -1060,7 +1072,13 @@ export async function getServiceDemand({ serviceName, serviceHash }) {
     !demand ||
     demand.serviceName !== serviceName ||
     demand.serviceHash !== serviceHash ||
-    demand.requestTelemetryState === null
+    demand.requestTelemetryState === null ||
+    (Number.isInteger(serverApiVersion) &&
+      serverApiVersion >= SERVE_EXACT_REQUEST_SUMMARY_API_VERSION &&
+      (demand.requestTelemetrySource !== 'postgresql_lb_demand_reports' ||
+        demand.asyncRequestSummary == null)) ||
+    (demand.asyncRequestSummary?.available === true &&
+      demand.asyncRequestSummary.serviceHash !== serviceHash)
   ) {
     throw new Error('Service demand response was malformed');
   }
