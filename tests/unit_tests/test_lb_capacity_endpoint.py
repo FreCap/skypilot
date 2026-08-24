@@ -98,17 +98,46 @@ class TestCapacityEndpoint(unittest.TestCase):
         self.assertEqual(body['async_request_ledger_protocol_version'], 1)
 
     def test_never_advertises_exact_protocol_without_complete_identity(self):
-        policy = lb_policies.LeastLoadPolicy()
-        policy.set_ready_replicas([])
-        balancer = _make_balancer(policy)
-        balancer._async_request_ledger_protocol_version = 1
+        incomplete_tuples = (
+            ('11111111-1111-4111-8111-111111111111', None),
+            (None, 'boltz-l4-fleet'),
+            ('', 'boltz-l4-fleet'),
+            ('11111111-1111-4111-8111-111111111111', ''),
+            ('', ''),
+            (None, None),
+        )
+        for service_hash, service_name in incomplete_tuples:
+            with self.subTest(service_hash=service_hash,
+                              service_name=service_name):
+                policy = lb_policies.LeastLoadPolicy()
+                policy.set_ready_replicas([])
+                balancer = _make_balancer(policy)
+                balancer._service_hash = service_hash
+                balancer._service_name = service_name
+                balancer._async_request_ledger_protocol_version = 1
 
-        body = json.loads(
-            asyncio.run(balancer._capacity(mock.MagicMock())).body)
+                body = json.loads(
+                    asyncio.run(balancer._capacity(mock.MagicMock())).body)
 
-        self.assertIsNone(body['service_name'])
-        self.assertIsNone(body['service_incarnation'])
-        self.assertIsNone(body['async_request_ledger_protocol_version'])
+                self.assertEqual(body['service_name'], service_name)
+                self.assertEqual(body['service_incarnation'], service_hash)
+                self.assertIsNone(body['async_request_ledger_protocol_version'])
+
+    def test_never_advertises_non_integer_exact_protocol(self):
+        for protocol in (True, 1.0, '1'):
+            with self.subTest(protocol=protocol):
+                policy = lb_policies.LeastLoadPolicy()
+                policy.set_ready_replicas([])
+                balancer = _make_balancer(policy)
+                balancer._service_hash = (
+                    '11111111-1111-4111-8111-111111111111')
+                balancer._service_name = 'boltz-l4-fleet'
+                balancer._async_request_ledger_protocol_version = protocol
+
+                body = json.loads(
+                    asyncio.run(balancer._capacity(mock.MagicMock())).body)
+
+                self.assertIsNone(body['async_request_ledger_protocol_version'])
 
     def test_round_robin_reports_unknown_in_flight(self):
         policy = lb_policies.RoundRobinPolicy()

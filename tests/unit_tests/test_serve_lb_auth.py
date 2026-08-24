@@ -610,6 +610,66 @@ def test_unsynchronized_receipt_mismatch_never_advertises_protocol(monkeypatch):
     lookup.assert_not_awaited()
 
 
+@pytest.mark.parametrize(('service_hash', 'service_name'), [
+    ('incarnation-a', None),
+    (None, 'test-service'),
+    ('', 'test-service'),
+    ('incarnation-a', ''),
+    ('', ''),
+    (None, None),
+])
+def test_incomplete_service_tuple_rejects_receipt_before_body_or_ledger(
+        monkeypatch, service_hash, service_name):
+    lb = _make_lb()
+    lb._service_hash = service_hash
+    lb._service_name = service_name
+    lb._async_request_ledger_protocol_version = 1
+    lookup = mock.AsyncMock()
+    monkeypatch.setattr(lb, '_lookup_async_ledger_receipt', lookup)
+    receive = mock.AsyncMock(side_effect=AssertionError(
+        'receipt body must not be read without complete exact authority'))
+    request = fastapi.Request(
+        _scope(
+            constants.LB_ASYNC_REQUEST_RECEIPT_ENDPOINT_PATH,
+            method='POST',
+            headers={
+                constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: 'incarnation-a',
+                'Content-Type': 'application/json',
+            }), receive)
+
+    with pytest.raises(fastapi.HTTPException) as raised:
+        _run(lb._async_request_receipt(request))
+
+    assert raised.value.status_code == 503
+    assert constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER not in (
+        raised.value.headers or {})
+    assert constants.LB_ASYNC_SERVICE_INCARNATION_HEADER not in (
+        raised.value.headers or {})
+    receive.assert_not_awaited()
+    lookup.assert_not_awaited()
+
+
+def test_ledger_transport_rechecks_exact_authority_at_call_boundary(
+        monkeypatch):
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    get_client = mock.Mock()
+    monkeypatch.setattr(lb, '_get_async_ledger_client', get_client)
+    # Model authority darkening after request-level admission and an await.
+    lb._service_name = None
+
+    with pytest.raises(
+            async_request_ledger_client.AsyncLedgerTransportError) as lookup:
+        _run(lb._lookup_async_ledger_receipt('request-1', 'a' * 64))
+    with pytest.raises(
+            async_request_ledger_client.AsyncLedgerTransportError) as post:
+        _run(lb._post_async_ledger({'operation': 'bind'}))
+
+    assert lookup.value.status_code == 503
+    assert post.value.status_code == 503
+    get_client.assert_not_called()
+
+
 @pytest.mark.parametrize('payload', [{}, {
     'ledger_protocol_version': True,
     'request_id': 'job-exact-1',
@@ -817,6 +877,42 @@ def test_exact_completion_rejects_recreated_service_before_ledger(monkeypatch):
     assert response.headers[
         constants.LB_ASYNC_SERVICE_INCARNATION_HEADER] == 'incarnation-a'
     lookup.assert_not_awaited()
+
+
+@pytest.mark.parametrize(('service_hash', 'service_name'), [
+    ('incarnation-a', None),
+    (None, 'test-service'),
+    ('', 'test-service'),
+    ('incarnation-a', ''),
+    ('', ''),
+    (None, None),
+])
+def test_incomplete_service_tuple_rejects_exact_completion_before_ledger(
+        monkeypatch, service_hash, service_name):
+    monkeypatch.setenv(constants.LB_AUTH_TOKEN_ENV_VAR, 's3cret')
+    lb = _make_lb()
+    lb._service_hash = service_hash
+    lb._service_name = service_name
+    lb._async_request_ledger_protocol_version = 1
+    lookup = mock.AsyncMock()
+    post = mock.AsyncMock()
+    record = mock.Mock()
+    monkeypatch.setattr(lb, '_lookup_async_ledger_receipt', lookup)
+    monkeypatch.setattr(lb, '_post_async_ledger', post)
+    monkeypatch.setattr(lb, '_record_prediction_time', record)
+    client = _client_with_routes(lb)
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+
+    response = client.post(constants.LB_PREDICTION_COMPLETION_ENDPOINT_PATH,
+                           headers=_exact_edge_auth('s3cret'),
+                           json=_exact_completion_payload(attempt_id))
+
+    assert response.status_code == 503
+    assert constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER not in response.headers
+    assert constants.LB_ASYNC_SERVICE_INCARNATION_HEADER not in response.headers
+    lookup.assert_not_awaited()
+    post.assert_not_awaited()
+    record.assert_not_called()
 
 
 def test_exact_completion_rejects_inexact_receipt_before_histogram(monkeypatch):

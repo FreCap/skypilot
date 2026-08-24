@@ -182,12 +182,13 @@ class TestExactLedgerPredispatch(unittest.TestCase):
             separators=(',', ':')).encode()
 
     @staticmethod
-    def _balancer():
-        balancer = lb_module.SkyServeLoadBalancer(
-            'http://controller:8001',
-            0,
-            service_hash=_SERVICE_INCARNATION,
-            service_name='test-service')
+    def _balancer(*,
+                  service_hash=_SERVICE_INCARNATION,
+                  service_name='test-service'):
+        balancer = lb_module.SkyServeLoadBalancer('http://controller:8001',
+                                                  0,
+                                                  service_hash=service_hash,
+                                                  service_name=service_name)
         balancer._async_request_ledger_protocol_version = 1
         balancer._lookup_async_ledger = mock.AsyncMock(return_value=None)
         balancer._post_async_ledger = mock.AsyncMock()
@@ -242,6 +243,53 @@ class TestExactLedgerPredispatch(unittest.TestCase):
         self.assertEqual(balancer._queue_depth, 0)
         self.assertEqual(balancer._waiting_request_body_bytes, 0)
         self.assertEqual(balancer._reject_last_seen, {})
+
+    def test_incomplete_service_tuple_rejects_before_any_side_effect(self):
+        incomplete_tuples = (
+            (_SERVICE_INCARNATION, None),
+            (None, 'test-service'),
+            ('', 'test-service'),
+            (_SERVICE_INCARNATION, ''),
+            ('', ''),
+            (None, None),
+        )
+        for service_hash, service_name in incomplete_tuples:
+            with self.subTest(service_hash=service_hash,
+                              service_name=service_name):
+                balancer = self._balancer(service_hash=service_hash,
+                                          service_name=service_name)
+                read_body = mock.AsyncMock()
+                record_rejection = mock.Mock()
+                record_demand = mock.Mock()
+                record_arrival = mock.Mock()
+                select_replica = mock.Mock()
+                balancer._request_body = read_body
+                balancer._record_rejection = record_rejection
+                balancer._record_request_demand_once = record_demand
+                balancer._record_offered_arrival = record_arrival
+                balancer._load_balancing_policy.select_replica = select_replica
+                request = _exact_ledger_request(self._body())
+
+                with self.assertRaises(fastapi.HTTPException) as raised:
+                    asyncio.run(balancer._proxy_with_retries(request))
+
+                self.assertEqual(raised.exception.status_code, 503)
+                self.assertNotIn(
+                    lb_module.constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER,
+                    raised.exception.headers or {})
+                self.assertNotIn(
+                    lb_module.constants.LB_ASYNC_SERVICE_INCARNATION_HEADER,
+                    raised.exception.headers or {})
+                read_body.assert_not_awaited()
+                balancer._lookup_async_ledger.assert_not_awaited()
+                balancer._post_async_ledger.assert_not_awaited()
+                record_rejection.assert_not_called()
+                record_demand.assert_not_called()
+                record_arrival.assert_not_called()
+                select_replica.assert_not_called()
+                self.assertEqual(balancer._queue_depth, 0)
+                self.assertEqual(balancer._waiting_request_body_bytes, 0)
+                self.assertEqual(balancer._reject_last_seen, {})
 
     def test_no_replica_rejection_returns_exact_durable_receipt(self):
         balancer = self._balancer()
@@ -362,6 +410,30 @@ class TestExactLedgerPredispatch(unittest.TestCase):
             lb_module.constants.LB_ASYNC_SERVICE_INCARNATION_HEADER,
             raised.exception.headers or {})
         balancer._lookup_async_ledger.assert_not_awaited()
+
+    def test_exact_echo_replaces_duplicate_upstream_identity_headers(self):
+        balancer = self._balancer()
+        response = fastapi.responses.Response()
+        protocol_header = (lb_module.constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER.
+                           lower().encode())
+        incarnation_header = (
+            lb_module.constants.LB_ASYNC_SERVICE_INCARNATION_HEADER.lower(
+            ).encode())
+        response.raw_headers.extend(
+            ((protocol_header, b'99'), (protocol_header, b'98'),
+             (incarnation_header, b'spoof-a'), (incarnation_header,
+                                                b'spoof-b')))
+
+        balancer._echo_exact_response(response)
+
+        self.assertEqual([
+            value for name, value in response.raw_headers
+            if name.lower() == protocol_header
+        ], [b'1'])
+        self.assertEqual([
+            value for name, value in response.raw_headers
+            if name.lower() == incarnation_header
+        ], [_SERVICE_INCARNATION.encode()])
 
 
 class TestRetriableStatusCodes(unittest.TestCase):

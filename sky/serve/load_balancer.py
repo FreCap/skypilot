@@ -2382,18 +2382,22 @@ class SkyServeLoadBalancer:
         body: bytes | None = None,
         max_body_bytes: int = constants.LB_REQUEST_QUEUE_MAX_BODY_BYTES,
     ) -> async_request_ledger_client.AsyncLedgerIdentity | None:
+        advertised_protocol_version = (
+            constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION
+            if self._exact_protocol_active() else None)
         return async_request_ledger_client.parse_identity(
-            request, self._async_request_ledger_protocol_version,
-            self._service_hash, body, max_body_bytes)
+            request, advertised_protocol_version, self._service_hash, body,
+            max_body_bytes)
 
     async def _post_async_ledger(
         self,
         payload: dict[str,
                       Any]) -> async_request_ledger_client.AsyncLedgerReceipt:
-        service_hash = self._service_hash
-        if service_hash is None:
+        if not self._exact_protocol_active():
             raise async_request_ledger_client.AsyncLedgerTransportError(
-                503, 'The load balancer has no service incarnation fence.')
+                503, 'Async ledger authority is not synchronized.')
+        service_hash = self._service_hash
+        assert service_hash is not None
         client = self._get_async_ledger_client()
         return await client.post(payload, service_hash)
 
@@ -2425,10 +2429,11 @@ class SkyServeLoadBalancer:
     async def _lookup_async_ledger_receipt(
         self, request_id: str, intent_sha256: str
     ) -> async_request_ledger_client.AsyncLedgerReceipt | None:
-        service_hash = self._service_hash
-        if service_hash is None:
+        if not self._exact_protocol_active():
             raise async_request_ledger_client.AsyncLedgerTransportError(
-                503, 'The load balancer has no service incarnation fence.')
+                503, 'Async ledger authority is not synchronized.')
+        service_hash = self._service_hash
+        assert service_hash is not None
         client = self._get_async_ledger_client()
         receipt = await client.lookup(
             {
@@ -2553,12 +2558,21 @@ class SkyServeLoadBalancer:
             },
             headers=headers)
 
+    def _exact_protocol_active(self) -> bool:
+        """Whether this LB can attest and execute the exact protocol."""
+        return (type(self._async_request_ledger_protocol_version) is int and
+                self._async_request_ledger_protocol_version
+                == constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION and
+                isinstance(self._service_hash, str) and
+                bool(self._service_hash) and
+                isinstance(self._service_name, str) and
+                bool(self._service_name))
+
     def _exact_protocol_headers(self) -> dict[str, str]:
         """Return the exact edge identity only while authority is live."""
-        if (self._async_request_ledger_protocol_version
-                != constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION or
-                self._service_hash is None or self._service_name is None):
+        if not self._exact_protocol_active():
             return {}
+        assert self._service_hash is not None
         return {
             constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: str(
                 constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION),
@@ -2735,8 +2749,7 @@ class SkyServeLoadBalancer:
             raise fastapi.HTTPException(
                 status_code=422,
                 detail='Exact prediction completion payload is malformed.')
-        if self._async_request_ledger_protocol_version != (
-                constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION):
+        if not self._exact_protocol_active():
             raise fastapi.HTTPException(
                 status_code=503,
                 detail='Async ledger authority is not synchronized.',
@@ -2901,6 +2914,13 @@ class SkyServeLoadBalancer:
         """Recover one exact receipt without routing or mutating its attempt."""
         async_request_ledger_client.require_service_incarnation(
             request, self._service_hash)
+        if not self._exact_protocol_active():
+            raise fastapi.HTTPException(
+                status_code=503,
+                detail='Async ledger authority is not synchronized.',
+                headers={
+                    'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
+                })
         content_type = request.headers.get('content-type', '')
         if content_type.partition(';')[0].strip().lower() != 'application/json':
             raise fastapi.HTTPException(status_code=415,
@@ -2954,15 +2974,6 @@ class SkyServeLoadBalancer:
             raise fastapi.HTTPException(
                 status_code=422,
                 detail='Invalid async request receipt lookup.') from None
-        if self._async_request_ledger_protocol_version != (
-                constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION):
-            raise fastapi.HTTPException(
-                status_code=503,
-                detail='Async ledger authority is not synchronized.',
-                headers={
-                    'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
-                })
-
         protocol_headers = self._exact_protocol_headers()
         try:
             receipt = await self._lookup_async_ledger_receipt(
@@ -3465,9 +3476,8 @@ class SkyServeLoadBalancer:
             request_queue_dispatch_limit = 0
             request_queue_submission_limit = 0
         slot = self._lb_slot
-        exact_protocol_version = (self._async_request_ledger_protocol_version
-                                  if self._service_hash is not None and
-                                  self._service_name is not None else None)
+        exact_protocol_version = (constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION
+                                  if self._exact_protocol_active() else None)
         return fastapi.responses.JSONResponse({
             # Exact callers freeze this value before any possible dispatch and
             # present it on POST, receipt lookup, and completion. A same-name
@@ -5437,10 +5447,12 @@ class SkyServeLoadBalancer:
             if self._request_queue_config is not None else
             constants.LB_REQUEST_QUEUE_MAX_BODY_BYTES)
         try:
+            advertised_protocol_version = (
+                constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION
+                if self._exact_protocol_active() else None)
             ledger_declaration = (
                 async_request_ledger_client.validate_identity_declaration(
-                    request, self._async_request_ledger_protocol_version,
-                    self._service_hash))
+                    request, advertised_protocol_version, self._service_hash))
         except fastapi.HTTPException:
             # Exact header and incarnation validation precedes body reads,
             # memory reservations, demand accounting, and ledger access.
