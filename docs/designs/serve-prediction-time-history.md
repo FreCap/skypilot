@@ -5,7 +5,7 @@
 Accepted for implementation on 2026-07-22 after explicit product approval to
 replace full HTTP response-time history with customer-facing prediction time.
 
-Updated 2026-08-22. The reporter-minute histogram is implemented, but its
+Updated 2026-08-24. The reporter-minute histogram is implemented, but its
 asynchronous completion count is explicitly approximate. The PostgreSQL
 ledger, stable API ingest path, load-balancer bind/lookup/transition
 integration, and coverage-aware status/dashboard summary are implemented,
@@ -13,9 +13,13 @@ locally qualified, and deployed dark in SkyPilot 1.1.1460 / Helm revision 588.
 Serve058 is at the live PostgreSQL head and both load-balancer slots run the
 same immutable 1.1.1460 image. Read-only receipt probes and the fresh dashboard
 summary are production proven. The source now projects the exact ledger through
-the controller-free current-demand read; that API/UI revision is not yet
-deployed or production-proven. A live exact asynchronous request and the
-10,000-request qualification are not. Adversarial review of the separate Boltz
+the controller-free current-demand read. The first live qualification exposed
+an unbounded ledger fan-out: a clean submission performed a pre-bind lookup and
+a completion performed a lookup before its terminal write, while lookup bursts
+could consume the load balancer's entire API transport pool. The checked-in
+correction removes those two steady-state reads and bounds the transport, but is
+not yet deployed or production-proven; the 10,000-request qualification remains
+open. Adversarial review of the separate Boltz
 caller found that caller-maintained first-attempt and heartbeat authority was
 both more complicated and less reliable than the already-transactional server
 boundary. The corrected contract below makes the stable exact request identity
@@ -192,11 +196,13 @@ behind the existing data-plane bearer middleware. For a ledger-qualified
 request it accepts one bounded JSON object with `request_id`, `attempt_id`,
 attempt number, expected revision, immutable intent digest, terminal `status`,
 and bounded nonnegative integer `processing_time_us`. It never forwards the
-request to a replica. The load balancer first reads the current receipt and requires the
-same request digest, attempt UUID, attempt number, and a revision at least as
-new as the submitted fence. It then commits the terminal transition through
-the stable API Service using the purpose-specific LB-sync token and returns
-success only after PostgreSQL accepts it. Identical at-least-once delivery
+request to a replica. The load balancer submits the terminal transition directly
+through the stable API Service using the purpose-specific LB-sync token.
+PostgreSQL atomically requires the same request digest, attempt UUID, attempt
+number, and a current revision at least as new as the submitted fence. A 409
+from an older exact-revision API triggers one current-receipt lookup and one
+retry fenced to that looked-up revision. The callback returns success only after
+PostgreSQL accepts it. Identical at-least-once delivery
 returns the same receipt; conflicting delivery returns 409; temporary
 persistence failure returns 503 so the terminal reporter retains and retries the
 already-durable outcome. Status polling may feed the latency histogram, but it
@@ -255,8 +261,9 @@ from the semantic digest, such as an expired presigned query credential for the
 same stable object identity. It must not re-read prediction, pipeline, feature-
 flag, provider, or service-selection state. Missing, changed, undecryptable, or
 digest-mismatched prepared state fails closed before any network send.
-Each load balancer checks the current attempt before queue and route selection
-and commits a projection-fenced bind before transport.
+Each load balancer commits one atomic projection-fenced bind before transport;
+the bind itself returns an existing non-rejected attempt without dispatch
+authority, so the steady path needs no preceding read.
 The PostgreSQL logical-request lock serializes concurrent binders: exactly one
 fresh bind has `dispatch_authorized: true`; every concurrent or later matching
 POST receives the complete existing receipt and performs no worker send. A
@@ -677,14 +684,15 @@ fabricated terminal result. Any future remote-cancel or expiry transition must
 prove handler quiescence and survive late marker/result races before it may
 replace this policy.
 
-Before queue or route selection, the LB performs `bind` with
-`allow_new_attempt: false`. It returns an existing current receipt or 404 and
-cannot create or advance an attempt. A non-retryable existing receipt returns
-409 plus the full receipt without requiring a ready route. Only
-`REJECTED_PRE_DISPATCH` permits the LB to select a fresh route and issue `bind`
-with `allow_new_attempt: true`; only that second operation may create a new
-dispatch attempt. `DISPATCH_MAY_HAVE_OCCURRED`, `ACCEPTED`, `AMBIGUOUS`, and
-terminal receipts never authorize another provider send. Service-hash isolation
+After route selection, the LB performs one atomic `bind` with
+`allow_new_attempt: true`. It returns an existing current receipt without
+dispatch authority, or creates a fresh projection-fenced attempt. Only a
+current `REJECTED_PRE_DISPATCH` receipt permits creation of a successor;
+`DISPATCH_MAY_HAVE_OCCURRED`, `ACCEPTED`, `AMBIGUOUS`, and terminal receipts
+never authorize another provider send. If no provider route can be selected,
+the pre-dispatch error path performs the read-only lookup before it records a
+durable rejection, preserving existing-attempt recovery without charging every
+successful submission for that read. Service-hash isolation
 keeps late writes from an older incarnation fenced if the service is ever
 explicitly recreated. The operator must not recreate the service while exact
 rows are nonterminal, because the new incarnation cannot recover the old
@@ -863,8 +871,12 @@ PostgreSQL and their owning workflows retry exact completion until acknowledged;
 the durable tables are never deleted. Do not roll a pre-Serve058 load balancer
 into the service or recreate the service while any exact request is nonterminal.
 
-Each exact submission enters the same server bind path. Its initial read-only
-lookup happens inside the load balancer before queueing or route selection. A
+Each new exact submission enters the same atomic server bind path without a
+read-before-write transaction. Bind returns the existing current receipt without
+dispatch authority for every non-rejected duplicate, so a repeated POST never
+authorizes a second worker send. If a request cannot select a provider route,
+the LB performs the read-only lookup before recording a durable pre-dispatch
+rejection; this preserves prompt lost-ack recovery with zero ready routes. A
 valid 409 receipt is a protocol response, not a generic failure: ACCEPTED or
 terminal means the outcome was recovered; DISPATCH_MAY_HAVE_OCCURRED or
 AMBIGUOUS remains unresolved and never dispatches again; only
@@ -872,10 +884,19 @@ REJECTED_PRE_DISPATCH permits a new selected-route bind. Every exact response
 includes the protocol advertisement plus attempt UUID, attempt number,
 revision, and state. After bind, the LB forwards only the nonsecret attempt
 UUID, attempt number, and revision needed to correlate the selected worker
-path. A later terminal reporter presents the request ID, intent digest, attempt
-UUID, attempt number, and last observed revision; the LB reads the current
-receipt before committing the terminal transition, so a revision-1 dispatch
-response is not stranded after the LB commits ACCEPTED revision 2.
+path.
+
+A later terminal reporter presents the request ID, intent digest, attempt UUID,
+attempt number, and its last observed revision. For a terminal operation only,
+PostgreSQL treats that revision as a minimum: under the same per-request lock it
+requires the exact current attempt and intent, rejects a future revision, and
+advances the current row. Thus a revision-1 dispatch response is not stranded
+after the LB commits ACCEPTED revision 2, and the normal completion path needs
+one write rather than a lookup plus a write. A new LB retries the old exact-
+revision API contract once after a 409 by resolving the current receipt, so the
+change remains safe during a two-version rollout. The LB permits at most 16
+ledger HTTP calls at once and at most eight read-only lookups; bind and terminal
+writes can use all 16, so a reconciliation burst cannot occupy the whole window.
 
 The exact coverage gate remains independent from protocol activation. Until the
 entire producer cohort is proven, the dashboard labels ledger counts partial and
@@ -905,8 +926,9 @@ the request ledger does not manufacture that evidence.
   bodies, duplicate keys, and protocol values whose JSON type is bool or float,
   duplicate and conflicting terminal delivery across LB sessions, and
   retryable persistence failures that do not rerun prediction work. Prove the
-  terminal reporter resolves revision 1 to the current post-accept revision
-  without weakening the exact attempt fence.
+  terminal reporter atomically advances from revision 1 through a current
+  post-accept revision without weakening the exact attempt fence. Prove a new LB
+  falls back once to the old exact-revision API after a 409.
 - Test normal sync, old-controller missing acknowledgement, legacy payload
   compatibility, persistence errors, and bounded drain flush.
 - Execute migration 023 against PostgreSQL and verify array constraints,
@@ -920,8 +942,9 @@ the request ledger does not manufacture that evidence.
   isolation, unconditional logical/attempt delete guards, reciprocal-pointer
   consistency, an insert guard that rejects every non-initial state/revision/
   field shape, and exact status aggregation.
-- Prove a read-only bind lookup creates no row, recovers every existing state
-  before queue/route selection with zero ready routes, and fails closed when the
+- Prove an atomic bind needs no preceding lookup, a read-only bind lookup creates
+  no row, the no-route rejection path recovers every existing state with zero
+  ready routes, and the protocol fails closed when the
   Serve058 schema is unavailable. Prove schema058 automatically advertises
   protocol 1 while schema057 suppresses it, without an environment gate.
 - Prove the bounded data-plane receipt lookup is authenticated and read-only,

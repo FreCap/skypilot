@@ -1006,7 +1006,7 @@ def test_exact_completion_rejects_noncanonical_canceled_status(monkeypatch):
     record.assert_not_called()
 
 
-def test_exact_completion_resolves_lb_accepted_revision_handoff(monkeypatch):
+def test_exact_completion_uses_bind_revision_as_atomic_minimum(monkeypatch):
     lb = _make_lb()
     lb._async_request_ledger_protocol_version = 1
     attempt_id = '11111111-1111-4111-8111-111111111111'
@@ -1023,8 +1023,67 @@ def test_exact_completion_resolves_lb_accepted_revision_handoff(monkeypatch):
     response = _run(lb._record_exact_async_prediction_payload(payload))
 
     assert response.status_code == 204
+    lookup.assert_not_awaited()
+    assert post.await_args.args[0]['expected_revision'] == 1
+
+
+def test_exact_completion_falls_back_once_for_old_exact_revision_api(
+        monkeypatch):
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+    lookup = _install_exact_completion_lookup(monkeypatch,
+                                              lb,
+                                              attempt_id,
+                                              revision=2)
+    payload = _exact_completion_payload(attempt_id)
+    payload['expected_revision'] = 1
+    committed = dataclasses.replace(_exact_completion_receipt(attempt_id),
+                                    revision=3)
+    observed_revisions = []
+
+    async def _post(ledger_payload):
+        observed_revisions.append(ledger_payload['expected_revision'])
+        if len(observed_revisions) == 1:
+            raise async_request_ledger_client.AsyncLedgerTransportError(
+                409, 'Request revision fence does not match.')
+        return committed
+
+    post = mock.AsyncMock(side_effect=_post)
+    monkeypatch.setattr(lb, '_post_async_ledger', post)
+
+    response = _run(lb._record_exact_async_prediction_payload(payload))
+
+    assert response.status_code == 204
     lookup.assert_awaited_once_with('job-exact-1', 'a' * 64)
-    assert post.await_args.args[0]['expected_revision'] == 2
+    assert post.await_count == 2
+    assert observed_revisions == [1, 2]
+
+
+def test_exact_completion_fallback_rejects_nonadvancing_receipt(monkeypatch):
+    lb = _make_lb()
+    lb._async_request_ledger_protocol_version = 1
+    attempt_id = '11111111-1111-4111-8111-111111111111'
+    lookup = _install_exact_completion_lookup(monkeypatch,
+                                              lb,
+                                              attempt_id,
+                                              revision=2)
+    payload = _exact_completion_payload(attempt_id)
+    payload['expected_revision'] = 1
+    nonadvancing = dataclasses.replace(_exact_completion_receipt(attempt_id),
+                                       revision=2)
+    post = mock.AsyncMock(
+        side_effect=(async_request_ledger_client.AsyncLedgerTransportError(
+            409, 'Request revision fence does not match.'), nonadvancing))
+    monkeypatch.setattr(lb, '_post_async_ledger', post)
+
+    with pytest.raises(fastapi.HTTPException) as error:
+        _run(lb._record_exact_async_prediction_payload(payload))
+
+    assert error.value.status_code == 503
+    assert error.value.detail == 'Async ledger returned an invalid terminal receipt.'
+    lookup.assert_awaited_once_with('job-exact-1', 'a' * 64)
+    assert post.await_count == 2
 
 
 @pytest.mark.parametrize('body', [

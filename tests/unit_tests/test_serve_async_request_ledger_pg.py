@@ -437,7 +437,12 @@ def test_terminal_receipt_is_attempt_fenced_and_idempotent(
     repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
     bound = repository.bind(_SERVICE_NAME, _SERVICE_HASH,
                             _bind_payload(publication))
+    accepted = repository.transition(_SERVICE_NAME, _SERVICE_HASH,
+                                     _transition_payload(bound, 'accepted'))
 
+    # The worker only received the bind receipt (revision 1).  Terminalization
+    # atomically fences the same attempt and advances the current ACCEPTED row;
+    # it does not need a separate current-revision lookup.
     terminal = repository.transition(
         _SERVICE_NAME, _SERVICE_HASH,
         _transition_payload(bound,
@@ -451,10 +456,21 @@ def test_terminal_receipt_is_attempt_fenced_and_idempotent(
                             terminal_status='SUCCEEDED',
                             processing_time_us=123))
     assert terminal.state == 'SUCCEEDED'
+    assert accepted.revision == 2
+    assert terminal.revision == 3
     assert duplicate.duplicate is True
     summary = repository.summary(_SERVICE_NAME, _SERVICE_HASH)
     assert summary['operational_terminal_receipt_total'] == 1
     assert summary['operational_terminal_receipts_by_status']['SUCCEEDED'] == 1
+
+    future_fence = _transition_payload(terminal,
+                                       'terminal',
+                                       terminal_status='SUCCEEDED',
+                                       processing_time_us=123)
+    future_fence['expected_revision'] = terminal.revision + 1
+    with pytest.raises(async_request_ledger.AsyncRequestLedgerConflict,
+                       match='revision fence'):
+        repository.transition(_SERVICE_NAME, _SERVICE_HASH, future_fence)
 
 
 def test_shutdown_blocks_bind_and_service_recreation_fences_transitions(
