@@ -5785,8 +5785,8 @@ class TestFillLaunchPath(unittest.TestCase):
             types.SimpleNamespace(intent=types.SimpleNamespace(
                 allowed_locations=template_lease.intent.allowed_locations,
                 physical_cluster_uid='physical-uid',
-                idempotency_key=f'{index:064x}')) for index in range(
-                    zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE))
+                idempotency_key=f'{index:064x}'))
+            for index in range(replica_managers._ZERO_COST_ACTUATION_QUANTUM))
         manager._zero_cost_actuation_repository.lease_batch.return_value = (
             leases)
         manager._scale_up_one_locked = mock.Mock(side_effect=[
@@ -5847,7 +5847,7 @@ class TestFillLaunchPath(unittest.TestCase):
             pool_key='pool',
             owner=manager._zero_cost_actuation_executor_id,
             lease_seconds=mock.ANY,
-            max_leases=zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE)
+            max_leases=replica_managers._ZERO_COST_ACTUATION_QUANTUM)
 
     def test_terminal_actuation_transition_wakes_reconcile(self):
         manager, _, _ = self._actuation_harness()

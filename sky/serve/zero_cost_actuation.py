@@ -2059,7 +2059,7 @@ class ZeroCostActuationRepository:
         lease_seconds: int,
         max_leases: int = MAX_ACTUATION_LEASE_BATCH_SIZE,
     ) -> tuple[IntentLease, ...]:
-        """Lease one bounded oldest-first physical-pool submission wave."""
+        """Lease one bounded fair physical-pool submission wave."""
         if (not isinstance(owner, uuid.UUID) or
                 not isinstance(lease_seconds, int) or lease_seconds <= 0 or
                 not isinstance(max_leases, int) or
@@ -2134,12 +2134,22 @@ class ZeroCostActuationRepository:
             rows = connection.execute(
                 sqlalchemy.select(_INTENTS).where(
                     *pending_predicates,
-                    _provider_proof_authority_predicate(
-                        ready_authorities)).order_by(
-                            _INTENTS.c.created_at,
-                            _INTENTS.c.intent_idempotency_key).limit(
-                                max_leases).with_for_update(
-                                    skip_locked=True)).mappings().all()
+                    _provider_proof_authority_predicate(ready_authorities)
+                ).order_by(
+                    # A failed intent must not monopolize a JIT lease
+                    # quantum while untouched grants wait behind it.
+                    # Once every grant has had one attempt, rotate
+                    # retryable work by its least-recent transition.
+                    sqlalchemy.case(
+                        (_INTENTS.c.state == IntentState.GRANTED.value, 0),
+                        else_=1),
+                    sqlalchemy.case(
+                        (_INTENTS.c.state
+                         == IntentState.RETRYABLE.value, _INTENTS.c.updated_at),
+                        else_=_INTENTS.c.created_at),
+                    _INTENTS.c.created_at,
+                    _INTENTS.c.intent_idempotency_key).limit(max_leases).
+                with_for_update(skip_locked=True)).mappings().all()
             # Close the authority-scan-to-row-lock race immediately before the
             # lease transition.  The renewal reserve keeps this bounded check
             # well away from the terminal launch horizon.
