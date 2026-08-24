@@ -26,14 +26,21 @@ tests:
               claimName: production-rwx-state
 
   - it: should reject an operator-supplied PVC in guarded HA
-    values:
-      - fixtures/rwx-authority-fence-values.yaml
     set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: postgres-uri
+      requestStore.backend: postgres
       storage.enabled: false
       storage.existingClaim: ""
+      apiService.extraVolumes:
+        - name: external-persistent-volume
+          persistentVolumeClaim:
+            claimName: external-state
     asserts:
       - failedTemplate:
-          errorMessage: 'extraVolumes persistentVolumeClaim "skypilot-rwx-authority-fence" is not supported in guarded HA'
+          errorMessage: 'extraVolumes persistentVolumeClaim "external-persistent-volume" is not supported in guarded HA'
 
   - it: should reject a CSI shared filesystem in guarded HA
     set:
@@ -46,40 +53,10 @@ tests:
       apiService.extraVolumes:
         - name: external-shared
           csi:
-            driver: efs.csi.aws.com
+            driver: storage.example.invalid
     asserts:
       - failedTemplate:
           errorMessage: 'extraVolumes volume "external-shared" uses unsupported source "csi" in guarded HA'
-
-  - it: should keep the authority fence in one-pod compatibility mode
-    values:
-      - fixtures/rwx-authority-fence-values.yaml
-    set:
-      apiService.highAvailability.enabled: false
-      apiService.replicas: 1
-      apiService.upgradeStrategy: Recreate
-    asserts:
-      - equal:
-          path: spec.template.spec.initContainers[0].name
-          value: verify-rwx-authority-fence
-      - equal:
-          path: spec.template.spec.initContainers[0].volumeMounts
-          value:
-            - name: skypilot-rwx-authority-fence
-              mountPath: /var/run/skypilot/rwx-authority
-              readOnly: true
-      - contains:
-          path: spec.template.spec.volumes
-          content:
-            name: skypilot-rwx-authority-fence
-            persistentVolumeClaim:
-              claimName: skypilot-state-authority
-              readOnly: true
-      - notContains:
-          path: spec.template.spec.containers[0].volumeMounts
-          any: true
-          content:
-            name: skypilot-rwx-authority-fence
 
   - it: should reject an existing claim when persistence is disabled
     set:

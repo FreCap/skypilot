@@ -367,33 +367,24 @@ By default, the API server is upgraded with the ``Recreate`` strategy, which int
 
     **Compatibility RollingUpdate and local file mounts:** Local ``file_mounts``
     and ``workdir`` can be lost when an unguarded compatibility pod is replaced.
-    Guarded high availability requires shared ReadWriteMany storage. For a
+    Guarded high availability requires ``storage.enabled=false`` and rejects
+    local uploads which would make one Pod's filesystem authoritative. For a
     compatibility deployment:
 
-    - Enable :ref:`persistent storage <helm-values-storage-enabled>` with a ``ReadWriteMany`` (RWX) PVC so both pods can access the files during the transition.
-    - Alternatively, use :ref:`cloud buckets <sky-storage>`, :ref:`volumes <volumes-on-kubernetes>`, or :ref:`git <sync-code-and-project-files-git>` instead of local paths; or set :ref:`jobs.bucket <config-yaml-jobs-bucket>` to redirect all local file uploads to a cloud bucket.
+    - Prefer :ref:`cloud buckets <sky-storage>`, :ref:`volumes <volumes-on-kubernetes>`, or :ref:`git <sync-code-and-project-files-git>` instead of local paths; or set :ref:`jobs.bucket <config-yaml-jobs-bucket>` to redirect local file uploads to a cloud bucket.
+    - If local persistent state is required, use the ``Recreate`` strategy and
+      qualify that compatibility profile independently. It is not the guarded
+      high-availability path.
 
     This does not apply if you are using a :ref:`remote jobs controller <jobs-controller-remote>`.
 
 For a claim provisioned outside the chart, set
 :ref:`storage.existingClaim <helm-values-storage-existingClaim>` and keep
 ``storage.enabled=true``. The claim must exist in the release namespace and be
-populated and qualified before the upgrade. In guarded HA, also declare
-``storage.accessMode=ReadWriteMany`` and verify that the live claim is Bound and
-actually advertises RWX; Helm cannot inspect that capability while rendering.
-
-Migrating an existing chart-owned claim requires separate revisions. First add
-``helm.sh/resource-policy: keep`` through ``storage.annotations`` while
-``storage.existingClaim`` is still empty, and verify that revision changes only
-the old PVC metadata. Then stop every filesystem and SQLite writer, copy and
-verify the data on the new claim, complete the request-store cutover, and only
-then select the external claim. Do not combine the keep annotation and claim
-switch: the old PVC is no longer rendered once ``existingClaim`` is set.
-
-The PostgreSQL request-store marker is a one-way rollback boundary. After it is
-committed, recover by applying a new upgrade revision pinned to a compatible
-image that already uses PostgreSQL and the same RWX claim. Do not use native
-Helm rollback to a stored RWO/SQLite revision.
+populated and qualified before the upgrade. This option belongs only to a
+non-guarded compatibility profile. Guarded high availability rejects every
+PVC-backed state path and upgrades with PostgreSQL authority plus disposable,
+bounded Pod-local materializations.
 
 The following table compares the two upgrade strategies:
 

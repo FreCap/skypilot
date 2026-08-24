@@ -41,14 +41,21 @@ tests:
           pattern: 'emptyDir: \{\}'
 
   - it: should reject an operator-supplied PVC in guarded HA
-    values:
-      - fixtures/rwx-authority-fence-values.yaml
     set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
       storage.enabled: false
       storage.existingClaim: ""
+      controllerService.extraVolumes:
+        - name: external-persistent-volume
+          persistentVolumeClaim:
+            claimName: external-state
     asserts:
       - failedTemplate:
-          errorMessage: 'extraVolumes persistentVolumeClaim "skypilot-rwx-authority-fence" is not supported in guarded HA'
+          errorMessage: 'extraVolumes persistentVolumeClaim "external-persistent-volume" is not supported in guarded HA'
 
   - it: should not render an controller deployment in compatibility mode
     asserts:

@@ -1,12 +1,13 @@
 # Production-Grade Multi-Replica API Server
 
-Status: PostgreSQL request authority and the 2/2/2 API/executor/controller
-split are live in production and were revalidated on 2026-08-21 at Helm
-revision 478 / release 1.1.1407. The private durable HA-observer canary and M5
-compatibility cleanup remain gated. The former executable RWX/EFS migration
-plan has been removed and is available only in Git history.
+Status: PostgreSQL request authority and the split API/executor/controller
+topology are live and were revalidated on 2026-08-22 at Helm revision 590 /
+release 1.1.1464 with two API, three executor, and two controller Pods. Guarded
+HA has no PVC or CSI mount. The private durable HA-observer canary and M5
+compatibility cleanup remain independently gated. The former executable
+RWX/EFS migration plan has been removed and is available only in Git history.
 
-Last updated: 2026-08-21
+Last updated: 2026-08-22
 
 Canonical owner: this file owns the role split, PostgreSQL request delivery,
 controller leadership, execution fencing, and availability contract. External
@@ -21,11 +22,11 @@ cutover has superseded the former EFS-to-S3 migration design.
 ## Summary
 
 Production now runs the implemented role split: two stateless API replicas,
-two active-active PostgreSQL request executors, and two active-standby
+three active-active PostgreSQL request executors, and two active-standby
 controller workers under PostgreSQL leadership and fencing. PostgreSQL is the
-request, queue, lease, and controller-ownership authority. The remaining
-storage dependency is one transitional EFS claim shared by all six role pods;
-its replacement is governed only by
+request, queue, lease, and controller-ownership authority. Bounded Pod-local
+volumes hold only reconstructible materializations; there is no shared
+filesystem dependency. That completed storage boundary is governed only by
 `docs/designs/stateless-ha-control-plane-storage.md`.
 
 This design separates three responsibilities:
@@ -818,13 +819,13 @@ Deployment evidence and storage supersession:
 
 M1 completed the one-way SQLite-to-PostgreSQL request-store migration and its
 real-PostgreSQL acceptance. Production PostgreSQL is authoritative and the
-legacy importer must never be rerun. The role split later shipped on one shared
-RWX claim as a transitional storage dependency. The former executable EFS/RWX
-copy, backup, Terraform, Helm, cost, rollback, and capacity plan has been
-removed from this canonical design; it remains available in Git history only.
-`docs/designs/stateless-ha-control-plane-storage.md` exclusively owns removal of
-that live claim and the retained-PostgreSQL plus fresh-service-lifecycle,
-emptyDir no-EFS cutover. No text in this file authorizes a new EFS/RWX change.
+legacy importer must never be rerun. The role split briefly shipped on one
+shared RWX claim; the fresh-lifecycle cutover has now removed it. The former
+executable EFS/RWX copy, backup, Terraform, Helm, cost, rollback, and capacity
+plan remains available in Git history only.
+`docs/designs/stateless-ha-control-plane-storage.md` owns the completed
+retained-PostgreSQL, bounded-emptyDir cutover. No text in this file authorizes a
+new EFS/RWX change.
 
 ### M2: Split API and executor roles
 
@@ -1835,11 +1836,10 @@ slower; any failed, stale, or missing observation resets the clock:
   aggregate headroom for all three possible rollout surges remains satisfied
   after accounting for DaemonSets, external load balancers, the observer, and
   all other live workloads;
-- the exact rendered PVC-free storage profile is running in all six Ready role
+- the exact rendered PVC-free storage profile is running in all seven Ready role
   pods, every local volume remains within its byte/inode budget, and local-
-  upload rejection has no bypass. Before the separate fresh cutover, EFS health
-  is operational telemetry only; afterward, any PVC/EFS mount or I/O fails the
-  storage gate;
+  upload rejection has no bypass. Any PVC/EFS mount or I/O fails the storage
+  gate;
 - PostgreSQL CPU remains below 70% at p95, connections below 70% of the
   configured maximum, and connection/error counters show no HA-attributable
   increase; and
