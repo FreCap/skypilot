@@ -28,7 +28,6 @@ from sky.users import permission
 from sky.users import rbac
 from sky.utils import common
 from sky.utils import debug_dump_helpers
-from sky.utils import yaml_utils
 
 logger = sky_logging.init_logger(__name__)
 router = fastapi.APIRouter()
@@ -86,25 +85,16 @@ async def _require_readable_service(service_name: str,
     return service
 
 
-def _redact_version_yaml(yaml_content: str | None,
-                         stable_order: bool = False) -> str | None:
+def _redact_version_yaml(yaml_content: str | None) -> str | None:
     if yaml_content is None:
         return None
-    if stable_order:
-        try:
-            documents = list(yaml_utils.safe_load_all(yaml_content))
-            config = (documents[0] if len(documents) == 1 and
-                      isinstance(documents[0], dict) else documents)
-            yaml_content = yaml_utils.dump_yaml_str(config, sort_keys=True)
-        except Exception:  # pylint: disable=broad-except
-            pass
     return debug_dump_helpers.redact_task_yaml(yaml_content)
 
 
 def _service_version_payload(version_record: dict, elected_version: int | None,
                              active_versions: list[int],
                              include_yaml: bool) -> dict:
-    """Build one version response, redacting YAML only when requested."""
+    """Build one version response with display-safe submitted YAML."""
     version = version_record['version']
     spec = version_record['spec']
     payload = {
@@ -112,9 +102,13 @@ def _service_version_payload(version_record: dict, elected_version: int | None,
         'submitted_yaml_content':
             (_redact_version_yaml(version_record['submitted_yaml_content'])
              if include_yaml else None),
-        'compiled_yaml_content':
-            (_redact_version_yaml(version_record['yaml_content'],
-                                  stable_order=True) if include_yaml else None),
+        # Compiled YAML is execution material, not a display document.  It can
+        # contain secret-substituted values outside schema-known credential
+        # fields and an embedded copy of the original user YAML.  Heuristic
+        # redaction therefore cannot make it safe to serialize.  Keep the
+        # nullable field for wire compatibility, but fail closed for every
+        # caller, including administrators.
+        'compiled_yaml_content': None,
         'created_at': version_record['created_at'],
         'created_by': version_record['created_by'],
         'quarantined_at': version_record['quarantined_at'],
@@ -239,7 +233,7 @@ def version_history(request: fastapi.Request,
 @router.get('/{service_name}/versions/{version}')
 def version_detail(request: fastapi.Request, service_name: str,
                    version: int) -> dict:
-    """Return one immutable version, including its redacted YAML."""
+    """Return one immutable version with its redacted submitted YAML."""
     _require_admin(request)
     record = serve_state.get_service_from_name(service_name)
     if record is None or record.get('pool'):

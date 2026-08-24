@@ -2253,6 +2253,19 @@ class TestRedactTaskYaml:
         assert 'val1' not in result
         assert 'val2' not in result
 
+    def test_drops_embedded_user_yaml_provenance(self):
+        """Compiled YAML must not retain its verbatim input document."""
+        hidden_value = 'VALUE_FROM_EMBEDDED_INPUT'
+        yaml_str = ('name: compiled-task\n'
+                    '_user_specified_yaml: |\n'
+                    '  secrets:\n'
+                    f'    TOKEN: {hidden_value}\n')
+
+        result = debug_dump_helpers.redact_task_yaml(yaml_str)
+
+        assert '_user_specified_yaml' not in result
+        assert hidden_value not in result
+
 
 # ---------------------------------------------------------------------------
 # Tests for _dump_request_id_info
