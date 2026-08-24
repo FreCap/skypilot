@@ -1,6 +1,6 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-24 06:45 UTC
+Last updated: 2026-08-24 07:58 UTC
 
 Status: **scheduler-admitted reserved-capacity convergence plus the provider-
 local exact request/load qualification are production-proven; bounded paid-
@@ -28,6 +28,14 @@ confirmed. The 06:44 route contained 13 A100, 141
 A100-80GB, and 136 H200 slots; all 290 were routed, materialized, freshly
 probed, and had zero unknown occupancy or provisioning tail. Its public
 capacity projection reported zero currently available slots for every card.
+A later same-day read-only audit reached 295/295 `READY`: East remained at 13
+A100 plus 141 A100-80GB, while PHX increased to 141 H200. Stored, elected,
+committed, applied, and sole active service version were all version 1;
+`update_apply_pending` was false. All 295 rows were reserved-fill, zero-cost,
+and non-Spot. The 141 PHX admissions were `POLICY_ADMITTED`, reserved grants
+equaled holdings, and every exact-card observation reported zero compatible
+spendable free capacity. Paid claims, waiters, replicas, Spot hourly cost, and
+ordinary on-demand capacity remained zero.
 
 This receipt followed a moving research denominator. As research released
 capacity, the published PHX grant progressed through 18, 25, 26, 34, 42, 52,
@@ -84,11 +92,18 @@ backend, or Temporal code is an explicit non-goal. Full Compute API producer
 activation is separate, out of scope, and not claimed by this design.
 
 The only required production behavior gate still open is a genuinely uncovered
-paid L4 Spot residual followed by complete drain and debit release. It requires
-an explicitly approved positive GPU-unit ceiling and recorded cost envelope.
-Ordinary on-demand remains structurally disallowed. Cleanup PRs remain
-separately gated on their exact old-path/legacy-row horizons and do not block
-the live single happy path.
+paid L4 Spot residual followed by complete drain, provider absence, and debit
+release. Provider-only Platform PR #8841 freezes the exact restart-safe canary
+at commit `ee74e0450f4c1299c068e487a8c723be3803c8fc`; it changes no runtime
+service definition and its deployment job is skipped. Draft provider-only PR
+#8842 freezes a proposed qualification cap of ten logical L4 GPU units in
+production while retaining cap zero in test. It must remain undeployed until
+the exact regions, physical shapes/count, duration, market, and cost envelope
+receive explicit approval. Ten is a qualification ceiling, not an implicit
+permanent business limit; the lasting finite cap requires a separately
+disclosed owner decision. Ordinary on-demand remains structurally disallowed.
+Cleanup PRs remain separately gated on their exact old-path/legacy-row horizons
+and do not block the live single happy path.
 
 ### Exact async bind convergence across route publication
 
@@ -638,7 +653,7 @@ boundaries.
 | Slice | Source | Deployed | Activated | Production proof |
 |---|---|---|---|---|
 | Bounded v5 teardown and clean recreation (#1676/#1677) | Complete | Complete in `1.1.1447` | Complete at gate 33 | Complete: lifecycle 91 purged normally; lifecycle 93 created |
-| Scheduler-authorized reserved fill | Complete | Complete through `1.1.1470` / Helm 594 | Complete at gate 39 | Complete against the dynamic denominator. The coherent 06:26 UTC receipt was 280/280 Ready; the service then automatically converged to a coherent 290/290 by 06:44 as more PHX capacity became confirmed. All replicas were reserved/non-Spot and Simone's Kueue policy was unchanged. |
+| Scheduler-authorized reserved fill | Complete | Complete through `1.1.1470` / Helm 594 | Complete at gate 39 | Complete against the dynamic denominator. The coherent 06:26 UTC receipt was 280/280 Ready; the service then automatically converged through 290/290 by 06:44 and reached 295/295 in the later same-day audit as more PHX capacity became confirmed. The final split was East 154 and PHX 141. All replicas were reserved/non-Spot and Simone's Kueue policy was unchanged. |
 | Controller/LB current-request projection | Complete | Complete | Complete | The two-slot LB remained healthy. After the 10,000-request campaign, the API projection was fresh/complete with two reporters and zero current QPS, queued, in-flight, and rejected work. The PostgreSQL exact summary matched the provider-local terminal census and remained explicitly partial by producer coverage. This receipt did not capture a nonzero API/UI sample during that campaign. |
 | PR #1678 duplicate-up and observer lock-order correction | Complete at `38ec24342` | Complete in Helm 572 | Complete at gate 34 | Duplicate-up, takeover, 180-second stale horizon, and +30 control-plane/HA/error checks passed; the coincident eight-card v6 readiness wave was superseded by supported provider teardown |
 | Kueue non-mutation | No source change | No rendered chart change | Not applicable | Complete: both normalized PRE and POST hashes are equal |
@@ -8530,7 +8545,17 @@ qualification and do not authorize a Kueue or infrastructure change.
 - [ ] Exercise genuinely uncovered paid Spot residual and drain in production
   only after recording the maximum logical GPU slots, possible machine shapes
   and count, regions, duration, market, and rough cost. Ordinary on-demand
-  remains disallowed without explicit management approval.
+  remains disallowed without explicit management approval. Provider-only PR
+  #8841 freezes the restart-safe exact canary without a deployable service
+  change. Draft provider-only PR #8842 proposes the still-unapproved bounded
+  exercise: at most ten logical L4 units, Spot only, 1/2/4/8-GPU widths, at
+  most ten physical machines, and at most one hour from the first paid claim to
+  provider-proven absence. The conservative current catalog compute bound is
+  `$21.2462/hour`, excluding disk and transfer. Do not merge/deploy the positive
+  production cap or send the L4-only demand campaign until that exact envelope
+  is explicitly approved. Keep cap ten enabled through the successful natural
+  drain proof; returning it to zero early would not prove positive-cap idle
+  retirement. Choose the permanent finite spend cap separately afterward.
 - [x] Pass typed provider present/absent/unknown/replaced,
   legacy-real-effect, lost-ACK, poisoned-row progress, broker conservation,
   no-paid-spill, and full restart/adoption tests. Focused unit and real-
