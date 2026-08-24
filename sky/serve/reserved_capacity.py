@@ -492,21 +492,35 @@ def _read_physical_replica_names(
                 _request_timeout=kubernetes.API_TIMEOUT)
             reader = _BoundedResponseReader(
                 response, _PHYSICAL_PRESENCE_MAX_RESPONSE_BYTES - total_bytes)
-            page_items_start = False
-            page_items_end = False
+            page_items_start_count = 0
+            page_items_end_count = 0
+            page_items_null_count = 0
+            page_items_invalid = False
             page_item_count = 0
+            page_item_end_count = 0
             page_metadata_count = 0
             page_kind: str | None = None
+            page_kind_count = 0
             next_continuation: str | None = None
             try:
                 try:
                     for prefix, event, value in ijson.parse(reader):
                         if prefix == 'kind' and event == 'string':
                             page_kind = value
+                            page_kind_count += 1
                         elif prefix == 'items' and event == 'start_array':
-                            page_items_start = True
+                            page_items_start_count += 1
                         elif prefix == 'items' and event == 'end_array':
-                            page_items_end = True
+                            page_items_end_count += 1
+                        elif prefix == 'items' and event == 'null':
+                            # Kubernetes' Go JSON encoder emits a nil Items
+                            # slice as null for an empty
+                            # PartialObjectMetadataList.  This is the exact
+                            # empty result of a successful list operation, not
+                            # a missing or truncated field.
+                            page_items_null_count += 1
+                        elif prefix == 'items':
+                            page_items_invalid = True
                         elif (prefix == 'metadata.continue' and
                               event == 'string'):
                             next_continuation = value or None
@@ -519,6 +533,13 @@ def _read_physical_replica_names(
                                     'exceeded.')
                             annotated_name = None
                             on_cloud_name = None
+                        elif prefix == 'items.item' and event == 'end_map':
+                            page_item_end_count += 1
+                        elif (prefix == 'items.item' and event != 'map_key'):
+                            # PartialObjectMetadataList items must be objects;
+                            # a scalar or nested array cannot be interpreted
+                            # as an empty result.
+                            page_items_invalid = True
                         elif prefix == annotation_prefix and event == 'string':
                             annotated_name = value
                         elif prefix == label_prefix and event == 'string':
@@ -541,8 +562,15 @@ def _read_physical_replica_names(
                                 # violated the exact selector as negative
                                 # evidence.
                                 fully_annotated = False
-                    if (page_kind != 'PartialObjectMetadataList' or
-                            not page_items_start or not page_items_end or
+                    items_complete = (not page_items_invalid and (
+                        (page_items_start_count == 1 and page_items_end_count
+                         == 1 and page_items_null_count == 0) or
+                        (page_items_null_count == 1 and page_items_start_count
+                         == 0 and page_items_end_count == 0)) and
+                                      page_item_end_count == page_item_count)
+                    if (page_kind_count != 1 or
+                            page_kind != 'PartialObjectMetadataList' or
+                            not items_complete or
                             page_metadata_count != page_item_count):
                         raise ValueError(
                             'Kubernetes Pod metadata response is incomplete.')

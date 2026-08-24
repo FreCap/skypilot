@@ -135,6 +135,12 @@ def _metadata_list(items, *, continuation=''):
     }
 
 
+def _raw_metadata_list_with_items_fields(items_fields):
+    return ('{"apiVersion":"meta.k8s.io/v1",'
+            '"kind":"PartialObjectMetadataList","metadata":{},' + items_fields +
+            '}').encode()
+
+
 def _patch_raw_api(monkeypatch, responses):
     client = mock.Mock()
     client.call_api.side_effect = responses
@@ -263,6 +269,16 @@ def test_exact_lookup_streams_partial_metadata_and_paginates(monkeypatch):
     assert all(response.actions == ['release'] for response in responses)
 
 
+def test_empty_partial_metadata_null_items_proves_absence(monkeypatch):
+    """Kubernetes encodes an empty nil Items slice as JSON null."""
+    response = _RawResponse(_metadata_list(None))
+    _patch_raw_api(monkeypatch, [response])
+
+    assert reserved_capacity.probe_physical_replica_presence(
+        _fence(), _CLUSTER) is Presence.ABSENT
+    assert response.actions == ['release']
+
+
 def test_exact_selector_hit_is_present_even_if_logical_prefix_was_shortened(
         monkeypatch):
     on_cloud_name = 'shortened-9f3a21c4'
@@ -290,8 +306,11 @@ def test_exact_selector_violation_cannot_prove_absence(monkeypatch):
         cluster_name_on_cloud='expected-label') is Presence.UNPROVEN
 
 
-@pytest.mark.parametrize(
-    'failure', ['wrong-kind', 'repeated-page', 'byte-limit', 'item-limit'])
+@pytest.mark.parametrize('failure', [
+    'wrong-kind', 'missing-items', 'duplicate-null', 'null-scalar',
+    'duplicate-array', 'scalar-array-element', 'truncated-array',
+    'repeated-page', 'byte-limit', 'item-limit'
+])
 def test_incomplete_or_unbounded_metadata_read_cannot_prove_absence(
         monkeypatch, failure):
     one_item = _metadata_item(annotation='other', label='other-on-cloud')
@@ -299,6 +318,35 @@ def test_incomplete_or_unbounded_metadata_read_cannot_prove_absence(
         payload = _metadata_list([one_item])
         payload['kind'] = 'PodList'
         responses = [_RawResponse(payload)]
+    elif failure == 'missing-items':
+        payload = _metadata_list([])
+        payload.pop('items')
+        responses = [_RawResponse(payload)]
+    elif failure == 'duplicate-null':
+        responses = [
+            _RawResponse(
+                _raw_metadata_list_with_items_fields(
+                    '"items":null,"items":null'))
+        ]
+    elif failure == 'null-scalar':
+        responses = [
+            _RawResponse(
+                _raw_metadata_list_with_items_fields('"items":null,"items":42'))
+        ]
+    elif failure == 'duplicate-array':
+        responses = [
+            _RawResponse(
+                _raw_metadata_list_with_items_fields('"items":[],"items":[]'))
+        ]
+    elif failure == 'scalar-array-element':
+        responses = [
+            _RawResponse(_raw_metadata_list_with_items_fields('"items":[null]'))
+        ]
+    elif failure == 'truncated-array':
+        responses = [
+            _RawResponse(
+                _raw_metadata_list_with_items_fields('"items":[')[:-1])
+        ]
     elif failure == 'repeated-page':
         responses = [
             _RawResponse(_metadata_list([one_item], continuation='same')),
