@@ -18,6 +18,7 @@ from sky.serve import async_request_ledger
 from sky.serve import async_request_ledger_schema
 from sky.serve import placement_normalization_authority
 from sky.serve import route_projection
+from sky.serve import route_projection_schema
 from sky.serve import serve_state_schema
 from sky.utils.db import migration_utils
 
@@ -28,6 +29,7 @@ _SERVICE_HASH = 'svc-hash'
 _REQUEST_ID = 'durable-request-1'
 _INTENT = 'a' * 64
 _CONTROLLER_ID = uuid.UUID('11111111-1111-4111-8111-111111111111')
+_NEW_CONTROLLER_ID = uuid.UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
 _RECORD_ID = uuid.UUID('22222222-2222-4222-8222-222222222222')
 _NEW_RECORD_ID = uuid.UUID('33333333-3333-4333-8333-333333333333')
 _ROUTE_URL = 'http://10.0.0.10:8080'
@@ -163,6 +165,34 @@ def _bind_payload(publication,
     }
 
 
+def _route_identities() -> dict:
+    return {
+        _ROUTE_URL: {
+            'replica_id': 1,
+            'replica_record_id': str(_RECORD_ID),
+            'service_version': 1,
+            'gpu_type': 'L4',
+            'gpu_count': 1,
+            'advertised': True,
+            'alias_expires_at': None,
+        }
+    }
+
+
+def _publish_response(engine, response, identities=None):
+    if identities is None:
+        identities = _route_identities()
+    return route_projection.RouteProjectionRepository(engine).publish(
+        _publisher_identity(),
+        1,
+        response,
+        identities, {
+            str(identity['replica_record_id'])
+            for identity in identities.values()
+        },
+        ttl_seconds=300)
+
+
 def _transition_payload(receipt, operation: str, **extra) -> dict:
     return {
         'protocol_version': 1,
@@ -264,6 +294,408 @@ def test_bind_is_exact_private_and_duplicate_never_authorizes_dispatch(
         'route_contract_service_version'] == 1
     assert attempt_row['dispatch_binding'][
         'selected_worker_service_version'] == 1
+
+
+def test_capacity_only_projection_movement_keeps_selected_route_valid(
+        ledger_database) -> None:
+    engine, selected_publication = ledger_database
+    refreshed_response = _route_response()
+    refreshed_response['capacity_hint'] = {
+        'replica_unit': 'physical_backend',
+        'target_replicas': 122,
+        'ready_replicas': 122,
+    }
+    current_publication = _publish_response(engine, refreshed_response)
+    assert current_publication.generation > selected_publication.generation
+    repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
+
+    bound = repository.bind(_SERVICE_NAME, _SERVICE_HASH,
+                            _bind_payload(selected_publication))
+
+    with engine.connect() as connection:
+        binding = connection.execute(
+            sqlalchemy.select(
+                async_request_ledger_schema.serve_async_request_attempts_table.
+                c.dispatch_binding)).scalar_one()
+    assert bound.dispatch_authorized is True
+    assert binding['route_projection_generation'] == (
+        current_publication.generation)
+    assert binding['route_projection_sha256'] == (
+        current_publication.content_sha256)
+
+
+def test_expired_selected_head_binds_after_identical_renewal(
+        ledger_database) -> None:
+    engine, selected_publication = ledger_database
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_heads_table).where(
+                    route_projection_schema.serve_route_heads_table.c.
+                    service_name == _SERVICE_NAME).values(
+                        refreshed_at=sqlalchemy.func.clock_timestamp() -
+                        sqlalchemy.text("INTERVAL '2 seconds'"),
+                        valid_until=sqlalchemy.func.clock_timestamp() -
+                        sqlalchemy.text("INTERVAL '1 second'")))
+    repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
+
+    with pytest.raises(
+            async_request_ledger.AsyncRequestLedgerRouteAuthorityConflict,
+            match='missing, stale, or moved'):
+        repository.bind(_SERVICE_NAME, _SERVICE_HASH,
+                        _bind_payload(selected_publication))
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                async_request_ledger_schema.serve_async_requests_table)
+        ).scalar_one() == 0
+
+    renewed = _publish_response(engine, _route_response())
+    assert renewed.generation == selected_publication.generation
+    assert renewed.content_sha256 == selected_publication.content_sha256
+    bound = repository.bind(_SERVICE_NAME, _SERVICE_HASH,
+                            _bind_payload(selected_publication))
+    assert bound.dispatch_authorized is True
+
+
+def test_pruned_selected_projection_is_typed_and_creates_no_row(
+        ledger_database) -> None:
+    engine, selected_publication = ledger_database
+    refreshed_response = _route_response()
+    refreshed_response['capacity_hint'] = {
+        'replica_unit': 'physical_backend',
+        'ready_replicas': 122,
+    }
+    current_publication = _publish_response(engine, refreshed_response)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(
+                route_projection_schema.serve_route_snapshots_table).where(
+                    route_projection_schema.serve_route_snapshots_table.c.
+                    service_name == _SERVICE_NAME,
+                    route_projection_schema.serve_route_snapshots_table.c.
+                    generation == selected_publication.generation))
+    repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
+
+    with pytest.raises(
+            async_request_ledger.AsyncRequestLedgerRouteAuthorityConflict,
+            match='missing, stale, or moved'):
+        repository.bind(_SERVICE_NAME, _SERVICE_HASH,
+                        _bind_payload(selected_publication))
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                async_request_ledger_schema.serve_async_requests_table)
+        ).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                async_request_ledger_schema.serve_async_request_attempts_table)
+        ).scalar_one() == 0
+    assert repository.bind(
+        _SERVICE_NAME, _SERVICE_HASH,
+        _bind_payload(current_publication)).dispatch_authorized is True
+
+
+def test_retained_projection_digest_mismatch_is_never_typed(
+        ledger_database) -> None:
+    engine, publication = ledger_database
+    repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
+    payload = _bind_payload(publication)
+    payload['route_projection_sha256'] = 'f' * 64
+
+    with pytest.raises(async_request_ledger.AsyncRequestLedgerConflict,
+                       match='fence does not match') as exc_info:
+        repository.bind(_SERVICE_NAME, _SERVICE_HASH, payload)
+    assert not isinstance(
+        exc_info.value,
+        async_request_ledger.AsyncRequestLedgerRouteAuthorityConflict)
+
+
+def test_expired_head_cannot_mask_invalid_retained_selection(
+        ledger_database) -> None:
+    engine, publication = ledger_database
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_heads_table).where(
+                    route_projection_schema.serve_route_heads_table.c.
+                    service_name == _SERVICE_NAME).values(
+                        refreshed_at=sqlalchemy.func.clock_timestamp() -
+                        sqlalchemy.text("INTERVAL '2 seconds'"),
+                        valid_until=sqlalchemy.func.clock_timestamp() -
+                        sqlalchemy.text("INTERVAL '1 second'")))
+    repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
+
+    wrong_digest = _bind_payload(publication)
+    wrong_digest['route_projection_sha256'] = 'f' * 64
+    with pytest.raises(async_request_ledger.AsyncRequestLedgerConflict,
+                       match='fence does not match') as digest_exc:
+        repository.bind(_SERVICE_NAME, _SERVICE_HASH, wrong_digest)
+    assert not isinstance(
+        digest_exc.value,
+        async_request_ledger.AsyncRequestLedgerRouteAuthorityConflict)
+
+    unknown_route = _bind_payload(publication,
+                                  selected_route_url='http://unknown:8080')
+    with pytest.raises(async_request_ledger.AsyncRequestLedgerConflict,
+                       match='no advertised identity') as route_exc:
+        repository.bind(_SERVICE_NAME, _SERVICE_HASH, unknown_route)
+    assert not isinstance(
+        route_exc.value,
+        async_request_ledger.AsyncRequestLedgerRouteAuthorityConflict)
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                async_request_ledger_schema.serve_async_requests_table)
+        ).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                async_request_ledger_schema.serve_async_request_attempts_table)
+        ).scalar_one() == 0
+
+
+def test_fresh_head_cannot_regress_below_selected_generation(
+        ledger_database) -> None:
+    engine, older_publication = ledger_database
+    selected_response = _route_response()
+    selected_response['capacity_hint'] = {
+        'replica_unit': 'physical_backend',
+        'target_replicas': 122,
+        'ready_replicas': 122,
+    }
+    selected_publication = _publish_response(engine, selected_response)
+    assert selected_publication.generation > older_publication.generation
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_heads_table).where(
+                    route_projection_schema.serve_route_heads_table.c.
+                    service_name == _SERVICE_NAME).values(
+                        generation=older_publication.generation))
+    repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
+
+    with pytest.raises(async_request_ledger.AsyncRequestLedgerUnavailable,
+                       match='head regressed') as exc_info:
+        repository.bind(_SERVICE_NAME, _SERVICE_HASH,
+                        _bind_payload(selected_publication))
+    assert not isinstance(
+        exc_info.value,
+        async_request_ledger.AsyncRequestLedgerRouteAuthorityConflict)
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                async_request_ledger_schema.serve_async_requests_table)
+        ).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                async_request_ledger_schema.serve_async_request_attempts_table)
+        ).scalar_one() == 0
+
+
+def test_unrelated_route_movement_keeps_selected_route_valid(
+        ledger_database) -> None:
+    engine, selected_publication = ledger_database
+    expanded_response = _route_response()
+    expanded_response['replica_info'][_NEW_ROUTE_URL] = {
+        'gpu_type': 'H200',
+        'gpu_count': '8',
+        'is_zero_cost': 'true',
+    }
+    expanded_response['num_ready_replicas'] = 2
+    expanded_identities = _route_identities()
+    expanded_identities[_NEW_ROUTE_URL] = {
+        'replica_id': 2,
+        'replica_record_id': str(_NEW_RECORD_ID),
+        'service_version': 1,
+        'gpu_type': 'H200',
+        'gpu_count': 8,
+        'advertised': True,
+        'alias_expires_at': None,
+    }
+    current_publication = _publish_response(engine, expanded_response,
+                                            expanded_identities)
+    repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
+
+    bound = repository.bind(_SERVICE_NAME, _SERVICE_HASH,
+                            _bind_payload(selected_publication))
+
+    with engine.connect() as connection:
+        binding = connection.execute(
+            sqlalchemy.select(
+                async_request_ledger_schema.serve_async_request_attempts_table.
+                c.dispatch_binding)).scalar_one()
+    assert bound.dispatch_authorized is True
+    assert binding['route_projection_generation'] == (
+        current_publication.generation)
+    assert binding['route_projection_sha256'] == (
+        current_publication.content_sha256)
+
+
+def test_genuine_projection_movement_is_typed_only_before_first_attempt(
+        ledger_database) -> None:
+    """A route-contract race is retryable only while no request row exists."""
+    engine, stale_publication = ledger_database
+    refreshed_response = _route_response()
+    refreshed_response['replica_info'][_ROUTE_URL]['async_occupancy'] = 'true'
+    fresh_publication = _publish_response(engine, refreshed_response)
+    assert fresh_publication.generation > stale_publication.generation
+    repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
+
+    with pytest.raises(
+            async_request_ledger.AsyncRequestLedgerRouteAuthorityConflict,
+            match='missing, stale, or moved'):
+        repository.bind(_SERVICE_NAME, _SERVICE_HASH,
+                        _bind_payload(stale_publication))
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                async_request_ledger_schema.serve_async_requests_table)
+        ).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                async_request_ledger_schema.serve_async_request_attempts_table)
+        ).scalar_one() == 0
+
+    bound = repository.bind(_SERVICE_NAME, _SERVICE_HASH,
+                            _bind_payload(fresh_publication))
+    duplicate = repository.bind(_SERVICE_NAME, _SERVICE_HASH,
+                                _bind_payload(stale_publication))
+    assert bound.dispatch_authorized is True
+    assert duplicate.dispatch_authorized is False
+    assert duplicate.attempt_id == bound.attempt_id
+
+
+def test_selected_route_removal_is_typed_before_insert(ledger_database) -> None:
+    engine, stale_publication = ledger_database
+    empty_response = _route_response()
+    empty_response['replica_info'] = {}
+    empty_response['num_ready_replicas'] = 0
+    _publish_response(engine, empty_response, {})
+    repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
+
+    with pytest.raises(
+            async_request_ledger.AsyncRequestLedgerRouteAuthorityConflict,
+            match='missing, stale, or moved'):
+        repository.bind(_SERVICE_NAME, _SERVICE_HASH,
+                        _bind_payload(stale_publication))
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                async_request_ledger_schema.serve_async_requests_table)
+        ).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                async_request_ledger_schema.serve_async_request_attempts_table)
+        ).scalar_one() == 0
+
+
+def test_same_version_routing_spec_drift_is_corruption_not_retry(
+        ledger_database) -> None:
+    engine, stale_publication = ledger_database
+    refreshed_response = _route_response()
+    refreshed_response['routing_spec']['stream_timeout_seconds'] = 330
+    _publish_response(engine, refreshed_response)
+    repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
+
+    with pytest.raises(async_request_ledger.AsyncRequestLedgerUnavailable,
+                       match='routing contract diverged'):
+        repository.bind(_SERVICE_NAME, _SERVICE_HASH,
+                        _bind_payload(stale_publication))
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                async_request_ledger_schema.serve_async_requests_table)
+        ).scalar_one() == 0
+
+
+def test_controller_lineage_movement_is_typed_before_insert(
+        ledger_database) -> None:
+    engine, stale_publication = ledger_database
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                _SERVICE_NAME).values(controller_incarnation=_NEW_CONTROLLER_ID,
+                                      controller_owner_epoch=7))
+    repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
+
+    with pytest.raises(
+            async_request_ledger.AsyncRequestLedgerRouteAuthorityConflict,
+            match='missing, stale, or moved'):
+        repository.bind(_SERVICE_NAME, _SERVICE_HASH,
+                        _bind_payload(stale_publication))
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                async_request_ledger_schema.serve_async_requests_table)
+        ).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                async_request_ledger_schema.serve_async_request_attempts_table)
+        ).scalar_one() == 0
+
+
+def test_route_producer_lineage_movement_is_typed_before_insert(
+        ledger_database) -> None:
+    engine, publication = ledger_database
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                _SERVICE_NAME).values(route_projection_protocol_version=2))
+    repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
+
+    with pytest.raises(
+            async_request_ledger.AsyncRequestLedgerRouteAuthorityConflict,
+            match='missing, stale, or moved'):
+        repository.bind(_SERVICE_NAME, _SERVICE_HASH,
+                        _bind_payload(publication))
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                async_request_ledger_schema.serve_async_requests_table)
+        ).scalar_one() == 0
+
+
+def test_existing_rejected_attempt_never_gets_route_retry_type(
+        ledger_database) -> None:
+    engine, stale_publication = ledger_database
+    repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
+    rejected = repository.reject_before_dispatch(_SERVICE_NAME, _SERVICE_HASH,
+                                                 _REQUEST_ID, _INTENT)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_heads_table).where(
+                    route_projection_schema.serve_route_heads_table.c.
+                    service_name == _SERVICE_NAME).values(
+                        refreshed_at=sqlalchemy.func.clock_timestamp() -
+                        sqlalchemy.text("INTERVAL '2 seconds'"),
+                        valid_until=sqlalchemy.func.clock_timestamp() -
+                        sqlalchemy.text("INTERVAL '1 second'")))
+
+    with pytest.raises(async_request_ledger.AsyncRequestLedgerConflict,
+                       match='missing, stale, or moved') as exc_info:
+        repository.bind(_SERVICE_NAME, _SERVICE_HASH,
+                        _bind_payload(stale_publication))
+    assert not isinstance(
+        exc_info.value,
+        async_request_ledger.AsyncRequestLedgerRouteAuthorityConflict)
+    lookup = repository.lookup_current(
+        _SERVICE_NAME, _SERVICE_HASH, {
+            'protocol_version': 1,
+            'request_id': _REQUEST_ID,
+            'intent_sha256': _INTENT,
+            'allow_new_attempt': False,
+        })
+    assert lookup.attempt_id == rejected.attempt_id
+    assert lookup.state == 'REJECTED_PRE_DISPATCH'
 
 
 def test_current_projection_binds_each_active_worker_version(
@@ -693,10 +1125,10 @@ def test_summary_reports_exact_opted_in_states_and_terminal_counts(
 
 
 def test_summary_does_not_wait_for_a_service_row_writer(ledger_database):
-    repository = async_request_ledger.AsyncRequestLedgerRepository(
-        ledger_database)
+    engine, _ = ledger_database
+    repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    writer = ledger_database.connect()
+    writer = engine.connect()
     transaction = writer.begin()
     try:
         writer.execute(

@@ -629,6 +629,28 @@ def _occupancy_context_sha256(response: Mapping[str, Any],
         })).hexdigest()
 
 
+def selected_route_context_sha256(response: Mapping[str, Any],
+                                  identities: Mapping[str, Any],
+                                  selected_url: str) -> str:
+    """Digest the immutable contract needed to bind one selected route.
+
+    Capacity telemetry and unrelated route churn cannot change the validity of
+    an otherwise identical selected worker.  The complete routing spec remains
+    in the fence because it owns compatibility, queueing, and admission policy.
+    """
+    replica_info = response.get('replica_info')
+    selected_wire = (replica_info.get(selected_url) if isinstance(
+        replica_info, Mapping) else None)
+    return hashlib.sha256(
+        _canonical_json({
+            'service_version': response.get('service_version'),
+            'routing_spec': response.get('routing_spec'),
+            'selected_route_url': selected_url,
+            'selected_route_wire': selected_wire,
+            'selected_route_identity': identities.get(selected_url),
+        })).hexdigest()
+
+
 def _canonical_record_id(value: object) -> str:
     if not isinstance(value, str):
         raise RouteProjectionValidationError(

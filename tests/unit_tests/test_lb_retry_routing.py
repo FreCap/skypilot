@@ -630,6 +630,74 @@ class TestRetriableStatusCodes(unittest.TestCase):
             dataclasses.asdict(duplicate))
         client.send.assert_not_awaited()
 
+    def test_typed_route_conflict_is_pre_send_only_without_existing_receipt(
+            self):
+        client, _ = self._client_returning(200)
+        client.send = mock.AsyncMock()
+        balancer = self._balancer([], client)
+        balancer._routing_version = 1
+        balancer._route_projection_generation = 7
+        balancer._route_projection_sha256 = 'c' * 64
+        balancer._route_source_epoch = 3
+        balancer._route_sync_generation = 11
+        request = _request()
+        identity = ledger_client.AsyncLedgerIdentity('request-1', 'a' * 64,
+                                                     'stable-job-1')
+        vars(request)[ledger_client.IDENTITY_REQUEST_ATTR] = identity
+
+        async def _moved(*_args):
+            # Model a coherent sync completing after selection but before the
+            # typed 409 reaches the proxy catch boundary.
+            balancer._route_sync_generation = 12
+            raise ledger_client.AsyncLedgerRouteAuthorityConflict(
+                409, 'route authority moved')
+
+        balancer._bind_async_ledger = _moved
+
+        result = asyncio.run(
+            balancer._proxy_request_to('http://a:8080', request))
+
+        self.assertIsInstance(result, lb_module._RouteAuthorityRetryableError)
+        self.assertEqual(result.route_sync_generation, 11)
+        self.assertEqual(result.conflict_observed_sync_generation, 12)
+        self.assertEqual(result.route_projection_generation, 7)
+        self.assertEqual(result.route_projection_sha256, 'c' * 64)
+        self.assertEqual(result.route_source_epoch, 3)
+        client.send.assert_not_awaited()
+        self.assertIsNone(ledger_client.get_receipt(request))
+
+        # A receipt of any state closes the implicit replay path, even if a
+        # malformed/mixed peer somehow returns the typed code afterward.
+        existing = self._install_ledger_request(request)
+        result = asyncio.run(
+            balancer._proxy_request_to('http://a:8080', request))
+        self.assertEqual(result.status_code, 409)
+        self.assertNotIsInstance(result,
+                                 lb_module._RouteAuthorityRetryableError)
+        self.assertIs(ledger_client.get_receipt(request), existing)
+        client.send.assert_not_awaited()
+
+    def test_generic_ledger_409_never_retries_or_sends(self):
+        client, _ = self._client_returning(200)
+        client.send = mock.AsyncMock()
+        balancer = self._balancer([], client)
+        request = _request()
+        identity = ledger_client.AsyncLedgerIdentity('request-1', 'a' * 64,
+                                                     'stable-job-1')
+        vars(request)[ledger_client.IDENTITY_REQUEST_ATTR] = identity
+        balancer._bind_async_ledger = mock.AsyncMock(
+            side_effect=ledger_client.AsyncLedgerTransportError(
+                409, 'generic conflict'))
+
+        result = asyncio.run(
+            balancer._proxy_request_to('http://a:8080', request))
+
+        self.assertEqual(result.status_code, 409)
+        self.assertEqual(json.loads(result.body)['detail'], 'generic conflict')
+        self.assertNotIsInstance(result,
+                                 lb_module._RouteAuthorityRetryableError)
+        client.send.assert_not_awaited()
+
     def test_ledger_qualified_retriable_status_is_ambiguous_not_replayed(self):
         client, closed = self._client_returning(503)
         balancer = self._balancer([503], client)
@@ -777,6 +845,295 @@ class TestRetryTuning(unittest.TestCase):
                       httpx.RemoteProtocolError('bad response')):
             with self.subTest(error=type(error).__name__):
                 self.assertFalse(lb_module._is_definitely_not_dispatched(error))
+
+    def test_route_conflict_refreshes_then_reselects_without_url_penalty(self):
+        # The production service uses max_retries=1. A typed bind conflict
+        # proves no provider attempt and therefore owns an independent budget.
+        balancer = self._balancer(max_retries=1)
+        balancer._load_balancing_policy.set_ready_replicas(['http://a:8080'])
+        balancer._routing_version = 1
+        balancer._route_projection_generation = 7
+        balancer._route_projection_sha256 = 'a' * 64
+        balancer._route_source_epoch = 2
+        balancer._async_request_ledger_protocol_version = 1
+        balancer._route_sync_generation = 4
+        bodies = []
+        selections = []
+
+        async def _proxy(url, request):
+            bodies.append(await balancer._request_body(request))
+            selected = vars(request)[lb_module._SELECTED_REPLICA_ATTR]
+            selections.append((url, selected.route_projection_generation,
+                               selected.route_projection_sha256,
+                               selected.route_sync_generation))
+            if len(selections) == 1:
+                return lb_module._RouteAuthorityRetryableError(
+                    'moved', selected.route_sync_generation,
+                    balancer._route_sync_generation,
+                    selected.route_projection_generation,
+                    selected.route_projection_sha256,
+                    selected.route_source_epoch)
+            return fastapi.responses.Response(status_code=200)
+
+        async def _refresh(sync_generation, conflict_sync_generation,
+                           route_fence):
+            self.assertEqual(sync_generation, 4)
+            self.assertEqual(conflict_sync_generation, 4)
+            self.assertEqual(route_fence, (7, 'a' * 64, 2))
+            balancer._route_projection_generation = 8
+            balancer._route_projection_sha256 = 'b' * 64
+            balancer._route_sync_generation = 5
+            return True
+
+        balancer._proxy_request_to = _proxy
+        balancer._refresh_route_authority_after_conflict = _refresh
+        body = TestExactLedgerPredispatch._body()
+        request = _exact_ledger_request(body)
+        request.is_disconnected = mock.AsyncMock(return_value=False)
+
+        response = asyncio.run(balancer._proxy_with_retries_inner(request))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([selection[0] for selection in selections],
+                         ['http://a:8080', 'http://a:8080'])
+        self.assertEqual([selection[1] for selection in selections], [7, 8])
+        self.assertEqual([selection[3] for selection in selections], [4, 5])
+        self.assertEqual(bodies, [body, body])
+        self.assertIs(bodies[0], bodies[1])
+        self.assertEqual(
+            balancer._async_attempt_rejection(
+                lb_module._RouteAuthorityRetryableError('moved', 4, 4, 7,
+                                                        'a' * 64, 2)),
+            (True, False))
+
+    def test_route_conflict_has_independent_bounded_refresh_budget(self):
+        balancer = self._balancer(max_retries=1)
+        balancer._load_balancing_policy.set_ready_replicas(['http://a:8080'])
+        balancer._routing_version = 1
+        balancer._route_projection_generation = 7
+        balancer._route_projection_sha256 = 'a' * 64
+        balancer._route_source_epoch = 2
+        balancer._async_request_ledger_protocol_version = 1
+        balancer._route_sync_generation = 4
+        proxy_calls = 0
+        refresh_calls = 0
+
+        async def _proxy(unused_url, request):
+            nonlocal proxy_calls
+            proxy_calls += 1
+            selected = vars(request)[lb_module._SELECTED_REPLICA_ATTR]
+            return lb_module._RouteAuthorityRetryableError(
+                'moved', selected.route_sync_generation,
+                balancer._route_sync_generation,
+                selected.route_projection_generation,
+                selected.route_projection_sha256, selected.route_source_epoch)
+
+        async def _refresh(unused_sync_generation,
+                           unused_conflict_sync_generation, unused_route_fence):
+            nonlocal refresh_calls
+            refresh_calls += 1
+            balancer._route_projection_generation += 1
+            balancer._route_projection_sha256 = (
+                f'{balancer._route_projection_generation:064x}')
+            balancer._route_sync_generation += 1
+            return True
+
+        balancer._proxy_request_to = _proxy
+        balancer._refresh_route_authority_after_conflict = _refresh
+        request = _exact_ledger_request(TestExactLedgerPredispatch._body())
+        request.is_disconnected = mock.AsyncMock(return_value=False)
+
+        with self.assertRaises(fastapi.HTTPException) as exc_info:
+            asyncio.run(balancer._proxy_with_retries_inner(request))
+
+        self.assertEqual(exc_info.exception.status_code, 503)
+        self.assertEqual(refresh_calls,
+                         lb_module.constants.LB_ROUTE_AUTHORITY_MAX_REFRESHES)
+        self.assertEqual(proxy_calls, refresh_calls + 1)
+
+    def test_foreground_route_refresh_is_coalesced_and_requires_new_fence(self):
+        balancer = lb_module.SkyServeLoadBalancer(
+            'http://controller:8001',
+            0,
+            service_hash=_SERVICE_INCARNATION,
+            service_name='test-service')
+        balancer._routing_version = 1
+        balancer._route_projection_generation = 7
+        balancer._route_projection_sha256 = 'a' * 64
+        balancer._route_source_epoch = 2
+        balancer._async_request_ledger_protocol_version = 1
+        balancer._route_sync_generation = 4
+        sync_calls = 0
+
+        async def _sync_once(*, route_only=False):
+            nonlocal sync_calls
+            self.assertTrue(route_only)
+            sync_calls += 1
+            await asyncio.sleep(0)
+            with balancer._client_pool_lock:
+                balancer._route_projection_generation = 8
+                balancer._route_projection_sha256 = 'b' * 64
+                balancer._route_sync_generation = 5
+
+        balancer._sync_with_controller_once_unlocked = _sync_once
+
+        async def _run():
+            refreshed = await asyncio.gather(
+                *(balancer._refresh_route_authority_after_conflict(
+                    4, 4, (7, 'a' * 64, 2)) for _ in range(32)))
+            self.assertEqual(sync_calls, 1)
+
+            async def _same_fence_renewal_sync(*, route_only=False):
+                nonlocal sync_calls
+                self.assertTrue(route_only)
+                sync_calls += 1
+                await asyncio.sleep(0)
+                with balancer._client_pool_lock:
+                    balancer._route_sync_generation = 6
+
+            balancer._sync_with_controller_once_unlocked = (
+                _same_fence_renewal_sync)
+            renewed = await asyncio.gather(
+                *(balancer._refresh_route_authority_after_conflict(
+                    5, 5, (8, 'b' * 64, 2)) for _ in range(32)))
+            self.assertEqual(sync_calls, 2)
+
+            async def _no_op_sync(*, route_only=False):
+                nonlocal sync_calls
+                self.assertTrue(route_only)
+                sync_calls += 1
+                await asyncio.sleep(0)
+
+            balancer._sync_with_controller_once_unlocked = _no_op_sync
+            no_op = await asyncio.gather(
+                *(balancer._refresh_route_authority_after_conflict(
+                    6, 6, (8, 'b' * 64, 2)) for _ in range(32)))
+            self.assertEqual(sync_calls, 3)
+
+            async def _invalid_sync(*, route_only=False):
+                nonlocal sync_calls
+                self.assertTrue(route_only)
+                sync_calls += 1
+                await asyncio.sleep(0)
+                raise ValueError('malformed projection')
+
+            with balancer._client_pool_lock:
+                balancer._route_sync_generation = 7
+            balancer._sync_with_controller_once_unlocked = _invalid_sync
+            invalid = await asyncio.gather(
+                *(balancer._refresh_route_authority_after_conflict(
+                    7, 7, (8, 'b' * 64, 2)) for _ in range(32)))
+            self.assertEqual(sync_calls, 4)
+
+            async def _cancelled_sync(*, route_only=False):
+                self.assertTrue(route_only)
+                raise asyncio.CancelledError()
+
+            with balancer._client_pool_lock:
+                # A later periodic coherent apply invalidates the cached
+                # failure and permits one new foreground probe.
+                balancer._route_sync_generation = 8
+            balancer._sync_with_controller_once_unlocked = _cancelled_sync
+            with self.assertRaises(asyncio.CancelledError):
+                await balancer._refresh_route_authority_after_conflict(
+                    8, 8, (8, 'b' * 64, 2))
+            return refreshed, renewed, no_op, invalid
+
+        refreshed, renewed, no_op, invalid = asyncio.run(_run())
+        self.assertEqual(refreshed, [True] * 32)
+        self.assertEqual(renewed, [True] * 32)
+        self.assertEqual(no_op, [False] * 32)
+        self.assertEqual(invalid, [False] * 32)
+        self.assertEqual(sync_calls, 4)
+        with balancer._client_pool_lock:
+            self.assertFalse(
+                balancer._route_authority_refreshed_locked(
+                    5, 5, (99, 'f' * 64, 2)))
+
+    def test_route_refresh_fails_if_role_is_lost_during_fetch(self):
+        balancer = self._balancer(max_retries=3)
+        balancer._routing_version = 1
+        balancer._route_projection_generation = 7
+        balancer._route_projection_sha256 = 'a' * 64
+        balancer._route_source_epoch = 2
+        balancer._async_request_ledger_protocol_version = 1
+        balancer._route_sync_generation = 4
+
+        async def _sync_once(*, route_only=False):
+            self.assertTrue(route_only)
+            with balancer._client_pool_lock:
+                balancer._route_projection_generation = 8
+                balancer._route_projection_sha256 = 'b' * 64
+                balancer._route_sync_generation = 5
+                balancer._draining = True
+
+        balancer._sync_with_controller_once_unlocked = _sync_once
+        refreshed = asyncio.run(
+            balancer._refresh_route_authority_after_conflict(
+                4, 4, (7, 'a' * 64, 2)))
+        self.assertFalse(refreshed)
+
+    def test_equal_fence_requires_complete_sync_after_conflict(self):
+        balancer = lb_module.SkyServeLoadBalancer(
+            'http://controller:8001',
+            0,
+            service_hash=_SERVICE_INCARNATION,
+            service_name='test-service')
+        balancer._routing_version = 1
+        balancer._route_projection_generation = 7
+        balancer._route_projection_sha256 = 'a' * 64
+        balancer._route_source_epoch = 2
+        balancer._async_request_ledger_protocol_version = 1
+        # This equal-fence sync completed after selection (4) but before the
+        # typed bind conflict was observed (5), so it cannot prove renewal.
+        balancer._route_sync_generation = 5
+        sync_calls = 0
+
+        async def _no_apply(*, route_only=False):
+            nonlocal sync_calls
+            self.assertTrue(route_only)
+            sync_calls += 1
+            await asyncio.sleep(0)
+
+        balancer._sync_with_controller_once_unlocked = _no_apply
+
+        async def _run():
+            before = await asyncio.gather(
+                *(balancer._refresh_route_authority_after_conflict(
+                    4, 5, (7, 'a' * 64, 2)) for _ in range(32)))
+            # Conversely, an equal coherent periodic apply after conflict is a
+            # fresh lease proof and avoids another foreground read.
+            with balancer._client_pool_lock:
+                balancer._route_sync_generation = 6
+            after = await balancer._refresh_route_authority_after_conflict(
+                4, 5, (7, 'a' * 64, 2))
+            return before, after
+
+        before, after = asyncio.run(_run())
+        self.assertEqual(before, [False] * 32)
+        self.assertTrue(after)
+        self.assertEqual(sync_calls, 1)
+
+    def test_same_generation_different_digest_never_satisfies_refresh(self):
+        balancer = self._balancer(max_retries=1)
+        balancer._routing_version = 1
+        balancer._route_projection_generation = 7
+        balancer._route_projection_sha256 = 'a' * 64
+        balancer._route_source_epoch = 2
+        balancer._async_request_ledger_protocol_version = 1
+        balancer._route_sync_generation = 4
+
+        async def _corrupt_apply(*, route_only=False):
+            self.assertTrue(route_only)
+            with balancer._client_pool_lock:
+                balancer._route_projection_sha256 = 'b' * 64
+                balancer._route_sync_generation = 5
+
+        balancer._sync_with_controller_once_unlocked = _corrupt_apply
+        self.assertFalse(
+            asyncio.run(
+                balancer._refresh_route_authority_after_conflict(
+                    4, 4, (7, 'a' * 64, 2))))
 
 
 class TestRoutingSpecSync(unittest.TestCase):

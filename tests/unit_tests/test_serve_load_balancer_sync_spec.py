@@ -312,7 +312,9 @@ class _FakeSession:
 
 def _run_one_sync(lb: load_balancer.SkyServeLoadBalancer,
                   body,
-                  on_response_enter=None) -> None:
+                  on_response_enter=None,
+                  *,
+                  route_only: bool = False) -> _FakeSession:
     """Drive a single _sync_with_controller_once with a mocked controller
     response carrying `body`."""
     session = _FakeSession(_FakeResp(body, on_enter=on_response_enter))
@@ -325,7 +327,82 @@ def _run_one_sync(lb: load_balancer.SkyServeLoadBalancer,
          mock.patch.object(lb,
                            '_get_lb_session_id',
                            return_value='test-pod-uid'):
-        asyncio.run(lb._sync_with_controller_once())
+        if route_only:
+
+            async def _route_only_sync():
+                async with lb._controller_sync_lock:
+                    await lb._sync_with_controller_once_unlocked(route_only=True
+                                                                )
+
+            asyncio.run(_route_only_sync())
+        else:
+            asyncio.run(lb._sync_with_controller_once())
+    return session
+
+
+def test_foreground_route_only_sync_preserves_all_demand_history():
+    lb = _make_lb()
+    lb._service_hash = 'service-hash-a'
+    lb._queued_compatibility_demand_supported = True
+    digest = 'b' * 64
+    response = {
+        'replica_info': {
+            'http://replica:8080': {
+                'gpu_type': 'L4',
+                'gpu_count': '1',
+            },
+        },
+        'num_ready_replicas': 1,
+        'routing_spec': {
+            'load_balancing_policy_name': 'least_load',
+        },
+        'service_version': 7,
+        'route_projection_generation': 11,
+        'route_projection_sha256': digest,
+        'route_source_epoch': 3,
+        'async_request_ledger_protocol_version': 1,
+        # A route-only read never negotiates demand-report capability.
+        'queued_compatibility_demand_supported': False,
+        # Nor may an unexpected ack clear a history snapshot it did not send.
+        'request_history_accepted': True,
+        'request_classification_history_accepted': True,
+        'prediction_time_history_accepted': True,
+    }
+    aggregator = lb._request_aggregator
+    with mock.patch.object(aggregator, 'drain', wraps=aggregator.drain) as drain, \
+         mock.patch.object(aggregator, 'restore',
+                           wraps=aggregator.restore) as restore, \
+         mock.patch.object(
+             aggregator,
+             'mark_request_history_accepted',
+             wraps=aggregator.mark_request_history_accepted) as history_ack, \
+         mock.patch.object(
+             aggregator,
+             'mark_request_classification_history_accepted',
+             wraps=aggregator.mark_request_classification_history_accepted
+         ) as classification_ack, \
+         mock.patch.object(
+             aggregator,
+             'mark_prediction_time_history_accepted',
+             wraps=aggregator.mark_prediction_time_history_accepted
+         ) as prediction_ack:
+        session = _run_one_sync(lb, response, route_only=True)
+
+    drain.assert_not_called()
+    restore.assert_not_called()
+    history_ack.assert_not_called()
+    classification_ack.assert_not_called()
+    prediction_ack.assert_not_called()
+    assert lb._queued_compatibility_demand_supported is True
+    assert lb._route_projection_generation == 11
+    assert lb._route_projection_sha256 == digest
+    assert lb._route_sync_generation == 1
+    assert len(session.post_calls) == 1
+    _, kwargs = session.post_calls[0]
+    assert kwargs['json']['request_aggregator'] == {}
+    assert kwargs['json']['request_history'] is None
+    assert kwargs['json']['request_classification_history'] is None
+    assert kwargs['json']['prediction_time_history'] is None
 
 
 def test_large_ready_set_is_not_emitted_to_info_logs():

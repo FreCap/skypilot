@@ -1,19 +1,20 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-24 01:23 UTC
+Last updated: 2026-08-24 04:41 UTC
 
 Status: **scheduler-admitted reserved-capacity convergence is production-proven;
 exact request-path and load qualification remain open.** The homogeneous
-control plane is SkyPilot release `1.1.1464`, Helm revision 590: two API, two
-controller, and three executor Pods are Ready on image
-`sha256:3af8c64962a1405a35e6e9cba9ad53f38a597be2bb7163e165bbda6c1ec6aafb`
-and chart digest
-`sha256:08dd56877be0a3e51399e47141effb2bbb0319ebc39c3b20b72d423fa138b58f`.
-The old test lifecycle was removed through supported teardown and
-`boltz-l4-fleet` was recreated once from the canonical definition as service
-incarnation `fb593111-6524-48f5-ab58-1f895a6664cd`, version 1. The active
-route reports generation 98, 149 expected and 149 reported backends, and 149
-fresh Ready workers.
+control plane was rechecked on 2026-08-24 at SkyPilot release `1.1.1469`, Helm
+revision 593: two API, two controller, and three executor Pods plus both
+external load balancers were healthy with zero restarts on image digest
+`sha256:9b0823f36b8d5e6993a691e6ae6691313fdec066e19ea615798bde4e2d7c1f96`.
+The current route has 122 Ready reserved workers, all in East. PHX currently
+exposes no Kueue-admissible fill slot because higher-priority research reclaimed
+that capacity under Simone's unchanged policy; this is correct yielding, not a
+fill regression or unused scheduler-admissible capacity. The lifecycle/count
+census below is the latest complete scheduler-capacity receipt recorded in this
+document, not a claim that its point-in-time route generation or worker count
+remains current after revision 593.
 
 At the 2026-08-24 01:17 UTC production census, all scheduler-spendable reserved
 capacity was occupied without a paid launch: 13 A100, 77 A100-80GB, and 59
@@ -57,11 +58,15 @@ Released source now includes the no-mount normalization, exact asynchronous
 Serve ledger and service-incarnation fence, reserved-before-paid placement,
 and the hard paid GPU-unit cap. The remaining required gates are:
 
-1. finish and deploy the PostgreSQL row-first exact caller from every current
-   Compute API dispatch path, using a frozen request preimage and exact
-   service/incarnation/endpoint/card identity;
-2. activate that test worker cohort without old/new unversioned Temporal
-   binaries overlapping, then prove a small end-to-end prediction completion;
+1. finish, deploy, and qualify the PostgreSQL row-first exact bind at the
+   SkyPilot external-LB/provider boundary, using a frozen request preimage and
+   exact service/incarnation/endpoint/card identity. Any Boltz-side caller work
+   is restricted to `ml_models/providers/skypilot/**`; changing Platform
+   application, common-backend, or Temporal code is an explicit non-goal. Full
+   Compute API producer activation is separate, out of scope, and not claimed
+   by this design;
+2. activate the provider-local test caller on one versioned protocol cohort,
+   then prove a small end-to-end prediction completion;
 3. run a bounded manifest of 10,000 logical requests, retrying only durable
    pre-dispatch rejections and adjudicating ambiguous responses by exact
    receipt rather than blind resubmission;
@@ -73,6 +78,113 @@ and the hard paid GPU-unit cap. The remaining required gates are:
    counts, the exact PostgreSQL ledger separately provides protocol-covered
    dispatch and terminal states, and every value exposes source and freshness;
    scheduler-blocked capacity remains a distinct placement count.
+
+### Exact async bind convergence across route publication
+
+Status: **source implementation is under focused qualification; it is not yet
+merged or deployed.** This is a correction inside the existing PostgreSQL-first
+async dispatch path, not a second routing authority or a provider retry.
+
+Production inspection on 2026-08-24 found route heads advancing from 276
+through 281 while external load balancers followed the normal 20-second sync
+cadence. The compared generations retained the same 122 route identities and
+the same routing contract; only `capacity_hint` changed. In a paced 1,000-job
+run, 366 completed while 634 received the human-only pre-bind
+`missing, stale, or moved` 409 and created no ledger row. A request could therefore
+select immutable generation G, reach the PostgreSQL bind after head H was
+published, and receive a generic 409 even though its selected worker had not
+moved. Saturation amplified this harmless observation race. It was not GPU,
+Kueue, Spot, or provider scarcity.
+
+The steady-state bind contract is:
+
+1. Under the existing request-key advisory lock and service-owner lock, a new
+   request validates its supplied G generation/digest, service incarnation,
+   supported producer lineage, selected URL, and exact immutable payload. A
+   retained G with the wrong digest is an integrity conflict. A legitimately
+   selected G pruned by bounded history is ordinary authority movement and may
+   request fresh selection only while no request or attempt row exists.
+2. The transaction reads fresh head H and requires its unexpired lease, exact
+   current service/controller incarnation, route-source epoch, capability, and
+   current supported producer protocol. Within one validated owner lineage H
+   must be monotonic: `H.generation < G.generation` is corruption and returns
+   unavailable, never an equivalence bind or typed retry. Missing, stale,
+   corrupt, or unowned H never authorizes dispatch.
+3. When G differs from H, equivalence is deliberately per selected route, not
+   whole fleet: `{service_version, complete routing_spec, selected URL's exact
+   public wire object, selected URL's exact private identity}` must match.
+   Capacity telemetry and unrelated replica additions, removals, or identity
+   churn do not invalidate an unchanged selected worker. The full routing spec
+   remains fenced because it owns accelerator compatibility, queueing, and
+   admission policy. Different routing specs within one service version are
+   corruption and return unavailable, not retryable movement.
+4. On equivalence, H is the sole commit-time authority. Identity and wire
+   fields are derived from H; current replica readiness, active worker version,
+   record identity, cost provenance, location, and worker admission are
+   revalidated from current PostgreSQL rows. The attempt atomically stores H's
+   generation and digest before any provider HTTP send. G is never stored as
+   current merely because it remained decodable.
+
+Genuine version, route-source epoch, controller-lineage, selected identity,
+selected wire, selected-route removal, stale-head, or pruned-G movement uses
+one additive machine code,
+`route_authority_changed_before_bind.v1`. The stable API emits that code only
+from a brand-new bind for which the advisory/row-lock read proved there is no
+request row or attempt and before either insert or provider send. A retained
+wrong digest, generic 409, pre-existing or rejected attempt, ambiguous/post-send
+receipt, invalid selected URL, regressed head, or any untyped failure never
+carries replay authority. Lost bind acknowledgements still return the existing
+attempt and never enter this path.
+
+Only a load balancer that sees HTTP 409 with that exact code may recover. It
+keeps the selected URL out of the dead/quarantine set, preserves its buffered
+request preimage, and performs one coalesced route-only use of the existing
+authenticated controller-sync channel. The route-only request sends current
+gauges needed by the compatible parser but uses an empty arrival batch and null
+history fields; it never drains, restores, negotiates, or acknowledges local
+demand/history. In `DURABLE_PROJECTED` mode the stable API response is a
+PostgreSQL-only projection read. The ordinary atomic decoder/apply boundary is
+reused, and a partial, malformed, legacy, regressed, equal-generation/different-
+digest, or role-lost result cannot satisfy recovery. The LB captures the sync
+generation both at selection and when the typed 409 is observed. A waiter may
+use a higher source epoch or same-epoch/higher generation after a complete sync
+newer than selection. It may use an identical generation/digest only after a
+complete coherent apply strictly newer than conflict observation, which proves
+an expired head was renewed without trusting a pre-conflict sync. It then
+reselects under the routing lock. Concurrent conflicts join that one refresh
+rather than stampeding the API; the completed-attempt cache shares both success
+and same-fence/error failure. A later coherent periodic sync generation
+invalidates a cached failure and permits one new foreground probe.
+
+Typed no-send movement owns an independent hard limit of three foreground
+refreshes. It does not consume `load_balancer.max_retries`, which is one on the
+current service and remains the provider-attempt budget. Exhaustion or refresh
+failure returns a controlled pre-dispatch 503. Cancellation propagates, and LB
+drain or serving-role loss during refresh fails closed.
+
+Mixed versions are intentionally safe. An old API never emits the additive
+code, so a new LB treats its 409 as generic. An old LB ignores the additive
+body field and retains its generic 409 behavior. A new API plus new LB enables
+reselection only for the exact typed pre-insert proof. An old or legacy sync
+response cannot provide the complete fresh projection/ledger fence and
+therefore cannot authorize the second bind or a provider send.
+
+Focused qualification must cover capacity-only and unrelated-route G-to-H
+acceptance with H persisted; selected wire/identity change and removal; pruned
+G versus retained-G digest corruption; expired H never masking an invalid G
+digest or selected URL; monotonic H with `H < G` rejected as unavailable;
+same-version routing-spec corruption; controller incarnation and producer
+lineage; existing/rejected/ambiguous
+attempt exclusion; exact HTTP-code parsing; no provider send before bind;
+single-flight N-way refresh; expired-head equal-fence renewal; pre-conflict
+equal-fence and same-generation/different-digest rejection; exception,
+cancellation, drain/role-loss behavior; no URL penalty; request-body identity;
+and `max_retries: 1` conflict-to-refresh-to-one-send behavior. Rollout remains
+open until the homogeneous Helm release passes a bounded saturation canary,
+shows capacity-only head churn committing without 409 starvation, shows a
+forced genuine movement coalescing and reselecting without duplicate rows or
+provider sends, and completes the guarded 10,000-logical-request receipt
+reconciliation. No deployment proof is claimed by this source change.
 
 The outstanding rollout-complexity defect is narrower than fill convergence.
 Today any fresh `POD_WAITING` Kueue row from the elected version globally holds

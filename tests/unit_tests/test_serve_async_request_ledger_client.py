@@ -370,6 +370,37 @@ def test_read_only_lookup_maps_only_404_to_absent() -> None:
         asyncio.run(client.close())
 
 
+def test_only_typed_route_authority_code_allows_retry_classification() -> None:
+    detail = 'The selected route projection is missing, stale, or moved.'
+    with pytest.raises(ledger_client.AsyncLedgerRouteAuthorityConflict,
+                       match='missing, stale, or moved'):
+        ledger_client.AsyncRequestLedgerClient._receipt_or_error(
+            409, {
+                'detail': detail,
+                'error_code':
+                    constants.LB_ASYNC_LEDGER_ROUTE_AUTHORITY_CONFLICT_CODE,
+            })
+
+    # New LB against an old API: the same human message without the stable code
+    # remains an ordinary conflict and must never authorize automatic replay.
+    with pytest.raises(ledger_client.AsyncLedgerTransportError) as old_api:
+        ledger_client.AsyncRequestLedgerClient._receipt_or_error(
+            409, {'detail': detail})
+    assert not isinstance(old_api.value,
+                          ledger_client.AsyncLedgerRouteAuthorityConflict)
+
+    # A code on any status other than the exact 409 is likewise fail closed.
+    with pytest.raises(ledger_client.AsyncLedgerTransportError) as wrong_status:
+        ledger_client.AsyncRequestLedgerClient._receipt_or_error(
+            503, {
+                'detail': detail,
+                'error_code':
+                    constants.LB_ASYNC_LEDGER_ROUTE_AUTHORITY_CONFLICT_CODE,
+            })
+    assert not isinstance(wrong_status.value,
+                          ledger_client.AsyncLedgerRouteAuthorityConflict)
+
+
 def test_transport_bounds_total_work_and_reserves_slots_for_mutations(
         monkeypatch) -> None:
 

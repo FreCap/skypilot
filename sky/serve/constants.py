@@ -500,6 +500,12 @@ LB_DEMAND_REPORT_PATH = '/demand'
 # Controller-independent, PostgreSQL-backed async dispatch receipts.  This
 # terminates at the stable API server and is authenticated by the LB-sync ring.
 LB_ASYNC_REQUEST_LEDGER_PATH = '/async-request-ledger'
+# A stable API server emits this code only when a brand-new exact bind lost its
+# selected route authority before the transaction created any request/attempt
+# row.  New load balancers may reselect a fresh route for this one code; old or
+# mixed-version peers see an ordinary 409 and continue to fail closed.
+LB_ASYNC_LEDGER_ROUTE_AUTHORITY_CONFLICT_CODE = (
+    'route_authority_changed_before_bind.v1')
 LB_ASYNC_REQUEST_LEDGER_MAX_BYTES = 16 * 1024
 LB_ASYNC_REQUEST_LEDGER_TIMEOUT_SECONDS = 10
 # Bound one active load balancer below the stable API's PostgreSQL worker
@@ -656,6 +662,11 @@ LB_OCCUPANCY_PROBE_TIMEOUT_SECONDS = 2
 # proxy implementation, we do retry for failed requests.
 # TODO(tian): Expose this option to users in yaml file.
 LB_MAX_RETRY = 3
+# A typed async-ledger authority conflict proves that no provider attempt was
+# made, so it must not consume the service's provider retry budget (which is 1
+# on the production fleet). Bound fresh route reselection independently to
+# avoid a livelock under continuous projection movement.
+LB_ROUTE_AUTHORITY_MAX_REFRESHES = 3
 
 # Retry-After advertised on LB-generated 503s (no ready replicas, or
 # every ready replica already shed this request). The client retry

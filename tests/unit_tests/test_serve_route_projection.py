@@ -1,6 +1,7 @@
 """Pure contracts for the provider-free SkyServe route document."""
 # pylint: disable=protected-access
 
+import copy
 import datetime
 import hashlib
 import json
@@ -86,6 +87,55 @@ def test_occupancy_context_excludes_capacity_but_fences_replica_identity():
     }
     assert (route_projection._occupancy_context_sha256(response, successor)
             != initial)
+
+
+def test_selected_route_context_ignores_unrelated_fleet_churn():
+    selected_url = 'http://selected:8080'
+    response = {
+        'service_version': 7,
+        'routing_spec': {
+            'load_balancing_policy_name': 'least_load',
+        },
+        'replica_info': {
+            selected_url: {
+                'gpu_type': 'L4',
+                'gpu_count': '1',
+            },
+        },
+        'capacity_hint': {
+            'ready': 1,
+        },
+    }
+    identities = {
+        selected_url: {
+            'replica_record_id': str(uuid.uuid4()),
+        },
+    }
+    initial = route_projection.selected_route_context_sha256(
+        response, identities, selected_url)
+    unrelated_url = 'http://unrelated:8080'
+    expanded = copy.deepcopy(response)
+    expanded['capacity_hint']['ready'] = 2
+    expanded['replica_info'][unrelated_url] = {
+        'gpu_type': 'H200',
+        'gpu_count': '8',
+    }
+    expanded_identities = copy.deepcopy(identities)
+    expanded_identities[unrelated_url] = {
+        'replica_record_id': str(uuid.uuid4()),
+    }
+    assert route_projection.selected_route_context_sha256(
+        expanded, expanded_identities, selected_url) == initial
+
+    changed_selected = copy.deepcopy(expanded_identities)
+    changed_selected[selected_url]['replica_record_id'] = str(uuid.uuid4())
+    assert route_projection.selected_route_context_sha256(
+        expanded, changed_selected, selected_url) != initial
+
+    changed_spec = copy.deepcopy(expanded)
+    changed_spec['routing_spec']['load_balancing_policy_name'] = 'round_robin'
+    assert route_projection.selected_route_context_sha256(
+        changed_spec, expanded_identities, selected_url) != initial
 
 
 def test_builds_existing_full_response_with_private_exact_identity():
