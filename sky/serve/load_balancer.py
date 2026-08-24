@@ -298,6 +298,7 @@ class SkyServeLoadBalancer:
         controller_url: str,
         load_balancer_port: int,
         service_hash: str | None = None,
+        service_name: str | None = None,
         lb_slot: str | lb_ha.LbSlot | None = None,
     ) -> None:
         """Initialize the load balancer.
@@ -313,11 +314,15 @@ class SkyServeLoadBalancer:
             service_hash: Durable incarnation of the service this external LB
                 may sync for. Standalone test LBs may omit it when their fake
                 controller does not enforce incarnation fencing.
+            service_name: Immutable service name paired with the incarnation.
+                Production external LBs receive it explicitly; standalone
+                tests may omit it.
         """
         self._app = fastapi.FastAPI()
         self._controller_url: str = controller_url
         self._load_balancer_port: int = load_balancer_port
         self._service_hash = service_hash
+        self._service_name = service_name
         parsed_slot = (lb_slot if isinstance(lb_slot, lb_ha.LbSlot) else
                        lb_ha.parse_slot(lb_slot))
         if lb_slot is not None and parsed_slot is None:
@@ -2377,18 +2382,22 @@ class SkyServeLoadBalancer:
         body: bytes | None = None,
         max_body_bytes: int = constants.LB_REQUEST_QUEUE_MAX_BODY_BYTES,
     ) -> async_request_ledger_client.AsyncLedgerIdentity | None:
+        advertised_protocol_version = (
+            constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION
+            if self._exact_protocol_active() else None)
         return async_request_ledger_client.parse_identity(
-            request, self._async_request_ledger_protocol_version, body,
+            request, advertised_protocol_version, self._service_hash, body,
             max_body_bytes)
 
     async def _post_async_ledger(
         self,
         payload: dict[str,
                       Any]) -> async_request_ledger_client.AsyncLedgerReceipt:
-        service_hash = self._service_hash
-        if service_hash is None:
+        if not self._exact_protocol_active():
             raise async_request_ledger_client.AsyncLedgerTransportError(
-                503, 'The load balancer has no service incarnation fence.')
+                503, 'Async ledger authority is not synchronized.')
+        service_hash = self._service_hash
+        assert service_hash is not None
         client = self._get_async_ledger_client()
         return await client.post(payload, service_hash)
 
@@ -2420,10 +2429,11 @@ class SkyServeLoadBalancer:
     async def _lookup_async_ledger_receipt(
         self, request_id: str, intent_sha256: str
     ) -> async_request_ledger_client.AsyncLedgerReceipt | None:
-        service_hash = self._service_hash
-        if service_hash is None:
+        if not self._exact_protocol_active():
             raise async_request_ledger_client.AsyncLedgerTransportError(
-                503, 'The load balancer has no service incarnation fence.')
+                503, 'Async ledger authority is not synchronized.')
+        service_hash = self._service_hash
+        assert service_hash is not None
         client = self._get_async_ledger_client()
         receipt = await client.lookup(
             {
@@ -2548,28 +2558,63 @@ class SkyServeLoadBalancer:
             },
             headers=headers)
 
-    @staticmethod
-    def _async_ledger_receipt_headers(
-        receipt: async_request_ledger_client.AsyncLedgerReceipt
-    ) -> dict[str, str]:
+    def _exact_protocol_active(self) -> bool:
+        """Whether this LB can attest and execute the exact protocol."""
+        return (type(self._async_request_ledger_protocol_version) is int and
+                self._async_request_ledger_protocol_version
+                == constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION and
+                isinstance(self._service_hash, str) and
+                bool(self._service_hash) and
+                isinstance(self._service_name, str) and
+                bool(self._service_name))
+
+    def _exact_protocol_headers(self) -> dict[str, str]:
+        """Return the exact edge identity only while authority is live."""
+        if not self._exact_protocol_active():
+            return {}
+        assert self._service_hash is not None
         return {
             constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: str(
                 constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION),
+            constants.LB_ASYNC_SERVICE_INCARNATION_HEADER: self._service_hash,
+        }
+
+    def _echo_exact_response(
+            self,
+            response: fastapi.responses.Response) -> fastapi.responses.Response:
+        for name, value in self._exact_protocol_headers().items():
+            response.headers[name] = value
+        return response
+
+    def _echo_exact_http_exception(
+            self, error: fastapi.HTTPException) -> fastapi.HTTPException:
+        headers = dict(error.headers or {})
+        headers.update(self._exact_protocol_headers())
+        return fastapi.HTTPException(status_code=error.status_code,
+                                     detail=error.detail,
+                                     headers=headers or None)
+
+    def _async_ledger_receipt_headers(
+        self, receipt: async_request_ledger_client.AsyncLedgerReceipt
+    ) -> dict[str, str]:
+        headers = self._exact_protocol_headers()
+        headers.update({
             constants.LB_ASYNC_ATTEMPT_ID_HEADER: receipt.attempt_id,
             constants.LB_ASYNC_ATTEMPT_NO_HEADER: str(receipt.attempt_no),
             constants.LB_ASYNC_LEDGER_REVISION_HEADER: str(receipt.revision),
             constants.LB_ASYNC_LEDGER_STATE_HEADER: receipt.state,
-        }
+        })
+        return headers
 
-    @staticmethod
-    def _unknown_ledger_outcome_response() -> fastapi.responses.Response:
+    def _unknown_ledger_outcome_response(self) -> fastapi.responses.Response:
         return fastapi.responses.JSONResponse(
             status_code=503,
             content={
                 'detail': ('The ledger outcome could not be durably read or '
                            'recorded; retry is not authorized.'),
                 'state': 'ledger_outcome_unknown',
-            })
+            },
+            headers=self._exact_protocol_headers())
 
     def _existing_async_attempt_response(
         self, receipt: async_request_ledger_client.AsyncLedgerReceipt
@@ -2704,8 +2749,7 @@ class SkyServeLoadBalancer:
             raise fastapi.HTTPException(
                 status_code=422,
                 detail='Exact prediction completion payload is malformed.')
-        if self._async_request_ledger_protocol_version != (
-                constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION):
+        if not self._exact_protocol_active():
             raise fastapi.HTTPException(
                 status_code=503,
                 detail='Async ledger authority is not synchronized.',
@@ -2788,17 +2832,27 @@ class SkyServeLoadBalancer:
                                          outcome)
         return fastapi.Response(
             status_code=204,
-            headers={
-                constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: str(
-                    constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION),
-                constants.LB_ASYNC_ATTEMPT_ID_HEADER: receipt.attempt_id,
-                constants.LB_ASYNC_ATTEMPT_NO_HEADER: str(receipt.attempt_no),
-                constants.LB_ASYNC_LEDGER_REVISION_HEADER: str(receipt.revision
-                                                              ),
-                constants.LB_ASYNC_LEDGER_STATE_HEADER: receipt.state,
-            })
+            headers=self._async_ledger_receipt_headers(receipt))
 
     async def _prediction_completed(
+            self, request: fastapi.Request) -> fastapi.Response:
+        """Echo exact identity without changing legacy completion behavior."""
+        try:
+            exact_declared = (
+                async_request_ledger_client.has_identity_declaration(request))
+        except fastapi.HTTPException as error:
+            raise self._echo_exact_http_exception(error) from error
+        try:
+            response = await self._prediction_completed_impl(request)
+        except fastapi.HTTPException as error:
+            if exact_declared:
+                raise self._echo_exact_http_exception(error) from error
+            raise
+        if exact_declared:
+            return self._echo_exact_response(response)
+        return response
+
+    async def _prediction_completed_impl(
             self, request: fastapi.Request) -> fastapi.Response:
         """Accept an out-of-band terminal prediction observation."""
         content_type = request.headers.get('content-type', '')
@@ -2837,6 +2891,8 @@ class SkyServeLoadBalancer:
                 status_code=422,
                 detail='Invalid prediction completion payload.') from None
         if (isinstance(payload, dict) and 'ledger_protocol_version' in payload):
+            async_request_ledger_client.require_service_incarnation(
+                request, self._service_hash)
             return await self._record_exact_async_prediction_payload(payload)
         if not self._record_async_prediction_payload(payload):
             raise fastapi.HTTPException(
@@ -2846,7 +2902,25 @@ class SkyServeLoadBalancer:
 
     async def _async_request_receipt(
             self, request: fastapi.Request) -> fastapi.Response:
+        """Echo the exact edge identity on every receipt-lookup response."""
+        try:
+            response = await self._async_request_receipt_impl(request)
+        except fastapi.HTTPException as error:
+            raise self._echo_exact_http_exception(error) from error
+        return self._echo_exact_response(response)
+
+    async def _async_request_receipt_impl(
+            self, request: fastapi.Request) -> fastapi.Response:
         """Recover one exact receipt without routing or mutating its attempt."""
+        async_request_ledger_client.require_service_incarnation(
+            request, self._service_hash)
+        if not self._exact_protocol_active():
+            raise fastapi.HTTPException(
+                status_code=503,
+                detail='Async ledger authority is not synchronized.',
+                headers={
+                    'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
+                })
         content_type = request.headers.get('content-type', '')
         if content_type.partition(';')[0].strip().lower() != 'application/json':
             raise fastapi.HTTPException(status_code=415,
@@ -2900,19 +2974,7 @@ class SkyServeLoadBalancer:
             raise fastapi.HTTPException(
                 status_code=422,
                 detail='Invalid async request receipt lookup.') from None
-        if self._async_request_ledger_protocol_version != (
-                constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION):
-            raise fastapi.HTTPException(
-                status_code=503,
-                detail='Async ledger authority is not synchronized.',
-                headers={
-                    'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)
-                })
-
-        protocol_headers = {
-            constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER: str(
-                constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION)
-        }
+        protocol_headers = self._exact_protocol_headers()
         try:
             receipt = await self._lookup_async_ledger_receipt(
                 request_id, intent_sha256)
@@ -3414,7 +3476,16 @@ class SkyServeLoadBalancer:
             request_queue_dispatch_limit = 0
             request_queue_submission_limit = 0
         slot = self._lb_slot
+        exact_protocol_version = (constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION
+                                  if self._exact_protocol_active() else None)
         return fastapi.responses.JSONResponse({
+            # Exact callers freeze this value before any possible dispatch and
+            # present it on POST, receipt lookup, and completion. A same-name
+            # service recreation therefore fails closed instead of opening a
+            # fresh ledger namespace after a lost acknowledgement.
+            'service_incarnation': self._service_hash,
+            'service_name': self._service_name,
+            'async_request_ledger_protocol_version': exact_protocol_version,
             'lb_role': role.value,
             'lb_role_generation': self._lb_role_generation,
             'lb_slot': slot.value if slot is not None else None,
@@ -5150,7 +5221,17 @@ class SkyServeLoadBalancer:
             upstream_headers = list(
                 self._headers_without_request_priority(request))
             if ledger_receipt is not None:
+                assert ledger_identity is not None
+                assert self._service_hash is not None
                 upstream_headers.extend((
+                    (constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER,
+                     str(constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION)),
+                    (constants.LB_ASYNC_SERVICE_INCARNATION_HEADER,
+                     self._service_hash),
+                    (constants.LB_ASYNC_INTENT_SHA256_HEADER,
+                     ledger_identity.intent_sha256),
+                    (constants.LB_ASYNC_EXECUTION_REQUEST_ID_HEADER,
+                     ledger_identity.request_id),
                     (constants.LB_ASYNC_ATTEMPT_ID_HEADER,
                      ledger_receipt.attempt_id),
                     (constants.LB_ASYNC_ATTEMPT_NO_HEADER,
@@ -5279,6 +5360,8 @@ class SkyServeLoadBalancer:
             if upstream_raw_headers is not None:
                 response.raw_headers = list(upstream_raw_headers)
             if ledger_receipt is not None:
+                service_incarnation = self._service_hash
+                assert service_incarnation is not None
                 owned_headers = {
                     constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER.lower().encode(
                         'ascii'),
@@ -5290,6 +5373,8 @@ class SkyServeLoadBalancer:
                         'ascii'),
                     constants.LB_ASYNC_LEDGER_STATE_HEADER.lower().encode(
                         'ascii'),
+                    constants.LB_ASYNC_SERVICE_INCARNATION_HEADER.lower().
+                    encode('ascii'),
                 }
                 response.raw_headers = [(name, value)
                                         for name, value in response.raw_headers
@@ -5308,6 +5393,8 @@ class SkyServeLoadBalancer:
                         'ascii'), str(ledger_receipt.revision).encode('ascii')),
                     (constants.LB_ASYNC_LEDGER_STATE_HEADER.lower().encode(
                         'ascii'), ledger_receipt.state.encode('ascii')),
+                    (constants.LB_ASYNC_SERVICE_INCARNATION_HEADER.lower().
+                     encode('ascii'), service_incarnation.encode('ascii')),
                 ))
             # Ownership of the slot transfers to the stream/background pair
             # only once the response object exists and will be returned.
@@ -5335,13 +5422,43 @@ class SkyServeLoadBalancer:
 
     async def _proxy_with_retries(
             self, request: fastapi.Request) -> fastapi.responses.Response:
+        """Echo the exact edge identity on every qualified response."""
+        try:
+            exact_declared = (
+                async_request_ledger_client.has_identity_declaration(request))
+        except fastapi.HTTPException as error:
+            raise self._echo_exact_http_exception(error) from error
+        try:
+            response = await self._proxy_with_retries_impl(request)
+        except fastapi.HTTPException as error:
+            if exact_declared:
+                raise self._echo_exact_http_exception(error) from error
+            raise
+        if exact_declared:
+            return self._echo_exact_response(response)
+        return response
+
+    async def _proxy_with_retries_impl(
+            self, request: fastapi.Request) -> fastapi.responses.Response:
         """Try to proxy the request to the endpoint replica with retries."""
         ledger_body = None
         ledger_body_max_bytes = (
             self._request_queue_config['max_request_body_bytes']
             if self._request_queue_config is not None else
             constants.LB_REQUEST_QUEUE_MAX_BODY_BYTES)
-        if async_request_ledger_client.has_identity_declaration(request):
+        try:
+            advertised_protocol_version = (
+                constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION
+                if self._exact_protocol_active() else None)
+            ledger_declaration = (
+                async_request_ledger_client.validate_identity_declaration(
+                    request, advertised_protocol_version, self._service_hash))
+        except fastapi.HTTPException:
+            # Exact header and incarnation validation precedes body reads,
+            # memory reservations, demand accounting, and ledger access.
+            self._release_waiting_body_budget(request, drop_body=True)
+            raise
+        if ledger_declaration is not None:
             try:
                 ledger_body = await self._request_body(
                     request, max_bytes=ledger_body_max_bytes)
@@ -5825,6 +5942,7 @@ def run_load_balancer(
     controller_addr: str,
     load_balancer_port: int,
     service_hash: str | None = None,
+    service_name: str | None = None,
     lb_slot: str | None = None,
 ) -> None:
     """Run the load balancer.
@@ -5836,10 +5954,12 @@ def run_load_balancer(
         load_balancer_port: The port where the load balancer listens to.
         service_hash: Durable incarnation of the service this external LB may
             sync for.
+        service_name: Immutable name paired with the service incarnation.
     """
     load_balancer = SkyServeLoadBalancer(controller_url=controller_addr,
                                          load_balancer_port=load_balancer_port,
                                          service_hash=service_hash,
+                                         service_name=service_name,
                                          lb_slot=lb_slot)
     load_balancer.run()
 
@@ -5862,6 +5982,9 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument('--service-hash',
                         required=True,
                         help='The durable service incarnation to sync for.')
+    parser.add_argument('--service-name',
+                        required=True,
+                        help='The immutable service name to attest.')
     parser.add_argument('--lb-slot',
                         choices=[slot.value for slot in lb_ha.LbSlot],
                         help='Immutable HA traffic slot (a or b).')
@@ -5874,6 +5997,7 @@ def _resolve_launch_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         controller_addr=args.controller_addr,
         load_balancer_port=args.load_balancer_port,
         service_hash=args.service_hash,
+        service_name=args.service_name,
     )
     if args.lb_slot is not None:
         kwargs['lb_slot'] = args.lb_slot

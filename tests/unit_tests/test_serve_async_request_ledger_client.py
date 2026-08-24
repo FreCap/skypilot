@@ -17,6 +17,7 @@ from sky.serve import constants
 _REQUEST_ID = 'stable-request-1'
 _JOB_ID = 'durable-job-9'
 _INTENT = 'a' * 64
+_SERVICE_INCARNATION = '11111111-1111-4111-8111-111111111111'
 _BODY = json.dumps(
     {
         'action': 'async_predict',
@@ -45,7 +46,13 @@ def _request(*headers: tuple[bytes, bytes], method: str = 'POST'):
     return fastapi.Request(scope)
 
 
-def _identity_request(*extra_headers: tuple[bytes, bytes]):
+def _identity_request(
+    *extra_headers: tuple[bytes, bytes],
+    service_incarnation: str | None = _SERVICE_INCARNATION,
+):
+    incarnation_headers = (() if service_incarnation is None else ((
+        constants.LB_ASYNC_SERVICE_INCARNATION_HEADER.lower().encode(),
+        service_incarnation.encode()),))
     return _request(
         (constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER.lower().encode(), b'1'),
         (constants.LB_ASYNC_INTENT_SHA256_HEADER.lower().encode(),
@@ -53,7 +60,8 @@ def _identity_request(*extra_headers: tuple[bytes, bytes]):
         (constants.LB_ASYNC_EXECUTION_REQUEST_ID_HEADER.lower().encode(),
          _REQUEST_ID.encode()),
         (constants.LB_JOB_ID_HEADER.lower().encode(), _JOB_ID.encode()),
-        (b'content-type', b'application/json'), *extra_headers)
+        (b'content-type', b'application/json'), *incarnation_headers,
+        *extra_headers)
 
 
 def _receipt(*,
@@ -74,8 +82,10 @@ def _receipt(*,
 
 
 def test_parse_identity_requires_explicit_complete_protocol() -> None:
-    assert ledger_client.parse_identity(_request(), 1) is None
-    identity = ledger_client.parse_identity(_identity_request(), 1, _BODY)
+    assert ledger_client.parse_identity(_request(), 1,
+                                        _SERVICE_INCARNATION) is None
+    identity = ledger_client.parse_identity(_identity_request(), 1,
+                                            _SERVICE_INCARNATION, _BODY)
     assert identity == ledger_client.AsyncLedgerIdentity(
         _REQUEST_ID, _INTENT, _JOB_ID)
 
@@ -83,14 +93,52 @@ def test_parse_identity_requires_explicit_complete_protocol() -> None:
         ledger_client.parse_identity(
             _identity_request(
                 (constants.LB_ASYNC_ATTEMPT_ID_HEADER.lower().encode(),
-                 str(uuid.uuid4()).encode())), 1, _BODY)
+                 str(uuid.uuid4()).encode())), 1, _SERVICE_INCARNATION, _BODY)
     assert error.value.status_code == 400
 
 
 def test_parse_identity_fails_closed_without_server_advertisement() -> None:
     with pytest.raises(fastapi.HTTPException) as error:
-        ledger_client.parse_identity(_identity_request(), None, _BODY)
+        ledger_client.parse_identity(_identity_request(), None,
+                                     _SERVICE_INCARNATION, _BODY)
     assert error.value.status_code == 503
+
+
+def test_parse_identity_requires_matching_service_incarnation() -> None:
+    with pytest.raises(fastapi.HTTPException) as missing:
+        ledger_client.parse_identity(
+            _identity_request(service_incarnation=None), 1,
+            _SERVICE_INCARNATION, _BODY)
+    assert missing.value.status_code == 400
+
+    with pytest.raises(fastapi.HTTPException) as mismatch:
+        ledger_client.parse_identity(
+            _identity_request(service_incarnation='different-incarnation'), 1,
+            _SERVICE_INCARNATION, _BODY)
+    assert mismatch.value.status_code == 409
+
+    with pytest.raises(fastapi.HTTPException) as duplicate:
+        ledger_client.parse_identity(
+            _identity_request(
+                (constants.LB_ASYNC_SERVICE_INCARNATION_HEADER.lower().encode(),
+                 _SERVICE_INCARNATION.encode())), 1, _SERVICE_INCARNATION,
+            _BODY)
+    assert duplicate.value.status_code == 400
+
+
+def test_incarnation_only_declaration_never_downgrades_to_legacy() -> None:
+    request = _request(
+        (constants.LB_ASYNC_SERVICE_INCARNATION_HEADER.lower().encode(),
+         _SERVICE_INCARNATION.encode()), (b'content-type', b'application/json'))
+
+    assert ledger_client.has_identity_declaration(request)
+    with pytest.raises(fastapi.HTTPException) as error:
+        ledger_client.validate_identity_declaration(request, 1,
+                                                    _SERVICE_INCARNATION)
+    assert error.value.status_code == 400
+    with pytest.raises(fastapi.HTTPException) as parsed:
+        ledger_client.parse_identity(request, 1, _SERVICE_INCARNATION, _BODY)
+    assert parsed.value.status_code == 400
 
 
 @pytest.mark.parametrize('body', [
@@ -111,7 +159,7 @@ def test_parse_identity_rejects_non_dispatch_or_inexact_payload(
         body: bytes) -> None:
     request = _identity_request()
     with pytest.raises(fastapi.HTTPException) as error:
-        ledger_client.parse_identity(request, 1, body)
+        ledger_client.parse_identity(request, 1, _SERVICE_INCARNATION, body)
     assert error.value.status_code == 400
     assert ledger_client.get_identity(request) is None
 
@@ -131,6 +179,7 @@ def test_parse_identity_uses_configured_request_queue_body_ceiling() -> None:
 
     identity = ledger_client.parse_identity(_identity_request(),
                                             1,
+                                            _SERVICE_INCARNATION,
                                             body,
                                             max_body_bytes=len(body))
     assert identity == ledger_client.AsyncLedgerIdentity(
@@ -139,6 +188,7 @@ def test_parse_identity_uses_configured_request_queue_body_ceiling() -> None:
     with pytest.raises(fastapi.HTTPException) as error:
         ledger_client.parse_identity(_identity_request(),
                                      1,
+                                     _SERVICE_INCARNATION,
                                      body,
                                      max_body_bytes=len(body) - 1)
     assert error.value.status_code == 413
@@ -148,7 +198,8 @@ def test_parse_identity_uses_rfc8785_body_canonicalization() -> None:
     canonical = (
         '{"action":"async_predict","payload":{"label":"€","small":1e-7},'
         '"request_id":"stable-request-1"}').encode()
-    identity = ledger_client.parse_identity(_identity_request(), 1, canonical)
+    identity = ledger_client.parse_identity(_identity_request(), 1,
+                                            _SERVICE_INCARNATION, canonical)
     assert identity == ledger_client.AsyncLedgerIdentity(
         _REQUEST_ID, _INTENT, _JOB_ID)
 
@@ -165,7 +216,8 @@ def test_parse_identity_uses_rfc8785_body_canonicalization() -> None:
         separators=(',', ':')).encode()
     assert python_spelling != canonical
     with pytest.raises(fastapi.HTTPException) as error:
-        ledger_client.parse_identity(_identity_request(), 1, python_spelling)
+        ledger_client.parse_identity(_identity_request(), 1,
+                                     _SERVICE_INCARNATION, python_spelling)
     assert error.value.status_code == 400
 
 
@@ -179,11 +231,13 @@ def test_parse_identity_matches_caller_jcs_interoperability_vector() -> None:
         (constants.LB_ASYNC_EXECUTION_REQUEST_ID_HEADER.lower().encode(),
          b'req-1'), (constants.LB_ASYNC_INTENT_SHA256_HEADER.lower().encode(),
                      _INTENT.encode()),
+        (constants.LB_ASYNC_SERVICE_INCARNATION_HEADER.lower().encode(),
+         _SERVICE_INCARNATION.encode()),
         (constants.LB_JOB_ID_HEADER.lower().encode(), _JOB_ID.encode()),
         (b'content-type', b'application/json'))
 
     assert ledger_client.parse_identity(
-        request, 1,
+        request, 1, _SERVICE_INCARNATION,
         canonical) == ledger_client.AsyncLedgerIdentity('req-1', _INTENT,
                                                         _JOB_ID)
 

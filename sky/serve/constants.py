@@ -437,6 +437,7 @@ LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS = 256
 # once a caller opts in, every missing receipt fails closed.
 LB_ASYNC_LEDGER_PROTOCOL_VERSION = 1
 LB_ASYNC_LEDGER_PROTOCOL_HEADER = 'X-SkyServe-Async-Ledger-Protocol'
+LB_ASYNC_SERVICE_INCARNATION_HEADER = 'X-SkyServe-Service-Incarnation'
 LB_ASYNC_INTENT_SHA256_HEADER = 'X-SkyServe-Async-Intent-Sha256'
 # The durable platform job ID and the prediction execution ID are different
 # identities.  The former deduplicates autoscaling pressure; the latter is the

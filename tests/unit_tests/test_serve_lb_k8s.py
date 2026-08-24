@@ -112,9 +112,7 @@ def _install(monkeypatch,
              priority_class_name=None,
              lb_priority_class_name=None,
              scheduler_name=None,
-             image_pull_secrets=({
-                 'name': 'registry-credentials'
-             },),
+             image_pull_secrets=None,
              data_auth=True,
              wait_for_endpoint=False,
              api_deployment_name='skypilot-api-server',
@@ -123,6 +121,8 @@ def _install(monkeypatch,
              db_service_names=(),
              patch_api=None,
              policy_api=None):
+    if image_pull_secrets is None:
+        image_pull_secrets = ({'name': 'registry-credentials'},)
     monkeypatch.setattr(lb_k8s.serve_utils, 'is_external_load_balancer_mode',
                         lambda: external)
     monkeypatch.setattr(lb_k8s.kubernetes_utils,
@@ -521,6 +521,7 @@ def test_create_builds_proxy_deployment_and_service(monkeypatch):
     assert '10.' not in controller_addr
     assert ':200' not in controller_addr
     assert args[args.index('--service-hash') + 1] == 'incarnation'
+    assert args[args.index('--service-name') + 1] == 'svc-a'
     assert pod_spec['terminationGracePeriodSeconds'] == 225
     assert container['startupProbe']['httpGet'][
         'path'] == constants.LB_LIVENESS_ENDPOINT_PATH

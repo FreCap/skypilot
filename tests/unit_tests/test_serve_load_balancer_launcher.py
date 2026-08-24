@@ -12,7 +12,7 @@ def _resolve(argv):
 
 _BASE = [
     '--controller-addr', 'http://ctrl:8001', '--load-balancer-port', '8890',
-    '--service-hash', 'incarnation-a'
+    '--service-hash', 'incarnation-a', '--service-name', 'svc-a'
 ]
 
 
@@ -21,17 +21,17 @@ def test_base_args_threaded():
     assert kwargs['controller_addr'] == 'http://ctrl:8001'
     assert kwargs['load_balancer_port'] == 8890
     assert kwargs['service_hash'] == 'incarnation-a'
+    assert kwargs['service_name'] == 'svc-a'
     assert set(kwargs) == {
-        'controller_addr', 'load_balancer_port', 'service_hash'
+        'controller_addr', 'load_balancer_port', 'service_hash', 'service_name'
     }
 
 
-def test_service_hash_is_required():
+@pytest.mark.parametrize('missing', ['--service-hash', '--service-name'])
+def test_service_identity_is_required(missing):
     with pytest.raises(SystemExit):
-        _resolve([
-            '--controller-addr', 'http://ctrl:8001', '--load-balancer-port',
-            '8890'
-        ])
+        index = _BASE.index(missing)
+        _resolve(_BASE[:index] + _BASE[index + 2:])
 
 
 def test_routing_and_tls_args_are_not_parsed():
@@ -45,5 +45,5 @@ def test_routing_and_tls_args_are_not_parsed():
             _resolve(_BASE + [removed, 'anything'])
     _, kwargs = _resolve(_BASE)
     assert set(kwargs) == {
-        'controller_addr', 'load_balancer_port', 'service_hash'
+        'controller_addr', 'load_balancer_port', 'service_hash', 'service_name'
     }

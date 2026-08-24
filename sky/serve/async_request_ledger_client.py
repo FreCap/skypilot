@@ -100,9 +100,124 @@ def has_identity_declaration(request: fastapi.Request) -> bool:
     return any(
         _raw_header_values(request, header_name) for header_name in (
             constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER,
+            constants.LB_ASYNC_SERVICE_INCARNATION_HEADER,
             constants.LB_ASYNC_INTENT_SHA256_HEADER,
             constants.LB_ASYNC_EXECUTION_REQUEST_ID_HEADER,
         ))
+
+
+def require_service_incarnation(request: fastapi.Request,
+                                current_service_hash: str | None) -> str:
+    """Fence an exact operation to the caller-prepared service incarnation."""
+    values = _raw_header_values(request,
+                                constants.LB_ASYNC_SERVICE_INCARNATION_HEADER)
+    if len(values) != 1 or not values[0] or len(values[0]) > 128:
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail=('Exact async ledger operations require exactly one '
+                    'bounded service-incarnation header.'))
+    expected = values[0]
+    if not current_service_hash:
+        raise fastapi.HTTPException(
+            status_code=503,
+            detail='The load balancer has no service incarnation fence.',
+            headers={'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)})
+    if expected != current_service_hash:
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail=('The prepared request belongs to a different service '
+                    'incarnation; dispatch is forbidden.'))
+    return expected
+
+
+def validate_identity_declaration(
+    request: fastapi.Request,
+    advertised_protocol_version: int | None,
+    current_service_hash: str | None,
+) -> AsyncLedgerIdentity | None:
+    """Validate exact declaration headers before reading/accounting a body."""
+    state = vars(request)
+    cached = state.get(IDENTITY_REQUEST_ATTR)
+    if isinstance(cached, AsyncLedgerIdentity):
+        return cached
+    protocol_values = _raw_header_values(
+        request, constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER)
+    incarnation_values = _raw_header_values(
+        request, constants.LB_ASYNC_SERVICE_INCARNATION_HEADER)
+    intent_values = _raw_header_values(request,
+                                       constants.LB_ASYNC_INTENT_SHA256_HEADER)
+    execution_id_values = _raw_header_values(
+        request, constants.LB_ASYNC_EXECUTION_REQUEST_ID_HEADER)
+    forbidden = sum((
+        _raw_header_values(request, constants.LB_ASYNC_ATTEMPT_ID_HEADER),
+        _raw_header_values(request, constants.LB_ASYNC_ATTEMPT_NO_HEADER),
+        _raw_header_values(request, constants.LB_ASYNC_LEDGER_REVISION_HEADER),
+        _raw_header_values(request, constants.LB_ASYNC_LEDGER_STATE_HEADER),
+    ), [])
+    if forbidden:
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail='Async ledger receipt headers are server-owned.')
+    if not any((protocol_values, incarnation_values, intent_values,
+                execution_id_values)):
+        return None
+    require_service_incarnation(request, current_service_hash)
+    if (len(protocol_values) != 1 or len(intent_values) != 1 or
+            len(execution_id_values) != 1):
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail='Async ledger protocol, intent, and execution request ID '
+            'headers must each appear exactly once.')
+    if protocol_values[0] != str(constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION):
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail='Async ledger protocol version is unsupported.')
+    if advertised_protocol_version != constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION:
+        raise fastapi.HTTPException(
+            status_code=503,
+            detail='Async ledger authority is not synchronized.',
+            headers={'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)})
+    if request.method.upper() != 'POST':
+        raise fastapi.HTTPException(
+            status_code=405,
+            detail='Ledger-qualified asynchronous submissions use POST.')
+    intent = intent_values[0]
+    if _SHA256_RE.fullmatch(intent) is None:
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail='Async intent must be a lowercase SHA-256 digest.')
+    stable_job_ids = _raw_header_values(request, constants.LB_JOB_ID_HEADER)
+    if (len(stable_job_ids) != 1 or not stable_job_ids[0] or
+            len(stable_job_ids[0])
+            > constants.LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS):
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail='Ledger-qualified requests require exactly one bounded '
+            'stable job ID.')
+    execution_request_id = execution_id_values[0]
+    if (not execution_request_id or len(execution_request_id)
+            > constants.LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS):
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail='Execution request ID header must be non-empty and bounded.')
+    content_types = _raw_header_values(request, 'Content-Type')
+    if (len(content_types) != 1 or
+            content_types[0].partition(';')[0].strip().lower()
+            != 'application/json'):
+        raise fastapi.HTTPException(
+            status_code=415,
+            detail='Ledger-qualified requests require application/json.')
+    content_encodings = _raw_header_values(request, 'Content-Encoding')
+    if (len(content_encodings) > 1 or
+        (content_encodings and
+         content_encodings[0].strip().lower() not in ('', 'identity'))):
+        raise fastapi.HTTPException(
+            status_code=415,
+            detail='Ledger-qualified request bodies must use identity '
+            'encoding.')
+    return AsyncLedgerIdentity(request_id=execution_request_id,
+                               intent_sha256=intent,
+                               stable_job_id=stable_job_ids[0])
 
 
 def _canonical_execution_request_id(body: bytes, max_body_bytes: int) -> str:
@@ -164,6 +279,7 @@ def _canonical_execution_request_id(body: bytes, max_body_bytes: int) -> str:
 def parse_identity(
     request: fastapi.Request,
     advertised_protocol_version: int | None,
+    current_service_hash: str | None,
     body: bytes | None = None,
     max_body_bytes: int = constants.LB_REQUEST_QUEUE_MAX_BODY_BYTES
 ) -> AsyncLedgerIdentity | None:
@@ -172,87 +288,21 @@ def parse_identity(
     cached = state.get(IDENTITY_REQUEST_ATTR)
     if isinstance(cached, AsyncLedgerIdentity):
         return cached
-    protocol_values = _raw_header_values(
-        request, constants.LB_ASYNC_LEDGER_PROTOCOL_HEADER)
-    intent_values = _raw_header_values(request,
-                                       constants.LB_ASYNC_INTENT_SHA256_HEADER)
-    execution_id_values = _raw_header_values(
-        request, constants.LB_ASYNC_EXECUTION_REQUEST_ID_HEADER)
-    forbidden = sum((
-        _raw_header_values(request, constants.LB_ASYNC_ATTEMPT_ID_HEADER),
-        _raw_header_values(request, constants.LB_ASYNC_ATTEMPT_NO_HEADER),
-        _raw_header_values(request, constants.LB_ASYNC_LEDGER_REVISION_HEADER),
-        _raw_header_values(request, constants.LB_ASYNC_LEDGER_STATE_HEADER),
-    ), [])
-    if forbidden:
-        raise fastapi.HTTPException(
-            status_code=400,
-            detail='Async ledger receipt headers are server-owned.')
-    if not protocol_values and not intent_values and not execution_id_values:
+    identity = validate_identity_declaration(request,
+                                             advertised_protocol_version,
+                                             current_service_hash)
+    if identity is None:
         return None
-    if (len(protocol_values) != 1 or len(intent_values) != 1 or
-            len(execution_id_values) != 1):
-        raise fastapi.HTTPException(
-            status_code=400,
-            detail='Async ledger protocol, intent, and execution request ID '
-            'headers must each appear exactly once.')
-    if protocol_values[0] != str(constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION):
-        raise fastapi.HTTPException(
-            status_code=400,
-            detail='Async ledger protocol version is unsupported.')
-    if advertised_protocol_version != constants.LB_ASYNC_LEDGER_PROTOCOL_VERSION:
-        raise fastapi.HTTPException(
-            status_code=503,
-            detail='Async ledger authority is not synchronized.',
-            headers={'Retry-After': str(constants.LB_503_RETRY_AFTER_SECONDS)})
-    if request.method.upper() != 'POST':
-        raise fastapi.HTTPException(
-            status_code=405,
-            detail='Ledger-qualified asynchronous submissions use POST.')
-    intent = intent_values[0]
-    if _SHA256_RE.fullmatch(intent) is None:
-        raise fastapi.HTTPException(
-            status_code=400,
-            detail='Async intent must be a lowercase SHA-256 digest.')
-    stable_job_ids = _raw_header_values(request, constants.LB_JOB_ID_HEADER)
-    if (len(stable_job_ids) != 1 or not stable_job_ids[0] or
-            len(stable_job_ids[0])
-            > constants.LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS):
-        raise fastapi.HTTPException(
-            status_code=400,
-            detail='Ledger-qualified requests require exactly one bounded '
-            'stable job ID.')
-    content_types = _raw_header_values(request, 'Content-Type')
-    if (len(content_types) != 1 or
-            content_types[0].partition(';')[0].strip().lower()
-            != 'application/json'):
-        raise fastapi.HTTPException(
-            status_code=415,
-            detail='Ledger-qualified requests require application/json.')
-    content_encodings = _raw_header_values(request, 'Content-Encoding')
-    if (len(content_encodings) > 1 or
-        (content_encodings and
-         content_encodings[0].strip().lower() not in ('', 'identity'))):
-        raise fastapi.HTTPException(
-            status_code=415,
-            detail='Ledger-qualified request bodies must use identity '
-            'encoding.')
     if body is None:
         raise fastapi.HTTPException(
             status_code=400,
             detail='Ledger-qualified request body was not validated.')
     payload_request_id = _canonical_execution_request_id(body, max_body_bytes)
-    execution_request_id = execution_id_values[0]
-    if (not execution_request_id or len(execution_request_id)
-            > constants.LB_ASYNC_PREDICTION_REQUEST_ID_MAX_CHARS or
-            execution_request_id != payload_request_id):
+    if identity.request_id != payload_request_id:
         raise fastapi.HTTPException(
             status_code=400,
             detail='Execution request ID header must exactly match the '
             'canonical payload request_id.')
-    identity = AsyncLedgerIdentity(request_id=execution_request_id,
-                                   intent_sha256=intent,
-                                   stable_job_id=stable_job_ids[0])
     state[IDENTITY_REQUEST_ATTR] = identity
     return identity
 
