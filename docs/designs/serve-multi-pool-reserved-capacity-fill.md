@@ -1,6 +1,6 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-24 20:56 UTC
+Last updated: 2026-08-24 21:13 UTC
 
 Status: **the PostgreSQL-authoritative single path, protocol-v10 shared cache,
 bounded controller work, clean service lifecycle, unchanged Kueue contract,
@@ -35,14 +35,14 @@ available GPUs: PHX H200 was 512 total / 2 non-preemptible-used /
 510 preemptible / 0 available; East A100 was 64 / 1 / 63 / 0; and East
 A100-80GB was 264 / 75 / 189 / 0. The service exactly owns the East preemptible
 counts. The PHX preemptible total includes low-priority workloads across the
-context, not only this service. `boltz-l4-fleet` currently owns 62
-Kueue-admitted H200 replicas; the other 448 preemptible GPUs are occupied by
-other workloads and are neither free nor attributed to this service. The public
+context, not only this service. At that 20:41 snapshot, `boltz-l4-fleet` owned
+62 Kueue-admitted H200 replicas; the other 448 preemptible GPUs were occupied by
+other workloads and were neither free nor attributed to this service. The public
 response's `partial: true` was solely its independent managed-jobs status being
 temporarily unavailable; both GPU cluster observations were `ok` with complete
-integer accounting. This is the dashboard-level proof that there is no
-compatible free GPU stranded outside the service's authoritative pool
-observations.
+integer accounting. This independently proves that no physical GPU was idle at
+that snapshot. The exact authenticated pool observations separately define
+which PHX capacity Kueue admitted and SkyPilot could spend.
 
 The corrected defect was controller-local queue aging, not Kueue refusal, GPU
 scarcity, or Spot scarcity. A 19:13 UTC H200 allocation created 14 intents with
@@ -135,6 +135,22 @@ control-plane Pods and both service load balancers remained Ready on the
 `1.1.1477` digest with zero restarts. The independent public capacity snapshot
 again reported both GPU clusters `ok` and zero available H200, A100, or
 A100-80GB GPUs. This closes the reserved-fill operational horizon.
+
+The dynamic denominator then increased without operator action. At 21:04:12
+UTC, the observer published 16 additional PHX H200 slots as spendable under
+unchanged Kueue policy. SkyPilot created all 16 intents in one allocation and
+committed every one by 21:04:39, a 27.65-second commit span with no terminal or
+expired intent. The durable graph was exactly 16 intents, records,
+associations, API requests, and replicas; every request `SUCCEEDED`. Kueue
+subsequently admitted all 16 Workloads by 21:05:23. By the 21:11:40 read, all
+16 workers were Ready and the service had automatically advanced to 330/330 Ready,
+zero-cost, non-Spot replicas: 63 East A100, 189 East A100-80GB, and 78 PHX H200.
+Holdings equaled effective caps in every pool, every exact-card observation had
+returned to zero observed/spendable free capacity, request telemetry remained
+fresh and complete, and paid claims/waiters remained zero. This post-horizon
+release is direct production evidence that the controller continuously follows
+new scheduler-admitted capacity rather than converging only to a frozen test
+denominator.
 
 The change does not lengthen authority, weaken atomic fencing, add a schema or
 migration, add a compatibility path or feature flag, or alter Kueue, Terraform,
@@ -321,7 +337,7 @@ followed by complete drain, provider absence, and debit release. The approved
 exercise is
 100 L4-only requests at submission concurrency 16, a cap of ten logical L4 GPU
 units, 1/2/4/8-GPU Spot shapes, at most ten physical machines, the configured
-14 AWS and 18 GCP eligible regions, and at most one hour from first paid claim
+18 AWS and 18 GCP eligible regions, and at most one hour from first paid claim
 to provider-proven absence. Its current compute envelope is approximately
 `$1.606/hour` at the observed floor and a conservative `$21.2462/hour` ceiling,
 excluding disk and transfer. Ten is a qualification ceiling, not an implicit
@@ -880,7 +896,7 @@ boundaries.
 | Slice | Source | Deployed | Activated | Production proof |
 |---|---|---|---|---|
 | Bounded v5 teardown and clean recreation (#1676/#1677) | Complete | Complete in `1.1.1447` | Complete at gate 33 | Complete: lifecycle 91 purged normally; lifecycle 93 created |
-| Scheduler-authorized reserved fill | Complete | Complete through `1.1.1477` / Helm 599 | Complete at gate 39 | Complete against the dynamic denominator. The current proof is 314/314 Ready: East 63 A100 plus 189 A100-80GB, and PHX 62 Kueue-admitted H200. All exact-card observations report zero spendable free capacity, every replica is reserved/non-Spot, and Simone's Kueue policy is unchanged. |
+| Scheduler-authorized reserved fill | Complete | Complete through `1.1.1477` / Helm 599 | Complete at gate 39 | Complete against the dynamic denominator. The exact 32-GPU wave and +30 horizon held 314/314 Ready; a later unchanged-policy release automatically advanced the service to 330/330: East 63 A100 plus 189 A100-80GB, and PHX 78 Kueue-admitted H200. All exact-card observations report zero spendable free capacity, every replica is reserved/non-Spot, and Simone's Kueue policy is unchanged. |
 | Controller/LB current-request projection | Complete | Complete | Complete | The two-slot LB remained healthy. After the 10,000-request campaign, the API projection was fresh/complete with two reporters and zero current QPS, queued, in-flight, and rejected work. The PostgreSQL exact summary matched the provider-local terminal census and remained explicitly partial by producer coverage. This receipt did not capture a nonzero API/UI sample during that campaign. |
 | PR #1678 duplicate-up and observer lock-order correction | Complete at `38ec24342` | Complete in Helm 572 | Complete at gate 34 | Duplicate-up, takeover, 180-second stale horizon, and +30 control-plane/HA/error checks passed; the coincident eight-card v6 readiness wave was superseded by supported provider teardown |
 | Kueue non-mutation | No source change | No rendered chart change | Not applicable | Complete: both normalized PRE and POST hashes are equal |
@@ -2699,7 +2715,9 @@ production-proven remain distinct states. Historical revision 594 / release
 subsequently merged protocol-v10 cache scope and bounded controller memory; the
 homogeneous `1.1.1477` / Helm-599 cohort and lifecycle-98 service renewed the
 receipt at 314/314 Ready, including an exact 32-GPU replacement wave and its
-+10/+30 horizons, with zero paid claims or Spot replicas. Provider-local exact
++10/+30 horizons, then automatically advanced to 330/330 after the observer
+published 16 more H200 slots and unchanged Kueue admitted their Workloads, with
+zero paid claims or Spot replicas. Provider-local exact
 async telemetry, actual-device completion evidence, and the guarded historical
 10,000-request campaign are complete. The only open product-behavior exercise
 is a genuinely uncovered bounded paid-Spot residual followed by complete
@@ -6922,14 +6940,14 @@ either case.
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed. Lifecycle 84/version 1 and lifecycle 85/version 1 both promoted `DURABLE_INTENT` epoch 1 before normal purge. Phase 2g subsequently closed the full busy-lane/no-row and throughput production evidence. |
 | 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed. Lifecycle 93/version 1 historically exercised the single controller fence, routing linearization lock, and PostgreSQL transaction owning the `DURABLE_FEED`/`DURABLE_INTENT` pair before supported teardown. Draft cleanup PR #1556 removes deprecated separate surfaces and unsupported demand demotion only after the documented horizon. |
 | 2f | Promoted capacity-authority controller takeover | PR #1562 is merged and deployed. Revision 502 proved one consolidated-HA recovery with the bound/demand/fill pair preserved and fresh route evidence restored from PostgreSQL; revision 505 then proved takeover of the deployment-owned renewal singleton. Helm revision 572 then forced a true PR-#1678 cross-Pod lifecycle-93 service-controller takeover from `10.30.1.190` / owner epoch 3 to `10.30.0.98` / owner epoch 4 with a new incarnation, while lifecycle, version, service hash, Ready state, endpoint, and replicas remained stable. The complete stale interval and +30 control-plane/HA/error checks also passed. No schema, provider, platform, or storage change was required. |
-| 2g | Production full reserved backfill | **Complete for the current dynamic scheduler-authorized denominator.** Historical receipts reached 280/280, 290/290, and 383 Ready while exposing the v9 shared-cache overcount and old controller OOMs. PR #1703 removed those defects. Lifecycle 98 on the homogeneous `1.1.1477` / Helm-599 cohort reached and retained 314/314 Ready: East 63 A100 plus 189 A100-80GB and PHX 62 Kueue-admitted H200. Every exact-card round and the public Infra snapshot report zero available capacity, every replica is reserved/non-Spot, and paid claims/waiters are zero. The exact 32-GPU replacement wave and +10/+30 horizons renew this phase under protocol v10. |
+| 2g | Production full reserved backfill | **Complete for the current dynamic scheduler-authorized denominator.** Historical receipts reached 280/280, 290/290, and 383 Ready while exposing the v9 shared-cache overcount and old controller OOMs. PR #1703 removed those defects. Lifecycle 98 on the homogeneous `1.1.1477` / Helm-599 cohort reached and retained 314/314 Ready through the exact 32-GPU replacement wave and +10/+30 horizons. When the observer later published 16 more H200 slots and unchanged Kueue admitted their Workloads, it automatically advanced to 330/330 Ready: East 63 A100 plus 189 A100-80GB and PHX 78 H200. Every exact-card round and the public Infra snapshot report zero available capacity, every replica is reserved/non-Spot, and paid claims/waiters are zero. |
 | 2h | Atomic reserved-fill replica/request admission | Merged in PR #1626 and deployed on Helm revision 473 / release `1.1.1401`. One atomic-admission module owns the root PostgreSQL transaction and savepoint; the manager only prepares immutable server-local input before it and starts the returned request reducer after commit. Serve055 adds the owner audit tuple, user FK, and retained-row one-shot transition. The deployed pending-first/global-pending/cleanup-unproven accounting correctly avoided duplicate replacement capacity. The remaining postcommit mutable-authority rejection is owned by phase 2i, not by another admission path or infrastructure change. |
 | 2i | Serve056 committed reserved-fill provider handoff and cohort rotation | PR #1629 merged at `1642ca2e3` as the scalar-schema precursor; PR #1632 restored adoption and corrective PR #1630 supplied the complete committed-handoff contract. That source is deployed through release `1.1.1410` and inherited by revision 489. Draft cleanup PR #1633 remains gated on the final zero-legacy census and production horizon. No EFS, KubeRay, Terraform/Terragrunt, platform runtime pin, or alternate provider path is added. |
 | 2j | Exact protocol-v2 execution capsule and no-failover retry boundary | PR #1667 is merged and deployed in release `1.1.1437`. Under the explicitly absent configured admin-policy mode, the server controller freezes one already-launchable Kubernetes resource in the hashed request, the executor reconstructs `best_resources` from it before cluster-existence/initial optimization, and the provisioner exits an exact-candidate failure before retry optimization or failover. Ordinary launches are unchanged. Lifecycle 93 historically proved clean recreation and full scheduler-authorized occupancy before supported teardown. |
 | 2k | Per-pool bounded conveyor and allocation-tail paid suppression | PR #1686 is merged and deployed in `1.1.1456`, inherited by `1.1.1457`. Independent 32-position pool windows refill without one Kueue-waiting lane blocking another, and the exact reserved allocation tail is debited before paid residual. Current production has zero paid claims and zero Spot replicas. |
 | 2l | Live exact pre-effect terminal recovery | PR #1687 is merged and deployed in `1.1.1457` / Helm 586. Live reconciliation atomically retired provider-free replica 465, its admission, and its committed intent while retaining association/request history; replacement 572 reached `POD_WAITING`. No manual SQL, provider call, service recreation, Kueue change, or lifecycle/version rotation occurred. |
 | 2m | Exact route-publication convergence and request/load qualification | PR #1700 merged at `9552669c0bbcbea9d2ee331569dc69fa4c7f0196` and is deployed in `1.1.1470` / Helm 594. Capacity-only route-head churn no longer rejects an unchanged selected worker. Staged 1, 100, 1,000, and 10,000-request production phases completed with exact terminal reconciliation, per-card work, logical-device saturation, no route starvation, and no paid launch under the zero cap. |
-| 2n | Protocol-v10 shared-cache admission and bounded controller memory | **Merged, deployed, and production-proven.** PR #1703 merged at `fecb2b0f3` and is inherited by `1.1.1477` / Helm 599. V10 adds the digest-bound `replica_additive`/`node_shared_immutable` scope while preserving v8/v9 decode compatibility. Metadata-only single-flight presence reads, handle reuse, and one bounded reusable readiness executor replaced per-replica full-Pod materialization and per-tick pool churn. Lifecycle 98 renewed full occupancy and survived the exact 32-GPU wave plus stale/+10/+30 horizons. The active controller cgroup peaked at 5,101,756,416 bytes under its 8-GiB limit with zero `max`, OOM, or OOM-kill events; both controller Pods had zero restarts. Armando's separate test service was neither torn down nor recreated; its load balancers inherited the homogeneous Helm image. |
+| 2n | Protocol-v10 shared-cache admission and bounded controller memory | **Merged, deployed, and production-proven.** PR #1703 merged at `fecb2b0f3` and is inherited by `1.1.1477` / Helm 599. V10 adds the digest-bound `replica_additive`/`node_shared_immutable` scope while preserving v8/v9 decode compatibility. Metadata-only single-flight presence reads, handle reuse, and one bounded reusable readiness executor replaced per-replica full-Pod materialization and per-tick pool churn. Lifecycle 98 renewed full occupancy and survived the exact 32-GPU wave plus stale/+10/+30 horizons. The active controller cgroup peaked at 5,101,756,416 bytes under its 8-GiB limit with zero `max`, OOM, or OOM-kill events; the production service child had 282 threads in the post-horizon observation under the structurally single max-256 readiness executor, and both controller Pods had zero restarts. Armando's separate test service had no lifecycle/version/spec mutation; its load balancers inherited the homogeneous Helm image. |
 | 3a | Stacked Serve055 owner-transition cleanup after the production horizon | The required `fix/serve-atomic-fill-admission-cleanup` branch adds PostgreSQL-only Serve058 `NOT NULL` owner columns and removes only the application one-shot `NULL` attestation branch, the schema-derived temporary global user-deletion guard, and transition-only observability/tests. The dialect-neutral SQLAlchemy model remains nullable for the separately supported controller-local SQLite/Serve037 path. Serve058 verifies or reinstalls the permanent PostgreSQL owner FK and owner-immutability trigger in the same migration. Draft PR #1660 is stacked on and cross-linked from #1659; it remains blocked on a complete capable cohort, zero `NULL` tuples, no old writers, backups, and the complete stale/HA production horizon. |
 | 3b | Stacked Serve056 scalar-`NULL` cleanup bridge removal | Draft PR #1633 is stacked on and cross-linked from #1630, replacing automatically closed draft #1631. It removes only the cleanup-only JSON resolver and its transition tests after zero scalar-`NULL` protocol-v2 replicas, zero unsettled scalar-`NULL` provider-effect associations, and zero scalar-`NULL` cleanup-unproven markers persist through the complete stale/quiescence/provider-reprobe horizon. It cannot merge earlier. Closed PRs #1506/#1510 are not revived. |
 
@@ -8490,7 +8508,9 @@ authorizes a Kueue or non-SkyPilot infrastructure change.
   do not substitute a larger memory limit. Lifecycle 98 retained full occupancy
   through the exact 32-GPU refill and +10/+30 horizons. The active controller
   cgroup peaked at 5,101,756,416 bytes below its unchanged 8-GiB limit with zero
-  memory-max/OOM events; both controller Pods have zero restarts.
+  memory-max/OOM events. The production service child had 282 threads in the
+  post-horizon observation under the structurally single max-256 readiness
+  executor; both controller Pods have zero restarts.
 - [x] Preserve Armando's independently owned test service and use the already
   cleanly recreated production lifecycle 98/version 1 directly from tested
   local provider commit `a69fb3409ede26f98c02f7730f764021c1ef0146` for the
@@ -8857,7 +8877,7 @@ authorizes a Kueue or non-SkyPilot infrastructure change.
   `X-SkyServe-Compatible-Accelerators: L4` and unique presigned result/marker
   targets in the production encryption envelope,
   concurrency 16, at most ten logical L4 units, Spot-only 1/2/4/8-GPU widths,
-  at most ten physical machines, the configured 14 AWS and 18 GCP eligible
+  at most ten physical machines, the configured 18 AWS and 18 GCP eligible
   regions, and at most one hour from first paid claim to provider-proven
   absence. The compute envelope is approximately `$1.606/hour` at the observed
   floor and a conservative `$21.2462/hour` ceiling, excluding disk and
