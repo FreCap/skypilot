@@ -7,6 +7,7 @@ import glob
 import fastapi
 
 from sky import sky_logging
+from sky.serve import async_request_ledger
 from sky.serve import demand_state
 from sky.serve import kubernetes_identity
 from sky.serve import serve_dashboard
@@ -314,6 +315,8 @@ async def current_demand(
             'service_name': service_name,
             'service_hash': expected_service_hash,
             **summary,
+            'async_request_summary':
+                async_request_ledger.unavailable_summary('non_consolidated'),
             **zero_cost_actuation.unavailable_status_summary('non_consolidated'),
         }
     if service is None:
@@ -322,13 +325,19 @@ async def current_demand(
         raise fastapi.HTTPException(
             status_code=409,
             detail='Service incarnation changed. Refresh and retry.')
-    summary, actuation = await asyncio.gather(
+    summary, async_summary, actuation = await asyncio.gather(
         asyncio.to_thread(demand_state.get_request_summary, service_name,
+                          expected_service_hash),
+        asyncio.to_thread(async_request_ledger.get_summary, service_name,
                           expected_service_hash),
         asyncio.to_thread(zero_cost_actuation.get_status_summary, service_name,
                           expected_service_hash))
     if summary.get(
             'request_telemetry_reason') == 'service_incarnation_mismatch':
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Service incarnation changed. Refresh and retry.')
+    if async_summary.get('reason') == 'service_incarnation_mismatch':
         raise fastapi.HTTPException(
             status_code=409,
             detail='Service incarnation changed. Refresh and retry.')
@@ -343,6 +352,7 @@ async def current_demand(
         'service_name': service_name,
         'service_hash': expected_service_hash,
         **summary,
+        'async_request_summary': async_summary,
         **actuation,
     }
 

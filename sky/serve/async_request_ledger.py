@@ -986,8 +986,7 @@ class AsyncRequestLedgerRepository:
                 current_owner = connection.execute(
                     sqlalchemy.select(_SERVICES.c.hash, _SERVICES.c.pool).where(
                         _SERVICES.c.name == service_name,
-                        _SERVICES.c.pool == 0).with_for_update(
-                            read=True)).mappings().one_or_none()
+                        _SERVICES.c.pool == 0)).mappings().one_or_none()
                 if (current_owner is None or
                         current_owner['hash'] != service_hash):
                     raise AsyncRequestLedgerConflict(
@@ -1032,6 +1031,7 @@ class AsyncRequestLedgerRepository:
         })
         return {
             'available': True,
+            'source': 'postgresql_async_request_ledger',
             # Protocol 1 is caller-opt-in. These counts are exact for opted-in
             # work, but cannot replace legacy telemetry until every producer
             # is separately proven to use the protocol.
@@ -1046,12 +1046,40 @@ class AsyncRequestLedgerRepository:
         }
 
 
+def get_summary(
+        service_name: str,
+        service_hash: str,
+        engine: sqlalchemy.engine.Engine | None = None) -> dict[str, Any]:
+    """Read one fail-closed, incarnation-scoped operational summary.
+
+    This is the canonical adapter for API projections.  It keeps schema and
+    database failures in the observability-only response contract while the
+    repository retains strict exceptions for correctness-sensitive callers.
+    """
+    if engine is None:
+        try:
+            engine = _postgres_engine()
+        except (AsyncRequestLedgerUnavailable, RuntimeError,
+                sqlalchemy.exc.SQLAlchemyError, ValueError):
+            return unavailable_summary('postgresql_required')
+    if not schema_available(engine):
+        return unavailable_summary('schema_unavailable')
+    try:
+        return AsyncRequestLedgerRepository(engine).summary(
+            service_name, service_hash)
+    except AsyncRequestLedgerConflict:
+        return unavailable_summary('service_incarnation_mismatch')
+    except AsyncRequestLedgerUnavailable:
+        return unavailable_summary('database_read_failed')
+
+
 def unavailable_summary(reason: str,
                         *,
                         coverage: str = 'none') -> dict[str, Any]:
     """Return a stable fail-closed shape for status projection."""
     return {
         'available': False,
+        'source': 'postgresql_async_request_ledger',
         'reason': reason,
         'coverage': coverage,
         'protocol_version': PROTOCOL_VERSION,

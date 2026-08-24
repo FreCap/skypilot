@@ -792,7 +792,7 @@ describe('getServiceDemand', () => {
     apiClient.get.mockResolvedValue({
       ok: true,
       status: 200,
-      headers: { get: () => '82' },
+      headers: { get: () => '92' },
       json: async () => ({
         service_name: 'boltz/l4',
         service_hash: 'hash/a',
@@ -808,6 +808,32 @@ describe('getServiceDemand', () => {
         request_queue_depth: 1,
         rejected_requests: 0,
         request_stats_age_seconds: 1.5,
+        request_telemetry_source: 'postgresql_lb_demand_reports',
+        async_request_summary: {
+          available: true,
+          source: 'postgresql_async_request_ledger',
+          coverage: 'partial',
+          protocol_version: 1,
+          observed_at: 100,
+          service_hash: 'hash/a',
+          state_counts: {
+            REJECTED_PRE_DISPATCH: 0,
+            DISPATCH_MAY_HAVE_OCCURRED: 1,
+            ACCEPTED: 2,
+            AMBIGUOUS: 0,
+            SUCCEEDED: 3,
+            FAILED: 1,
+            CANCELLED: 0,
+            EXPIRED: 0,
+          },
+          operational_terminal_receipt_total: 4,
+          operational_terminal_receipts_by_status: {
+            SUCCEEDED: 3,
+            FAILED: 1,
+            CANCELLED: 0,
+            EXPIRED: 0,
+          },
+        },
         zero_cost_actuation_status: 'available',
         zero_cost_actuation_reason: 'complete',
         zero_cost_actuation_mode: 'DURABLE_INTENT',
@@ -835,10 +861,17 @@ describe('getServiceDemand', () => {
       serviceName: 'boltz/l4',
       serviceHash: 'hash/a',
       requestTelemetryState: 'fresh',
+      requestTelemetrySource: 'postgresql_lb_demand_reports',
       requestTelemetryGeneration: 8,
       recentRequestCount: 12,
       requestRate: 0.2,
       inFlightRequests: 3,
+      asyncRequestSummary: {
+        available: true,
+        source: 'postgresql_async_request_ledger',
+        serviceHash: 'hash/a',
+        operationalTerminalReceiptTotal: 4,
+      },
       zeroCostActuationMode: 'DURABLE_INTENT',
       zeroCostActuationEpoch: 1,
       pendingZeroCostActuationCount: 6,
@@ -885,6 +918,76 @@ describe('getServiceDemand', () => {
       status: 200,
       headers: { get: () => '82' },
       json: async () => null,
+    });
+
+    await expect(
+      getServiceDemand({ serviceName: 'svc', serviceHash: 'hash-a' })
+    ).rejects.toThrow('Service demand response was malformed');
+  });
+
+  it('requires the exact summary only from servers advertising it', async () => {
+    const payload = {
+      service_name: 'svc',
+      service_hash: 'hash-a',
+      request_telemetry_state: 'fresh',
+    };
+    apiClient.get.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => '91' },
+      json: async () => payload,
+    });
+    await expect(
+      getServiceDemand({ serviceName: 'svc', serviceHash: 'hash-a' })
+    ).resolves.toMatchObject({ asyncRequestSummary: null });
+
+    apiClient.get.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => '92' },
+      json: async () => payload,
+    });
+    await expect(
+      getServiceDemand({ serviceName: 'svc', serviceHash: 'hash-a' })
+    ).rejects.toThrow('Service demand response was malformed');
+  });
+
+  it('rejects an exact summary from a different incarnation', async () => {
+    apiClient.get.mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => '92' },
+      json: async () => ({
+        service_name: 'svc',
+        service_hash: 'hash-a',
+        request_telemetry_state: 'fresh',
+        request_telemetry_source: 'postgresql_lb_demand_reports',
+        async_request_summary: {
+          available: true,
+          source: 'postgresql_async_request_ledger',
+          coverage: 'partial',
+          protocol_version: 1,
+          observed_at: 100,
+          service_hash: 'hash-b',
+          state_counts: {
+            REJECTED_PRE_DISPATCH: 0,
+            DISPATCH_MAY_HAVE_OCCURRED: 0,
+            ACCEPTED: 0,
+            AMBIGUOUS: 0,
+            SUCCEEDED: 0,
+            FAILED: 0,
+            CANCELLED: 0,
+            EXPIRED: 0,
+          },
+          operational_terminal_receipt_total: 0,
+          operational_terminal_receipts_by_status: {
+            SUCCEEDED: 0,
+            FAILED: 0,
+            CANCELLED: 0,
+            EXPIRED: 0,
+          },
+        },
+      }),
     });
 
     await expect(
@@ -1677,6 +1780,7 @@ describe('normalizeAsyncRequestSummary', () => {
   it('keeps exact protocol-covered states and terminal totals', () => {
     expect(normalizeAsyncRequestSummary(exactSummary)).toEqual({
       available: true,
+      source: 'postgresql_async_request_ledger',
       coverage: 'partial',
       protocolVersion: 1,
       observedAt: 100,
@@ -1686,6 +1790,15 @@ describe('normalizeAsyncRequestSummary', () => {
       operationalTerminalReceiptsByStatus:
         exactSummary.operational_terminal_receipts_by_status,
     });
+  });
+
+  it('rejects an unexpected authority source', () => {
+    expect(
+      normalizeAsyncRequestSummary({
+        ...exactSummary,
+        source: 'controller_cache',
+      })
+    ).toBeNull();
   });
 
   it.each([

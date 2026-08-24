@@ -2220,12 +2220,16 @@ function ServiceDetails() {
       ? {
           requestTelemetryState: directDemand.requestTelemetryState,
           requestTelemetryReason: directDemand.requestTelemetryReason,
+          requestTelemetrySource: directDemand.requestTelemetrySource ?? null,
           requestTelemetryGeneration:
             directDemand.requestTelemetryGeneration ?? null,
           requestTelemetryCompatibilityComplete:
             directDemand.requestTelemetryCompatibilityComplete ?? null,
           requestReporterCount: directDemand.requestReporterCount ?? null,
           requestStatsAgeSeconds: directDemand.requestStatsAgeSeconds ?? null,
+          asyncRequestSummary: directDemand.asyncRequestSummary ?? null,
+          requestTelemetryRefreshUnavailable:
+            directDemand.refreshUnavailable === true,
           zeroCostActuationStatus: directDemand.zeroCostActuationStatus ?? null,
           zeroCostActuationReason: directDemand.zeroCostActuationReason ?? null,
           zeroCostActuationMode: directDemand.zeroCostActuationMode ?? null,
@@ -2779,32 +2783,57 @@ export function ServiceDetailCard({
     getTerminalPredictionObservationSummaryLastHour(requestHistory);
   const terminalPredictionObservationsLastHour =
     terminalPredictionObservationSummaryLastHour?.total ?? null;
+  // Current activity has one canonical direct read.  Keep the history copy as
+  // a mixed-version fallback until every compatible server returns the ledger
+  // summary from /demand.
+  const directAsyncSummary = serviceData.asyncRequestSummary;
   const exactAsyncSummary =
-    requestHistory?.asyncRequestSummary?.available === true
-      ? requestHistory.asyncRequestSummary
-      : null;
-  const exactAsyncStateCounts = exactAsyncSummary?.stateCounts;
-  const exactDispatchUncertain = exactAsyncStateCounts
-    ? exactAsyncStateCounts.DISPATCH_MAY_HAVE_OCCURRED +
-      exactAsyncStateCounts.AMBIGUOUS
-    : null;
+    directAsyncSummary?.available === true
+      ? directAsyncSummary
+      : directAsyncSummary == null &&
+          requestHistory?.asyncRequestSummary?.available === true
+        ? requestHistory.asyncRequestSummary
+        : null;
+  const exactAsyncUnavailableSummary =
+    directAsyncSummary?.available === false
+      ? directAsyncSummary
+      : directAsyncSummary == null &&
+          requestHistory?.asyncRequestSummary?.available === false
+        ? requestHistory.asyncRequestSummary
+        : null;
+  const exactAsyncSummaryFromDemand = exactAsyncSummary === directAsyncSummary;
   const exactAsyncSnapshotAgeSeconds = Number.isFinite(
     exactAsyncSummary?.observedAt
   )
     ? Math.max(0, Date.now() / 1000 - exactAsyncSummary.observedAt)
     : null;
+  const exactAsyncRefreshUnavailable = exactAsyncSummaryFromDemand
+    ? serviceData.requestTelemetryRefreshUnavailable === true
+    : requestHistory?.refreshUnavailable === true;
   const exactAsyncFreshness = exactAsyncSummary
-    ? requestHistory?.refreshUnavailable
-      ? `Exact ledger refresh failed; showing a snapshot observed ${
-          exactAsyncSnapshotAgeSeconds == null
-            ? 'at an unknown time'
-            : `${Math.round(exactAsyncSnapshotAgeSeconds)}s ago`
-        }.`
-      : exactAsyncSnapshotAgeSeconds == null
-        ? 'Exact ledger snapshot time unavailable.'
-        : `Exact ledger snapshot observed ${Math.round(
-            exactAsyncSnapshotAgeSeconds
-          )}s ago.`
+    ? exactAsyncSummaryFromDemand
+      ? exactAsyncRefreshUnavailable
+        ? `PostgreSQL exact ledger refresh failed; showing a snapshot observed ${
+            exactAsyncSnapshotAgeSeconds == null
+              ? 'at an unknown time'
+              : `${Math.round(exactAsyncSnapshotAgeSeconds)}s ago`
+          }.`
+        : exactAsyncSnapshotAgeSeconds == null
+          ? 'PostgreSQL exact ledger snapshot time unavailable.'
+          : `PostgreSQL exact ledger snapshot observed ${Math.round(
+              exactAsyncSnapshotAgeSeconds
+            )}s ago.`
+      : requestHistory?.refreshUnavailable
+        ? `Exact ledger refresh failed; showing a snapshot observed ${
+            exactAsyncSnapshotAgeSeconds == null
+              ? 'at an unknown time'
+              : `${Math.round(exactAsyncSnapshotAgeSeconds)}s ago`
+          }.`
+        : exactAsyncSnapshotAgeSeconds == null
+          ? 'Exact ledger snapshot time unavailable.'
+          : `Exact ledger snapshot observed ${Math.round(
+              exactAsyncSnapshotAgeSeconds
+            )}s ago.`
     : null;
   const latestTerminalObservationReportAgeSeconds =
     terminalPredictionObservationsLastHour == null
@@ -2864,14 +2893,6 @@ export function ServiceDetailCard({
       `${lastReportedPrefix}${serviceData.requestQueueDepth} queued`
     );
   }
-  if (exactAsyncStateCounts) {
-    const coveragePrefix = 'protocol-covered ';
-    requestDetails.push(
-      `${coveragePrefix}${exactAsyncStateCounts.REJECTED_PRE_DISPATCH.toLocaleString()} pre-dispatch`,
-      `${coveragePrefix}${exactDispatchUncertain.toLocaleString()} dispatch outcome uncertain`,
-      `${coveragePrefix}${exactAsyncStateCounts.ACCEPTED.toLocaleString()} accepted (not confirmed processing)`
-    );
-  }
   if (serviceData.unknownInFlightReplicaCount > 0) {
     requestDetails.push(
       `${lastReportedPrefix}${serviceData.unknownInFlightReplicaCount} backend${
@@ -2888,6 +2909,9 @@ export function ServiceDetailCard({
     requestDetails.push(
       `activity report ${Math.round(serviceData.requestStatsAgeSeconds)}s old`
     );
+  }
+  if (serviceData.requestTelemetrySource === 'postgresql_lb_demand_reports') {
+    requestDetails.push('source PostgreSQL load-balancer reports');
   }
   if (
     serviceData.requestTelemetryState != null &&
@@ -3107,12 +3131,12 @@ export function ServiceDetailCard({
                 {serviceData.inFlightRequests != null
                   ? `${serviceData.inFlightRequests.toLocaleString()} ${
                       requestTelemetryIsStale ? 'last reported ' : ''
-                    }processing`
+                    }processing / in-flight`
                   : serviceData.confirmedInFlightRequests != null
                     ? `${serviceData.confirmedInFlightRequests.toLocaleString()} ${
                         requestTelemetryIsStale
-                          ? 'last confirmed processing'
-                          : 'confirmed processing'
+                          ? 'last confirmed processing / in-flight'
+                          : 'confirmed processing / in-flight'
                       }`
                     : serviceData.requestRate != null
                       ? `${lastReportedPrefix}${formatRequestRate(
@@ -3130,24 +3154,33 @@ export function ServiceDetailCard({
             </div>
             <div>
               <div className="text-gray-600 font-medium text-base">
-                Unique async terminal receipts
+                Exact async request lifecycle
               </div>
               <div className="text-base mt-1">
                 {exactAsyncSummary
-                  ? `${exactAsyncSummary.operationalTerminalReceiptTotal.toLocaleString()} protocol-covered (partial)`
-                  : historyLoading
-                    ? 'Loading...'
-                    : 'Unavailable'}
+                  ? `${exactAsyncSummary.operationalTerminalReceiptTotal.toLocaleString()} terminal, protocol-covered (partial)`
+                  : exactAsyncUnavailableSummary
+                    ? 'Unavailable'
+                    : historyLoading
+                      ? 'Loading...'
+                      : 'Unavailable'}
               </div>
               {exactAsyncSummary && (
                 <div className="text-xs text-gray-500 mt-1">
-                  {`${exactAsyncSummary.operationalTerminalReceiptsByStatus.SUCCEEDED.toLocaleString()} succeeded · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.FAILED.toLocaleString()} failed · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.CANCELLED.toLocaleString()} cancelled · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.EXPIRED.toLocaleString()} expired`}
+                  {`${exactAsyncSummary.stateCounts.REJECTED_PRE_DISPATCH.toLocaleString()} rejected before dispatch · ${exactAsyncSummary.stateCounts.ACCEPTED.toLocaleString()} accepted / dispatch-confirmed (not proven actively processing) · ${exactAsyncSummary.stateCounts.DISPATCH_MAY_HAVE_OCCURRED.toLocaleString()} dispatch may have occurred · ${exactAsyncSummary.stateCounts.AMBIGUOUS.toLocaleString()} ambiguous · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.SUCCEEDED.toLocaleString()} succeeded · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.FAILED.toLocaleString()} failed · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.CANCELLED.toLocaleString()} cancelled · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.EXPIRED.toLocaleString()} expired`}
+                </div>
+              )}
+              {exactAsyncUnavailableSummary && (
+                <div className="text-xs text-amber-700 mt-1">
+                  {`PostgreSQL exact ledger unavailable: ${(
+                    exactAsyncUnavailableSummary.reason || 'unknown reason'
+                  ).replaceAll('_', ' ')}`}
                 </div>
               )}
               {exactAsyncFreshness && (
                 <div
                   className={`text-xs mt-1 ${
-                    requestHistory?.refreshUnavailable
+                    exactAsyncRefreshUnavailable
                       ? 'text-amber-700'
                       : 'text-gray-500'
                   }`}

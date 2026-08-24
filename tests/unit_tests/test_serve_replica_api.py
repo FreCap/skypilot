@@ -122,7 +122,11 @@ def test_replica_reads_have_a_distinct_api_capability_version():
         server_constants.MIN_SERVE_LAZY_VERSION_YAML_API_VERSION)
     assert lazy_version_yaml_version == 90
     assert zero_cost_actuation_version < lazy_version_yaml_version
-    assert server_constants.API_VERSION == lazy_version_yaml_version
+    exact_request_summary_version = (
+        server_constants.MIN_SERVE_EXACT_REQUEST_SUMMARY_API_VERSION)
+    assert exact_request_summary_version == 92
+    assert lazy_version_yaml_version < exact_request_summary_version
+    assert server_constants.API_VERSION == exact_request_summary_version
 
 
 def test_current_demand_reads_database_without_controller():
@@ -134,6 +138,12 @@ def test_current_demand_reads_database_without_controller():
         'request_telemetry_state': 'fresh',
         'request_telemetry_generation': 7,
         'recent_request_count': 12,
+    }
+    async_summary = {
+        'available': True,
+        'source': 'postgresql_async_request_ledger',
+        'service_hash': 'hash-a',
+        'state_counts': {},
     }
     actuation = {
         'zero_cost_actuation_status': 'available',
@@ -158,6 +168,9 @@ def test_current_demand_reads_database_without_controller():
          mock.patch.object(server.demand_state,
                            'get_request_summary',
                            return_value=summary) as get_summary, \
+         mock.patch.object(server.async_request_ledger,
+                           'get_summary',
+                           return_value=async_summary) as get_async_summary, \
          mock.patch.object(server.zero_cost_actuation,
                            'get_status_summary',
                            return_value=actuation) as get_actuation, \
@@ -172,9 +185,11 @@ def test_current_demand_reads_database_without_controller():
         'service_name': 'svc',
         'service_hash': 'hash-a',
         **summary,
+        'async_request_summary': async_summary,
         **actuation,
     }
     get_summary.assert_called_once_with('svc', 'hash-a')
+    get_async_summary.assert_called_once_with('svc', 'hash-a')
     get_actuation.assert_called_once_with('svc', 'hash-a')
     schedule.assert_not_awaited()
 
@@ -235,6 +250,42 @@ def test_current_demand_fences_a_race_after_service_snapshot():
                  'request_telemetry_state': 'unavailable',
                  'request_telemetry_reason': 'service_incarnation_mismatch',
              }):
+        response = _client().get('/serve/svc/demand',
+                                 params={'expected_service_hash': 'hash-a'})
+
+    assert response.status_code == 409
+
+
+def test_current_demand_fences_async_ledger_incarnation_race():
+    with mock.patch.object(server.serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(server.serve_state,
+                           'get_service_status_snapshot',
+                           return_value={
+                               'hash': 'hash-a',
+                               'pool': False,
+                           }), \
+         mock.patch.object(
+             server.demand_state,
+             'get_request_summary',
+             return_value={
+                 'request_telemetry_state': 'fresh',
+                 'request_telemetry_reason': 'complete',
+             }), \
+         mock.patch.object(
+             server.async_request_ledger,
+             'get_summary',
+             return_value={
+                 'available': False,
+                 'reason': 'service_incarnation_mismatch',
+             }), \
+         mock.patch.object(server.zero_cost_actuation,
+                           'get_status_summary',
+                           return_value={
+                               'zero_cost_actuation_status': 'available',
+                               'zero_cost_actuation_reason': 'complete',
+                           }):
         response = _client().get('/serve/svc/demand',
                                  params={'expected_service_hash': 'hash-a'})
 
