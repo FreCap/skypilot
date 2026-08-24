@@ -87,5 +87,4 @@ jobs:
             --with 'SQLAlchemy>=2,<3' \
             python -m unittest -v \
               test_seed_config.py \
-              test_reconcile_api_server.py \
-              test_verify_rwx_authority_fence.py
+              test_reconcile_api_server.py

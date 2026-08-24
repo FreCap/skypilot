@@ -1308,12 +1308,11 @@ pod can never start against an empty volume.
 the chart creates; they do not mutate the external claim. Inspect and qualify
 that claim independently.
 
-This setting also supports a safe storage migration: first retain the legacy
-release-owned claim, provision and verify the replacement claim independently,
-copy the state while all legacy writers are stopped, and only then select the
-replacement. ``storage.accessMode`` remains the declared storage capability and
-must be ``ReadWriteMany`` when guarded HA is enabled; Helm cannot inspect an
-existing claim at render time.
+This setting is available only to compatibility profiles which use persistent
+storage. Guarded PostgreSQL HA requires ``storage.enabled=false`` and rejects
+all PVC-backed storage, including an existing claim. Helm cannot inspect an
+existing claim's access mode or contents at render time; operators of a
+non-guarded compatibility profile must qualify that claim independently.
 
 Default: ``""``
 
@@ -1321,8 +1320,8 @@ Default: ``""``
 
   storage:
     enabled: true
-    existingClaim: skypilot-state-rwx
-    accessMode: ReadWriteMany
+    existingClaim: existing-skypilot-state
+    accessMode: ReadWriteOnce
 
 .. _helm-values-storage-storageClassName:
 

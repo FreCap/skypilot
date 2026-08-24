@@ -117,61 +117,6 @@ locals {
     var.api_server_image != null ? var.api_server_image : ""
   )
 
-  # A completed RWO -> RWX cutover is authorized by a small digest-sealed fence
-  # on a dedicated EFS access point. Only this init container sees that PVC. The
-  # writable state mount and every long-running role container remain unable to
-  # reach the authority path.
-  rwx_authority_fence_enabled = var.rwx_authority_fence != null
-  rwx_authority_fence_script  = file("${path.module}/scripts/verify_rwx_authority_fence.py")
-  rwx_authority_fence_expected_identity = local.rwx_authority_fence_enabled ? {
-    namespace    = var.namespace
-    release_name = var.release_name
-    source = merge(var.rwx_authority_fence.identity.source, {
-      pvc_namespace = var.namespace
-    })
-    target = merge(var.rwx_authority_fence.identity.target, {
-      state_claim_name        = var.rwx_authority_fence.state_claim_name
-      state_pvc_namespace     = var.namespace
-      authority_claim_name    = var.rwx_authority_fence.authority_claim_name
-      authority_pvc_namespace = var.namespace
-    })
-  } : null
-  rwx_authority_fence_volumes = [for volume in [{
-    name = "skypilot-rwx-authority-fence"
-    persistentVolumeClaim = {
-      claimName = try(var.rwx_authority_fence.authority_claim_name, "")
-      readOnly  = true
-    }
-  }] : volume if local.rwx_authority_fence_enabled]
-  rwx_authority_fence_init_containers = [for container in [{
-    name    = "verify-rwx-authority-fence"
-    image   = local.init_helper_image
-    command = ["python", "-c", local.rwx_authority_fence_script]
-    env = [
-      {
-        name  = "SKYPILOT_RWX_AUTHORITY_FENCE_EXPECTED_SHA256"
-        value = try(var.rwx_authority_fence.expected_sha256, "")
-      },
-      {
-        name  = "SKYPILOT_RWX_AUTHORITY_FENCE_EXPECTED_IDENTITY"
-        value = jsonencode(local.rwx_authority_fence_expected_identity)
-      },
-      {
-        name  = "SKYPILOT_RWX_AUTHORITY_FENCE_EXPECTED_POSTGRES_EVIDENCE_SHA256"
-        value = try(var.rwx_authority_fence.expected_postgres_evidence_sha256, "")
-      },
-    ]
-    securityContext = {
-      allowPrivilegeEscalation = false
-      readOnlyRootFilesystem   = true
-      capabilities             = { drop = ["ALL"] }
-    }
-    volumeMounts = [{
-      name      = "skypilot-rwx-authority-fence"
-      mountPath = "/var/run/skypilot/rwx-authority"
-      readOnly  = true
-    }]
-  }] : container if local.rwx_authority_fence_enabled]
   gcp_login_image = local.gcp_provisioner_enabled ? local.init_helper_image : null
   # gcp-cred: keyless external_account cred-config (no key).
   # gcp-token: projected K8s SA token whose audience is the WIF provider; cred-config
@@ -284,7 +229,6 @@ locals {
     local.gcp_volumes,
     local.nebius_volumes,
     local.azure_volumes,
-    local.rwx_authority_fence_volumes,
   )
   all_extra_volume_mounts = concat(local.aws_volume_mounts, local.gcp_volume_mounts, local.nebius_volume_mounts, local.azure_volume_mounts)
   # gcp and azure both use top-level extraInitContainers (keyless CLI logins).
@@ -295,7 +239,6 @@ locals {
   all_init_containers = concat(
     jsondecode(jsonencode(local.gcp_init_containers)),
     jsondecode(jsonencode(local.azure_init_containers)),
-    jsondecode(jsonencode(local.rwx_authority_fence_init_containers)),
   )
   # jsondecode(jsonencode(...)) erases the per-list object types: env entries
   # with `value` and with `valueFrom` cannot otherwise share one concat().
@@ -400,39 +343,6 @@ locals {
     keys(try(local.extra_helm_values_decoded.apiService, null)),
     [],
   ))
-  # storage remains an escape-hatch chart block, but an enabled authority fence
-  # must bind the exact PVC mounted as state. Empty existingClaim means the
-  # chart-owned <release>-state default.
-  rwx_authority_fence_effective_state_claim_name = try(
-    trimspace(local.extra_helm_values_decoded.storage.existingClaim) != "" ?
-    local.extra_helm_values_decoded.storage.existingClaim :
-    "${var.release_name}-state",
-    "${var.release_name}-state",
-  )
-  rwx_authority_fence_existing_state_claim_explicit = try(
-    trimspace(local.extra_helm_values_decoded.storage.existingClaim) != "",
-    false,
-  )
-  rwx_authority_fence_effective_storage_enabled = try(
-    local.extra_helm_values_decoded.storage.enabled == true,
-    true,
-  )
-  rwx_authority_fence_effective_access_mode = try(
-    local.extra_helm_values_decoded.storage.accessMode,
-    "ReadWriteOnce",
-  )
-  # The shared API volume is propagated into every role pod. When the fence is
-  # enabled, reject every escape-hatch container/volume array that could mount
-  # that otherwise init-only authority volume into a long-running container.
-  rwx_authority_fence_forbidden_escape_hatch = anytrue([
-    try(length(local.extra_helm_values_decoded.apiService.sidecarContainers) > 0, false),
-    try(length(local.extra_helm_values_decoded.databaseConnection.extraVolumes) > 0, false),
-    try(length(local.extra_helm_values_decoded.databaseConnection.extraVolumeMounts) > 0, false),
-    try(length(local.extra_helm_values_decoded.executorService.extraVolumes) > 0, false),
-    try(length(local.extra_helm_values_decoded.executorService.extraVolumeMounts) > 0, false),
-    try(length(local.extra_helm_values_decoded.controllerService.extraVolumes) > 0, false),
-    try(length(local.extra_helm_values_decoded.controllerService.extraVolumeMounts) > 0, false),
-  ])
   # High availability is an escape-hatch chart value today. Keep the
   # post-seed reconciler in compatibility mode unless the final Helm override
   # explicitly enables split roles. Invalid shapes still fail the Helm release
@@ -541,38 +451,6 @@ resource "helm_release" "skypilot" {
     precondition {
       condition     = length(local.duplicate_extra_env_names) == 0
       error_message = "apiService.extraEnvs contains duplicate names after assembling generated and user-provided values: ${join(", ", sort(tolist(local.duplicate_extra_env_names)))}."
-    }
-    precondition {
-      condition = !local.rwx_authority_fence_enabled || can(
-        regex("^.+@sha256:[0-9a-f]{64}$", trimspace(local.init_helper_image))
-      )
-      error_message = "rwx_authority_fence requires a digest-pinned operations_helper_image or api_server_image ending in @sha256:<64 lowercase hex characters>."
-    }
-    precondition {
-      condition = !local.rwx_authority_fence_enabled || (
-        var.request_store.backend == "postgres" &&
-        var.request_store.enforce_builtin_execution_quiescence_backends
-      )
-      error_message = "rwx_authority_fence requires request_store.backend=postgres and enforce_builtin_execution_quiescence_backends=true so the evidence covers every execution storage and queue backend."
-    }
-    precondition {
-      condition = !local.rwx_authority_fence_enabled || (
-        local.rwx_authority_fence_effective_storage_enabled &&
-        local.rwx_authority_fence_effective_access_mode == "ReadWriteMany"
-      )
-      error_message = "rwx_authority_fence requires storage.enabled=true and storage.accessMode=ReadWriteMany."
-    }
-    precondition {
-      condition = !local.rwx_authority_fence_enabled || (
-        local.rwx_authority_fence_existing_state_claim_explicit &&
-        local.rwx_authority_fence_effective_state_claim_name ==
-        var.rwx_authority_fence.state_claim_name
-      )
-      error_message = "rwx_authority_fence requires an explicit nonempty storage.existingClaim equal to rwx_authority_fence.state_claim_name; a chart-created claim is not an accepted static RWX target."
-    }
-    precondition {
-      condition     = !local.rwx_authority_fence_enabled || !local.rwx_authority_fence_forbidden_escape_hatch
-      error_message = "rwx_authority_fence forbids nonempty apiService.sidecarContainers and databaseConnection/executorService/controllerService extraVolumes or extraVolumeMounts; only the typed init verifier may mount the authority volume."
     }
     precondition {
       condition     = local.extra_helm_values_valid_yaml
