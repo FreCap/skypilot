@@ -1,7 +1,7 @@
 # Stateless HA control-plane storage
 
 Status: Complete and live-qualified for the SkyPilot guarded-HA installation.
-Helm revision 590 / release 1.1.1464 runs with `storage.enabled=false`,
+Helm revision 594 / release 1.1.1470 runs with `storage.enabled=false`,
 PostgreSQL authority, bounded pod-local state, two API Pods, three executor
 Pods, and two controller Pods. The `skypilot` namespace has no PVC, and none of
 those role Pods has a PVC or CSI volume. `boltz-l4-fleet` was cleanly recreated
@@ -10,7 +10,7 @@ PostgreSQL; that recreation was not an EFS import or a claim that the deleted
 service incarnation was recovered. PRs #1642 and #1643 remain superseded and
 must not merge.
 
-Last updated: 2026-08-22
+Last updated: 2026-08-24
 
 Canonical owner: this file owns removal of the SkyPilot control-plane PVC and
 shared-filesystem dependency. The multi-replica role split and PostgreSQL request and
@@ -131,9 +131,10 @@ The fresh guarded-HA profile supports:
   PostgreSQL and can be materialized into a pod-local file;
 - service/controller restart, leadership transfer, replica recovery, and
   reserved-fill reconciliation from PostgreSQL; and
-- structured request telemetry from PostgreSQL. Completing the service UI's
-  queued, processing, in-flight, and terminal projection remains owned by the
-  reserved-capacity design and is not evidence for this storage closeout.
+- structured request telemetry from PostgreSQL. The provider-local terminal
+  census and fresh current-demand projection are qualified in the reserved-
+  capacity design; they are not evidence for this storage closeout, and full
+  producer coverage remains explicitly separate.
 
 The profile rejects, before reading or staging bytes:
 
@@ -194,19 +195,20 @@ this test deployment.
 ## Implementation and qualification audit
 
 The source boundary was introduced across PRs #1640 and #1645--#1648. Release
-1.1.1464 at Helm revision 590 is the current live receipt for the final storage
-topology; the request/data-plane qualification that remains open is tracked in
-the reserved-capacity design and is not silently promoted to storage evidence.
+1.1.1470 at Helm revision 594 is the current live receipt for the final storage
+topology. The separately completed request/data-plane qualification is tracked
+in the reserved-capacity design and is not silently promoted to storage
+evidence.
 
 | Surface | Implemented boundary | Qualification status |
 | --- | --- | --- |
-| API requests and queue | PostgreSQL owns request rows, queue, leases, execution generations, cancellation, retention pins, and provider-action fences. The guarded profile does not consult the obsolete SQLite cutover gate. | Deployed on the PVC-free release. Exact 10,000-request qualification remains a separate request-path gate. |
+| API requests and queue | PostgreSQL owns request rows, queue, leases, execution generations, cancellation, retention pins, and provider-action fences. The guarded profile does not consult the obsolete SQLite cutover gate. | Deployed on the PVC-free release. The separate exact 10,000-request gate passed on revision 594. |
 | Server config and workspace policy | Guarded central config and Casbin reconciliation are PostgreSQL-authoritative. Config seeding commits YAML, revision, and digest together. | Deployed across all seven Ready role Pods; no shared config lock or volume is present. |
 | Serve | YAML, service/version rows, controller config bytes and digests, placement, snapshots, claims, and recovery state are in PostgreSQL. Guarded recovery rejects predecessor-local fallbacks. | The old service was removed and a new incarnation was created from canonical YAML. This closeout does not characterize that clean recreation as recovery of the deleted incarnation. |
 | Managed Jobs | Structured job state, environment, YAML/config snapshots, and generated SSH material are in PostgreSQL. Guarded admission rejects local bytes after policy mutation and before volume preparation. | Source-qualified and deployed; a separate Managed Jobs smoke test was not a prerequisite for the fleet's storage cutover. |
 | Uploads and raw logs | Guarded legacy/v2 upload, local blob-ID, raw-log, sync-down, and download paths fail before treating a pod-local path as durable authority. | Source tests are the evidence for these negative surfaces. No additional live route matrix is claimed here. |
 | SSH | Generated key material is PostgreSQL-owned; mutable SSH-node-pool publication is rejected before local-byte admission. | Source-qualified and deployed. |
-| Helm | Guarded HA requires `storage.enabled=false`, emits no PVC mount, gives every role separate bounded disk-backed `emptyDir`, and rejects operator writable volumes. | Focused Helm tests pass, and revision 590 has two API, three executor, and two controller Pods with no PVC or CSI volume. |
+| Helm | Guarded HA requires `storage.enabled=false`, emits no PVC mount, gives every role separate bounded disk-backed `emptyDir`, and rejects operator writable volumes. | Focused Helm tests pass, and revision 594 has two API, three executor, and two controller Pods with no PVC or CSI volume. |
 
 The submitted `boltz-l4-fleet` definition used for the clean recreation has no
 local `workdir` or `file_mounts`; its model image and weights come from external
@@ -411,7 +413,7 @@ outcome is:
 - PostgreSQL and its fenced history were retained; no EFS bytes were imported.
 - The old fleet lifecycle was removed through supported teardown, and the new
   service incarnation was created from the canonical YAML and required Secrets.
-- Helm revision 590 runs release 1.1.1464 with `storage.enabled=false`, bounded
+- Helm revision 594 runs release 1.1.1470 with `storage.enabled=false`, bounded
   disk-backed `emptyDir` volumes, and no SkyPilot PVC or CSI mount.
 - The release-owned claim/access-point transition path is absent. Shared base
   filesystems, StorageClasses, and CSI components outside SkyPilot release
@@ -452,20 +454,22 @@ outcome is:
 
 ### Live installation receipt
 
-- Helm revision 590 / release 1.1.1464 has two API, three executor, and two
+- Helm revision 594 / release 1.1.1470 has two API, three executor, and two
   controller Pods Ready on one homogeneous image and chart cohort.
 - The `skypilot` namespace has no PVC. Pod specs contain no PVC or CSI volume,
   and guarded HA runs with `storage.enabled=false`.
 - PostgreSQL remains the structured authority while every role uses only
   bounded, disposable local materializations.
 - `boltz-l4-fleet` was cleanly recreated from canonical YAML as a new service
-  incarnation and reached 149 fresh Ready workers without a paid launch at the
-  recorded capacity census. This is reserved-capacity evidence, not proof that
-  the deleted service incarnation was recovered.
-- Exact 10,000-request completion, complete dashboard request telemetry, and
-  paid L4 residual qualification remain open in
-  `docs/designs/serve-multi-pool-reserved-capacity-fill.md`. They must not be
-  inferred from this storage receipt.
+  incarnation. A point-in-time revision-594 receipt reached 280/280 fresh Ready
+  workers without a paid launch and then advanced to a coherent 290/290 at
+  06:44 UTC as ten more PHX slots were confirmed. This is reserved-capacity
+  evidence, not proof that the deleted service incarnation was recovered.
+- Exact 10,000-request completion and a fresh post-campaign current-demand API
+  projection passed separately on revision 594. No nonzero revision-594 visual
+  dashboard sample is claimed. Paid L4 residual qualification remains open in
+  `docs/designs/serve-multi-pool-reserved-capacity-fill.md`. None of those
+  request/economic results is inferred from this storage receipt.
 
 ## Steady-state rollback boundary
 
@@ -529,8 +533,9 @@ materialization.
 
 ## Open gates
 
-No storage-cutover gate remains. Ongoing Serve request-load, controller
-failover, and reserved/paid capacity qualification are owned by their
-respective designs; a failure there must fix forward without remounting shared
-storage. Generic non-HA PVC support is outside this production profile and does
-not authorize a guarded-HA PVC or EFS fallback.
+No storage-cutover gate remains. Serve request-load, controller failover, and
+reserved-capacity qualification completed in their respective designs; the
+bounded paid-Spot residual/drain exercise remains there. Any failure must fix
+forward without remounting shared storage. Generic non-HA PVC support is
+outside this production profile and does not authorize a guarded-HA PVC or EFS
+fallback.
