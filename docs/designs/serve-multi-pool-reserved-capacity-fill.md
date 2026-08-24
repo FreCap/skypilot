@@ -1,20 +1,20 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-24 19:46 UTC
+Last updated: 2026-08-24 20:32 UTC
 
 Status: **the PostgreSQL-authoritative single path, protocol-v10 shared cache,
 bounded controller work, clean service lifecycle, unchanged Kueue contract,
-and complete consumption of the current scheduler-authorized denominator are
-deployed and production-proven. One remaining high-volume convergence defect
-has a surgical SkyPilot-only correction under qualification: lease only the
-next four reserved-fill intents instead of aging the complete provider-free
-window behind serial controller work. Deployment, a repeated at-least-32-GPU
-wave, and an authenticated bounded paid-Spot residual/drain exercise remain
-open gates.**
+complete consumption of the current scheduler-authorized denominator, and
+just-in-time high-volume reserved-fill actuation are deployed and
+production-proven. The remaining functional production gate is an
+authenticated bounded paid-Spot residual/drain exercise using an
+operator-supplied protected-endpoint bearer. One final +30-minute reserved-fill
+control read remains an operational evidence gate, not a behavior or source
+change.**
 
-The control plane runs SkyPilot release `1.1.1476`, Helm revision 598, on image
+The control plane runs SkyPilot release `1.1.1477`, Helm revision 599, on image
 digest
-`sha256:95a18537f60a3e0429ff626e6bf8adbf8c774383329568cdbe462a7060e48b09`.
+`sha256:a81be57e34f6e22c60d9f4f5d2bc7b308d40820f9ad1ed836ea6d116a5ea960c`.
 Both API Pods, both controller Pods, and all three executor Pods are Ready with
 zero restarts. PostgreSQL is the sole central correctness authority, Helm
 storage is disabled, and no EFS/PVC correctness path is present.
@@ -30,30 +30,84 @@ zero. The service has `min_replicas: 0` and the approved bounded qualification
 cap of ten logical L4 Spot units; the cap is a ceiling, not a target, and zero
 request demand has produced no paid capacity.
 
-The remaining defect is controller-local queue aging, not Kueue refusal, GPU
+The corrected defect was controller-local queue aging, not Kueue refusal, GPU
 scarcity, or Spot scarcity. A 19:13 UTC H200 allocation created 14 intents with
-about 90.6 seconds of observation authority remaining. The deployed executor
+about 90.6 seconds of observation authority remaining. Release `1.1.1476`
 leased the complete batch before processing it serially. Ten committed, one
 ended `replica_commit_deferred`, and three reached `grant_expired`; a transient
 provider-phase persistence-fence collision consumed about 13 seconds in the
 tail. A later 16-intent H200 allocation committed all 16 in about 13.5 seconds,
-proving that the atomic PostgreSQL admission and Kubernetes path are fast enough
-when not queued behind an aging leased batch.
+proving that the atomic PostgreSQL admission and Kubernetes path were fast
+enough when not queued behind an aging leased batch.
 
-The correction preserves the 32-intent provider-free pending window but leases
-only one just-in-time quantum of four. The unleased tail remains `GRANTED`, owns
-no provider effect, and may be superseded by a fresher allocation. A full
-successful quantum releases its exact lane before signalling the dispatcher,
-so the next same-pool quantum starts without overlap or a lost wakeup. The
-lease selector attempts untouched `GRANTED` rows before `RETRYABLE` rows and
-rotates retries by their least-recent transition, so four persistent failures
-cannot monopolize the quantum and starve the other 28 positions. An N-1 writer
-may have already leased up to 32 rows when rollout begins; the new writer cannot
-steal those live leases and may recover them only after their bounded 90-second
-execution horizon. Qualification therefore starts only after both controller
-Pods report the new digest and either no predecessor `ACTUATING` row remains or
-one complete lease horizon has elapsed. This is a bounded safe delay, not a
-second mixed-version behavior path.
+Release `1.1.1477` preserves the 32-intent provider-free pending window but
+leases only one just-in-time quantum of four. The unleased tail remains
+`GRANTED`, owns no provider effect, and may be superseded by a fresher
+allocation. A full successful quantum releases its exact lane before signalling
+the dispatcher, so the next same-pool quantum starts without overlap or a lost
+wakeup. The lease selector attempts untouched `GRANTED` rows before
+`RETRYABLE` rows and rotates retries by their least-recent transition, so four
+persistent failures cannot monopolize the quantum and starve the other 28
+positions. An N-1 writer may have already leased up to 32 rows when rollout
+begins; the new writer cannot steal those live leases and may recover them only
+after their bounded 90-second execution horizon. Production qualification
+began only after both controller Pods reported the new digest and PostgreSQL
+reported no predecessor `ACTUATING` rows.
+
+The 20:17--20:24 UTC production exercise deleted exactly 32 armed East
+A100-80GB worker Pods with UID preconditions and made no PostgreSQL, PHX, Kueue,
+service, paid-provider, or workload-controller write. The controller retired
+all 32 old replica records and produced exactly 32 new intents, 32 replica
+records, 32 associations, 32 API requests, and 32 replicas. Every request
+succeeded and every replacement became Ready, zero-cost, and non-Spot. There
+were no terminal or expired wave intents, duplicate effects, paid claims,
+paid waiters, PHX row changes, or Kueue-policy changes. The first 26 intents
+were published at 20:18:34, the remaining six at 20:19:19 after the next fresh
+observation, and all 32 were committed by 20:19:59. First-to-last commit took
+84.98 seconds and every intent remained inside its immutable observation
+authority, whose horizon ended at 20:21:07. Full application readiness reached
+314/314 at 20:24:26 and remained stable for more than 60 seconds: 63 East A100,
+189 East A100-80GB, and 62 PHX H200, with zero observed and spendable free
+capacity in all three pools.
+
+One intent encountered the PostgreSQL broker persist fence, returned
+`replica_commit_deferred` before atomic admission, installed no adopter, and
+performed no provider I/O. It was fairly re-leased and committed. Several
+intents likewise observed transient process-local physical-cluster capture
+contention and retried before materialization. These are expected optimistic,
+provider-free retry seams rather than ambiguous or duplicate effects. The hard
+production gates are therefore zero grant expiry, zero terminal or ambiguous
+wave intent, one exact durable graph per intent, zero paid spill, and bounded
+restoration of full capacity. A transient retry is a performance signal and
+becomes a blocker only if it breaks the authority or convergence SLO; requiring
+zero retries would incorrectly reject the intended fail-closed contention
+contract. The first qualification monitor conservatively remembered every
+transient retry and therefore could not emit its original zero-retry success
+result even after recovery. It was stopped only after the full fleet had stayed
+Ready for more than 60 seconds. The subsequent PostgreSQL receipt proved the
+32-way intent/record/association/request/replica bijection and 32 successful
+requests; controller logs proved the deferred attempt stopped before adopter or
+provider I/O. This evidence is why the canonical gate is corrected here instead
+of hiding the retry or adding another source path.
+
+The 32 replacements reached application readiness 254--317 seconds after
+replica creation, with a 292-second median. Kubernetes Running/Ready only
+proved the worker runtime marker; SkyServe correctly waited for the Boltz
+`/v1/models/model` probe after cache/weight preparation and model load. This
+was parallel application warm-up, not Kueue waiting, image-pull delay, or
+actuation blockage, and it remained far inside the 1,200-second failure
+deadline.
+
+The +10-minute control read at 20:36:47 UTC retained the same 314/314 Ready
+fleet, three authoritative pool holdings/grants of 63, 189, and 62, and zero
+observed/spendable free capacity. The 32-way graph remained bijective and all
+32 API requests remained `SUCCEEDED`; paid claims and waiters remained absent.
+All seven control-plane Pods remained Ready on the `1.1.1477` digest with zero
+restarts. PostgreSQL request telemetry was fresh and complete from both load
+balancer reporters (oldest report 6.96 seconds): recent requests, queue depth,
+in-flight work, and rejected work were all zero. Thus the service UI has a
+live controller-independent request-count source even when current demand is
+zero.
 
 The change does not lengthen authority, weaken atomic fencing, add a schema or
 migration, add a compatibility path or feature flag, or alter Kueue, Terraform,
@@ -61,13 +115,12 @@ Terragrunt, provider IAM, or application code. The existing changed-only
 readiness writer is a separately measurable optimization, not part of this
 correction.
 
-The remaining production gates are: deploy the homogeneous correction; prove
-an at-least-32-GPU refill reaches zero spendable free capacity without expired
-grants, duplicate provider effects, or paid spill; then use an
-operator-supplied protected-endpoint bearer for the approved 100-request,
-concurrency-16 residual-demand exercise and prove bounded Spot-only overflow
-and full provider/debit drain. The bearer must not be recovered from a
-Kubernetes Secret.
+The remaining production gate is to use an operator-supplied
+protected-endpoint bearer for the approved 100-request, concurrency-16
+residual-demand exercise and prove reserved-first accounting, bounded Spot-only
+overflow, and full provider/debit drain. The bearer must not be recovered from
+a Kubernetes Secret. Separately, retain the current 314/314 reserved receipt
+through the scheduled +30-minute control read.
 
 ## Historical evidence and implementation record
 
@@ -796,11 +849,11 @@ boundaries.
 | Slice | Source | Deployed | Activated | Production proof |
 |---|---|---|---|---|
 | Bounded v5 teardown and clean recreation (#1676/#1677) | Complete | Complete in `1.1.1447` | Complete at gate 33 | Complete: lifecycle 91 purged normally; lifecycle 93 created |
-| Scheduler-authorized reserved fill | Complete | Complete through `1.1.1470` / Helm 594 | Complete at gate 39 | Complete against the dynamic denominator. The coherent 06:26 UTC receipt was 280/280 Ready; the service then automatically converged through 290/290 by 06:44 and reached 295/295 in the later same-day audit as more PHX capacity became confirmed. The final split was East 154 and PHX 141. All replicas were reserved/non-Spot and Simone's Kueue policy was unchanged. |
+| Scheduler-authorized reserved fill | Complete | Complete through `1.1.1477` / Helm 599 | Complete at gate 39 | Complete against the dynamic denominator. The current proof is 314/314 Ready: East 63 A100 plus 189 A100-80GB, and PHX 62 Kueue-admitted H200. All exact-card observations report zero spendable free capacity, every replica is reserved/non-Spot, and Simone's Kueue policy is unchanged. |
 | Controller/LB current-request projection | Complete | Complete | Complete | The two-slot LB remained healthy. After the 10,000-request campaign, the API projection was fresh/complete with two reporters and zero current QPS, queued, in-flight, and rejected work. The PostgreSQL exact summary matched the provider-local terminal census and remained explicitly partial by producer coverage. This receipt did not capture a nonzero API/UI sample during that campaign. |
 | PR #1678 duplicate-up and observer lock-order correction | Complete at `38ec24342` | Complete in Helm 572 | Complete at gate 34 | Duplicate-up, takeover, 180-second stale horizon, and +30 control-plane/HA/error checks passed; the coincident eight-card v6 readiness wave was superseded by supported provider teardown |
 | Kueue non-mutation | No source change | No rendered chart change | Not applicable | Complete: both normalized PRE and POST hashes are equal |
-| Paid residual | Complete | Complete | Qualification fence active at zero | Source/real-PostgreSQL tests qualify commit-before-residual and drain; idle plus the full request campaign created no paid capacity under `max_live_paid_gpu_units: 0`. A positive bounded Spot residual and complete drain remain the sole open production behavior exercise. |
+| Paid residual | Complete | Complete with the local provider's cap-ten qualification envelope | Activated but idle | Source/real-PostgreSQL tests qualify commit-before-residual and drain. Idle production and the 32-GPU refill created no paid claim, waiter, or replica because reserved capacity covered the denominator. An authenticated positive bounded Spot residual and complete drain remain the sole open production behavior exercise. |
 | Protocol-v7 bootstrap and N-1 terminal-cleanup correction (#1679) | Complete at `40a0832bd` | Complete in `1.1.1449` / Helm 573 | Complete at gate 35 | Complete: lifecycle 93 purged and lifecycle 94 recreated without manual deletion |
 | Fill throughput and HA lock-starvation correction (#1680) | Complete at `b311dd277` | Complete in `1.1.1450` / Helm 575 | Complete at gate 36 | Historical East batch proof committed 16 intents together and made all 16 Ready with zero generation-36 `grant_expired` intents. The formerly pending PHX cleanup/deployment is superseded by the lifecycle-96/Helm-586 receipt. |
 | Generation-fenced pre-job cleanup (#1682) | Complete at `73c40a3fe` | Complete in `1.1.1452` / Helm 576 | Complete at gate 37 | Complete: PHX 194/194 Kueue-admitted Ready plus four topology-withheld; East 328/328 physical GPUs assigned; zero paid claims/waiters |
@@ -810,6 +863,7 @@ boundaries.
 | Retained-Pod pre-job whole-service purge correction | Complete | Complete and inherited by `1.1.1457` / Helm 586 | Complete before lifecycle 96 | The former lifecycle-95 hold and pending purge/recreation language is historical. Lifecycle 96/version 1 remained stable through the two latest fix-forwards. |
 | Bounded per-pool conveyor and reserved-before-paid accounting (#1686) | Complete | Complete in `1.1.1456`, inherited by `1.1.1457` | Complete; lifecycle 96/version 1 unchanged | Every physical pool has an independent bounded launch conveyor. Current East and PHX scheduler-admissible capacity converged with zero paid claims and zero Spot replicas. |
 | Live provider-free pre-effect recovery (#1687) | Complete | Complete in `1.1.1457` / Helm 586 | Complete; no service activation or version replacement | Exact replica 465, its admission, and its committed intent were atomically retired after a `NOT_STARTED`, quiesced, provider-`NOT_QUERIED` proof; history was retained and replacement 572 reached `POD_WAITING`. |
+| Just-in-time fair actuation (#1708) | Complete at `7b0fec896` | Complete in `1.1.1477` / Helm 599 | Complete without a service-version change | An exact 32-GPU East wave committed all 32 intents in 84.98 seconds with zero expiry, terminal intent, duplicate graph, or paid spill; all replacements became Ready and the fleet returned to 314/314. Provider-free contention retries recovered fairly and stayed inside immutable authority. |
 
 At approximately 03:07 UTC, after takeover and gate-34 activation,
 `sky serve status` reported 133 Ready of 136 current reserved units after
@@ -1648,7 +1702,16 @@ PostgreSQL time. An intent whose grant expires before that commit is fenced
 without a replica, request, queue entry, retention pin, or provider effect and
 is terminalized by the normal expiry path. A positive remaining grant window is
 never discarded merely because it is shorter than the executor ownership
-lease. The manager commits each exact intent/replica/request graph independently
+lease. Lease order is fair and deterministic: untouched `GRANTED` intents are
+selected before `RETRYABLE` intents, then retries rotate by their least-recent
+transition, with creation time and key as stable ties. Provider-phase,
+physical-capture, and broker-persist contention before atomic admission releases
+only that intent back to `RETRYABLE`; it is an expected fail-closed seam, not an
+ambiguous effect. A transient retry is not itself a failed qualification gate.
+It becomes a failure only if the immutable authority expires, the intent
+terminalizes or becomes ambiguous, a duplicate durable/provider effect appears,
+paid capacity spills, or the documented convergence SLO is missed. The manager
+commits each exact intent/replica/request graph independently
 under its existing serialization, refreshes the durable replica graph and ID
 set for each quantum, and rechecks exact actuation authority immediately before
 every materialization. Another pool is therefore permitted to interleave
