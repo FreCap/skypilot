@@ -56,7 +56,9 @@ def _make_manager(failure_threshold):
     manager._consecutive_failure_threshold_timeout = mock.Mock(
         return_value=failure_threshold)
     manager._handle_preemption = mock.Mock(return_value=False)
-    manager._cloud_instance_looks_alive = mock.Mock(return_value=True)
+    manager._cloud_instance_looks_alive = mock.Mock(
+        return_value=(replica_managers._PreemptionPrefilterResult(
+            replica_managers._PreemptionPrefilterDisposition.LIVE_OR_UNPROVEN)))
     manager._terminate_replica = mock.Mock()
     manager._db_fence_kwargs = mock.Mock(return_value={})
     manager._resolve_probe_urls = mock.Mock(

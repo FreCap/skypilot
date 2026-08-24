@@ -83,6 +83,7 @@ if typing.TYPE_CHECKING:
 
     from sky.serve import demand_state
     from sky.serve import service_spec
+    from sky.serve.ordinary_launch_binding import BoundLaunchContext
     from sky.serve.ordinary_launch_binding import BoundNonPoolLaunchContext
     from sky.serve.ordinary_launch_binding import ControllerBindingAuthority
     from sky.serve.replica_info import ReplicaInfo
@@ -145,6 +146,38 @@ class ProbeRouteResult:
     resolved_routes: dict[int, route_projection.ResolvedRouteMaterial]
     identity_verified_replica_ids: set[int]
     complete: bool
+
+
+class _PreemptionPrefilterDisposition(enum.Enum):
+    """Conservative result of one status-lock-free provider probe."""
+
+    LIVE_OR_UNPROVEN = 'LIVE_OR_UNPROVEN'
+    DEAD_NEEDS_REFRESH = 'DEAD_NEEDS_REFRESH'
+    EXACT_KUBERNETES_ABSENT = 'EXACT_KUBERNETES_ABSENT'
+    IDENTITY_UNCERTAIN = 'IDENTITY_UNCERTAIN'
+
+
+@dataclasses.dataclass(frozen=True)
+class _ExactKubernetesAbsenceProof:
+    """Pre-quiescence identity proof used only for interruption reduction."""
+
+    cleanup_fence: reserved_capacity.ProtocolV2CleanupFence
+    cluster_name: str
+    replica_record_id: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _PreemptionPrefilterResult:
+    disposition: _PreemptionPrefilterDisposition
+    exact_absence: _ExactKubernetesAbsenceProof | None = None
+
+    def __post_init__(self) -> None:
+        carries_absence = self.exact_absence is not None
+        expects_absence = self.disposition is (
+            _PreemptionPrefilterDisposition.EXACT_KUBERNETES_ABSENT)
+        if carries_absence != expects_absence:
+            raise ValueError(
+                'Exact Kubernetes absence disposition and proof disagree.')
 
 
 # Wall-clock persistence is the only way to carry a drain deadline across
@@ -4424,7 +4457,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         info: ReplicaInfo,
         launch_cloud: clouds.Cloud | None,
         *,
-        initial_reduction: Any = None,
+        initial_context: 'BoundLaunchContext | None' = None,
     ) -> tuple[Callable[[], Any], Callable[[Any, BaseException | None], Any],
                Callable[[str], Any]]:
         """Close exact inspect/reduce/cancel calls over one record identity."""
@@ -4433,8 +4466,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             raise _BoundOrdinaryLaunchUnresolvedError(
                 'Bound ordinary launch has no controller authority.')
         context_box: list[Any] = []
-        if initial_reduction is not None:
-            context_box.append(initial_reduction.context)
+        if initial_context is not None:
+            context_box.append(initial_context)
 
         def _inspect() -> Any:
             reduction = request_postgres.inspect_bound_ordinary_launch(
@@ -4521,7 +4554,7 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _build_bound_launch_adopter(
         self,
         info: ReplicaInfo,
-        reduction: Any,
+        bound_context: 'BoundLaunchContext',
         *,
         yaml_content: str | None = None,
         spec: 'service_spec.SkyServiceSpec | None' = None,
@@ -4553,11 +4586,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             task_template=task_template)
         recovery_cloud = next(iter(recovery_task.resources)).cloud
         _, reduce_bound, cancel_bound = self._bound_ordinary_launch_callbacks(
-            info, recovery_cloud, initial_reduction=reduction)
+            info, recovery_cloud, initial_context=bound_context)
         log_file = serve_utils.generate_replica_launch_log_file_name(
             self._service_name, info.replica_id, self._resource_scope)
         completion_queue, completion_event = self._launch_completion_state()
-        launch_context = reduction.context
+        launch_context = bound_context
         return _ReplicaLaunchThread(
             target=adopt_bound_ordinary_launch,
             replica_id=info.replica_id,
@@ -4583,7 +4616,7 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _install_bound_launch_adopter(
         self,
         info: ReplicaInfo,
-        reduction: Any,
+        bound_context: 'BoundLaunchContext',
         *,
         start: bool,
         yaml_content: str | None = None,
@@ -4595,8 +4628,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         if info.replica_id in runtime.launch_thread_pool:
             return False
         launch_thread = self._build_bound_launch_adopter(
-            info, reduction, yaml_content=yaml_content, spec=spec)
-        request_id = reduction.context.request_id
+            info, bound_context, yaml_content=yaml_content, spec=spec)
+        request_id = bound_context.request_id
         self._register_bound_launch_adopter(info, request_id, launch_thread,
                                             existing_replica_infos)
         if start:
@@ -4757,7 +4790,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         _bound_projection_classification(reduction)
                         in ('ADOPT_ACTIVE', 'WAIT_QUIESCENCE')):
                     self._install_bound_launch_adopter(info,
-                                                       reduction,
+                                                       reduction.context,
                                                        start=True)
             except Exception as error:  # pylint: disable=broad-except
                 logger.warning(
@@ -4919,7 +4952,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         if provider_present_cleanup is not None:
             return provider_present_cleanup
         _, reduce_exact, cancel_exact = (self._bound_ordinary_launch_callbacks(
-            info, None, initial_reduction=initial))
+            info, None, initial_context=initial.context))
         durable_reason = getattr(initial, 'cancel_reason', None)
         if durable_reason is not None and (not isinstance(durable_reason, str)
                                            or not durable_reason):
@@ -6488,7 +6521,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 self._service_name, replica_info.version)
                         self._install_bound_launch_adopter(
                             replica_info,
-                            bound_reduction,
+                            bound_reduction.context,
                             start=True,
                             yaml_content=prior_yaml_content,
                             spec=recovery_spec)
@@ -8248,17 +8281,28 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                'atomic admission returned a '
                                                'mismatched durable receipt')
                 assert admission_receipt is not None
-                reduction = request_postgres.inspect_bound_ordinary_launch(
-                    self._service_name, replica_id, info.replica_record_id)
-                if (reduction is None or reduction.context.request_id
-                        != admission_receipt.request_id):
+                bound_context = admission_receipt.context
+                if (not isinstance(
+                        bound_context,
+                        ordinary_launch_binding.BoundNonPoolLaunchContext) or
+                        bound_context.profile.kind
+                        is not ordinary_launch_binding.NonPoolLaunchProfileKind.
+                        RESERVED_FILL or str(bound_context.association_id)
+                        != admission_receipt.association_id or
+                        bound_context.request_id != admission_receipt.request_id
+                        or bound_context.service_name != self._service_name or
+                        bound_context.replica_id != replica_id or
+                        str(bound_context.replica_record_id)
+                        != info.replica_record_id or
+                        bound_context.launch_generation
+                        != admission_receipt.launch_generation):
                     raise reserved_fill_admission.AdmissionAmbiguousError(
-                        'committed atomic admission has no exact durable '
-                        'request snapshot')
+                        'committed atomic admission returned an inconsistent '
+                        'bound launch context')
                 try:
                     self._install_bound_launch_adopter(
                         info,
-                        reduction,
+                        bound_context,
                         start=True,
                         yaml_content=launch_yaml_content,
                         spec=launch_spec,
@@ -13124,8 +13168,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         *,
         phase_admission: provider_phase.ProviderPhaseAdmission | None = None,
         handle: Any = _NOT_PROVIDED,
-    ) -> bool | None:
-        """Whether the cloud still reports this replica's instance(s) as UP.
+    ) -> _PreemptionPrefilterResult:
+        """Classify liveness without repeating a full cluster refresh.
 
         Cloud-API-only (one provider call, no SSH probe, no status lock, no
         DB writes): this is the cheap pre-filter that decides whether a
@@ -13142,11 +13186,16 @@ class SkyPilotReplicaManager(ReplicaManager):
         instance — routes to the full path, which stays the authority on
         classification.
 
-        Errors count as alive: a transient provider/API error must not
+        Exact protocol-v2 Kubernetes ABSENT carries a private typed proof. The
+        ordered reducer can then skip only the redundant forced refresh. It is
+        not post-teardown evidence: the normal down worker must still quiesce
+        the request and prove a fresh absence before deleting durable state.
+
+        Errors count as live/unproven: a transient provider/API error must not
         stampede a whole cold-starting fleet into forced refreshes — a
         genuinely dead instance keeps failing its probe and is re-checked
-        next round. A missing handle counts as NOT alive so the full path
-        (which logs and handles that case) runs.
+        next round. A missing handle requires the existing full path, which
+        logs and handles that case.
         """
         try:
             if handle is _NOT_PROVIDED:
@@ -13158,7 +13207,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 phase_admission=phase_admission,
                 wait_for_initializer=phase_admission is None)
             if handle is None:
-                return False
+                return _PreemptionPrefilterResult(
+                    _PreemptionPrefilterDisposition.DEAD_NEEDS_REFRESH)
             assert isinstance(handle, backends.CloudVmRayResourceHandle)
             observation_boundary = time.monotonic()
             with provider_fence:
@@ -13171,37 +13221,51 @@ class SkyPilotReplicaManager(ReplicaManager):
                     cluster_name_on_cloud = handle.cluster_name_on_cloud
                     if (not isinstance(cluster_name_on_cloud, str) or
                             not cluster_name_on_cloud):
-                        return True
+                        return _PreemptionPrefilterResult(
+                            _PreemptionPrefilterDisposition.LIVE_OR_UNPROVEN)
                     presence = (
                         reserved_capacity.probe_physical_replica_presence(
                             cleanup_fence,
                             info.cluster_name,
                             observed_after=observation_boundary,
                             cluster_name_on_cloud=cluster_name_on_cloud))
-                    # An API/identity uncertainty is not evidence of
-                    # interruption; retry next round without stampeding the
+                    if (presence is
+                            reserved_capacity.PhysicalReplicaPresence.ABSENT):
+                        return _PreemptionPrefilterResult(
+                            _PreemptionPrefilterDisposition.
+                            EXACT_KUBERNETES_ABSENT,
+                            _ExactKubernetesAbsenceProof(
+                                cleanup_fence=cleanup_fence,
+                                cluster_name=info.cluster_name,
+                                replica_record_id=info.replica_record_id))
+                    # PRESENT or an API uncertainty is not evidence of
+                    # interruption. Retry next round without stampeding the
                     # full refresh path.
-                    return (
-                        True if presence
-                        is reserved_capacity.PhysicalReplicaPresence.UNPROVEN
-                        else presence
-                        is reserved_capacity.PhysicalReplicaPresence.PRESENT)
+                    return _PreemptionPrefilterResult(
+                        _PreemptionPrefilterDisposition.LIVE_OR_UNPROVEN)
                 statuses = backend_utils.query_cluster_instance_statuses(handle)
             if len(statuses) < handle.launched_nodes:
-                return False
-            return all(status == status_lib.ClusterStatus.UP
-                       for status, _ in statuses.values())
+                return _PreemptionPrefilterResult(
+                    _PreemptionPrefilterDisposition.DEAD_NEEDS_REFRESH)
+            if all(status == status_lib.ClusterStatus.UP
+                   for status, _ in statuses.values()):
+                return _PreemptionPrefilterResult(
+                    _PreemptionPrefilterDisposition.LIVE_OR_UNPROVEN)
+            return _PreemptionPrefilterResult(
+                _PreemptionPrefilterDisposition.DEAD_NEEDS_REFRESH)
         except exceptions.KubernetesPhysicalClusterIdentityError as error:
             logger.error(
                 f'Preemption pre-filter has unknown provider identity for '
                 f'replica {info.replica_id} ({info.cluster_name}): '
                 f'{common_utils.format_exception(error)}')
-            return None
+            return _PreemptionPrefilterResult(
+                _PreemptionPrefilterDisposition.IDENTITY_UNCERTAIN)
         except Exception as e:  # pylint: disable=broad-except
             logger.debug(f'Preemption pre-filter failed for replica '
                          f'{info.replica_id} ({info.cluster_name}); treating '
                          f'as alive: {common_utils.format_exception(e)}')
-            return True
+            return _PreemptionPrefilterResult(
+                _PreemptionPrefilterDisposition.LIVE_OR_UNPROVEN)
 
     def _is_reclaimable_zero_cost_kubernetes(self, info: ReplicaInfo) -> bool:
         """Whether a non-spot replica runs as reclaimable research capacity."""
@@ -13222,7 +13286,12 @@ class SkyPilotReplicaManager(ReplicaManager):
         """Whether infrastructure loss should enter replacement lifecycle."""
         return (info.is_spot or self._is_reclaimable_zero_cost_kubernetes(info))
 
-    def _handle_preemption(self, info: ReplicaInfo) -> bool:
+    def _handle_preemption(
+        self,
+        info: ReplicaInfo,
+        *,
+        exact_kubernetes_absence: _ExactKubernetesAbsenceProof | None = None,
+    ) -> bool:
         """Handle an infrastructure interruption after a replica error.
 
         Returns:
@@ -13232,16 +13301,34 @@ class SkyPilotReplicaManager(ReplicaManager):
                 not self._is_interruptible_replica(info)):
             return False
 
-        # Get cluster handle first for zone information. The following
-        # backend_utils.refresh_cluster_status_handle might delete the
-        # cluster record from the cluster table.
-        handle = global_user_state.get_handle_from_cluster_name(
-            info.cluster_name)
+        # The exact Kubernetes proof already contains every immutable field
+        # needed for interruption classification. Other paths still load the
+        # handle first for zone information because the following forced
+        # refresh might delete the cluster record from the cluster table.
+        handle = None
+        if exact_kubernetes_absence is None:
+            handle = global_user_state.get_handle_from_cluster_name(
+                info.cluster_name)
         if self._update_recovery_required:
             return False
-        provider_fence = reserved_capacity.protocol_v2_provider_fence(
-            info, handle)
-        if handle is None:
+        if exact_kubernetes_absence is not None:
+            cleanup_fence = (
+                reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+            if (cleanup_fence is None or
+                    exact_kubernetes_absence.cleanup_fence != cleanup_fence or
+                    exact_kubernetes_absence.cluster_name != info.cluster_name
+                    or exact_kubernetes_absence.replica_record_id
+                    != info.replica_record_id):
+                raise exceptions.KubernetesPhysicalClusterIdentityError(
+                    'Exact preemption absence does not match the durable '
+                    'reserved-fill replica identity.')
+            # The parallel prefilter already proved this exact protocol-v2
+            # Kubernetes replica physically absent under its immutable UID
+            # fence. Do not repeat the expensive forced refresh serially
+            # under the manager mutex. The down worker below still performs
+            # request quiescence and obtains fresh post-teardown absence.
+            cluster_status = None
+        elif handle is None:
             # A missing global-state row after a failed probe is conclusive for
             # a successfully launched interruptible replica: forced status
             # refresh removes terminated clusters before this handler can run.
@@ -13251,6 +13338,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             cluster_status = None
         else:
             assert isinstance(handle, backends.CloudVmRayResourceHandle)
+            provider_fence = reserved_capacity.protocol_v2_provider_fence(
+                info, handle)
             # Pull the actual cluster status from the provider to distinguish
             # an infrastructure interruption from an application readiness
             # failure.
@@ -16372,7 +16461,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             if failed_interruptible_infos:
 
                 def _preemption_liveness(
-                        failed_info: ReplicaInfo) -> bool | None:
+                        failed_info: ReplicaInfo) -> _PreemptionPrefilterResult:
                     handle = probe_handles.get(failed_info.replica_id,
                                                _NOT_PROVIDED)
                     if handle is _NOT_PROVIDED:
@@ -16383,7 +16472,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         phase_admission=phase_admission,
                         handle=handle)
 
-                alive_flags: list[bool | None] = []
+                liveness_results: list[_PreemptionPrefilterResult] = []
                 for offset in range(0, len(failed_interruptible_infos),
                                     self._PREEMPTION_PREFILTER_PARALLELISM):
                     batch = failed_interruptible_infos[
@@ -16392,24 +16481,37 @@ class SkyPilotReplicaManager(ReplicaManager):
                         executor.submit(_preemption_liveness, failed_info)
                         for failed_info in batch
                     ]
-                    alive_flags.extend(future.result() for future in futures)
+                    liveness_results.extend(
+                        future.result() for future in futures)
                 if self._update_recovery_required:
                     return infos
-                for failed_info, alive in zip(failed_interruptible_infos,
-                                              alive_flags):
+                for failed_info, liveness in zip(failed_interruptible_infos,
+                                                 liveness_results):
                     if self._update_recovery_required:
                         return infos
-                    if alive is None:
+                    if liveness.disposition is (
+                            _PreemptionPrefilterDisposition.IDENTITY_UNCERTAIN):
                         self._record_provider_identity_uncertain(
                             failed_info,
                             'cloud liveness could not prove the physical '
                             'Kubernetes identity')
                 possibly_preempted_ids = {
                     failed_info.replica_id
-                    for failed_info, alive in zip(failed_interruptible_infos,
-                                                  alive_flags)
-                    if alive is False
+                    for failed_info, liveness in zip(failed_interruptible_infos,
+                                                     liveness_results)
+                    if liveness.disposition in (
+                        _PreemptionPrefilterDisposition.DEAD_NEEDS_REFRESH,
+                        _PreemptionPrefilterDisposition.EXACT_KUBERNETES_ABSENT)
                 }
+                exact_kubernetes_absences = {
+                    failed_info.replica_id: liveness.exact_absence
+                    for failed_info, liveness in zip(failed_interruptible_infos,
+                                                     liveness_results)
+                    if liveness.disposition is (
+                        _PreemptionPrefilterDisposition.EXACT_KUBERNETES_ABSENT)
+                }
+            else:
+                exact_kubernetes_absences = {}
 
             changed_only_readiness_persistence = self._changed_only_readiness_persistence
             pending_writes: list[tuple[int, ReplicaInfo]] = []
@@ -16442,7 +16544,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                     # Durable legacy interruption/down intent wins before any
                     # OOM observation or probe reduction can revive routing.
                     try:
-                        is_preempted = self._handle_preemption(info)
+                        exact_absence = exact_kubernetes_absences.get(
+                            info.replica_id)
+                        if exact_absence is None:
+                            is_preempted = self._handle_preemption(info)
+                        else:
+                            is_preempted = self._handle_preemption(
+                                info, exact_kubernetes_absence=exact_absence)
                     except exceptions.KubernetesPhysicalClusterIdentityError as error:
                         self._record_provider_identity_uncertain(
                             info, 'forced preemption refresh was fenced off: '

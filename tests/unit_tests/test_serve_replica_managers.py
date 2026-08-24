@@ -287,7 +287,7 @@ def test_live_reconciliation_adopts_association_race(monkeypatch):
                                    generic=True)
     info = _fake_replica_info(
         3, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
-    reduction = mock.sentinel.reduction
+    reduction = types.SimpleNamespace(context=mock.sentinel.context)
     runtime = types.SimpleNamespace(launch_thread_pool={}, down_thread_pool={})
     retirement = ordinary_launch_binding.PreAdmissionRetirement(
         ordinary_launch_binding.PreAdmissionRetirementDisposition.ASSOCIATED)
@@ -320,9 +320,8 @@ def test_live_reconciliation_adopts_association_race(monkeypatch):
         manager._reconcile_unowned_bound_non_pool_launches([info])
 
     assert inspect.call_count == 2
-    manager._install_bound_launch_adopter.assert_called_once_with(info,
-                                                                  reduction,
-                                                                  start=True)
+    manager._install_bound_launch_adopter.assert_called_once_with(
+        info, reduction.context, start=True)
     manager._notify_scale_reconciliation.assert_not_called()
 
 
@@ -1885,7 +1884,7 @@ class TestBoundOrdinaryLaunchManagerIntegration:
                  replica_managers.request_postgres,
                  'reduce_bound_ordinary_launch') as locked_reduce:
             _, reduce_exact, _ = manager._bound_ordinary_launch_callbacks(
-                info, None, initial_reduction=active)
+                info, None, initial_context=active.context)
             assert reduce_exact(None, None) is active
 
         inspect.assert_not_called()
@@ -1914,7 +1913,7 @@ class TestBoundOrdinaryLaunchManagerIntegration:
                  'reduce_bound_ordinary_launch',
                  return_value=terminal) as locked_reduce:
             _, reduce_exact, _ = manager._bound_ordinary_launch_callbacks(
-                info, None, initial_reduction=active)
+                info, None, initial_context=active.context)
             assert reduce_exact(None, None) is terminal
 
         inspect.assert_not_called()
@@ -1939,7 +1938,7 @@ class TestBoundOrdinaryLaunchManagerIntegration:
                  'reduce_bound_ordinary_launch',
                  return_value=terminal) as locked_reduce:
             _, reduce_exact, _ = manager._bound_ordinary_launch_callbacks(
-                info, None, initial_reduction=active)
+                info, None, initial_context=active.context)
             assert reduce_exact(None, None) is terminal
 
         assert locked_reduce.call_args.args == (context, authority)
@@ -3864,10 +3863,55 @@ def test_v2_cloud_liveness_uid_mismatch_is_unknown_not_preempted():
          mock.patch.object(
              replica_managers.backend_utils,
              'query_cluster_instance_statuses') as query_statuses:
-        assert mgr._cloud_instance_looks_alive(info) is None
+        result = mgr._cloud_instance_looks_alive(info)
+        assert result.disposition is (
+            replica_managers._PreemptionPrefilterDisposition.IDENTITY_UNCERTAIN)
 
     query_statuses.assert_not_called()
     assert info.status_property.preempted is False
+
+
+def test_v2_cloud_liveness_exact_absence_returns_typed_proof():
+    info = replica_managers.ReplicaInfo(replica_id=1,
+                                        cluster_name='svc-1',
+                                        replica_port='8080',
+                                        is_spot=False,
+                                        location=None,
+                                        version=1,
+                                        resources_override=None)
+    _stamp_protocol_v2_fill(info)
+    handle = _protocol_v2_handle(info)
+    mgr = _make_manager()
+
+    with mock.patch.object(
+            replica_managers.global_user_state,
+            'get_handle_from_cluster_name',
+            return_value=handle), \
+         mock.patch.object(
+             replica_managers.kubernetes_adaptor,
+             'physical_cluster_uid_fence',
+             return_value=contextlib.nullcontext()), \
+         mock.patch.object(
+             replica_managers.reserved_capacity,
+             'probe_physical_replica_presence',
+             return_value=(replica_managers.reserved_capacity.
+                           PhysicalReplicaPresence.ABSENT)) as probe:
+        result = mgr._cloud_instance_looks_alive(info)
+
+    cleanup_fence = (replica_managers.reserved_capacity.
+                     parse_protocol_v2_cleanup_fence(info))
+    assert result == replica_managers._PreemptionPrefilterResult(
+        replica_managers._PreemptionPrefilterDisposition.
+        EXACT_KUBERNETES_ABSENT,
+        replica_managers._ExactKubernetesAbsenceProof(
+            cleanup_fence=cleanup_fence,
+            cluster_name=info.cluster_name,
+            replica_record_id=info.replica_record_id))
+    probe.assert_called_once_with(
+        cleanup_fence,
+        info.cluster_name,
+        observed_after=mock.ANY,
+        cluster_name_on_cloud=handle.cluster_name_on_cloud)
 
 
 def test_v2_forced_preemption_uid_mismatch_never_refreshes_or_marks_loss():
@@ -3901,6 +3945,80 @@ def test_v2_forced_preemption_uid_mismatch_never_refreshes_or_marks_loss():
         mgr._handle_preemption(info)
 
     refresh_status.assert_not_called()
+    assert info.status_property.preempted is False
+
+
+def test_v2_exact_absence_preemption_skips_refresh_but_schedules_down():
+    info = replica_managers.ReplicaInfo(replica_id=1,
+                                        cluster_name='svc-1',
+                                        replica_port='8080',
+                                        is_spot=False,
+                                        location=None,
+                                        version=1,
+                                        resources_override=None)
+    _stamp_protocol_v2_fill(info)
+    mgr = _make_manager()
+    mgr._spot_placer = mock.Mock()
+    mgr._is_interruptible_replica = mock.Mock(return_value=True)
+    cleanup_fence = (replica_managers.reserved_capacity.
+                     parse_protocol_v2_cleanup_fence(info))
+    receipt = replica_managers._ExactKubernetesAbsenceProof(
+        cleanup_fence=cleanup_fence,
+        cluster_name=info.cluster_name,
+        replica_record_id=info.replica_record_id)
+
+    with mock.patch.object(
+            replica_managers.global_user_state,
+            'get_handle_from_cluster_name',
+            return_value=_protocol_v2_handle(info)) as get_handle, \
+         mock.patch.object(
+             replica_managers.backend_utils,
+             'refresh_cluster_status_handle') as refresh_status, \
+         mock.patch.object(mgr, '_persist_replica') as persist, \
+         mock.patch.object(mgr, '_terminate_replica') as terminate:
+        assert mgr._handle_preemption(info,
+                                      exact_kubernetes_absence=receipt) is True
+
+    refresh_status.assert_not_called()
+    get_handle.assert_not_called()
+    assert info.status_property.preempted is True
+    persist.assert_called_once_with(1, info)
+    terminate.assert_called_once_with(1,
+                                      sync_down_logs=False,
+                                      replica_drain_delay_seconds=0,
+                                      is_scale_down=True)
+
+
+def test_v2_exact_absence_preemption_rejects_stale_record_proof():
+    info = replica_managers.ReplicaInfo(replica_id=1,
+                                        cluster_name='svc-1',
+                                        replica_port='8080',
+                                        is_spot=False,
+                                        location=None,
+                                        version=1,
+                                        resources_override=None)
+    _stamp_protocol_v2_fill(info)
+    mgr = _make_manager()
+    mgr._is_interruptible_replica = mock.Mock(return_value=True)
+    cleanup_fence = (replica_managers.reserved_capacity.
+                     parse_protocol_v2_cleanup_fence(info))
+    stale_proof = replica_managers._ExactKubernetesAbsenceProof(
+        cleanup_fence=cleanup_fence,
+        cluster_name=info.cluster_name,
+        replica_record_id='00000000-0000-4000-8000-000000000000')
+
+    with mock.patch.object(
+            replica_managers.backend_utils,
+            'refresh_cluster_status_handle') as refresh_status, \
+         mock.patch.object(mgr, '_persist_replica') as persist, \
+         mock.patch.object(mgr, '_terminate_replica') as terminate, \
+         pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='does not match'):
+        mgr._handle_preemption(info, exact_kubernetes_absence=stale_proof)
+
+    refresh_status.assert_not_called()
+    persist.assert_not_called()
+    terminate.assert_not_called()
     assert info.status_property.preempted is False
 
 
@@ -8628,6 +8746,7 @@ class TestCloudInstanceLooksAlive:
         handle = mock.Mock(
             spec=replica_managers.backends.CloudVmRayResourceHandle)
         handle.launched_nodes = launched_nodes
+        handle.launched_resources = None
         return handle
 
     def test_running_instance_counts_as_alive(self):
@@ -8635,7 +8754,8 @@ class TestCloudInstanceLooksAlive:
         result, query = self._run(
             self._handle(),
             statuses={'i-1': (status_lib.ClusterStatus.UP, None)})
-        assert result is True
+        assert result.disposition is (
+            replica_managers._PreemptionPrefilterDisposition.LIVE_OR_UNPROVEN)
         query.assert_called_once()
 
     def test_partially_up_multinode_counts_as_dead(self):
@@ -8645,7 +8765,8 @@ class TestCloudInstanceLooksAlive:
         result, _ = self._run(
             self._handle(launched_nodes=2),
             statuses={'i-1': (status_lib.ClusterStatus.UP, None)})
-        assert result is False
+        assert result.disposition is (
+            replica_managers._PreemptionPrefilterDisposition.DEAD_NEEDS_REFRESH)
 
     def test_multinode_with_stopped_member_counts_as_dead(self):
         from sky.utils import status_lib
@@ -8655,31 +8776,36 @@ class TestCloudInstanceLooksAlive:
                                   'i-2': (status_lib.ClusterStatus.STOPPED,
                                           'preempted'),
                               })
-        assert result is False
+        assert result.disposition is (
+            replica_managers._PreemptionPrefilterDisposition.DEAD_NEEDS_REFRESH)
 
     def test_no_instances_counts_as_dead(self):
         result, _ = self._run(self._handle(), statuses={})
-        assert result is False
+        assert result.disposition is (
+            replica_managers._PreemptionPrefilterDisposition.DEAD_NEEDS_REFRESH)
 
     def test_stopped_instance_counts_as_dead(self):
         from sky.utils import status_lib
         result, _ = self._run(
             self._handle(),
             statuses={'i-1': (status_lib.ClusterStatus.STOPPED, 'preempted')})
-        assert result is False
+        assert result.disposition is (
+            replica_managers._PreemptionPrefilterDisposition.DEAD_NEEDS_REFRESH)
 
     def test_provider_error_counts_as_alive(self):
         # A transient provider error must not stampede a cold-starting
         # fleet into forced refreshes.
         result, _ = self._run(self._handle(),
                               side_effect=RuntimeError('throttled'))
-        assert result is True
+        assert result.disposition is (
+            replica_managers._PreemptionPrefilterDisposition.LIVE_OR_UNPROVEN)
 
     def test_missing_handle_routes_to_full_path(self):
         # No handle -> NOT alive, so the full _handle_preemption (which
         # logs and handles the missing-handle case) runs.
         result, query = self._run(handle=None)
-        assert result is False
+        assert result.disposition is (
+            replica_managers._PreemptionPrefilterDisposition.DEAD_NEEDS_REFRESH)
         query.assert_not_called()
 
 
@@ -8864,7 +8990,10 @@ class TestInfrastructureInterruptionRecovery:
         manager._get_post_data = mock.Mock(return_value=None)
         manager._get_readiness_timeout_seconds = mock.Mock(return_value=15)
         manager._get_readiness_headers = mock.Mock(return_value=None)
-        manager._cloud_instance_looks_alive = mock.Mock(return_value=False)
+        manager._cloud_instance_looks_alive = mock.Mock(
+            return_value=(replica_managers._PreemptionPrefilterResult(
+                replica_managers._PreemptionPrefilterDisposition.
+                DEAD_NEEDS_REFRESH)))
         manager._handle_preemption = mock.Mock(return_value=True)
         manager._persist_replicas = mock.Mock()
         manager._changed_only_readiness_persistence = changed_only

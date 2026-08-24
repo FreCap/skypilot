@@ -107,7 +107,10 @@ class TestProbeRoundBatching(unittest.TestCase):
         manager._consecutive_failure_threshold_timeout = mock.Mock(
             return_value=0)
         manager._handle_preemption = mock.Mock(return_value=False)
-        manager._cloud_instance_looks_alive = mock.Mock(return_value=True)
+        manager._cloud_instance_looks_alive = mock.Mock(
+            return_value=(replica_managers._PreemptionPrefilterResult(
+                replica_managers._PreemptionPrefilterDisposition.
+                LIVE_OR_UNPROVEN)))
         manager._terminate_replica = mock.Mock()
         manager._resolve_probe_urls = mock.Mock(
             side_effect=lambda infos, **_kwargs:
@@ -314,7 +317,10 @@ class TestProbeRoundBatching(unittest.TestCase):
                 manager = self._make_manager()
                 manager._changed_only_readiness_persistence = enabled
                 manager._is_interruptible_replica = mock.Mock(return_value=True)
-                manager._cloud_instance_looks_alive.return_value = False
+                manager._cloud_instance_looks_alive.return_value = (
+                    replica_managers._PreemptionPrefilterResult(
+                        replica_managers._PreemptionPrefilterDisposition.
+                        DEAD_NEEDS_REFRESH))
                 manager._handle_preemption.return_value = True
                 info = _replica_info(1, False)
 
@@ -324,6 +330,39 @@ class TestProbeRoundBatching(unittest.TestCase):
                 self.assertEqual(persist.call_count, expected_call_count)
                 if not enabled:
                     persist.assert_called_once_with([])
+
+    def test_exact_kubernetes_absence_wave_schedules_in_one_probe_round(self):
+        manager = self._make_manager()
+        manager._is_interruptible_replica = mock.Mock(return_value=True)
+        manager._handle_preemption.return_value = True
+        infos = [
+            _replica_info(replica_id, False) for replica_id in range(1, 65)
+        ]
+        proofs = {
+            info.replica_id: replica_managers._ExactKubernetesAbsenceProof(
+                cleanup_fence=(
+                    replica_managers.reserved_capacity.ProtocolV2CleanupFence(
+                        kubernetes_context='ctx',
+                        physical_cluster_uid='physical-uid')),
+                cluster_name=info.cluster_name,
+                replica_record_id=f'record-{info.replica_id}') for info in infos
+        }
+        for info in infos:
+            info.replica_record_id = proofs[info.replica_id].replica_record_id
+
+        manager._cloud_instance_looks_alive.side_effect = lambda info, **_: (
+            replica_managers._PreemptionPrefilterResult(
+                replica_managers._PreemptionPrefilterDisposition.
+                EXACT_KUBERNETES_ABSENT, proofs[info.replica_id]))
+
+        self._run_probe_round(manager, infos)
+
+        self.assertEqual(manager._handle_preemption.call_count, 64)
+        for info in infos:
+            self.assertIn(
+                mock.call(info,
+                          exact_kubernetes_absence=proofs[info.replica_id]),
+                manager._handle_preemption.call_args_list)
 
     def test_enabled_mode_persists_each_readiness_fingerprint_transition(self):
         cases = ({

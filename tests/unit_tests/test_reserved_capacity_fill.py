@@ -4582,7 +4582,7 @@ def _make_manager(placer):
     manager._resource_scope = 'service-hash'
     manager._controller_owner = (123, '10.0.0.1')
     manager._enforce_launch_fence = True
-    manager.yaml_content = 'unused: patched helpers below'
+    manager.yaml_content = 'resources:\n  accelerators: H200:1\n'
     manager._spot_placer = placer
     manager._launch_thread_pool = {}
     manager._replica_to_request_id = {}
@@ -4801,16 +4801,42 @@ class TestFillLaunchPath(unittest.TestCase):
         return mock.sentinel.intent_lease
 
     @staticmethod
-    def _committed_admission(spec):
+    def _bound_context(manager, spec):
+        profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+            authorization_reference='test:reserved-fill',
+            authorization_generation=1,
+            authorization_payload={'kind': 'RESERVED_FILL'})
+        return ordinary_launch_binding.BoundNonPoolLaunchContext(
+            association_id=uuid.UUID('11111111-1111-4111-8111-111111111111'),
+            request_id='request-id',
+            service_name=manager._service_name,
+            replica_id=7,
+            replica_record_id=uuid.UUID(spec.replica_info.replica_record_id),
+            launch_generation=1,
+            input_digest='a' * 64,
+            profile=profile,
+            capability_cohort_epoch=(
+                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+            capability_profile_set_digest=(
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            ),
+            receipt_protocol_version=(
+                ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
+
+    @classmethod
+    def _committed_admission(cls, manager, spec):
         spec.replica_info.zero_cost_admission_sequence = 1
+        context = cls._bound_context(manager, spec)
         return reserved_fill_admission.AdmissionResult(
             reserved_fill_admission.AdmissionDisposition.COMMITTED,
             reserved_fill_admission.AdmissionReceipt(
                 replica_id=7,
                 replica_record_id=spec.replica_info.replica_record_id,
-                association_id='association-id',
+                association_id=str(context.association_id),
                 request_id='request-id',
-                launch_generation=1))
+                launch_generation=1,
+                context=context))
 
     @staticmethod
     def _actuation_harness():
@@ -5431,16 +5457,8 @@ class TestFillLaunchPath(unittest.TestCase):
         def _admit(spec):
             self.assertEqual(events, [])
             admitted_specs.append(spec)
-            spec.replica_info.zero_cost_admission_sequence = 1
             events.append('commit')
-            return reserved_fill_admission.AdmissionResult(
-                reserved_fill_admission.AdmissionDisposition.COMMITTED,
-                reserved_fill_admission.AdmissionReceipt(
-                    replica_id=7,
-                    replica_record_id=spec.replica_info.replica_record_id,
-                    association_id='association-id',
-                    request_id='request-id',
-                    launch_generation=1))
+            return self._committed_admission(manager, spec)
 
         def _worker(*_args, **_kwargs):
             events.append('adopter')
@@ -5481,7 +5499,7 @@ class TestFillLaunchPath(unittest.TestCase):
              mock.patch.object(
                  replica_managers.request_postgres,
                  'inspect_bound_ordinary_launch',
-                 return_value=reduction), \
+                 return_value=reduction) as inspect_bound, \
              mock.patch.object(reserved_fill_admission,
                                'admit',
                                side_effect=_admit) as admit, \
@@ -5493,6 +5511,8 @@ class TestFillLaunchPath(unittest.TestCase):
             result = self._launch_v2(manager,
                                      override,
                                      actuation_lease=actuation_lease)
+
+        inspect_bound.assert_not_called()
 
         if actuation_lease is None:
             self.assertFalse(result)
@@ -5527,78 +5547,6 @@ class TestFillLaunchPath(unittest.TestCase):
             with self.subTest(actuation_mode=actuation_mode):
                 self._assert_v2_atomic_profile(actuation_mode, actuation_lease)
 
-    def test_v2_committed_inspection_baseexception_escapes_exactly(self):
-
-        class InspectInterrupt(BaseException):
-            pass
-
-        interrupt = InspectInterrupt('inspect interrupted after commit')
-        location = make_location('phx-context',
-                                 accelerators={'H200': 1},
-                                 cloud_name='Kubernetes',
-                                 use_spot=False)
-        placer = mock.Mock()
-        placer.active_locations.return_value = [location]
-        placer.select_next_zero_cost_location.return_value = location
-        manager = _make_manager(placer)
-        lease = self._enable_durable_intent(manager)
-        completion_event = mock.Mock()
-        manager._launch_completion_event = completion_event
-        bound_task = types.SimpleNamespace(
-            resources=[types.SimpleNamespace(cloud=clouds.Kubernetes())])
-
-        with mock.patch.object(replica_managers,
-                               '_should_use_spot',
-                               return_value=False), \
-             mock.patch.object(replica_managers,
-                               '_get_resources_ports',
-                               return_value='8080'), \
-             mock.patch.object(
-                 kubernetes_adaptor,
-                 'physical_cluster_uid_fence',
-                 return_value=contextlib.nullcontext()), \
-             mock.patch.object(replica_managers,
-                               '_build_replica_launch_task',
-                               return_value=bound_task), \
-             mock.patch.object(manager,
-                               '_bound_ordinary_launch_fence_context',
-                               return_value={'bound': True}), \
-             mock.patch.object(
-                 replica_managers.request_postgres,
-                 'stable_bound_ordinary_launch_submission_id',
-                 return_value='00000000-0000-4000-8000-000000000456'), \
-             mock.patch.object(
-                 replica_managers.sdk,
-                 'prepare_launch_request_for_server_controller',
-                 return_value=mock.sentinel.prepared), \
-             mock.patch.object(reserved_fill_admission,
-                               'admit',
-                               side_effect=self._committed_admission), \
-             mock.patch.object(
-                 replica_managers.request_postgres,
-                 'inspect_bound_ordinary_launch',
-                 side_effect=interrupt), \
-             mock.patch.object(manager,
-                               '_install_bound_launch_adopter') as install, \
-             mock.patch.object(
-                 manager,
-                 '_release_unstarted_location_retry') as release_retry, \
-             mock.patch.object(manager, '_remove_replica') as cleanup:
-            with self.assertRaises(InspectInterrupt) as raised:
-                self._launch_v2(manager,
-                                self._v2_override(location,
-                                                  exact_shape={'H200': 1},
-                                                  attributed=True),
-                                actuation_lease=lease)
-
-        self.assertIs(raised.exception, interrupt)
-        completion_event.set.assert_called_once_with()
-        install.assert_not_called()
-        release_retry.assert_not_called()
-        cleanup.assert_not_called()
-        placer.release_retry.assert_not_called()
-        placer.set_preemptive.assert_not_called()
-
     def test_v2_committed_adopter_registration_baseexception_escapes_exactly(
             self):
 
@@ -5620,9 +5568,10 @@ class TestFillLaunchPath(unittest.TestCase):
         manager._launch_completion_event = completion_event
         bound_task = types.SimpleNamespace(
             resources=[types.SimpleNamespace(cloud=clouds.Kubernetes())])
-        reduction = types.SimpleNamespace(context=types.SimpleNamespace(
-            request_id='request-id'))
         worker = mock.Mock()
+
+        def _commit(spec):
+            return self._committed_admission(manager, spec)
 
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
@@ -5650,11 +5599,7 @@ class TestFillLaunchPath(unittest.TestCase):
                  return_value=mock.sentinel.prepared), \
              mock.patch.object(reserved_fill_admission,
                                'admit',
-                               side_effect=self._committed_admission), \
-             mock.patch.object(
-                 replica_managers.request_postgres,
-                 'inspect_bound_ordinary_launch',
-                 return_value=reduction), \
+                               side_effect=_commit), \
              mock.patch.object(manager,
                                '_build_bound_launch_adopter',
                                return_value=worker), \
@@ -5723,8 +5668,6 @@ class TestFillLaunchPath(unittest.TestCase):
         existing = []
         bound_task = types.SimpleNamespace(
             resources=[types.SimpleNamespace(cloud=clouds.Kubernetes())])
-        reduction = types.SimpleNamespace(context=types.SimpleNamespace(
-            request_id='request-id'))
         worker = mock.Mock()
         worker.ident = None
         worker.start.side_effect = start_interrupt
@@ -5732,7 +5675,7 @@ class TestFillLaunchPath(unittest.TestCase):
 
         def _commit(spec):
             admitted_infos.append(spec.replica_info)
-            return self._committed_admission(spec)
+            return self._committed_admission(manager, spec)
 
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
@@ -5764,7 +5707,8 @@ class TestFillLaunchPath(unittest.TestCase):
              mock.patch.object(
                  replica_managers.request_postgres,
                  'inspect_bound_ordinary_launch',
-                 return_value=reduction), \
+                 side_effect=AssertionError(
+                     'committed admission must not be reinspected')), \
              mock.patch.object(manager,
                                '_build_bound_launch_adopter',
                                return_value=worker), \
@@ -6115,15 +6059,7 @@ class TestFillLaunchPath(unittest.TestCase):
         def _admit(spec):
             events.append('commit')
             admitted_info.append(spec.replica_info)
-            spec.replica_info.zero_cost_admission_sequence = 1
-            return reserved_fill_admission.AdmissionResult(
-                reserved_fill_admission.AdmissionDisposition.COMMITTED,
-                reserved_fill_admission.AdmissionReceipt(
-                    replica_id=7,
-                    replica_record_id=(spec.replica_info.replica_record_id),
-                    association_id='association-id',
-                    request_id='request-id',
-                    launch_generation=1))
+            return self._committed_admission(manager, spec)
 
         def _worker(*args, **kwargs):
             nonlocal worker_constructions
@@ -6402,20 +6338,10 @@ class TestFillLaunchPath(unittest.TestCase):
             self.assertEqual(events, ['physical-enter'])
             events.append('commit')
             admitted_specs.append(spec)
-            spec.replica_info.zero_cost_admission_sequence = 1
-            return reserved_fill_admission.AdmissionResult(
-                reserved_fill_admission.AdmissionDisposition.COMMITTED,
-                reserved_fill_admission.AdmissionReceipt(
-                    replica_id=7,
-                    replica_record_id=spec.replica_info.replica_record_id,
-                    association_id='association-id',
-                    request_id='request-id',
-                    launch_generation=1))
+            return self._committed_admission(manager, spec)
 
         bound_task = types.SimpleNamespace(
             resources=[types.SimpleNamespace(cloud=clouds.Kubernetes())])
-        reduction = types.SimpleNamespace(context=types.SimpleNamespace(
-            request_id='request-id'))
 
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
@@ -6444,7 +6370,8 @@ class TestFillLaunchPath(unittest.TestCase):
              mock.patch.object(
                  replica_managers.request_postgres,
                  'inspect_bound_ordinary_launch',
-                 return_value=reduction), \
+                 side_effect=AssertionError(
+                     'committed admission must not be reinspected')), \
              mock.patch.object(manager,
                                '_install_bound_launch_adopter',
                                return_value=True) as install, \
