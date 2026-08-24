@@ -100,6 +100,10 @@ class ReconcileApiServerTest(unittest.TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(
+            self._aws_args_path.exists(),
+            'reconciliation exited before invoking aws update-kubeconfig',
+        )
         args = [
             arg.decode()
             for arg in self._aws_args_path.read_bytes().split(b'\0')
