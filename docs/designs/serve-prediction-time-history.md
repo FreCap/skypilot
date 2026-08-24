@@ -196,11 +196,13 @@ behind the existing data-plane bearer middleware. For a ledger-qualified
 request it accepts one bounded JSON object with `request_id`, `attempt_id`,
 attempt number, expected revision, immutable intent digest, terminal `status`,
 and bounded nonnegative integer `processing_time_us`. It never forwards the
-request to a replica. The load balancer first reads the current receipt and requires the
-same request digest, attempt UUID, attempt number, and a revision at least as
-new as the submitted fence. It then commits the terminal transition through
-the stable API Service using the purpose-specific LB-sync token and returns
-success only after PostgreSQL accepts it. Identical at-least-once delivery
+request to a replica. The load balancer submits the terminal transition directly
+through the stable API Service using the purpose-specific LB-sync token.
+PostgreSQL atomically requires the same request digest, attempt UUID, attempt
+number, and a current revision at least as new as the submitted fence. A 409
+from an older exact-revision API triggers one current-receipt lookup and one
+retry fenced to that looked-up revision. The callback returns success only after
+PostgreSQL accepts it. Identical at-least-once delivery
 returns the same receipt; conflicting delivery returns 409; temporary
 persistence failure returns 503 so the terminal reporter retains and retries the
 already-durable outcome. Status polling may feed the latency histogram, but it
@@ -259,8 +261,9 @@ from the semantic digest, such as an expired presigned query credential for the
 same stable object identity. It must not re-read prediction, pipeline, feature-
 flag, provider, or service-selection state. Missing, changed, undecryptable, or
 digest-mismatched prepared state fails closed before any network send.
-Each load balancer checks the current attempt before queue and route selection
-and commits a projection-fenced bind before transport.
+Each load balancer commits one atomic projection-fenced bind before transport;
+the bind itself returns an existing non-rejected attempt without dispatch
+authority, so the steady path needs no preceding read.
 The PostgreSQL logical-request lock serializes concurrent binders: exactly one
 fresh bind has `dispatch_authorized: true`; every concurrent or later matching
 POST receives the complete existing receipt and performs no worker send. A
@@ -681,14 +684,15 @@ fabricated terminal result. Any future remote-cancel or expiry transition must
 prove handler quiescence and survive late marker/result races before it may
 replace this policy.
 
-Before queue or route selection, the LB performs `bind` with
-`allow_new_attempt: false`. It returns an existing current receipt or 404 and
-cannot create or advance an attempt. A non-retryable existing receipt returns
-409 plus the full receipt without requiring a ready route. Only
-`REJECTED_PRE_DISPATCH` permits the LB to select a fresh route and issue `bind`
-with `allow_new_attempt: true`; only that second operation may create a new
-dispatch attempt. `DISPATCH_MAY_HAVE_OCCURRED`, `ACCEPTED`, `AMBIGUOUS`, and
-terminal receipts never authorize another provider send. Service-hash isolation
+After route selection, the LB performs one atomic `bind` with
+`allow_new_attempt: true`. It returns an existing current receipt without
+dispatch authority, or creates a fresh projection-fenced attempt. Only a
+current `REJECTED_PRE_DISPATCH` receipt permits creation of a successor;
+`DISPATCH_MAY_HAVE_OCCURRED`, `ACCEPTED`, `AMBIGUOUS`, and terminal receipts
+never authorize another provider send. If no provider route can be selected,
+the pre-dispatch error path performs the read-only lookup before it records a
+durable rejection, preserving existing-attempt recovery without charging every
+successful submission for that read. Service-hash isolation
 keeps late writes from an older incarnation fenced if the service is ever
 explicitly recreated. The operator must not recreate the service while exact
 rows are nonterminal, because the new incarnation cannot recover the old
