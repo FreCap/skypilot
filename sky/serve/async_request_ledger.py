@@ -864,6 +864,10 @@ class AsyncRequestLedgerRepository:
                     raise AsyncRequestLedgerConflict(
                         'Request intent or attempt fence does not match.')
                 state = AsyncRequestState(current['state'])
+                current_revision = int(current['revision'])
+                if operation == 'terminal' and current_revision < revision:
+                    raise AsyncRequestLedgerConflict(
+                        'Request revision fence does not match.')
                 if operation == 'accepted' and (state in (
                         AsyncRequestState.ACCEPTED, AsyncRequestState.AMBIGUOUS)
                                                 or state.is_terminal):
@@ -882,14 +886,14 @@ class AsyncRequestLedgerRepository:
                         return _receipt(current, duplicate=True)
                     raise AsyncRequestLedgerConflict(
                         'A different terminal receipt already exists.')
-                if int(current['revision']) != revision:
+                if operation != 'terminal' and current_revision != revision:
                     raise AsyncRequestLedgerConflict(
                         'Request revision fence does not match.')
                 now = connection.execute(
                     sqlalchemy.select(
                         sqlalchemy.func.clock_timestamp())).scalar_one()
                 values: dict[str, Any] = {
-                    'revision': revision + 1,
+                    'revision': current_revision + 1,
                     'updated_at': now,
                 }
                 if operation == 'accepted':

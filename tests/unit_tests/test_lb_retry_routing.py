@@ -321,6 +321,18 @@ class TestExactLedgerPredispatch(unittest.TestCase):
             balancer._post_async_ledger.await_args.args[0]['request_id'],
             'execution-1')
 
+    def test_admitted_request_skips_redundant_read_before_atomic_bind(self):
+        balancer = self._balancer()
+        balancer._proxy_with_retries_inner = mock.AsyncMock(
+            return_value=fastapi.responses.Response(status_code=200))
+
+        response = asyncio.run(
+            balancer._proxy_with_retries(_exact_ledger_request(self._body())))
+
+        self.assertEqual(response.status_code, 200)
+        balancer._lookup_async_ledger.assert_not_awaited()
+        balancer._proxy_with_retries_inner.assert_awaited_once()
+
     def test_lost_ack_recovers_existing_attempt_without_ready_route(self):
         balancer = self._balancer()
         receipt = ledger_client.AsyncLedgerReceipt(

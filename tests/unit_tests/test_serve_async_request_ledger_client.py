@@ -299,6 +299,12 @@ def test_terminal_observation_receipt_is_exact_and_idempotent() -> None:
     assert ledger_client.validate_terminal_observation_receipt(
         _REQUEST_ID, attempt_id, 1, 7, 'SUCCEEDED', duplicate) is duplicate
 
+    # The completion reporter only knows the bind revision.  An intervening
+    # ACCEPTED transition may advance the authoritative row more than once.
+    advanced = dataclasses.replace(committed, revision=9)
+    assert ledger_client.validate_terminal_observation_receipt(
+        _REQUEST_ID, attempt_id, 1, 7, 'SUCCEEDED', advanced) is advanced
+
 
 def test_terminal_observation_rejects_inexact_receipt() -> None:
     attempt_id = str(uuid.uuid4())
@@ -311,7 +317,7 @@ def test_terminal_observation_rejects_inexact_receipt() -> None:
         dataclasses.replace(receipt, attempt_id=str(uuid.uuid4())),
         dataclasses.replace(receipt, attempt_no=2),
         dataclasses.replace(receipt, state='FAILED'),
-        dataclasses.replace(receipt, revision=9),
+        dataclasses.replace(receipt, revision=7),
         dataclasses.replace(receipt, dispatch_authorized=True),
     )
     for invalid in invalid_receipts:
@@ -362,3 +368,93 @@ def test_read_only_lookup_maps_only_404_to_absent() -> None:
             asyncio.run(client.lookup({'operation': 'bind'}, 'hash'))
     finally:
         asyncio.run(client.close())
+
+
+def test_transport_bounds_total_work_and_reserves_slots_for_mutations(
+        monkeypatch) -> None:
+
+    class _Response:
+        status_code = 200
+        content = b'{}'
+
+        @staticmethod
+        def json():
+            return {}
+
+    class _BlockingClient:
+        """Fake transport that exposes active-call concurrency."""
+
+        def __init__(self) -> None:
+            self.release = asyncio.Event()
+            self.active = 0
+            self.active_lookups = 0
+            self.max_active = 0
+            self.mutation_started = asyncio.Event()
+
+        async def post(self, unused_url, **kwargs):
+            payload = kwargs['json']
+            headers = kwargs['headers']
+            del unused_url, headers
+            is_lookup = (payload.get('operation') == 'bind' and
+                         payload.get('allow_new_attempt') is False)
+            self.active += 1
+            self.active_lookups += int(is_lookup)
+            self.max_active = max(self.max_active, self.active)
+            if not is_lookup:
+                self.mutation_started.set()
+            try:
+                await self.release.wait()
+                return _Response()
+            finally:
+                self.active -= 1
+                self.active_lookups -= int(is_lookup)
+
+        async def aclose(self):
+            pass
+
+    transport = _BlockingClient()
+    monkeypatch.setattr(ledger_client.httpx, 'AsyncClient',
+                        lambda **unused_kwargs: transport)
+    monkeypatch.setattr(ledger_client.serve_utils, 'get_lb_sync_auth_tokens',
+                        lambda required: ())
+    client = ledger_client.AsyncRequestLedgerClient('http://controller')
+
+    async def _run() -> None:
+        lookup_payload = {
+            'operation': 'bind',
+            'allow_new_attempt': False,
+        }
+        mutation_payload = {'operation': 'accepted'}
+        lookups = [
+            asyncio.create_task(client._post_raw(lookup_payload, 'hash'))
+            for _ in range(32)
+        ]
+        for _ in range(100):
+            if transport.active_lookups == (
+                    constants.LB_ASYNC_REQUEST_LEDGER_MAX_LOOKUP_CONCURRENCY):
+                break
+            await asyncio.sleep(0)
+        assert transport.active_lookups == (
+            constants.LB_ASYNC_REQUEST_LEDGER_MAX_LOOKUP_CONCURRENCY)
+
+        mutations = [
+            asyncio.create_task(client._post_raw(mutation_payload, 'hash'))
+            for _ in range(32)
+        ]
+        await asyncio.wait_for(transport.mutation_started.wait(), timeout=1)
+        for _ in range(100):
+            if transport.active == constants.LB_ASYNC_REQUEST_LEDGER_MAX_CONCURRENCY:
+                break
+            await asyncio.sleep(0)
+        assert transport.active == constants.LB_ASYNC_REQUEST_LEDGER_MAX_CONCURRENCY
+        assert transport.max_active == (
+            constants.LB_ASYNC_REQUEST_LEDGER_MAX_CONCURRENCY)
+
+        # Hundreds of callers may await the passive gates without monopolizing
+        # the loop that also serves the Kubernetes liveness route.
+        await asyncio.wait_for(asyncio.sleep(0), timeout=0.1)
+        transport.release.set()
+        await asyncio.gather(*lookups, *mutations)
+        await client.close()
+
+    asyncio.run(_run())

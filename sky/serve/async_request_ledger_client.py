@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import hashlib
 import json
@@ -420,7 +421,7 @@ def validate_predispatch_rejection(
 
 def validate_terminal_observation_receipt(
         request_id: str, attempt_id: str, attempt_no: int,
-        expected_revision: int, terminal_state: str,
+        minimum_revision: int, terminal_state: str,
         receipt: AsyncLedgerReceipt) -> AsyncLedgerReceipt:
     """Fence an out-of-band completion acknowledgement before aggregation."""
     try:
@@ -430,14 +431,14 @@ def validate_terminal_observation_receipt(
     if (not isinstance(request_id, str) or not request_id or
             canonical_attempt_id != attempt_id or type(attempt_no) is not int or
             not 1 <= attempt_no <= (1 << 63) - 1 or
-            type(expected_revision) is not int or expected_revision < 1 or
+            type(minimum_revision) is not int or minimum_revision < 1 or
             terminal_state not in _TERMINAL_STATES):
         raise AsyncLedgerTransportError(
             503, 'Async ledger terminal identity is malformed.')
     request_key = hashlib.sha256(request_id.encode('utf-8')).hexdigest()
     exact_revision = (
-        (not receipt.duplicate and receipt.revision == expected_revision + 1) or
-        (receipt.duplicate and receipt.revision >= expected_revision))
+        (not receipt.duplicate and receipt.revision > minimum_revision) or
+        (receipt.duplicate and receipt.revision >= minimum_revision))
     if (receipt.request_key_sha256 != request_key or
             receipt.attempt_id != attempt_id or
             receipt.attempt_no != attempt_no or
@@ -480,14 +481,37 @@ class AsyncRequestLedgerClient:
 
     def __init__(self, controller_url: str) -> None:
         self._url = controller_url + constants.LB_ASYNC_REQUEST_LEDGER_PATH
+        self._request_slots = asyncio.Semaphore(
+            constants.LB_ASYNC_REQUEST_LEDGER_MAX_CONCURRENCY)
+        self._lookup_slots = asyncio.Semaphore(
+            constants.LB_ASYNC_REQUEST_LEDGER_MAX_LOOKUP_CONCURRENCY)
         self._client = httpx.AsyncClient(
-            timeout=constants.LB_ASYNC_REQUEST_LEDGER_TIMEOUT_SECONDS)
+            timeout=constants.LB_ASYNC_REQUEST_LEDGER_TIMEOUT_SECONDS,
+            limits=httpx.Limits(max_connections=constants.
+                                LB_ASYNC_REQUEST_LEDGER_MAX_CONCURRENCY,
+                                max_keepalive_connections=constants.
+                                LB_ASYNC_REQUEST_LEDGER_MAX_CONCURRENCY))
 
     async def close(self) -> None:
         await self._client.aclose()
 
     async def _post_raw(self, payload: dict[str, Any],
                         service_hash: str) -> tuple[int, Any]:
+        read_only_lookup = (payload.get('operation') == 'bind' and
+                            payload.get('allow_new_attempt') is False)
+        if read_only_lookup:
+            async with self._lookup_slots:
+                return await self._post_raw_bounded(payload, service_hash)
+        return await self._post_raw_bounded(payload, service_hash)
+
+    async def _post_raw_bounded(self, payload: dict[str, Any],
+                                service_hash: str) -> tuple[int, Any]:
+        """Use a small transport window while queued coroutines stay passive."""
+        async with self._request_slots:
+            return await self._post_raw_in_slot(payload, service_hash)
+
+    async def _post_raw_in_slot(self, payload: dict[str, Any],
+                                service_hash: str) -> tuple[int, Any]:
         tokens = serve_utils.get_lb_sync_auth_tokens(required=True)
         token_attempts: tuple[str | None, ...] = (tokens if tokens else (None,))
         for token_index, token in enumerate(token_attempts):

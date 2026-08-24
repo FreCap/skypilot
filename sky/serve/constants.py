@@ -502,6 +502,12 @@ LB_DEMAND_REPORT_PATH = '/demand'
 LB_ASYNC_REQUEST_LEDGER_PATH = '/async-request-ledger'
 LB_ASYNC_REQUEST_LEDGER_MAX_BYTES = 16 * 1024
 LB_ASYNC_REQUEST_LEDGER_TIMEOUT_SECONDS = 10
+# Bound one active load balancer below the stable API's PostgreSQL worker
+# concurrency.  Read-only reconciliation gets half the budget so a lookup burst
+# cannot starve bind and terminal receipts, which are correctness-critical
+# writes on the provider dispatch path.
+LB_ASYNC_REQUEST_LEDGER_MAX_CONCURRENCY = 16
+LB_ASYNC_REQUEST_LEDGER_MAX_LOOKUP_CONCURRENCY = 8
 LB_DEMAND_REPORT_PROTOCOL_VERSION = 2
 LB_DEMAND_REPORT_MIN_PROTOCOL_VERSION = 1
 LB_DEMAND_REPORT_INTERVAL_SECONDS = 5

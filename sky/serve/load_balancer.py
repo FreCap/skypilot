@@ -2535,9 +2535,35 @@ class SkyServeLoadBalancer:
         receipt = async_request_ledger_client.get_receipt(request)
         if receipt is None:
             try:
+                # The success path binds atomically and therefore needs no
+                # read-before-write.  Only a request that could not select a
+                # provider route pays for this lookup, preserving prompt
+                # lost-ack recovery when a duplicate arrives with no capacity.
+                receipt = await self._lookup_async_ledger(request, identity)
+            except async_request_ledger_client.AsyncLedgerTransportError as ledger_error:
+                logger.warning(
+                    'Failed to read an exact pre-dispatch attempt: %s',
+                    ledger_error.detail)
+                return self._unknown_ledger_outcome_response()
+        if receipt is not None and receipt.state != 'REJECTED_PRE_DISPATCH':
+            return self._existing_async_attempt_response(receipt)
+        if receipt is None:
+            try:
                 receipt = await self._reject_async_ledger_before_dispatch(
                     request)
             except async_request_ledger_client.AsyncLedgerTransportError as ledger_error:
+                if ledger_error.status_code == 409:
+                    # Another active LB may have bound between the read-only
+                    # miss and rejection.  Resolve that race without ever
+                    # authorizing a second provider send.
+                    try:
+                        receipt = await self._lookup_async_ledger(
+                            request, identity)
+                    except async_request_ledger_client.AsyncLedgerTransportError:
+                        receipt = None
+                    if (receipt is not None and
+                            receipt.state != 'REJECTED_PRE_DISPATCH'):
+                        return self._existing_async_attempt_response(receipt)
                 logger.warning(
                     'Failed to persist an exact pre-dispatch '
                     'rejection: %s', ledger_error.detail)
@@ -2801,23 +2827,31 @@ class SkyServeLoadBalancer:
             'processing_time_us': processing_time_us,
         }
         try:
-            current = await self._lookup_async_ledger_receipt(
-                payload['request_id'], payload['intent_sha256'])
-            if current is None:
-                raise async_request_ledger_client.AsyncLedgerTransportError(
-                    409, 'No durable request attempt exists.')
-            current = (
-                async_request_ledger_client.validate_terminal_lookup_receipt(
-                    payload['request_id'], payload['attempt_id'],
-                    payload['attempt_no'], payload['expected_revision'],
-                    current))
-            ledger_payload['expected_revision'] = current.revision
-            receipt = await self._post_async_ledger(ledger_payload)
+            try:
+                receipt = await self._post_async_ledger(ledger_payload)
+            except async_request_ledger_client.AsyncLedgerTransportError as error:
+                if error.status_code != 409:
+                    raise
+                # A mixed-version API server may still require the exact current
+                # revision.  Resolve and retry once only on its conflict; the
+                # current server treats expected_revision as a minimum and keeps
+                # the normal path to one write.
+                current = await self._lookup_async_ledger_receipt(
+                    payload['request_id'], payload['intent_sha256'])
+                if current is None:
+                    raise error
+                current = (async_request_ledger_client.
+                           validate_terminal_lookup_receipt(
+                               payload['request_id'], payload['attempt_id'],
+                               payload['attempt_no'],
+                               payload['expected_revision'], current))
+                ledger_payload['expected_revision'] = current.revision
+                receipt = await self._post_async_ledger(ledger_payload)
             receipt = (async_request_ledger_client.
                        validate_terminal_observation_receipt(
                            payload['request_id'], payload['attempt_id'],
-                           payload['attempt_no'], current.revision, status,
-                           receipt))
+                           payload['attempt_no'], payload['expected_revision'],
+                           status, receipt))
         except async_request_ledger_client.AsyncLedgerTransportError as error:
             raise fastapi.HTTPException(
                 status_code=(error.status_code
@@ -5474,19 +5508,6 @@ class SkyServeLoadBalancer:
             # effects and must not be converted to durable rejections.
             self._release_waiting_body_budget(request, drop_body=True)
             raise
-        if ledger_identity is not None:
-            try:
-                current_receipt = await self._lookup_async_ledger(
-                    request, ledger_identity)
-            except async_request_ledger_client.AsyncLedgerTransportError as error:
-                logger.warning('Failed to read the exact current attempt: %s',
-                               error.detail)
-                self._release_waiting_body_budget(request, drop_body=True)
-                return self._unknown_ledger_outcome_response()
-            if (current_receipt is not None and
-                    current_receipt.state != 'REJECTED_PRE_DISPATCH'):
-                self._release_waiting_body_budget(request, drop_body=True)
-                return self._existing_async_attempt_response(current_receipt)
         try:
             if self._draining:
                 # The readiness change needs time to propagate through the
