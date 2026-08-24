@@ -240,10 +240,11 @@ _RESERVED_FILL_PHYSICAL_PREFLIGHT_TIMEOUT_SECONDS = 45
 _RESERVED_FILL_PHYSICAL_PREFLIGHT_RELEASE_TIMEOUT_SECONDS = 1
 _ZERO_COST_ACTUATION_LEASE_SECONDS = 90
 _ZERO_COST_ACTUATION_POLL_SECONDS = 1
-# Bound each lane's consecutive manager-mutex work while amortizing one
-# physical-cluster preflight across the repository's bounded lease batch. This
-# matches SkyServe's historical per-service launch parallelism and lets another
-# physical pool acquire the mutex between chunks.
+# Lease only the work one lane is about to materialize.  The repository may
+# retain a wider provider-free pending window, but leasing that complete window
+# makes its tail age behind controller-local work and prevents a successor
+# allocation from refreshing it.  Four matches SkyServe's historical
+# per-service launch parallelism and bounds consecutive manager-mutex work.
 _ZERO_COST_ACTUATION_QUANTUM = 4
 # The current version plus two recently used recovery versions. Older
 # versions remain recoverable from their immutable PostgreSQL YAML/spec rows;
@@ -9418,7 +9419,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             and owner_fingerprint == intent.controller_owner)
 
     def _actuate_zero_cost_pool(self, pool_key: str) -> None:
-        """Stage one bounded lease batch in an independent physical-pool lane."""
+        """Stage one JIT quantum in an independent physical-pool lane."""
         leases: tuple[zero_cost_actuation.IntentLease, ...] = ()
         handled_intent_keys: set[str] = set()
         preflights: _ReservedFillPhysicalPreflightBatch | None = None
@@ -9432,7 +9433,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 pool_key=pool_key,
                 owner=self._zero_cost_actuation_executor_id,
                 lease_seconds=_ZERO_COST_ACTUATION_LEASE_SECONDS,
-                max_leases=zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE)
+                max_leases=_ZERO_COST_ACTUATION_QUANTUM)
             if not leases:
                 return
             actionable: list[zero_cost_actuation.IntentLease] = []
@@ -9464,9 +9465,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                         chunk = actionable[chunk_start:chunk_start +
                                            _ZERO_COST_ACTUATION_QUANTUM]
                         with self.lock:
-                            # Another pool may materialize while this lane yields
-                            # the mutex between chunks. Refresh both the durable
-                            # graph and replica-ID set on every acquisition.
+                            # Refresh both the durable graph and replica-ID set
+                            # immediately before this JIT quantum commits.
                             infos = serve_state.get_replica_infos(
                                 self._service_name)
                             used_replica_ids = {
@@ -9496,7 +9496,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 except (reserved_fill_admission.
                                         AdmissionAmbiguousError) as error:
                                     # Preserve only this exact maybe-committed
-                                    # graph.  Later batch members remain
+                                    # graph. Later quantum members remain
                                     # independently actionable.
                                     materialization_committed = True
                                     window_released = True
@@ -9506,7 +9506,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     logger.warning(
                                         'Zero-cost admission for pool %s intent '
                                         '%s is ambiguous; preserving it and '
-                                        'continuing the bounded wave: %s',
+                                        'continuing the JIT quantum: %s',
                                         pool_key, intent_key,
                                         common_utils.format_exception(error))
                                     continue
@@ -9580,7 +9580,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         raise
                     preflights = None
             if ambiguous_error is not None:
-                # Finish every independently actionable batch member, then
+                # Finish every independently actionable quantum member, then
                 # enter the established ambiguity path exactly once. It owns
                 # the sole reconciliation signal and preserves BaseException
                 # precedence without retrying the provider effect.
@@ -9668,11 +9668,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             # the current SafeThread remains registered races with the
             # dispatcher's is_alive() filter: it can consume the wakeup, retain
             # this almost-finished thread, and impose the one-second poll delay
-            # before the next bounded wave.  All provider and graph work is
+            # before the next JIT quantum. All provider and graph work is
             # complete at this point, so removing only our exact thread hands
-            # actuation ownership to the next wave without overlapping work.
-            if (window_released and len(leases)
-                    == zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE):
+            # actuation ownership to the next quantum without overlapping work.
+            if (window_released and
+                    len(leases) == _ZERO_COST_ACTUATION_QUANTUM):
                 current_thread = threading.current_thread()
                 with self._zero_cost_actuation_lane_lock:
                     if (self._zero_cost_actuation_lanes.get(pool_key)

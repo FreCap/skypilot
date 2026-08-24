@@ -430,8 +430,7 @@ def test_durable_pool_executor_does_not_serialize_independent_pools() -> None:
     repository.terminate.assert_not_called()
 
 
-def test_durable_pool_executor_amortizes_preflight_across_full_lease_batch(
-) -> None:
+def test_durable_pool_executor_leases_one_just_in_time_quantum() -> None:
     manager = _manager()
 
     class RecordingLock:
@@ -460,7 +459,7 @@ def test_durable_pool_executor_amortizes_preflight_across_full_lease_batch(
     manager._zero_cost_actuation_executor_id = (  # pylint: disable=protected-access
         mock.sentinel.executor_id)
     manager._scale_reconciliation_event = threading.Event()  # pylint: disable=protected-access
-    lease_batch_size = zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE
+    lease_batch_size = replica_managers._ZERO_COST_ACTUATION_QUANTUM
     plan = _plan((_snapshot('east-context', 'uid-east', lease_batch_size),))
     pool_key = plan.intents[0].pool_key
     lane_event = mock.Mock(spec=threading.Event)
@@ -526,9 +525,7 @@ def test_durable_pool_executor_amortizes_preflight_across_full_lease_batch(
         'workspace-a')
     release.assert_called_once_with(preflights)
     assert scale_one.call_count == lease_batch_size
-    assert recording_lock.chunk_sizes == [
-        replica_managers._ZERO_COST_ACTUATION_QUANTUM
-    ] * (lease_batch_size // replica_managers._ZERO_COST_ACTUATION_QUANTUM)
+    assert recording_lock.chunk_sizes == [lease_batch_size]
     assert get_replica_infos.call_count == len(recording_lock.chunk_sizes)
     repository.release_retryable.assert_not_called()
     repository.terminate.assert_not_called()
@@ -536,7 +533,7 @@ def test_durable_pool_executor_amortizes_preflight_across_full_lease_batch(
     assert pool_key not in manager._zero_cost_actuation_lanes  # pylint: disable=protected-access
 
 
-def test_durable_pool_executor_yields_manager_lock_between_quanta() -> None:
+def test_durable_pool_executor_bounds_manager_lock_to_one_quantum() -> None:
     manager = _manager()
     start_second_pool = threading.Event()
     second_pool_waiting = threading.Event()
@@ -588,7 +585,7 @@ def test_durable_pool_executor_yields_manager_lock_between_quanta() -> None:
     manager._zero_cost_actuation_event = threading.Event()  # pylint: disable=protected-access
     manager._zero_cost_actuation_lane_lock = threading.Lock()  # pylint: disable=protected-access
     manager._zero_cost_actuation_lanes = {}  # pylint: disable=protected-access
-    first_pool_size = replica_managers._ZERO_COST_ACTUATION_QUANTUM + 1
+    first_pool_size = replica_managers._ZERO_COST_ACTUATION_QUANTUM
     plan = _plan(
         (_snapshot('east-context', 'uid-east',
                    first_pool_size), _snapshot('west-context', 'uid-west', 1)))
@@ -690,11 +687,10 @@ def test_durable_pool_executor_yields_manager_lock_between_quanta() -> None:
     assert not worker_errors
     assert second_pool_was_waiting == [True]
     assert interleaving_lock.second_pool_interleaved
-    assert launch_order == ['uid-east'] * 4 + ['uid-west', 'uid-east']
+    assert launch_order == ['uid-east'] * 4 + ['uid-west']
     assert interleaving_lock.chunks == [
         ('actuation-pool-a', 4),
         ('actuation-pool-b', 1),
-        ('actuation-pool-a', 1),
     ]
     assert max(chunk_size for _, chunk_size in interleaving_lock.chunks) <= 4
     assert sorted(
@@ -703,8 +699,174 @@ def test_durable_pool_executor_yields_manager_lock_between_quanta() -> None:
         ]
     assert repository.lease_batch.call_count == 2
     assert all(call.kwargs['max_leases'] ==
-               zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE
+               replica_managers._ZERO_COST_ACTUATION_QUANTUM
                for call in repository.lease_batch.call_args_list)
+
+
+def test_dispatcher_hands_off_full_window_one_quantum_at_a_time() -> None:
+    manager = _manager()
+    manager.lock = threading.Lock()
+    manager._workspace = 'workspace-a'  # pylint: disable=protected-access
+    manager._zero_cost_actuation_executor_id = (  # pylint: disable=protected-access
+        mock.sentinel.executor_id)
+    manager._scale_reconciliation_event = threading.Event()  # pylint: disable=protected-access
+    manager._zero_cost_actuation_lane_lock = threading.Lock()  # pylint: disable=protected-access
+    manager._zero_cost_actuation_lanes = {}  # pylint: disable=protected-access
+
+    window_size = zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE
+    plan = _plan((_snapshot('east-context', 'uid-east', window_size),))
+    pool_key = plan.intents[0].pool_key
+    pending = list(plan.intents)
+    repository_lock = threading.Lock()
+    lease_calls: list[tuple[threading.Thread, tuple[SimpleNamespace, ...]]] = []
+    first_lane: list[threading.Thread] = []
+    second_lease_started = threading.Event()
+    second_started_while_first_alive: list[bool] = []
+    repository = mock.Mock()
+
+    def actionable_pool_keys(**_kwargs):
+        with repository_lock:
+            return (pool_key,) if pending else ()
+
+    def lease_batch(**kwargs):
+        current = threading.current_thread()
+        with repository_lock:
+            intents = tuple(pending[:kwargs['max_leases']])
+            del pending[:len(intents)]
+        leases = tuple(SimpleNamespace(intent=intent) for intent in intents)
+        lease_calls.append((current, leases))
+        if not first_lane:
+            first_lane.append(current)
+        elif len(lease_calls) == 2:
+            second_started_while_first_alive.append(first_lane[0].is_alive())
+            second_lease_started.set()
+        return leases
+
+    repository.actionable_pool_keys.side_effect = actionable_pool_keys
+    repository.lease_batch.side_effect = lease_batch
+    manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
+
+    lane_absent_before_signal: list[bool] = []
+    first_handoff_observed_second_lane: list[bool] = []
+
+    class HandoffEvent(threading.Event):
+        """Hold the first lane tail open while the dispatcher hands off."""
+
+        def set(self) -> None:
+            current = threading.current_thread()
+            if first_lane and current is first_lane[0]:
+                with manager._zero_cost_actuation_lane_lock:  # pylint: disable=protected-access
+                    lane_absent_before_signal.append(
+                        manager._zero_cost_actuation_lanes.get(pool_key)  # pylint: disable=protected-access
+                        is not current)
+                super().set()
+                first_handoff_observed_second_lane.append(
+                    second_lease_started.wait(timeout=2))
+                return
+            super().set()
+
+    handoff_event = HandoffEvent()
+    manager._zero_cost_actuation_event = handoff_event  # pylint: disable=protected-access
+    stop_dispatcher = threading.Event()
+    manager._manager_daemon_should_stop = stop_dispatcher.is_set  # pylint: disable=protected-access
+
+    active_provider_phases = 0
+    max_active_provider_phases = 0
+    provider_phase_lock = threading.Lock()
+
+    @contextlib.contextmanager
+    def provider_admission(*_args, **_kwargs):
+        nonlocal active_provider_phases, max_active_provider_phases
+        with provider_phase_lock:
+            active_provider_phases += 1
+            max_active_provider_phases = max(max_active_provider_phases,
+                                             active_provider_phases)
+        try:
+            yield mock.sentinel.admission
+        finally:
+            with provider_phase_lock:
+                active_provider_phases -= 1
+
+    processed: list[str] = []
+    full_window_processed = threading.Event()
+
+    def materialize(resources_override, _used_replica_ids, *_args, **_kwargs):
+        processed.append(resources_override[
+            replica_managers.serve_constants.
+            RESERVED_FILL_INTENT_IDEMPOTENCY_KEY_OVERRIDE_KEY])
+        if len(processed) == window_size:
+            stop_dispatcher.set()
+            full_window_processed.set()
+        return replica_managers._ReplicaLaunchResult(  # pylint: disable=protected-access
+            replica_id=len(processed),
+            planned_capacity=1,
+            funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)  # pylint: disable=protected-access
+
+    def start_preflights(intents, _admission, _workspace):
+        return SimpleNamespace(
+            preflights={
+                (intent.allowed_locations[0].region, intent.physical_cluster_uid):
+                    SimpleNamespace(error=None) for intent in intents
+            })
+
+    dispatcher = threading.Thread(
+        target=manager._zero_cost_actuation_dispatcher,
+        name='zero-cost-dispatcher')  # pylint: disable=protected-access
+    completed_full_window = False
+    with mock.patch.object(
+            manager,
+            '_zero_cost_actuation_authority_current',
+            return_value=True), mock.patch.object(
+                zero_cost_actuation,
+                'get_service_mode',
+                return_value=zero_cost_actuation.ActuationMode.DURABLE_INTENT), \
+            mock.patch.object(
+                replica_managers.provider_phase,
+                'try_provider_phase',
+                side_effect=provider_admission), mock.patch.object(
+                    manager,
+                    '_start_reserved_fill_physical_preflights',
+                    side_effect=start_preflights), mock.patch.object(
+                        manager,
+                        '_release_reserved_fill_physical_preflights'), \
+            mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[]), mock.patch.object(
+                    manager,
+                    '_scale_up_one_locked',
+                    side_effect=materialize):
+        dispatcher.start()
+        try:
+            completed_full_window = full_window_processed.wait(timeout=5)
+            dispatcher.join(timeout=5)
+        finally:
+            if dispatcher.is_alive():
+                stop_dispatcher.set()
+                threading.Event.set(handoff_event)
+                dispatcher.join(timeout=2)
+
+    assert completed_full_window
+    assert not dispatcher.is_alive()
+    for lane, _ in lease_calls:
+        lane.join(timeout=2)
+        assert not lane.is_alive()
+    assert repository.lease_batch.call_count == window_size // (
+        replica_managers._ZERO_COST_ACTUATION_QUANTUM)
+    assert all(call.kwargs['max_leases'] ==
+               replica_managers._ZERO_COST_ACTUATION_QUANTUM
+               for call in repository.lease_batch.call_args_list)
+    assert [len(leases) for _, leases in lease_calls] == [4] * 8
+    assert len({id(lane) for lane, _ in lease_calls}) == 8
+    assert processed == [intent.idempotency_key for intent in plan.intents]
+    assert not pending
+    assert lane_absent_before_signal == [True]
+    assert first_handoff_observed_second_lane == [True]
+    assert second_started_while_first_alive == [True]
+    assert max_active_provider_phases == 1
+    assert pool_key not in manager._zero_cost_actuation_lanes  # pylint: disable=protected-access
+    repository.release_retryable.assert_not_called()
+    repository.terminate.assert_not_called()
 
 
 def test_durable_pool_executor_continues_after_per_intent_ambiguity() -> None:

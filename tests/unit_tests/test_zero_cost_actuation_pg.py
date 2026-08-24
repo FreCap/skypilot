@@ -675,21 +675,24 @@ def test_successor_allocation_preserves_live_actuation_and_refills_after_release
     phx_pool = next(intent.pool_key
                     for intent in predecessor.intents
                     if intent.allowed_locations[0].region == 'phx')
-    lease = repository.lease_next(service_name='svc',
-                                  pool_key=phx_pool,
-                                  owner=uuid.uuid4(),
-                                  lease_seconds=30)
-    assert lease is not None
+    leases = repository.lease_batch(
+        service_name='svc',
+        pool_key=phx_pool,
+        owner=uuid.uuid4(),
+        lease_seconds=30,
+        max_leases=replica_managers._ZERO_COST_ACTUATION_QUANTUM)
+    assert len(leases) == replica_managers._ZERO_COST_ACTUATION_QUANTUM
 
     successor = _multi_pool_plan(free_slots=40,
                                  allocation_generation=6,
                                  valid_until=deadline)
     second = _grant_plan(repository, successor, max_capacity=80)
-    # The old live lease remains authoritative while provider preflight may be
-    # in progress and consumes one PHX window slot.  The successor may replace
-    # only the other provider-free rows, so it cannot duplicate that work.
-    assert len(second.accepted) == 63
-    assert len(second.deferred) == 17
+    # Only one just-in-time quantum remains authoritative while provider
+    # preflight may be in progress.  The successor replaces the other 60
+    # provider-free rows, so controller-local queueing cannot pin the complete
+    # 32-position PHX window to the predecessor allocation.
+    assert len(second.accepted) == 60
+    assert len(second.deferred) == 20
 
     intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
     admissions = kueue_lane_lineage_schema.serve_kueue_admissions_table
@@ -709,13 +712,16 @@ def test_successor_allocation_preserves_live_actuation_and_refills_after_release
     actuating_rows = [
         row for row in predecessor_rows if row.state == 'ACTUATING'
     ]
-    assert len(actuating_rows) == 1
-    assert actuating_rows[0].intent_idempotency_key == (
-        lease.intent.idempotency_key)
-    assert actuating_rows[0].lease_owner == lease.owner
-    assert actuating_rows[0].lease_generation == lease.generation
-    assert actuating_rows[0].lease_expires_at == lease.expires_at
-    assert actuating_rows[0].last_error is None
+    assert len(actuating_rows) == len(leases)
+    actuating_by_key = {
+        row.intent_idempotency_key: row for row in actuating_rows
+    }
+    for lease in leases:
+        row = actuating_by_key[lease.intent.idempotency_key]
+        assert row.lease_owner == lease.owner
+        assert row.lease_generation == lease.generation
+        assert row.lease_expires_at == lease.expires_at
+        assert row.last_error is None
     assert {row.state for row in predecessor_rows} == {'ACTUATING', 'TERMINAL'}
     assert {
         row.last_error for row in predecessor_rows if row.state == 'TERMINAL'
@@ -730,21 +736,23 @@ def test_successor_allocation_preserves_live_actuation_and_refills_after_release
             item.intent_idempotency_key].allowed_locations[0].region == 'phx'
     }
     assert lane_generations == expected_lane_keys | {
-        lease.intent.idempotency_key
+        lease.intent.idempotency_key for lease in leases
     }
 
-    # Once the exact owner settles its pre-provider failure, the obsolete row
-    # is provider-free RETRYABLE.  A replay can retire it and fill the last
-    # successor slot without ever exceeding the per-pool window.
-    assert repository.release_retryable(lease, 'test_preflight_cancelled')
+    # Once the exact owner settles each pre-provider failure, the obsolete rows
+    # are provider-free RETRYABLE.  A replay can retire them and fill the last
+    # successor slots without ever exceeding the per-pool window.
+    for lease in leases:
+        assert repository.release_retryable(lease, 'test_preflight_cancelled')
     third = _grant_plan(repository, successor, max_capacity=80)
     assert len(third.accepted) == 64
     assert len(third.deferred) == 16
     with actuation_database.connect() as connection:
         old = connection.execute(
             sqlalchemy.select(intents.c.state, intents.c.last_error).where(
-                intents.c.intent_idempotency_key ==
-                lease.intent.idempotency_key)).one()
+                intents.c.intent_idempotency_key.in_(
+                    tuple(lease.intent.idempotency_key
+                          for lease in leases)))).all()
         live_by_pool = dict(
             connection.execute(
                 sqlalchemy.select(
@@ -752,7 +760,7 @@ def test_successor_allocation_preserves_live_actuation_and_refills_after_release
                         intents.c.state.in_(
                             ('GRANTED', 'ACTUATING',
                              'RETRYABLE'))).group_by(intents.c.pool_key)).all())
-    assert old == ('TERMINAL', 'allocation_superseded')
+    assert old == [('TERMINAL', 'allocation_superseded')] * len(leases)
     assert sorted(live_by_pool.values()) == [32, 32]
 
 
@@ -899,6 +907,147 @@ def test_kueue_same_domain_window_matches_one_lease_wave(
                                       pool_key=plan.intents[0].pool_key,
                                       owner=owner,
                                       lease_seconds=30)
+
+
+def test_jit_leases_try_every_grant_before_rotating_retryable(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    window_size = zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE
+    quantum = replica_managers._ZERO_COST_ACTUATION_QUANTUM
+    plan = _plan(free_slots=window_size, valid_until=time.time() + 120)
+    receipt = _grant_plan(repository, plan, max_capacity=window_size)
+    assert len(receipt.accepted) == window_size
+    _install_fresh_provider_proofs(actuation_database, plan.intents)
+    owner = uuid.uuid4()
+
+    failed_waves: list[tuple[str, ...]] = []
+    attempted: set[str] = set()
+    for wave_index in range(window_size // quantum):
+        leases = repository.lease_batch(service_name='svc',
+                                        pool_key=plan.intents[0].pool_key,
+                                        owner=owner,
+                                        lease_seconds=30,
+                                        max_leases=quantum)
+        keys = tuple(lease.intent.idempotency_key for lease in leases)
+        assert len(keys) == quantum
+        # A failed RETRYABLE key must not consume another JIT quantum while
+        # any untouched GRANTED key remains in the same physical pool.
+        assert attempted.isdisjoint(keys)
+        attempted.update(keys)
+        failed_waves.append(keys)
+        for lease in leases:
+            assert repository.release_retryable(lease,
+                                                f'failure-wave-{wave_index}')
+
+    assert attempted == {intent.idempotency_key for intent in plan.intents}
+
+    # Give each failed wave one deterministic last-attempt timestamp.  Once
+    # every grant has been tried, RETRYABLE work rotates oldest attempt first;
+    # creation time and the immutable key break ties within one wave.
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    with actuation_database.begin() as connection:
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        for wave_index, keys in enumerate(failed_waves):
+            connection.execute(
+                sqlalchemy.update(intents).where(
+                    intents.c.intent_idempotency_key.in_(keys)).values(
+                        updated_at=(now - datetime.timedelta(
+                            seconds=len(failed_waves) - wave_index))))
+
+    first_retry = repository.lease_batch(service_name='svc',
+                                         pool_key=plan.intents[0].pool_key,
+                                         owner=owner,
+                                         lease_seconds=30,
+                                         max_leases=quantum)
+    assert tuple(
+        lease.intent.idempotency_key for lease in first_retry) == tuple(
+            sorted(failed_waves[0]))
+    for lease in first_retry:
+        assert repository.release_retryable(lease, 'rotate-first-wave')
+
+    second_retry = repository.lease_batch(service_name='svc',
+                                          pool_key=plan.intents[0].pool_key,
+                                          owner=owner,
+                                          lease_seconds=30,
+                                          max_leases=quantum)
+    assert tuple(
+        lease.intent.idempotency_key for lease in second_retry) == tuple(
+            sorted(failed_waves[1]))
+
+
+def test_jit_takeover_bounds_expired_predecessor_wave(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    window_size = zero_cost_actuation.MAX_ACTUATION_LEASE_BATCH_SIZE
+    quantum = replica_managers._ZERO_COST_ACTUATION_QUANTUM
+    plan = _plan(free_slots=window_size, valid_until=time.time() + 120)
+    receipt = _grant_plan(repository, plan, max_capacity=window_size)
+    assert len(receipt.accepted) == window_size
+    _install_fresh_provider_proofs(actuation_database, plan.intents)
+    old_owner = uuid.uuid4()
+    old_leases = repository.lease_batch(service_name='svc',
+                                        pool_key=plan.intents[0].pool_key,
+                                        owner=old_owner,
+                                        lease_seconds=90,
+                                        max_leases=window_size)
+    assert len(old_leases) == window_size
+    assert {lease.generation for lease in old_leases} == {1}
+
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    with actuation_database.begin() as connection:
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        connection.execute(
+            sqlalchemy.update(intents).where(
+                intents.c.intent_idempotency_key.in_(
+                    tuple(lease.intent.idempotency_key
+                          for lease in old_leases))).values(
+                              lease_expires_at=(now -
+                                                datetime.timedelta(seconds=1)),
+                              updated_at=(now - datetime.timedelta(seconds=1))))
+
+    new_owner = uuid.uuid4()
+    takeover = repository.lease_batch(service_name='svc',
+                                      pool_key=plan.intents[0].pool_key,
+                                      owner=new_owner,
+                                      lease_seconds=90,
+                                      max_leases=quantum)
+    assert len(takeover) == quantum
+    assert {lease.generation for lease in takeover} == {2}
+    assert {lease.owner for lease in takeover} == {new_owner}
+    assert tuple(lease.intent.idempotency_key for lease in takeover) == tuple(
+        lease.intent.idempotency_key for lease in old_leases[:quantum])
+    assert old_leases[0].intent.idempotency_key in {
+        lease.intent.idempotency_key for lease in takeover
+    }
+
+    with actuation_database.connect() as connection:
+        rows = connection.execute(
+            sqlalchemy.select(intents).order_by(
+                intents.c.intent_idempotency_key)).mappings().all()
+    actuating = [row for row in rows if row['state'] == 'ACTUATING']
+    retryable = [row for row in rows if row['state'] == 'RETRYABLE']
+    assert len(actuating) == quantum
+    assert len(retryable) == window_size - quantum
+    assert {row['lease_owner'] for row in actuating} == {new_owner}
+    assert {row['lease_generation'] for row in actuating} == {2}
+    assert {row['lease_owner'] for row in retryable} == {None}
+    assert {row['lease_expires_at'] for row in retryable} == {None}
+    assert {row['lease_generation'] for row in retryable} == {1}
+    assert all(row['valid_until'] > now for row in rows)
+
+    stale_info = _replica_for_intent(old_leases[0].intent, 1)
+    with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict):
+        with actuation_database.begin() as connection:
+            _commit_and_insert_replica(connection, old_leases[0], stale_info)
+    with actuation_database.connect() as connection:
+        replica_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.replicas_table)).scalar_one()
+    assert replica_count == 0
 
 
 def test_lease_batch_separates_execution_lease_from_grant_expiry(

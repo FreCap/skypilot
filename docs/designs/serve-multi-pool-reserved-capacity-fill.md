@@ -1,55 +1,79 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-24 17:31 UTC
+Last updated: 2026-08-24 19:46 UTC
 
-Status: **protocol v10 shared-cache admission, bounded controller memory, clean
-service recreation, and the scheduler-authorized reserved-capacity denominator
-are deployed and production-proven. A 64-replica fault wave exposed a serial
-retirement/post-commit inspection convoy; its surgical SkyPilot-only correction
-is source-qualified and awaiting homogeneous deployment and a repeated wave.
-The bounded positive paid-Spot residual and full drain remain the sole behavior
-gate requiring operator-authenticated traffic.** The current control plane runs
-SkyPilot release `1.1.1475`, Helm revision 597, on image digest
-`sha256:3ae4d82084e829a3c2d2de370768cee664097773be30d555f1c6daf1d7aa62e1`.
+Status: **the PostgreSQL-authoritative single path, protocol-v10 shared cache,
+bounded controller work, clean service lifecycle, unchanged Kueue contract,
+and complete consumption of the current scheduler-authorized denominator are
+deployed and production-proven. One remaining high-volume convergence defect
+has a surgical SkyPilot-only correction under qualification: lease only the
+next four reserved-fill intents instead of aging the complete provider-free
+window behind serial controller work. Deployment, a repeated at-least-32-GPU
+wave, and an authenticated bounded paid-Spot residual/drain exercise remain
+open gates.**
+
+The control plane runs SkyPilot release `1.1.1476`, Helm revision 598, on image
+digest
+`sha256:95a18537f60a3e0429ff626e6bf8adbf8c774383329568cdbe462a7060e48b09`.
 Both API Pods, both controller Pods, and all three executor Pods are Ready with
-zero restarts. The external load balancer pair is healthy. PostgreSQL is the
-central authority, Helm storage is disabled, and no EFS/PVC correctness path is
-present.
+zero restarts. PostgreSQL is the sole central correctness authority, Helm
+storage is disabled, and no EFS/PVC correctness path is present.
 
-The fresh `boltz-l4-fleet` lifecycle 98/version 1 was created directly from the
+The live `boltz-l4-fleet` is lifecycle 98/version 1, created directly from the
 locally qualified provider source at
-`a69fb3409ede26f98c02f7730f764021c1ef0146`; no boltz-platform PR or runtime pin
-is involved. Before the deliberate wave it reached 378/378 Ready reserved,
-zero-cost, non-Spot replicas: 63 A100, 189 A100-80GB, and 126 H200. A controller
-restart preserved the service hash, lifecycle, version, and durable ownership.
-One exact East deletion was replaced and Ready in 140.8 seconds with zero paid
-claim or provider Spot capacity.
+`a69fb3409ede26f98c02f7730f764021c1ef0146`; no boltz-platform PR, application
+change, or runtime pin is involved. At 19:46 UTC it had exactly 314/314 Ready
+reserved, zero-cost, non-Spot replicas: 63 East A100, 189 East A100-80GB, and
+62 PHX H200. The latest protocol-v2 rounds reported zero observed and spendable
+free capacity in all three exact-card pools. Paid claims and paid replicas were
+zero. The service has `min_replicas: 0` and the approved bounded qualification
+cap of ten logical L4 Spot units; the cap is a ceiling, not a target, and zero
+request demand has produced no paid capacity.
 
-The subsequent 32-East plus 32-PHX exact-UID deletion wave proved safety but
-not bounded convergence. Physical absence was visible promptly, yet the
-controller repeated a forced cluster refresh serially under the manager mutex
-for each already-proven Kubernetes absence. Materialization then repeated a
-PostgreSQL inspection after its atomic admission commit. All 64 intents were
-eventually durable, but 28 grants expired and three commits deferred before the
-fleet recovered. The correction carries a private exact-absence proof only far
-enough to skip that redundant refresh, while preserving request quiescence and
-a fresh post-teardown absence proof before row deletion. It also returns the
-canonical server-stamped bound context in the atomic admission receipt instead
-of rereading the same committed tuple. It adds no schema, migration, fallback,
-feature flag, provider authority, or Kueue change.
+The remaining defect is controller-local queue aging, not Kueue refusal, GPU
+scarcity, or Spot scarcity. A 19:13 UTC H200 allocation created 14 intents with
+about 90.6 seconds of observation authority remaining. The deployed executor
+leased the complete batch before processing it serially. Ten committed, one
+ended `replica_commit_deferred`, and three reached `grant_expired`; a transient
+provider-phase persistence-fence collision consumed about 13 seconds in the
+tail. A later 16-intent H200 allocation committed all 16 in about 13.5 seconds,
+proving that the atomic PostgreSQL admission and Kubernetes path are fast enough
+when not queued behind an aging leased batch.
 
-The post-wave steady state is 371 Ready plus seven real PHX Pods/Workloads
-waiting for Kueue admission. East is fully occupied at 252/252 compatible
-physical GPUs. PHX is fully occupied at 119/119 scheduler-admitted H200 GPUs;
-the seven additional low-priority SkyPilot Workloads have `admission: null` and
-`QuotaReserved=False`. Kueue repeatedly nominates a higher-priority 128-H200
-research gang first, finds that it cannot be admitted or legally preempt enough
-capacity under the unchanged policy, and then skips the smaller SkyPilot head
-with `FailedAfterNomination`. The seven raw idle devices are therefore not
-currently admissible to SkyPilot and are outside the utilization denominator.
-This is scheduler-policy fragmentation, not a SkyPilot fill failure, and no
-ClusterQueue, cohort, quota, borrowing, priority, or preemption change is
-authorized.
+The correction preserves the 32-intent provider-free pending window but leases
+only one just-in-time quantum of four. The unleased tail remains `GRANTED`, owns
+no provider effect, and may be superseded by a fresher allocation. A full
+successful quantum releases its exact lane before signalling the dispatcher,
+so the next same-pool quantum starts without overlap or a lost wakeup. The
+lease selector attempts untouched `GRANTED` rows before `RETRYABLE` rows and
+rotates retries by their least-recent transition, so four persistent failures
+cannot monopolize the quantum and starve the other 28 positions. An N-1 writer
+may have already leased up to 32 rows when rollout begins; the new writer cannot
+steal those live leases and may recover them only after their bounded 90-second
+execution horizon. Qualification therefore starts only after both controller
+Pods report the new digest and either no predecessor `ACTUATING` row remains or
+one complete lease horizon has elapsed. This is a bounded safe delay, not a
+second mixed-version behavior path.
+
+The change does not lengthen authority, weaken atomic fencing, add a schema or
+migration, add a compatibility path or feature flag, or alter Kueue, Terraform,
+Terragrunt, provider IAM, or application code. The existing changed-only
+readiness writer is a separately measurable optimization, not part of this
+correction.
+
+The remaining production gates are: deploy the homogeneous correction; prove
+an at-least-32-GPU refill reaches zero spendable free capacity without expired
+grants, duplicate provider effects, or paid spill; then use an
+operator-supplied protected-endpoint bearer for the approved 100-request,
+concurrency-16 residual-demand exercise and prove bounded Spot-only overflow
+and full provider/debit drain. The bearer must not be recovered from a
+Kubernetes Secret.
+
+## Historical evidence and implementation record
+
+The sections below retain dated evidence from earlier rollout stages. The
+status above is authoritative when an older snapshot records a smaller fleet,
+an earlier release, or a gate that has since closed.
 
 The 2026-08-24 12:55--13:12 UTC read-only audit observed the service expanding
 automatically from 295 to 383 Ready zero-cost logical GPUs as research released
@@ -1608,30 +1632,32 @@ provider cleanup.
 
 Durable submission uses one bounded executor per physical pool, not one
 provider-preflight round trip per intent and not an unbounded thread per Pod.
-Each lane leases at most the repository's hard safety limit of 32 oldest
-actionable intents and opens one V2 provider-phase admission plus one
-deduplicated physical-UID capture for that complete bounded batch. Every intent
-keeps its own owner, generation, and expiry. The repository leases an intent
-when its observation authority is current at the lease transaction. The
-execution lease serializes executor ownership; it does not extend grant
-authority and therefore need not fit inside the observation window. The atomic
-materialization transaction independently requires `valid_until` to remain
-strictly later than PostgreSQL time. An intent whose grant expires before that
-commit is fenced without a replica, request, queue entry, retention pin, or
-provider effect and is terminalized by the normal expiry path. A positive
-remaining grant window is never discarded merely because it is shorter than
-the executor ownership lease. The manager commits each exact
-intent/replica/request graph independently under its existing serialization,
-but releases and reacquires that mutex between actuation quanta of at most four
-intents. It refreshes the durable replica graph and ID set on every mutex
-acquisition, and rechecks exact actuation authority immediately before every
-materialization. Another pool is therefore permitted to interleave between
-quanta without paying another physical preflight for the same batch. Each
+The repository may retain at most 32 provider-free pending intents per pool,
+but a lane leases only one just-in-time actuation quantum of at most four oldest
+actionable intents. It opens one V2 provider-phase admission plus one
+deduplicated physical-UID capture for that quantum. The unleased tail remains
+`GRANTED`, owns no provider effect, and can be retired and replaced by a fresh
+successor allocation. Controller-local queueing therefore cannot pin the
+complete pending window to an aging observation. Every leased intent keeps its
+own owner, generation, and expiry. The repository leases an intent when its
+observation authority is current at the lease transaction. The execution lease
+serializes executor ownership; it does not extend grant authority and therefore
+need not fit inside the observation window. The atomic materialization
+transaction independently requires `valid_until` to remain strictly later than
+PostgreSQL time. An intent whose grant expires before that commit is fenced
+without a replica, request, queue entry, retention pin, or provider effect and
+is terminalized by the normal expiry path. A positive remaining grant window is
+never discarded merely because it is shorter than the executor ownership
+lease. The manager commits each exact intent/replica/request graph independently
+under its existing serialization, refreshes the durable replica graph and ID
+set for each quantum, and rechecks exact actuation authority immediately before
+every materialization. Another pool is therefore permitted to interleave
+between quanta. Each
 committed graph immediately starts the ordinary bound-request adopter, but the
 adopter does not execute the launch: actual provider work begins only when the
 generic request executor leases that durable request. The held rollout
 therefore supplies the matching generic long-worker capacity described below.
-A full 32-item batch that stages work releases its exact pool lane before
+A full four-item quantum that stages work releases its exact pool lane before
 re-signalling durable work, which prevents a completed-but-still-live thread
 from consuming the wakeup and
 imposing the one-second dispatcher poll. This bounds cross-pool head-of-line
@@ -4807,7 +4833,8 @@ full window neither globally suppresses genuinely uncovered demand nor lets it
 spill over reserved supply.
 
 The existing durable-intent dispatcher subsequently leases each physical pool
-on an independent lane. It performs the bounded physical preflight and then
+on an independent lane. It leases at most one four-intent just-in-time quantum,
+performs the bounded physical preflight, and then
 uses the shared generalized non-pool transaction to materialize the replica,
 association, executable request, queue/pin, and capacity debit atomically. Only
 that committed materialization can reach the ordinary asynchronous provider
