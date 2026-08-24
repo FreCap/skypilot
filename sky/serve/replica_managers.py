@@ -4,6 +4,7 @@ from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
+import concurrent.futures
 import contextlib
 import copy
 import dataclasses
@@ -73,6 +74,7 @@ from sky.utils import env_options
 from sky.utils import locks
 from sky.utils import resources_utils
 from sky.utils import status_lib
+from sky.utils import subprocess_utils
 from sky.utils import thread_utils
 from sky.utils import ux_utils
 from sky.utils import yaml_utils
@@ -2145,12 +2147,15 @@ def _wait_for_post_teardown_physical_absence(
     cluster_name: str,
     cleanup_fence: reserved_capacity.ProtocolV2CleanupFence,
     continue_guard: Callable[[], bool] | None,
+    cluster_name_on_cloud: str | None = None,
+    observed_after: float | None = None,
 ) -> reserved_capacity.ProtocolV2PhysicalAbsenceReceipt:
     """Wait for one successful protocol-v2 down to become observable.
 
     Kubernetes deletion is asynchronous even with a zero grace period.  Each
-    uncached provider read gets its own short provider phase and immutable
-    physical-cluster fence; the gate is released before the next poll sleeps.
+    causally fresh provider read gets its own short provider phase and
+    immutable physical-cluster fence; the gate is released before the next
+    poll sleeps.
     Only ABSENT completes teardown.  PRESENT, an unreadable/retargeted context,
     or ownership loss remains fail closed.
     """
@@ -2166,9 +2171,14 @@ def _wait_for_post_teardown_physical_absence(
             with provider_phase.provider_phase(
                     provider_phase.ProviderPhaseMode.V2_FENCED,
                     timeout_seconds=remaining):
-                last_presence = (
-                    reserved_capacity.probe_physical_replica_presence(
-                        cleanup_fence, cluster_name, use_cache=False))
+                probe_kwargs: dict[str, Any] = {}
+                if observed_after is not None:
+                    probe_kwargs['observed_after'] = observed_after
+                if cluster_name_on_cloud is not None:
+                    probe_kwargs['cluster_name_on_cloud'] = (
+                        cluster_name_on_cloud)
+                last_presence = reserved_capacity.probe_physical_replica_presence(
+                    cleanup_fence, cluster_name, **probe_kwargs)
         except exceptions.ProviderPhaseTimeoutError as error:
             raise exceptions.KubernetesPhysicalClusterIdentityError(
                 f'Cannot prove protocol-v2 cleanup for {cluster_name!r}: '
@@ -2184,6 +2194,11 @@ def _wait_for_post_teardown_physical_absence(
         if last_presence is reserved_capacity.PhysicalReplicaPresence.ABSENT:
             return reserved_capacity.ProtocolV2PhysicalAbsenceReceipt(
                 cleanup_fence=cleanup_fence, cluster_name=cluster_name)
+
+        # PRESENT and UNPROVEN must not pin the next poll to a cached provider
+        # result.  Advance the causal floor after observing this result; the
+        # next poll can share only a read that starts after this boundary.
+        observed_after = time.monotonic()
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -2227,6 +2242,8 @@ def terminate_cluster(
     # the retired action-authority design does not replace this loop.
     retry_cnt = 0
     backoff = common_utils.Backoff()
+    cleanup_cluster_name_on_cloud: str | None = None
+    teardown_completed_at: float | None = None
     while True:
         if continue_guard is not None and not continue_guard():
             raise RuntimeError(
@@ -2261,6 +2278,7 @@ def terminate_cluster(
                     logger.info(
                         f'Replica cluster {cluster_name!r} has no durable '
                         'cluster record; proving fenced physical absence.')
+                    teardown_completed_at = time.monotonic()
                     break
                 expected_cluster_hash = None
                 if cleanup_fence is not None:
@@ -2283,6 +2301,11 @@ def terminate_cluster(
                             f'Cannot prove protocol-v2 cleanup for '
                             f'{cluster_name!r}: its durable cluster handle '
                             'does not match the fenced Kubernetes context.')
+                    observed_name_on_cloud = handle.cluster_name_on_cloud
+                    cleanup_cluster_name_on_cloud = (
+                        observed_name_on_cloud
+                        if isinstance(observed_name_on_cloud, str) and
+                        observed_name_on_cloud else None)
                     expected_cluster_hash = cluster_record.get('cluster_hash')
                     if (not isinstance(expected_cluster_hash, str) or
                             not expected_cluster_hash):
@@ -2329,6 +2352,7 @@ def terminate_cluster(
                         core.down(cluster_name,
                                   _expected_cluster_hash=expected_cluster_hash,
                                   _continue_guard=continue_guard)
+                teardown_completed_at = time.monotonic()
             break
         except exceptions.ClusterDoesNotExist:
             if cleanup_fence is not None:
@@ -2340,6 +2364,7 @@ def terminate_cluster(
                 logger.info(
                     f'Replica cluster {cluster_name!r} disappeared during '
                     'teardown; proving fenced physical absence.')
+                teardown_completed_at = time.monotonic()
                 break
             # The cluster is already terminated.
             logger.info(
@@ -2380,8 +2405,15 @@ def terminate_cluster(
 
     absence_receipt = None
     if cleanup_fence is not None:
+        if teardown_completed_at is None:
+            raise RuntimeError('Protocol-v2 cleanup has no causal teardown '
+                               'completion boundary.')
         absence_receipt = _wait_for_post_teardown_physical_absence(
-            cluster_name, cleanup_fence, continue_guard)
+            cluster_name,
+            cleanup_fence,
+            continue_guard,
+            cluster_name_on_cloud=cleanup_cluster_name_on_cloud,
+            observed_after=teardown_completed_at)
     logger.info(f'Replica cluster {cluster_name} terminated.')
     return absence_receipt
 
@@ -3606,6 +3638,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._ownership_lost = threading.Event()
         self._manager_daemon_stop = threading.Event()
         self._scale_reconciliation_event = threading.Event()
+        self._readiness_executor_lock = threading.Lock()
+        self._readiness_executor: concurrent.futures.ThreadPoolExecutor | None = (
+            None)
         # The controller installs its single generation coordinator after the
         # manager is constructed.  Keep the legacy event as a compatibility
         # signal for direct embedders, but route every committed feedback wake
@@ -13050,11 +13085,31 @@ class SkyPilotReplicaManager(ReplicaManager):
     _PREEMPTION_PREFILTER_PARALLELISM = 16
     _PROBE_ROUND_MAX_PARALLELISM = 256
 
+    def _get_readiness_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """Return the manager's bounded, reusable readiness I/O executor."""
+        with self._readiness_executor_lock:
+            executor = self._readiness_executor
+            if executor is None:
+                executor = subprocess_utils.ContextThreadPoolExecutor(
+                    max_workers=self._PROBE_ROUND_MAX_PARALLELISM,
+                    thread_name_prefix='serve-readiness')
+                self._readiness_executor = executor
+            return executor
+
+    def _shutdown_readiness_executor(self) -> None:
+        """Release readiness workers after this manager is terminal."""
+        with self._readiness_executor_lock:
+            executor = self._readiness_executor
+            self._readiness_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
     def _cloud_instance_looks_alive(
         self,
         info: ReplicaInfo,
         *,
         phase_admission: provider_phase.ProviderPhaseAdmission | None = None,
+        handle: Any = _NOT_PROVIDED,
     ) -> bool | None:
         """Whether the cloud still reports this replica's instance(s) as UP.
 
@@ -13080,8 +13135,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         (which logs and handles that case) runs.
         """
         try:
-            handle = global_user_state.get_handle_from_cluster_name(
-                info.cluster_name)
+            if handle is _NOT_PROVIDED:
+                handle = global_user_state.get_handle_from_cluster_name(
+                    info.cluster_name)
             provider_fence = reserved_capacity.protocol_v2_provider_fence(
                 info,
                 handle,
@@ -13090,7 +13146,32 @@ class SkyPilotReplicaManager(ReplicaManager):
             if handle is None:
                 return False
             assert isinstance(handle, backends.CloudVmRayResourceHandle)
+            observation_boundary = time.monotonic()
             with provider_fence:
+                cleanup_fence = (
+                    reserved_capacity.parse_protocol_v2_cleanup_fence(info))
+                launched_resources = handle.launched_resources
+                if (cleanup_fence is not None and
+                        launched_resources is not None and isinstance(
+                            launched_resources.cloud, clouds.Kubernetes)):
+                    cluster_name_on_cloud = handle.cluster_name_on_cloud
+                    if (not isinstance(cluster_name_on_cloud, str) or
+                            not cluster_name_on_cloud):
+                        return True
+                    presence = (
+                        reserved_capacity.probe_physical_replica_presence(
+                            cleanup_fence,
+                            info.cluster_name,
+                            observed_after=observation_boundary,
+                            cluster_name_on_cloud=cluster_name_on_cloud))
+                    # An API/identity uncertainty is not evidence of
+                    # interruption; retry next round without stampeding the
+                    # full refresh path.
+                    return (
+                        True if presence
+                        is reserved_capacity.PhysicalReplicaPresence.UNPROVEN
+                        else presence
+                        is reserved_capacity.PhysicalReplicaPresence.PRESENT)
                 statuses = backend_utils.query_cluster_instance_statuses(handle)
             if len(statuses) < handle.launched_nodes:
                 return False
@@ -15137,6 +15218,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         resolved_route_material: dict[int,
                                       route_projection.ResolvedRouteMaterial] |
         None = None,
+        resolved_handles: dict[int, backends.CloudVmRayResourceHandle] |
+        None = None,
     ) -> dict[int, str | None]:
         """Resolve one endpoint per replica from batched cluster state.
 
@@ -15305,6 +15388,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 _resolve_ordinary(phase_admission)
             for info in infos:
                 urls.setdefault(info.replica_id, None)
+            if resolved_handles is not None:
+                resolved_handles.update(handles)
             return urls
 
         # Standalone active-URL reads establish the process phase themselves,
@@ -15319,6 +15404,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 _resolve_ordinary(admission)
         for info in infos:
             urls.setdefault(info.replica_id, None)
+        if resolved_handles is not None:
+            resolved_handles.update(handles)
         return urls
 
     def _write_resolved_route_materials(
@@ -15759,6 +15846,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         ]
         if not infos_to_probe:
             return infos
+        probe_handles: dict[int, backends.CloudVmRayResourceHandle] = {}
         if not self._is_pool:
             versions = {info.version for info in infos_to_probe}
             specs = {
@@ -15781,7 +15869,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 phase_admission=phase_admission,
                 deferred_replica_ids=deferred_route_ids,
                 identity_rejected_replica_ids=identity_rejected_route_ids,
-                resolved_route_material=resolved_route_material)
+                resolved_route_material=resolved_route_material,
+                resolved_handles=probe_handles)
             if resolved_route_material is not None:
                 self._write_resolved_route_materials(infos_to_probe,
                                                      resolved_route_material)
@@ -15901,14 +15990,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                   job_id)
 
         recovery_backend = backends.CloudVmRayBackend()
-        # Probes are pure I/O (HTTP GET/POST with a several-second timeout):
-        # the default ThreadPool size (cpu_count) turns a large fleet into
-        # dozens of sequential probe waves and the round overruns its 10s
-        # period. Size the pool to the fleet, capped to bound thread cost.
-        num_probe_threads = min(len(infos_to_probe),
-                                self._PROBE_ROUND_MAX_PARALLELISM)
-        with mp_pool.ThreadPool(num_probe_threads) as pool, \
-             contextlib.ExitStack() as route_suspension_rollback:
+        # Probes are pure I/O (HTTP GET/POST with a several-second timeout).
+        # Reuse one bounded executor across ticks: constructing and retiring
+        # up to 256 native threads every ten seconds retains allocator arenas
+        # and amplifies transient provider-response memory at fleet scale.
+        executor = self._get_readiness_executor()
+        with contextlib.ExitStack() as route_suspension_rollback:
             provider_identity_errors: dict[int, str] = {}
             provider_identity_errors_lock = threading.Lock()
             pending_route_suspensions: list[
@@ -16087,7 +16174,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if self._is_pool:
                     replica_to_probe.append(f'replica_{info.replica_id}(cluster'
                                             f'_name={info.cluster_name})')
-                    probe_futures.append(pool.apply_async(_probe_pool, (info,)))
+                    probe_futures.append(executor.submit(_probe_pool, info))
                 else:
                     resolved_url = probe_urls[info.replica_id]
                     readiness_path = self._get_readiness_path(info.version)
@@ -16098,16 +16185,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                     replica_to_probe.append(
                         f'replica_{info.replica_id}(url={resolved_url})')
                     probe_futures.append(
-                        pool.apply_async(
+                        executor.submit(
                             _probe_nonpool,
-                            (
-                                info,
-                                readiness_path,
-                                post_data,
-                                timeout,
-                                readiness_headers,
-                                resolved_url,
-                            ),
+                            info,
+                            readiness_path,
+                            post_data,
+                            timeout,
+                            readiness_headers,
+                            resolved_url,
                         ),)
             logger.info(f'Replicas to probe: {", ".join(replica_to_probe)}')
 
@@ -16119,7 +16204,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 ReplicaInfo, bool, float, float,
                 tuple[job_lib.JobStatus | None, job_lib.JobSystemRecoveryInfo |
                       None, job_lib.JobSystemRecoveryDetailStatus] | None,
-                bool]] = [future.get() for future in probe_futures]
+                bool]] = [future.result() for future in probe_futures]
             # A config/runtime transition can fail while this locked probe is
             # waiting on HTTP.  Treat every completed result as stale before
             # any route, recovery, uptime, replica, or teardown reduction.
@@ -16156,7 +16241,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
             candidate_status_futures = {
                 info.replica_id:
-                    (info, pool.apply_async(_candidate_status, (info, handle)))
+                    (info, executor.submit(_candidate_status, info, handle))
                 for info, handle in candidate_status_inputs
             }
             candidate_cycle_evidence: dict[int, tuple[bool, bool]] = {}
@@ -16167,7 +16252,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if self._update_recovery_required:
                     return infos
                 try:
-                    status_payload = status_future.get()
+                    status_payload = status_future.result()
                     if self._update_recovery_required:
                         return infos
                 except exceptions.KubernetesPhysicalClusterIdentityError as error:
@@ -16271,13 +16356,29 @@ class SkyPilotReplicaManager(ReplicaManager):
             ]
             possibly_preempted_ids: set[int] = set()
             if failed_interruptible_infos:
-                num_workers = min(self._PREEMPTION_PREFILTER_PARALLELISM,
-                                  len(failed_interruptible_infos))
-                with mp_pool.ThreadPool(num_workers) as prefilter_pool:
-                    alive_flags = prefilter_pool.map(
-                        functools.partial(self._cloud_instance_looks_alive,
-                                          phase_admission=phase_admission),
-                        failed_interruptible_infos)
+
+                def _preemption_liveness(
+                        failed_info: ReplicaInfo) -> bool | None:
+                    handle = probe_handles.get(failed_info.replica_id,
+                                               _NOT_PROVIDED)
+                    if handle is _NOT_PROVIDED:
+                        return self._cloud_instance_looks_alive(
+                            failed_info, phase_admission=phase_admission)
+                    return self._cloud_instance_looks_alive(
+                        failed_info,
+                        phase_admission=phase_admission,
+                        handle=handle)
+
+                alive_flags: list[bool | None] = []
+                for offset in range(0, len(failed_interruptible_infos),
+                                    self._PREEMPTION_PREFILTER_PARALLELISM):
+                    batch = failed_interruptible_infos[
+                        offset:offset + self._PREEMPTION_PREFILTER_PARALLELISM]
+                    futures = [
+                        executor.submit(_preemption_liveness, failed_info)
+                        for failed_info in batch
+                    ]
+                    alive_flags.extend(future.result() for future in futures)
                 if self._update_recovery_required:
                     return infos
                 for failed_info, alive in zip(failed_interruptible_infos,
@@ -16702,47 +16803,50 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _replica_prober(self) -> None:
         """Periodically probe replicas."""
-        while not self._manager_daemon_should_stop():
-            logger.debug('Running replica prober.')
-            try:
-                with self._get_status_epoch_lock():
-                    status_epoch = self._status_epoch_generation
-                # Reuse the probe round's end-of-round snapshot instead of
-                # re-reading (and re-deserializing) the whole fleet from the
-                # DB a second time per tick.
-                replica_infos = self._probe_all_replicas()
-                if self._manager_daemon_should_stop():
-                    return
-                # TODO(zhwu): when there are multiple load balancers, we need
-                # to make sure the active_versions are the union of all
-                # versions of all load balancers.
-                self._set_service_status_from_replica_infos(
-                    replica_infos, expected_status_epoch=status_epoch)
-                route_result = self._last_probe_route_result
-                publisher = self._route_projection_publisher
-                if (publisher is not None and route_result is not None and
-                        route_result.replica_infos is replica_infos and
-                        route_result.complete and
-                        not self._manager_daemon_should_stop()):
-                    publisher(route_result)
+        try:
+            while not self._manager_daemon_should_stop():
+                logger.debug('Running replica prober.')
+                try:
+                    with self._get_status_epoch_lock():
+                        status_epoch = self._status_epoch_generation
+                    # Reuse the probe round's end-of-round snapshot instead of
+                    # re-reading (and re-deserializing) the whole fleet from the
+                    # DB a second time per tick.
+                    replica_infos = self._probe_all_replicas()
+                    if self._manager_daemon_should_stop():
+                        return
+                    # TODO(zhwu): when there are multiple load balancers, we
+                    # need to make sure the active_versions are the union of
+                    # all versions of all load balancers.
+                    self._set_service_status_from_replica_infos(
+                        replica_infos, expected_status_epoch=status_epoch)
+                    route_result = self._last_probe_route_result
+                    publisher = self._route_projection_publisher
+                    if (publisher is not None and route_result is not None and
+                            route_result.replica_infos is replica_infos and
+                            route_result.complete and
+                            not self._manager_daemon_should_stop()):
+                        publisher(route_result)
 
-            except Exception as e:  # pylint: disable=broad-except
-                # No matter what error happens, we should keep the
-                # replica prober running.
-                logger.error('Error in replica prober: '
-                             f'{common_utils.format_exception(e)}')
-                with ux_utils.enable_traceback():
-                    logger.error(f'  Traceback: {traceback.format_exc()}')
-            finally:
-                # The per-version spec memo is valid only for the probe round
-                # that just finished; drop it so the probe-interval read below
-                # (and the next round) re-reads each spec fresh and never reuses
-                # one across ticks.
-                self._tick_version_spec_cache = {}
-            # TODO(MaoZiming): Probe cloud for early preemption warning.
-            if self._wait_for_manager_daemon_stop(
-                    self._get_endpoint_probe_interval_seconds()):
-                return
+                except Exception as e:  # pylint: disable=broad-except
+                    # No matter what error happens, we should keep the
+                    # replica prober running.
+                    logger.error('Error in replica prober: '
+                                 f'{common_utils.format_exception(e)}')
+                    with ux_utils.enable_traceback():
+                        logger.error(f'  Traceback: {traceback.format_exc()}')
+                finally:
+                    # The per-version spec memo is valid only for the probe
+                    # round that just finished; drop it so the probe-interval
+                    # read below (and next round) re-reads every spec fresh.
+                    self._tick_version_spec_cache = {}
+                # TODO(MaoZiming): Probe cloud for early preemption warning.
+                if self._wait_for_manager_daemon_stop(
+                        self._get_endpoint_probe_interval_seconds()):
+                    return
+        finally:
+            if self._manager_daemon_stop.is_set():
+                self._shutdown_readiness_executor()
 
     def get_active_replica_urls(self) -> list[str]:
         """Get the urls of all active replicas."""

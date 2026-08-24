@@ -12,6 +12,7 @@ from collections.abc import Mapping
 import dataclasses
 import datetime
 import enum
+import time
 from typing import Any
 import uuid
 
@@ -61,8 +62,9 @@ def _provider_observation(
     # Cleanup authorization requires a provider observation made after the
     # executor-termination attestation. A cached snapshot has an older,
     # process-local observation time and therefore cannot satisfy that proof.
+    provider_read_boundary = time.monotonic()
     presence = reserved_capacity.probe_physical_replica_presence(
-        fence, identity.cluster_name, use_cache=False)
+        fence, identity.cluster_name, observed_after=provider_read_boundary)
     classification = {
         reserved_capacity.PhysicalReplicaPresence.ABSENT:
             ordinary_launch_binding.ProviderEvidence.ABSENT,

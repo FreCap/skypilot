@@ -59,9 +59,9 @@ _WORKER_KUEUE_ADMISSION_KEYS = frozenset(
     {'local_queue_name', 'workload_priority_class_name'})
 _WORKER_V2_KEYS = (_WORKER_V1_KEYS | frozenset(
     {'projection_version', 'kueue_admission', 'scheduler_name'}))
-_WORKER_V3_V9_KEYS = (_WORKER_V2_KEYS |
-                      frozenset({'provision_timeout', 'scratch'}))
-_WORKER_V3_V9_PROTOCOL_VERSIONS = frozenset({3, 4, 5, 6, 7, 8, 9})
+_WORKER_V3_V10_KEYS = (_WORKER_V2_KEYS |
+                       frozenset({'provision_timeout', 'scratch'}))
+_WORKER_V3_V10_PROTOCOL_VERSIONS = frozenset({3, 4, 5, 6, 7, 8, 9, 10})
 _ACCELERATOR_SCHEDULING_KEYS = frozenset(
     {'label_key', 'label_values', 'resource_key'})
 _MAX_ACCELERATOR_LABEL_VALUES = 16
@@ -101,6 +101,9 @@ _CACHE_NODE_LOCAL_V8_KEYS = (_CACHE_NODE_LOCAL_V1_V7_KEYS | frozenset({
     'relative_path',
     'bootstrap_image',
 }))
+_CACHE_NODE_LOCAL_V10_KEYS = (_CACHE_NODE_LOCAL_V8_KEYS |
+                              frozenset({'budget_scope'}))
+_CACHE_BUDGET_SCOPES = frozenset({'replica_additive', 'node_shared_immutable'})
 _WORKER_SCRATCH_NONE_KEYS = frozenset({'kind'})
 _WORKER_SCRATCH_CONFIG_MEMORY_KEYS = frozenset({'kind', 'size_limit_bytes'})
 _CONTROLLER_EMPTY_DIR_KEYS = frozenset({
@@ -118,6 +121,8 @@ WORKER_CACHE_BOOTSTRAP_HOST_MOUNT_PATH_ENV_VAR = (
     'SKYPILOT_SERVE_WORKER_CACHE_BOOTSTRAP_HOST_MOUNT_PATH')
 WORKER_CACHE_BOOTSTRAP_IMAGE_ENV_VAR = (
     'SKYPILOT_SERVE_WORKER_CACHE_BOOTSTRAP_IMAGE')
+WORKER_CACHE_BUDGET_SCOPES_ENV_VAR = (
+    'SKYPILOT_SERVE_WORKER_CACHE_BUDGET_SCOPES_JSON')
 SCRATCH_ENV_VAR = 'SKYPILOT_SERVE_SCRATCH_KIND'
 SCRATCH_ENV_PREFIX = 'SKYPILOT_SERVE_SCRATCH_'
 _CACHE_ATTESTATION_ENV_KEYS = {
@@ -326,6 +331,7 @@ def validate_cache_projection(
     value: Any,
     *,
     require_bootstrap_mount: bool | None = None,
+    require_budget_scope: bool | None = None,
 ) -> dict[str, Any]:
     """Strictly validate one worker cache projection."""
     if not isinstance(value, dict):
@@ -335,10 +341,21 @@ def validate_cache_projection(
         if set(value) != _CACHE_NONE_KEYS:
             raise ValueError('Cache kind none cannot contain other fields.')
         return {'kind': 'none'}
-    expected_keys = (_CACHE_NODE_LOCAL_V8_KEYS if require_bootstrap_mount else
-                     _CACHE_NODE_LOCAL_V1_V7_KEYS)
-    if (require_bootstrap_mount is None and kind == 'node_local'):
-        if set(value) == _CACHE_NODE_LOCAL_V8_KEYS:
+    if require_budget_scope and require_bootstrap_mount is False:
+        raise ValueError('Worker cache budget scope requires the bootstrap '
+                         'mount contract.')
+    if require_budget_scope:
+        expected_keys = _CACHE_NODE_LOCAL_V10_KEYS
+    elif require_bootstrap_mount:
+        expected_keys = _CACHE_NODE_LOCAL_V8_KEYS
+    else:
+        expected_keys = _CACHE_NODE_LOCAL_V1_V7_KEYS
+    if (require_bootstrap_mount is None and require_budget_scope is None and
+            kind == 'node_local'):
+        keys = set(value)
+        if keys == _CACHE_NODE_LOCAL_V10_KEYS:
+            expected_keys = _CACHE_NODE_LOCAL_V10_KEYS
+        elif keys == _CACHE_NODE_LOCAL_V8_KEYS:
             expected_keys = _CACHE_NODE_LOCAL_V8_KEYS
         else:
             expected_keys = _CACHE_NODE_LOCAL_V1_V7_KEYS
@@ -360,15 +377,25 @@ def validate_cache_projection(
         'host_path': host_path,
         'attestation': _validate_cache_attestation(value['attestation']),
     }
-    if expected_keys == _CACHE_NODE_LOCAL_V8_KEYS:
+    if expected_keys in (_CACHE_NODE_LOCAL_V8_KEYS, _CACHE_NODE_LOCAL_V10_KEYS):
         projected.update({
             'host_mount_path': value['host_mount_path'],
             'relative_path': value['relative_path'],
             'bootstrap_image': value['bootstrap_image'],
         })
+        if expected_keys == _CACHE_NODE_LOCAL_V10_KEYS:
+            budget_scope = value['budget_scope']
+            if budget_scope not in _CACHE_BUDGET_SCOPES:
+                raise ValueError(
+                    'Worker cache budget_scope must be replica_additive or '
+                    'node_shared_immutable.')
+            projected['budget_scope'] = budget_scope
         try:
             return dict(
-                kubernetes_pod_spec.validate_projected_worker_cache(projected))
+                kubernetes_pod_spec.validate_projected_worker_cache(
+                    projected,
+                    require_budget_scope=(
+                        expected_keys == _CACHE_NODE_LOCAL_V10_KEYS)))
         except kubernetes_pod_spec.ProjectedCacheContractError as error:
             raise ValueError(str(error)) from error
     return projected
@@ -461,15 +488,15 @@ def worker_projection_protocol_version(projection: Mapping[str, Any]) -> int:
     Protocol v1 intentionally has no discriminator.  Its old exact key set is
     the only implicit-v1 shape accepted during the ordinary-launch transition.
     Protocol v2 remains an isolated decoder for already-committed rows.
-    Protocols v3-v9 intentionally share one closed key set: v3 retains its
+    Protocols v3-v10 intentionally share one closed key set: v3 retains its
     historical Running-only provisioning semantics, v4 requires UID-bound
     runtime readiness, and v6 uniquely binds bootstrap writes to projected
     memory-backed scratch. V5 remains decode-only after its released renderer
     collision, and v6 remains decode-only after its released bootstrap
     supervisor collision. V7 remains decode-only after its cache-leaf
-    bootstrap gap. V8 remains byte-exact and decode/settlement/cleanup-capable
-    after its cache-leaf normalization gap. New rows carry the explicit v9
-    discriminator.
+    bootstrap gap. V8 and v9 remain byte-exact and decode/settlement/cleanup-
+    capable after their cache-leaf corrections. New rows carry the explicit
+    v10 discriminator, whose bootstrap reserves one shared cache envelope.
     """
     if not isinstance(projection, Mapping):
         raise ValueError('Worker placement projection must be a mapping.')
@@ -482,19 +509,20 @@ def worker_projection_protocol_version(projection: Mapping[str, Any]) -> int:
             raise ValueError('Worker placement projection_version must be '
                              'exactly 2 for the protocol-v2 key set.')
         return 2
-    if keys == _WORKER_V3_V9_KEYS:
+    if keys == _WORKER_V3_V10_KEYS:
         projection_version = projection['projection_version']
         if (type(projection_version) is not int or
-                projection_version not in _WORKER_V3_V9_PROTOCOL_VERSIONS):
+                projection_version not in _WORKER_V3_V10_PROTOCOL_VERSIONS):
             raise ValueError('Worker placement projection_version must be '
-                             'exactly 3, 4, 5, 6, 7, 8, or 9 for the '
-                             'protocol-v3/v4/v5/v6/v7/v8/v9 key set.')
+                             'exactly 3, 4, 5, 6, 7, 8, 9, or 10 for the '
+                             'protocol-v3/v4/v5/v6/v7/v8/v9/v10 key set.')
         return projection_version
     raise ValueError(
         'Worker placement projection must contain exactly the protocol-v1 '
         f'keys {sorted(_WORKER_V1_KEYS)!r} or protocol-v2 keys '
-        f'{sorted(_WORKER_V2_KEYS)!r} or protocol-v3/v4/v5/v6/v7/v8/v9 keys '
-        f'{sorted(_WORKER_V3_V9_KEYS)!r}.')
+        f'{sorted(_WORKER_V2_KEYS)!r} or '
+        'protocol-v3/v4/v5/v6/v7/v8/v9/v10 keys '
+        f'{sorted(_WORKER_V3_V10_KEYS)!r}.')
 
 
 def worker_projection_has_strict_admission(
@@ -659,7 +687,8 @@ def validate_worker_placement_projections(
                 'accelerator_name'].lower()
         cache = validate_cache_projection(
             projection['cache'],
-            require_bootstrap_mount=(candidate_protocol_version >= 8))
+            require_bootstrap_mount=(candidate_protocol_version >= 8),
+            require_budget_scope=(candidate_protocol_version >= 10))
         validated_projection = {
             'candidate_id': candidate_id,
             'kubernetes_context': projection['kubernetes_context'],
@@ -709,7 +738,7 @@ def worker_projection_sha256(projection: Mapping[str, Any]) -> str:
                 worker_projection_protocol_version(validated[0])):
         raise ValueError(
             'Worker projection digest requires protocol 2, 3, 4, 5, 6, 7, 8, '
-            'or 9.')
+            '9, or 10.')
     canonical_json = json.dumps(validated[0],
                                 sort_keys=True,
                                 separators=(',', ':'),
@@ -1116,6 +1145,29 @@ def _effective_auto_mounts(context: str,
     return value if isinstance(value, list) else []
 
 
+def _worker_cache_budget_scopes() -> dict[str, str]:
+    """Load the v10 operator-owned scope registry without a legacy fallback."""
+    raw = os.environ.get(WORKER_CACHE_BUDGET_SCOPES_ENV_VAR)
+    if not raw:
+        raise ValueError('Node-local Serve cache requires operator-owned '
+                         f'{WORKER_CACHE_BUDGET_SCOPES_ENV_VAR}.')
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f'{WORKER_CACHE_BUDGET_SCOPES_ENV_VAR} must be valid JSON.'
+        ) from error
+    if (not isinstance(value, dict) or not value or
+            any(not isinstance(attestation_id, str) or not attestation_id or
+                scope not in _CACHE_BUDGET_SCOPES
+                for attestation_id, scope in value.items())):
+        raise ValueError(
+            f'{WORKER_CACHE_BUDGET_SCOPES_ENV_VAR} must be a non-empty JSON '
+            'object mapping attestation IDs to replica_additive or '
+            'node_shared_immutable.')
+    return value
+
+
 def _project_cache(context: str, workspace: str | None) -> dict[str, Any]:
     configured = skypilot_config.get_effective_workspace_region_config(
         cloud='kubernetes',
@@ -1159,6 +1211,16 @@ def _project_cache(context: str, workspace: str | None) -> dict[str, Any]:
     if not isinstance(host_path, str) or not isinstance(host_mount_path, str):
         raise ValueError('Node-local Serve cache requires a registered host '
                          'path and server-owned bootstrap host mount path.')
+    attestation = configured.get('attestation')
+    attestation_id = (attestation.get('attestation_id') if isinstance(
+        attestation, dict) else None)
+    if not isinstance(attestation_id, str):
+        raise ValueError('Node-local Serve cache requires a string '
+                         'attestation ID.')
+    budget_scope = _worker_cache_budget_scopes().get(attestation_id)
+    if budget_scope is None:
+        raise ValueError('Node-local Serve cache attestation ID must have one '
+                         'operator-owned v10 budget scope.')
     relative_path = posixpath.relpath(host_path, host_mount_path)
     projection = {
         'kind': 'node_local',
@@ -1168,9 +1230,12 @@ def _project_cache(context: str, workspace: str | None) -> dict[str, Any]:
         'host_mount_path': host_mount_path,
         'relative_path': relative_path,
         'bootstrap_image': bootstrap_image,
-        'attestation': configured.get('attestation'),
+        'budget_scope': budget_scope,
+        'attestation': attestation,
     }
-    return validate_cache_projection(projection, require_bootstrap_mount=True)
+    return validate_cache_projection(projection,
+                                     require_bootstrap_mount=True,
+                                     require_budget_scope=True)
 
 
 def _project_worker_scratch(context: str,
@@ -1425,13 +1490,15 @@ def cache_environment(projection: dict[str, Any]) -> dict[str, str]:
     if cache['kind'] == 'none':
         return env
     env[f'{CACHE_ENV_PREFIX}MOUNT_PATH'] = cache['mount_path']
+    if 'budget_scope' in cache:
+        env[f'{CACHE_ENV_PREFIX}BUDGET_SCOPE'] = cache['budget_scope']
     for key, suffix in _CACHE_ATTESTATION_ENV_KEYS.items():
         env[f'{CACHE_ENV_PREFIX}{suffix}'] = str(cache['attestation'][key])
     return env
 
 
 def scratch_environment(projection: dict[str, Any]) -> dict[str, str]:
-    """Return server-owned runtime scratch environment for one v3-v9 worker."""
+    """Return server-owned runtime scratch environment for v3-v10."""
     if not kubernetes_pod_spec.serve_worker_projection_protocol_has_scratch(
             worker_projection_protocol_version(projection)):
         return {}
@@ -1446,7 +1513,7 @@ def scratch_environment(projection: dict[str, Any]) -> dict[str, str]:
 
 
 def bootstrap_environment(projection: dict[str, Any]) -> dict[str, str]:
-    """Return server-owned scratch paths for one v6/v7/v8/v9 bootstrap."""
+    """Return server-owned scratch paths for one v6-v10 bootstrap."""
     projection_version = worker_projection_protocol_version(projection)
     scratch: object = {'kind': 'none'}
     if kubernetes_pod_spec.serve_worker_projection_protocol_has_scratch(

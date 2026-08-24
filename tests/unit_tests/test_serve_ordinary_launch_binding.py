@@ -123,7 +123,7 @@ def test_non_pool_profile_envelope_is_closed_and_canonical() -> None:
 
 def test_supported_non_pool_profile_set_digest_is_stable_and_complete() -> None:
     digest = binding.supported_non_pool_profile_set_digest()
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 9
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 10
     assert len(digest) == 64
     assert digest == binding.supported_non_pool_profile_set_digest()
     assert set(binding._PROFILE_AUTHORIZATION_KIND) == set(  # pylint: disable=protected-access
@@ -757,7 +757,7 @@ def _non_pool_identity(
         cluster_name='svc-3',
         input_digest=binding.canonical_launch_digest(body),
         profile=profile,
-        capability_cohort_epoch=9,
+        capability_cohort_epoch=binding.NON_POOL_CAPABILITY_COHORT_EPOCH,
         capability_profile_set_digest=(
             binding.supported_non_pool_profile_set_digest()),
         receipt_protocol_version=binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)
@@ -799,7 +799,7 @@ def _system_recovery_body_and_identity(
         cluster_name='svc-3',
         input_digest=binding.canonical_launch_digest(body),
         profile=profile,
-        capability_cohort_epoch=9,
+        capability_cohort_epoch=binding.NON_POOL_CAPABILITY_COHORT_EPOCH,
         capability_profile_set_digest=(
             binding.supported_non_pool_profile_set_digest()),
         receipt_protocol_version=binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)
@@ -898,7 +898,7 @@ def test_non_pool_identity_and_context_are_structurally_distinct() -> None:
     binding.install_bound_non_pool_context(body, identity, 7)
     context = body.extra_launch_context
     assert context[binding.PROFILE_KIND_KEY] == 'ORDINARY_PAID'
-    assert context[binding.CAPABILITY_COHORT_EPOCH_KEY] == 9
+    assert context[binding.CAPABILITY_COHORT_EPOCH_KEY] == 10
     parsed = binding.parse_bound_non_pool_launch_context(context)
     assert isinstance(parsed, binding.BoundNonPoolLaunchContext)
     assert parsed.profile == identity.profile
@@ -1231,7 +1231,7 @@ def test_api014_serve051_lineage_and_sqlite_stays_at_serve037(
     assert (
         server_constants.MIN_SERVE_INCREMENTAL_ROUTE_LEASES_API_VERSION == 88)
     assert server_constants.MIN_SERVE_EXACT_REQUEST_SUMMARY_API_VERSION == 92
-    assert server_constants.API_VERSION == 92
+    assert server_constants.API_VERSION == 93
 
     alembic_command.upgrade(serve_config, '037')
     inspector = sqlalchemy.inspect(sqlite)

@@ -24,19 +24,20 @@ from sky.utils import config_utils
 
 PodRole = Literal['head', 'worker']
 
-SERVE_WORKER_PROJECTION_PROTOCOL_VERSION = 9
+SERVE_WORKER_PROJECTION_PROTOCOL_VERSION = 10
 _SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
-    {1, 2, 3, 4, 5, 6, 7, 8, 9})
+    {1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
 _STRICT_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
-    {2, 3, 4, 5, 6, 7, 8, 9})
+    {2, 3, 4, 5, 6, 7, 8, 9, 10})
 _SCRATCH_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
-    {3, 4, 5, 6, 7, 8, 9})
+    {3, 4, 5, 6, 7, 8, 9, 10})
 _RUNTIME_READY_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
-    {4, 5, 6, 7, 8, 9})
+    {4, 5, 6, 7, 8, 9, 10})
 _SCRATCH_BOOTSTRAP_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
-    {6, 7, 8, 9})
-_CACHE_BOOTSTRAP_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({8, 9})
-_RENDERABLE_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({8, 9})
+    {6, 7, 8, 9, 10})
+_CACHE_BOOTSTRAP_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset(
+    {8, 9, 10})
+_RENDERABLE_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({8, 9, 10})
 SERVE_WORKER_SCRATCH_MOUNT_PATH = '/tmp'
 SERVE_WORKER_SCRATCH_VOLUME_NAME = 'skypilot-serve-worker-tmp'
 SERVE_WORKER_BOOTSTRAP_ENV_MARKER = 'SKYPILOT_SERVE_WORKER_BOOTSTRAP_ENV_V8'
@@ -370,6 +371,46 @@ finally:
     os.close(directory_fd)
 PY
 '''
+
+
+def _build_shared_cache_bootstrap_script_v10() -> str:
+    """Derive scoped v10 without changing the byte-exact v9 renderer."""
+    replacements = (
+        ('# SKYPILOT_SERVE_WORKER_CACHE_BOOTSTRAP_V9',
+         '# SKYPILOT_SERVE_WORKER_CACHE_BOOTSTRAP_V10'),
+        ("required(prefix + 'ATTESTATION_ID')",
+         "required(prefix + 'ATTESTATION_ID')\n"
+         "budget_scope = required(prefix + 'BUDGET_SCOPE')\n"
+         "if budget_scope not in {'replica_additive', "
+         "'node_shared_immutable'}:\n"
+         "    raise RuntimeError('cache bootstrap budget scope is invalid')"),
+        ("if free_bytes < required_bytes * max_packing + reserved_bytes:\n"
+         "    raise RuntimeError("
+         "'cache parent lacks the projected free byte reserve')\n"
+         "if free_inodes < required_inodes * max_packing + reserved_inodes:\n"
+         "    raise RuntimeError("
+         "'cache parent lacks the projected free inode reserve')",
+         "budget_multiplier = (max_packing\n"
+         "                     if budget_scope == 'replica_additive' else 1)\n"
+         "if free_bytes < required_bytes * budget_multiplier + reserved_bytes:\n"
+         "    raise RuntimeError(\n"
+         "        'cache parent lacks the projected free byte reserve')\n"
+         "if free_inodes < required_inodes * budget_multiplier + reserved_inodes:\n"
+         "    raise RuntimeError(\n"
+         "        'cache parent lacks the projected free inode reserve')"),
+    )
+    script = SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT_V9
+    for released, corrected in replacements:
+        if script.count(released) != 1:
+            raise RuntimeError('Released cache bootstrap source changed; '
+                               'protocol v10 cannot be derived safely.')
+        script = script.replace(released, corrected)
+    return script
+
+
+SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT_V10 = (
+    _build_shared_cache_bootstrap_script_v10())
+del _build_shared_cache_bootstrap_script_v10
 # The startup probe starts only after image pull and container creation.  This
 # bound covers the in-container SSH, environment, SkyPilot, and Ray bootstrap;
 # provider scheduling retains its separate projected provision_timeout.
@@ -386,10 +427,14 @@ _SERVE_WORKER_SCRATCH_NONE_KEYS = frozenset({'kind'})
 _SERVE_WORKER_SCRATCH_MEMORY_KEYS = frozenset(
     {'kind', 'mount_path', 'volume_name', 'size_limit_bytes'})
 _SERVE_WORKER_CACHE_NONE_KEYS = frozenset({'kind'})
-_SERVE_WORKER_CACHE_NODE_LOCAL_KEYS = frozenset({
+_SERVE_WORKER_CACHE_NODE_LOCAL_V8_V9_KEYS = frozenset({
     'kind', 'mount_path', 'volume_name', 'host_path', 'host_mount_path',
     'relative_path', 'bootstrap_image', 'attestation'
 })
+_SERVE_WORKER_CACHE_NODE_LOCAL_V10_KEYS = (
+    _SERVE_WORKER_CACHE_NODE_LOCAL_V8_V9_KEYS | frozenset({'budget_scope'}))
+_SERVE_WORKER_CACHE_BUDGET_SCOPES = frozenset(
+    {'replica_additive', 'node_shared_immutable'})
 _DIGEST_PINNED_IMAGE_PATTERN = re.compile(r'^[^\s@]+@sha256:[0-9a-f]{64}$')
 _SERVE_WORKER_CACHE_ATTESTATION_KEYS = frozenset({
     'attestation_id', 'device_source_pattern', 'filesystem_type',
@@ -478,7 +523,7 @@ def validate_serve_worker_projection_protocol_version(
     if (type(value) is not int or
             value not in _SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS):
         raise ValueError('SkyServe worker projection protocol version must be '
-                         '1, 2, 3, 4, 5, 6, 7, 8, or 9.')
+                         '1, 2, 3, 4, 5, 6, 7, 8, 9, or 10.')
     return value
 
 
@@ -490,7 +535,9 @@ def serve_worker_cache_bootstrap_script(protocol_version: object) -> str:
         return SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT_V8
     if version == 9:
         return SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT_V9
-    raise ValueError('Worker cache bootstrap requires protocol 8 or 9.')
+    if version == 10:
+        return SERVE_WORKER_CACHE_BOOTSTRAP_SCRIPT_V10
+    raise ValueError('Worker cache bootstrap requires protocol 8, 9, or 10.')
 
 
 def serve_worker_projection_protocol_has_strict_admission(
@@ -547,7 +594,7 @@ def serve_worker_projection_protocol_is_renderable(value: object) -> bool:
 
 
 def validate_projected_worker_provision_timeout(value: object) -> int:
-    """Validate the closed v3-v9 provisioning-wait contract."""
+    """Validate the closed v3-v10 provisioning-wait contract."""
     if type(value) is not int or value < -1:
         raise ValueError('Projected worker provision_timeout must be -1 or a '
                          'non-negative integer.')
@@ -972,8 +1019,17 @@ def enforce_projected_worker_scratch_contract(
     )
 
 
-def validate_projected_worker_cache(value: object) -> dict[str, object]:
-    """Validate the provider-side protocol-v8/v9 cache bootstrap contract."""
+def validate_projected_worker_cache(
+    value: object,
+    *,
+    require_budget_scope: bool | None = None,
+) -> dict[str, object]:
+    """Validate one provider-side versioned cache contract.
+
+    ``None`` infers the retained v8/v9 or v10 shape from its exact keys.  A
+    protocol boundary must pass ``False`` or ``True`` so the discriminator and
+    payload cannot be mixed.
+    """
     if not isinstance(value, dict):
         raise ProjectedCacheContractError(
             'Worker cache contract must be a mapping.')
@@ -983,12 +1039,25 @@ def validate_projected_worker_cache(value: object) -> dict[str, object]:
             raise ProjectedCacheContractError(
                 'Worker cache kind none cannot contain other fields.')
         return {'kind': 'none'}
-    if (kind != 'node_local' or
-            set(value) != _SERVE_WORKER_CACHE_NODE_LOCAL_KEYS):
+    expected_keys = (_SERVE_WORKER_CACHE_NODE_LOCAL_V10_KEYS
+                     if require_budget_scope else
+                     _SERVE_WORKER_CACHE_NODE_LOCAL_V8_V9_KEYS)
+    if require_budget_scope is None:
+        expected_keys = (_SERVE_WORKER_CACHE_NODE_LOCAL_V10_KEYS
+                         if 'budget_scope' in value else
+                         _SERVE_WORKER_CACHE_NODE_LOCAL_V8_V9_KEYS)
+    if kind != 'node_local' or set(value) != expected_keys:
         raise ProjectedCacheContractError(
             'Worker cache must be exactly kind none or a complete '
-            'node_local contract.')
+            'protocol-appropriate node_local contract.')
     copied: dict[str, object] = {'kind': 'node_local'}
+    if expected_keys == _SERVE_WORKER_CACHE_NODE_LOCAL_V10_KEYS:
+        budget_scope = value['budget_scope']
+        if budget_scope not in _SERVE_WORKER_CACHE_BUDGET_SCOPES:
+            raise ProjectedCacheContractError(
+                'Worker cache budget_scope must be replica_additive or '
+                'node_shared_immutable.')
+        copied['budget_scope'] = budget_scope
     for key in ('mount_path', 'volume_name', 'host_path', 'host_mount_path',
                 'relative_path', 'bootstrap_image'):
         field = value[key]
@@ -1081,7 +1150,7 @@ def validate_projected_worker_cache(value: object) -> dict[str, object]:
 
 def projected_worker_cache_mount_and_relative_path(
         cache: object) -> tuple[str, str] | None:
-    """Return the attested mount and relative path created by v8/v9."""
+    """Return the attested mount and relative path created by v8/v9/v10."""
     expected = validate_projected_worker_cache(cache)
     if expected['kind'] == 'none':
         return None
@@ -1100,6 +1169,9 @@ def _cache_bootstrap_environment(expected: dict[str, object],
         f'{SERVE_WORKER_CACHE_BOOTSTRAP_ENV_PREFIX}PARENT_MOUNT_PATH': SERVE_WORKER_CACHE_BOOTSTRAP_PARENT_MOUNT_PATH,
         f'{SERVE_WORKER_CACHE_BOOTSTRAP_ENV_PREFIX}RELATIVE_PATH': relative_path,
     }
+    if 'budget_scope' in expected:
+        values[f'{SERVE_WORKER_CACHE_BOOTSTRAP_ENV_PREFIX}BUDGET_SCOPE'] = str(
+            expected['budget_scope'])
     for key in sorted(_SERVE_WORKER_CACHE_ATTESTATION_KEYS):
         values[f'{SERVE_WORKER_CACHE_BOOTSTRAP_ENV_PREFIX}{key.upper()}'] = str(
             attestation[key])
@@ -1364,11 +1436,16 @@ def enforce_projected_worker_cache_contract(
     protocol_version: object = SERVE_WORKER_PROJECTION_PROTOCOL_VERSION,
 ) -> ProjectedCacheContract:
     """Own one versioned attested cache-leaf bootstrap Pod surface."""
-    expected = validate_projected_worker_cache(expected_cache)
     try:
-        bootstrap_script = serve_worker_cache_bootstrap_script(protocol_version)
+        version = validate_serve_worker_projection_protocol_version(
+            protocol_version)
+        bootstrap_script = serve_worker_cache_bootstrap_script(version)
     except ValueError as error:
         raise ProjectedCacheContractError(str(error)) from error
+    assert version is not None
+    expected = validate_projected_worker_cache(expected_cache,
+                                               require_budget_scope=version
+                                               >= 10)
     if rewrite:
         if not isinstance(pod_spec, dict):
             raise ProjectedCacheContractError(
@@ -1771,18 +1848,18 @@ def validate_projected_worker_bootstrap_environment(
     if any(marker in script
            for marker in SERVE_WORKER_LEGACY_BOOTSTRAP_ENV_MARKERS):
         raise ProjectedRuntimeReadinessContractError(
-            'Protocol-v8/v9 scratch bootstrap cannot carry a historical marker.'
+            'Protocol-v8/v9/v10 scratch bootstrap cannot carry a historical marker.'
         )
     marker_line = f'# {SERVE_WORKER_BOOTSTRAP_ENV_MARKER}'
     script_lines = script.splitlines()
     if script_lines.count(marker_line) != 1:
         raise ProjectedRuntimeReadinessContractError(
-            'Protocol-v8/v9 scratch bootstrap must carry one exact marker.')
+            'Protocol-v8/v9/v10 scratch bootstrap must carry one exact marker.')
     marker_offset = script_lines.index(marker_line)
     env = _pod_api_field(runtime, 'env', 'env')
     if not isinstance(env, (list, tuple)):
         raise ProjectedRuntimeReadinessContractError(
-            'Protocol-v8/v9 scratch bootstrap environment must be a list.')
+            'Protocol-v8/v9/v10 scratch bootstrap environment must be a list.')
     observed_entries = []
     for entry in env:
         if _pod_api_field(entry, 'name', 'name') not in expected:
@@ -1798,14 +1875,14 @@ def validate_projected_worker_bootstrap_environment(
     } for key in sorted(expected)]
     if observed_entries != expected_entries:
         raise ProjectedRuntimeReadinessContractError(
-            'Protocol-v8/v9 scratch bootstrap Pod environment differs from the '
+            'Protocol-v8/v9/v10 scratch bootstrap Pod environment differs from the '
             'exact server-owned paths.')
     for key, value in expected.items():
         export = f'export {key}={json.dumps(value)}'
         if (script_lines.count(export) != 1 or
                 script_lines.index(export) < marker_offset):
             raise ProjectedRuntimeReadinessContractError(
-                'Protocol-v8/v9 scratch bootstrap script must re-export every '
+                'Protocol-v8/v9/v10 scratch bootstrap script must re-export every '
                 'exact server-owned path once after its post-runcmd marker.')
     return {key: expected[key] for key in sorted(expected)}
 

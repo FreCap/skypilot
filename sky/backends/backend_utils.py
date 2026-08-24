@@ -921,7 +921,7 @@ def _select_worker_projection(
             projection_version):
         raise exceptions.InvalidCloudConfigs(
             'SkyServe Kubernetes placement requires a byte-exact renderer for '
-            f'projection protocol {projection_version}; only protocols 8 and 9 '
+            f'projection protocol {projection_version}; only protocols 8, 9, and 10 '
             'are renderable.')
     try:
         kubernetes_identity.validate_no_resource_worker_projection_overrides(
@@ -1034,7 +1034,7 @@ def _enforce_worker_projection_on_kubernetes_yaml(
                 projection_version):
             raise ValueError(
                 'Worker placement projection requires a byte-exact renderer; '
-                'only protocols 8 and 9 are renderable.')
+                'only protocols 8, 9, and 10 are renderable.')
     except ValueError as error:
         raise exceptions.InvalidCloudConfigs(str(error)) from error
     assert validated is not None
@@ -1073,7 +1073,7 @@ def _enforce_worker_projection_on_kubernetes_yaml(
     else:
         if expected_runtime_bootstrap_sha256 is not None:
             raise exceptions.InvalidCloudConfigs(
-                'Only projection protocol v4/v5/v6/v7/v8/v9 may carry a worker '
+                'Only projection protocol v4/v5/v6/v7/v8/v9/v10 may carry a worker '
                 'runtime '
                 'bootstrap SHA256 contract.')
         cluster_yaml['provider'].pop(

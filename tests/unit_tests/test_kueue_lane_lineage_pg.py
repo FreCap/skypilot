@@ -2517,7 +2517,7 @@ def test_whole_service_teardown_retires_provider_absent_admissionless_graph(
     probe.assert_called_once_with(reserved_capacity.ProtocolV2CleanupFence(
         kubernetes_context=_CONTEXT, physical_cluster_uid=_PHYSICAL_UID),
                                   f'{_SERVICE}-1',
-                                  use_cache=False)
+                                  observed_after=mock.ANY)
 
     associations = ordinary_launch_binding.ordinary_launch_associations_table
     with admission_database.connect() as connection:

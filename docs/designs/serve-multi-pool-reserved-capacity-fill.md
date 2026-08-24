@@ -1,14 +1,94 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-24 07:58 UTC
+Last updated: 2026-08-24 13:53 UTC
 
 Status: **scheduler-admitted reserved-capacity convergence plus the provider-
-local exact request/load qualification are production-proven; bounded paid-
-Spot overflow is the only remaining production behavior gate.** The
-homogeneous control plane runs SkyPilot release `1.1.1470`, Helm revision 594:
-two API, two controller, and three executor Pods plus both external load
-balancers are healthy with zero restarts on image digest
+local exact request/load qualification are production-proven on protocol v9.
+A fresh worker-fit audit found one SkyPilot shared-cache admission bug in East,
+and a concurrent control-plane audit found a reproducible SkyServe controller
+memory amplifier. Protocol v10 plus the bounded-memory correction are under
+source review; homogeneous deployment, clean service recreation, renewed
+reserved occupancy, and bounded paid-Spot overflow/drain remain production
+gates.** The current control plane runs SkyPilot release `1.1.1470`, Helm
+revision 594, on image digest
 `sha256:7e1ef1c2043812073fe45d7c472a346bd679b5a4bbb1b3b8417699c2b7c8f2c0`.
+Both API Pods, both controller Pods, all three executor Pods, and both external
+load balancers were Ready at the frozen preflight, but controller Pod suffix
+`jxgkf` had two restarts and `wsrfc` had one; all three were confirmed OOMs.
+The earlier zero-restart receipt remains historical evidence, not current
+health evidence.
+
+The 2026-08-24 12:55--13:12 UTC read-only audit observed the service expanding
+automatically from 295 to 383 Ready zero-cost logical GPUs as research released
+capacity. The final frozen census was 403 replicas: 383 Ready, 15 Pending, and
+5 Shutting Down. The exact Ready split was 61 A100, 173 A100-80GB, and 149
+H200. Every row was version-1 Kubernetes reserved capacity, zero-cost, and
+non-Spot; paid claims, waiters, AWS/GCP replicas, Spot rows, and Spot cost were
+zero. Nine PHX H200 Workloads were correctly held by unchanged Kueue
+with `QuotaReserved=False/WaitingForQuota`: topology `hyperpod` reported that
+none of 64 nodes jointly fit the requested Pod (8 excluded on CPU and 56 on
+GPU). Those nine GPU-only inventory slots are not Kueue-admissible capacity and
+are outside the utilization denominator. No Kueue, quota, cohort, priority, or
+preemption change is authorized.
+
+The East tail exposed a different SkyPilot bug. Repeated A100-80GB workers were
+scheduled to one healthy 8-GPU node and failed the SkyPilot-owned
+`skypilot-serve-cache-bootstrap` init container. The attested NVMe had
+3,283,518,623,744 available bytes, no DiskPressure, and ample inodes. Every
+logical worker mounts the same `boltz-platform/boltz-l4-fleet` cache leaf, but
+protocol v9 demanded `8 * 500 GB + 500 GB = 4.5 TB` remain free before every
+start. The actual shared cold-start-plus-reserve boundary is 1.0 TB. Protocol
+v10 corrects that double count without deleting cache contents or weakening
+filesystem, source, ownership, permission, total-size, or inode attestation.
+Its closed `budget_scope` is either `replica_additive`, which retains the v8/v9
+full-packing free-space rule, or `node_shared_immutable`, which checks one
+required-plus-reserve envelope. V8 and v9 retain their distinct released
+renderer/init-script bytes exactly and never reinterpret existing rows with
+v10 semantics.
+
+The controller audit found two independent memory amplifiers. First, cleanup
+and failed-replica liveness repeatedly materialized all SkyPilot Pods from an
+all-namespace Kubernetes response for each replica. One East response was
+16.7 MB on the wire but added about 168 MB RSS; four concurrent reads added
+about 499 MB, with substantial allocator memory retained after GC. The
+post-teardown absence loop bypassed the 30-second cache and could repeat this
+once per second for up to 90 seconds. Second, every ten-second readiness round
+created and destroyed as many as 256 native threads; thread names had advanced
+past 22,590 in 43 minutes. The active service-controller child reached about
+4.42 GiB RSS/4.36 GiB PSS and its Pod cgroup later reached 8,408,256,512 bytes,
+about 97.9% of the 8-GiB limit.
+
+The sole correction is source-under-review and not deployed: capture the exact
+durable on-cloud cluster name before teardown, use an equality label selector
+and stream only Pod metadata, retain a streaming metadata-only broad fallback
+only when the handle is unavailable, single-flight reads per fenced physical
+target without accepting a read begun before teardown as fresh `ABSENT`
+evidence, reuse already-resolved handles, and reuse one bounded readiness
+executor until manager shutdown. Raising the controller memory limit is not
+the correction. Normal service teardown must wait for this source to merge,
+deploy homogeneously, and pass a bounded-memory preflight because teardown is
+one of the reproduction paths.
+
+An in-place cap-only service update is not a safe workaround. Durable intent,
+admission, association, and replica version identity is immutable, while the
+current update path attempts to relabel runtime-identical rows; the nine
+outgoing Kueue waits also hold version election. Because SkyPilot is test-only,
+the approved operational path is normal evidence-backed teardown followed by
+fresh version-1 creation from the reviewed local provider definition after the
+v10 Helm cohort is homogeneous. Use ordinary `serve down`, not a historical
+purge procedure. The recreated spec intentionally carries the approved cap of
+ten logical L4 Spot units; zero demand cannot launch paid capacity, and
+reserved-covered demand must continue to suppress it. No SQL row edits or
+manual Pod deletion are allowed. Provider PRs #8841 and #8842 are closed and
+are not deployment authority. The operator will invoke the service directly
+from a locally validated `ml_models/providers/skypilot/**` source. Commit
+`a69fb3409ede26f98c02f7730f764021c1ef0146` is the final tested deployment
+source: it freezes the cap-ten exercise, application-level node-wide lock,
+content-addressed immutable generation, completion marker, atomic publication,
+and exact `node_shared_immutable` runtime assertion. Commit
+`8933749a5afa46268e78c01f230d0c0cd94e8ba4` is only its cap predecessor, and
+`ee74e0450f4c1299c068e487a8c723be3803c8fc` is only the earlier canary
+predecessor. No `boltz-platform` PR is required or expected.
 
 The 2026-08-24 06:26 UTC qualification receipt is coherent at every authority:
 PostgreSQL has 280/280 `READY`, route generation 507 has 280 active Ready/
@@ -57,11 +137,13 @@ qualification, or a Kueue change. That latency optimization is not required
 by the current production gate.
 
 Simone's Kueue configuration is unchanged. SkyPilot submits PHX fill through
-the existing `be` LocalQueue, `be-lt` WorkloadPriorityClass, default scheduler,
-existing `skypilot-pool-sa`, and Pod priority `-1000`. Kueue alone decides
-admit, queue, and preempt. SkyPilot adds no ClusterQueue, cohort, quota,
-borrowing, or preemption rule. East has no Kueue and targets all healthy
-compatible physical capacity.
+the existing `be` LocalQueue, which unchanged Kueue maps to the existing
+`skypilot-be` ClusterQueue, plus the existing `be-lt`
+WorkloadPriorityClass, default scheduler, `skypilot-pool-sa`, and independent
+Pod priority `-1000`/`Never`. Kueue alone decides admit, queue, and preempt.
+SkyPilot adds or changes no ClusterQueue, cohort, quota, borrowing, priority,
+or preemption rule. East has no Kueue and targets all healthy compatible
+physical capacity.
 
 The live service has `min_replicas: 0` and
 `max_live_paid_gpu_units: 0`. The only inherited paid alternative is Spot L4;
@@ -70,9 +152,11 @@ re-reads the elected cap, counts every cleanup-unproven paid GPU unit, and
 atomically rejects a new paid claim above the cap. Thus the deployed zero-cap
 qualification configuration cannot buy capacity even under stale callers or
 concurrent launch attempts.
-A positive Spot cap may be activated only after an explicit cost envelope is
-disclosed and approved; the reserved-before-paid residual and successful
-teardown debit remain mandatory.
+The operator has approved one bounded qualification envelope, but the live cap
+remains zero until protocol v10, controller-memory safety, clean recreation,
+reserved occupancy, provider observers, and protected-endpoint authentication
+all pass. The reserved-before-paid residual and successful teardown debit
+remain mandatory.
 
 PostgreSQL is the sole central correctness authority. Helm has
 `storage.enabled=false`; the API Deployment has no PVC-backed volume; replica,
@@ -91,19 +175,21 @@ Boltz-side caller work remains restricted to
 backend, or Temporal code is an explicit non-goal. Full Compute API producer
 activation is separate, out of scope, and not claimed by this design.
 
-The only required production behavior gate still open is a genuinely uncovered
-paid L4 Spot residual followed by complete drain, provider absence, and debit
-release. Provider-only Platform PR #8841 freezes the exact restart-safe canary
-at commit `ee74e0450f4c1299c068e487a8c723be3803c8fc`; it changes no runtime
-service definition and its deployment job is skipped. Draft provider-only PR
-#8842 freezes a proposed qualification cap of ten logical L4 GPU units in
-production while retaining cap zero in test. It must remain undeployed until
-the exact regions, physical shapes/count, duration, market, and cost envelope
-receive explicit approval. Ten is a qualification ceiling, not an implicit
-permanent business limit; the lasting finite cap requires a separately
-disclosed owner decision. Ordinary on-demand remains structurally disallowed.
-Cleanup PRs remain separately gated on their exact old-path/legacy-row horizons
-and do not block the live single happy path.
+After the v10/memory rollout and renewed reserved-capacity proof, the remaining
+behavior gate is a genuinely uncovered paid L4 Spot residual followed by
+complete drain, provider absence, and debit release. The approved exercise is
+100 L4-only requests at submission concurrency 16, a cap of ten logical L4 GPU
+units, 1/2/4/8-GPU Spot shapes, at most ten physical machines, the configured
+14 AWS and 18 GCP eligible regions, and at most one hour from first paid claim
+to provider-proven absence. Its current compute envelope is approximately
+`$1.606/hour` at the observed floor and a conservative `$21.2462/hour` ceiling,
+excluding disk and transfer. Ten is a qualification ceiling, not an implicit
+permanent business limit. The exact canary and cap-ten definitions are invoked
+from local provider commit `a69fb3409ede26f98c02f7730f764021c1ef0146`;
+closed Platform PRs #8841/#8842 are not used. Ordinary on-demand remains
+structurally disallowed. Cleanup PRs
+remain separately gated on their exact old-path/legacy-row horizons and do not
+block the live single happy path.
 
 ### Exact async bind convergence across route publication
 
@@ -2434,8 +2520,9 @@ occupancy proof remain valid chronology, not current-state claims.
 Explicit exclusions: EFS/RWX is neither authority nor a correctness fallback;
 KubeRay is not part of this Serve path; no Terraform or Terragrunt expansion is
 required; and no `boltz-platform` SkyPilot runtime pin is added. Deployment is
-fix-forward through the SkyPilot Helm release, while #8652 is used only for the
-service configuration update it owns.
+fix-forward through the SkyPilot Helm release. The next service creation reads
+the reviewed local `ml_models/providers/skypilot/**` definition directly; no
+new or retained Platform PR is deployment authority.
 
 `storage.enabled=false`; active control-plane Pods and the former lifecycle-93
 fleet workers have no EFS or PVC mount. The retired PVC, retained PV, and sole access
@@ -2455,9 +2542,11 @@ proved this dynamic capacity boundary at 280/280 Ready and then automatically
 advanced to 290/290 as ten more PHX slots were confirmed, with zero paid claims
 or Spot replicas. Provider-local exact async telemetry, actual-device
 completion evidence, and the guarded 10,000-request campaign are complete. The
-only open production behavior exercise is a genuinely uncovered bounded paid-
-Spot residual followed by complete drain; the current zero cap cannot perform
-that exercise.
+current protocol-v10/cache-scope and bounded-controller-memory source is not
+yet merged or deployed, and a fresh service has not yet renewed that capacity
+receipt. After those rollout gates pass, the only open product-behavior
+exercise is a genuinely uncovered bounded paid-Spot residual followed by
+complete drain; the current zero cap cannot perform that exercise.
 
 ### Controller-independent dashboard read boundary
 
@@ -2642,10 +2731,12 @@ dry-ran successfully, then failed closed in the separate test target because
 service change. The workflow subsequently completed: revision 472 ran the
 uniform successor cohort and elected version 64, which later admitted
 provider-free capacity before the teardown recorded at the top of this design.
-The existing prod-only
+The then-existing prod-only
 `ml-model-deploy.yml` dispatch with `models=boltz-2`,
-`mode=prod`, and `provider=skypilot` targets only `boltz-l4-fleet` and remains
-the canonical application path. Version 64 has the same three worker
+`mode=prod`, and `provider=skypilot` targeted only `boltz-l4-fleet` and was
+the canonical path for that historical rollout. It is not the protocol-v10
+deployment path; current recreation uses the frozen local provider source.
+Version 64 has the same three worker
 projections and `utilization_gate: false`. Historical exact database readback
 proves its three non-null worker
 projections include a PHX H200 projection that uses
@@ -4697,16 +4788,18 @@ retain their real latencies.
 
 Reserved fill remains zero-cost-only and uses the server/workspace-owned
 preemptible inference placement. Canonical worker placement projection protocol
-v4 is the single owner for new admission; v1/v2/v3 are retained readers only.
-Each candidate adds `projection_version: 4`, the closed `provision_timeout` and
-scratch contracts, and either `kueue_admission: null` or the exact closed
+v10 is the single owner for new admission. V1-v7 are retained settlement/
+cleanup readers, while byte-exact v8/v9 additionally support exact historical
+Pod adoption as the N-2/N-1 window. Each fresh candidate carries
+`projection_version: 10`, the closed `provision_timeout`, scratch, and cache
+budget-scope contracts, and either `kueue_admission: null` or the exact closed
 mapping `{local_queue_name, workload_priority_class_name}`. Namespace, service
 account, Pod PriorityClass name/value/preemption policy, accelerator scheduling,
-LocalQueue, WorkloadPriorityClass, scheduling timeout, and scratch are frozen
-together when the service version is committed. `require_managed` is derived
-from non-null Kueue admission; it is not separately caller-selectable.
+LocalQueue, WorkloadPriorityClass, scheduling timeout, cache, and scratch are
+frozen together when the service version is committed. `require_managed` is
+derived from non-null Kueue admission; it is not separately caller-selectable.
 
-Protocol v4 also owns the scheduler and actual binding seam. The immutable
+Protocol v10 retains the scheduler and actual binding seam introduced by v4. The immutable
 candidate freezes `scheduler_name` from only the server-owned context/workspace
 Pod configuration, defaults it to `default-scheduler`, and binds it through the
 candidate digest and typed reclaim-policy view. Final rendering removes any
@@ -4745,7 +4838,10 @@ inference context that:
 
 - the inference namespace has an active LocalQueue selected by server-owned
   SkyPilot configuration;
-- its ClusterQueue admits that namespace and shares a reviewed preemption
+- in PHX that exact existing LocalQueue is `be`, its admitted output is the
+  existing ClusterQueue `skypilot-be`, and its WorkloadPriorityClass is the
+  existing `be-lt`; SkyPilot creates or mutates none of those objects;
+- the existing ClusterQueue admits that namespace and shares a reviewed preemption
   domain with BCL/research workloads;
 - PHX fill uses the existing lowest Kueue WorkloadPriorityClass, `be-lt` at
   value 11, while the worker Pod independently uses the server-owned
@@ -5727,7 +5823,7 @@ Protocol v5 is historical and cleanup-only because releases 1.1.1440 and
 environments. Their cohort-4/cohort-5 lineage remains sufficient for bounded
 settlement, but neither representation may authorize fresh provider work.
 
-Protocol v6 retains the complete v4 readiness contract and uniquely binds
+Protocol v6 historically retained the complete v4 readiness contract and uniquely bound
 large SkyPilot/uv bootstrap writes to a memory-scratch worker's already
 authenticated `/tmp`. The three exact server-owned paths are present both as
 literal Pod env, which every new `kubectl exec` process inherits, and as
@@ -5742,7 +5838,7 @@ evidence rather than an N-2 compatibility claim. This extension changes no
 projection payload shape, database schema, Kueue object, task resource, or
 platform configuration.
 
-Protocol v7 is the sole fresh-writer successor to v6. The +30 eight-card refill
+Protocol v7 was the sole fresh-writer successor to v6. The +30 eight-card refill
 proved v6 can durably assign released capacity, but also exposed that its
 background apt/SSH wrapper inherits `set -e`: the 90-second wrapper timeout
 killed `apt-get` while child dpkg PID 2654 retained the package lock, leaving
@@ -5771,7 +5867,7 @@ bootstrap content. Its apt/SSH phase must:
 - publish success only after OpenSSH installation, required configuration,
   and the complete authenticated readiness contract pass.
 
-Protocol v6 becomes settlement/cleanup-only through the existing historical
+Protocol v6 then became settlement/cleanup-only through the existing historical
 validator; it cannot authorize a fresh provider effect after cohort 7 is
 activated. Editing v6's script in place is forbidden because the same
 discriminator would then name two concrete bootstrap identities, repeating the
@@ -6326,17 +6422,15 @@ before activation. If it does not, the new image may deploy but the gate stays
   service version and closed accelerator-to-projection digest maps.
 - `reserved_fill_projection_authority.py` is the canonical adapter from one
   immutable worker projection to typed reclaim admission. New writes emit
-  homogeneous explicit projection protocol v7; sequenced paths require
-  non-null typed Kueue admission. Protocol v7 supports both an exact AWS role
+  homogeneous explicit projection protocol v10; sequenced paths require
+  non-null typed Kueue admission. Protocol v10 supports both an exact AWS role
   ARN and an explicit null identity contract, and the value is hash-bound and
-  exposed to the deployment policy. Protocols v5/v6 remain as exact N-2/N-1
-  projection decoders and terminal-cleanup identity classifiers. Generic
-  operational settlement remains N/N-1; v5/cohort-5 N-2 can only retire an
-  already terminal, quiescent, pin-released, zero-paid, canonical
-  `PROJECTED`/`ABSENT` graph. V1-v4 removal remains pending the retargeted
-  cleanup PR #1619.
-- API capability 77 exposes the placement-projection capability surface and
-  the exact advertised current discriminator is v7; allocation-map schema 5
+  exposed to the deployment policy. Protocols v8/v9 remain byte-exact N-2/N-1
+  historical adoption/inspection/settlement/cleanup readers, never alternate
+  fresh-effect writers. Older v1-v7 decoder removal remains gated on the exact
+  retained-row and stale-writer horizon.
+- API capability 77 introduced the placement-projection surface; the current
+  worktree is API 93 and advertises discriminator v10/cohort 10. Allocation-map schema 5
   binds service version and the closed digest map; ReplicaInfo v18 persists the
   selected scalar digest. Activation successor A reads only the six sanctioned
   legacy versions/eight exact pre-v17 shapes and the two exact v17 shapes long
@@ -6491,7 +6585,15 @@ The current worktree now:
 23. carries the normalized accelerator label key, sorted label values, and
     resource key in every typed reclaim admission, requires their exact
     code-owned match at activation, claim, and terminal launch, and makes the
-    east A100-40 and A100-80 bundle contracts disjoint.
+    east A100-40 and A100-80 bundle contracts disjoint; and
+24. adds protocol v10's closed, digest-bound `replica_additive` versus
+    `node_shared_immutable` cache budget scope while preserving each released
+    v8/v9 renderer and init script byte-for-byte; and
+25. bounds controller memory by selecting an exact on-cloud cluster label when
+    the durable handle exists, streaming only Pod metadata, sharing concurrent
+    reads per fenced target without weakening fresh-absence proof, reusing
+    resolved handles, and retaining one bounded readiness executor until
+    manager shutdown instead of creating one large pool per tick.
 
 Regression tests exist for corrections 1--23, including owner-death,
 request-liveness, legacy-row retirement, runtime-daemon supervision,
@@ -6500,6 +6602,10 @@ slot ownership. The complete non-PostgreSQL matrix, changed-source lint, and
 Terraform module tests pass. The exact serial PostgreSQL freeze and corrected
 deployment-policy matrix pass, and all three restarted consecutive adversarial
 reviews passed without findings.
+
+Corrections 24 and 25 are present in the current worktree but remain under
+focused test and adversarial review. They are not merged, deployed, activated,
+or production-proven.
 
 The audit also proved that research-over-fill reclaim is a deployment
 prerequisite rather than a Pod-priority property. A read-only audit on
@@ -6581,11 +6687,14 @@ not duplicate their ownership or widen the writer role.
 
 ### Status actually exposed
 
-The public server API version is 77. Reserved-fill reconciliation status keeps
-its independent minimum capability at 76; immutable worker placement
-projection requires API 77 plus projection protocol 2. These are distinct from
-the PostgreSQL API-request schema revision 010 required for activation. The
-controller's `/autoscaler/info` response always contains a nested
+The deployed public server API version is 92; the protocol-v10 successor is
+API 93. Reserved-fill reconciliation status keeps its independent minimum
+capability at 76, and immutable worker placement projection was introduced at
+API 77; those introduction floors are not the current writer version. The
+deployed worker projection is protocol v9/cohort 9, while all fresh effects
+after the next rollout require protocol v10/cohort 10. Historical PostgreSQL
+API-request schema revision 010 was the activation floor and is likewise not a
+current-version claim. The controller's `/autoscaler/info` response always contains a nested
 `reserved_fill_reconciliation` object. The user-facing service status copies
 the same object when `with_target_num_replicas` is requested.
 
@@ -6652,13 +6761,14 @@ either case.
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed. Lifecycle 84/version 1 and lifecycle 85/version 1 both promoted `DURABLE_INTENT` epoch 1 before normal purge. Phase 2g subsequently closed the full busy-lane/no-row and throughput production evidence. |
 | 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed. Lifecycle 93/version 1 historically exercised the single controller fence, routing linearization lock, and PostgreSQL transaction owning the `DURABLE_FEED`/`DURABLE_INTENT` pair before supported teardown. Draft cleanup PR #1556 removes deprecated separate surfaces and unsupported demand demotion only after the documented horizon. |
 | 2f | Promoted capacity-authority controller takeover | PR #1562 is merged and deployed. Revision 502 proved one consolidated-HA recovery with the bound/demand/fill pair preserved and fresh route evidence restored from PostgreSQL; revision 505 then proved takeover of the deployment-owned renewal singleton. Helm revision 572 then forced a true PR-#1678 cross-Pod lifecycle-93 service-controller takeover from `10.30.1.190` / owner epoch 3 to `10.30.0.98` / owner epoch 4 with a new incarnation, while lifecycle, version, service hash, Ready state, endpoint, and replicas remained stable. The complete stale interval and +30 control-plane/HA/error checks also passed. No schema, provider, platform, or storage change was required. |
-| 2g | Production full reserved backfill | **Complete for the dynamic scheduler-authorized denominator.** Homogeneous Helm revision 594 / release `1.1.1470` runs all seven writers with zero restarts. The coherent 06:26 UTC receipt had 280/280 `READY`: East 13 A100 + 141 A100-80GB with zero compatible physical free; PHX 126 H200 with effective cap, raw/published grant, and holdings all 126 across two rounds. A later coherent read reached 290/290 by 06:44 as ten more PHX slots were confirmed. Every PHX Pod was `POLICY_ADMITTED` under the unchanged contract. Exact provider-local request telemetry, per-device evidence, and the guarded 10,000-request campaign passed. Paid claims and Spot replicas remain zero; genuinely uncovered paid-Spot drain is the separate open gate. |
+| 2g | Production full reserved backfill | **Historically complete for the dynamic scheduler-authorized denominator; current-v10 renewal is open.** The coherent 06:26 UTC receipt had 280/280 `READY`, and a later coherent read reached 290/290 as ten more PHX slots were confirmed. The 13:12 frozen census reached 383 Ready with nine PHX rows correctly Kueue-held, but six East Pending rows exposed the shared-cache v9 double count and five rows were Shutting Down. Every PHX Pod counted as spendable was `POLICY_ADMITTED` under the unchanged contract. Exact provider-local request telemetry, per-device evidence, and the guarded 10,000-request campaign passed. Paid claims and Spot replicas remain zero. The controller Pods now have three confirmed OOM restarts (two on suffix `jxgkf`, one on `wsrfc`), so homogeneous protocol-v10 recreation, bounded-memory refill, and a new coherent denominator receipt are required before this phase is current again. |
 | 2h | Atomic reserved-fill replica/request admission | Merged in PR #1626 and deployed on Helm revision 473 / release `1.1.1401`. One atomic-admission module owns the root PostgreSQL transaction and savepoint; the manager only prepares immutable server-local input before it and starts the returned request reducer after commit. Serve055 adds the owner audit tuple, user FK, and retained-row one-shot transition. The deployed pending-first/global-pending/cleanup-unproven accounting correctly avoided duplicate replacement capacity. The remaining postcommit mutable-authority rejection is owned by phase 2i, not by another admission path or infrastructure change. |
 | 2i | Serve056 committed reserved-fill provider handoff and cohort rotation | PR #1629 merged at `1642ca2e3` as the scalar-schema precursor; PR #1632 restored adoption and corrective PR #1630 supplied the complete committed-handoff contract. That source is deployed through release `1.1.1410` and inherited by revision 489. Draft cleanup PR #1633 remains gated on the final zero-legacy census and production horizon. No EFS, KubeRay, Terraform/Terragrunt, platform runtime pin, or alternate provider path is added. |
 | 2j | Exact protocol-v2 execution capsule and no-failover retry boundary | PR #1667 is merged and deployed in release `1.1.1437`. Under the explicitly absent configured admin-policy mode, the server controller freezes one already-launchable Kubernetes resource in the hashed request, the executor reconstructs `best_resources` from it before cluster-existence/initial optimization, and the provisioner exits an exact-candidate failure before retry optimization or failover. Ordinary launches are unchanged. Lifecycle 93 historically proved clean recreation and full scheduler-authorized occupancy before supported teardown. |
 | 2k | Per-pool bounded conveyor and allocation-tail paid suppression | PR #1686 is merged and deployed in `1.1.1456`, inherited by `1.1.1457`. Independent 32-position pool windows refill without one Kueue-waiting lane blocking another, and the exact reserved allocation tail is debited before paid residual. Current production has zero paid claims and zero Spot replicas. |
 | 2l | Live exact pre-effect terminal recovery | PR #1687 is merged and deployed in `1.1.1457` / Helm 586. Live reconciliation atomically retired provider-free replica 465, its admission, and its committed intent while retaining association/request history; replacement 572 reached `POD_WAITING`. No manual SQL, provider call, service recreation, Kueue change, or lifecycle/version rotation occurred. |
 | 2m | Exact route-publication convergence and request/load qualification | PR #1700 merged at `9552669c0bbcbea9d2ee331569dc69fa4c7f0196` and is deployed in `1.1.1470` / Helm 594. Capacity-only route-head churn no longer rejects an unchanged selected worker. Staged 1, 100, 1,000, and 10,000-request production phases completed with exact terminal reconciliation, per-card work, logical-device saturation, no route starvation, and no paid launch under the zero cap. |
+| 2n | Protocol-v10 shared-cache admission and bounded controller memory | **Source-under-review; not merged, deployed, or production-proven.** V10 adds the digest-bound `replica_additive`/`node_shared_immutable` scope while preserving v8/v9 bytes. The same successor removes per-replica full-Pod presence materialization and per-tick thread-pool churn through exact/streamed single-flight reads, handle reuse, and one bounded reusable readiness executor. Its acceptance gate is homogeneous API-93/cohort-10 deployment, normal test-service teardown/recreation from local provider source, complete renewed occupancy, and bounded controller memory through the stale/quiescence horizon. |
 | 3a | Stacked Serve055 owner-transition cleanup after the production horizon | The required `fix/serve-atomic-fill-admission-cleanup` branch adds PostgreSQL-only Serve058 `NOT NULL` owner columns and removes only the application one-shot `NULL` attestation branch, the schema-derived temporary global user-deletion guard, and transition-only observability/tests. The dialect-neutral SQLAlchemy model remains nullable for the separately supported controller-local SQLite/Serve037 path. Serve058 verifies or reinstalls the permanent PostgreSQL owner FK and owner-immutability trigger in the same migration. Draft PR #1660 is stacked on and cross-linked from #1659; it remains blocked on a complete capable cohort, zero `NULL` tuples, no old writers, backups, and the complete stale/HA production horizon. |
 | 3b | Stacked Serve056 scalar-`NULL` cleanup bridge removal | Draft PR #1633 is stacked on and cross-linked from #1630, replacing automatically closed draft #1631. It removes only the cleanup-only JSON resolver and its transition tests after zero scalar-`NULL` protocol-v2 replicas, zero unsettled scalar-`NULL` provider-effect associations, and zero scalar-`NULL` cleanup-unproven markers persist through the complete stale/quiescence/provider-reprobe horizon. It cannot merge earlier. Closed PRs #1506/#1510 are not revived. |
 
@@ -6669,11 +6779,14 @@ reconciliation; neither is a second source of launch authority.
 
 ## Deployment, activation, and fix-forward reauthorization
 
-The reserved-capacity deployment sequence completed at direct-Helm revision
-586 / release `1.1.1457` and is inherited and further production-proven by
-revision 594 / release `1.1.1470`; there is no pending purge, recreation,
-activation, or service-version rollout for reserved convergence. The earlier
-direct-Helm purge/recreate, A/B/C, split-topology, publisher, and platform-PR
+The historical reserved-capacity deployment sequence completed at direct-Helm
+revision 586 / release `1.1.1457` and was further production-proven by revision
+594 / release `1.1.1470`. Protocol-v10 cache admission and the bounded-memory
+controller correction now require one new fix-forward Helm cohort and a normal
+test-service teardown/recreation. That current sequence is defined at the top
+of this design and in the projection design; it uses the local provider source
+and no Platform PR or state migration. The earlier direct-Helm purge/recreate,
+A/B/C, split-topology, publisher, generation-transition, and platform-PR
 sequences retained below are historical review evidence only. They must not be
 executed, used as merge gates, or treated as current deployment authority.
 
@@ -8113,9 +8226,11 @@ legacy activation.
 
 ## Remaining gates after capacity convergence
 
-Checked items below are retained receipts. Reserved-capacity convergence is
-complete; unchecked items are cleanup-specific or request/data-plane
-qualification and do not authorize a Kueue or infrastructure change.
+Checked items below are retained receipts. Historical reserved-capacity
+convergence is complete, but protocol-v10 cache admission, controller-memory
+safety, clean recreation, and a renewed denominator receipt are current open
+gates. No unchecked item authorizes a Kueue or non-SkyPilot infrastructure
+change.
 
 - [x] Merge and deploy PRs #1671--#1677. They establish protocol v6,
   lock-free proof renewal, stable claim/conserved-capacity-hint identity, and
@@ -8196,6 +8311,29 @@ qualification and do not authorize a Kueue or infrastructure change.
   `1.1.1457` / Helm-586 cohort supplied one completion receipt; revision 594
   supersedes it with the dynamic 280/280 then 290/290 receipts recorded at the
   top of this document, zero paid claims, and zero Spot replicas.
+- [ ] Merge and direct-Helm deploy one homogeneous API-93/projection-10/
+  cohort-10 SkyPilot image containing both the explicit cache budget scope and
+  bounded controller-memory corrections. Preserve Helm values and PostgreSQL,
+  install the exact attestation-ID-to-`node_shared_immutable` registry in the
+  API/controller construction environment, change no Kueue/Terraform/
+  Terragrunt object, and prove every writer reports the same immutable image
+  before fresh provider effects. Executors consume only the frozen scope.
+- [ ] Prove controller memory remains bounded through normal service teardown,
+  fresh recreation, full refill, and one complete stale/quiescence interval.
+  Require bounded RSS/cgroup memory and thread count, zero new OOM, exact
+  metadata-only/single-flight presence reads, and fresh post-teardown absence;
+  do not substitute a larger memory limit.
+- [ ] Tear down the test-only service with ordinary `serve down` after the
+  corrected cohort is healthy (do not replay a historical purge procedure),
+  prove exact Pod/Workload/provider/database absence, and recreate version 1
+  directly from tested local provider commit
+  `a69fb3409ede26f98c02f7730f764021c1ef0146`. Prove v10
+  `node_shared_immutable` admission on the formerly blocked East node, all
+  East scheduler-fit capacity, all PHX `POLICY_ADMITTED` capacity under the
+  unchanged `be` -> `skypilot-be`, `be-lt`, Pod `-1000`/`Never` contract, zero
+  paid capacity at zero or reserved-covered demand, and fresh complete request
+  telemetry. Do not migrate/relabel rows, delete Pods
+  manually, or use a Platform PR.
 
 - [x] Merge and deploy the deployment-owned provider-proof singleton in PRs
   #1656/#1657 and release `1.1.1429`; revision 501 proved it dark through more
@@ -8542,20 +8680,20 @@ qualification and do not authorize a Kueue or infrastructure change.
   produced exactly 10,000 HTTP 200 responses plus 10,000 terminal successes,
   with zero non-200, receipt lookup, failed, missing-artifact, timed-out, or
   unsettled result and no nonterminal ledger tail.
-- [ ] Exercise genuinely uncovered paid Spot residual and drain in production
-  only after recording the maximum logical GPU slots, possible machine shapes
-  and count, regions, duration, market, and rough cost. Ordinary on-demand
-  remains disallowed without explicit management approval. Provider-only PR
-  #8841 freezes the restart-safe exact canary without a deployable service
-  change. Draft provider-only PR #8842 proposes the still-unapproved bounded
-  exercise: at most ten logical L4 units, Spot only, 1/2/4/8-GPU widths, at
-  most ten physical machines, and at most one hour from the first paid claim to
-  provider-proven absence. The conservative current catalog compute bound is
-  `$21.2462/hour`, excluding disk and transfer. Do not merge/deploy the positive
-  production cap or send the L4-only demand campaign until that exact envelope
-  is explicitly approved. Keep cap ten enabled through the successful natural
-  drain proof; returning it to zero early would not prove positive-cap idle
-  retirement. Choose the permanent finite spend cap separately afterward.
+- [ ] Exercise the approved genuinely uncovered paid Spot residual and drain
+  only after the v10 recreation and reserved-capacity receipt pass, provider
+  observers are ready, and the operator supplies protected-endpoint
+  authentication. Use local provider commit
+  `a69fb3409ede26f98c02f7730f764021c1ef0146`: 100 L4-only requests,
+  concurrency 16, at most ten logical L4 units, Spot-only 1/2/4/8-GPU widths,
+  at most ten physical machines, the configured 14 AWS and 18 GCP eligible
+  regions, and at most one hour from first paid claim to provider-proven
+  absence. The compute envelope is approximately `$1.606/hour` at the observed
+  floor and a conservative `$21.2462/hour` ceiling, excluding disk and
+  transfer. Closed Platform PRs #8841/#8842 are not deployment authority. Keep
+  cap ten enabled through successful natural drain; returning it to zero early
+  would not prove positive-cap idle retirement. Choose the permanent finite
+  spend cap separately afterward.
 - [x] Pass typed provider present/absent/unknown/replaced,
   legacy-real-effect, lost-ACK, poisoned-row progress, broker conservation,
   no-paid-spill, and full restart/adoption tests. Focused unit and real-

@@ -91,7 +91,7 @@ def test_unknown_provider_evidence_quarantines_only_the_exact_row() -> None:
         kubernetes_context=identity.provider_context,
         physical_cluster_uid=identity.provider_physical_resource_uid),
                                   identity.cluster_name,
-                                  use_cache=False)
+                                  observed_after=mock.ANY)
     project.assert_not_called()
 
 

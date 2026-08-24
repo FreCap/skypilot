@@ -11,7 +11,7 @@ from sky.utils import controller_constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 92  # Controller-free exact SkyServe request summary
+API_VERSION = 93  # SkyServe shared-cache projection protocol v10
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):

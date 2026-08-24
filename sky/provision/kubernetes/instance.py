@@ -2719,7 +2719,7 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     except ValueError as error:
         raise config_lib.KubernetesError(
             'The rendered SkyServe worker projection protocol version must be '
-            '1, 2, 3, 4, 5, 6, 7, 8, 9, or absent.') from error
+            '1, 2, 3, 4, 5, 6, 7, 8, 9, 10, or absent.') from error
     historical_rendered_projection = bool(
         serve_worker_projection_protocol_version is not None and
         serve_worker_projection_protocol_version
@@ -2792,7 +2792,7 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         if (serve_worker_expected_scratch
                 is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
             raise config_lib.KubernetesError(
-                'Projection protocol v3/v4/v5/v6/v7/v8/v9 requires the complete '
+                'Projection protocol v3/v4/v5/v6/v7/v8/v9/v10 requires the complete '
                 'worker '
                 'scratch attestation contract.')
         serve_worker_expected_scratch = (
@@ -2801,31 +2801,33 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     elif (serve_worker_expected_scratch
           is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
         raise config_lib.KubernetesError(
-            'Only projection protocol v3/v4/v5/v6/v7/v8/v9 may carry a worker '
+            'Only projection protocol v3/v4/v5/v6/v7/v8/v9/v10 may carry a worker '
             'scratch '
             'attestation contract.')
     if require_cache_bootstrap:
         if (serve_worker_expected_cache
                 is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
             raise config_lib.KubernetesError(
-                'Projection protocol v8/v9 requires the complete worker cache '
+                'Projection protocol v8/v9/v10 requires the complete worker cache '
                 'bootstrap attestation contract.')
         try:
             serve_worker_expected_cache = (
                 pod_spec_lib.validate_projected_worker_cache(
-                    serve_worker_expected_cache))
+                    serve_worker_expected_cache,
+                    require_budget_scope=(
+                        serve_worker_projection_protocol_version == 10)))
         except pod_spec_lib.ProjectedCacheContractError as error:
             raise config_lib.KubernetesError(str(error)) from error
     elif (serve_worker_expected_cache
           is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
         raise config_lib.KubernetesError(
-            'Only projection protocol v8/v9 may carry a worker cache bootstrap '
+            'Only projection protocol v8/v9/v10 may carry a worker cache bootstrap '
             'attestation contract.')
     if require_runtime_readiness:
         if (serve_worker_expected_runtime_bootstrap_sha256
                 is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
             raise config_lib.KubernetesError(
-                'Projection protocol v4/v5/v6/v7/v8/v9 requires the complete '
+                'Projection protocol v4/v5/v6/v7/v8/v9/v10 requires the complete '
                 'worker runtime '
                 'bootstrap SHA256 contract.')
         try:
@@ -2837,7 +2839,7 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     elif (serve_worker_expected_runtime_bootstrap_sha256
           is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
         raise config_lib.KubernetesError(
-            'Only projection protocol v4/v5/v6/v7/v8/v9 may carry a worker '
+            'Only projection protocol v4/v5/v6/v7/v8/v9/v10 may carry a worker '
             'runtime '
             'bootstrap SHA256 contract.')
     priority_attestation_presence = tuple(

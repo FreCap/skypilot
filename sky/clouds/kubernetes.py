@@ -814,7 +814,7 @@ class Kubernetes(clouds.Cloud):
                     projection_version)):
             raise ValueError(
                 'Kubernetes deployment resources require a byte-exact worker '
-                'placement projection renderer; only protocols 8 and 9 are '
+                'placement projection renderer; only protocols 8, 9, and 10 are '
                 'renderable.')
         has_strict_worker_admission = (
             kubernetes_pod_spec.

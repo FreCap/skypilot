@@ -2766,6 +2766,7 @@ def _stamp_protocol_v2_fill(info,
 def _protocol_v2_handle(info, context='phx'):
     handle = mock.Mock(spec=replica_managers.backends.CloudVmRayResourceHandle)
     handle.cluster_name = info.cluster_name
+    handle.cluster_name_on_cloud = f'{info.cluster_name}-on-cloud'
     handle.cluster_yaml = '/tmp/protocol-v2-cluster.yaml'
     handle.launched_resources = mock.Mock(cloud=clouds.Kubernetes(),
                                           region=context)
@@ -2794,6 +2795,7 @@ def test_protocol_v2_down_waits_for_uncached_physical_absence(tmp_path):
         replica_managers.reserved_capacity.PhysicalReplicaPresence.ABSENT,
     ])
     events = []
+    observation_boundaries = []
     phase_number = 0
 
     @contextlib.contextmanager
@@ -2808,10 +2810,14 @@ def test_protocol_v2_down_waits_for_uncached_physical_absence(tmp_path):
         finally:
             events.append(f'phase-{current_phase}-exit')
 
-    def _probe(actual_fence, actual_cluster_name, *, use_cache):
+    def _probe(actual_fence, actual_cluster_name, *, observed_after,
+               cluster_name_on_cloud):
         assert actual_fence == fence
         assert actual_cluster_name == cluster_name
-        assert use_cache is False
+        assert isinstance(observed_after, float)
+        assert 'down' in events
+        assert cluster_name_on_cloud == f'{cluster_name}-on-cloud'
+        observation_boundaries.append(observed_after)
         presence = next(presences)
         events.append(f'probe-{presence.value}')
         return presence
@@ -2850,6 +2856,8 @@ def test_protocol_v2_down_waits_for_uncached_physical_absence(tmp_path):
         _expected_cluster_hash='cluster-generation',
         _continue_guard=guard)
     assert probe.call_count == 3
+    assert observation_boundaries == sorted(observation_boundaries)
+    assert len(set(observation_boundaries)) == 3
     assert receipt == (
         replica_managers.reserved_capacity.ProtocolV2PhysicalAbsenceReceipt(
             cleanup_fence=fence, cluster_name=cluster_name))
@@ -2880,7 +2888,7 @@ def test_protocol_v2_down_missing_record_proves_physical_absence(tmp_path):
                                                      cleanup_fence=fence)
 
     core_down.assert_not_called()
-    probe.assert_called_once_with(fence, cluster_name, use_cache=False)
+    probe.assert_called_once_with(fence, cluster_name, observed_after=mock.ANY)
     assert receipt == (
         replica_managers.reserved_capacity.ProtocolV2PhysicalAbsenceReceipt(
             cleanup_fence=fence, cluster_name=cluster_name))
@@ -2916,7 +2924,11 @@ def test_protocol_v2_down_disappeared_cluster_proves_physical_absence(tmp_path):
                                                      cleanup_fence=fence)
 
     core_down.assert_called_once()
-    probe.assert_called_once_with(fence, cluster_name, use_cache=False)
+    probe.assert_called_once_with(
+        fence,
+        cluster_name,
+        observed_after=mock.ANY,
+        cluster_name_on_cloud=f'{cluster_name}-on-cloud')
     assert receipt == (
         replica_managers.reserved_capacity.ProtocolV2PhysicalAbsenceReceipt(
             cleanup_fence=fence, cluster_name=cluster_name))
@@ -2951,7 +2963,7 @@ def test_protocol_v2_down_missing_record_never_infers_absence(
                                            cleanup_fence=fence)
 
     core_down.assert_not_called()
-    probe.assert_called_once_with(fence, cluster_name, use_cache=False)
+    probe.assert_called_once_with(fence, cluster_name, observed_after=mock.ANY)
 
 
 def test_protocol_v2_down_retains_perpetual_present_uncertainty(tmp_path):
@@ -2984,7 +2996,11 @@ def test_protocol_v2_down_retains_perpetual_present_uncertainty(tmp_path):
                                            cleanup_fence=fence)
 
     core_down.assert_called_once()
-    probe.assert_called_once_with(fence, cluster_name, use_cache=False)
+    probe.assert_called_once_with(
+        fence,
+        cluster_name,
+        observed_after=mock.ANY,
+        cluster_name_on_cloud=f'{cluster_name}-on-cloud')
 
 
 def test_protocol_v2_down_rejects_absence_after_owner_loss(tmp_path):
@@ -3016,7 +3032,11 @@ def test_protocol_v2_down_rejects_absence_after_owner_loss(tmp_path):
                                            cleanup_fence=fence)
 
     core_down.assert_called_once()
-    probe.assert_called_once_with(fence, cluster_name, use_cache=False)
+    probe.assert_called_once_with(
+        fence,
+        cluster_name,
+        observed_after=mock.ANY,
+        cluster_name_on_cloud=f'{cluster_name}-on-cloud')
     assert guard.call_count == 3
 
 

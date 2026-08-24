@@ -247,7 +247,7 @@ def test_admissionless_teardown_uncached_absence_is_stamped_without_backfill():
             kubernetes_context=target.identity.kubernetes_context,
             physical_cluster_uid=target.identity.physical_cluster_uid),
         target.cluster_name,
-        use_cache=False)
+        observed_after=mock.ANY)
     record_absence.assert_called_once_with(
         mock.ANY, target, provider_read_started_at=_READ_STARTED_AT)
     repository.insert_intent_pending_in_connection.assert_not_called()
@@ -337,7 +337,7 @@ def test_admissionless_teardown_nonabsence_fails_without_stamp_or_backfill(
             kubernetes_context=target.identity.kubernetes_context,
             physical_cluster_uid=target.identity.physical_cluster_uid),
         target.cluster_name,
-        use_cache=False)
+        observed_after=mock.ANY)
     record_absence.assert_not_called()
     repository.insert_intent_pending_in_connection.assert_not_called()
     repository.bind_materialized_in_connection.assert_not_called()

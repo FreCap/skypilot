@@ -553,9 +553,9 @@ def _install_failed_teardown_provider_observation(monkeypatch, engine, info,
             return 'replacement-physical-cluster-uid'
         return info.reserved_fill_physical_cluster_uid
 
-    def _probe_presence(_fence, cluster_name, *, use_cache):
+    def _probe_presence(_fence, cluster_name, *, observed_after):
         assert cluster_name == info.cluster_name
-        assert not use_cache
+        assert isinstance(observed_after, float)
         provider_reads.append('replica-presence')
         return {
             ordinary_launch_binding.ProviderEvidence.PRESENT:
