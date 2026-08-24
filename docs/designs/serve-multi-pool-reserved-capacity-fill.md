@@ -1,113 +1,90 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-23 23:43 UTC
+Last updated: 2026-08-24 01:23 UTC
 
-Status: **reserved-capacity convergence is production-complete; request-level
-qualification remains open.** PR #1686 merged and release `1.1.1456` proved
-the bounded per-pool conveyor and reserved-before-paid residual. PR #1687
-merged and release `1.1.1457` proved live, provider-free recovery of an exact
-pre-effect terminal launch. The final homogeneous deployment is Helm revision
-586 on all two API, two controller, and three executor writers at image
-`sha256:1f22ba247e4e5044e71ff9d6b991a9676339c6e7172f2ff8530fc9f2c0fd97df`
+Status: **scheduler-admitted reserved-capacity convergence is production-proven;
+exact request-path and load qualification remain open.** The homogeneous
+control plane is SkyPilot release `1.1.1464`, Helm revision 590: two API, two
+controller, and three executor Pods are Ready on image
+`sha256:3af8c64962a1405a35e6e9cba9ad53f38a597be2bb7163e165bbda6c1ec6aafb`
 and chart digest
-`sha256:be2078d5e4175e071b37b50b8bc29a20d705a58bd21e3abb53518c4cb96e5495`.
-All seven control-plane Pods are Ready with zero restarts. Lifecycle 96/version
-1 remained unchanged through both fix-forward deployments.
+`sha256:08dd56877be0a3e51399e47141effb2bbb0319ebc39c3b20b72d423fa138b58f`.
+The old test lifecycle was removed through supported teardown and
+`boltz-l4-fleet` was recreated once from the canonical definition as service
+incarnation `fb593111-6524-48f5-ab58-1f895a6664cd`, version 1. The active
+route reports generation 98, 149 expected and 149 reported backends, and 149
+fresh Ready workers.
 
-The current PostgreSQL service census is 167 `READY` and one `PENDING`. This is
-a dynamic scheduler outcome rather than a fixed fleet floor: research reclaimed
-capacity after the earlier 372-replica snapshot. East has all 328 of 328 GPUs
-assigned, with 90 one-GPU fleet workers and 238 research GPU requests. All 41
-eight-GPU nodes are fully packed, including nine nodes with all eight devices
-assigned to distinct fleet workers. PHX has 511 of 512 GPUs running, with 77
-one-GPU H200 fleet workers and 434 research GPU requests. The remaining fleet
-Workload uses the existing `be` LocalQueue and the existing `-1000` Pod
-priority, but Kueue reports `WaitingForQuota` / `NoReservation`; the raw final
-GPU is therefore not presently admitted to SkyPilot by the unchanged policy.
-All admitted fleet Workloads are running, including eight PHX nodes with eight
-fleet workers apiece. SkyPilot must not change research ClusterQueues, cohorts,
-quotas, priorities, borrowing, or preemption to claim that last raw device.
+At the 2026-08-24 01:17 UTC production census, all scheduler-spendable reserved
+capacity was occupied without a paid launch: 13 A100, 77 A100-80GB, and 59
+H200 workers were Ready. East had all 328 physical GPU requests running: 90
+one-GPU fleet workers and 238 research requests. PHX had 509 of 512 physical
+GPU requests running: 59 one-GPU fleet workers and 450 research requests. The
+three raw PHX devices left on two nodes were not scheduler-fit for this worker:
+each device needs 4 CPUs and 16 GiB, while those nodes had only 2.785 and 1.785
+allocatable CPUs left. Three exact fleet Workloads therefore remain
+`POD_WAITING` with Kueue `NoReservation`; they own no admitted GPU debit and
+must be presented as CPU/topology-blocked submitted capacity, not usable idle
+capacity. Multiple one-GPU workers are packed on the same eight-GPU machines,
+proving that the service uses every schedulable device rather than one worker
+per node.
 
-PR #1687 atomically retired the exact orphaned replica 465, its admission, and
-its committed intent after proving the associated launch was `NOT_STARTED`,
-pre-effect terminal, execution-quiesced, and provider `NOT_QUERIED`. Its
-association/request history was retained. Replacement replica 572 reached
-`POD_WAITING`, demonstrating automatic refill without manual SQL or provider
-cleanup. Simone's Kueue configuration is unchanged. Helm storage is disabled,
-there is no SkyPilot PVC, and PostgreSQL remains the control-plane authority;
-EFS is not a correctness dependency. The API returns HTTP 200 and the dashboard
-returns the expected HTTP 307 SSO redirect.
+Simone's Kueue configuration is unchanged. SkyPilot submits PHX fill through
+the existing `be` LocalQueue, `be-lt` WorkloadPriorityClass, default scheduler,
+existing `skypilot-pool-sa`, and Pod priority `-1000`. Kueue alone decides
+admit, queue, and preempt. SkyPilot adds no ClusterQueue, cohort, quota,
+borrowing, or preemption rule. East has no Kueue and targets all healthy
+compatible physical capacity.
 
-The remaining gates are deliberately separate from reserved-capacity
-convergence: deploy the stale-demand census and current-route demand fixes,
-durably qualify exact asynchronous request telemetry, collect actual
-worker/device completion evidence, run a guarded 10,000-logical-request
-campaign, and exercise genuinely uncovered paid Spot residual and drain. The
-campaign must first replace the current broad multi-cloud Spot alternative set
-with an explicitly disclosed bounded Spot envelope; ordinary on-demand is not
-an allowed fallback. None of those gates authorizes changing Kueue or claiming
-HTTP admission as model completion.
+The live service has `min_replicas: 0` and
+`max_live_paid_gpu_units: 0`. The only inherited paid alternative is Spot L4;
+ordinary on-demand is not an allowed fallback. The PostgreSQL transaction
+re-reads the elected cap, counts every cleanup-unproven paid GPU unit, and
+atomically rejects a new paid claim above the cap. Thus the current load phase
+cannot buy capacity even under stale callers or concurrent launch attempts.
+A positive Spot cap may be activated only after an explicit cost envelope is
+disclosed and approved; the reserved-before-paid residual and successful
+teardown debit remain mandatory.
 
-One scoped source correction precedes further service-policy iterations.
-SkyServe already relabels a live replica to a new service version when its
-runtime task is unchanged, avoiding an unnecessary replacement and drain for a
-policy-only update. Its reuse gate, however, recognizes only an explicit
-`file_mounts: {}` as empty. The canonical `boltz-l4-fleet` YAML omits
-`file_mounts`, so the equivalent absent value currently exits the reuse path
-before runtime comparison and turns a service-policy-only update into a full
-rolling replacement. The steady-state contract treats absent, explicit null,
-and an empty mapping as the same no-mount runtime. Only a nonempty mount
-mapping requires replacement. This normalization changes no task bytes,
-replica placement, Kueue object, provider resource, database schema, storage,
-or service-version safety fence; recovery-capable replicas and genuinely
-changed runtime tasks retain their existing replacement behavior. Focused
-tests must cover omitted, null, empty, and nonempty mounts before deployment.
+PostgreSQL is the sole central correctness authority. Helm has
+`storage.enabled=false`; the API Deployment has no PVC-backed volume; replica,
+association, request, queue, capacity debit, and exact asynchronous-dispatch
+state are PostgreSQL-owned. EFS is neither mounted nor a recovery dependency.
+No KubeRay, Terraform/Terragrunt expansion, broad application-admin grant, or
+`boltz-platform` SkyPilot runtime pin is part of this design.
 
-Paid residual activation for the placer-backed fleet also needs one durable
-service-owned safety control, not another deployment-specific environment
-profile. An optional
-`replica_policy.max_live_paid_gpu_units` integer limits cleanup-unproven paid
-GPU capacity for one logical-per-GPU service. It is valid only with
-`spot_placer: dynamic_fallback_per_gpu`, whose persisted `planned_capacity` is
-the exact whole-GPU width of the selected backend. The value must be at least
-zero; omission means unlimited for compatibility. Phase A sets the value to
-zero, proving the complete reservation-aware path and request load without
-buying capacity. A later explicitly reviewed phase may raise it to a disclosed
-GPU-unit bound for genuinely uncovered Spot demand. Because this is a
-service-policy field, the unchanged-runtime relabel contract above applies and
-changing only the cap must not roll compatible replicas.
+Released source now includes the no-mount normalization, exact asynchronous
+Serve ledger and service-incarnation fence, reserved-before-paid placement,
+and the hard paid GPU-unit cap. The remaining required gates are:
 
-The cap is intentionally stricter than the existing unresolved-launch window.
-A row contributes its positive integer `planned_capacity` whenever its
-persisted `is_zero_cost` value is not exactly true and its durable
-`sky_down_status` is distinct from `SUCCEEDED`; malformed or missing retained
-widths conservatively contribute at least one unit. READY, failed, ambiguous,
-and shutting-down rows therefore keep their debit until teardown has durably
-succeeded; deleting a transient paid claim or marking a row terminal cannot
-release cost authority. The advisory launch budget applies the same predicate
-to its replica snapshot, but the sole authority is the PostgreSQL transaction
-that locks the service incarnation, reloads the elected immutable spec instead
-of trusting the controller's advisory value, recounts those rows, and admits
-only when the live sum plus the incoming row's exact `planned_capacity` does
-not exceed the cap, atomically with the new replica and paid claim. This also
-fences an in-flight old-version manager after a committed cap reduction.
-Concurrent admissions cannot exceed the cap, including heterogeneous
-multi-GPU backends. Exact replay of an already durable claim remains allowed
-even at or above the limit, while a new claim is rejected. If shared
-PostgreSQL authority is unavailable and the cap is configured, paid selection
-fails closed and must never enter the legacy-local window.
+1. finish and deploy the PostgreSQL row-first exact caller from every current
+   Compute API dispatch path, using a frozen request preimage and exact
+   service/incarnation/endpoint/card identity;
+2. activate that test worker cohort without old/new unversioned Temporal
+   binaries overlapping, then prove a small end-to-end prediction completion;
+3. run a bounded manifest of 10,000 logical requests, retrying only durable
+   pre-dispatch rejections and adjudicating ambiguous responses by exact
+   receipt rather than blind resubmission;
+4. prove rapid scale-out, per-device execution and completion telemetry, zero
+   ordinary on-demand launches, and zero paid Spot launches while the cap is
+   zero; and
+5. expose confirmed queued, dispatched, processing, completed, rejected, and
+   scheduler-blocked counts with freshness in the service UI.
 
-This placer-backed control reuses the existing service-spec pickle, replica
-JSON/scalar projection, service-row lock, and paid claim transaction. It adds
-no table, migration, EFS state, provider path, Kueue object, Terraform
-resource, or second launch implementation. It is rejected without
-`dynamic_fallback_per_gpu`, because vanilla and physical-backend Serve launches
-do not share its logical GPU-unit contract or all pass through the paid claim
-seam. Tests must cover schema and constructor validation,
-YAML/copy/old-pickle behavior, advisory counting (including null cost
-provenance and teardown success), PostgreSQL concurrency, elected-spec
-authority against a stale caller, exact replay, malformed legacy replica
-state, cap zero, and the no-PostgreSQL fail-closed path.
+The outstanding rollout-complexity defect is narrower than fill convergence.
+Today any fresh `POD_WAITING` Kueue row from the elected version globally holds
+a new version election, even for a policy-only update whose immutable worker
+projection is identical. With CPU-fragmented nodes, that wait can be
+unbounded. The steady-state rule must use content identity rather than version
+number: an update with the same service incarnation and exact immutable worker
+projection adopts the retained Pod UID and admission attempt; an incompatible
+update performs exact UID-scoped cleanup, proves provider/Pod absence, releases
+intent, association, pin, and debit, and only then replaces it. A waiting row
+never contributes demand, assigned capacity, or paid residual. Stale, expired,
+duplicate, or target-incompatible waiting rows must not block unrelated pools
+or versions. Until that source correction is merged and proven, clean
+`serve down`/`serve up` is the deliberately simpler test-only rollout path; no
+state migration is required for this test fleet.
 
 ## Historical rollout record
 
