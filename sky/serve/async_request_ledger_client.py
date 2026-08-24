@@ -69,6 +69,10 @@ class AsyncLedgerTransportError(RuntimeError):
         self.detail = detail
 
 
+class AsyncLedgerRouteAuthorityConflict(AsyncLedgerTransportError):
+    """A typed pre-bind conflict that permits fresh route selection only."""
+
+
 def _raw_header_values(request: fastapi.Request, header_name: str) -> list[str]:
     """Read one security-relevant header without coalescing duplicates."""
     raw_headers = getattr(request.headers, 'raw', None)
@@ -544,6 +548,10 @@ class AsyncRequestLedgerClient:
         if status_code != 200:
             detail = (payload.get('detail')
                       if isinstance(payload, dict) else None)
+            if (status_code == 409 and isinstance(detail, str) and detail and
+                    isinstance(payload, dict) and payload.get('error_code')
+                    == constants.LB_ASYNC_LEDGER_ROUTE_AUTHORITY_CONFLICT_CODE):
+                raise AsyncLedgerRouteAuthorityConflict(status_code, detail)
             raise AsyncLedgerTransportError(
                 status_code, detail or 'Async ledger persistence failed.')
         return _parse_receipt(payload)

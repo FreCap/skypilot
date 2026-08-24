@@ -486,6 +486,43 @@ def test_async_ledger_route_preserves_domain_error_status(
     assert json.loads(response.body)['detail'] == str(error)
 
 
+def test_async_ledger_route_types_only_new_attempt_authority_conflict(
+        monkeypatch):
+    _install_async_ledger_schema(monkeypatch)
+    error = (controller_proxy.async_request_ledger.
+             AsyncRequestLedgerRouteAuthorityConflict(
+                 'The selected route projection is missing, stale, or moved.'))
+    repository = mock.Mock()
+    repository.bind.side_effect = error
+    monkeypatch.setattr(controller_proxy.async_request_ledger,
+                        'AsyncRequestLedgerRepository',
+                        mock.Mock(return_value=repository))
+    payload = {
+        'protocol_version': 1,
+        'operation': 'bind',
+        'request_id': 'request-1',
+        'intent_sha256': 'a' * 64,
+        'route_contract_service_version': 1,
+        'route_projection_generation': 2,
+        'route_projection_sha256': 'c' * 64,
+        'route_source_epoch': 3,
+        'selected_route_url': 'http://10.0.0.1:8080',
+        'allow_new_attempt': True,
+    }
+
+    response = asyncio.run(
+        controller_proxy.record_async_request_ledger(
+            'svc',
+            _request('/api/internal/serve/svc/async-request-ledger',
+                     body=json.dumps(payload).encode())))
+
+    assert response.status_code == 409
+    assert json.loads(response.body) == {
+        'detail': str(error),
+        'error_code': constants.LB_ASYNC_LEDGER_ROUTE_AUTHORITY_CONFLICT_CODE,
+    }
+
+
 def test_async_ledger_route_keeps_json_errors_separate_from_validation(
         monkeypatch):
     _install_async_ledger_schema(monkeypatch)

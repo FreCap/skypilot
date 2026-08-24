@@ -9,22 +9,32 @@ Updated 2026-08-24. The reporter-minute histogram is implemented, but its
 asynchronous completion count is explicitly approximate. The PostgreSQL
 ledger, stable API ingest path, load-balancer bind/lookup/transition
 integration, and coverage-aware status/dashboard summary are implemented,
-locally qualified, and deployed dark in SkyPilot 1.1.1460 / Helm revision 588.
-Serve058 is at the live PostgreSQL head and both load-balancer slots run the
-same immutable 1.1.1460 image. Read-only receipt probes and the fresh dashboard
+locally qualified, and remain deployed dark. The current homogeneous baseline
+is SkyPilot 1.1.1469 / Helm revision 593 on immutable image
+`sha256:9b0823f36b8d5e6993a691e6ae6691313fdec066e19ea615798bde4e2d7c1f96`;
+Serve058 is at the live PostgreSQL head and both load-balancer slots are
+healthy on that image. Read-only receipt probes and the fresh dashboard
 summary are production proven. The source now projects the exact ledger through
 the controller-free current-demand read. The first live qualification exposed
 an unbounded ledger fan-out: a clean submission performed a pre-bind lookup and
 a completion performed a lookup before its terminal write, while lookup bursts
 could consume the load balancer's entire API transport pool. The checked-in
-correction removes those two steady-state reads and bounds the transport, but is
-not yet deployed or production-proven; the 10,000-request qualification remains
-open. Adversarial review of the separate Boltz
+correction in #1699 removes those two steady-state reads and bounds the
+transport. It is deployed in 1.1.1469, and its three-transaction steady-state
+behavior is production proven; the 10,000-request qualification remains open.
+A further source correction under qualification removes harmless
+route-publication churn from exact pre-bind conflicts while preserving a typed
+fail-closed retry boundary; this separate correction is not yet merged or
+deployed. Adversarial
+review of the separate Boltz
 caller found that caller-maintained first-attempt and heartbeat authority was
 both more complicated and less reliable than the already-transactional server
 boundary. The corrected contract below makes the stable exact request identity
 and intent digest the retry-idempotency boundary, while requiring homogeneous
-server and platform activation and a stable service incarnation. The
+server and provider-local activation and a stable service incarnation. Any
+Boltz-side work is restricted to `ml_models/providers/skypilot/**`; Platform
+application, common-backend, and Temporal changes are out of scope and are not
+claimed by this design. The
 ledger is the single additive Serve058 migration directly after released
 Serve057; the unrelated draft immutable-owner cleanup and sequencing migration
 are not part of this feature.
@@ -443,13 +453,49 @@ accelerator and count, `is_zero_cost`, and a canonical location object.
 Location contains either cloud region/zone or the
 Kubernetes context, physical cluster UID, and reserved pool key. It never
 contains the private route URL. The stable API transaction verifies the current
-service hash, fresh route head, exact projection fence, advertised URL identity,
+service hash, fresh route head, selected projection, advertised URL identity,
 and matching replica record before storing this envelope. The private route
 identity therefore carries the selected replica version. The route-contract
 version must still match the current projection contract, while the replica row
 and its zero-cost admission are checked against the selected-worker version.
 This preserves routing to compatible previous active versions during a normal
 service update instead of falsely stamping every route as the newest version.
+
+The exact bind does not require selected immutable generation G to remain the
+head by the time PostgreSQL commits. It validates G's supplied digest,
+incarnation, supported producer, complete payload, and advertised non-alias
+selected URL before reading fresh current head H in the same transaction.
+Within one validated owner lineage, `H.generation < G.generation` is corruption
+and returns unavailable. When G differs from a monotonic H, the bind may
+continue only if
+`{service_version, complete routing_spec, selected URL exact public wire,
+selected URL exact private identity}` is identical. Capacity hints and
+unrelated route additions, removals, or identity churn are excluded. The full
+routing spec remains included because it owns compatibility, queueing, and
+admission; same-version routing-spec drift is corruption. Identity/wire
+derivation and the durable `dispatch_binding` always use H, followed by current
+replica, active-version, record, cost, location, and worker-admission checks.
+
+A missing/pruned G, expired head, normal service/controller/epoch movement, or
+selected-route movement raises the additive machine code
+`route_authority_changed_before_bind.v1` only when the request-key lock proves
+that no request/attempt row exists and before any insert or provider send. A
+retained G with the wrong digest, a generic 409, any existing or rejected
+attempt, an invalid selected URL, a regressed head, and ambiguous/post-send
+state never carry reselection authority.
+
+The LB recognizes only HTTP 409 plus that exact code. It captures both the sync
+generation used for selection and the current sync generation when the typed
+409 is observed. A coalesced route-only sync does not drain or acknowledge
+demand/history, and the body preimage is reused unchanged. A higher source
+epoch or same-epoch/higher generation can be reselected after a complete sync
+newer than selection. An identical generation/digest is valid only after a
+complete coherent apply strictly newer than the conflict-observed generation,
+which covers an expired lease renewed in place without trusting an older
+pre-conflict sync. Lower fences and equal-generation/different-digest responses
+fail closed. Concurrent waiters share success and failure, URL health is not
+penalized, and three typed no-send refreshes are bounded independently from the
+provider `max_retries` budget.
 
 Serve058 has no marker-evidence column. The live reporter does not have a
 marker-object digest, so an unused nullable field would create a misleading
@@ -625,6 +671,13 @@ Protocol negotiation is explicit in both directions:
   provider, request identity, body semantics, or service incarnation;
 - mixed API/controller/LB Pods: an LB does not accept protocol-1 requests until
   its controller sync advertises schema-backed protocol 1.
+
+The route-authority correction is additive across mixed versions. An old API
+does not emit the machine code, so a new LB treats its human 409 as generic. An
+old LB ignores the new response field and retains generic failure. Only a new
+API plus new LB performs route refresh/reselection, and an incomplete, legacy,
+or malformed sync response cannot satisfy its exact projection/ledger fence.
+The provider retry budget and provider send ordering are unchanged.
 
 The durable inference submitter opts in on its existing
 `POST /v1/models/model:predict` call with protocol 1, a bounded execution
@@ -964,6 +1017,16 @@ the request ledger does not manufacture that evidence.
   more consecutive definite LB-local pre-dispatch retries, and a
   bind-commit/LB-crash ambiguity. Prove no upstream response or post-connect
   error can authorize replay under that execution request ID.
+- Exercise capacity-only and unrelated-route G-to-H movement, selected-route
+  wire/identity change and removal, pruned G versus wrong retained digest,
+  expired H unable to mask an invalid G digest or selected URL, monotonic
+  `H >= G`, same-version routing-spec corruption, producer/controller lineage,
+  and expired-head same-generation renewal. Prove the typed code creates no
+  row or provider send; generic/existing/ambiguous outcomes never reselect; 32
+  concurrent success, same-fence failure, and exception waiters perform one
+  route-only sync; equal-fence freshness is newer than conflict observation;
+  request bytes are identical; and `max_retries: 1` still permits exactly one
+  fresh bind/provider attempt.
 - Exercise a service update whose current route projection contains compatible
   READY replicas from the newest and previous active versions. Prove each route
   binds with the same route-contract fence and its own selected-worker version,

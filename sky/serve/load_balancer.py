@@ -40,6 +40,7 @@ from sky.serve.load_balancer_http import _ReleasingStreamingResponse
 from sky.serve.load_balancer_retry import _bind_facade_globals
 from sky.serve.load_balancer_retry import _PreDispatchError
 from sky.serve.load_balancer_retry import _RetriableStatusError
+from sky.serve.load_balancer_retry import _RouteAuthorityRetryableError
 from sky.utils import common_utils
 
 logger = sky_logging.init_logger(__name__)
@@ -57,6 +58,7 @@ _InboundAuthMiddleware.__module__ = __name__
 _ReleasingStreamingResponse.__module__ = __name__
 _RetriableStatusError.__module__ = __name__
 _PreDispatchError.__module__ = __name__
+_RouteAuthorityRetryableError.__module__ = __name__
 
 # Per-client in-flight request counter attribute. Attached to the
 # httpx.AsyncClient OBJECT (not keyed by URL): a URL pruned and re-added
@@ -144,6 +146,7 @@ class _SelectedReplica:
     route_projection_generation: int | None
     route_projection_sha256: str | None
     route_source_epoch: int | None
+    route_sync_generation: int
 
 
 class SkyServeLoadBalancer:
@@ -171,6 +174,8 @@ class SkyServeLoadBalancer:
     _async_request_ledger_protocol_version: int | None
     _async_request_ledger_client: (
         async_request_ledger_client.AsyncRequestLedgerClient | None)
+    _controller_sync_lock: asyncio.Lock
+    _route_sync_generation: int
     _background_tasks: set[asyncio.Task]
     _load_balancing_policy_name: str
     _load_balancing_policy: lb_policies.LoadBalancingPolicy
@@ -346,6 +351,18 @@ class SkyServeLoadBalancer:
         self._route_source_epoch: int | None = None
         self._async_request_ledger_protocol_version: int | None = None
         self._async_request_ledger_client = None
+        # Serialize the periodic full sync with rare exact-bind foreground
+        # refreshes. Followers coalesce by comparing _route_sync_generation,
+        # so a genuine projection movement cannot trigger one sync per request.
+        self._controller_sync_lock = asyncio.Lock()
+        self._route_sync_generation = 0
+        # Cache a completed foreground refresh against both the rejected
+        # selection and the local coherent-sync generation. Concurrent waiters
+        # then share failure as well as success; any later periodic apply
+        # advances the generation and reopens one probe.
+        self._route_authority_refresh_result: tuple[int, int, tuple[int, str,
+                                                                    int], int,
+                                                    bool] | None = None
         # Strong references to owned background tasks (the event loop only
         # holds weak references to tasks).
         self._background_tasks: set[asyncio.Task] = set()
@@ -659,7 +676,8 @@ class SkyServeLoadBalancer:
             route_contract_service_version=self._routing_version,
             route_projection_generation=(self._route_projection_generation),
             route_projection_sha256=(self._route_projection_sha256),
-            route_source_epoch=self._route_source_epoch)
+            route_source_epoch=self._route_source_epoch,
+            route_sync_generation=self._route_sync_generation)
 
     def _checkout_selected_replica_locked(
             self, selected: _SelectedReplica) -> httpx.AsyncClient | None:
@@ -3073,6 +3091,11 @@ class SkyServeLoadBalancer:
         """Return (definitely rejected, invalidate capacity baseline)."""
         if outcome is None:
             return False, False
+        if isinstance(outcome, _RouteAuthorityRetryableError):
+            # The endpoint did not fail: only the selected PostgreSQL route
+            # fence aged out before bind.  Release this attempt without
+            # invalidating the worker's otherwise fresh occupancy sample.
+            return True, False
         if isinstance(outcome, _RetriableStatusError):
             return True, True
         if isinstance(outcome, fastapi.responses.Response):
@@ -4047,6 +4070,22 @@ class SkyServeLoadBalancer:
             await asyncio.sleep(interval)
 
     async def _sync_with_controller_once(self) -> None:
+        """Serialize one coherent route sync across background and edge use."""
+        async with self._controller_sync_lock:
+            await self._sync_with_controller_once_unlocked()
+
+    async def _sync_with_controller_once_unlocked(self,
+                                                  *,
+                                                  route_only: bool = False
+                                                 ) -> None:
+        """Fetch and apply one sync while the shared sync lock is held.
+
+        ``route_only`` is the foreground recovery path for a typed pre-bind
+        route-authority conflict.  It sends the same current gauges needed by
+        a legacy parser but does not drain or acknowledge any arrival/history
+        aggregator.  The response must still pass the ordinary complete-route
+        decoder and atomic apply below.
+        """
         ready_replica_urls = []
         replica_info = {}
         routing_spec = None
@@ -4090,19 +4129,28 @@ class SkyServeLoadBalancer:
             }
         session_id = self._get_lb_session_id()
         async with aiohttp.ClientSession() as session:
-            # Remove exactly the batch being sent BEFORE awaiting the
-            # controller. Requests arriving during the await accumulate in the
-            # now-empty aggregator for the next sync. A failed/cancelled send
-            # restores this batch ahead of those newer arrivals in `finally`.
-            request_batch = self._request_aggregator.drain()
-            request_history = (
-                self._request_aggregator.request_history_snapshot())
-            request_classification_history = (
-                self._request_aggregator.
-                request_classification_history_snapshot())
-            prediction_time_history = (
-                self._request_aggregator.prediction_time_history_snapshot())
-            request_batch_accepted = False
+            if route_only:
+                # A route retry is not a demand-reporting round.  In
+                # particular, never clear/ack a request just because route
+                # authority moved between selection and the ledger bind.
+                request_batch = {}
+                request_history = None
+                request_classification_history = None
+                prediction_time_history = None
+            else:
+                # Remove exactly the batch being sent BEFORE awaiting the
+                # controller. Requests arriving during the await accumulate in
+                # the now-empty aggregator for the next sync. A failed or
+                # cancelled send restores this batch ahead of newer arrivals.
+                request_batch = self._request_aggregator.drain()
+                request_history = (
+                    self._request_aggregator.request_history_snapshot())
+                request_classification_history = (
+                    self._request_aggregator.
+                    request_classification_history_snapshot())
+                prediction_time_history = (
+                    self._request_aggregator.prediction_time_history_snapshot())
+            request_batch_accepted = route_only
             sync_payload = {
                 # Catalog/version fence for compatibility gauges. This is the
                 # version of the routing spec already applied by this LB, not
@@ -4175,24 +4223,26 @@ class SkyServeLoadBalancer:
                         # conservatively over-counting.
                         request_batch_accepted = True
                         response_json = await response.json()
-                        self._set_queued_compatibility_demand_support(
-                            response_json.get(
-                                'queued_compatibility_demand_supported') is
-                            True)
-                        if response_json.get(
-                                'request_history_accepted') is True:
-                            self._request_aggregator.mark_request_history_accepted(
-                                request_history)
-                        classification_accepted = response_json.get(
-                            'request_classification_history_accepted')
-                        if classification_accepted is True:
-                            (self._request_aggregator.
-                             mark_request_classification_history_accepted(
-                                 request_classification_history))
-                        if response_json.get(
-                                'prediction_time_history_accepted') is True:
-                            self._request_aggregator.mark_prediction_time_history_accepted(
-                                prediction_time_history)
+                        if not route_only:
+                            self._set_queued_compatibility_demand_support(
+                                response_json.get(
+                                    'queued_compatibility_demand_supported') is
+                                True)
+                            if response_json.get(
+                                    'request_history_accepted') is True:
+                                (self._request_aggregator.
+                                 mark_request_history_accepted(request_history))
+                            classification_accepted = response_json.get(
+                                'request_classification_history_accepted')
+                            if classification_accepted is True:
+                                (self._request_aggregator.
+                                 mark_request_classification_history_accepted(
+                                     request_classification_history))
+                            if response_json.get(
+                                    'prediction_time_history_accepted') is True:
+                                (self._request_aggregator.
+                                 mark_prediction_time_history_accepted(
+                                     prediction_time_history))
                         replica_info = response_json.get('replica_info', {})
                         # Count of READY, active replicas the controller has,
                         # which can exceed len(replica_info) when endpoints are
@@ -4458,6 +4508,12 @@ class SkyServeLoadBalancer:
                     self._route_source_epoch = route_source_epoch
                     self._async_request_ledger_protocol_version = (
                         async_request_ledger_protocol_version)
+                    # This generation advances only after the complete routing
+                    # spec, route set, projection fence, and exact-ledger
+                    # capability are atomically installed. It lets a foreground
+                    # bind conflict prove that a later coherent sync occurred,
+                    # even when a lease renewal retained the same snapshot ID.
+                    self._route_sync_generation += 1
                 for replica_url, client in client_to_close:
                     # Fire-and-forget: a drain can legitimately take as long
                     # as the longest in-flight prediction; the sync loop must
@@ -4483,8 +4539,111 @@ class SkyServeLoadBalancer:
                 # dispatch limit. Wake waiters to re-evaluate immediately.
                 await self._notify_request_queue()
             finally:
-                if not request_batch_accepted:
+                if not route_only and not request_batch_accepted:
                     self._request_aggregator.restore(request_batch)
+
+    def _route_authority_refreshed_locked(
+            self, selected_sync_generation: int,
+            conflict_observed_sync_generation: int,
+            selected_route_fence: tuple[int, str, int]) -> bool:
+        """Whether a later coherent sync installed usable exact authority."""
+        current_generation = self._route_projection_generation
+        current_digest = self._route_projection_sha256
+        current_source_epoch = self._route_source_epoch
+        successor_fence = (type(current_source_epoch) is int and
+                           (current_source_epoch > selected_route_fence[2] or
+                            (current_source_epoch == selected_route_fence[2] and
+                             type(current_generation) is int and
+                             current_generation > selected_route_fence[0])))
+        equal_fence = (current_source_epoch == selected_route_fence[2] and
+                       current_generation == selected_route_fence[0] and
+                       current_digest == selected_route_fence[1])
+        fresh_fence = (
+            (successor_fence and
+             self._route_sync_generation > selected_sync_generation) or
+            (equal_fence and
+             self._route_sync_generation > conflict_observed_sync_generation))
+        return (fresh_fence and self._exact_protocol_active() and
+                type(self._routing_version) is int and
+                self._routing_version > 0 and
+                type(current_generation) is int and current_generation > 0 and
+                isinstance(current_digest, str) and
+                re.fullmatch(r'[0-9a-f]{64}', current_digest) is not None and
+                type(current_source_epoch) is int and current_source_epoch > 0)
+
+    async def _refresh_route_authority_after_conflict(
+            self, selected_sync_generation: int,
+            conflict_observed_sync_generation: int,
+            selected_route_fence: tuple[int, str, int]) -> bool:
+        """Coalesce one authenticated foreground sync after a typed conflict.
+
+        A successor fence from a sync after selection already satisfies the
+        refresh. An equal fence requires a coherent sync after the typed 409
+        was observed, proving an in-place lease renewal. Otherwise the first
+        waiter performs one route-only controller sync; followers observe its
+        result while holding the same lock and do no additional I/O. Failure or
+        an incomplete response remains fail closed without consuming
+        demand/history state.
+        """
+        if (type(selected_sync_generation) is not int or
+                selected_sync_generation < 0 or
+                type(conflict_observed_sync_generation) is not int or
+                conflict_observed_sync_generation < selected_sync_generation or
+                not (isinstance(selected_route_fence, tuple) and
+                     len(selected_route_fence) == 3 and
+                     type(selected_route_fence[0]) is int and
+                     selected_route_fence[0] > 0 and
+                     isinstance(selected_route_fence[1], str) and
+                     re.fullmatch(r'[0-9a-f]{64}', selected_route_fence[1]) and
+                     type(selected_route_fence[2]) is int and
+                     selected_route_fence[2] > 0)):
+            return False
+        async with self._controller_sync_lock:
+            with self._client_pool_lock:
+                if self._route_authority_refreshed_locked(
+                        selected_sync_generation,
+                        conflict_observed_sync_generation,
+                        selected_route_fence):
+                    return True
+                if self._draining or not self._accepts_new_requests():
+                    return False
+                current_sync_generation = self._route_sync_generation
+            cached_result = self._route_authority_refresh_result
+            if (cached_result is not None and cached_result[:4]
+                    == (selected_sync_generation,
+                        conflict_observed_sync_generation, selected_route_fence,
+                        current_sync_generation)):
+                return cached_result[4]
+            try:
+                await self._sync_with_controller_once_unlocked(route_only=True)
+            except Exception as error:  # pylint: disable=broad-except
+                # This is a request-path recovery probe.  Decoder, credential,
+                # and local apply errors are controlled pre-dispatch failures;
+                # cancellation remains a BaseException and still propagates.
+                logger.warning(
+                    'Foreground route-authority refresh failed closed: '
+                    f'{common_utils.format_exception(error)}')
+                with self._client_pool_lock:
+                    failed_at_generation = self._route_sync_generation
+                self._route_authority_refresh_result = (
+                    selected_sync_generation, conflict_observed_sync_generation,
+                    selected_route_fence, failed_at_generation, False)
+                return False
+            with self._client_pool_lock:
+                if self._draining or not self._accepts_new_requests():
+                    self._route_authority_refresh_result = (
+                        selected_sync_generation,
+                        conflict_observed_sync_generation, selected_route_fence,
+                        self._route_sync_generation, False)
+                    return False
+                refreshed = self._route_authority_refreshed_locked(
+                    selected_sync_generation, conflict_observed_sync_generation,
+                    selected_route_fence)
+                applied_generation = self._route_sync_generation
+            self._route_authority_refresh_result = (
+                selected_sync_generation, conflict_observed_sync_generation,
+                selected_route_fence, applied_generation, refreshed)
+            return refreshed
 
     @staticmethod
     def _build_replica_ssl_context() -> ssl.SSLContext | bool | None:
@@ -5240,6 +5399,31 @@ class SkyServeLoadBalancer:
                 try:
                     ledger_receipt = await self._bind_async_ledger(
                         request, selected, ledger_identity)
+                except async_request_ledger_client.AsyncLedgerRouteAuthorityConflict as error:
+                    if (async_request_ledger_client.get_receipt(request)
+                            is None):
+                        # The typed stable-API code proves that this brand-new
+                        # bind committed no row and preceded every provider
+                        # send. Return an internal pre-dispatch outcome so the
+                        # outer loop discards this selection and captures a
+                        # fresh route/projection snapshot.
+                        assert selected.route_projection_generation is not None
+                        assert selected.route_projection_sha256 is not None
+                        assert selected.route_source_epoch is not None
+                        with self._client_pool_lock:
+                            conflict_observed_sync_generation = (
+                                self._route_sync_generation)
+                        return _RouteAuthorityRetryableError(
+                            error.detail, selected.route_sync_generation,
+                            conflict_observed_sync_generation,
+                            selected.route_projection_generation,
+                            selected.route_projection_sha256,
+                            selected.route_source_epoch)
+                    # A receipt means an attempt already exists. Even a
+                    # malformed/mixed peer must never turn that into an
+                    # implicit replay.
+                    return fastapi.responses.JSONResponse(
+                        status_code=409, content={'detail': error.detail})
                 except async_request_ledger_client.AsyncLedgerTransportError as error:
                     return fastapi.responses.JSONResponse(
                         status_code=(error.status_code if
@@ -5656,6 +5840,7 @@ class SkyServeLoadBalancer:
         # SkyServe supports serving on Spot Instances. To avoid preemptions
         # during request handling, we add a retry here.
         retry_cnt = 0
+        route_authority_refresh_cnt = 0
         async_occupancy_request: bool | None = None
         # URLs that already failed THIS request: without exclusion,
         # least-load retries deterministically re-select a
@@ -5786,7 +5971,6 @@ class SkyServeLoadBalancer:
                 raise _unavailable(detail +
                                    'Use "sky serve status [SERVICE_NAME]" '
                                    'to check the replica status.')
-            retry_cnt += 1
             # Hand the unit off for the dispatch: the proxy await is accounted
             # by the policy's load_map (pre_execute_hook), and for synchronous
             # servers it lasts until compute completes. Re-taken in the finally
@@ -5825,6 +6009,31 @@ class SkyServeLoadBalancer:
                 if 200 <= response_or_exception.status_code < 300:
                     self._clear_rejection(request)
                 return response_or_exception
+            if isinstance(response_or_exception, _RouteAuthorityRetryableError):
+                # This typed conflict proves both no durable attempt row and no
+                # provider send. It is route-authority movement, not a worker
+                # failure: retain URL eligibility and occupancy proof.
+                if await request.is_disconnected():
+                    return fastapi.responses.Response(status_code=499)
+                route_authority_refresh_cnt += 1
+                if route_authority_refresh_cnt > (
+                        constants.LB_ROUTE_AUTHORITY_MAX_REFRESHES):
+                    raise _unavailable(
+                        'Route authority changed before dispatch and the fresh '
+                        'selection retry budget was exhausted.')
+                if not await self._refresh_route_authority_after_conflict(
+                        response_or_exception.route_sync_generation,
+                        response_or_exception.conflict_observed_sync_generation,
+                    (response_or_exception.route_projection_generation,
+                     response_or_exception.route_projection_sha256,
+                     response_or_exception.route_source_epoch)):
+                    raise _unavailable(
+                        'Route authority changed before dispatch and a fresh '
+                        'coherent route projection could not be obtained.')
+                # Selection happens only at the top of the loop, under the
+                # routing lock, so this cannot reuse the rejected snapshot.
+                continue
+            retry_cnt += 1
             failed_urls.add(ready_replica_url)
             with self._client_pool_lock:
                 all_ready_tried = failed_urls.issuperset(

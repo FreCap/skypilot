@@ -446,6 +446,13 @@ async def record_async_request_ledger(
     except async_request_ledger.AsyncRequestLedgerNotFound as error:
         return fastapi.responses.JSONResponse(status_code=404,
                                               content={'detail': str(error)})
+    except async_request_ledger.AsyncRequestLedgerRouteAuthorityConflict as error:
+        return fastapi.responses.JSONResponse(
+            status_code=409,
+            content={
+                'detail': str(error),
+                'error_code': error.error_code,
+            })
     except async_request_ledger.AsyncRequestLedgerConflict as error:
         return fastapi.responses.JSONResponse(status_code=409,
                                               content={'detail': str(error)})

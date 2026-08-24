@@ -106,6 +106,22 @@ class AsyncRequestLedgerConflict(AsyncRequestLedgerError):
     """The operation conflicts with a durable receipt or incarnation."""
 
 
+class AsyncRequestLedgerRouteAuthorityConflict(AsyncRequestLedgerConflict):
+    """A new bind lost route authority before creating a durable attempt.
+
+    This exported type is raised only from ``bind()`` after the exact request
+    lock proved that no current attempt exists.  It is therefore safe for the
+    load balancer to discard the selected route and run route selection again;
+    no provider send or durable request/attempt row can precede it.
+    """
+
+    error_code = constants.LB_ASYNC_LEDGER_ROUTE_AUTHORITY_CONFLICT_CODE
+
+
+class _RouteAuthorityConflict(AsyncRequestLedgerConflict):
+    """Internal selected-projection conflict awaiting request-row context."""
+
+
 class AsyncRequestLedgerNotFound(AsyncRequestLedgerError):
     """No current receipt exists for a read-only bind lookup."""
 
@@ -502,37 +518,44 @@ class AsyncRequestLedgerRepository:
                  owner: Mapping[str, Any], payload: Mapping[str, Any]) -> dict:
         service_name = str(owner['name'])
         if (owner['route_source_mode'] != 'DURABLE_PROJECTED' or
-                owner['route_projection_capable'] is not True or
-                owner['current_version']
-                != payload['route_contract_service_version'] or
-                owner['route_source_epoch'] != payload['route_source_epoch'] or
                 owner['status'] in {
                     status.value for status in serve_statuses.ServiceStatus.
                     replica_launch_blocking_statuses()
                 }):
             raise AsyncRequestLedgerConflict(
                 'The selected route is not current durable authority.')
-        now = connection.execute(
-            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
-        head = connection.execute(
-            sqlalchemy.select(_HEADS).where(
-                _HEADS.c.service_name == service_name).with_for_update(
-                    read=True)).mappings().one_or_none()
-        if (head is None or
-                head['generation'] != payload['route_projection_generation'] or
-                head['valid_until'] <= now):
-            raise AsyncRequestLedgerConflict(
-                'The selected route projection is missing, stale, or moved.')
+        if (owner['route_projection_capable'] is not True or
+                owner['route_projection_protocol_version'] not in (
+                    route_projection.PROTOCOL_VERSION,
+                    route_projection.INCREMENTAL_PRODUCER_PROTOCOL_VERSION)):
+            raise AsyncRequestLedgerUnavailable(
+                'Current controller route capability is unavailable.')
+        selected_generation = int(payload['route_projection_generation'])
         snapshot = connection.execute(
             sqlalchemy.select(_SNAPSHOTS).where(
                 _SNAPSHOTS.c.service_name == service_name,
-                _SNAPSHOTS.c.generation == payload[
-                    'route_projection_generation'])).mappings().one_or_none()
-        if (snapshot is None or snapshot['content_sha256']
-                != payload['route_projection_sha256'] or
-                not route_projection.snapshot_owner_matches(snapshot, owner)):
+                _SNAPSHOTS.c.generation ==
+                selected_generation)).mappings().one_or_none()
+        if snapshot is None:
+            # Fast capacity-only publication can retire G from bounded history
+            # before its selected request reaches bind. No row exists yet, so
+            # a fresh selection is safe; a digest mismatch on a retained G is
+            # not equivalent and remains a generic integrity conflict below.
+            raise _RouteAuthorityConflict(
+                'The selected route projection is missing, stale, or moved.')
+        if snapshot['content_sha256'] != payload['route_projection_sha256']:
             raise AsyncRequestLedgerConflict(
                 'The selected route projection fence does not match.')
+        if (snapshot['service_hash'] != owner['hash'] or
+                snapshot['service_lifecycle_epoch']
+                != owner['lifecycle_epoch']):
+            raise AsyncRequestLedgerConflict(
+                'The selected route belongs to another service incarnation.')
+        if snapshot['producer_protocol_version'] not in (
+                route_projection.PROTOCOL_VERSION,
+                route_projection.INCREMENTAL_PRODUCER_PROTOCOL_VERSION):
+            raise AsyncRequestLedgerUnavailable(
+                'The selected route projection producer is unsupported.')
         try:
             response, identities = (route_projection.RouteProjectionRepository.
                                     validate_snapshot_row(snapshot))
@@ -540,6 +563,96 @@ class AsyncRequestLedgerRepository:
             raise AsyncRequestLedgerUnavailable(
                 'The selected route projection is corrupt.') from error
         selected_url = str(payload['selected_route_url'])
+        selected_identity = identities.get(selected_url)
+        selected_wire = response.get('replica_info', {}).get(selected_url)
+        if (not isinstance(selected_identity, dict) or
+                selected_identity.get('advertised') is not True or
+                selected_identity.get('alias_expires_at') is not None or
+                not isinstance(selected_wire, dict)):
+            raise AsyncRequestLedgerConflict(
+                'The selected route has no advertised identity.')
+        # Validate a retained immutable G before classifying mutable-head or
+        # owner movement as safely retryable.  A stale H must not turn a forged
+        # digest, corrupt retained G, or arbitrary URL into fresh-selection
+        # authority.
+        if (owner['current_version']
+                != payload['route_contract_service_version'] or
+                owner['route_source_epoch'] != payload['route_source_epoch'] or
+                owner['route_projection_controller_incarnation']
+                != owner['controller_incarnation']):
+            raise _RouteAuthorityConflict(
+                'The selected route projection is missing, stale, or moved.')
+        if (not route_projection.snapshot_owner_matches(snapshot, owner) or
+                snapshot['producer_protocol_version']
+                != owner['route_projection_protocol_version']):
+            raise _RouteAuthorityConflict(
+                'The selected route projection is missing, stale, or moved.')
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        head = connection.execute(
+            sqlalchemy.select(_HEADS).where(
+                _HEADS.c.service_name == service_name).with_for_update(
+                    read=True)).mappings().one_or_none()
+        if head is None or head['valid_until'] <= now:
+            raise _RouteAuthorityConflict(
+                'The selected route projection is missing, stale, or moved.')
+        head_generation = int(head['generation'])
+        if head_generation < selected_generation:
+            # Generations are monotonic within one validated owner lineage.
+            # Never reinterpret an older H as commit-time authority, even if
+            # this route's projected context happens to be identical.
+            raise AsyncRequestLedgerUnavailable(
+                'The current route projection head regressed.')
+        if head_generation != selected_generation:
+            # Full projection generations include volatile capacity telemetry
+            # and unrelated fleet churn. A selected immutable snapshot remains
+            # valid when the service/routing contract and this exact selected
+            # route's public + private identity are unchanged in the fresh
+            # head. Live replica, record, cost, and worker-admission checks
+            # below still run against current PostgreSQL rows.
+            head_snapshot = connection.execute(
+                sqlalchemy.select(_SNAPSHOTS).where(
+                    _SNAPSHOTS.c.service_name == service_name,
+                    _SNAPSHOTS.c.generation ==
+                    head_generation)).mappings().one_or_none()
+            if (head_snapshot is None or
+                    not route_projection.snapshot_owner_matches(
+                        head_snapshot, owner) or
+                    head_snapshot['producer_protocol_version']
+                    != owner['route_projection_protocol_version']):
+                raise AsyncRequestLedgerUnavailable(
+                    'The current route projection is corrupt or unowned.')
+            try:
+                head_response, head_identities = (
+                    route_projection.RouteProjectionRepository.
+                    validate_snapshot_row(head_snapshot))
+            except route_projection.RouteProjectionError as error:
+                raise AsyncRequestLedgerUnavailable(
+                    'The current route projection is corrupt.') from error
+            if (response.get('service_version')
+                    == head_response.get('service_version') and
+                    response.get('routing_spec')
+                    != head_response.get('routing_spec')):
+                # A routing contract is immutable within a service version.
+                # Treat same-version drift as corruption, not normal authority
+                # movement that a fresh LB selection could safely cure.
+                raise AsyncRequestLedgerUnavailable(
+                    'The current route projection routing contract diverged.')
+            selected_context = (route_projection.selected_route_context_sha256(
+                response, identities, selected_url))
+            head_context = route_projection.selected_route_context_sha256(
+                head_response, head_identities, selected_url)
+            if selected_context != head_context:
+                raise _RouteAuthorityConflict(
+                    'The selected route projection is missing, stale, or moved.'
+                )
+            # H, not the retained selection G, is the commit-time authority.
+            # Context equality proves that H still contains the same stable
+            # route identities; all identity/wire derivation and the durable
+            # audit fence therefore use H below.
+            snapshot = head_snapshot
+            response = head_response
+            identities = head_identities
         identity = identities.get(selected_url)
         wire = response.get('replica_info', {}).get(selected_url)
         if (not isinstance(identity, dict) or
@@ -609,9 +722,8 @@ class AsyncRequestLedgerRepository:
                 payload['route_contract_service_version']),
             'selected_worker_service_version':
                 (selected_worker_service_version),
-            'route_projection_generation': int(
-                payload['route_projection_generation']),
-            'route_projection_sha256': str(payload['route_projection_sha256']),
+            'route_projection_generation': int(head_generation),
+            'route_projection_sha256': str(snapshot['content_sha256']),
             'route_source_epoch': int(payload['route_source_epoch']),
             'replica_id': replica_id,
             'replica_record_id': str(record_id),
@@ -689,7 +801,21 @@ class AsyncRequestLedgerRepository:
                 else:
                     assert request_row is None
                 # Only a genuinely new attempt validates and captures a route.
-                binding = self._binding(connection, owner, payload)
+                try:
+                    binding = self._binding(connection, owner, payload)
+                except _RouteAuthorityConflict as error:
+                    if current is None:
+                        # No request/attempt row existed under the exact
+                        # advisory + row-lock scope, and _binding() runs before
+                        # either insert below.  Expose the only conflict whose
+                        # machine-readable response can authorize fresh route
+                        # selection without risking a second provider send.
+                        raise AsyncRequestLedgerRouteAuthorityConflict(
+                            str(error)) from error
+                    # A rejected predecessor is still an existing attempt.  It
+                    # may permit a caller-directed new attempt, but never an
+                    # implicit in-LB replay based on a route conflict.
+                    raise AsyncRequestLedgerConflict(str(error)) from error
                 now = connection.execute(
                     sqlalchemy.select(
                         sqlalchemy.func.clock_timestamp())).scalar_one()

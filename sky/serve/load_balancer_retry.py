@@ -34,6 +34,22 @@ class _PreDispatchError(RuntimeError):
     """A proxy attempt failed before an upstream request could be sent."""
 
 
+class _RouteAuthorityRetryableError(_PreDispatchError):
+    """A new exact bind must discard its stale route and select afresh."""
+
+    def __init__(self, detail: str, route_sync_generation: int,
+                 conflict_observed_sync_generation: int,
+                 route_projection_generation: int, route_projection_sha256: str,
+                 route_source_epoch: int) -> None:
+        super().__init__(detail)
+        self.route_sync_generation = route_sync_generation
+        self.conflict_observed_sync_generation = (
+            conflict_observed_sync_generation)
+        self.route_projection_generation = route_projection_generation
+        self.route_projection_sha256 = route_projection_sha256
+        self.route_source_epoch = route_source_epoch
+
+
 def _is_dead_connection_error(exc: Exception) -> bool:
     """Whether a proxy failure indicates a DEAD replica vs a saturated one.
 
