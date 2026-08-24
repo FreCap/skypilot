@@ -19,6 +19,7 @@ import concurrent.futures
 import contextlib
 import copy
 import dataclasses
+import datetime
 import functools
 import json
 import logging
@@ -1657,6 +1658,292 @@ class TestBoundOrdinaryLaunchManagerIntegration:
                                      cancel_reason=cancel_reason,
                                      request=types.SimpleNamespace(
                                          status=status, error=error))
+
+    @staticmethod
+    def _callback_fixture():
+        manager = _make_manager()
+        authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND, generic=True)
+        manager._ordinary_launch_binding_authority = authority
+        context = _bound_non_pool_context(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+        info = _fake_replica_info(
+            context.replica_id,
+            replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.replica_record_id = str(context.replica_record_id)
+        return manager, authority, context, info
+
+    @staticmethod
+    def _active_snapshot_row(context, authority):
+        profile = context.profile
+        info = _fake_replica_info(
+            context.replica_id,
+            replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.replica_record_id = str(context.replica_record_id)
+        info.reserved_fill = True
+        info.is_zero_cost = True
+        info.zero_cost_admission_sequence = 1
+        info.zero_cost_materialization_sequence = 1
+        reserved_values = {
+            'reserved_fill_pool_key': 'pool-a',
+            'reserved_fill_service_generation': 1,
+            'reserved_fill_physical_cluster_uid': 'physical-a',
+            'reserved_fill_kubernetes_context': 'context-a',
+            'reserved_fill_allocation_generation': 1,
+            'reserved_fill_allocation_input_sha256': 'a' * 64,
+            'reserved_fill_allocation_claim_generation': 1,
+            'reserved_fill_reconciliation_gate_generation': 1,
+            'reserved_fill_reclaim_fleet_bundle_sha256': 'b' * 64,
+            'reserved_fill_reclaim_policy_revision': 'policy-a',
+            'reserved_fill_reclaim_provider_inventory_sha256': 'c' * 64,
+            'reserved_fill_worker_projection_sha256': 'd' * 64,
+            'reserved_fill_observation_generation': 1,
+            'reserved_fill_observation_sequence': 0,
+            'reserved_fill_intent_idempotency_key': 'e' * 64,
+        }
+        for field, value in reserved_values.items():
+            setattr(info, field, value)
+        return {
+            'association_id': context.association_id,
+            'request_id': context.request_id,
+            'service_name': context.service_name,
+            'service_hash': authority.service_hash,
+            'service_workspace': authority.service_workspace,
+            'service_lifecycle_epoch': authority.service_lifecycle_epoch,
+            'service_binding_epoch': authority.binding_epoch,
+            'service_version': 1,
+            'replica_id': context.replica_id,
+            'replica_record_id': context.replica_record_id,
+            'launch_generation': context.launch_generation,
+            'cluster_name': 'svc-3',
+            'input_digest': context.input_digest,
+            'owner_controller_incarnation': authority.controller_incarnation,
+            'owner_controller_epoch': authority.controller_owner_epoch,
+            'resolution': ordinary_launch_binding.Resolution.BOUND.value,
+            'binding_protocol_version':
+                ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION,
+            'profile_kind': profile.kind.value,
+            'profile_version': profile.version,
+            'profile_digest': profile.digest,
+            'capability_cohort_epoch': context.capability_cohort_epoch,
+            'capability_profile_set_digest':
+                context.capability_profile_set_digest,
+            'receipt_protocol_version': context.receipt_protocol_version,
+            'authorization_kind': profile.authorization_kind.value,
+            'authorization_reference': profile.authorization_reference,
+            'authorization_generation': profile.authorization_generation,
+            'authorization_digest': profile.authorization_digest,
+            'service_job_id': None,
+            'cancel_reason': None,
+            '_fence_epoch': authority.service_lifecycle_epoch,
+            '_service_hash': authority.service_hash,
+            '_service_workspace': authority.service_workspace,
+            '_service_lifecycle_epoch': authority.service_lifecycle_epoch,
+            '_service_binding_mode': authority.binding_mode.value,
+            '_service_binding_epoch': authority.binding_epoch,
+            '_service_capable': True,
+            '_service_incarnation': authority.controller_incarnation,
+            '_service_owner_epoch': authority.controller_owner_epoch,
+            '_service_non_pool_capable': True,
+            '_service_non_pool_incarnation': authority.controller_incarnation,
+            '_service_non_pool_protocol':
+                authority.non_pool_binding_protocol_version,
+            '_service_non_pool_profile_set':
+                authority.non_pool_profile_set_digest,
+            '_service_non_pool_cohort':
+                authority.non_pool_capability_cohort_epoch,
+            '_service_non_pool_receipt':
+                authority.non_pool_receipt_protocol_version,
+            '_service_status': 'READY',
+            '_replica_id': context.replica_id,
+            '_replica_state_version': 1,
+            '_replica_state': info.to_storage_dict(),
+            '_replica_status': 'PROVISIONING',
+            '_replica_version': 1,
+            '_replica_cluster_name': 'svc-3',
+            '_replica_paid_pool_key': None,
+            '_request_status': 'PENDING',
+            '_request_generation': 0,
+            '_request_claim_token': None,
+            '_request_worker_instance_id': None,
+            '_request_lease_expires_at': None,
+            '_request_quiescence_required': False,
+            '_queue_delivery_state': 'queued',
+            '_queue_claim_generation': None,
+        }
+
+    def test_active_snapshot_is_one_plain_select(self):
+        _, authority, context, _ = self._callback_fixture()
+        connection = mock.MagicMock()
+        result = connection.execute.return_value
+        result.mappings.return_value.one_or_none.return_value = (
+            self._active_snapshot_row(context, authority))
+        engine = mock.MagicMock()
+        engine.dialect.name = 'postgresql'
+        engine.connect.return_value.__enter__.return_value = connection
+
+        with mock.patch.object(request_postgres,
+                               'initialize_and_get_db',
+                               return_value=engine):
+            snapshot = (
+                request_postgres.read_bound_reserved_fill_active_snapshot(
+                    context, authority))
+
+        assert snapshot is not None
+        assert snapshot.disposition is (
+            request_postgres.OrdinaryLaunchReductionDisposition.ADOPT_ACTIVE)
+        assert snapshot.request.quiescent
+        connection.execute.assert_called_once()
+        sql = str(connection.execute.call_args.args[0]).upper()
+        assert sql.lstrip().startswith('SELECT')
+        assert 'FOR UPDATE' not in sql
+        assert 'PG_ADVISORY' not in sql
+
+    def test_claimed_active_snapshot_returns_exact_live_claim(self):
+        _, authority, context, _ = self._callback_fixture()
+        row = self._active_snapshot_row(context, authority)
+        claim_token = uuid.uuid4()
+        worker_id = uuid.uuid4()
+        lease = datetime.datetime.now(
+            datetime.timezone.utc) + datetime.timedelta(seconds=30)
+        row.update({
+            '_request_status': 'RUNNING',
+            '_request_generation': 1,
+            '_request_claim_token': claim_token,
+            '_request_worker_instance_id': worker_id,
+            '_request_lease_expires_at': lease,
+            '_request_quiescence_required': True,
+            '_queue_delivery_state': 'claimed',
+            '_queue_claim_generation': 1,
+        })
+        connection = mock.MagicMock()
+        result = connection.execute.return_value
+        result.mappings.return_value.one_or_none.return_value = row
+        engine = mock.MagicMock()
+        engine.dialect.name = 'postgresql'
+        engine.connect.return_value.__enter__.return_value = connection
+
+        with mock.patch.object(request_postgres,
+                               'initialize_and_get_db',
+                               return_value=engine):
+            snapshot = (
+                request_postgres.read_bound_reserved_fill_active_snapshot(
+                    context, authority))
+
+        assert snapshot is not None
+        assert snapshot.request.status is api_requests.RequestStatus.RUNNING
+        assert snapshot.request.claim_token == claim_token
+        assert snapshot.request.worker_instance_id == worker_id
+        assert snapshot.request.lease_expires_at == lease
+        assert snapshot.request.claim_active
+        assert not snapshot.request.quiescent
+
+    def test_non_reserved_active_snapshot_does_not_query(self):
+        authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND, generic=True)
+        context = _bound_non_pool_context(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+        with mock.patch.object(request_postgres,
+                               'initialize_and_get_db') as initialize:
+            assert (request_postgres.read_bound_reserved_fill_active_snapshot(
+                context, authority)) is None
+        initialize.assert_not_called()
+
+    def test_stale_authority_rejects_active_snapshot(self):
+        _, authority, context, _ = self._callback_fixture()
+        stale = dataclasses.replace(authority, controller_owner_epoch=8)
+        connection = mock.MagicMock()
+        result = connection.execute.return_value
+        result.mappings.return_value.one_or_none.return_value = (
+            self._active_snapshot_row(context, authority))
+        engine = mock.MagicMock()
+        engine.dialect.name = 'postgresql'
+        engine.connect.return_value.__enter__.return_value = connection
+
+        with mock.patch.object(request_postgres,
+                               'initialize_and_get_db',
+                               return_value=engine):
+            assert (request_postgres.read_bound_reserved_fill_active_snapshot(
+                context, stale)) is None
+
+    def test_active_bound_poll_uses_non_authorizing_snapshot(self):
+        manager, _, context, info = self._callback_fixture()
+        active = self._projection('ADOPT_ACTIVE',
+                                  status='RUNNING',
+                                  projected=False)
+        active.context = context
+
+        with mock.patch.object(
+                replica_managers.request_postgres,
+                'inspect_bound_ordinary_launch',
+                return_value=active) as inspect, \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'read_bound_reserved_fill_active_snapshot',
+                 return_value=active) as active_snapshot, \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'reduce_bound_ordinary_launch') as locked_reduce:
+            _, reduce_exact, _ = manager._bound_ordinary_launch_callbacks(
+                info, None, initial_reduction=active)
+            assert reduce_exact(None, None) is active
+
+        inspect.assert_not_called()
+        active_snapshot.assert_called_once_with(
+            context, manager._ordinary_launch_binding_authority)
+        locked_reduce.assert_not_called()
+
+    def test_inactive_snapshot_enters_locked_reducer(self):
+        manager, authority, context, info = self._callback_fixture()
+        active = self._projection('ADOPT_ACTIVE',
+                                  status='RUNNING',
+                                  projected=False)
+        active.context = context
+        terminal = mock.sentinel.terminal
+
+        with mock.patch.object(
+                replica_managers.request_postgres,
+                'inspect_bound_ordinary_launch',
+                return_value=active) as inspect, \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'read_bound_reserved_fill_active_snapshot',
+                 return_value=None) as active_snapshot, \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'reduce_bound_ordinary_launch',
+                 return_value=terminal) as locked_reduce:
+            _, reduce_exact, _ = manager._bound_ordinary_launch_callbacks(
+                info, None, initial_reduction=active)
+            assert reduce_exact(None, None) is terminal
+
+        inspect.assert_not_called()
+        active_snapshot.assert_called_once_with(context, authority)
+        assert locked_reduce.call_args.args == (context, authority)
+        assert 'project_replica_result' in locked_reduce.call_args.kwargs
+
+    def test_failed_active_snapshot_enters_locked_reducer(self):
+        manager, authority, context, info = self._callback_fixture()
+        active = self._projection('ADOPT_ACTIVE',
+                                  status='RUNNING',
+                                  projected=False)
+        active.context = context
+        terminal = mock.sentinel.terminal
+
+        with mock.patch.object(
+                replica_managers.request_postgres,
+                'read_bound_reserved_fill_active_snapshot',
+                side_effect=RuntimeError('read failed')), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'reduce_bound_ordinary_launch',
+                 return_value=terminal) as locked_reduce:
+            _, reduce_exact, _ = manager._bound_ordinary_launch_callbacks(
+                info, None, initial_reduction=active)
+            assert reduce_exact(None, None) is terminal
+
+        assert locked_reduce.call_args.args == (context, authority)
+        assert 'project_replica_result' in locked_reduce.call_args.kwargs
 
     def test_pre_effect_terminal_is_typed_failure_without_sdk_wait(self):
         reduce_exact = mock.Mock(return_value=self._projection(
