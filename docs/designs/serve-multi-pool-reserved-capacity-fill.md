@@ -1,22 +1,55 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-24 13:53 UTC
+Last updated: 2026-08-24 17:31 UTC
 
-Status: **scheduler-admitted reserved-capacity convergence plus the provider-
-local exact request/load qualification are production-proven on protocol v9.
-A fresh worker-fit audit found one SkyPilot shared-cache admission bug in East,
-and a concurrent control-plane audit found a reproducible SkyServe controller
-memory amplifier. Protocol v10 plus the bounded-memory correction are under
-source review; homogeneous deployment, clean service recreation, renewed
-reserved occupancy, and bounded paid-Spot overflow/drain remain production
-gates.** The current control plane runs SkyPilot release `1.1.1470`, Helm
-revision 594, on image digest
-`sha256:7e1ef1c2043812073fe45d7c472a346bd679b5a4bbb1b3b8417699c2b7c8f2c0`.
-Both API Pods, both controller Pods, all three executor Pods, and both external
-load balancers were Ready at the frozen preflight, but controller Pod suffix
-`jxgkf` had two restarts and `wsrfc` had one; all three were confirmed OOMs.
-The earlier zero-restart receipt remains historical evidence, not current
-health evidence.
+Status: **protocol v10 shared-cache admission, bounded controller memory, clean
+service recreation, and the scheduler-authorized reserved-capacity denominator
+are deployed and production-proven. A 64-replica fault wave exposed a serial
+retirement/post-commit inspection convoy; its surgical SkyPilot-only correction
+is source-qualified and awaiting homogeneous deployment and a repeated wave.
+The bounded positive paid-Spot residual and full drain remain the sole behavior
+gate requiring operator-authenticated traffic.** The current control plane runs
+SkyPilot release `1.1.1475`, Helm revision 597, on image digest
+`sha256:3ae4d82084e829a3c2d2de370768cee664097773be30d555f1c6daf1d7aa62e1`.
+Both API Pods, both controller Pods, and all three executor Pods are Ready with
+zero restarts. The external load balancer pair is healthy. PostgreSQL is the
+central authority, Helm storage is disabled, and no EFS/PVC correctness path is
+present.
+
+The fresh `boltz-l4-fleet` lifecycle 98/version 1 was created directly from the
+locally qualified provider source at
+`a69fb3409ede26f98c02f7730f764021c1ef0146`; no boltz-platform PR or runtime pin
+is involved. Before the deliberate wave it reached 378/378 Ready reserved,
+zero-cost, non-Spot replicas: 63 A100, 189 A100-80GB, and 126 H200. A controller
+restart preserved the service hash, lifecycle, version, and durable ownership.
+One exact East deletion was replaced and Ready in 140.8 seconds with zero paid
+claim or provider Spot capacity.
+
+The subsequent 32-East plus 32-PHX exact-UID deletion wave proved safety but
+not bounded convergence. Physical absence was visible promptly, yet the
+controller repeated a forced cluster refresh serially under the manager mutex
+for each already-proven Kubernetes absence. Materialization then repeated a
+PostgreSQL inspection after its atomic admission commit. All 64 intents were
+eventually durable, but 28 grants expired and three commits deferred before the
+fleet recovered. The correction carries a private exact-absence proof only far
+enough to skip that redundant refresh, while preserving request quiescence and
+a fresh post-teardown absence proof before row deletion. It also returns the
+canonical server-stamped bound context in the atomic admission receipt instead
+of rereading the same committed tuple. It adds no schema, migration, fallback,
+feature flag, provider authority, or Kueue change.
+
+The post-wave steady state is 371 Ready plus seven real PHX Pods/Workloads
+waiting for Kueue admission. East is fully occupied at 252/252 compatible
+physical GPUs. PHX is fully occupied at 119/119 scheduler-admitted H200 GPUs;
+the seven additional low-priority SkyPilot Workloads have `admission: null` and
+`QuotaReserved=False`. Kueue repeatedly nominates a higher-priority 128-H200
+research gang first, finds that it cannot be admitted or legally preempt enough
+capacity under the unchanged policy, and then skips the smaller SkyPilot head
+with `FailedAfterNomination`. The seven raw idle devices are therefore not
+currently admissible to SkyPilot and are outside the utilization denominator.
+This is scheduler-policy fragmentation, not a SkyPilot fill failure, and no
+ClusterQueue, cohort, quota, borrowing, priority, or preemption change is
+authorized.
 
 The 2026-08-24 12:55--13:12 UTC read-only audit observed the service expanding
 automatically from 295 to 383 Ready zero-cost logical GPUs as research released

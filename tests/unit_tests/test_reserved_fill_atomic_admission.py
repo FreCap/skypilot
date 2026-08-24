@@ -65,7 +65,8 @@ def test_commit_ack_loss_hydrates_exact_tuple_and_publishes_once(
         replica_record_id='11111111-1111-4111-8111-111111111111',
         association_id='22222222-2222-4222-8222-222222222222',
         request_id='request-7',
-        launch_generation=1)
+        launch_generation=1,
+        context=mock.sentinel.context)
     transaction = mock.Mock(side_effect=(
         reserved_fill_admission.AdmissionAmbiguousError('ack lost'),
         (staged, receipt),
@@ -106,7 +107,8 @@ def test_postcommit_publication_failure_is_ambiguous(admitted_preflight,
         replica_record_id='11111111-1111-4111-8111-111111111111',
         association_id='22222222-2222-4222-8222-222222222222',
         request_id='request-7',
-        launch_generation=1)
+        launch_generation=1,
+        context=mock.sentinel.context)
     staged = mock.Mock()
     staged.publish_after_commit.side_effect = RuntimeError('publish failed')
     monkeypatch.setattr(reserved_fill_admission, '_transaction',
@@ -157,7 +159,8 @@ def test_broker_lock_exit_timeout_after_commit_hydrates_not_rejects(
         replica_record_id='11111111-1111-4111-8111-111111111111',
         association_id='22222222-2222-4222-8222-222222222222',
         request_id='request-7',
-        launch_generation=1)
+        launch_generation=1,
+        context=mock.sentinel.context)
     staged = mock.Mock()
     lock = SimpleNamespace(
         acquire=mock.Mock(side_effect=(_ExitTimeout(),
@@ -247,7 +250,8 @@ def test_nonexception_baseexception_is_re_raised_after_evidence_handling(
         replica_record_id='11111111-1111-4111-8111-111111111111',
         association_id='22222222-2222-4222-8222-222222222222',
         request_id='request-7',
-        launch_generation=1)
+        launch_generation=1,
+        context=mock.sentinel.context)
     staged = mock.Mock()
     if point == 'commit':
         transaction = mock.Mock(side_effect=(_InjectedFault(),

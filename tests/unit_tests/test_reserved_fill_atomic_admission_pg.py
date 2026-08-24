@@ -1383,6 +1383,17 @@ def test_inner_commit_is_savepoint_and_outer_rollback_removes_full_suffix(
             connection, spec, 7, require_existing=False)
         assert not staged.already_committed
         assert receipt.replica_id == 1
+        assert isinstance(receipt.context,
+                          ordinary_launch_binding.BoundNonPoolLaunchContext)
+        assert str(receipt.context.association_id) == receipt.association_id
+        assert receipt.context.request_id == receipt.request_id
+        assert receipt.context.service_name == _SERVICE
+        assert receipt.context.replica_id == receipt.replica_id
+        assert (str(
+            receipt.context.replica_record_id) == receipt.replica_record_id)
+        assert (receipt.context.launch_generation == receipt.launch_generation)
+        assert receipt.context.profile.kind is (
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
         assert _suffix_counts(connection) == (1, 1, 1, 1, 1)
         assert connection.execute(
             sqlalchemy.select(zero_cost_actuation_schema.

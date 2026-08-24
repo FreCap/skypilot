@@ -46,6 +46,7 @@ class AdmissionReceipt:
     association_id: str
     request_id: str
     launch_generation: int
+    context: ordinary_launch_binding.BoundNonPoolLaunchContext
 
 
 @dataclasses.dataclass(frozen=True)
@@ -277,12 +278,15 @@ def _stage_and_bind_in_savepoint(
                 replica_record_id=replica_record_id,
                 provider_cluster_generation=admission.launch_generation,
                 association_id=uuid.UUID(admission.association_id))
+    context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
+        built.request.request_body.extra_launch_context)
     return staged, AdmissionReceipt(
         replica_id=staged.replica_id,
         replica_record_id=staged.persisted_info.replica_record_id,
         association_id=admission.association_id,
         request_id=admission.request_id,
-        launch_generation=admission.launch_generation)
+        launch_generation=admission.launch_generation,
+        context=context)
 
 
 def _stage_and_bind(
