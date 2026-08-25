@@ -69,6 +69,23 @@ def abruptly_exiting_task():
     os._exit(7)
 
 
+def exit_with_inherited_spawn_sentinel(holder_pid_path,
+                                       release_path=None,
+                                       exit_delay_seconds=0):
+    """Exit after leaving the spawn sentinel open in an orphan descendant."""
+    holder_pid = os.fork()
+    if holder_pid == 0:
+        pathlib.Path(holder_pid_path).write_text(str(os.getpid()),
+                                                 encoding='utf-8')
+        while True:
+            time.sleep(1)
+    if release_path is not None:
+        while not pathlib.Path(release_path).exists():
+            time.sleep(0.01)
+    time.sleep(exit_delay_seconds)
+    os._exit(0)
+
+
 def hanging_inner_warden(*_args):
     os.setsid()
     while True:
@@ -941,7 +958,7 @@ def test_authenticated_result_without_guardian_reap_releases_as_ambiguity():
     future = process.InvocationFuture(identity, monitor_connection, False,
                                       'expected-token')
     assert future.set_running_or_notify_cancel()
-    guardian = unittest.mock.Mock(pid=identity.pid, exitcode=None)
+    guardian = unittest.mock.Mock(pid=identity.pid, exitcode=None, _popen=None)
     record = process._InvocationRecord(guardian, future)
     monitor = threading.Thread(target=executor._monitor_boundary,
                                args=(record, monitor_connection))
@@ -967,8 +984,187 @@ def test_authenticated_result_without_guardian_reap_releases_as_ambiguity():
     with pytest.raises(process.AmbiguousBoundaryError) as captured:
         future.wait_for_boundary_release(timeout=0)
     assert captured.value is poison_errors[0]
+    guardian.join.assert_not_called()
+
+
+def _start_spawn_zombie_with_open_sentinel(tmp_path):
+    holder_pid_path = tmp_path / 'sentinel-holder-pid'
+    guardian = process._SPAWN_CONTEXT.Process(
+        target=exit_with_inherited_spawn_sentinel,
+        args=(str(holder_pid_path),),
+        daemon=False)
+    guardian.start()
+    assert guardian.pid is not None
+    identity = process.ProcessIdentity(
+        guardian.pid, process._read_process_start_time_ticks(guardian.pid))
+    assert _wait_until(holder_pid_path.exists)
+
+    def exact_zombie():
+        try:
+            observed, state, parent_pid = process._read_process_stat(
+                identity.pid)
+        except (FileNotFoundError, ProcessLookupError):
+            return False
+        return (observed == identity and state == 'Z' and
+                parent_pid == os.getpid())
+
+    assert _wait_until(exact_zombie)
+    # The orphan holder retains the spawn-sentinel writer, so timed join cannot
+    # reach waitpid even though the exact direct child is already a zombie.
+    guardian.join(timeout=0.05)
+    assert exact_zombie()
+    return guardian, identity, int(holder_pid_path.read_text(encoding='utf-8'))
+
+
+def _kill_sentinel_holder(holder_pid):
+    try:
+        os.kill(holder_pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def test_monitor_reaps_exact_zombie_when_spawn_sentinel_remains_open(
+        tmp_path, monkeypatch):
+    reap_timeout = 1.0
+    monkeypatch.setattr(process, '_PROCESS_REAP_PROOF_TIMEOUT_SECONDS',
+                        reap_timeout)
+    holder_pid_path = tmp_path / 'delayed-sentinel-holder-pid'
+    release_path = tmp_path / 'release-guardian'
+    guardian = process._SPAWN_CONTEXT.Process(
+        target=exit_with_inherited_spawn_sentinel,
+        args=(str(holder_pid_path), str(release_path), 0.15),
+        daemon=False)
+    guardian.start()
+    assert guardian.pid is not None
+    identity = process.ProcessIdentity(
+        guardian.pid, process._read_process_start_time_ticks(guardian.pid))
+    assert _wait_until(holder_pid_path.exists)
+    holder_pid = int(holder_pid_path.read_text(encoding='utf-8'))
+    original_reap = process._reap_exact_direct_child_zombie
+    reap_calls = []
+
+    def record_reap(child, expected_identity):
+        reap_calls.append((child.pid, expected_identity))
+        return original_reap(child, expected_identity)
+
+    monkeypatch.setattr(process, '_reap_exact_direct_child_zombie', record_reap)
+    executor = DisposableExecutor(max_workers=1)
+    monitor_connection, sender_connection = process.multiprocessing.Pipe(
+        duplex=True)
+    future = process.InvocationFuture(identity, monitor_connection, False,
+                                      'expected-token')
+    assert future.set_running_or_notify_cancel()
+    record = process._InvocationRecord(guardian, future)
+    monitor = threading.Thread(target=executor._monitor_boundary,
+                               args=(record, monitor_connection))
+    record.monitor = monitor
+    monitor.start()
+    result = process.BoundaryResult(identity,
+                                    process.InvocationOutcome(
+                                        process.InvocationOutcomeKind.SUCCEEDED,
+                                        value='authenticated'),
+                                    family_drained=True)
+    try:
+        sender_connection.send(
+            process._BoundaryEnvelope('expected-token', process._Event.RESULT,
+                                      result))
+        assert future.result(timeout=2) == 'authenticated'
+        assert sender_connection.recv() is process._Command.RECEIPT
+        release_guardian = threading.Timer(0.05, release_path.touch)
+        release_guardian.start()
+        release_started_at = time.monotonic()
+        sender_connection.close()
+        monitor.join(timeout=2)
+        release_elapsed = time.monotonic() - release_started_at
+        release_guardian.join(timeout=1)
+        assert not monitor.is_alive()
+        assert future.wait_for_boundary_release(timeout=0)
+        assert not executor.poisoned
+        # The false-open spawn sentinel would consume the full one-second join
+        # horizon. Exact-child polling reaps shortly after the 0.20-second
+        # release-plus-exit delay and preserves the caller's lifetime budget.
+        assert release_elapsed < reap_timeout * 0.8
+        assert reap_calls
+        assert all(call == (identity.pid, identity) for call in reap_calls)
+        assert future.boundary_result == result
+        assert future.boundary_result.family_drained
+        assert guardian.exitcode == 0
+        assert not process._identity_matches(identity)
+    finally:
+        sender_connection.close()
+        _kill_sentinel_holder(holder_pid)
+        if guardian.exitcode is None:
+            os.waitpid(identity.pid, os.WNOHANG)
+        guardian.close()
+
+
+def test_exact_zombie_reap_rejects_live_child():
+    guardian = process._SPAWN_CONTEXT.Process(target=time.sleep,
+                                              args=(30,),
+                                              daemon=False)
+    guardian.start()
+    assert guardian.pid is not None
+    identity = process.ProcessIdentity(
+        guardian.pid, process._read_process_start_time_ticks(guardian.pid))
+    try:
+        assert not process._reap_exact_direct_child_zombie(guardian, identity)
+        assert process._identity_matches(identity)
+    finally:
+        guardian.terminate()
+        guardian.join(timeout=5)
+        guardian.close()
+
+
+@pytest.mark.parametrize('change_pid', [False, True])
+def test_exact_zombie_reap_rejects_wrong_identity(tmp_path, change_pid):
+    guardian, identity, holder_pid = _start_spawn_zombie_with_open_sentinel(
+        tmp_path)
+    wrong_identity = dataclasses.replace(
+        identity,
+        pid=identity.pid + 1 if change_pid else identity.pid,
+        start_time_ticks=(identity.start_time_ticks
+                          if change_pid else identity.start_time_ticks + 1))
+    try:
+        assert not process._reap_exact_direct_child_zombie(
+            guardian, wrong_identity)
+        observed, state, parent_pid = process._read_process_stat(identity.pid)
+        assert observed == identity
+        assert state == 'Z'
+        assert parent_pid == os.getpid()
+        assert process._reap_exact_direct_child_zombie(guardian, identity)
+    finally:
+        _kill_sentinel_holder(holder_pid)
+        guardian.close()
+
+
+def test_exact_zombie_reap_requires_authenticated_family_result(monkeypatch):
+    executor = DisposableExecutor(max_workers=1)
+    monitor_connection, sender_connection = process.multiprocessing.Pipe(
+        duplex=True)
+    identity = process.ProcessIdentity(424244, 103)
+    future = process.InvocationFuture(identity, monitor_connection, False,
+                                      'expected-token')
+    assert future.set_running_or_notify_cancel()
+    guardian = unittest.mock.Mock(pid=identity.pid, exitcode=None)
+    record = process._InvocationRecord(guardian, future)
+    reap = unittest.mock.Mock(return_value=True)
+    monkeypatch.setattr(process, '_wait_for_exact_direct_child_reap', reap)
+    monitor = threading.Thread(target=executor._monitor_boundary,
+                               args=(record, monitor_connection))
+    record.monitor = monitor
+    monitor.start()
+    sender_connection.close()
+    monitor.join(timeout=2)
+
+    assert not monitor.is_alive()
+    assert executor.poisoned
+    assert future.boundary_result is None
+    reap.assert_not_called()
     guardian.join.assert_called_once_with(
         timeout=process._PROCESS_REAP_PROOF_TIMEOUT_SECONDS)
+    with pytest.raises(process.AmbiguousBoundaryError,
+                       match='without boundary proof'):
+        future.result(timeout=0)
 
 
 def test_shutdown_is_bounded_and_retryable_until_receipt_acknowledged():

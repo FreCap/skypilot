@@ -202,7 +202,8 @@ class _InvocationRecord:
 _SPAWN_CONTEXT = multiprocessing.get_context('spawn')
 
 
-def _read_process_start_time_ticks(pid: int) -> int:
+def _read_process_stat(pid: int) -> tuple[ProcessIdentity, str, int]:
+    """Read one process's exact identity, state, and parent from procfs."""
     content = (pathlib.Path('/proc') / str(pid) /
                'stat').read_text(encoding='utf-8')
     comm_end = content.rfind(')')
@@ -211,10 +212,89 @@ def _read_process_start_time_ticks(pid: int) -> int:
     fields_after_comm = content[comm_end + 1:].split()
     if len(fields_after_comm) <= 19:
         raise ValueError(f'Malformed procfs identity for PID {pid}.')
-    value = int(fields_after_comm[19])
-    if value <= 0:
+    state = fields_after_comm[0]
+    parent_pid = int(fields_after_comm[1])
+    start_time_ticks = int(fields_after_comm[19])
+    if len(state) != 1 or parent_pid < 0 or start_time_ticks <= 0:
         raise ValueError(f'Invalid procfs birth identity for PID {pid}.')
-    return value
+    return (ProcessIdentity(pid, start_time_ticks), state, parent_pid)
+
+
+def _read_process_start_time_ticks(pid: int) -> int:
+    return _read_process_stat(pid)[0].start_time_ticks
+
+
+def _reap_exact_direct_child_zombie(child: multiprocessing_process.BaseProcess,
+                                    expected_identity: ProcessIdentity) -> bool:
+    """Reap a proven exact zombie when its spawn sentinel remains open.
+
+    ``BaseProcess.join(timeout=...)`` waits on the spawn sentinel before it
+    calls ``waitpid``.  A leaked writer can therefore leave an already-exited
+    direct child as a zombie while the timed join reports no lifetime proof.
+    Only an authenticated boundary result may call this helper.  It accepts
+    exactly the recorded birth identity in zombie state with this process as
+    its direct parent, then performs the missing nonblocking reap itself.
+    """
+    child_pid = child.pid
+    if child_pid is None or child_pid != expected_identity.pid:
+        return False
+    popen = getattr(child, '_popen', None)
+    if (popen is None or getattr(popen, 'pid', None) != child_pid or
+            getattr(popen, 'returncode', None) is not None):
+        return False
+    try:
+        observed_identity, state, parent_pid = _read_process_stat(child_pid)
+    except (FileNotFoundError, ProcessLookupError, OSError, ValueError):
+        return False
+    if (observed_identity != expected_identity or state != 'Z' or
+            parent_pid != os.getpid()):
+        return False
+    try:
+        waited_pid, wait_status = os.waitpid(child_pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        return False
+    if waited_pid != child_pid:
+        return False
+    popen.returncode = os.waitstatus_to_exitcode(wait_status)
+    # ``Popen.wait`` now returns the cached status without touching the leaked
+    # sentinel, while public ``join`` removes the reaped process from the
+    # multiprocessing active-child registry.
+    child.join(timeout=0)
+    return True
+
+
+def _wait_for_exact_direct_child_reap(
+        child: multiprocessing_process.BaseProcess,
+        expected_identity: ProcessIdentity, timeout: float) -> bool:
+    """Poll waitpid for one exact child without trusting its spawn sentinel."""
+    if timeout < 0:
+        raise ValueError('Process reap timeout must be nonnegative.')
+    child_pid = child.pid
+    if child_pid is None or child_pid != expected_identity.pid:
+        return False
+    popen = getattr(child, '_popen', None)
+    if popen is None or getattr(popen, 'pid', None) != child_pid:
+        return False
+    if getattr(popen, 'returncode', None) is not None:
+        return True
+    deadline = time.monotonic() + timeout
+    while True:
+        if _reap_exact_direct_child_zombie(child, expected_identity):
+            return True
+        if getattr(popen, 'returncode', None) is not None:
+            return True
+        try:
+            observed_identity, _, parent_pid = _read_process_stat(child_pid)
+        except (FileNotFoundError, ProcessLookupError, OSError, ValueError):
+            # Absence without this owner obtaining waitpid status is not proof.
+            return False
+        if (observed_identity != expected_identity or
+                parent_pid != os.getpid()):
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_BOUNDARY_POLL_SECONDS, remaining))
 
 
 def _enable_subreaper() -> None:
@@ -1248,12 +1328,22 @@ class DisposableExecutor:
                         result_seen = True
                         record.future._publish_boundary_result(  # pylint: disable=protected-access
                             result)
-            try:
-                record.guardian.join(
-                    timeout=_PROCESS_REAP_PROOF_TIMEOUT_SECONDS)
-            except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
-                receive_error = e
-            guardian_reaped = record.guardian.exitcode is not None
+            guardian_reaped = False
+            if result_seen:
+                # A spawn sentinel can remain open in an already-drained orphan
+                # descendant. Poll the authenticated direct child itself across
+                # the existing reap horizon instead of spending that horizon on
+                # a false-open sentinel and checking waitpid only once afterward.
+                guardian_reaped = _wait_for_exact_direct_child_reap(
+                    record.guardian, record.future.guardian_identity,
+                    _PROCESS_REAP_PROOF_TIMEOUT_SECONDS)
+            else:
+                try:
+                    record.guardian.join(
+                        timeout=_PROCESS_REAP_PROOF_TIMEOUT_SECONDS)
+                except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
+                    receive_error = e
+                guardian_reaped = record.guardian.exitcode is not None
             if not guardian_reaped and receive_error is None:
                 receive_error = BoundaryExecutionError(
                     f'Invocation guardian {record.guardian.pid} did not reap '
