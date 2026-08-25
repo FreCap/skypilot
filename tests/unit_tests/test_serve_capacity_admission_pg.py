@@ -22,6 +22,7 @@ from sky.serve import capacity_admission
 from sky.serve import capacity_admission_schema
 from sky.serve import constants
 from sky.serve import demand_state
+from sky.serve import demand_state_schema
 from sky.serve import kubernetes_identity
 from sky.serve import kueue_lane_lineage
 from sky.serve import kueue_lane_lineage_schema
@@ -93,6 +94,7 @@ def _capacity_service_spec(
     *,
     max_replicas: int = 10,
     replica_unit: str = 'physical_backend',
+    lb_high_availability: bool = False,
 ) -> service_spec.SkyServiceSpec:
     assert replica_unit in ('physical_backend', 'logical')
     return service_spec.SkyServiceSpec(
@@ -108,7 +110,7 @@ def _capacity_service_spec(
                      if replica_unit == 'logical' else None),
         graceful_drain_async_occupancy=(True
                                         if replica_unit == 'logical' else None),
-        lb_high_availability=False,
+        lb_high_availability=lb_high_availability,
         reserved_capacity_fill=reserved_fill_enabled)
 
 
@@ -174,7 +176,12 @@ def _demand_report(now: float,
                    *,
                    sequence: int = 1,
                    request_count: int = 1,
-                   occupancy_sample_age_seconds: float = 0.1) -> dict:
+                   occupancy_sample_age_seconds: float = 0.1,
+                   reporter_session_id: str = 'process-a',
+                   lb_session_id: str = 'pod-a',
+                   lb_slot: str = 'a',
+                   applied_role: str = 'ACTIVE',
+                   routing_version: int = 1) -> dict:
     bucket_seconds = constants.LB_DEMAND_WINDOW_BUCKET_SECONDS
     profiles = ([{
         'priority': 50,
@@ -184,13 +191,13 @@ def _demand_report(now: float,
     return {
         'protocol_version': 2,
         'sequence': sequence,
-        'reporter_session_id': 'process-a',
+        'reporter_session_id': reporter_session_id,
         'reporter_observed_at': now,
-        'lb_session_id': 'pod-a',
-        'lb_slot': 'a',
-        'routing_version': 1,
+        'lb_session_id': lb_session_id,
+        'lb_slot': lb_slot,
+        'routing_version': routing_version,
         'armed_generation': None,
-        'applied_role': 'ACTIVE',
+        'applied_role': applied_role,
         'applied_generation': 1,
         'local_in_flight': request_count,
         'http_in_flight': {
@@ -683,8 +690,47 @@ def _route_record_id(engine) -> str:
                 route_projection_schema.serve_route_snapshots_table.c.
                 identity_payload).where(
                     route_projection_schema.serve_route_snapshots_table.c.
-                    service_name == 'svc')).scalar_one()
+                    service_name == 'svc').order_by(
+                        route_projection_schema.serve_route_snapshots_table.c.
+                        generation.desc()).limit(1)).scalar_one()
     return str(identity_payload[_URL]['replica_record_id'])
+
+
+def _publish_successor_route(
+    engine: sqlalchemy.engine.Engine,
+    incarnation: uuid.UUID,
+    marker: int,
+) -> route_projection.RoutePublicationReceipt:
+    response = _route_response()
+    response['capacity_hint']['test_route_marker'] = marker
+    record_id = _route_record_id(engine)
+    identity = route_projection.RoutePublisherIdentity(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        controller_incarnation=incarnation,
+        controller_owner_epoch=4,
+        controller_pid=123,
+        controller_ip='10.0.0.5')
+    return route_projection.RouteProjectionRepository(engine).publish(
+        identity,
+        1,
+        response,
+        _route_identities(record_id), {record_id},
+        ttl_seconds=60)
+
+
+def _validate_committed_claim(engine: sqlalchemy.engine.Engine,
+                              claim: dict) -> None:
+    with engine.begin() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        capacity_admission.validate_paid_claim_in_connection(connection,
+                                                             service,
+                                                             claim,
+                                                             prospective=False)
 
 
 def _prepare_logical_retirement(capacity_database):
@@ -1972,6 +2018,240 @@ def test_committed_claim_survives_unpublished_semantic_heartbeats(
                     **successor.claim_values('L4'), 'replica_id': 11
                 },
                 prospective=True)
+
+
+def test_committed_claim_accepts_mixed_monotonic_routes_only_postcommit(
+        capacity_database):
+    engine, incarnation, admitted_route = capacity_database
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    lb_ha_enabled=1,
+                    lb_active_slot='a',
+                    lb_cutover_generation=1))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    spec=pickle.dumps(_capacity_service_spec(
+                        False, lb_high_availability=True),
+                                      protocol=4)))
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    authority = repository.publish(_plan(1))
+    claim = _insert_claim(engine, authority, 10)
+    successor_route = _publish_successor_route(engine, incarnation, 2)
+    assert successor_route.generation == admitted_route.generation + 1
+
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), admitted_route, sequence=2))
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(),
+                       successor_route,
+                       reporter_session_id='process-b',
+                       lb_session_id='pod-b',
+                       lb_slot='b',
+                       applied_role='DRAINING'))
+
+    # Mixed route snapshots remain unusable as aggregate demand or as fresh
+    # prospective admission authority.
+    assert demand_state.get_autoscaling_snapshot('svc', 'svc-hash') is None
+    with engine.begin() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict):
+            capacity_admission.validate_paid_claim_in_connection(
+                connection, {
+                    **service, 'name': 'svc'
+                }, {
+                    **authority.claim_values('L4'), 'replica_id': 11
+                },
+                prospective=True)
+
+    # The already committed bounded debit may perform its one provider effect
+    # because both fresh LB sessions name persisted, valid monotonic routes.
+    _validate_committed_claim(engine, claim)
+
+
+def test_committed_claim_accepts_normalized_report_json(capacity_database):
+    engine, _, admitted_route = capacity_database
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+    claim = _insert_claim(engine, authority, 10)
+
+    # Ingestion hashes the exact wire JSON before normalizing finite timestamps
+    # to floats in the stored JSONB payload.  Post-commit route validation must
+    # compare the authority-bearing fields, not recompute that wire digest from
+    # the normalized representation.
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(int(time.time()), admitted_route, sequence=2))
+
+    _validate_committed_claim(engine, claim)
+
+
+def test_committed_claim_rejects_route_before_admitted_plan(capacity_database):
+    engine, incarnation, first_route = capacity_database
+    admitted_route = _publish_successor_route(engine, incarnation, 2)
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), admitted_route, sequence=2))
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+    claim = _insert_claim(engine, authority, 10)
+    demand_state.ingest_report(
+        'svc', 'svc-hash', _demand_report(time.time(), first_route, sequence=3))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='valid admitted route'):
+        _validate_committed_claim(engine, claim)
+
+
+@pytest.mark.parametrize('mutation', [
+    'future_generation',
+    'wrong_digest',
+    'wrong_routing_version',
+    'wrong_source_epoch',
+    'stored_payload_route_digest_corruption',
+    'missing_snapshot',
+])
+def test_committed_claim_rejects_invalid_report_route_reference(
+        capacity_database, mutation):
+    engine, incarnation, admitted_route = capacity_database
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+    claim = _insert_claim(engine, authority, 10)
+    successor_route = _publish_successor_route(engine, incarnation, 2)
+    report_route = admitted_route
+    report_kwargs = {}
+    report_mutation = None
+
+    if mutation == 'future_generation':
+        report_route = dataclasses.replace(
+            successor_route,
+            generation=successor_route.generation + 1,
+            content_sha256='f' * 64)
+    elif mutation == 'wrong_digest':
+        report_route = dataclasses.replace(admitted_route,
+                                           content_sha256='f' * 64)
+    elif mutation == 'wrong_routing_version':
+        report_kwargs['routing_version'] = 2
+    elif mutation == 'wrong_source_epoch':
+        report_mutation = ('route_source_epoch', 2)
+    elif mutation == 'missing_snapshot':
+        report_route = successor_route
+        _publish_successor_route(engine, incarnation, 3)
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.delete(
+                    route_projection_schema.serve_route_snapshots_table).where(
+                        route_projection_schema.serve_route_snapshots_table.c.
+                        service_name == 'svc',
+                        route_projection_schema.serve_route_snapshots_table.c.
+                        generation == successor_route.generation))
+
+    report = _demand_report(time.time(),
+                            report_route,
+                            sequence=2,
+                            **report_kwargs)
+    if report_mutation is not None:
+        report[report_mutation[0]] = report_mutation[1]
+    demand_state.ingest_report('svc', 'svc-hash', report)
+    if mutation == 'stored_payload_route_digest_corruption':
+        reports = demand_state_schema.serve_lb_demand_reports_table
+        with engine.begin() as connection:
+            row = connection.execute(
+                sqlalchemy.select(reports.c.payload).where(
+                    reports.c.service_name == 'svc',
+                    reports.c.service_hash == 'svc-hash',
+                    reports.c.reporter_session_id == 'process-a')).scalar_one()
+            corrupt = dict(row)
+            corrupt['route_projection_sha256'] = 'f' * 64
+            connection.execute(
+                sqlalchemy.update(reports).where(
+                    reports.c.service_name == 'svc',
+                    reports.c.service_hash == 'svc-hash',
+                    reports.c.reporter_session_id == 'process-a').values(
+                        payload=corrupt))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict):
+        _validate_committed_claim(engine, claim)
+
+
+@pytest.mark.parametrize(('field', 'value'), [
+    ('service_hash', 'other-hash'),
+    ('service_lifecycle_epoch', 4),
+    ('service_version', 2),
+    ('controller_owner_epoch', 5),
+    ('controller_pid', 456),
+    ('controller_ip', '10.0.0.6'),
+    ('producer_protocol_version', 2),
+])
+def test_committed_claim_rejects_reported_snapshot_owner_drift(
+        capacity_database, field, value):
+    engine, incarnation, admitted_route = capacity_database
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+    claim = _insert_claim(engine, authority, 10)
+    _publish_successor_route(engine, incarnation, 2)
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), admitted_route, sequence=2))
+    snapshots = route_projection_schema.serve_route_snapshots_table
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(snapshots).where(
+                snapshots.c.service_name == 'svc',
+                snapshots.c.generation == admitted_route.generation).values(
+                    **{field: value}))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict):
+        _validate_committed_claim(engine, claim)
+
+
+@pytest.mark.parametrize('authority_loss', [
+    'stale_head',
+    'stale_report',
+    'old_cutover_session',
+])
+def test_committed_claim_rejects_stale_route_or_lb_authority(
+        capacity_database, authority_loss):
+    engine, _, _ = capacity_database
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+    claim = _insert_claim(engine, authority, 10)
+    with engine.begin() as connection:
+        expired_at = datetime.datetime.now(
+            datetime.timezone.utc) - datetime.timedelta(seconds=1)
+        observed_at = expired_at - datetime.timedelta(seconds=1)
+        if authority_loss == 'stale_head':
+            connection.execute(
+                sqlalchemy.update(
+                    route_projection_schema.serve_route_heads_table).where(
+                        route_projection_schema.serve_route_heads_table.c.
+                        service_name == 'svc').values(refreshed_at=observed_at,
+                                                      valid_until=expired_at))
+        elif authority_loss == 'stale_report':
+            connection.execute(
+                sqlalchemy.update(
+                    demand_state_schema.serve_lb_demand_reports_table).where(
+                        demand_state_schema.serve_lb_demand_reports_table.c.
+                        service_name == 'svc').values(received_at=observed_at,
+                                                      valid_until=expired_at))
+        else:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name == 'svc').values(
+                        lb_ha_enabled=1,
+                        lb_active_slot='a',
+                        lb_cutover_generation=2))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict):
+        _validate_committed_claim(engine, claim)
 
 
 def test_committed_claim_survives_fresh_aggregate_zero(capacity_database):
