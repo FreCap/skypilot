@@ -16055,10 +16055,6 @@ class TestPaidLocationLaunchBudget:
             frontier_key_by_location={
                 location: ('l4',) for location in locations
             },
-            failure_domain_by_location={
-                location: paid_capacity.failure_domain(location)
-                for location in locations
-            },
             owned_pool_keys_by_frontier={('l4',): {keys[primary], keys[hedge]}},
             newest_claimed_at_by_pool_key={
                 keys[primary]: 0,
