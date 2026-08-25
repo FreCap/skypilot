@@ -17,6 +17,9 @@
 {{- $controllerImage := default .Values.apiService.image (get $controllerService "image") -}}
 {{- $controllerPullPolicy := default .Values.apiService.imagePullPolicy (get $controllerService "imagePullPolicy") -}}
 {{- $controllerReplicas := dig "replicas" 2 $controllerService -}}
+{{- $controllerRollingUpdate := get $controllerService "rollingUpdate" | default (dict) -}}
+{{- $controllerMaxSurge := dig "maxSurge" 0 $controllerRollingUpdate -}}
+{{- $controllerMaxUnavailable := dig "maxUnavailable" 1 $controllerRollingUpdate -}}
 {{- $controllerHealthPort := dig "healthPort" 46582 $controllerService -}}
 {{- if and .Values.apiService.metrics.enabled (eq (int $controllerHealthPort) (int .Values.apiService.metrics.port)) -}}
 {{- fail "controllerService.healthPort must differ from apiService.metrics.port when metrics are enabled" -}}
@@ -163,8 +166,9 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
+      {{- /* Use dig rather than default so an explicit integer zero is kept. */}}
+      maxSurge: {{ $controllerMaxSurge }}
+      maxUnavailable: {{ $controllerMaxUnavailable }}
   selector:
     matchLabels:
       app: {{ $fullName }}-controller

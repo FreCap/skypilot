@@ -6,8 +6,11 @@ release 1.1.1464 with two API, three executor, and two controller Pods. Guarded
 HA has no PVC or CSI mount. The private durable HA-observer canary and M5
 compatibility cleanup remain independently gated. The former executable
 RWX/EFS migration plan has been removed and is available only in Git history.
+The API rolls with one surge and zero unavailable replicas; controller and
+executor roles roll in place by default so a packed control plane cannot stall
+on an unschedulable temporary Pod.
 
-Last updated: 2026-08-22
+Last updated: 2026-08-25
 
 Canonical owner: this file owns the role split, PostgreSQL request delivery,
 controller leadership, execution fencing, and availability contract. External
@@ -690,16 +693,18 @@ The chart enforces:
 - `storage.enabled=false`, no `storage.existingClaim`, and bounded disk-backed
   emptyDir plus matching ephemeral-storage requests/limits for every role.
   Guarded HA rejects any PVC, EFS, fallback, or unbounded local volume.
-- Guarded HA pins RollingUpdate to zero unavailable replicas
-  (`maxUnavailable: 0` or `0%`) and an absolute `maxSurge: 1`.
-  Compatibility-mode RollingUpdate retains its existing configurable values,
-  but HA rendering fails before producing manifests when either invariant is
-  violated. The absolute single surge gives every role a replacement slot
-  without allowing percentage rounding or an operator override to multiply its
-  per-role temporary capacity. Helm and the post-seed reconciler may roll all
-  three Deployments concurrently, so rollout preflight must prove aggregate
-  cluster headroom for one surge API, executor, and controller pod (up to three
-  temporary pods), not one temporary pod total.
+- Guarded HA keeps the API RollingUpdate contract at zero unavailable replicas
+  (`maxUnavailable: 0` or `0%`) and an absolute `maxSurge: 1`; rendering fails
+  before producing manifests when either API invariant is violated. The API is
+  live request ingress, so it retains a Ready endpoint before an old one is
+  removed.
+- Controller and executor Deployments remain RollingUpdate and independently
+  configurable, but default to absolute `maxSurge: 0` and
+  `maxUnavailable: 1`. Each role has at least two replicas, PostgreSQL-backed
+  fencing or durable work, and a role PodDisruptionBudget, so the default keeps
+  one replica available while replacing the other without requiring a
+  temporary third Pod. Operators may select `1/0` for either role only after
+  rollout preflight proves room for that role's surge.
 - Guarded API Deployments set `minReadySeconds: 10` and
   `progressDeadlineSeconds: 600`, in addition to the pre-stop drain and a
   termination grace period longer than the drain budget. Ten continuously
@@ -723,8 +728,9 @@ The chart enforces:
   `.spec.replicas`, not the temporary number of healthy surge pods. At desired
   scale two, a three-healthy-pod surge can therefore report two allowed
   disruptions; this PDB is an availability floor, not a one-eviction surge
-  mutex. The Deployment's separate `maxUnavailable: 0` contract governs its
-  rolling update.
+  mutex. The API Deployment's separate `maxUnavailable: 0` contract governs
+  its rolling update; controller and executor Deployments default to the same
+  one-unavailable floor as their PDBs.
 - Migration hooks finish before Deployments roll.
 - The direct-Helm bundle owns a revision-scoped seed hook Job, generation-
   annotated role Deployments, and a distinct post-rollout verifier hook Job;
@@ -1564,12 +1570,14 @@ by HA mode.
   the 262,144-byte input bound, pre-seed failure, post-rollout verification,
   retry/failure TTLs, interrupted-client-after-success, uninstall residue, and
   revision-scoped cleanup.
-- Placement/capacity tests prove the exact 2/2/2 role pods plus one bounded
-  surge per role schedule across failure domains with their declared
-  requests/limits and priorities, do not overlap SkyServe worker/LB selectors,
-  and retain required node and zone headroom. Provider-specific node migration,
-  taint, cost-stop, and infrastructure rollback sequences are deployment
-  runbook evidence, not unnamed plans in this canonical application design.
+- Placement/capacity tests prove the exact 2/2/2 role pods plus one bounded API
+  surge schedule across failure domains with their declared requests/limits
+  and priorities, do not overlap SkyServe worker/LB selectors, and retain
+  required node and zone headroom. A controller or executor surge is included
+  only when its explicit rollout override enables one. Provider-specific node
+  migration, taint, cost-stop, and infrastructure rollback sequences are
+  deployment runbook evidence, not unnamed plans in this canonical application
+  design.
 - Private-observer API tests cover additive PostgreSQL schema 009 upgrade,
   retained-schema downgrade refusal, the exact table constraints and cascade,
   canonical body/digest/UUID vectors shared with Terraform, new admission
@@ -1833,9 +1841,10 @@ slower; any failed, stale, or missing observation resets the clock:
   counters have no unexplained increase;
 - every role pod remains on the exact approved failure-domain and node-class
   inventory; no hosting node reports pressure; and the reviewed per-zone and
-  aggregate headroom for all three possible rollout surges remains satisfied
-  after accounting for DaemonSets, external load balancers, the observer, and
-  all other live workloads;
+  aggregate headroom for the required API surge plus any explicitly configured
+  controller or executor surge remains satisfied after accounting for
+  DaemonSets, external load balancers, the observer, and all other live
+  workloads;
 - the exact rendered PVC-free storage profile is running in all seven Ready role
   pods, every local volume remains within its byte/inode budget, and local-
   upload rejection has no bypass. Any PVC/EFS mount or I/O fails the storage
@@ -2307,14 +2316,13 @@ Helm contract rejects `fullnameOverride`, retains the release name as its single
 naming authority, and passes exact role Deployment names to the independent
 seed reconciler.
 
-The same review made the capacity boundary explicit. Both Helm and the
-post-seed reconciler may roll API, executor, and controller Deployments at the
-same time. `maxSurge: 1` is therefore a per-role bound, not a whole-release
-bound, and activation must prove aggregate headroom for as many as three surge
-pods. Serializing only post-seed waits would not protect Helm upgrades. The HA
-guard accepts the equivalent zero-unavailable forms `0` and `0%`, but keeps
-the surge bound as absolute integer `1` so percentage rounding cannot silently
-increase temporary capacity. Focused boundary tests cover all three choices.
+At that stage, the same review made the capacity boundary explicit: Helm and
+the post-seed reconciler may roll API, executor, and controller Deployments at
+the same time, so the original `maxSurge: 1` setting required aggregate
+headroom for as many as three surge Pods. Review 31 supersedes that requirement
+for controller and executor after production showed that reserved surge
+headroom can deadlock a packed control plane. The API's absolute single-surge,
+zero-unavailable contract from this review remains unchanged.
 
 ### Reviews 14--28: historical rollout closure
 
@@ -2360,3 +2368,21 @@ pool and non-pool effects, ephemeral storage, callback/relaunch exclusion,
 phase-aware retry, exact finalization, and death between claim and completion.
 No compatibility branch or refresh-owned provider fallback remains in the
 steady-state contract.
+
+### Review 31: packed-control-plane role rollouts
+
+Production rollout evidence showed that the original per-role `maxSurge: 1`
+contract can deadlock an otherwise healthy upgrade when the control-plane nodes
+fit the desired API, executor, and controller Pods but not three additional
+surge Pods. Adding node capacity is not an application correctness requirement:
+controller leadership is fenced in PostgreSQL and executor requests are
+durable and reclaimable by the remaining replica.
+
+The steady-state chart therefore keeps the ingress API's guarded `1/0`
+strategy unchanged and defaults only controller and executor to `0/1`.
+Per-role values remain configurable for installations with proven surge
+headroom. Templates use key-preserving lookup rather than truthiness defaults,
+so an explicit integer zero and a retained release that lacks the newly added
+map both render deterministically. Focused Helm tests cover defaults, explicit
+zero overrides, null/missing retained values, schema generation, and the
+unchanged API strategy.

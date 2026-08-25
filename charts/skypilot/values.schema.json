@@ -496,6 +496,26 @@
                 "resources": {
                     "type": "object"
                 },
+                "rollingUpdate": {
+                    "type": [
+                        "object",
+                        "null"
+                    ],
+                    "properties": {
+                        "maxSurge": {
+                            "type": [
+                                "integer",
+                                "string"
+                            ]
+                        },
+                        "maxUnavailable": {
+                            "type": [
+                                "integer",
+                                "string"
+                            ]
+                        }
+                    }
+                },
                 "terminationGracePeriodSeconds": {
                     "type": "integer",
                     "minimum": 1
@@ -656,6 +676,26 @@
                 },
                 "resources": {
                     "type": "object"
+                },
+                "rollingUpdate": {
+                    "type": [
+                        "object",
+                        "null"
+                    ],
+                    "properties": {
+                        "maxSurge": {
+                            "type": [
+                                "integer",
+                                "string"
+                            ]
+                        },
+                        "maxUnavailable": {
+                            "type": [
+                                "integer",
+                                "string"
+                            ]
+                        }
+                    }
                 },
                 "terminationGracePeriodSeconds": {
                     "type": "integer",
