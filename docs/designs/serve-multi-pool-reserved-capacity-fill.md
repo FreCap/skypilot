@@ -4,14 +4,17 @@ Last updated: 2026-08-25
 
 Status: **the reserved-capacity path remains production-proven against the
 unchanged scheduler-authorized denominator. The control plane is now SkyPilot
-release `1.1.1484`, Helm revision 606. No fleet provider resource or routable
-replica remains, but the supported teardown is not complete: the historical
-`boltz-l4-fleet` row is still `SHUTTING_DOWN` with two retained ambiguous
-ordinary-paid replica rows. The target-100 paid-Spot qualification is
-incomplete: the clean `1.1.1484` rerun exposed zero provider launches because
-mutable demand updates revoked already committed paid claims before their
-first effect. The source-only correction below and evidence-backed teardown
-adjudication are the next deployment gates.**
+release `1.1.1485`, Helm revision 607. PR #1716's immutable paid-provider
+handoff is deployed, and the clean Spot-only `boltz-l4-fleet-spot100`
+qualification has produced real Spot provider effects with no On-Demand
+capacity. The target-100 / 10,000-request proof is still running. It exposed a
+remaining provider-handoff progress defect: fresh load-balancer reports can
+name adjacent valid route snapshots while the route head advances during
+normal scale-out, but `1.1.1485` requires every report to name the exact latest
+head. The bounded correction below is the next source, deployment, and live
+qualification gate. The historical `boltz-l4-fleet` teardown also remains
+`SHUTTING_DOWN` with two retained ambiguous ordinary-paid replica rows; these
+must not be deleted without durable provider-absence evidence.**
 
 The two Spot VMs retained by the prior `1.1.1483`/`.1541` canary are fully
 terminated at the provider. Their down requests are terminal and execution-
@@ -22,9 +25,9 @@ central correctness authority, Helm storage is disabled, and no EFS/PVC
 correctness path is present. Historical fleet and qualification receipts below
 are chronology, not current live state.
 
-Source-only addendum (2026-08-25; not yet deployed or production-proven): the
-paid provider handoff and asynchronous drain observation now have one explicit
-atomic boundary. Before a paid claim commits, the current PostgreSQL demand,
+Deployed addendum (2026-08-25; PR #1716 / `1.1.1485`): the paid provider
+handoff and asynchronous drain observation now have one explicit atomic
+boundary. Before a paid claim commits, the current PostgreSQL demand,
 route, reserved allocation, capacity graph, inventory, plan head, and global
 cap must match exactly. Paid admission atomically persists the replica, paid
 claim, and global-capacity debit; that is the immutable authority boundary. A
@@ -43,7 +46,49 @@ This prevents high-rate demand updates from repeatedly stranding already
 committed Spot launches without weakening prospective reserved-before-paid or
 global-cap admission.
 
-The same source addendum closes a controller/LB restart seam in graceful paid
+Qualification correction (2026-08-25; source and production proof pending):
+the fresh current-authority load-balancer reports used by the committed-claim
+provider guard are not a barrier over one route-head generation. A normal
+backend readiness change may publish route generation N+1 while one current LB
+session still freshly reports N. Requiring every report to equal N+1 turns
+safe provider dispatch into a synchronization lottery and amplifies churn as
+each new backend changes the route again.
+
+The steady-state guard instead validates every fresh report's own immutable
+route reference. Its source epoch must equal the current service and admitted
+plan epoch; its generation must be at least the plan's admitted route
+generation and no newer than the locked current head; and the exact persisted
+snapshot at that generation must exist, match the report digest, pass canonical
+snapshot validation, and match the current service hash, lifecycle, version,
+controller incarnation, protocol, producer protocol, owner, and routing
+version. Report rows and their normalized payloads remain protocol 2, complete,
+and bound to the exact current service, hash, selected slot, session, routing
+version, and monotonic sequence through scalar/payload agreement plus the
+existing current LB-session authority validator. The ingestion digest covers
+the pre-normalized wire payload and is deliberately not recomputed from the
+stored normalized JSONB representation. Every fresh authority-bearing ACTIVE
+or DRAINING report is checked, not merely one convenient reporter. The locked
+current head must
+independently remain fresh, valid, owned, and non-regressed; the original plan's
+route generation/digest/epoch tuple remains internally exact; and the guard
+locks the head, reports, and referenced snapshots in canonical order before
+resampling the PostgreSQL clock for freshness.
+
+This relaxed predicate exists only in
+`_validate_committed_paid_claim_in_connection(..., prospective=False)`, after
+the paid claim and global debit committed atomically. It must not be reused by
+autoscaling demand aggregation, capacity-plan publication, initial/prospective
+paid admission, reserved-fill admission, or retirement. Those paths continue
+to require one exact route generation because mixed snapshots are not a sound
+demand or occupancy aggregate. Thus current HA sessions may safely name valid
+adjacent monotonic snapshots only for the one already-committed provider
+handoff, while an old epoch/session, pre-plan or future generation,
+missing/pruned snapshot, wrong digest, ownership change, corrupt snapshot,
+N-1 producer protocol, stale report, or stale current head still fails closed.
+No schema, migration, provider path, infrastructure object, compatibility
+branch, or second happy path is introduced.
+
+The same deployed addendum closes a controller/LB restart seam in graceful paid
 retirement. A revoked asynchronous route whose exact current replica is still a
 scheduled scale-down waiting for idle is projected at read time in a separate
 observation-only route-sync namespace. It is bound to the exact service hash,
@@ -952,7 +997,7 @@ boundaries.
 | PR #1678 duplicate-up and observer lock-order correction | Complete at `38ec24342` | Complete in Helm 572 | Complete at gate 34 | Duplicate-up, takeover, 180-second stale horizon, and +30 control-plane/HA/error checks passed; the coincident eight-card v6 readiness wave was superseded by supported provider teardown |
 | Kueue non-mutation | No source change | No rendered chart change | Not applicable | Complete: both normalized PRE and POST hashes are equal |
 | Paid residual | Complete | Complete with the local provider's cap-ten qualification envelope | Activated but idle | Source/real-PostgreSQL tests qualify commit-before-residual and drain. Idle production and the 32-GPU refill created no paid claim, waiter, or replica because reserved capacity covered the denominator. An authenticated positive bounded Spot residual and complete drain remain the sole open production behavior exercise. |
-| Immutable paid handoff and restart-safe async drain observation | Source-complete in the current fix-forward; no schema or migration | Not deployed | Not activated | Not production-proven. Required gates are a homogeneous rollout, sustained paid-demand launch proof without claim churn, cold-LB explicit-zero retirement proof, and complete provider/debit drain. |
+| Immutable paid handoff and restart-safe async drain observation (#1716) | Complete at `407bade13`; no schema or migration | Complete in `1.1.1485` / Helm 607 | Active for the clean `boltz-l4-fleet-spot100` qualification | Partially proven: three real Spot provider effects committed and launched with zero On-Demand capacity. Normal route churn then exposed the adjacent-snapshot handoff defect corrected by the pending bounded follow-up; sustained target-100 demand, 10,000 terminal requests, cold-LB explicit-zero retirement, and complete provider/debit drain remain open gates. |
 | Protocol-v7 bootstrap and N-1 terminal-cleanup correction (#1679) | Complete at `40a0832bd` | Complete in `1.1.1449` / Helm 573 | Complete at gate 35 | Complete: lifecycle 93 purged and lifecycle 94 recreated without manual deletion |
 | Fill throughput and HA lock-starvation correction (#1680) | Complete at `b311dd277` | Complete in `1.1.1450` / Helm 575 | Complete at gate 36 | Historical East batch proof committed 16 intents together and made all 16 Ready with zero generation-36 `grant_expired` intents. The formerly pending PHX cleanup/deployment is superseded by the lifecycle-96/Helm-586 receipt. |
 | Generation-fenced pre-job cleanup (#1682) | Complete at `73c40a3fe` | Complete in `1.1.1452` / Helm 576 | Complete at gate 37 | Complete: PHX 194/194 Kueue-admitted Ready plus four topology-withheld; East 328/328 physical GPUs assigned; zero paid claims/waiters |
