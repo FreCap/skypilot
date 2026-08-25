@@ -297,6 +297,18 @@ executorService:
   # HA mode requires at least two, enforced contextually by the template.
   # @schema type: [integer]; minimum: 0
   replicas: 2
+  # Roll in place by default so an HA executor upgrade does not require a
+  # third pod to fit on the control-plane nodes. PostgreSQL-backed durable
+  # requests remain claimable by the other replica during replacement.
+  # Set maxSurge: 1 and maxUnavailable: 0 only when rollout preflight proves
+  # spare capacity for a temporary executor pod. Values may be integers or
+  # percentage strings (e.g. "25%").
+  # @schema type: [object, null]
+  rollingUpdate:
+    # @schema type: [integer, string]
+    maxSurge: 0
+    # @schema type: [integer, string]
+    maxUnavailable: 1
   # Uses apiService.image when null.
   # @schema type: [string, null]
   image: null
@@ -338,6 +350,18 @@ controllerService:
   # HA mode requires at least two, enforced contextually by the template.
   # @schema type: [integer]; minimum: 0
   replicas: 2
+  # Roll in place by default so an HA controller upgrade does not require a
+  # third pod to fit on the control-plane nodes. PostgreSQL leadership fencing
+  # keeps the remaining replica authoritative during replacement.
+  # Set maxSurge: 1 and maxUnavailable: 0 only when rollout preflight proves
+  # spare capacity for a temporary controller pod. Values may be integers or
+  # percentage strings (e.g. "25%").
+  # @schema type: [object, null]
+  rollingUpdate:
+    # @schema type: [integer, string]
+    maxSurge: 0
+    # @schema type: [integer, string]
+    maxUnavailable: 1
   # Uses apiService.image when null.
   # @schema type: [string, null]
   image: null

@@ -60,6 +60,14 @@ Create ``ha-values.yaml``:
       accessMode: ReadWriteMany
       storageClassName: <rwx-storage-class>
 
+The API Deployment retains the guarded ``maxSurge: 1`` and
+``maxUnavailable: 0`` availability contract. The controller and executor
+Deployments default to ``maxSurge: 0`` and ``maxUnavailable: 1`` so each can
+replace one of its two or more replicas without requiring room for a temporary
+third Pod. Their rollout bounds can be overridden independently under
+``controllerService.rollingUpdate`` and ``executorService.rollingUpdate`` when
+rollout preflight proves the required surge capacity.
+
 Install or upgrade with those values:
 
 .. code-block:: bash

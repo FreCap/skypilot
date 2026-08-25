@@ -16,6 +16,9 @@
 {{- $executorImage := default .Values.apiService.image (get $executorService "image") -}}
 {{- $executorPullPolicy := default .Values.apiService.imagePullPolicy (get $executorService "imagePullPolicy") -}}
 {{- $executorReplicas := dig "replicas" 2 $executorService -}}
+{{- $executorRollingUpdate := get $executorService "rollingUpdate" | default (dict) -}}
+{{- $executorMaxSurge := dig "maxSurge" 0 $executorRollingUpdate -}}
+{{- $executorMaxUnavailable := dig "maxUnavailable" 1 $executorRollingUpdate -}}
 {{- $executorHealthPort := dig "healthPort" 46581 $executorService -}}
 {{- if and .Values.apiService.metrics.enabled (eq (int $executorHealthPort) (int .Values.apiService.metrics.port)) -}}
 {{- fail "executorService.healthPort must differ from apiService.metrics.port when metrics are enabled" -}}
@@ -159,8 +162,9 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
+      {{- /* Use dig rather than default so an explicit integer zero is kept. */}}
+      maxSurge: {{ $executorMaxSurge }}
+      maxUnavailable: {{ $executorMaxUnavailable }}
   selector:
     matchLabels:
       app: {{ $fullName }}-executor

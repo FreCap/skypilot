@@ -115,8 +115,11 @@ tests:
           path: spec.strategy.type
           value: RollingUpdate
       - equal:
-          path: spec.strategy.rollingUpdate.maxUnavailable
+          path: spec.strategy.rollingUpdate.maxSurge
           value: 0
+      - equal:
+          path: spec.strategy.rollingUpdate.maxUnavailable
+          value: 1
       - contains:
           path: spec.template.spec.containers[0].env
           content:
@@ -240,6 +243,31 @@ tests:
           content:
             name: metrics
             containerPort: 9090
+
+  - it: should honor executor rollout overrides including explicit zero
+    set:
+      apiService.highAvailability.enabled: true
+      executorService.rollingUpdate.maxSurge: 1
+      executorService.rollingUpdate.maxUnavailable: 0
+    asserts:
+      - equal:
+          path: spec.strategy.rollingUpdate.maxSurge
+          value: 1
+      - equal:
+          path: spec.strategy.rollingUpdate.maxUnavailable
+          value: 0
+
+  - it: should use in-place executor rollout defaults when retained values omit the map
+    set:
+      apiService.highAvailability.enabled: true
+      executorService.rollingUpdate: null
+    asserts:
+      - equal:
+          path: spec.strategy.rollingUpdate.maxSurge
+          value: 0
+      - equal:
+          path: spec.strategy.rollingUpdate.maxUnavailable
+          value: 1
 
   - it: should reserve the pre-import server identity marker
     set:
