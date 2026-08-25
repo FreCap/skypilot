@@ -340,6 +340,74 @@ def _run_one_sync(lb: load_balancer.SkyServeLoadBalancer,
     return session
 
 
+def test_cold_lb_observes_retired_async_url_without_routing_it():
+    lb = _make_lb()
+    retired_url = 'http://retired:8080'
+    _run_one_sync(
+        lb, {
+            'replica_info': {},
+            constants.LB_DRAINING_REPLICA_INFO_KEY: {
+                retired_url: {
+                    'gpu_type': 'L4',
+                    'gpu_count': '1',
+                    'is_zero_cost': 'false',
+                    'async_occupancy': 'true',
+                },
+            },
+            'num_ready_replicas': 0,
+            'routing_spec': {
+                'load_balancing_policy_name': 'least_load',
+            },
+            'service_version': 7,
+        })
+
+    assert lb._load_balancing_policy.ready_replicas == []
+    assert retired_url not in lb._client_pool
+    assert retired_url not in lb._replica_info_by_url
+    assert retired_url in lb._occupancy_declared_urls
+    assert retired_url in lb._occupancy_capable
+
+    async_probe = mock.AsyncMock(return_value=(0, 1, 1))
+    with mock.patch.object(lb, '_fetch_replica_occupancy', new=async_probe):
+        asyncio.run(lb._probe_replica_occupancy_once())
+
+    in_flight, routing_urls, unknown_urls, sampled_urls = (
+        lb._in_flight_with_draining())
+    assert async_probe.await_count == 1
+    assert in_flight == {retired_url: 0}
+    assert routing_urls == []
+    assert not unknown_urls
+    assert sampled_urls == [retired_url]
+
+    with mock.patch.object(lb,
+                           '_get_lb_session_id',
+                           return_value='test-pod-uid'):
+        drain_report = lb._ha_role_payload()
+        demand_report, _, _, _ = lb._build_demand_report()
+    assert drain_report['async_occupancy'] == {retired_url: 0}
+    assert drain_report['occupancy_sampled_urls'] == [retired_url]
+    assert drain_report['total_slots_by_url'] == {retired_url: 1}
+    assert retired_url not in demand_report['async_occupancy']
+    assert retired_url not in demand_report['occupancy_sampled_urls']
+    assert retired_url not in demand_report['total_slots_by_url']
+    assert retired_url not in demand_report['unknown_in_flight_urls']
+    assert retired_url not in demand_report['routing_urls']
+
+
+def test_draining_observation_cannot_overlap_routable_url():
+    url = 'http://replica:8080'
+    info = {
+        'gpu_type': 'L4',
+        'gpu_count': '1',
+        'is_zero_cost': 'false',
+        'async_occupancy': 'true',
+    }
+
+    with pytest.raises(ValueError, match='overlaps a routable URL'):
+        load_balancer.SkyServeLoadBalancer._decode_draining_replica_info(
+            {url: info}, {url: info})
+
+
 def test_foreground_route_only_sync_preserves_all_demand_history():
     lb = _make_lb()
     lb._service_hash = 'service-hash-a'

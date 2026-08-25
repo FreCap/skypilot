@@ -70,6 +70,9 @@ def test_occupancy_context_excludes_capacity_but_fences_replica_identity():
         }
     }
     initial = route_projection._occupancy_context_sha256(response, identities)
+    explicit_empty = {**response, constants.LB_DRAINING_REPLICA_INFO_KEY: {}}
+    assert (route_projection._occupancy_context_sha256(explicit_empty,
+                                                       identities) == initial)
 
     changed_capacity = dict(response)
     changed_capacity['capacity_hint'] = {
@@ -87,6 +90,36 @@ def test_occupancy_context_excludes_capacity_but_fences_replica_identity():
     }
     assert (route_projection._occupancy_context_sha256(response, successor)
             != initial)
+
+    retired_url = 'http://retired:8080'
+    with_draining = {
+        **response,
+        constants.LB_DRAINING_REPLICA_INFO_KEY: {
+            retired_url: {
+                'gpu_type': 'L4',
+                'gpu_count': '1',
+                'is_zero_cost': 'false',
+                'async_occupancy': 'true',
+            },
+        },
+    }
+    draining_identities = {
+        **identities,
+        retired_url: {
+            'replica_record_id': str(uuid.uuid4()),
+            'advertised': False,
+        },
+    }
+    draining = route_projection._occupancy_context_sha256(
+        with_draining, draining_identities)
+    assert draining != initial
+    draining_identities[retired_url] = {
+        **draining_identities[retired_url],
+        'replica_record_id': str(uuid.uuid4()),
+    }
+    assert (route_projection._occupancy_context_sha256(with_draining,
+                                                       draining_identities)
+            != draining)
 
 
 def test_selected_route_context_ignores_unrelated_fleet_churn():
@@ -321,6 +354,54 @@ def test_incremental_view_expires_only_one_replica():
     assert set(
         result.identities) == {'http://10.0.0.1:8000', 'http://10.0.0.2:8000'}
     assert result.identities['http://10.0.0.2:8000']['advertised'] is False
+
+
+def test_incremental_view_projects_revoked_async_drain_observation_off_route():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    replica = route_projection.IncrementalRouteReplica(1, str(uuid.uuid4()), 1,
+                                                       'SHUTTING_DOWN')
+    row = _incremental_lease(1, replica.replica_record_id,
+                             'http://10.0.0.1:8000', now)
+    row.update({
+        'ready': False,
+        'valid_until': None,
+        'revoked_at': now,
+    })
+
+    result = route_projection.build_draining_route_view([{
+        'replica_id': replica.replica_id,
+        'replica_record_id': replica.replica_record_id,
+        'version': replica.service_version,
+        'status': replica.status,
+    }], [row], set())
+
+    assert result.replica_info == {
+        'http://10.0.0.1:8000': {
+            'gpu_type': 'L4',
+            'gpu_count': '1',
+            'is_zero_cost': 'false',
+            'async_occupancy': 'true',
+        }
+    }
+    assert result.identities['http://10.0.0.1:8000']['advertised'] is False
+
+
+def test_draining_route_view_withholds_existing_identity_url_overlap():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    record_id = str(uuid.uuid4())
+    url = 'http://10.0.0.1:8000'
+    row = _incremental_lease(1, record_id, url, now)
+    row.update({'ready': False, 'valid_until': None, 'revoked_at': now})
+
+    result = route_projection.build_draining_route_view([{
+        'replica_id': 1,
+        'replica_record_id': record_id,
+        'version': 1,
+        'status': 'SHUTTING_DOWN',
+    }], [row], {url})
+
+    assert not result.replica_info
+    assert not result.identities
 
 
 def test_incremental_view_requires_closed_recovery_marker():
