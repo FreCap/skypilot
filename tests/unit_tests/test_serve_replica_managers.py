@@ -14731,7 +14731,7 @@ class TestLaunchReplicaSnapshotAccumulation:
         manager._service_name = 'svc'
         manager.yaml_content = 'dummy: yaml'
         manager.latest_version = 1
-        manager._version_specs = {1: mock.Mock()}
+        manager._version_specs = {1: mock.Mock(max_live_paid_gpu_units=100)}
         manager._version_task_templates = {1: mock.Mock(name='task_template')}
         manager._launch_thread_pool = thread_utils.ThreadSafeDict()
         manager._replica_to_request_id = thread_utils.ThreadSafeDict()
@@ -14795,6 +14795,9 @@ class TestLaunchReplicaSnapshotAccumulation:
         location.to_dict.return_value = {'zone': 'z'}
         placer.select_next_location.return_value = location
         manager = self._make_manager(placer)
+        completion_event = (
+            manager._legacy_mutation_runtime_state().launch_completion_event)
+        completion_event.clear()
 
         with mock.patch('sky.serve.replica_managers._should_use_spot',
                         return_value=True), \
@@ -14814,6 +14817,10 @@ class TestLaunchReplicaSnapshotAccumulation:
             manager._launch_replica(replica_id=1)
         # Without a caller-provided snapshot each launch scans fresh state.
         assert mock_scan.call_count == 1
+        # Admission is still performed by the shared-budget refresher, but a
+        # fresh planner claim must not wait for its 20-second fallback poll and
+        # expire behind the load balancer's five-second demand heartbeat.
+        assert completion_event.is_set()
 
     def test_recovery_preserves_exact_spot_location(self):
         # A recovered spot row already owns its cluster name. Selecting a new
