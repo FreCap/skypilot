@@ -4591,11 +4591,12 @@ def validate_effect_authority_in_connection(
                           association,
                           context,
                           require_launch_authorized=True)
-    # Mutable demand can revoke a paid claim only before the first provider
-    # effect.  Once PROVIDER_IO is durable, later phase transitions are
-    # bookkeeping for that same immutable profile and must complete even if
-    # demand or its short plan lease changes meanwhile.  Current desired state
-    # independently owns any compensating teardown.
+    # The atomic replica+claim+global-cap debit authorizes exactly one first
+    # provider effect. Raw demand telemetry or a demand-derived successor plan
+    # cannot revoke it; explicit durable cancellation/retirement may still
+    # remove the claim before this boundary. Once PROVIDER_IO is durable, later
+    # phase transitions are bookkeeping for that same immutable profile.
+    # Current desired state independently owns any compensating teardown.
     provider_start = association[
         'effect_phase'] == EffectPhase.NOT_STARTED.value
     paid_fresh_until = None

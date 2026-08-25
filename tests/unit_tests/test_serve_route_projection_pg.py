@@ -14,6 +14,7 @@ import sqlalchemy
 from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
+from sky.serve import constants
 from sky.serve import demand_state_schema
 from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
@@ -673,6 +674,170 @@ def test_publish_refresh_promote_and_provider_free_read(route_database):
     assert projected.response['route_source_epoch'] == 1
     assert set(projected.response['replica_info']) == {'http://10.0.0.1:8000'}
     assert projected.response['capacity_hint']['decoded'] == 1
+
+
+def test_successor_controller_projects_predecessor_revoked_drain_observation(
+        route_database):
+    engine, incarnation = route_database
+    repository = route_projection.RouteProjectionRepository(engine)
+    old_identity = _identity(incarnation)
+    record_id = str(uuid.uuid4())
+    _insert_replica(engine, record_id)
+    info = types.SimpleNamespace(replica_id=1,
+                                 replica_record_id=record_id,
+                                 version=1,
+                                 status=types.SimpleNamespace(name='READY'))
+    repository.upsert_replica_material(old_identity, info, _material())
+    target = repository.list_probe_targets(old_identity)[0]
+    assert repository.record_probe_result(target, True, ttl_seconds=60).accepted
+    assert repository.revoke_replica(old_identity, 1, record_id,
+                                     'paid_retirement_admitted') == 1
+
+    successor_incarnation = uuid.uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id == 1).values(
+                    status='SHUTTING_DOWN',
+                    sky_down_status='SCHEDULED',
+                    replica_state={
+                        'replica_record_id': record_id,
+                        'is_zero_cost': False,
+                        'status_property': {
+                            'is_scale_down': True,
+                            'wait_for_idle_before_termination': True,
+                        },
+                    }))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    controller_incarnation=successor_incarnation,
+                    controller_owner_epoch=5,
+                    controller_pid=456,
+                    controller_ip='10.0.0.6'))
+    successor = route_projection.RoutePublisherIdentity(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        controller_incarnation=successor_incarnation,
+        controller_owner_epoch=5,
+        controller_pid=456,
+        controller_ip='10.0.0.6')
+
+    receipt = repository.compose_incremental_snapshot(
+        successor,
+        1, {'load_balancing_policy_name': 'round_robin'},
+        lambda _version, state: types.SimpleNamespace(replica_id=1,
+                                                      replica_record_id=state[
+                                                          'replica_record_id'],
+                                                      version=1),
+        lambda infos, _translation, _logical_versions: {
+            'capacity_replica_count': len(infos),
+        },
+        ttl_seconds=60)
+    with engine.begin() as connection:
+        row = connection.execute(
+            sqlalchemy.select(
+                route_projection_schema.serve_route_snapshots_table).where(
+                    route_projection_schema.serve_route_snapshots_table.c.
+                    service_name == 'svc',
+                    route_projection_schema.serve_route_snapshots_table.c.
+                    generation == receipt.generation)).mappings().one()
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_source_mode='DURABLE_PROJECTED',
+                    route_source_epoch=1,
+                    route_projection_capable=True,
+                    route_projection_controller_incarnation=(
+                        successor_incarnation),
+                    route_projection_protocol_version=2))
+    # The additive field is read-time only: persisted protocol-1 response
+    # bytes stay readable by the immediately previous controller version.
+    assert constants.LB_DRAINING_REPLICA_INFO_KEY not in row['response_payload']
+    _insert_report(engine)
+    decision = repository.resolve_sync('svc', 'svc-hash', 'pod-a')
+    assert decision.response is not None
+    response = decision.response
+
+    assert response['replica_info'] == {}
+    assert response[constants.LB_DRAINING_REPLICA_INFO_KEY] == {
+        'http://10.0.0.1:8000': {
+            'gpu_type': 'L4',
+            'gpu_count': '1',
+            'is_zero_cost': 'false',
+            'async_occupancy': 'true',
+        }
+    }
+    assert response['capacity_hint']['capacity_replica_count'] == 0
+
+
+def test_draining_observation_cannot_overwrite_retained_route_alias(
+        route_database):
+    engine, incarnation = route_database
+    repository = route_projection.RouteProjectionRepository(engine)
+    advertised_record_id = str(uuid.uuid4())
+    alias_url = 'http://10.0.0.1:8000'
+    advertised_url = 'http://10.0.0.2:8000'
+    repository.publish(_identity(incarnation),
+                       1,
+                       _response(alias_url),
+                       _identity_payload(advertised_record_id, alias_url),
+                       {advertised_record_id},
+                       ttl_seconds=60)
+    repository.publish(_identity(incarnation),
+                       1,
+                       _response(advertised_url),
+                       _identity_payload(advertised_record_id, advertised_url),
+                       {advertised_record_id},
+                       ttl_seconds=60)
+
+    draining_record_id = str(uuid.uuid4())
+    _insert_replica(engine, draining_record_id, replica_id=2, status='READY')
+    draining_info = types.SimpleNamespace(
+        replica_id=2,
+        replica_record_id=draining_record_id,
+        version=1,
+        status=types.SimpleNamespace(name='READY'))
+    repository.upsert_replica_material(_identity(incarnation), draining_info,
+                                       _material(alias_url))
+    target = repository.list_probe_targets(_identity(incarnation))[0]
+    assert target.replica_record_id == draining_record_id
+    assert repository.record_probe_result(target, True, ttl_seconds=60).accepted
+    assert repository.revoke_replica(_identity(incarnation), 2,
+                                     draining_record_id,
+                                     'paid_retirement_admitted') == 1
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id == 2).values(
+                    status='SHUTTING_DOWN',
+                    sky_down_status='SCHEDULED',
+                    replica_state={
+                        'replica_record_id': draining_record_id,
+                        'is_zero_cost': False,
+                        'status_property': {
+                            'is_scale_down': True,
+                            'wait_for_idle_before_termination': True,
+                        },
+                    }))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_source_mode='DURABLE_PROJECTED',
+                    route_source_epoch=1,
+                    route_projection_capable=True,
+                    route_projection_controller_incarnation=incarnation,
+                    route_projection_protocol_version=1))
+    _insert_report(engine)
+
+    decision = repository.resolve_sync('svc', 'svc-hash', 'pod-a')
+
+    assert decision.response is not None
+    assert set(decision.response['replica_info']) == {advertised_url}
+    assert decision.response[constants.LB_DRAINING_REPLICA_INFO_KEY] == {}
 
 
 def test_route_promotion_waits_for_and_rejects_nonstable_ha_cutover(

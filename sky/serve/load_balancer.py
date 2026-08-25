@@ -3686,6 +3686,42 @@ class SkyServeLoadBalancer:
         return (not ready_replica_urls and bool(num_ready_replicas) and
                 bool(self._load_balancing_policy.ready_replicas))
 
+    @staticmethod
+    def _decode_draining_replica_info(
+            raw: Any,
+            replica_info: dict[str, dict[str,
+                                         Any]]) -> dict[str, dict[str, Any]]:
+        """Validate the closed observation-only route-sync namespace.
+
+        The normal ``replica_info`` map is the sole input to routing and
+        transport-client creation.  These retired URLs may only seed an
+        asynchronous occupancy probe, so overlap or any declaration other
+        than the exact async contract rejects the complete sync.
+        """
+        if not isinstance(raw, dict):
+            raise ValueError('Draining replica observations are malformed.')
+        if set(raw) & set(replica_info):
+            raise ValueError(
+                'A draining replica observation overlaps a routable URL.')
+        result: dict[str, dict[str, Any]] = {}
+        expected_fields = {
+            'gpu_type', 'gpu_count', 'is_zero_cost', 'async_occupancy'
+        }
+        for url, info in raw.items():
+            if (not isinstance(url, str) or not url or
+                    not isinstance(info, dict) or
+                    set(info) != expected_fields or
+                    not isinstance(info.get('gpu_type'), str) or
+                    not info['gpu_type'] or
+                    not isinstance(info.get('gpu_count'), str) or
+                    not info['gpu_count'].isdigit() or
+                    int(info['gpu_count']) < 1 or
+                    info.get('is_zero_cost') not in ('true', 'false') or
+                    info.get('async_occupancy') != 'true'):
+                raise ValueError('Draining replica observations are malformed.')
+            result[url] = dict(info)
+        return result
+
     # ------------------------------------------------------------------
     # [boltz fork] Async-occupancy probing.
     #
@@ -3910,10 +3946,15 @@ class SkyServeLoadBalancer:
                 if url not in ready_set and url not in current_ready
             }
             self._replica_occupancy = merged_occupancy
+            # A sampled off-ready URL's width is observation metadata needed
+            # to report the same-session zero to the HA drain.  It is not
+            # spendable: free slots stay ready-only below, and every admission
+            # consumer intersects total slots with the current ready set.
             self._replica_total_slots = {
                 url: slots
                 for url, slots in merged_total_slots.items()
-                if url in ready_set and url in current_ready
+                if ((url in ready_set and url in current_ready) or
+                    url in self._occupancy_sampled_off_ready)
             }
             self._replica_free_slots = {
                 url: slots
@@ -4088,6 +4129,7 @@ class SkyServeLoadBalancer:
         """
         ready_replica_urls = []
         replica_info = {}
+        draining_replica_info = {}
         routing_spec = None
         num_ready_replicas: int | None = None
         capacity_hint = None
@@ -4244,6 +4286,11 @@ class SkyServeLoadBalancer:
                                  mark_prediction_time_history_accepted(
                                      prediction_time_history))
                         replica_info = response_json.get('replica_info', {})
+                        draining_replica_info = (
+                            self._decode_draining_replica_info(
+                                response_json.get(
+                                    constants.LB_DRAINING_REPLICA_INFO_KEY, {}),
+                                replica_info))
                         # Count of READY, active replicas the controller has,
                         # which can exceed len(replica_info) when endpoints are
                         # briefly unresolvable. None from an older controller
@@ -4397,6 +4444,11 @@ class SkyServeLoadBalancer:
                         if str(info.get('async_occupancy', '')).lower() ==
                         'true' and url not in invalid_marker_urls
                     }
+                    # Observation-only URLs never enter the ready set or
+                    # client pool.  Declaring them occupancy-capable is enough
+                    # for a cold LB to probe and report a same-session explicit
+                    # zero to the controller's SEEN-THEN-CLEAN drain tracker.
+                    declared_async_urls |= set(draining_replica_info)
                     explicitly_sync_urls = {
                         url for url, info in replica_info.items()
                         if str(info.get('async_occupancy', '')).lower() ==

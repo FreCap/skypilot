@@ -1,19 +1,43 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Current status (2026-08-25 04:00 UTC): the isolated
-`boltz-l4-fleet-spot100` qualification service is on release `1.1.1483` / Helm
-revision 605 with a 100-GPU positive paid cap and a Spot-only AWS/GCP catalog.
-The first 10,000-request attempt completed all 550 requests it dispatched but
-materialized only two GPUs. Production evidence isolated two source defects:
-paid UNKNOWN replacements omitted the ordinary demand-plan tuple, and an
-idle paid retirement could remain permanently `ACTIVE` after equivalent-zero
-demand/route heartbeats advanced. Both corrections are source-complete and
-locally focused-test green, but are not yet merged, deployed, or production
-proven. The next gate is one homogeneous Helm rollout, supported cleanup of the
-two retained v1483 Spot instances, and a sustained 512-concurrency rerun that
-requires target 100, 100 provider-backed ready GPU slots, 10,000 successful
-requests, no On-Demand effects, and complete teardown. The older phase account
-below is historical chronology and is not an executable runbook.
+Current status (2026-08-25): SkyPilot release `1.1.1484` is deployed as Helm
+revision 606. PR #1715's UNKNOWN-replacement claim binding and equivalent-zero
+retirement corrections are merged and deployed. The two Spot VMs retained by
+the prior `1.1.1483` canary are fully terminated at the provider. A clean
+`1.1.1484` target-100/10,000-request rerun was stopped after it exposed a third
+source defect: demand heartbeats advanced between atomic paid-claim commit and
+the deferred provider guard, so committed rows churned without any provider
+launch. The qualification provider resources are down, but the historical
+`boltz-l4-fleet` service row remains `SHUTTING_DOWN` behind two ambiguous,
+execution-quiesced ordinary-paid rows. The next gate is the source-only atomic-
+handoff and cold-LB drain-observation correction below plus evidence-backed
+teardown adjudication, followed by one homogeneous Helm rollout and a sustained
+512-concurrency rerun requiring target 100, 100 provider-backed ready GPU slots,
+10,000 successful requests, no On-Demand effects, and complete teardown. The
+older phase account below is historical chronology and is not an executable
+runbook.
+
+Source addendum (2026-08-25; not deployed or production-proven): paid demand
+and supply remain exact through the atomic replica/claim/cap-debit commit. Once
+that commit succeeds, the claim's one provider effect is authorized by its
+immutable original plan and bounded debit ledger; later heartbeats, successor
+plans (including aggregate zero), or reserved-supply changes cannot strand it.
+Lifecycle and source epochs, monotonic demand and route generations, fresh
+current route/LB ownership, and the exact persisted action graph still fail
+closed. A successor authorizes no replay or additional debit, and ordinary
+desired-state retirement removes any capacity that became excess. This split
+replaces the older text below that described mutable demand/allocation as a
+post-commit provider-start revocation mechanism.
+
+The same fix-forward projects exact revoked async leases for scheduled
+wait-for-idle replicas in an additive, read-time-only route-sync field. Cold
+load balancers probe those URLs for the existing `SEEN-THEN-CLEAN` evidence but
+never route to them or create transport clients. Durable demand reports retain
+their `current_routes_only=True` contraction, so this observation overlay
+cannot enter autoscaling demand. Persisted protocol-1 route bytes remain
+unchanged for N-1 controller rollback, and N-1 load balancers ignore the
+additive field. No schema, migration, EFS state, or second route authority is
+introduced.
 
 Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
 #1504. PR #1521's partial-coverage in-flight observability, the complete G1S
@@ -383,15 +407,18 @@ routes, autoscaling, sibling pools, or the service dashboard.
 - Use one authenticated durable demand feed for both autoscaling and UI.
 - Account compatible ready and committed zero-cost capacity before any paid
   Spot or On-Demand launch is authorized.
-- Require fresh authenticated unmet demand at both ordinary demand-driven paid
-  admission and the provider-I/O fence.
+- Require fresh authenticated unmet demand and exact reserved-before-paid
+  accounting at ordinary paid admission. After atomic claim commit, require
+  the immutable capped debit plus current lifecycle, route, and LB authority at
+  the provider-I/O fence; mutable demand cannot revoke that one effect.
 - Resolve exact route material once under the provider identity fence, then
   renew or revoke each replica's readiness lease without provider queries,
   manager locks, or an all-fleet completion barrier.
-- Let fresh aggregate zero demand revoke paid scale-up authority immediately;
-  drain each paid replica and wait for its own exact zero-occupancy proof before
-  destructive teardown. Incomplete exact-card attribution may block scale-up,
-  never preserve a stale paid target by itself.
+- Let fresh aggregate zero demand revoke prospective paid scale-up authority
+  immediately; it cannot revoke an already atomically debited first provider
+  effect. Drain each paid replica and wait for its own exact zero-occupancy
+  proof before destructive teardown. Incomplete exact-card attribution may
+  block scale-up, never preserve a stale paid target by itself.
 - Persist a zero-cost fill actuation intent before a replica row. Create the
   replica/action only after the single per-physical-pool executor owns its
   provider phase and physical identity fence.
@@ -714,15 +741,18 @@ pre-commit snapshot.
 
 Fresh zero has a narrower destructive contract than positive demand. A fresh
 current ACTIVE protocol-v2 report with zero arrivals in the complete demand
-window and zero queue revokes all ordinary paid *scale-up* authority and
-publishes an aggregate paid target of zero even if exact-card compatibility is
-incomplete. It may also place paid endpoints into the normal draining route
-state so compatible zero-cost endpoints receive new work. Zero arrivals and
-zero queue do not prove zero processing: each paid replica remains alive until
-every current ACTIVE/DRAINING reporter proves that exact URL has zero in-flight
-work and the existing drain fence commits. An unknown URL therefore delays only
-that replica's teardown, not route draining, zero plan publication, unrelated
-paid replicas, or reserved fill. Exact-card incompleteness continues to block
+window and zero queue revokes all *prospective* ordinary paid scale-up authority
+and publishes an aggregate paid target of zero even if exact-card compatibility
+is incomplete. A claim whose replica/request/cap debit already committed may
+perform its first provider effect exactly once; the zero successor cannot mint
+another claim, and normal desired-state reconciliation retires that now-excess
+replica. Paid endpoints enter the normal draining route state so compatible
+zero-cost endpoints receive new work. Zero arrivals and zero queue do not prove
+zero processing: each paid replica remains alive until every current
+ACTIVE/DRAINING reporter proves that exact URL has zero in-flight work and the
+existing drain fence commits. An unknown URL therefore delays only that
+replica's teardown, not route draining, zero plan publication, unrelated paid
+replicas, or reserved fill. Exact-card incompleteness continues to block
 positive paid scale-up and cross-card replacement; it cannot by itself preserve
 a stale positive paid target.
 
@@ -751,7 +781,8 @@ inventory to reconstruct the immutable baseline, refreshes the same semantic
 generation's head with the newest receipt generation/watermark, and preserves
 bounded queued work. Every fresh promoted reconcile publishes, including a
 zero target; a demand drop therefore mints a zero-residual generation that
-revokes the prior head.
+revokes the prior head for prospective claims without revoking an already
+committed debit's first provider effect.
 
 For a `DURABLE_INTENT` service, every positive plan is
 `ALLOCATION_BOUND`: its content-hashed payload contains the canonical full
@@ -766,36 +797,39 @@ These modes are exact: a positive fill-enabled plan without an allocation
 binding, including a plan written before this field existed, fails closed after
 durable-intent promotion; zero revocations cannot authorize a paid claim.
 
-Positive plan publication, initial paid-claim admission, and every paid
-provider-start validation linearize with allocation replacement under the
-canonical lock order: protocol observation `SHARE`, lifecycle when applicable,
-service `FOR UPDATE`, service-local rows, exact current-allocation validation,
-then capacity and plan-head rows. This includes retained protocol-v1 effects
-and replacement or recovery profiles whose locked funding is a paid claim;
-direct-mode legacy claims retain their existing compatibility only until the
-durable selectors activate. Validation uses
+Positive plan publication and initial paid-claim admission linearize with
+allocation replacement under the canonical lock order: protocol observation
+`SHARE`, lifecycle when applicable, service `FOR UPDATE`, service-local rows,
+exact current-allocation validation, then capacity and plan-head rows. This
+includes retained pre-commit protocol-v1 effects and replacement or recovery
+profiles whose funding has not yet committed. Admission uses
 `read_current_in_connection()` in that transaction and requires the bound
 identity to equal the complete current identity, including generation and
 digest. If allocation replacement owns the protocol lock first, the old plan
-or claim is rejected after the successor commits. If provider-start validation
-owns it first, that already-validated effect may start and the writer follows.
-The validator carries the minimum plan-head, route-head, demand-report, and
-allocation-snapshot freshness horizon through request/queue and retention-pin
-locking, then samples the PostgreSQL clock once more at the literal provider
-boundary; time spent waiting on any downstream lock cannot outlive authority.
-The controller publishes an unbound zero revocation and returns before
-optimistic planning whenever a sequenced durable observation has no current
-allocation, preventing a planning early-return from preserving an obsolete
-positive paid head.
+or prospective claim is rejected after the successor commits. If the atomic
+replica/claim/cap-debit transaction owns it first, that debit becomes the
+immutable provider handoff; the writer follows and its successor planning
+accounts for or retires the committed row. The provider guard does not
+recompute mutable allocation supply. It locks the exact persisted effect graph
+and original generation's claims, proves those debits remain within the
+original paid residual, requires monotonic demand and route generations with
+unchanged source epochs, validates the fresh current route/LB owner, and then
+resamples the PostgreSQL clock. The controller publishes an unbound zero
+revocation and returns before optimistic planning whenever a sequenced durable
+observation has no current allocation, preventing a planning early-return from
+preserving an obsolete positive head for new claims.
 
 A paid claim persists plan generation/digest, source demand receipt generation,
 demand-source epoch, canonical accelerator accounting class, and positive
 capacity units. Its existing generic association/request authorization copies
-that immutable claim tuple. Admission and the generic executor revalidate the
-current plan head, receipt watermark, recomputed locked inventory, and the
-content-addressed route payload immediately before provider I/O. Expired,
-satisfied, corrupt, or owner-mismatched authority terminates the request at
-`NOT_STARTED`; it never reaches a cloud API. Once provider I/O may have
+that immutable claim tuple. Admission revalidates the current plan head,
+receipt watermark, recomputed locked inventory, reserved allocation, and
+content-addressed route payload before committing the paid admission. The
+generic executor then validates the exact committed graph, immutable plan/debit ledger,
+monotonic source sequence, and fresh current route/LB owner immediately before
+provider I/O. A missing graph, over-debit, regressed sequence, expired route,
+or owner/source-epoch mismatch terminates the request at `NOT_STARTED`; mutable
+demand or supply advancement alone does not. Once provider I/O may have
 started, the durable action reconciliation contract owns the result and no
 telemetry change can pretend the effect did not happen.
 
@@ -1403,8 +1437,10 @@ subtests, and no failures before PR #1531 merged.
 
 The implemented paid-retirement transaction binds the exact service owner,
 replica record, demand generation, fresh route head, and zero-residual capacity
-plan. Fresh aggregate zero immediately clears cold paid-launch authority and
-publishes a nonempty all-zero capacity target. Every paid replica is then made
+plan. Fresh aggregate zero immediately clears prospective cold paid-launch
+authority and publishes a nonempty all-zero capacity target; an already
+committed debit may perform its one first effect and then joins this same
+retirement path. Every paid replica is then made
 off-route atomically with an `ACTIVE` retirement intent. A never-ready replica
 may commit immediately; a previously routable replica has no deadline-based
 escape and becomes `COMMITTED` only after its retained exact route URL reports

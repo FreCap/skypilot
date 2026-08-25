@@ -540,6 +540,10 @@ LB_CONTROLLER_SYSTEM_RECOVERY_LEASE_PATH = (
 LB_ROLE_PROXY_OBSERVABILITY_HEADER = ('X-SkyServe-LB-Role-Proxy-Observability')
 LB_ROLE_CONTROLLER_OWNER_VERIFIED_HEADER = (
     'X-SkyServe-LB-Role-Controller-Owner-Verified')
+# Full route syncs keep retired asynchronous backends in this separate,
+# observation-only namespace.  It can seed occupancy probes but must never be
+# copied into the routing policy or transport-client pool.
+LB_DRAINING_REPLICA_INFO_KEY = 'draining_replica_info'
 
 # A recovery-capable backend can bind the same route after Ray has killed its
 # first process.  The heavyweight 20-second controller sync deliberately keeps

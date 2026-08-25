@@ -1,31 +1,72 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-24 21:13 UTC
+Last updated: 2026-08-25
 
-Status: **the PostgreSQL-authoritative single path, protocol-v10 shared cache,
-bounded controller work, clean service lifecycle, unchanged Kueue contract,
-complete consumption of the current scheduler-authorized denominator, and
-just-in-time high-volume reserved-fill actuation are deployed and
-production-proven. The reserved-fill operational gates are closed. The sole
-remaining functional production gate is an authenticated bounded paid-Spot
-residual/drain exercise using an operator-supplied protected-endpoint bearer
-and a real encrypted L4-only request envelope.**
+Status: **the reserved-capacity path remains production-proven against the
+unchanged scheduler-authorized denominator. The control plane is now SkyPilot
+release `1.1.1484`, Helm revision 606. No fleet provider resource or routable
+replica remains, but the supported teardown is not complete: the historical
+`boltz-l4-fleet` row is still `SHUTTING_DOWN` with two retained ambiguous
+ordinary-paid replica rows. The target-100 paid-Spot qualification is
+incomplete: the clean `1.1.1484` rerun exposed zero provider launches because
+mutable demand updates revoked already committed paid claims before their
+first effect. The source-only correction below and evidence-backed teardown
+adjudication are the next deployment gates.**
 
-The control plane runs SkyPilot release `1.1.1477`, Helm revision 599, on image
-digest
-`sha256:a81be57e34f6e22c60d9f4f5d2bc7b308d40820f9ad1ed836ea6d116a5ea960c`.
-Both API Pods, both controller Pods, and all three executor Pods are Ready with
-zero restarts. PostgreSQL is the sole central correctness authority, Helm
-storage is disabled, and no EFS/PVC correctness path is present.
+The two Spot VMs retained by the prior `1.1.1483`/`.1541` canary are fully
+terminated at the provider. Their down requests are terminal and execution-
+quiesced, but controller recovery currently refuses to erase the ambiguous
+ordinary-paid rows without durable provider-absence adjudication; it therefore
+retries rather than completing service removal. PostgreSQL remains the sole
+central correctness authority, Helm storage is disabled, and no EFS/PVC
+correctness path is present. Historical fleet and qualification receipts below
+are chronology, not current live state.
 
-The live `boltz-l4-fleet` is lifecycle 98/version 1, created directly from the
+Source-only addendum (2026-08-25; not yet deployed or production-proven): the
+paid provider handoff and asynchronous drain observation now have one explicit
+atomic boundary. Before a paid claim commits, the current PostgreSQL demand,
+route, reserved allocation, capacity graph, inventory, plan head, and global
+cap must match exactly. Paid admission atomically persists the replica, paid
+claim, and global-capacity debit; that is the immutable authority boundary. A
+following transaction binds the association, request, queue, and retention pin,
+and the executor acquires its execution claim later. Before provider I/O, the
+guard locks and exact-matches that complete persisted graph back to the paid
+admission. After the admission commit, later demand heartbeats, a successor
+plan (including aggregate zero), or a changed reserved-supply projection cannot
+revoke the claim's one first provider effect.
+The provider guard instead locks and validates the exact persisted graph, the
+original content-hashed plan and bounded claim ledger, monotonic demand
+generation, unchanged lifecycle/source epochs, a non-regressed fresh route,
+and fresh current load-balancer ownership. No successor can mint another debit
+from the old plan, and an excess replica follows ordinary post-start retirement.
+This prevents high-rate demand updates from repeatedly stranding already
+committed Spot launches without weakening prospective reserved-before-paid or
+global-cap admission.
+
+The same source addendum closes a controller/LB restart seam in graceful paid
+retirement. A revoked asynchronous route whose exact current replica is still a
+scheduled scale-down waiting for idle is projected at read time in a separate
+observation-only route-sync namespace. It is bound to the exact service hash,
+lifecycle, replica record, version, and content-addressed revoked lease. A cold
+load balancer probes that URL and may report explicit zero, but never inserts it
+into its ready set, selection policy, transport-client pool, or routable replica
+map. The overlay participates in the occupancy-context digest but is not stored
+inside the protocol-1 route snapshot, so an N-1 controller can still read the
+persisted snapshot and an N-1 load balancer safely ignores the additive top-
+level field. URL collisions, synchronous/recovery-marker routes, malformed
+material, stale lifecycle identity, and ambiguous records remain withheld.
+This preserves the existing per-replica `SEEN-THEN-CLEAN` proof across either
+controller or load-balancer restart without adding a timeout escape, schema,
+migration, EFS state, or second routing path.
+
+The historical `boltz-l4-fleet` lifecycle 98/version 1 was created directly from the
 locally qualified provider source at
 `a69fb3409ede26f98c02f7730f764021c1ef0146`; no boltz-platform PR, application
 change, or runtime pin is involved. At 19:46 UTC it had exactly 314/314 Ready
 reserved, zero-cost, non-Spot replicas: 63 East A100, 189 East A100-80GB, and
 62 PHX H200. The latest protocol-v2 rounds reported zero observed and spendable
 free capacity in all three exact-card pools. Paid claims and paid replicas were
-zero. The service has `min_replicas: 0` and the approved bounded qualification
+zero. That service had `min_replicas: 0` and the approved bounded qualification
 cap of ten logical L4 Spot units; the cap is a ceiling, not a target, and zero
 request demand has produced no paid capacity.
 
@@ -669,15 +710,21 @@ services use durable actuation state. Every positive fill-enabled
 `ReservedFillAllocationIdentity` in its content-hashed JSON payload; an
 all-zero durable-fill plan is an explicit unbound revocation; a fill-disabled
 or pre-promotion plan is explicitly not applicable. Publication, initial
-paid-claim admission, retained protocol-v1 effects, and every protocol-v2
-paid-funded provider-effect profile take the protocol `FOR SHARE` prefix
-before lifecycle/service-local locks and revalidate the exact current
-allocation in that transaction. The final provider-start check resamples the
-PostgreSQL clock after request locks and covers allocation-snapshot TTLs. A
-pre-contract positive plan fails closed once its fill-enabled service is
-durable. The controller also publishes an unbound zero successor before any
-optimistic planning return when sequenced allocation is unavailable. This adds
-no table, migration, provider path, or infrastructure object and preserves
+paid-claim admission, and retained pre-commit protocol-v1 effects take the
+protocol `FOR SHARE` prefix before lifecycle/service-local locks and revalidate
+the exact current allocation in that transaction. The first transaction
+atomically fixes the replica, paid claim, and global debit. The following bound-
+request transaction fixes the association, request, queue, and pin; execution
+ownership remains a later runtime claim. A deferred protocol-v2 provider start
+does not re-authorize the paid debit against mutable successor demand or
+supply; it locks and exact-matches the complete persisted graph to that debit,
+the original plan digest and bounded claim ledger, monotonic source identities,
+and the current fresh route/LB owner.
+The final provider-start check resamples the PostgreSQL clock after request
+locks. A pre-contract positive plan fails closed once its fill-enabled service
+is durable. The controller also publishes an unbound zero successor before
+any optimistic planning return when sequenced allocation is unavailable. This
+adds no table, migration, provider path, or infrastructure object and preserves
 pre-contract compatibility only where allocation binding is not required.
 
 Lifecycle-96 qualification on release `1.1.1455` exposed one remaining
@@ -745,12 +792,16 @@ Thus demand genuinely beyond all compatible current reserved supply can
 receive paid authority while the conveyor is full; demand covered by
 not-yet-materialized compatible reserved slots cannot spill to paid.
 
-Every initial paid claim and final provider-start validation rereads the exact
-allocation and locked capacity graph and recomputes this tail. A changed,
-expired, malformed, or unbound allocation, a changed tail, or a legacy positive
-allocation-bound payload without both the projection and its supply-aware
-target fails closed. This extension is stored only in the existing
-content-hashed JSON payload and adds no table or migration. Each atomic
+Every initial paid claim rereads the exact allocation and locked capacity graph
+and recomputes this tail. A changed, expired, malformed, or unbound allocation,
+a changed tail, or a legacy positive allocation-bound payload without both the
+projection and its supply-aware target fails closed before commit. After the
+atomic paid debit commits, these mutable inputs drive successor planning and
+ordinary retirement but do not revoke the one already-admitted provider
+effect. The immutable original plan residual and all claims on that generation
+remain locked and bounded, so the handoff cannot exceed the residual or mint a
+second claim. This extension is stored only in the existing content-hashed JSON
+payload and adds no table or migration. Each atomic
 pending-to-replica materialization moves capacity from the allocation tail to
 pending and then materialized inventory while freeing one window position; the
 following capacity plan recomputes all three terms without double counting.
@@ -901,6 +952,7 @@ boundaries.
 | PR #1678 duplicate-up and observer lock-order correction | Complete at `38ec24342` | Complete in Helm 572 | Complete at gate 34 | Duplicate-up, takeover, 180-second stale horizon, and +30 control-plane/HA/error checks passed; the coincident eight-card v6 readiness wave was superseded by supported provider teardown |
 | Kueue non-mutation | No source change | No rendered chart change | Not applicable | Complete: both normalized PRE and POST hashes are equal |
 | Paid residual | Complete | Complete with the local provider's cap-ten qualification envelope | Activated but idle | Source/real-PostgreSQL tests qualify commit-before-residual and drain. Idle production and the 32-GPU refill created no paid claim, waiter, or replica because reserved capacity covered the denominator. An authenticated positive bounded Spot residual and complete drain remain the sole open production behavior exercise. |
+| Immutable paid handoff and restart-safe async drain observation | Source-complete in the current fix-forward; no schema or migration | Not deployed | Not activated | Not production-proven. Required gates are a homogeneous rollout, sustained paid-demand launch proof without claim churn, cold-LB explicit-zero retirement proof, and complete provider/debit drain. |
 | Protocol-v7 bootstrap and N-1 terminal-cleanup correction (#1679) | Complete at `40a0832bd` | Complete in `1.1.1449` / Helm 573 | Complete at gate 35 | Complete: lifecycle 93 purged and lifecycle 94 recreated without manual deletion |
 | Fill throughput and HA lock-starvation correction (#1680) | Complete at `b311dd277` | Complete in `1.1.1450` / Helm 575 | Complete at gate 36 | Historical East batch proof committed 16 intents together and made all 16 Ready with zero generation-36 `grant_expired` intents. The formerly pending PHX cleanup/deployment is superseded by the lifecycle-96/Helm-586 receipt. |
 | Generation-fenced pre-job cleanup (#1682) | Complete at `73c40a3fe` | Complete in `1.1.1452` / Helm 576 | Complete at gate 37 | Complete: PHX 194/194 Kueue-admitted Ready plus four topology-withheld; East 328/328 physical GPUs assigned; zero paid claims/waiters |

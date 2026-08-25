@@ -1794,6 +1794,31 @@ def test_heartbeat_refresh_keeps_plan_and_bounded_claims(capacity_database):
                 prospective=True)
 
 
+def test_committed_claim_rechecks_immutable_plan_debit_ledger(
+        capacity_database):
+    engine, _, _ = capacity_database
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(2))
+    first_claim = _insert_claim(engine, authority, 13)
+    _insert_claim(engine, authority, 14)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                serve_state_schema.paid_capacity_claims_table).where(
+                    serve_state_schema.paid_capacity_claims_table.c.service_name
+                    == 'svc',
+                    serve_state_schema.paid_capacity_claims_table.c.replica_id
+                    == 14).values(capacity_plan_units=2))
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                           match='immutable plan debit'):
+            capacity_admission.validate_paid_claim_in_connection(
+                connection, service, first_claim, prospective=False)
+
+
 def test_plan_publication_rebases_equivalent_heartbeat(capacity_database):
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
@@ -1949,7 +1974,7 @@ def test_committed_claim_survives_unpublished_semantic_heartbeats(
                 prospective=True)
 
 
-def test_fresh_aggregate_zero_revokes_committed_claim(capacity_database):
+def test_committed_claim_survives_fresh_aggregate_zero(capacity_database):
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
     authority = repository.publish(_plan(1))
@@ -1963,13 +1988,13 @@ def test_fresh_aggregate_zero_revokes_committed_claim(capacity_database):
             sqlalchemy.select(serve_state_schema.services_table).where(
                 serve_state_schema.services_table.c.name ==
                 'svc').with_for_update()).mappings().one()
-        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                           match='revoked committed paid capacity'):
-            capacity_admission.validate_paid_claim_in_connection(
-                connection, service, claim, prospective=False)
+        capacity_admission.validate_paid_claim_in_connection(connection,
+                                                             service,
+                                                             claim,
+                                                             prospective=False)
 
 
-def test_nonzero_demand_decrease_revokes_committed_claim(capacity_database):
+def test_committed_claim_survives_nonzero_demand_decrease(capacity_database):
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
     demand_state.ingest_report(
@@ -1986,10 +2011,118 @@ def test_nonzero_demand_decrease_revokes_committed_claim(capacity_database):
             sqlalchemy.select(serve_state_schema.services_table).where(
                 serve_state_schema.services_table.c.name ==
                 'svc').with_for_update()).mappings().one()
-        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                           match='demand semantics changed'):
+        capacity_admission.validate_paid_claim_in_connection(connection,
+                                                             service,
+                                                             claim,
+                                                             prospective=False)
+
+
+def test_committed_claim_survives_high_churn_compatibility_demand(
+        capacity_database):
+    engine, _, route_receipt = capacity_database
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    authority = repository.publish(_plan(1))
+    claim = _insert_claim(engine, authority, 10)
+    with engine.connect() as connection:
+        admitted_at = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.paid_capacity_claims_table.c.claimed_at).
+            where(
+                serve_state_schema.paid_capacity_claims_table.c.service_name ==
+                'svc',
+                serve_state_schema.paid_capacity_claims_table.c.replica_id ==
+                10)).scalar_one()
+
+    # Each report advances both recent_request_count and the exact L4
+    # compatibility profile before the deferred provider handler validates.
+    # The atomically persisted global-cap debit is immutable across this
+    # mutable demand churn; no successor plan publication is required.
+    for sequence, request_count in enumerate((7, 2, 19, 1, 31, 0, 11), start=2):
+        demand_state.ingest_report(
+            'svc', 'svc-hash',
+            _demand_report(time.time(),
+                           route_receipt,
+                           sequence=sequence,
+                           request_count=request_count))
+        with engine.begin() as connection:
+            service = connection.execute(
+                sqlalchemy.select(serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    'svc').with_for_update()).mappings().one()
             capacity_admission.validate_paid_claim_in_connection(
                 connection, service, claim, prospective=False)
+
+    # A demand-derived zero successor accounts for the already committed paid
+    # baseline but authorizes no additional claim.  It still cannot revoke the
+    # original provider effect.
+    successor = repository.publish(_plan(0))
+    assert not successor.remaining()
+    with engine.begin() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        capacity_admission.validate_paid_claim_in_connection(connection,
+                                                             service,
+                                                             claim,
+                                                             prospective=False)
+
+    with engine.connect() as connection:
+        persisted = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.paid_capacity_claims_table).where(
+                    serve_state_schema.paid_capacity_claims_table.c.service_name
+                    == 'svc',
+                    serve_state_schema.paid_capacity_claims_table.c.replica_id
+                    == 10)).mappings().one()
+    assert persisted['capacity_plan_generation'] == authority.generation
+    assert persisted['capacity_plan_sha256'] == authority.content_sha256
+    assert persisted['claimed_at'] == admitted_at
+
+
+def test_allocation_bound_claim_survives_unbound_zero_successor(
+        capacity_database, monkeypatch):
+    engine, incarnation, route_receipt = capacity_database
+    allocation = _allocation_map({'H200': 1})
+    _enable_durable_intent(engine, incarnation)
+    _mock_current_allocation(monkeypatch, allocation)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    plan, _ = _allocation_bound_plan(repository, allocation, {
+        'l4': 1,
+        'h200': 1,
+    })
+    authority = repository.publish(plan)
+    claim = _insert_claim(engine, authority, 18)
+
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=0))
+    zero = repository.publish(
+        _plan(
+            0,
+            capacity_target_by_accelerator={
+                'l4': 0,
+                'h200': 0,
+            },
+            reserved_fill_authority=(
+                capacity_admission.ReservedFillPlanAuthority.zero_revocation()
+            )))
+    assert not zero.remaining()
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='no paid residual'):
+        zero.claim_values('L4')
+
+    with engine.begin() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        capacity_admission.validate_paid_claim_in_connection(
+            connection,
+            service,
+            claim,
+            prospective=False,
+            protocol_and_service_prelocked=True)
 
 
 def test_zero_cost_commit_after_plan_revokes_paid_claim(capacity_database):
@@ -2033,7 +2166,7 @@ def test_only_quota_assigned_kueue_capacity_is_reserved_supply(
 
 @pytest.mark.parametrize('provider_effect', [False, True],
                          ids=['final-claim', 'provider-effect'])
-def test_missing_kueue_admission_fails_closed_at_final_paid_boundaries(
+def test_missing_kueue_admission_is_fenced_only_before_claim_commit(
         capacity_database, provider_effect):
     engine, _, _ = capacity_database
     key = _install_waiting_kueue_capacity(engine)
@@ -2051,8 +2184,7 @@ def test_missing_kueue_admission_fails_closed_at_final_paid_boundaries(
             sqlalchemy.select(serve_state_schema.services_table).where(
                 serve_state_schema.services_table.c.name ==
                 'svc').with_for_update()).mappings().one()
-        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                           match='Committed capacity changed'):
+        if provider_effect:
             capacity_admission.validate_paid_claim_in_connection(
                 connection, {
                     **service, 'name': 'svc'
@@ -2060,12 +2192,22 @@ def test_missing_kueue_admission_fails_closed_at_final_paid_boundaries(
                     **claim, 'replica_id': 101
                 },
                 prospective=not provider_effect)
+        else:
+            with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                               match='Committed capacity changed'):
+                capacity_admission.validate_paid_claim_in_connection(
+                    connection, {
+                        **service, 'name': 'svc'
+                    }, {
+                        **claim, 'replica_id': 101
+                    },
+                    prospective=True)
 
 
 @pytest.mark.parametrize('provider_effect', [False, True],
                          ids=['final-claim', 'provider-effect'])
 @pytest.mark.parametrize(('field', 'value'), _COPIED_ADMISSION_MUTATIONS)
-def test_each_copied_kueue_identity_mismatch_fails_closed_at_paid_boundaries(
+def test_copied_kueue_identity_is_fenced_only_before_claim_commit(
         capacity_database, monkeypatch, provider_effect, field, value):
     engine, _, _ = capacity_database
     key = _install_waiting_kueue_capacity(engine)
@@ -2089,8 +2231,7 @@ def test_each_copied_kueue_identity_mismatch_fails_closed_at_paid_boundaries(
             sqlalchemy.select(serve_state_schema.services_table).where(
                 serve_state_schema.services_table.c.name ==
                 'svc').with_for_update()).mappings().one()
-        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                           match='Committed capacity changed'):
+        if provider_effect:
             capacity_admission.validate_paid_claim_in_connection(
                 connection, {
                     **service, 'name': 'svc'
@@ -2098,6 +2239,16 @@ def test_each_copied_kueue_identity_mismatch_fails_closed_at_paid_boundaries(
                     **claim, 'replica_id': 103
                 },
                 prospective=not provider_effect)
+        else:
+            with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                               match='Committed capacity changed'):
+                capacity_admission.validate_paid_claim_in_connection(
+                    connection, {
+                        **service, 'name': 'svc'
+                    }, {
+                        **claim, 'replica_id': 103
+                    },
+                    prospective=True)
 
 
 def test_proven_east_intent_without_admission_allows_final_paid_claim(
@@ -2261,8 +2412,10 @@ def test_tail_to_pending_to_replica_never_double_counts_reserved_supply(
     assert not replica_authority.remaining()
 
 
-def test_provider_start_rejects_tail_to_pending_inventory_change(
-        capacity_database, monkeypatch):
+@pytest.mark.parametrize('provider_effect', [False, True],
+                         ids=['final-claim', 'provider-effect'])
+def test_tail_to_pending_change_is_fenced_only_before_claim_commit(
+        capacity_database, monkeypatch, provider_effect):
     engine, incarnation, _ = capacity_database
     allocation = _allocation_map({'H200': 1})
     _enable_durable_intent(engine, incarnation)
@@ -2273,7 +2426,8 @@ def test_provider_start_rejects_tail_to_pending_inventory_change(
         'h200': 1,
     })
     authority = repository.publish(plan)
-    claim = _insert_claim(engine, authority, 82)
+    claim = (authority.claim_values('L4')
+             if not provider_effect else _insert_claim(engine, authority, 82))
     _insert_current_allocation_pending(engine, allocation)
 
     with engine.begin() as connection:
@@ -2283,14 +2437,22 @@ def test_provider_start_rejects_tail_to_pending_inventory_change(
             sqlalchemy.select(serve_state_schema.services_table).where(
                 serve_state_schema.services_table.c.name ==
                 'svc').with_for_update()).mappings().one()
-        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                           match='Reserved economic supply changed'):
+        if provider_effect:
             capacity_admission.validate_paid_claim_in_connection(
                 connection,
                 service,
                 claim,
                 prospective=False,
                 protocol_and_service_prelocked=True)
+        else:
+            with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                               match='Reserved economic supply changed'):
+                capacity_admission.validate_paid_claim_in_connection(
+                    connection,
+                    service,
+                    claim,
+                    prospective=True,
+                    protocol_and_service_prelocked=True)
 
 
 def test_provider_start_accepts_plan_own_paid_replica_row(
@@ -2322,8 +2484,10 @@ def test_provider_start_accepts_plan_own_paid_replica_row(
             protocol_and_service_prelocked=True)
 
 
-def test_provider_start_rejects_reserved_lifecycle_change_at_same_inventory(
-        capacity_database, monkeypatch):
+@pytest.mark.parametrize('provider_effect', [False, True],
+                         ids=['final-claim', 'provider-effect'])
+def test_reserved_lifecycle_change_is_fenced_only_before_claim_commit(
+        capacity_database, monkeypatch, provider_effect):
     engine, incarnation, _ = capacity_database
     allocation = _allocation_map({'H200': 1})
     _enable_durable_intent(engine, incarnation)
@@ -2341,7 +2505,8 @@ def test_provider_start_rejects_reserved_lifecycle_change_at_same_inventory(
         'h200': 2,
     })
     authority = repository.publish(plan)
-    claim = _insert_claim(engine, authority, 86)
+    claim = (authority.claim_values('L4')
+             if not provider_effect else _insert_claim(engine, authority, 86))
 
     replicas = serve_state_schema.replicas_table
     with engine.begin() as connection:
@@ -2366,14 +2531,22 @@ def test_provider_start_rejects_reserved_lifecycle_change_at_same_inventory(
             sqlalchemy.select(serve_state_schema.services_table).where(
                 serve_state_schema.services_table.c.name ==
                 'svc').with_for_update()).mappings().one()
-        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                           match='Reserved economic supply changed'):
+        if provider_effect:
             capacity_admission.validate_paid_claim_in_connection(
                 connection,
                 service,
                 claim,
                 prospective=False,
                 protocol_and_service_prelocked=True)
+        else:
+            with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                               match='Reserved economic supply changed'):
+                capacity_admission.validate_paid_claim_in_connection(
+                    connection,
+                    service,
+                    claim,
+                    prospective=True,
+                    protocol_and_service_prelocked=True)
 
 
 def test_running_paid_replica_is_not_mutated_by_future_supply_change(
@@ -2459,7 +2632,7 @@ def test_full_allocation_tail_requires_rotation_independent_headroom(
                     allocation.identity))
 
 
-def test_zero_target_mints_revoking_semantic_generation(capacity_database):
+def test_committed_claim_survives_zero_target_successor(capacity_database):
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
     first = repository.publish(_plan(1))
@@ -2467,21 +2640,22 @@ def test_zero_target_mints_revoking_semantic_generation(capacity_database):
     demand_state.ingest_report(
         'svc', 'svc-hash',
         _demand_report(time.time(), route_receipt, sequence=2, request_count=0))
-    revoked = repository.publish(_plan(0))
+    zero_target = repository.publish(_plan(0))
 
-    assert revoked.generation == first.generation + 1
-    assert not revoked.remaining()
+    assert zero_target.generation == first.generation + 1
+    assert not zero_target.remaining()
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='no paid residual'):
+        zero_target.claim_values('L4')
     with engine.begin() as connection:
         service = connection.execute(
             sqlalchemy.select(serve_state_schema.services_table).where(
                 serve_state_schema.services_table.c.name ==
                 'svc').with_for_update()).mappings().one()
-        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                           match='lost its current'):
-            capacity_admission.validate_paid_claim_in_connection(
-                connection, {
-                    **service, 'name': 'svc'
-                }, claim)
+        capacity_admission.validate_paid_claim_in_connection(
+            connection, {
+                **service, 'name': 'svc'
+            }, claim)
 
 
 def test_protocol2_full_window_zero_revokes_paid_authority_without_exact_cards(
@@ -2604,6 +2778,7 @@ def test_exact_card_plan_rejects_unclassified_committed_replica(
     engine, _, _ = capacity_database
     unclassified = _replica_values(41, zero_cost=True)
     unclassified['replica_state']['location'] = None
+    unclassified['replica_state']['resources_override'] = None
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.insert(

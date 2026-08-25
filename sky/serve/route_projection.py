@@ -311,6 +311,14 @@ class RouteBuildResult:
 
 
 @dataclasses.dataclass(frozen=True)
+class DrainingRouteBuildResult:
+    """Observation-only async routes and their exact private identities."""
+
+    replica_info: dict[str, dict[str, str]]
+    identities: dict[str, dict[str, Any]]
+
+
+@dataclasses.dataclass(frozen=True)
 class IncrementalRouteReplica:
     """Scalar current-row identity used by provider-free composition."""
 
@@ -625,6 +633,12 @@ def _occupancy_context_sha256(response: Mapping[str, Any],
             'service_version': response.get('service_version'),
             'routing_spec': response.get('routing_spec'),
             'replica_info': response.get('replica_info'),
+            # Observation-only retired routes participate in the occupancy
+            # fence even though they can never participate in selection.  A
+            # cold LB must discard a sample if the exact set it was asked to
+            # observe changes while that sample is in flight.
+            constants.LB_DRAINING_REPLICA_INFO_KEY: response.get(
+                constants.LB_DRAINING_REPLICA_INFO_KEY, {}),
             'identities': identities,
         })).hexdigest()
 
@@ -1189,6 +1203,29 @@ def _incremental_replica_query(service_name: str, *, include_state: bool,
     return query.with_for_update() if for_update else query
 
 
+def _incremental_draining_replica_query(service_name: str, *,
+                                        for_update: bool) -> sqlalchemy.Select:
+    """Select only scalar exact identities that still require idle proof."""
+    status_property = _REPLICAS.c.replica_state['status_property']
+    query = sqlalchemy.select(
+        _REPLICAS.c.replica_id,
+        _REPLICAS.c.replica_state_version,
+        _REPLICAS.c.status,
+        _REPLICAS.c.version,
+        _REPLICAS.c.replica_state['replica_record_id'].as_string().label(
+            'replica_record_id'),
+        _replica_state_sha256_expression(),
+    ).where(
+        _REPLICAS.c.service_name == service_name,
+        _REPLICAS.c.status == serve_statuses.ReplicaStatus.SHUTTING_DOWN.value,
+        _REPLICAS.c.sky_down_status == 'SCHEDULED',
+        status_property['is_scale_down'].as_boolean().is_(True),
+        status_property['wait_for_idle_before_termination'].as_boolean().is_(
+            True),
+    ).order_by(_REPLICAS.c.replica_id)
+    return query.with_for_update() if for_update else query
+
+
 def _incremental_lease_query(identity: RoutePublisherIdentity, *,
                              for_update: bool) -> sqlalchemy.Select:
     query = sqlalchemy.select(_LEASES).where(
@@ -1202,6 +1239,122 @@ def _incremental_lease_query(identity: RoutePublisherIdentity, *,
         _LEASES.c.revoked_at.is_(None),
     ).order_by(_LEASES.c.replica_id, _LEASES.c.replica_record_id)
     return query.with_for_update() if for_update else query
+
+
+def _incremental_draining_lease_query(identity: RoutePublisherIdentity, *,
+                                      for_update: bool) -> sqlalchemy.Select:
+    """Select exact revoked async routes still awaiting a drain proof.
+
+    Controller ownership is intentionally absent from this query.  A
+    replacement controller must be able to project the immutable lease written
+    by its predecessor, but only while the current exact replica row remains a
+    scheduled scale-down waiting for idle.  The service incarnation, record,
+    and version joins prevent historical or reused-address material from
+    crossing that boundary.
+    """
+    status_property = _REPLICAS.c.replica_state['status_property']
+    exact_draining_replica = sqlalchemy.exists(
+        sqlalchemy.select(1).where(
+            _REPLICAS.c.service_name == _LEASES.c.service_name,
+            _REPLICAS.c.replica_id == _LEASES.c.replica_id,
+            _REPLICAS.c.version == _LEASES.c.service_version,
+            _REPLICAS.c.replica_state['replica_record_id'].as_string() ==
+            sqlalchemy.cast(_LEASES.c.replica_record_id, sqlalchemy.Text),
+            _REPLICAS.c.status ==
+            serve_statuses.ReplicaStatus.SHUTTING_DOWN.value,
+            _REPLICAS.c.sky_down_status == 'SCHEDULED',
+            status_property['is_scale_down'].as_boolean().is_(True),
+            status_property['wait_for_idle_before_termination'].as_boolean(
+            ).is_(True),
+        ))
+    query = sqlalchemy.select(_LEASES).where(
+        _LEASES.c.service_name == identity.service_name,
+        _LEASES.c.service_hash == identity.service_hash,
+        _LEASES.c.service_lifecycle_epoch == identity.service_lifecycle_epoch,
+        _LEASES.c.route_allowed.is_(True),
+        _LEASES.c.async_occupancy.is_(True),
+        _LEASES.c.requires_route_marker.is_(False),
+        _LEASES.c.revoked_at.is_not(None),
+        exact_draining_replica,
+    ).order_by(_LEASES.c.replica_id, _LEASES.c.replica_record_id)
+    return query.with_for_update() if for_update else query
+
+
+def build_draining_route_view(
+    replica_rows: Sequence[Mapping[str, Any]],
+    lease_rows: Sequence[Mapping[str, Any]],
+    existing_identity_urls: set[str],
+) -> DrainingRouteBuildResult:
+    """Build a non-routable observation overlay from exact PostgreSQL rows."""
+    if not isinstance(existing_identity_urls, set):
+        raise RouteProjectionValidationError(
+            'Draining-route exclusions must be a set.')
+    replicas: dict[tuple[int, str], IncrementalRouteReplica] = {}
+    for row in replica_rows:
+        try:
+            replica = IncrementalRouteReplica(
+                replica_id=int(row['replica_id']),
+                replica_record_id=str(row['replica_record_id']),
+                service_version=int(row['version']),
+                status=str(row['status']))
+            if replica.status != serve_statuses.ReplicaStatus.SHUTTING_DOWN.value:
+                continue
+        except (KeyError, TypeError, ValueError,
+                RouteProjectionValidationError):
+            continue
+        replicas[(replica.replica_id, replica.replica_record_id)] = replica
+
+    sources: dict[str, list[tuple[IncrementalRouteReplica, Mapping[str,
+                                                                   Any]]]] = {}
+    for row in lease_rows:
+        try:
+            _validate_lease_material_row(row)
+            record_id = _canonical_record_id(str(row['replica_record_id']))
+            draining_replica = replicas.get((int(row['replica_id']), record_id))
+            revoked_at = row.get('revoked_at')
+            if (draining_replica is None or draining_replica.service_version
+                    != int(row['service_version']) or
+                    row.get('route_allowed') is not True or
+                    row.get('async_occupancy') is not True or
+                    row.get('requires_route_marker') is not False or
+                    not isinstance(revoked_at, datetime.datetime) or
+                    revoked_at.tzinfo is None):
+                continue
+            material = ResolvedRouteMaterial(row['route_url'], row['gpu_type'],
+                                             int(row['gpu_count']))
+        except (KeyError, TypeError, ValueError,
+                RouteProjectionValidationError):
+            continue
+        sources.setdefault(material.url, []).append((draining_replica, row))
+
+    replica_info: dict[str, dict[str, str]] = {}
+    identities: dict[str, dict[str, Any]] = {}
+    for url, candidates in sources.items():
+        # No address may be both routable and observation-only, and a probe of
+        # a colliding address cannot identify which retired record answered.
+        if url in existing_identity_urls or len(candidates) != 1:
+            continue
+        replica, row = candidates[0]
+        replica_info[url] = {
+            'gpu_type': row['gpu_type'],
+            'gpu_count': str(row['gpu_count']),
+            'is_zero_cost': ('true' if row['is_zero_cost'] else 'false'),
+            'async_occupancy': 'true',
+        }
+        identities[url] = {
+            'replica_id': replica.replica_id,
+            'replica_record_id': replica.replica_record_id,
+            'service_version': replica.service_version,
+            'gpu_type': row['gpu_type'],
+            'gpu_count': int(row['gpu_count']),
+            'advertised': False,
+            'alias_expires_at': None,
+        }
+    if len(existing_identity_urls) + len(replica_info) > MAX_ROUTE_IDENTITIES:
+        raise RouteProjectionValidationError(
+            'Draining route view exceeds the bounded identity limit.')
+    return DrainingRouteBuildResult(replica_info=replica_info,
+                                    identities=identities)
 
 
 def _replica_fingerprints(
@@ -2523,11 +2676,32 @@ class RouteProjectionRepository:
                         'Route projection owner, version, or producer is '
                         'stale.')
                 response, identities = self.validate_snapshot_row(snapshot)
+                current_identity = RoutePublisherIdentity(
+                    service_name=service_name,
+                    service_hash=str(owner['hash']),
+                    service_lifecycle_epoch=int(owner['lifecycle_epoch']),
+                    controller_incarnation=owner['controller_incarnation'],
+                    controller_owner_epoch=int(owner['controller_owner_epoch']),
+                    controller_pid=int(owner['controller_pid']),
+                    controller_ip=str(owner['controller_ip']))
+                draining_replica_rows = session.execute(
+                    _incremental_draining_replica_query(
+                        service_name, for_update=False)).mappings().all()
+                draining_lease_rows = session.execute(
+                    _incremental_draining_lease_query(
+                        current_identity, for_update=False)).mappings().all()
+                draining = build_draining_route_view(draining_replica_rows,
+                                                     draining_lease_rows,
+                                                     set(identities))
+                response[constants.LB_DRAINING_REPLICA_INFO_KEY] = (
+                    draining.replica_info)
+                occupancy_identities = dict(identities)
+                occupancy_identities.update(draining.identities)
                 response.update({
                     'route_projection_generation': int(head['generation']),
                     'route_projection_sha256': snapshot['content_sha256'],
                     'route_occupancy_context_sha256': _occupancy_context_sha256(
-                        response, identities),
+                        response, occupancy_identities),
                     'route_source_epoch': int(owner['route_source_epoch']),
                 })
                 return RouteSyncDecision(mode=mode, response=response)
