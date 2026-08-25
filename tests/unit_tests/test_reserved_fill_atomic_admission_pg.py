@@ -863,17 +863,18 @@ def _use_real_broker(monkeypatch, engine):
                         get_postgres_lock)
 
 
-def test_serve058_lineage_and_sqlite_ceiling() -> None:
+def test_serve059_lineage_and_sqlite_ceiling() -> None:
     sqlite = sqlalchemy.create_engine('sqlite://')
     config = migration_utils.get_alembic_config(sqlite,
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['058']
+    assert scripts.get_heads() == ['059']
+    assert scripts.get_revision('059').down_revision == '058'
     assert scripts.get_revision('058').down_revision == '057'
     assert scripts.get_revision('056').down_revision == '055'
     assert scripts.get_revision('055').down_revision == '054'
-    assert migration_utils.SERVE_VERSION == '058'
+    assert migration_utils.SERVE_VERSION == '059'
     assert migration_utils.serve_target_version(sqlite) == '037'
     with pytest.raises(RuntimeError, match='PostgreSQL-only'):
         alembic_command.upgrade(config, '056')

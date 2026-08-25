@@ -1,10 +1,11 @@
 """Failure-isolated provider evidence for bound non-pool launches.
 
 Provider observation is deliberately separate from association reduction.
-Only reserved-fill profiles currently retain an immutable physical provider
-identity.  Other profiles therefore remain ``UNKNOWN`` when their exact
-request result cannot settle the action; a missing SkyPilot cluster record is
-never promoted into provider absence.
+Reserved-fill profiles retain an immutable physical provider identity. An
+ordinary-paid AWS Spot failure may instead carry an exact zero-effect create
+receipt on its terminal request. Other profiles and incomplete receipts remain
+``UNKNOWN``; a missing SkyPilot cluster record is never promoted into provider
+absence.
 """
 
 from __future__ import annotations
@@ -60,8 +61,8 @@ def observe_provider(
         'profile_kind': context.profile.kind.value,
         'replica_record_id': str(context.replica_record_id),
     }
-    if (context.profile.kind
-            != ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
+    if (context.profile.kind !=
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
         return ProviderObservation(
             ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
                 **base,
@@ -136,8 +137,8 @@ def observe_post_teardown_absence_receipt(
     if not isinstance(receipt,
                       reserved_capacity.ProtocolV2PhysicalAbsenceReceipt):
         raise TypeError('receipt must be a protocol-v2 absence receipt.')
-    if (context.profile.kind
-            != ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
+    if (context.profile.kind !=
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Post-teardown physical absence requires a reserved-fill profile.')
     try:
@@ -224,6 +225,16 @@ def reconcile(
                     reserved_capacity.PhysicalReplicaPresence.ABSENT.value,
                 'source': 'durable-provider-evidence',
             })
-    observation = observe_provider(context, replica_info)
+    observation = None
+    if (context.profile.kind ==
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+        paid_payload = (
+            request_postgres.bound_non_pool_terminal_provider_absence_payload(
+                context, authority))
+        if paid_payload is not None:
+            observation = ProviderObservation(
+                ordinary_launch_binding.ProviderEvidence.ABSENT, paid_payload)
+    if observation is None:
+        observation = observe_provider(context, replica_info)
     _reduce_observation(context, authority, project_replica_result, observation)
     return observation

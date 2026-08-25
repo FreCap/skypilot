@@ -40,6 +40,7 @@ from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
+from sky.provision import capacity_policy
 from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
 from sky.serve import drain_observability
@@ -462,8 +463,8 @@ def _logical_target_state_components(
         for item in raw:
             if (not isinstance(item, tuple) or len(item) != 2 or
                     not isinstance(item[0], str) or not item[0] or
-                    type(item[1]) is not int or
-                    item[1] < (0 if allow_zero else 1)):
+                    type(item[1]) is not int or item[1] <
+                (0 if allow_zero else 1)):
                 return None
             folded = item[0].casefold()
             if folded in seen:
@@ -2123,8 +2124,8 @@ class _ReplicaDrainTracker:
          session) = report
         if routing_urls is None or not isinstance(session, str) or not session:
             return
-        if (time.monotonic() - received_at
-                > _IN_FLIGHT_REPORT_STALENESS_SECONDS):
+        if (time.monotonic() - received_at >
+                _IN_FLIGHT_REPORT_STALENESS_SECONDS):
             return
         url = self._replica_url
         if (url not in routing_urls and url not in unknown_urls and
@@ -2144,8 +2145,8 @@ class _ReplicaDrainTracker:
             return False
         if routing_urls is None:
             return False
-        if (time.monotonic() - received_at
-                > _IN_FLIGHT_REPORT_STALENESS_SECONDS):
+        if (time.monotonic() - received_at >
+                _IN_FLIGHT_REPORT_STALENESS_SECONDS):
             return False
         url = self._replica_url
         if session != self._session:
@@ -2329,8 +2330,8 @@ def terminate_cluster(
                     if (handle.cluster_name != cluster_name or
                             launched_resources is None or not isinstance(
                                 launched_resources.cloud, clouds.Kubernetes) or
-                            launched_resources.region
-                            != cleanup_fence.kubernetes_context):
+                            launched_resources.region !=
+                            cleanup_fence.kubernetes_context):
                         raise exceptions.KubernetesPhysicalClusterIdentityError(
                             f'Cannot prove protocol-v2 cleanup for '
                             f'{cluster_name!r}: its durable cluster handle '
@@ -3127,8 +3128,8 @@ class ReplicaManager:
             if retirement_floor is not None:
                 floor_components = _logical_target_state_components(
                     retirement_floor)
-                if (floor_components is None or
-                        floor_components[:2] != (version, generation)):
+                if (floor_components is None or floor_components[:2] !=
+                    (version, generation)):
                     logger.warning('Discarding malformed logical retirement '
                                    f'floor {retirement_floor!r}.')
                     return
@@ -3174,8 +3175,8 @@ class ReplicaManager:
             if retirement_floor is not None:
                 floor_components = _logical_target_state_components(
                     retirement_floor)
-                if (floor_components is None or floor_components[:2]
-                        != (target_version, target_generation)):
+                if (floor_components is None or floor_components[:2] !=
+                    (target_version, target_generation)):
                     logger.warning('Discarding incoherent logical retirement '
                                    f'floor {retirement_floor!r}.')
                     return False
@@ -3309,8 +3310,8 @@ class ReplicaManager:
     def _logical_snapshot_is_fresh(snapshot: LogicalReconcileSnapshot) -> bool:
         if snapshot.authority is not None:
             return time.monotonic() < snapshot.authority.deadline_monotonic
-        return (time.monotonic() - snapshot.received_at
-                <= 3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
+        return (time.monotonic() - snapshot.received_at <=
+                3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
 
     @property
     def workspace(self) -> str:
@@ -3954,8 +3955,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         if placer is not None:
             states = serve_state.get_service_placement_policy_states(
                 self._service_name)
-            placer.load_retry_state(None if states is
-                                    None else states['spot_placement_state'])
+            placer.load_retry_state(
+                None if states is None else states['spot_placement_state'])
         self._spot_placement_state_restored = True
 
     def _persist_spot_placement_state_if_dirty(self) -> None:
@@ -4220,8 +4221,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         """Build the complete immutable admission fence for one replica."""
         authority = self._ordinary_launch_binding_authority
         if (authority is None or authority.capable is not True or
-                authority.binding_mode
-                != ordinary_launch_binding.BindingMode.BOUND):
+                authority.binding_mode !=
+                ordinary_launch_binding.BindingMode.BOUND):
             raise _BoundOrdinaryLaunchUnresolvedError(
                 'Bound ordinary launch has no promoted controller authority.')
         fence = (self._replica_launch_fence_context(service_version)
@@ -4293,16 +4294,69 @@ class SkyPilotReplicaManager(ReplicaManager):
         provider_present_cleanup = (getattr(
             projection, 'provider_evidence',
             None) == ordinary_launch_binding.ProviderEvidence.PRESENT)
+        paid_provider_absent = False
+        provider_negative_ack = None
         if provider_absent:
             absence_context = projection.context
             if (not isinstance(
                     absence_context,
                     ordinary_launch_binding.BoundNonPoolLaunchContext) or
-                    absence_context.profile.kind != ordinary_launch_binding.
-                    NonPoolLaunchProfileKind.RESERVED_FILL or
                     projection.pre_effect_terminal or
-                    projection.service_job_id is not None or
-                    projection.paid_capacity_pool_key is not None):
+                    projection.service_job_id is not None):
+                return False
+            if (absence_context.profile.kind == ordinary_launch_binding.
+                    NonPoolLaunchProfileKind.RESERVED_FILL):
+                if projection.paid_capacity_pool_key is not None:
+                    return False
+            elif (absence_context.profile.kind == ordinary_launch_binding.
+                  NonPoolLaunchProfileKind.ORDINARY_PAID):
+                paid_provider_absent = True
+                decoded_error = _decoded_bound_request_error(request_error)
+                evidence_payload = getattr(projection,
+                                           'provider_evidence_payload', None)
+                expected_receipt = (evidence_payload.get('receipt')
+                                    if isinstance(evidence_payload, Mapping)
+                                    else None)
+                expected_cloud_name = (
+                    expected_receipt.get('cluster_name_on_cloud') if isinstance(
+                        expected_receipt, Mapping) else None)
+                try:
+                    expected_client_token = (
+                        ordinary_launch_binding.ordinary_paid_aws_client_token(
+                            absence_context))
+                    expected_aws_account_id = (
+                        ordinary_launch_binding.
+                        ordinary_paid_aws_account_id_from_pool_key(
+                            projection.paid_capacity_pool_key))
+                except (TypeError, ValueError,
+                        ordinary_launch_binding.OrdinaryLaunchBindingConflict):
+                    return False
+                provider_negative_ack = (
+                    capacity_policy.extract_provider_negative_ack(decoded_error)
+                    if decoded_error is not None else None)
+                provider_negative_ack = (
+                    capacity_policy.validate_provider_negative_ack(
+                        provider_negative_ack,
+                        cluster_name=expected_cloud_name,
+                        client_token=expected_client_token,
+                        expected_aws_account_id=expected_aws_account_id)
+                    if isinstance(expected_cloud_name, str) and
+                    expected_cloud_name else None)
+                if (provider_negative_ack is None or
+                        provider_negative_ack != expected_receipt or
+                        projection.status.value != 'FAILED' or
+                        projection.cause.value != 'handler_failed' or
+                        not isinstance(projection.paid_capacity_pool_key, str)
+                        or not projection.paid_capacity_pool_key or
+                        info.paid_capacity_pool_key !=
+                        projection.paid_capacity_pool_key or
+                        info.is_spot is not True or
+                        info.is_zero_cost is not False or
+                        info.reserved_fill is not False or
+                        info.service_job_id is not None):
+                    return False
+                reason = provider_negative_ack['reason']
+            else:
                 return False
         if provider_present_cleanup:
             cleanup_context = projection.context
@@ -4349,8 +4403,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             if getattr(projection, 'cancel_reason', None) is not None:
                 info.status_property.sky_launch_status = (
                     common_utils.ProcessStatus.INTERRUPTED)
-            elif (info.status_property.sky_launch_status
-                  != common_utils.ProcessStatus.INTERRUPTED):
+            elif (info.status_property.sky_launch_status !=
+                  common_utils.ProcessStatus.INTERRUPTED):
                 info.status_property.sky_launch_status = (
                     common_utils.ProcessStatus.SCHEDULED)
             # OTHER_FAILURE deliberately makes no paid-pool feedback change.
@@ -4363,11 +4417,20 @@ class SkyPilotReplicaManager(ReplicaManager):
             # physical resource is absent, never publish the replica as ready
             # or stamp a zero-cost materialization even if the handler had
             # reported success before disappearing.
-            if (info.status_property.sky_launch_status
-                    != common_utils.ProcessStatus.INTERRUPTED):
+            if (info.status_property.sky_launch_status !=
+                    common_utils.ProcessStatus.INTERRUPTED):
                 info.status_property.sky_launch_status = (
                     common_utils.ProcessStatus.FAILED)
-            paid_outcome = None
+            if paid_provider_absent:
+                info.status_property.failed_spot_availability = True
+                if reason == 'quota':
+                    paid_outcome = paid_capacity.LaunchOutcome.QUOTA_FAILURE
+                elif reason == 'capacity':
+                    paid_outcome = paid_capacity.LaunchOutcome.CAPACITY_FAILURE
+                else:
+                    return False
+            else:
+                paid_outcome = None
         elif provider_present_cleanup:
             # PRESENT proves the exact physical allocation exists, not that
             # launch succeeded.  Preserve the association and request pin;
@@ -4379,8 +4442,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             # may race that cancel and finish successfully, but its result must
             # not erase the only durable cleanup intent before the down worker
             # records SCHEDULED.
-            if (info.status_property.sky_launch_status
-                    != common_utils.ProcessStatus.INTERRUPTED):
+            if (info.status_property.sky_launch_status !=
+                    common_utils.ProcessStatus.INTERRUPTED):
                 info.status_property.sky_launch_status = (
                     common_utils.ProcessStatus.SUCCEEDED)
             paid_outcome = paid_capacity.LaunchOutcome.SUCCESS
@@ -4390,8 +4453,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             # generic failed launch. Post-effect terminal outcomes remain
             # failures; they must never look successful merely because
             # projection itself committed.
-            if (info.status_property.sky_launch_status
-                    != common_utils.ProcessStatus.INTERRUPTED):
+            if (info.status_property.sky_launch_status !=
+                    common_utils.ProcessStatus.INTERRUPTED):
                 info.status_property.sky_launch_status = (
                     common_utils.ProcessStatus.FAILED)
             if reason == 'quota':
@@ -4409,12 +4472,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                 NonPoolLaunchProfileKind.SYSTEM_OOM_RECOVERY):
             intent = info.system_recovery_launch_intent
             if (intent is None or info.system_recovery_quarantine is not None or
-                    info.system_recovery_disposition
-                    != system_recovery_state.SystemRecoveryDisposition.CANDIDATE
-                    or binding_context.profile.authorization_reference
-                    != f'system-oom:{intent.launch_nonce}' or
-                    binding_context.profile.authorization_generation
-                    != intent.launch_generation):
+                    info.system_recovery_disposition !=
+                    system_recovery_state.SystemRecoveryDisposition.CANDIDATE or
+                    binding_context.profile.authorization_reference !=
+                    f'system-oom:{intent.launch_nonce}' or
+                    binding_context.profile.authorization_generation !=
+                    intent.launch_generation):
                 return False
             if not projection.pre_effect_terminal:
                 job_id = projection.service_job_id
@@ -4729,18 +4792,29 @@ class SkyPilotReplicaManager(ReplicaManager):
             return False
         info = serve_state.get_replica_info_from_id(self._service_name,
                                                     replica_id)
-        if (info is None or
-                not self._provider_present_cleanup_marker_shape(info)):
+        if (info is None or not ordinary_launch_binding.
+                replica_has_projected_provider_absence_cleanup_marker(info)):
             return False
-        if not (request_postgres.
-                bound_non_pool_projected_provider_absence_is_authorized(
-                    self._service_name, replica_id, info.replica_record_id)):
-            return False
-        # Complete the same durable down-result path a successful local worker
-        # would have used. The authorization above independently proves the
-        # settled association history, canonical ABSENT evidence, released
-        # pin, null pointer, and zero-paid marker after any process restart.
-        self._handle_sky_down_finish(info, format_exc=None)
+        # The selected transaction independently proves settled association
+        # history, canonical ABSENT evidence, released pin, null pointer, and
+        # no paid claim after any process restart. Ordinary paid rejection has
+        # no provider object to tear down, so retire its exact row directly.
+        if info.reserved_fill is True:
+            if not (request_postgres.
+                    bound_non_pool_projected_provider_absence_is_authorized(
+                        self._service_name, replica_id,
+                        info.replica_record_id)):
+                return False
+            self._handle_sky_down_finish(info, format_exc=None)
+        else:
+            if not (request_postgres.
+                    retire_bound_non_pool_projected_paid_provider_absence(
+                        self._service_name, replica_id,
+                        info.replica_record_id)):
+                return False
+            logger.info(
+                'Replica %s removed after exact paid provider '
+                'negative acknowledgement.', info.replica_id)
         return True
 
     def _reconcile_unowned_bound_non_pool_launches(
@@ -4808,10 +4882,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         active_ids = {
             binding_context.replica_id for binding_context in contexts
         }
-        infos = {
-            (info.replica_id, info.replica_record_id): info
-            for info in replica_infos
-        }
+        infos = {(info.replica_id, info.replica_record_id): info
+                 for info in replica_infos}
         for binding_context in contexts:
             if (binding_context.replica_id in runtime.launch_thread_pool or
                     binding_context.replica_id in runtime.down_thread_pool):
@@ -4906,8 +4978,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         """Return one fully revalidated durable PRESENT cleanup marker."""
         authority = self._ordinary_launch_binding_authority
         if (authority is None or authority.capable is not True or
-                authority.binding_mode
-                != ordinary_launch_binding.BindingMode.BOUND or
+                authority.binding_mode !=
+                ordinary_launch_binding.BindingMode.BOUND or
                 not authority.retained_non_pool_settlement_allowed):
             return None
         if target is None:
@@ -4940,8 +5012,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         """Cancel, quiesce, and project an exact request before provider down."""
         authority = self._ordinary_launch_binding_authority
         if (authority is None or authority.capable is not True or
-                authority.binding_mode
-                != ordinary_launch_binding.BindingMode.BOUND):
+                authority.binding_mode !=
+                ordinary_launch_binding.BindingMode.BOUND):
             return None
         initial = request_postgres.lookup_bound_ordinary_launch_cancel_target(
             self._service_name, info.replica_id, info.replica_record_id)
@@ -4994,8 +5066,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         """Deliver exact cancellation without waiting for provider authority."""
         authority = self._ordinary_launch_binding_authority
         if (authority is None or authority.capable is not True or
-                authority.binding_mode
-                != ordinary_launch_binding.BindingMode.BOUND):
+                authority.binding_mode !=
+                ordinary_launch_binding.BindingMode.BOUND):
             return
         target = request_postgres.lookup_bound_ordinary_launch_cancel_target(
             self._service_name, info.replica_id, info.replica_record_id)
@@ -5163,18 +5235,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                 info.status_property.service_ready_now = False
                 self._persist_replica(info.replica_id, info)
                 changed = True
-            if (disposition
-                    != system_recovery_state.SystemRecoveryDisposition.CAPABLE
-                    or info.system_recovery is None or
-                    info.system_recovery.state
+            if (disposition !=
+                    system_recovery_state.SystemRecoveryDisposition.CAPABLE or
+                    info.system_recovery is None or info.system_recovery.state
                     == system_recovery_state.ControllerRecoveryState.EXHAUSTED
                     or self._has_system_recovery_teardown_intent(info)):
                 continue
 
             def _start_barrier(fresh: ReplicaInfo) -> bool:
-                if (fresh.system_recovery_disposition != system_recovery_state.
-                        SystemRecoveryDisposition.CAPABLE or
-                        fresh.system_recovery is None or
+                if (fresh.system_recovery_disposition !=
+                        system_recovery_state.SystemRecoveryDisposition.CAPABLE
+                        or fresh.system_recovery is None or
                         fresh.system_recovery.state == system_recovery_state.
                         ControllerRecoveryState.EXHAUSTED or
                         self._has_system_recovery_teardown_intent(fresh)):
@@ -5229,8 +5300,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         self, info: ReplicaInfo
     ) -> system_recovery_route_lease.RouteSuspension | None:
         """Reversibly omit one exact row around an off-route DB mutation."""
-        if (info.system_recovery_disposition
-                != system_recovery_state.SystemRecoveryDisposition.CAPABLE):
+        if (info.system_recovery_disposition !=
+                system_recovery_state.SystemRecoveryDisposition.CAPABLE):
             return None
         if (info.status == serve_state.ReplicaStatus.READY and
                 self.system_recovery_allows_routing(info)):
@@ -5274,8 +5345,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             owner = serve_state.get_service_controller_owner(self._service_name)
             if (not isinstance(owner, Mapping) or
                     owner.get('hash') != expected_service_hash or
-                (owner.get('controller_pid'), owner.get('controller_ip'))
-                    != expected_controller_owner):
+                (owner.get('controller_pid'), owner.get('controller_ip')) !=
+                    expected_controller_owner):
                 self._commit_system_recovery_route_suspensions(suspensions)
                 return
             fresh_infos = serve_state.get_replica_infos_from_ids(
@@ -5387,8 +5458,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # demotion.  Its callback may use that stale value only on attempts
         # that launch_cluster has already classified as ordinary; the bound
         # recovery attempt is gated before every callback invocation.
-        if (disposition
-                != system_recovery_state.SystemRecoveryDisposition.ORDINARY and
+        if (disposition !=
+                system_recovery_state.SystemRecoveryDisposition.ORDINARY and
                 not (allow_demoted_candidate and
                      disposition == system_recovery_state.
                      SystemRecoveryDisposition.CANDIDATE)):
@@ -5475,8 +5546,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             return None
         owner = serve_state.get_service_controller_owner(self._service_name)
         if (owner is None or owner.get('hash') != service_hash or
-            (owner.get('controller_pid'), owner.get('controller_ip'))
-                != controller_owner):
+            (owner.get('controller_pid'), owner.get('controller_ip')) !=
+                controller_owner):
             return None
         lifecycle_epoch = owner.get('lifecycle_epoch')
         if (isinstance(lifecycle_epoch, bool) or
@@ -5594,8 +5665,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                      replica_id)
         if (fresh is None or fresh.system_recovery_quarantine is not None or
                 fresh.system_recovery_launch_intent != intent or
-                fresh.system_recovery_disposition
-                != system_recovery_state.SystemRecoveryDisposition.CANDIDATE):
+                fresh.system_recovery_disposition !=
+                system_recovery_state.SystemRecoveryDisposition.CANDIDATE):
             return None
         request_id = fresh.launch_request_id
         return request_id if isinstance(request_id,
@@ -5614,9 +5685,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 return False
             if (fresh.system_recovery_quarantine is not None or
                     fresh.system_recovery_launch_intent != intent or
-                    fresh.system_recovery_disposition
-                    != system_recovery_state.SystemRecoveryDisposition.CANDIDATE
-                    or fresh.launch_request_id != request_id):
+                    fresh.system_recovery_disposition !=
+                    system_recovery_state.SystemRecoveryDisposition.CANDIDATE or
+                    fresh.launch_request_id != request_id):
                 return False
             if fresh.service_job_id == service_job_id:
                 return True
@@ -6139,8 +6210,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if info.unknown_capacity_replacement is True)
         existing_replica_ids = [info.replica_id for info in all_replica_infos]
         intent_replica_id_high_water = 0
-        if (self._reserved_fill_actuation_mode
-                is zero_cost_actuation.ActuationMode.DURABLE_INTENT):
+        if (self._reserved_fill_actuation_mode is
+                zero_cost_actuation.ActuationMode.DURABLE_INTENT):
             # A committed durable intent retains its replica-ID association
             # after the replica row is cleaned.  Reusing that historical ID
             # would violate the intent ledger's uniqueness constraint and
@@ -6654,9 +6725,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     })
                 if (matching_paid_retirement or
                     (paid_retirement_read_failed and
-                     info.status_property.wait_for_idle_before_termination
-                     is True and
-                     info.status_property.drain_cap_seconds is None)):
+                     info.status_property.wait_for_idle_before_termination is
+                     True and info.status_property.drain_cap_seconds is None)):
                     recovery_wait_urls[info.replica_id] = (
                         None if record is None else record.get('route_url'))
                     continue
@@ -6767,8 +6837,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._register_wait_for_idle(replica_info,
                                                  replica_url=replica_url)
                     if (replica_info.status_property.
-                            logical_retirement_controller_epoch
-                            != self._logical_controller_epoch):
+                            logical_retirement_controller_epoch !=
+                            self._logical_controller_epoch):
                         recovering_logical_ids.add(replica_info.replica_id)
                     continue
                 if (replica_info.status_property.
@@ -6895,8 +6965,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         """Retain a bounded current-plus-recovery Task parse cache."""
         self._version_task_templates.pop(version, None)
         self._version_task_templates[version] = task
-        while (len(self._version_task_templates)
-               > _SERVICE_VERSION_TASK_TEMPLATE_CACHE_SIZE):
+        while (len(self._version_task_templates) >
+               _SERVICE_VERSION_TASK_TEMPLATE_CACHE_SIZE):
             for cached_version in tuple(self._version_task_templates):
                 if cached_version != self.latest_version:
                     self._version_task_templates.pop(cached_version)
@@ -7457,8 +7527,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 type(fill_ordinary_admission_sequence)
                                 is not int or
                                 fill_ordinary_admission_sequence < 0 or
-                                fill_ordinary_admission_sequence
-                                > fill_observation_sequence or
+                                fill_ordinary_admission_sequence >
+                                fill_observation_sequence or
                                 not _is_lowercase_sha256(
                                     fill_intent_idempotency_key)):
                             self._log_fill_skip(
@@ -7473,8 +7543,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                         self._log_fill_skip('malformed protocol-v2 pool key')
                         return None
                     if (fill_pool_identity.protocol_version != 2 or
-                            fill_pool_identity.physical_cluster_uid
-                            != fill_physical_cluster_uid):
+                            fill_pool_identity.physical_cluster_uid !=
+                            fill_physical_cluster_uid):
                         self._log_fill_skip('protocol-v2 pool identity does '
                                             'not match its physical UID')
                         return None
@@ -7554,8 +7624,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                             'identity')
                         return None
                     if fill_exact_accelerator_shape is not None:
-                        if ((str(selected_card).casefold(), selected_count)
-                                != fill_exact_accelerator_shape):
+                        if ((str(selected_card).casefold(), selected_count) !=
+                                fill_exact_accelerator_shape):
                             self._release_unstarted_location_retry(location)
                             self._log_fill_skip(
                                 'selected pool location changed the carried '
@@ -7669,8 +7739,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 assert isinstance(persisted_shape, dict)
                 persisted_card, persisted_count = next(
                     iter(persisted_shape.items()))
-                if ((str(persisted_card).casefold(), persisted_count)
-                        != fill_exact_accelerator_shape):
+                if ((str(persisted_card).casefold(), persisted_count) !=
+                        fill_exact_accelerator_shape):
                     self._release_unstarted_location_retry(location)
                     self._log_fill_skip('persisted pool location changed the '
                                         'carried exact accelerator shape')
@@ -7807,9 +7877,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._enforce_launch_fence and launch_fence is not None and
             launch_spec is not None and
             serve_state.system_recovery_persistence_available() and
-            launch_spec.endpoint_probe_interval_seconds <= serve_constants.
-            SYSTEM_RECOVERY_MAX_ELIGIBLE_PROBE_INTERVAL_SECONDS and
-            launch_spec.readiness_timeout_seconds <= serve_constants.
+            launch_spec.endpoint_probe_interval_seconds <=
+            serve_constants.SYSTEM_RECOVERY_MAX_ELIGIBLE_PROBE_INTERVAL_SECONDS
+            and launch_spec.readiness_timeout_seconds <= serve_constants.
             SYSTEM_RECOVERY_MAX_ELIGIBLE_READINESS_TIMEOUT_SECONDS)
         if candidate_prerequisites:
             try:
@@ -8255,8 +8325,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 admission_result = (
                                     reserved_fill_admission.admit(
                                         atomic_admission_spec))
-                                if (admission_result.disposition
-                                        is reserved_fill_admission.
+                                if (admission_result.disposition is
+                                        reserved_fill_admission.
                                         AdmissionDisposition.AMBIGUOUS):
                                     raise (reserved_fill_admission.
                                            AdmissionAmbiguousError)(
@@ -8273,10 +8343,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     return None
                                 admission_receipt = admission_result.receipt
                                 if (admission_receipt is None or
-                                        admission_receipt.replica_id
-                                        != replica_id or
-                                        admission_receipt.replica_record_id
-                                        != info.replica_record_id):
+                                        admission_receipt.replica_id !=
+                                        replica_id or
+                                        admission_receipt.replica_record_id !=
+                                        info.replica_record_id):
                                     raise (reserved_fill_admission.
                                            AdmissionAmbiguousError)(
                                                'atomic admission returned a '
@@ -8288,15 +8358,15 @@ class SkyPilotReplicaManager(ReplicaManager):
                         ordinary_launch_binding.BoundNonPoolLaunchContext) or
                         bound_context.profile.kind
                         is not ordinary_launch_binding.NonPoolLaunchProfileKind.
-                        RESERVED_FILL or str(bound_context.association_id)
-                        != admission_receipt.association_id or
+                        RESERVED_FILL or str(bound_context.association_id) !=
+                        admission_receipt.association_id or
                         bound_context.request_id != admission_receipt.request_id
                         or bound_context.service_name != self._service_name or
                         bound_context.replica_id != replica_id or
-                        str(bound_context.replica_record_id)
-                        != info.replica_record_id or
-                        bound_context.launch_generation
-                        != admission_receipt.launch_generation):
+                        str(bound_context.replica_record_id) !=
+                        info.replica_record_id or
+                        bound_context.launch_generation !=
+                        admission_receipt.launch_generation):
                     raise reserved_fill_admission.AdmissionAmbiguousError(
                         'committed atomic admission returned an inconsistent '
                         'bound launch context')
@@ -8778,8 +8848,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 active_count_by_pool[pool_key] = (
                     active_count_by_pool.get(pool_key, 0) + 1)
 
-        capacity_infos = (existing_replica_infos if capacity_replica_infos
-                          is None else capacity_replica_infos)
+        capacity_infos = (existing_replica_infos
+                          if capacity_replica_infos is None else
+                          capacity_replica_infos)
         unobserved_gpus_by_pool: dict[tuple[str, str], int] = {}
         unresolved_backends_by_pool: dict[tuple[str, str], int] = {}
         for info in capacity_infos:
@@ -8804,21 +8875,21 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if observation is None else observation.authority)
             created_at = info.created_at
             status_property = info.status_property
-            if (observation_authority is reserved_capacity.
-                    FreeGpuObservationAuthority.SEQUENCED_GATE and
-                    observation_admission_sequence is not None and
+            if (observation_authority is
+                    reserved_capacity.FreeGpuObservationAuthority.SEQUENCED_GATE
+                    and observation_admission_sequence is not None and
                     observation_materialization_sequence is not None):
                 admission_sequence = info.zero_cost_admission_sequence
                 materialization_sequence = (
                     info.zero_cost_materialization_sequence)
-                unobserved = (isinstance(admission_sequence, bool) or
-                              not isinstance(admission_sequence, int) or
-                              admission_sequence
-                              > observation_admission_sequence or
-                              isinstance(materialization_sequence, bool) or
-                              not isinstance(materialization_sequence, int) or
-                              materialization_sequence
-                              > observation_materialization_sequence)
+                unobserved = (
+                    isinstance(admission_sequence, bool) or
+                    not isinstance(admission_sequence, int) or
+                    admission_sequence > observation_admission_sequence or
+                    isinstance(materialization_sequence, bool) or
+                    not isinstance(materialization_sequence, int) or
+                    materialization_sequence >
+                    observation_materialization_sequence)
                 if not info.is_ready:
                     unresolved_backends_by_pool[pool_key] = (
                         unresolved_backends_by_pool.get(pool_key, 0) + 1)
@@ -9167,8 +9238,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             return (reserved_fill_planner.DeferredFillReason.LOST_OWNER,
                     'controller ownership could not be proven')
         if (owner is None or owner.get('hash') != service_hash or
-            (owner.get('controller_pid'), owner.get('controller_ip'))
-                != controller_owner or owner.get('status') in
+            (owner.get('controller_pid'), owner.get('controller_ip')) !=
+                controller_owner or owner.get('status') in
                 serve_state.ServiceStatus.replica_launch_blocking_statuses()):
             return (
                 reserved_fill_planner.DeferredFillReason.LOST_OWNER,
@@ -9680,8 +9751,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     len(leases) == _ZERO_COST_ACTUATION_QUANTUM):
                 current_thread = threading.current_thread()
                 with self._zero_cost_actuation_lane_lock:
-                    if (self._zero_cost_actuation_lanes.get(pool_key)
-                            is current_thread):
+                    if (self._zero_cost_actuation_lanes.get(pool_key) is
+                            current_thread):
                         del self._zero_cost_actuation_lanes[pool_key]
                 self._zero_cost_actuation_event.set()
 
@@ -9802,12 +9873,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                     ).read_current(self._service_name, service_hash,
                                    controller_owner))
                 if (current_allocation is None or
-                        current_allocation.allocation_generation
-                        != plan.allocation_generation or
-                        current_allocation.allocation_input_sha256
-                        != plan.allocation_input_sha256 or
-                        current_allocation.allocation_claim_generation
-                        != plan.allocation_claim_generation):
+                        current_allocation.allocation_generation !=
+                        plan.allocation_generation or
+                        current_allocation.allocation_input_sha256 !=
+                        plan.allocation_input_sha256 or
+                        current_allocation.allocation_claim_generation !=
+                        plan.allocation_claim_generation):
                     return self._reserved_fill_commit_result(
                         plan, [],
                         self._reserved_fill_deferred_tail(
@@ -10270,9 +10341,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # not suppress a correctly attributed successor.
                 continue
             candidate = unknown_predecessors.get(predecessor.replica_id)
-            if (candidate is None or candidate.replica_record_id
-                    != predecessor.replica_record_id or
-                    candidate.version != predecessor.service_version or
+            if (candidate is None or
+                    candidate.replica_record_id != predecessor.replica_record_id
+                    or candidate.version != predecessor.service_version or
                     replacement.planned_capacity != candidate.planned_capacity
                     or _replica_card(replacement) != _replica_card(candidate)):
                 continue
@@ -10449,8 +10520,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 serve_constants.LB_REQUEST_PRIORITY_MIN,
                 min(serve_constants.LB_REQUEST_PRIORITY_MAX,
                     selected_launch_priority))
-            if (selected_launch_priority
-                    != serve_constants.LB_REQUEST_PRIORITY_MIN):
+            if (selected_launch_priority !=
+                    serve_constants.LB_REQUEST_PRIORITY_MIN):
                 launch_kwargs['launch_priority'] = selected_launch_priority
             unknown_predecessor = next(
                 (unknown_predecessors[replica_id]
@@ -10913,8 +10984,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             # before a prior controller died. No provider call remains: route
             # this restart shape directly through the exact record-fenced
             # down-result remover.
-            self._handle_sky_down_finish(projected_provider_absence_info,
-                                         format_exc=None)
+            if not self._finalize_projected_provider_absence_cleanup(
+                    projected_provider_absence_info.replica_id):
+                raise RuntimeError(
+                    'Projected provider absence lost exact row-removal '
+                    'authority.')
             return
 
         log_file_name = serve_utils.generate_replica_log_file_name(
@@ -11231,7 +11305,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             # transaction below still requires the association's exact
             # current lifecycle, owner, incarnation, request, and provider
             # identity; no historical lifecycle is cleanup authority.
-            if self._provider_present_cleanup_marker_shape(info):
+            if (ordinary_launch_binding.
+                    replica_has_projected_provider_absence_cleanup_marker(
+                        info)):
                 try:
                     if self._finalize_projected_provider_absence_cleanup(
                             info.replica_id):
@@ -12088,8 +12164,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             old_epoch_candidates = []
             for info in candidates:
                 status = info.status_property
-                if (status.logical_retirement_controller_epoch
-                        != self._logical_controller_epoch):
+                if (status.logical_retirement_controller_epoch !=
+                        self._logical_controller_epoch):
                     old_epoch_candidates.append(info)
                     continue
                 # Adoption changes durable shutdown authority. Do not admit
@@ -12603,11 +12679,22 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if retirement['state'] == (
                         paid_retirement.PaidRetirementState.COMMITTED.value):
                     self._wait_for_idle_trackers.pop(replica_id, None)
-                    self._terminate_replica(replica_id,
-                                            sync_down_logs=False,
-                                            replica_drain_delay_seconds=0,
-                                            is_scale_down=True,
-                                            in_flight_drain_cap_seconds=0)
+                    try:
+                        self._terminate_replica(replica_id,
+                                                sync_down_logs=False,
+                                                replica_drain_delay_seconds=0,
+                                                is_scale_down=True,
+                                                in_flight_drain_cap_seconds=0)
+                    except _BoundOrdinaryLaunchUnresolvedError as error:
+                        # The bound-launch reducer remains the sole authority
+                        # for this ambiguous row.  Its durable paid-retirement
+                        # commit keeps it off route; do not let it prevent
+                        # independently committed siblings from terminating.
+                        logger.warning(
+                            'Deferring committed paid retirement for replica '
+                            '%s while its bound ordinary launch remains '
+                            'durably ambiguous: %s', replica_id,
+                            common_utils.format_exception(error))
                     continue
                 if not drained:
                     continue
@@ -12634,11 +12721,21 @@ class SkyPilotReplicaManager(ReplicaManager):
                     continue
                 self._drain_proof_stats.record_proved_drained()
                 self._wait_for_idle_trackers.pop(replica_id, None)
-                self._terminate_replica(replica_id,
-                                        sync_down_logs=False,
-                                        replica_drain_delay_seconds=0,
-                                        is_scale_down=True,
-                                        in_flight_drain_cap_seconds=0)
+                try:
+                    self._terminate_replica(replica_id,
+                                            sync_down_logs=False,
+                                            replica_drain_delay_seconds=0,
+                                            is_scale_down=True,
+                                            in_flight_drain_cap_seconds=0)
+                except _BoundOrdinaryLaunchUnresolvedError as error:
+                    # Idle proof and the PostgreSQL commit are already
+                    # irreversible.  Preserve that exact row for bound-launch
+                    # reconciliation, but continue retiring independent peers.
+                    logger.warning(
+                        'Deferring proved-idle paid retirement for replica %s '
+                        'while its bound ordinary launch remains durably '
+                        'ambiguous: %s', replica_id,
+                        common_utils.format_exception(error))
                 continue
             if not drained and not deadline_expired:
                 continue
@@ -12755,11 +12852,22 @@ class SkyPilotReplicaManager(ReplicaManager):
                                              deadline=math.inf,
                                              replica_url=record['route_url'])
             else:
-                self._terminate_replica(info.replica_id,
-                                        sync_down_logs=False,
-                                        replica_drain_delay_seconds=0,
-                                        is_scale_down=True,
-                                        in_flight_drain_cap_seconds=0)
+                try:
+                    self._terminate_replica(info.replica_id,
+                                            sync_down_logs=False,
+                                            replica_drain_delay_seconds=0,
+                                            is_scale_down=True,
+                                            in_flight_drain_cap_seconds=0)
+                except _BoundOrdinaryLaunchUnresolvedError as error:
+                    # This row was committed without an idle wait because it
+                    # never served traffic.  Keep its ambiguous bound launch
+                    # for exact reconciliation without aborting the rest of
+                    # the fresh-zero retirement wave.
+                    logger.warning(
+                        'Deferring immediate paid retirement for replica %s '
+                        'while its bound ordinary launch remains durably '
+                        'ambiguous: %s', info.replica_id,
+                        common_utils.format_exception(error))
         return changed
 
     @with_lock
@@ -12890,8 +12998,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 return
             retirement_components = _logical_target_state_components(
                 _logical_retirement_target(logical_state))
-            if (retirement_components is None or retirement_components[:2]
-                    != (version, reconcile_generation)):
+            if (retirement_components is None or retirement_components[:2] !=
+                (version, reconcile_generation)):
                 logger.info('Discarding logical scale-down batch without a '
                             'coherent same-generation retirement floor.')
                 return
@@ -13040,8 +13148,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                         immediate_teardown_infos.append(info)
                 else:
                     if (replica_id in snapshot.unknown_replica_ids or
-                            snapshot.in_flight_by_replica_id.get(replica_id)
-                            != 0):
+                            snapshot.in_flight_by_replica_id.get(replica_id) !=
+                            0):
                         continue
                     victim_ready_width = ready_width
                     if info.version == version and victim_ready_width == 0:
@@ -13362,8 +13470,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             if (cleanup_fence is None or
                     exact_kubernetes_absence.cleanup_fence != cleanup_fence or
                     exact_kubernetes_absence.cluster_name != info.cluster_name
-                    or exact_kubernetes_absence.replica_record_id
-                    != info.replica_record_id):
+                    or exact_kubernetes_absence.replica_record_id !=
+                    info.replica_record_id):
                 raise exceptions.KubernetesPhysicalClusterIdentityError(
                     'Exact preemption absence does not match the durable '
                     'reserved-fill replica identity.')
@@ -13532,7 +13640,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         targets = {card: 0 for card, _ in accelerator_shapes}
         targets.update(dict(target_by_accelerator))
         baseline = {card: 0 for card in targets}
-        candidates: dict[str, list[ReplicaInfo]] = {card: [] for card in targets}
+        candidates: dict[str,
+                         list[ReplicaInfo]] = {card: [] for card in targets}
         authorized_ids: set[int] = set()
         candidate_summary: tuple[Any, ...] | None = None
         replica_infos = serve_state.get_replica_infos(self._service_name)
@@ -13599,8 +13708,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     details=(f'previous_target={target_fence!r}, '
                              f'current_target={current_state.target!r}'))
         candidate_ids_first_16 = {
-            card: [info.replica_id for info in card_candidates[:16]]
-            for card, card_candidates in candidates.items()
+            card: [info.replica_id for info in card_candidates[:16]
+                  ] for card, card_candidates in candidates.items()
         }
         candidate_counts = {
             card: len(card_candidates)
@@ -13701,8 +13810,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         for info in serve_state.get_replica_infos(self._service_name):
             if info.version == latest_version:
                 continue
-            if (info.status_property.sky_down_status
-                    != common_utils.ProcessStatus.SUCCEEDED):
+            if (info.status_property.sky_down_status !=
+                    common_utils.ProcessStatus.SUCCEEDED):
                 continue
             if (info.status not in self._PRUNABLE_SUPERSEDED_STATUSES):
                 continue
@@ -14639,8 +14748,8 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _system_recovery_status_barrier_expired(self,
                                                 info: ReplicaInfo) -> bool:
-        if (info.system_recovery_disposition
-                != system_recovery_state.SystemRecoveryDisposition.CAPABLE or
+        if (info.system_recovery_disposition !=
+                system_recovery_state.SystemRecoveryDisposition.CAPABLE or
                 info.replica_id
                 in self._system_recovery_status_initialized_ids()):
             return False
@@ -14650,8 +14759,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         anchor = recovery.status_barrier_started_at
         if not isinstance(anchor, (int, float)):
             return True
-        return (time.time() - float(anchor)
-                >= system_recovery_state.CANDIDATE_RELEASE_GUARD_SECONDS)
+        return (time.time() - float(anchor) >=
+                system_recovery_state.CANDIDATE_RELEASE_GUARD_SECONDS)
 
     def _system_recovery_controller_grace_seconds(
             self, info: ReplicaInfo,
@@ -14726,10 +14835,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                         f'Replica {fresh.replica_id} returned malformed '
                         f'recovery detail for exact job {exact_job_id}: '
                         f'{common_utils.format_exception(e)}')
-                if (observation is None or observation.capability
-                        != intent.expected_runtime_capability or
-                        observation.profile_version
-                        != intent.runtime_profile_version):
+                if (observation is None or observation.capability !=
+                        intent.expected_runtime_capability or
+                        observation.profile_version !=
+                        intent.runtime_profile_version):
                     outcome['teardown'] = True
                     outcome['events'].add('evidence_lost')
                     observation = None
@@ -14751,8 +14860,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     # ABSENT is a valid unresolved-candidate sample until the
                     # guarded release protocol sees it in the same cycle as a
                     # fresh successful probe. Every other shape fails closed.
-                    if (detail_status
-                            != job_lib.JobSystemRecoveryDetailStatus.ABSENT or
+                    if (detail_status !=
+                            job_lib.JobSystemRecoveryDetailStatus.ABSENT or
                             job_status.is_terminal()):
                         outcome['teardown'] = True
                     return False
@@ -14844,8 +14953,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._service_name, snapshot.replica_id)
         if updated is None:
             return True
-        if (updated.system_recovery_disposition
-                != system_recovery_state.SystemRecoveryDisposition.CANDIDATE):
+        if (updated.system_recovery_disposition !=
+                system_recovery_state.SystemRecoveryDisposition.CANDIDATE):
             self._candidate_release_monotonic_deadlines.pop(
                 updated.replica_id, None)
         status_changed = False
@@ -14860,8 +14969,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 updated.system_recovery_disposition
                 == system_recovery_state.SystemRecoveryDisposition.CAPABLE and
                 updated.system_recovery is not None and
-                updated.system_recovery.state
-                != system_recovery_state.ControllerRecoveryState.EXHAUSTED):
+                updated.system_recovery.state !=
+                system_recovery_state.ControllerRecoveryState.EXHAUSTED):
             self._system_recovery_status_initialized_ids().add(
                 updated.replica_id)
         elif outcome['teardown']:
@@ -15653,9 +15762,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 succeeded=succeeded,
                 probe_started_at=probe_started_at,
                 now=time.time(),
-                monotonic_guard_satisfied=(deadline is not None and
-                                           probe_monotonic_started_at
-                                           > deadline),
+                monotonic_guard_satisfied=(
+                    deadline is not None and
+                    probe_monotonic_started_at > deadline),
                 exact_job_nonterminal=exact_job_nonterminal,
                 exact_detail_absent=exact_detail_absent,
                 teardown_intent=self._has_system_recovery_teardown_intent(
@@ -15680,8 +15789,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         if updated is None:
             outcome['teardown'] = True
             return info, True, True
-        if (updated.system_recovery_disposition
-                != system_recovery_state.SystemRecoveryDisposition.CANDIDATE):
+        if (updated.system_recovery_disposition !=
+                system_recovery_state.SystemRecoveryDisposition.CANDIDATE):
             deadlines.pop(updated.replica_id, None)
         if (updated.system_recovery_disposition ==
                 system_recovery_state.SystemRecoveryDisposition.ORDINARY):
@@ -15708,8 +15817,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         def _reduce(fresh: ReplicaInfo) -> bool:
             outcome['reduction'] = None
             recovery_events.clear()
-            if (fresh.system_recovery_disposition
-                    != system_recovery_state.SystemRecoveryDisposition.CAPABLE):
+            if (fresh.system_recovery_disposition !=
+                    system_recovery_state.SystemRecoveryDisposition.CAPABLE):
                 return False
             recovery = fresh.system_recovery
             if recovery is None:
@@ -16075,8 +16184,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     None if recovery is None else
                     recovery.retry_submitted_adopted_at)
                 route_issue_candidates[info.replica_id] = (
-                    info, status_generation, exact_generation
-                    is None, retry_submitted_adopted_at, route_url,
+                    info, status_generation, exact_generation is None,
+                    retry_submitted_adopted_at, route_url,
                     self._get_readiness_path(info.version),
                     self._get_post_data(info.version),
                     self._get_readiness_headers(info.version), job_id)
@@ -16389,7 +16498,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
             candidate_status_futures = {
                 info.replica_id:
-                    (info, executor.submit(_candidate_status, info, handle))
+                (info, executor.submit(_candidate_status, info, handle))
                 for info, handle in candidate_status_inputs
             }
             candidate_cycle_evidence: dict[int, tuple[bool, bool]] = {}
@@ -16668,10 +16777,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                         if recovery_reduction.clear_probe_failure_window:
                             info.first_consecutive_failure_time = None
                         recovery = info.system_recovery
-                        has_served = (info.status_property.first_ready_time
-                                      is not None and
-                                      info.status_property.first_ready_time
-                                      >= 0)
+                        has_served = (
+                            info.status_property.first_ready_time is not None
+                            and info.status_property.first_ready_time >= 0)
                         recovery_holds_failure = has_served and (
                             recovery is None or recovery.state
                             in (system_recovery_state.ControllerRecoveryState.
@@ -16805,8 +16913,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     should_persist_readiness = (
                         not changed_only_eligible_before or
                         not changed_only_eligible_after or
-                        readiness_fingerprint_before
-                        != readiness_fingerprint_after)
+                        readiness_fingerprint_before !=
+                        readiness_fingerprint_after)
                 if should_persist_readiness:
                     pending_writes.append((info.replica_id, info))
                 if should_teardown:
@@ -17044,8 +17152,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         allow_retry_submitted: bool = False,
     ) -> system_recovery_route_lease.RouteGeneration | None:
         """Build the exact routable process/row/attempt generation."""
-        if (info.system_recovery_disposition
-                != system_recovery_state.SystemRecoveryDisposition.CAPABLE or
+        if (info.system_recovery_disposition !=
+                system_recovery_state.SystemRecoveryDisposition.CAPABLE or
                 info.system_recovery is None):
             return None
         recovery = info.system_recovery
@@ -17112,8 +17220,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         if (observation.job_id != info.service_job_id or
                 observation.capability != recovery.capability or
                 observation.node_boot_id != recovery.node_boot_id or
-                observation.original_attempt_id
-                != recovery.original_attempt_id):
+                observation.original_attempt_id !=
+                recovery.original_attempt_id):
             return False
         if generation.recovery_state == 'ARMED':
             return (observation.phase
@@ -17146,8 +17254,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         updated = self._patch_system_recovery_with_latest(
             info.replica_id, _terminalize)
         if (updated is None or updated.system_recovery is None or
-                updated.system_recovery.state
-                != system_recovery_state.ControllerRecoveryState.EXHAUSTED):
+                updated.system_recovery.state !=
+                system_recovery_state.ControllerRecoveryState.EXHAUSTED):
             return
         self._system_recovery_status_initialized_ids().discard(info.replica_id)
         system_oom_recovery_observability.record_for_replica(
@@ -17219,8 +17327,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         if (disposition ==
                 system_recovery_state.SystemRecoveryDisposition.ORDINARY):
             return True
-        if (disposition
-                != system_recovery_state.SystemRecoveryDisposition.CAPABLE or
+        if (disposition !=
+                system_recovery_state.SystemRecoveryDisposition.CAPABLE or
                 info.replica_id
                 not in self._system_recovery_status_initialized_ids()):
             return False
@@ -17299,8 +17407,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             placement_states = (serve_state.get_service_placement_policy_states(
                 self._service_name))
             new_spot_placer.load_retry_state(
-                None if placement_states is
-                None else placement_states['spot_placement_state'])
+                None if placement_states is None else
+                placement_states['spot_placement_state'])
         if new_uses_logical_replicas:
             _validate_logical_capacity_sources(new_default_planned_capacity,
                                                new_spot_placer,

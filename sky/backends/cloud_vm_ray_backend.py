@@ -152,6 +152,30 @@ SKY_REMOTE_WORKDIR = constants.SKY_REMOTE_WORKDIR
 logger = sky_logging.init_logger(__name__)
 
 
+def _provider_create_rejection_failover_record(
+    error: provision_common.ProviderCreateRejectedError,
+    provider_negative_ack: dict[str, Any] | None,
+) -> provision_common.ProvisionerError:
+    """Projects one exact create rejection onto the stable history wire type.
+
+    ``ResourcesUnavailableError.failover_history`` is currently serialized as
+    nested pickle state.  Keep the new rejection subtype inside the live
+    provisioner boundary: N-1/N-2 readers already know ``ProvisionerError``
+    and safely ignore the additive receipt attribute.  Copy only the closed
+    fields needed by capacity classification and durable absence proof.
+    """
+    failure = provision_common.ProvisionerError(str(error))
+    if provider_negative_ack is not None:
+        failure.provider_negative_ack = copy.deepcopy(provider_negative_ack)
+    provider_errors = getattr(error, 'errors', None)
+    if type(provider_errors) is list:
+        failure.errors = copy.deepcopy(provider_errors)
+    requested_count = getattr(error, 'requested_count', None)
+    if requested_count is not None:
+        failure.requested_count = requested_count
+    return failure
+
+
 def _resolve_container_image_for_placement(
     resources: resources_lib.Resources,
     *,
@@ -499,6 +523,8 @@ _terminal_failover_leaves = capacity_policy._terminal_failover_leaves  # pylint:
 _terminal_leaf_cause_nodes = capacity_policy._terminal_leaf_cause_nodes  # pylint: disable=protected-access
 classify_resources_unavailable_error = (
     capacity_policy.classify_resources_unavailable_error)
+validate_provider_negative_ack = capacity_policy.validate_provider_negative_ack
+extract_provider_negative_ack = capacity_policy.extract_provider_negative_ack
 _is_quota_error = capacity_policy._is_quota_error  # pylint: disable=protected-access
 _canonical_accelerators = capacity_policy._canonical_accelerators  # pylint: disable=protected-access
 
@@ -538,6 +564,8 @@ for _capacity_policy_symbol in (
         _terminal_failover_leaves,
         _terminal_leaf_cause_nodes,
         classify_resources_unavailable_error,
+        validate_provider_negative_ack,
+        extract_provider_negative_ack,
         _is_quota_error,
         _canonical_accelerators,
         _capacity_cache_cloud_name,
@@ -842,8 +870,8 @@ class RetryingVmProvisioner:
                     fence, resources)
                 cloud = resources.cloud
                 assert cloud is not None
-                if (cloud.PROVISIONER_VERSION
-                        != clouds.ProvisionerVersion.SKYPILOT):
+                if (cloud.PROVISIONER_VERSION !=
+                        clouds.ProvisionerVersion.SKYPILOT):
                     raise ValueError('Reserved-fill Kubernetes requires the '
                                      'attested in-tree provisioner path.')
         except ValueError as error:
@@ -861,8 +889,8 @@ class RetryingVmProvisioner:
                 'SkyServe binding-excluded launch context is malformed.'
             ) from error
         if (excluded is None or excluded.get(
-                serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY)
-                != serve_constants.
+                serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY) !=
+                serve_constants.
                 ORDINARY_LAUNCH_BINDING_EXCLUDED_SYSTEM_RECOVERY_PROFILE):
             return
         claim = request_storage.active_execution_claim()
@@ -1803,8 +1831,8 @@ class RetryingVmProvisioner:
                         list(
                             resources_utils.port_ranges_to_set(
                                 to_provision.ports))
-                        if to_provision.cloud.OPEN_PORTS_VERSION
-                        <= clouds.OpenPortsVersion.LAUNCH_ONLY else None)
+                        if to_provision.cloud.OPEN_PORTS_VERSION <=
+                        clouds.OpenPortsVersion.LAUNCH_ONLY else None)
                     reserved_fill_pod_materialized = False
                     try:
                         controller = controller_utils.Controllers.from_name(
@@ -1844,6 +1872,53 @@ class RetryingVmProvisioner:
                             assert self._active_cluster_hash is not None
                             bulk_provision_kwargs['cluster_incarnation'] = (
                                 self._active_cluster_hash)
+                        paid_aws_client_token = None
+                        paid_aws_account_id = None
+                        if (isinstance(to_provision.cloud, clouds.AWS) and
+                                ordinary_launch_binding.
+                                has_bound_launch_context(
+                                    self._extra_launch_context) and
+                                ordinary_launch_binding.
+                                BINDING_PROTOCOL_VERSION_KEY
+                                in self._extra_launch_context):
+                            paid_context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
+                                self._extra_launch_context)
+                            if (paid_context.profile.kind is
+                                    ordinary_launch_binding.
+                                    NonPoolLaunchProfileKind.ORDINARY_PAID and
+                                    paid_context.capability_cohort_epoch >=
+                                    ordinary_launch_binding.
+                                    ORDINARY_PAID_AWS_CLIENT_TOKEN_COHORT_FLOOR
+                               ):
+                                paid_aws_client_token = (
+                                    ordinary_launch_binding.
+                                    ordinary_paid_aws_client_token(paid_context)
+                                )
+                                paid_aws_account_id = (
+                                    ordinary_launch_binding.
+                                    ordinary_paid_aws_account_id(paid_context))
+                                active_account_id = (
+                                    cloud_user_identity[1]
+                                    if isinstance(cloud_user_identity,
+                                                  (list, tuple)) and
+                                    len(cloud_user_identity) >= 2 else None)
+                                if active_account_id != paid_aws_account_id:
+                                    raise exceptions.ServeReplicaLaunchFenceError(
+                                        'Ordinary-paid AWS account changed '
+                                        'after atomic capacity admission.')
+                        if paid_aws_client_token is not None:
+                            if (builtin_bulk_provision_fn is None or
+                                    bulk_provision_fn
+                                    is not builtin_bulk_provision_fn):
+                                raise exceptions.ServeReplicaLaunchFenceError(
+                                    'Ordinary-paid AWS requires the in-tree '
+                                    'idempotent provisioner boundary.')
+                            bulk_provision_kwargs[
+                                'provider_create_idempotency_token'] = (
+                                    paid_aws_client_token)
+                            bulk_provision_kwargs[
+                                'provider_create_account_id'] = (
+                                    paid_aws_account_id)
                         reserved_fill_fence = (
                             reserved_capacity.parse_protocol_v2_launch_fence(
                                 self._extra_launch_context))
@@ -2068,7 +2143,26 @@ class RetryingVmProvisioner:
                         if reserved_fill_pod_materialized:
                             reserved_capacity.raise_protocol_v2_materialized_launch_error(
                                 e, phase='post-create provisioning')
-                        provision_failures.append(e)
+                        provider_negative_ack = None
+                        if (isinstance(
+                                e, provision_common.ProviderCreateRejectedError)
+                                and paid_aws_client_token is not None and
+                                paid_aws_account_id is not None):
+                            provider_negative_ack = (
+                                validate_provider_negative_ack(
+                                    getattr(e, 'provider_negative_ack', None),
+                                    cluster_name=(handle.cluster_name_on_cloud),
+                                    requested_count=num_nodes,
+                                    client_token=paid_aws_client_token,
+                                    expected_aws_account_id=(
+                                        paid_aws_account_id)))
+                            if provider_negative_ack is not None:
+                                e.provider_negative_ack = provider_negative_ack
+                            provision_failures.append(
+                                _provider_create_rejection_failover_record(
+                                    e, provider_negative_ack))
+                        else:
+                            provision_failures.append(e)
                         capacity_reason = _classify_capacity_error(
                             to_provision.cloud, e)
                         if _is_quota_error(e):
@@ -2128,11 +2222,12 @@ class RetryingVmProvisioner:
                         # NOTE: We try to cleanup the cluster even if the previous
                         # cluster does not exist. Also we are fast at
                         # cleaning up clusters now if there is no existing node..
-                        CloudVmRayBackend().post_teardown_cleanup(
-                            handle,
-                            terminate=not prev_cluster_ever_up,
-                            remove_from_db=False,
-                            failover=True)
+                        if provider_negative_ack is None:
+                            CloudVmRayBackend().post_teardown_cleanup(
+                                handle,
+                                terminate=not prev_cluster_ever_up,
+                                remove_from_db=False,
+                                failover=True)
                         # TODO(suquark): other clouds may have different zone
                         #  blocking strategy. See '_update_blocklist_on_error'
                         #  for details.
@@ -3093,8 +3188,8 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
         # When a cluster is on a cloud that does not support the new
         # provisioner, we should skip updating cluster_info.
         if (self.launched_resources.cloud is not None and
-                self.launched_resources.cloud.PROVISIONER_VERSION
-                >= clouds.ProvisionerVersion.SKYPILOT):
+                self.launched_resources.cloud.PROVISIONER_VERSION >=
+                clouds.ProvisionerVersion.SKYPILOT):
             provider_name = str(self.launched_resources.cloud).lower()
             config = {}
             # It is possible that the cluster yaml is not available when
@@ -3271,8 +3366,8 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
 
         launched_resources = self.launched_resources.assert_launchable()
         updated_to_skypilot_provisioner_after_provisioned = (
-            launched_resources.cloud.PROVISIONER_VERSION
-            >= clouds.ProvisionerVersion.SKYPILOT and
+            launched_resources.cloud.PROVISIONER_VERSION >=
+            clouds.ProvisionerVersion.SKYPILOT and
             self.cached_external_ips is not None and
             self.cached_cluster_info is None)
         if updated_to_skypilot_provisioner_after_provisioned:
@@ -3281,8 +3376,8 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                 f'provisioner after cluster {self.cluster_name} was '
                 f'provisioned. Cached IPs are used for connecting to the '
                 'cluster.')
-        if (clouds.ProvisionerVersion.RAY_PROVISIONER_SKYPILOT_TERMINATOR
-                >= launched_resources.cloud.PROVISIONER_VERSION or
+        if (clouds.ProvisionerVersion.RAY_PROVISIONER_SKYPILOT_TERMINATOR >=
+                launched_resources.cloud.PROVISIONER_VERSION or
                 updated_to_skypilot_provisioner_after_provisioned):
             ip_list = (self.cached_external_ips
                        if force_cached else self.external_ips())
@@ -4051,8 +4146,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             return False
         cluster_owner_identity = cluster_record.get('owner')
         if (not isinstance(cluster_owner_identity, list) or
-                tuple(cluster_owner_identity)
-                != evidence.provision_owner_identity):
+                tuple(cluster_owner_identity) !=
+                evidence.provision_owner_identity):
             return False
         if (evidence.request_id != current_request_id or
                 bound_request_id != current_request_id or
@@ -4892,8 +4987,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 ports_to_reconcile = current_ports_set
         if ports_to_reconcile:
             launched_resources = handle.launched_resources.assert_launchable()
-            if not (launched_resources.cloud.OPEN_PORTS_VERSION
-                    <= clouds.OpenPortsVersion.LAUNCH_ONLY):
+            if not (launched_resources.cloud.OPEN_PORTS_VERSION <=
+                    clouds.OpenPortsVersion.LAUNCH_ONLY):
                 with rich_utils.safe_status(
                         ux_utils.spinner_message(
                             'Launching - Opening new ports')):
@@ -5880,9 +5975,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                             'Ignoring malformed system recovery state for job '
                             f'{job_id}: {error}')
                 for job_id in tuple(detail_statuses):
-                    if ((detail_statuses[job_id] ==
-                         job_lib.JobSystemRecoveryDetailStatus.PRESENT)
-                            != (job_id in recovery_infos)):
+                    if ((detail_statuses[job_id]
+                         == job_lib.JobSystemRecoveryDetailStatus.PRESENT) !=
+                        (job_id in recovery_infos)):
                         detail_statuses[job_id] = (
                             job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
                         recovery_infos.pop(job_id, None)
@@ -7358,8 +7453,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             to_provision = handle.launched_resources
             assert to_provision is not None
             to_provision = to_provision.assert_launchable()
-            if (to_provision.cloud.OPEN_PORTS_VERSION
-                    <= clouds.OpenPortsVersion.LAUNCH_ONLY):
+            if (to_provision.cloud.OPEN_PORTS_VERSION <=
+                    clouds.OpenPortsVersion.LAUNCH_ONLY):
                 if not requested_ports_set <= current_ports_set:
                     current_cloud = to_provision.cloud
                     with ux_utils.print_exception_no_traceback():

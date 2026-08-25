@@ -12,10 +12,12 @@ import time
 import typing
 from typing import Any, Optional
 
+from sky import exceptions
 from sky import sky_logging
 from sky.adaptors import aws
 from sky.clouds import aws as aws_cloud
 from sky.clouds.utils import aws_utils
+from sky.provision import capacity_policy
 from sky.provision import common
 from sky.provision import constants
 from sky.provision.aws import config as aws_config
@@ -53,6 +55,7 @@ _DEPENDENCY_VIOLATION_PATTERN = re.compile(
 
 _RESUME_INSTANCE_TIMEOUT = 480  # 8 minutes
 _RESUME_PER_INSTANCE_TIMEOUT = 120  # 2 minutes
+_ORDINARY_PAID_PROVIDER_PROOF_RETRY_SECONDS = 5
 
 # ======================== About AWS subnet/VPC ========================
 # https://stackoverflow.com/questions/37407492/are-there-differences-in-networking-performance-if-ec2-instances-are-in-differen
@@ -131,6 +134,7 @@ def _create_instances(
     associate_public_ip_address: bool,
     max_efa_interfaces: int,
     is_single_zone_request: bool = False,
+    provider_create_idempotency_token: str | None = None,
 ) -> list:
     """Compatibility facade for the extracted request implementation."""
     return instance_requests.create_instances(
@@ -142,7 +146,8 @@ def _create_instances(
         associate_public_ip_address,
         max_efa_interfaces,
         is_single_zone_request,
-        create_max_retries=BOTO_CREATE_MAX_RETRIES)
+        create_max_retries=BOTO_CREATE_MAX_RETRIES,
+        provider_create_idempotency_token=provider_create_idempotency_token)
 
 
 def _get_head_instance_id(instances: list) -> str | None:
@@ -212,28 +217,326 @@ def _capture_fresh_instance_identity(
                                       market_type=market_type)
 
 
+def _capture_request_aws_identity(request_session: Any,
+                                  region: str) -> tuple[str, str] | None:
+    """Return the account and principal used by this provisioner session."""
+    if request_session is None:
+        return None
+    try:
+        sts_client = request_session.client('sts', region_name=region)
+        caller_identity = sts_client.get_caller_identity()
+        if type(caller_identity) is not dict:
+            return None
+        account_id = caller_identity.get('Account')
+        principal_arn = caller_identity.get('Arn')
+        if (not isinstance(account_id, str) or
+                re.fullmatch(r'[0-9]{12}', account_id) is None or
+                not isinstance(principal_arn, str) or not principal_arn):
+            return None
+        return account_id, principal_arn
+    except Exception as error:  # pylint: disable=broad-except
+        # The caller decides whether identity is optional audit evidence or a
+        # required account-bound preflight. Keep this helper closed and let the
+        # tokenized paid path pause instead of confusing unavailability with a
+        # durable identity mismatch.
+        logger.debug('AWS account/principal evidence is unavailable: '
+                     f'{common_utils.format_exception(error)}')
+        return None
+
+
+def _capture_subnet_availability_zones(
+        request_session: Any, region: str,
+        subnet_ids: list[str]) -> dict[str, str] | None:
+    """Resolve every attempted subnet to its provider-native exact AZ."""
+    if request_session is None or not subnet_ids or any(
+            not isinstance(subnet_id, str) or not subnet_id
+            for subnet_id in subnet_ids):
+        return None
+    unique_subnet_ids = sorted(set(subnet_ids))
+    try:
+        ec2_client = request_session.client('ec2', region_name=region)
+        response = ec2_client.describe_subnets(SubnetIds=unique_subnet_ids)
+        if (type(response) is not dict or
+                type(response.get('Subnets')) is not list):
+            return None
+        subnet_availability_zones: dict[str, str] = {}
+        for subnet in response['Subnets']:
+            if type(subnet) is not dict:
+                return None
+            subnet_id = subnet.get('SubnetId')
+            availability_zone = subnet.get('AvailabilityZone')
+            if (not isinstance(subnet_id, str) or not subnet_id or
+                    not isinstance(availability_zone, str) or
+                    not availability_zone or
+                    subnet_id in subnet_availability_zones):
+                return None
+            subnet_availability_zones[subnet_id] = availability_zone
+        if set(subnet_availability_zones) != set(unique_subnet_ids):
+            return None
+        return subnet_availability_zones
+    except Exception as error:  # pylint: disable=broad-except
+        logger.debug('AWS subnet/AZ evidence is unavailable: '
+                     f'{common_utils.format_exception(error)}')
+        return None
+
+
+def _pause_ordinary_paid_provider_proof(
+        detail: str) -> exceptions.ExecutionPausedError:
+    """Pause one account-bound create until its read-only proof recovers.
+
+    The outer ordinary-launch association is already in ``PROVIDER_IO`` when
+    this AWS boundary runs. A prior execution generation may therefore have
+    reached ``RunInstances`` even when the current generation stops in its
+    STS/subnet preflight. Retrying the same immutable association is safe
+    because it reuses the same EC2 ClientToken; terminalizing or failing over
+    would instead strand the paid claim or risk a duplicate provider object.
+    """
+    return exceptions.ExecutionPausedError(
+        detail,
+        hint=('Retrying the same immutable ordinary-paid AWS association; '
+              'no failover or provider teardown is permitted while its '
+              'account/subnet proof is unavailable.'),
+        retry_wait_seconds=_ORDINARY_PAID_PROVIDER_PROOF_RETRY_SECONDS)
+
+
+def _single_availability_zone(provider_config: dict[str, Any]) -> str | None:
+    value = provider_config.get('availability_zone')
+    if not isinstance(value, str):
+        return None
+    zones = [zone.strip() for zone in value.split(',') if zone.strip()]
+    return zones[0] if len(zones) == 1 else None
+
+
+def _promote_provider_negative_ack(
+    error: BaseException,
+    *,
+    request_aws_identity: tuple[str, str] | None,
+    request_subnet_availability_zones: dict[str, str] | None,
+    region: str,
+    availability_zone: str | None,
+    cluster_name_on_cloud: str,
+    requested_count: int,
+    instance_type: object,
+    initial_nonterminated_instance_ids: list[str],
+    resumed_instance_ids: list[str],
+    created_instance_ids: list[str],
+    successful_create_calls: int,
+    provider_create_idempotency_token: str | None,
+    provider_create_account_id: str | None,
+) -> dict[str, Any] | None:
+    """Attach whole-invocation zero-effect evidence when fully proven."""
+    error_dict = getattr(error, '__dict__', None)
+    if type(error_dict) is not dict:
+        return None
+    # The private request-layer candidate is intentionally never serialized.
+    # Once the whole-invocation layer consumes it, only the independently
+    # validated public receipt may remain on the exception.
+    candidate = error_dict.pop(
+        instance_requests._AWS_RUN_INSTANCES_NEGATIVE_ACK_CANDIDATE_ATTR,  # pylint: disable=protected-access
+        None)
+    if (availability_zone is None or initial_nonterminated_instance_ids or
+            resumed_instance_ids or created_instance_ids or
+            successful_create_calls != 0 or type(requested_count) is not int or
+            requested_count < 1 or not isinstance(instance_type, str) or
+            not instance_type):
+        return None
+    candidate_keys = {
+        'schema_version', 'provider', 'operation', 'reason',
+        'cluster_name_on_cloud', 'requested_count', 'market', 'instance_type',
+        'client_token', 'attempts'
+    }
+    if (type(candidate) is not dict or set(candidate) != candidate_keys or
+            candidate['schema_version'] != 1 or
+            candidate['provider'] != 'aws' or
+            candidate['operation'] != 'RunInstances' or
+            candidate['reason'] not in ('capacity', 'quota') or
+            candidate['cluster_name_on_cloud'] != cluster_name_on_cloud or
+            candidate['requested_count'] != requested_count or
+            candidate['market'] != 'spot' or
+            candidate['instance_type'] != instance_type or
+            candidate['client_token'] != provider_create_idempotency_token or
+            not capacity_policy.valid_aws_run_instances_client_token(
+                provider_create_idempotency_token) or
+            type(candidate['attempts']) is not list or
+            not candidate['attempts']):
+        return None
+    raw_attempt_keys = {
+        'provider_request_id', 'error_code', 'reason', 'http_status_code',
+        'subnet_id', 'market', 'instance_type', 'cluster_name_on_cloud',
+        'min_count', 'max_count', 'capacity_reservation_id', 'client_token'
+    }
+    raw_subnet_ids: list[str] = []
+    for raw_attempt in candidate['attempts']:
+        if type(raw_attempt
+               ) is not dict or set(raw_attempt) != raw_attempt_keys:
+            return None
+        raw_subnet_ids.append(raw_attempt['subnet_id'])
+
+    # Tokenized paid launches attest the provider account and their one exact
+    # subnet before any EC2 inventory or create effect.  Reuse that immutable
+    # preflight result here: a transient lookup after a typed rejection must
+    # not strand an otherwise exact zero-effect launch indefinitely.
+    if (request_aws_identity is None or
+            request_aws_identity[0] != provider_create_account_id):
+        return None
+    if request_subnet_availability_zones is None:
+        return None
+    aws_account_id, aws_principal_arn = request_aws_identity
+    if any(
+            request_subnet_availability_zones.get(subnet_id) !=
+            availability_zone for subnet_id in raw_subnet_ids):
+        return None
+
+    attempts: list[dict[str, Any]] = []
+    for raw_attempt in candidate['attempts']:
+        attempts.append({
+            'provider_request_id': raw_attempt['provider_request_id'],
+            'error_code': raw_attempt['error_code'],
+            'reason': raw_attempt['reason'],
+            'http_status_code': raw_attempt['http_status_code'],
+            'aws_account_id': aws_account_id,
+            'aws_principal_arn': aws_principal_arn,
+            'region': region,
+            'availability_zone': availability_zone,
+            'subnet_id': raw_attempt['subnet_id'],
+            'market': raw_attempt['market'],
+            'instance_type': raw_attempt['instance_type'],
+            'cluster_name_on_cloud': raw_attempt['cluster_name_on_cloud'],
+            'min_count': raw_attempt['min_count'],
+            'max_count': raw_attempt['max_count'],
+            'capacity_reservation_id': raw_attempt['capacity_reservation_id'],
+            'client_token': raw_attempt['client_token'],
+        })
+    receipt = {
+        'schema_version': 1,
+        'provider': 'aws',
+        'operation': 'RunInstances',
+        'reason': candidate['reason'],
+        'aws_account_id': aws_account_id,
+        'aws_principal_arn': aws_principal_arn,
+        'cluster_name_on_cloud': cluster_name_on_cloud,
+        'requested_count': requested_count,
+        'market': 'spot',
+        'instance_type': instance_type,
+        'region': region,
+        'availability_zone': availability_zone,
+        'client_token': provider_create_idempotency_token,
+        'invocations': [{
+            'region': region,
+            'availability_zone': availability_zone,
+            'initial_nonterminated_instance_ids': [],
+            'resumed_instance_ids': [],
+            'created_instance_ids': [],
+            'successful_create_calls': 0,
+            'ambiguous_create_calls': 0,
+            'create_call_count': len(attempts),
+            'attempts': attempts,
+        }],
+    }
+    canonical = capacity_policy.validate_provider_negative_ack(
+        receipt,
+        cluster_name=cluster_name_on_cloud,
+        requested_count=requested_count,
+        client_token=provider_create_idempotency_token,
+        expected_aws_account_id=provider_create_account_id)
+    return canonical
+
+
 def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                   config: common.ProvisionConfig) -> common.ProvisionRecord:
     """See sky/provision/__init__.py"""
     del cluster_name  # unused
     is_single_zone_request = _is_single_zone_request(config.provider_config)
 
-    ec2 = _default_ec2_resource(region)
+    expected_account_id = config.provider_create_account_id
+    expected_client_token = config.provider_create_idempotency_token
+    if (expected_account_id is None) != (expected_client_token is None):
+        raise exceptions.ServeReplicaLaunchFenceError(
+            'Ordinary-paid AWS provider scope does not match the active '
+            'workspace credentials.')
+    exact_availability_zone = _single_availability_zone(config.provider_config)
+    raw_subnet_ids = config.node_config.get('SubnetIds')
+    if expected_account_id is not None:
+        capacity_reservation_target = (config.node_config.get(
+            'CapacityReservationSpecification',
+            {}).get('CapacityReservationTarget'))
+        # One association owns one EC2 idempotency token and therefore one
+        # immutable RunInstances parameter set. Refuse configurations that
+        # could split the launch across reservations/subnets or AZs before any
+        # credential or EC2 call.
+        if (re.fullmatch(r'[0-9]{12}', expected_account_id) is None or
+                not capacity_policy.valid_aws_run_instances_client_token(
+                    expected_client_token) or exact_availability_zone is None or
+                capacity_reservation_target or
+                type(raw_subnet_ids) is not list or len(raw_subnet_ids) != 1 or
+                not isinstance(raw_subnet_ids[0], str) or
+                not raw_subnet_ids[0]):
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'Ordinary-paid AWS provider scope must bind one valid account '
+                'and client token, one exact availability zone, and one exact '
+                'subnet without a targeted capacity reservation.')
+    try:
+        ec2 = _default_ec2_resource(region)
+    except Exception as error:  # pylint: disable=broad-except
+        if expected_account_id is not None:
+            raise _pause_ordinary_paid_provider_proof(
+                'Ordinary-paid AWS credentials are temporarily unavailable '
+                'before provider inventory.') from error
+        raise
     # aws.resource() above and aws.session() share the same thread-local
     # workspace-profile session. Fetch it after creating the resource so the
     # compatibility reload in _default_ec2_resource(), if any, has completed.
     # This retains the exact provisioning credential scope for the optional
     # post-create DescribeInstances/STS evidence rather than resolving a new
     # ambient/default session later in the backend.
+    request_session_error = None
     try:
         request_session = aws.session(check_credentials=True,
                                       profile=aws.get_workspace_profile())
-    except Exception:  # pylint: disable=broad-except
+    except Exception as error:  # pylint: disable=broad-except
         request_session = None
+        request_session_error = error
+    request_aws_identity = None
+    request_subnet_availability_zones = None
+    if expected_account_id is not None:
+        if request_session is None:
+            raise _pause_ordinary_paid_provider_proof(
+                'Ordinary-paid AWS request credentials are temporarily '
+                'unavailable before provider inventory.') from (
+                    request_session_error)
+        request_aws_identity = _capture_request_aws_identity(
+            request_session, region)
+        if request_aws_identity is None:
+            raise _pause_ordinary_paid_provider_proof(
+                'Ordinary-paid AWS account proof is temporarily unavailable '
+                'before provider inventory.')
+        if request_aws_identity[0] != expected_account_id:
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'Ordinary-paid AWS provider scope does not match the active '
+                'workspace credentials.')
+        assert isinstance(raw_subnet_ids, list)
+        request_subnet_availability_zones = (_capture_subnet_availability_zones(
+            request_session, region, raw_subnet_ids))
+        if request_subnet_availability_zones is None:
+            raise _pause_ordinary_paid_provider_proof(
+                'Ordinary-paid AWS subnet proof is temporarily unavailable '
+                'before provider inventory.')
+        if (request_subnet_availability_zones.get(raw_subnet_ids[0]) !=
+                exact_availability_zone):
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'Ordinary-paid AWS provider subnet does not match its '
+                'immutable availability-zone scope.')
     # NOTE: We set max_attempts=0 for fast failing when the resource is not
     # available (although the doc says it will only retry for network
     # issues, practically, it retries for capacity errors, etc as well).
-    ec2_fail_fast = aws.resource('ec2', region_name=region, max_attempts=0)
+    try:
+        ec2_fail_fast = aws.resource('ec2', region_name=region, max_attempts=0)
+    except Exception as error:  # pylint: disable=broad-except
+        if expected_account_id is not None:
+            raise _pause_ordinary_paid_provider_proof(
+                'Ordinary-paid AWS EC2 request client is temporarily '
+                'unavailable before provider inventory.') from error
+        raise
 
     region = ec2.meta.client.meta.region_name
     zone = None
@@ -246,24 +549,85 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
     tags[constants.TAG_SKYPILOT_MANAGED] = (
         constants.SKYPILOT_MANAGED_TAG_VALUE)
     tags = dict(sorted(tags.items()))
-    filters: list[ec2_type_defs.FilterTypeDef] = [{
-        'Name': 'instance-state-name',
-        'Values': ['pending', 'running', 'stopping', 'stopped'],
-    }, {
-        'Name': f'tag:{constants.TAG_RAY_CLUSTER_NAME}',
-        'Values': [cluster_name_on_cloud],
-    }]
-    exist_instances = list(ec2.instances.filter(Filters=filters))
-    exist_instances.sort(key=lambda x: x.id)
-    head_instance_id = _get_head_instance_id(exist_instances)
+    filters: list[ec2_type_defs.FilterTypeDef] = [
+        {
+            'Name': 'instance-state-name',
+            # A shutting-down instance is still a provider object and therefore
+            # prevents zero-effect certification, even though normal launch logic
+            # does not try to reuse it.
+            'Values': [
+                'pending', 'running', 'stopping', 'stopped', 'shutting-down'
+            ],
+        },
+        {
+            'Name': f'tag:{constants.TAG_RAY_CLUSTER_NAME}',
+            'Values': [cluster_name_on_cloud],
+        }
+    ]
+    try:
+        initial_inventory_instances = list(
+            ec2.instances.filter(Filters=filters))
+        # Boto resources may lazily load these attributes. Materialize every
+        # read needed to classify the pre-create inventory inside the same
+        # retryable proof boundary; no provider mutation has happened yet.
+        raw_inventory = [(instance, instance.id, instance.state, instance.tags)
+                         for instance in initial_inventory_instances]
+    except Exception as error:  # pylint: disable=broad-except
+        if expected_account_id is not None:
+            raise _pause_ordinary_paid_provider_proof(
+                'Ordinary-paid AWS instance inventory is temporarily '
+                'unavailable before provider create.') from error
+        raise
+
+    inventory: list[tuple[Any, str, str, list[dict[str, str]]]] = []
+    seen_instance_ids: set[str] = set()
+    allowed_states = frozenset(
+        {'pending', 'running', 'stopping', 'stopped', 'shutting-down'})
+    for instance, instance_id, state, instance_tags in raw_inventory:
+        state_name = state.get('Name') if isinstance(state, dict) else None
+        valid_tags = bool(
+            isinstance(instance_tags, list) and all(
+                isinstance(tag, dict) and isinstance(tag.get('Key'), str) and
+                isinstance(tag.get('Value'), str) for tag in instance_tags))
+        if (not isinstance(instance_id, str) or not instance_id or
+                instance_id in seen_instance_ids or
+                not isinstance(state_name, str) or
+                state_name not in allowed_states or not valid_tags):
+            detail = ('AWS returned malformed or duplicate instance inventory '
+                      f'for cluster {cluster_name_on_cloud!r}.')
+            if expected_account_id is not None:
+                raise exceptions.ServeReplicaLaunchFenceError(detail)
+            raise RuntimeError(detail)
+        seen_instance_ids.add(instance_id)
+        assert isinstance(state_name, str)
+        assert isinstance(instance_tags, list)
+        inventory.append((instance, instance_id, state_name, instance_tags))
+
+    initial_nonterminated_instance_ids = sorted(seen_instance_ids)
+    existing_inventory = [
+        item for item in inventory if item[2] != 'shutting-down'
+    ]
+    existing_inventory.sort(key=lambda item: item[1])
+    exist_instances = [item[0] for item in existing_inventory]
+    head_instance_id = None
+    head_node_markers = tuple(constants.HEAD_NODE_TAGS.items())
+    for _, instance_id, _, instance_tags in existing_inventory:
+        if any((tag['Key'], tag['Value']) in head_node_markers
+               for tag in instance_tags):
+            if head_instance_id is not None:
+                logger.warning(
+                    'There are multiple head nodes in the cluster '
+                    f'(current head instance id: {head_instance_id}, '
+                    f'newly discovered id: {instance_id}). It is likely '
+                    'that something goes wrong.')
+            head_instance_id = instance_id
 
     pending_instances = []
     running_instances = []
     stopping_instances = []
     stopped_instances = []
 
-    for inst in exist_instances:
-        state = inst.state['Name']
+    for inst, _, state, _ in existing_inventory:
         if state == 'pending':
             pending_instances.append(inst)
         elif state == 'running':
@@ -273,7 +637,7 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
         elif state == 'stopped':
             stopped_instances.append(inst)
         else:
-            raise RuntimeError(f'Impossible state "{state}".')
+            assert False, state
 
     def _create_node_tag(target_instance, is_head: bool = True) -> str:
         node_type_tags = (constants.HEAD_NODE_TAGS
@@ -354,8 +718,8 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 # SkyPilot more responsive.
                 fut = pool_.apply_async(inst.wait_until_stopped)
                 per_instance_time_start = time.time()
-                while (time.time() - per_instance_time_start
-                       < _RESUME_PER_INSTANCE_TIMEOUT):
+                while (time.time() - per_instance_time_start <
+                       _RESUME_PER_INSTANCE_TIMEOUT):
                     if fut.ready():
                         fut.get()
                         break
@@ -406,7 +770,68 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
             'CapacityReservationSpecification',
             {}).get('CapacityReservationTarget',
                     {}).get('CapacityReservationId', []))
-        created_instances = []
+        created_instances: list[Any] = []
+        successful_create_calls = 0
+
+        def _create_fresh_instances(node_config: dict[str, Any],
+                                    count: int) -> list:
+            nonlocal successful_create_calls
+            try:
+                instances = _create_instances(
+                    ec2_fail_fast,
+                    cluster_name_on_cloud,
+                    node_config,
+                    tags,
+                    count,
+                    associate_public_ip_address=(
+                        not config.provider_config['use_internal_ips']),
+                    max_efa_interfaces=max_efa_interfaces,
+                    is_single_zone_request=is_single_zone_request,
+                    provider_create_idempotency_token=(
+                        config.provider_create_idempotency_token))
+            except Exception as error:
+                provider_negative_ack = _promote_provider_negative_ack(
+                    error,
+                    request_aws_identity=request_aws_identity,
+                    request_subnet_availability_zones=(
+                        request_subnet_availability_zones),
+                    region=region,
+                    availability_zone=exact_availability_zone,
+                    cluster_name_on_cloud=cluster_name_on_cloud,
+                    requested_count=config.count,
+                    instance_type=config.node_config.get('InstanceType'),
+                    initial_nonterminated_instance_ids=(
+                        initial_nonterminated_instance_ids),
+                    resumed_instance_ids=resumed_instance_ids,
+                    created_instance_ids=[
+                        instance.id for instance in created_instances
+                    ],
+                    successful_create_calls=successful_create_calls,
+                    provider_create_idempotency_token=(
+                        config.provider_create_idempotency_token),
+                    provider_create_account_id=(
+                        config.provider_create_account_id))
+                if provider_negative_ack is not None:
+                    rejected = common.ProviderCreateRejectedError(str(error))
+                    rejected.provider_negative_ack = provider_negative_ack
+                    rejected.requested_count = config.count
+                    provider_errors = getattr(error, 'errors', None)
+                    if isinstance(provider_errors, list):
+                        rejected.errors = copy.deepcopy(provider_errors)
+                    raise rejected from error
+                if (config.provider_create_idempotency_token is not None and
+                        not isinstance(
+                            error, exceptions.ProviderCreateAmbiguousError)):
+                    # The SDK call ran, but the closed whole-invocation
+                    # rejection could not be promoted. Keep replaying this
+                    # association/token; cleanup or failover could otherwise
+                    # delete or duplicate an unobserved successful create.
+                    raise instance_requests._provider_create_ambiguous_error(  # pylint: disable=protected-access
+                    ) from error
+                raise
+            successful_create_calls += 1
+            return instances
+
         if target_reservation_names:
             node_config = copy.deepcopy(config.node_config)
             # Clear the capacity reservation specification settings in the
@@ -451,16 +876,8 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                     node_config['InstanceMarketOptions'] = {
                         'MarketType': aws_utils.ReservationType.BLOCK.value
                     }
-                created_reserved_instances = _create_instances(
-                    ec2_fail_fast,
-                    cluster_name_on_cloud,
-                    node_config,
-                    tags,
-                    reservation_count,
-                    associate_public_ip_address=(
-                        not config.provider_config['use_internal_ips']),
-                    max_efa_interfaces=max_efa_interfaces,
-                    is_single_zone_request=is_single_zone_request)
+                created_reserved_instances = _create_fresh_instances(
+                    node_config, reservation_count)
                 created_instances.extend(created_reserved_instances)
                 to_start_count -= reservation_count
                 if to_start_count <= 0:
@@ -476,16 +893,8 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
             # as we have already created the instances with the reservations.
             config.node_config.get('CapacityReservationSpecification',
                                    {}).pop('CapacityReservationTarget', None)
-            created_remaining_instances = _create_instances(
-                ec2_fail_fast,
-                cluster_name_on_cloud,
-                config.node_config,
-                tags,
-                to_start_count,
-                associate_public_ip_address=(
-                    not config.provider_config['use_internal_ips']),
-                max_efa_interfaces=max_efa_interfaces,
-                is_single_zone_request=is_single_zone_request)
+            created_remaining_instances = _create_fresh_instances(
+                config.node_config, to_start_count)
 
             created_instances.extend(created_remaining_instances)
         created_instances.sort(key=lambda x: x.id)

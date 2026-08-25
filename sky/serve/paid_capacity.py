@@ -14,12 +14,15 @@ import functools
 import json
 import math
 import os
+import re
 import threading
 import time
 import typing
 from typing import Any
 
+from sky import clouds
 from sky import sky_logging
+from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.serve import constants
 from sky.serve import spot_placer
@@ -62,7 +65,9 @@ _FAILURE_COOLDOWN_SECONDS_ENV_VAR = (
     'SKYPILOT_SERVE_PAID_LOCATION_FAILURE_COOLDOWN_SECONDS')
 _ADMISSION_SUMMARY_LOG_MIN_INTERVAL_SECONDS = 30
 _ADMISSION_SUMMARY_LOG_INTERVAL_SECONDS = 5 * 60
-_POOL_KEY_VERSION = 1
+_LEGACY_POOL_KEY_VERSION = 1
+_POOL_KEY_VERSION = 2
+_AWS_ACCOUNT_ID_RE = re.compile(r'[0-9]{12}')
 _UNRESOLVED_STATUS_VALUES = frozenset({'PENDING', 'PROVISIONING'})
 _admission_summary_log_lock = threading.Lock()
 _admission_summary_log_signature: tuple[Any, ...] | None = None
@@ -493,11 +498,93 @@ def _normalized_accelerators(
     return normalized
 
 
-def pool_key(location: spot_placer.Location, *, workspace: str,
-             num_nodes: int) -> str:
+def _active_aws_account_id_for_workspace(workspace: str,
+                                         cloud: clouds.Cloud) -> str:
+    """Resolve the account that one workspace will use for AWS effects."""
+    if not isinstance(workspace, str) or not workspace:
+        raise ValueError('workspace must be nonempty.')
+    if not isinstance(cloud, clouds.AWS):
+        raise ValueError('AWS account resolution requires an AWS cloud.')
+    with skypilot_config.local_active_workspace_ctx(workspace):
+        active_identity = cloud.get_active_user_identity()
+    account_id = (active_identity[1] if isinstance(active_identity,
+                                                   (list, tuple)) and
+                  len(active_identity) >= 2 else None)
+    if (not isinstance(account_id, str) or
+            _AWS_ACCOUNT_ID_RE.fullmatch(account_id) is None):
+        raise ValueError('Active AWS account identity is unavailable.')
+    return account_id
+
+
+def _provider_identity_for_location(
+    location: spot_placer.Location,
+    *,
+    workspace: str,
+    aws_account_id: str | None = None,
+) -> dict[str, str] | None:
+    if not isinstance(location.cloud, clouds.AWS):
+        return None
+    account_id = aws_account_id
+    if (not isinstance(account_id, str) or
+            _AWS_ACCOUNT_ID_RE.fullmatch(account_id) is None):
+        raise ValueError('AWS paid pool requires one exact account ID.')
+    return {'aws_account_id': account_id}
+
+
+def _active_aws_account_id_for_locations(
+        locations: Iterable[spot_placer.Location], *,
+        workspace: str) -> str | None:
+    """Resolve one workspace account once for a placement/budget snapshot."""
+    aws_clouds = [
+        location.cloud
+        for location in locations
+        if isinstance(location.cloud, clouds.AWS)
+    ]
+    if not aws_clouds:
+        return None
+    return _active_aws_account_id_for_workspace(workspace, aws_clouds[0])
+
+
+def pool_key(location: spot_placer.Location,
+             *,
+             workspace: str,
+             num_nodes: int,
+             aws_account_id: str | None = None) -> str:
     """Build a stable identity for one exact provider capacity pool."""
     payload = {
-        'version': _POOL_KEY_VERSION,
+        # Account scope is an AWS provider requirement.  Keep every other
+        # provider on the existing v1 identity so this AWS-only safety change
+        # neither resets its admission history nor widens its rollout surface.
+        'version': (_POOL_KEY_VERSION if isinstance(location.cloud, clouds.AWS)
+                    else _LEGACY_POOL_KEY_VERSION),
+        'workspace': workspace,
+        'cloud': str(location.cloud).casefold(),
+        'region': location.region,
+        'zone': location.zone,
+        'instance_type': location.instance_type,
+        'accelerators': _normalized_accelerators(location.accelerators),
+        'use_spot': location.use_spot,
+        'num_nodes': num_nodes,
+    }
+    if isinstance(location.cloud, clouds.AWS):
+        payload['provider_identity'] = _provider_identity_for_location(
+            location, workspace=workspace, aws_account_id=aws_account_id)
+    return json.dumps(payload, sort_keys=True, separators=(',', ':'))
+
+
+def _legacy_pool_key(location: spot_placer.Location, *, workspace: str,
+                     num_nodes: int) -> str:
+    """Build the account-unscoped v1 key used only for legacy settlement.
+
+    A replica which predates account-scoped paid admission has no durable fact
+    proving which AWS account owns a possibly-created provider object.  Its
+    recovery claim must preserve that uncertainty instead of freezing whatever
+    account happens to be active after restart.  Cohort-11 provider effects
+    reject this legacy key, while the claim can still conservatively account
+    for the unresolved replica.
+    """
+    payload = {
+        'version': _LEGACY_POOL_KEY_VERSION,
         'workspace': workspace,
         'cloud': str(location.cloud).casefold(),
         'region': location.region,
@@ -525,14 +612,19 @@ def _pool_key_payload(key: str) -> dict[str, Any] | None:
         payload = json.loads(key)
     except (TypeError, ValueError):
         return None
-    expected_fields = {
+    legacy_fields = {
         'version', 'workspace', 'cloud', 'region', 'zone', 'instance_type',
         'accelerators', 'use_spot', 'num_nodes'
     }
-    if (not isinstance(payload, dict) or set(payload) != expected_fields or
+    current_fields = legacy_fields | {'provider_identity'}
+    if (not isinstance(payload, dict) or
+        (payload.get('version') == _LEGACY_POOL_KEY_VERSION and
+         set(payload) != legacy_fields) or
+        (payload.get('version') == _POOL_KEY_VERSION and
+         set(payload) != current_fields) or payload.get('version')
+            not in (_LEGACY_POOL_KEY_VERSION, _POOL_KEY_VERSION) or
             type(payload.get('version')) is not int or  # pylint: disable=unidiomatic-typecheck
-            payload['version'] != _POOL_KEY_VERSION
-            or not isinstance(payload.get('workspace'), str)
+            not isinstance(payload.get('workspace'), str)
             or not payload['workspace']
             or not isinstance(payload.get('cloud'), str) or not payload['cloud']
             or not isinstance(payload.get('region'), str)
@@ -547,6 +639,15 @@ def _pool_key_payload(key: str) -> dict[str, Any] | None:
             payload['num_nodes'] <= 0
             or not isinstance(payload.get('accelerators'), list)):
         return None
+    if payload['version'] == _POOL_KEY_VERSION:
+        provider_identity = payload['provider_identity']
+        if (payload['cloud'] != 'aws' or
+                not isinstance(provider_identity, dict) or
+                set(provider_identity) != {'aws_account_id'} or
+                not isinstance(provider_identity['aws_account_id'], str) or
+                _AWS_ACCOUNT_ID_RE.fullmatch(
+                    provider_identity['aws_account_id']) is None):
+            return None
     names = []
     for accelerator in payload['accelerators']:
         if (not isinstance(accelerator, list) or len(accelerator) != 2 or
@@ -563,6 +664,33 @@ def _pool_key_payload(key: str) -> dict[str, Any] | None:
     if json.dumps(payload, sort_keys=True, separators=(',', ':')) != key:
         return None
     return payload
+
+
+def pool_key_payload(key: str) -> dict[str, Any] | None:
+    """Decode one canonical exact paid provider-pool identity."""
+    payload = _pool_key_payload(key)
+    return None if payload is None else dict(payload)
+
+
+def _frozen_aws_account_id_from_replica_infos(
+        replica_infos: Iterable['replica_managers.ReplicaInfo'], *,
+        workspace: str) -> str | None:
+    """Recover one already-committed account without provider I/O."""
+    account_ids: set[str] = set()
+    for info in replica_infos:
+        key = getattr(info, 'paid_capacity_pool_key', None)
+        if not isinstance(key, str):
+            continue
+        payload = _pool_key_payload(key)
+        if (payload is None or payload['version'] != _POOL_KEY_VERSION or
+                payload['workspace'] != workspace or payload['cloud'] != 'aws'):
+            continue
+        provider_identity = payload['provider_identity']
+        assert isinstance(provider_identity, dict)
+        account_ids.add(provider_identity['aws_account_id'])
+    if len(account_ids) != 1:
+        return None
+    return next(iter(account_ids))
 
 
 def frontier_key_from_pool_key(key: str) -> FrontierKey | None:
@@ -622,9 +750,10 @@ def _log_admission_summary(states: dict[str, dict[str, Any]],
             live_paid_gpu_units is not None):
         paid_gpu_units_remaining = max(
             0, max_live_paid_gpu_units - live_paid_gpu_units)
-    signature = (len(states), tuple(sorted(state_counts.items())), overage_pools
-                 > 0, service_remaining == 0, max_live_paid_gpu_units,
-                 live_paid_gpu_units, paid_gpu_units_remaining)
+    signature = (len(states), tuple(sorted(state_counts.items())),
+                 overage_pools > 0, service_remaining == 0,
+                 max_live_paid_gpu_units, live_paid_gpu_units,
+                 paid_gpu_units_remaining)
     observed_at = time.monotonic()
     global _admission_summary_log_signature
     global _admission_summary_logged_at
@@ -671,8 +800,8 @@ def _live_paid_gpu_units(
     for info in existing_replica_infos:
         down_status = info.status_property.sky_down_status
         down_status_value = getattr(down_status, 'value', down_status)
-        if (info.is_zero_cost is not True and down_status_value
-                != common_utils.ProcessStatus.SUCCEEDED.value):
+        if (info.is_zero_cost is not True and down_status_value !=
+                common_utils.ProcessStatus.SUCCEEDED.value):
             planned_capacity = getattr(info, 'planned_capacity', None)
             if (type(planned_capacity) is not int or  # pylint: disable=unidiomatic-typecheck
                     planned_capacity < 1):
@@ -774,6 +903,7 @@ def build_launch_budget(
     service_hash: str | None = None,
     requested_frontier_keys: set[FrontierKey] | None = None,
     max_live_paid_gpu_units: int | None = None,
+    allow_provider_identity_lookup: bool = True,
 ) -> LaunchBudget:
     """Read one advisory shared-capacity snapshot for all active paid pools."""
     if (max_live_paid_gpu_units is not None and
@@ -786,13 +916,17 @@ def build_launch_budget(
         location for location in placer.ranked_active_locations()
         if location not in zero_cost
     ]
-    keys = {
-        location:
-            pool_key(location, workspace=workspace, num_nodes=placer.num_nodes)
-        for location in paid_locations
-    }
     live_paid_gpu_units = _live_paid_gpu_units(existing_replica_infos)
     if not globally_managed or not central_authority_available():
+        # Preserve the pre-account-scope local policy exactly.  It neither has
+        # PostgreSQL authority to freeze an account nor needs provider identity
+        # to enforce its process-local unresolved-launch window.
+        keys = {
+            location: _legacy_pool_key(location,
+                                       workspace=workspace,
+                                       num_nodes=placer.num_nodes)
+            for location in paid_locations
+        }
         if max_live_paid_gpu_units is not None:
             # A configured hard cost bound requires the shared PostgreSQL
             # service lock. Never silently widen it to the legacy local
@@ -813,6 +947,41 @@ def build_launch_budget(
                             states_by_pool_key={},
                             globally_managed=False,
                             live_paid_gpu_units=live_paid_gpu_units)
+
+    aws_account_id = None
+    if allow_provider_identity_lookup:
+        try:
+            aws_account_id = _active_aws_account_id_for_locations(
+                paid_locations, workspace=workspace)
+        except Exception as error:  # pylint: disable=broad-except
+            # Paid AWS identity is a hard correctness scope, but its transient
+            # unavailability must not suppress zero-cost Kubernetes fill or other
+            # paid providers in the same heterogeneous service.
+            logger.warning('Disabling AWS paid candidates because the exact '
+                           'workspace account is unavailable: '
+                           f'{common_utils.format_exception(error)}')
+            paid_locations = [
+                location for location in paid_locations
+                if not isinstance(location.cloud, clouds.AWS)
+            ]
+    else:
+        # Dashboard/status rendering is advisory and must remain provider-free.
+        # Reuse an exact account already frozen in a live replica, or omit AWS
+        # admission from that read snapshot until the launch path freezes one.
+        aws_account_id = _frozen_aws_account_id_from_replica_infos(
+            existing_replica_infos, workspace=workspace)
+        if aws_account_id is None:
+            paid_locations = [
+                location for location in paid_locations
+                if not isinstance(location.cloud, clouds.AWS)
+            ]
+    keys = {
+        location: pool_key(location,
+                           workspace=workspace,
+                           num_nodes=placer.num_nodes,
+                           aws_account_id=aws_account_id)
+        for location in paid_locations
+    }
 
     states = serve_state.get_paid_capacity_pool_states(
         list(keys.values()),
@@ -1361,9 +1530,20 @@ def adopt_existing_claims(
         location = placer.resolve_location(replica_location)
         if location is None or location in zero_cost:
             continue
-        key = pool_key(location,
-                       workspace=workspace,
-                       num_nodes=placer.num_nodes)
+        if isinstance(location.cloud, clouds.AWS):
+            # This row existed before it had a durable paid-pool identity.
+            # Never infer its provider account from ambient restart
+            # credentials: the unresolved launch may have effected a
+            # different account.  Retain an account-unscoped v1 claim for
+            # conservative settlement; cohort-11 AWS provider effects require
+            # v2 and therefore fail closed.
+            key = _legacy_pool_key(location,
+                                   workspace=workspace,
+                                   num_nodes=placer.num_nodes)
+        else:
+            key = pool_key(location,
+                           workspace=workspace,
+                           num_nodes=placer.num_nodes)
         claims.append((info.replica_id, key, priority, info))
     return serve_state.adopt_paid_capacity_claims(
         service_name,

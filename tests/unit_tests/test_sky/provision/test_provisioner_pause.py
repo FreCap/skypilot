@@ -51,9 +51,13 @@ def _call_bulk_provision(
     tmp_path,
     provider_effect_guard_factory: common.ProviderEffectGuardFactory |
     None = None,
+    *,
+    cloud: clouds.Cloud | None = None,
+    provider_create_idempotency_token: str | None = None,
+    provider_create_account_id: str | None = None,
 ):
     return provisioner.bulk_provision(
-        cloud=clouds.Kubernetes(),
+        cloud=cloud or clouds.Kubernetes(),
         region=clouds.Region('us'),
         zones=None,
         cluster_name=resources_utils.ClusterName('c', 'c-on-cloud'),
@@ -61,7 +65,56 @@ def _call_bulk_provision(
         cluster_yaml='/fake/cluster.yaml',
         prev_cluster_ever_up=False,
         log_dir=str(tmp_path),
+        provider_create_idempotency_token=(provider_create_idempotency_token),
+        provider_create_account_id=provider_create_account_id,
         provider_effect_guard_factory=(provider_effect_guard_factory))
+
+
+def _provider_negative_ack() -> dict:
+    client_token = 'a' * 64
+    return {
+        'schema_version': 1,
+        'provider': 'aws',
+        'operation': 'RunInstances',
+        'reason': 'capacity',
+        'aws_account_id': '123456789012',
+        'aws_principal_arn': 'arn:aws:sts::123456789012:assumed-role/test/run',
+        'cluster_name_on_cloud': 'c-on-cloud',
+        'requested_count': 1,
+        'market': 'spot',
+        'instance_type': 'g6.4xlarge',
+        'region': 'us-east-1',
+        'availability_zone': 'us-east-1a',
+        'client_token': client_token,
+        'invocations': [{
+            'region': 'us-east-1',
+            'availability_zone': 'us-east-1a',
+            'initial_nonterminated_instance_ids': [],
+            'resumed_instance_ids': [],
+            'created_instance_ids': [],
+            'successful_create_calls': 0,
+            'ambiguous_create_calls': 0,
+            'create_call_count': 1,
+            'attempts': [{
+                'provider_request_id': 'request-1',
+                'error_code': 'InsufficientInstanceCapacity',
+                'reason': 'capacity',
+                'http_status_code': 500,
+                'aws_account_id': '123456789012',
+                'aws_principal_arn': 'arn:aws:sts::123456789012:assumed-role/test/run',
+                'region': 'us-east-1',
+                'availability_zone': 'us-east-1a',
+                'subnet_id': 'subnet-a',
+                'market': 'spot',
+                'instance_type': 'g6.4xlarge',
+                'cluster_name_on_cloud': 'c-on-cloud',
+                'min_count': 1,
+                'max_count': 1,
+                'capacity_reservation_id': None,
+                'client_token': client_token,
+            }],
+        }],
+    }
 
 
 def test_bulk_provision_does_not_teardown_on_pause(patched_bulk_provision,
@@ -79,6 +132,22 @@ def test_bulk_provision_does_not_teardown_on_pause(patched_bulk_provision,
     patched_bulk_provision.assert_not_called()
 
 
+def test_bulk_provision_does_not_teardown_ambiguous_provider_create(
+        patched_bulk_provision, monkeypatch, tmp_path):
+    paused = exceptions.ProviderCreateAmbiguousError(
+        'RunInstances response lost',
+        hint='replay same association and ClientToken',
+        retry_wait_seconds=5)
+    monkeypatch.setattr(provisioner, '_bulk_provision',
+                        mock.MagicMock(side_effect=paused))
+
+    with pytest.raises(exceptions.ProviderCreateAmbiguousError) as exc_info:
+        _call_bulk_provision(tmp_path)
+
+    assert exc_info.value is paused
+    patched_bulk_provision.assert_not_called()
+
+
 def test_bulk_provision_tears_down_on_ordinary_failure(patched_bulk_provision,
                                                        monkeypatch, tmp_path):
     """Negative control: an ordinary failure still tears down.
@@ -92,6 +161,44 @@ def test_bulk_provision_tears_down_on_ordinary_failure(patched_bulk_provision,
 
     with pytest.raises(RuntimeError, match='provisioning failed'):
         _call_bulk_provision(tmp_path)
+
+    patched_bulk_provision.assert_called_once()
+
+
+def test_bulk_provision_skips_teardown_for_exact_provider_negative_ack(
+        patched_bulk_provision, monkeypatch, tmp_path):
+    receipt = _provider_negative_ack()
+    rejected = common.ProviderCreateRejectedError('provider rejected create')
+    rejected.provider_negative_ack = receipt
+    monkeypatch.setattr(provisioner, '_bulk_provision',
+                        mock.MagicMock(side_effect=rejected))
+
+    with pytest.raises(common.ProviderCreateRejectedError) as exc_info:
+        _call_bulk_provision(
+            tmp_path,
+            cloud=clouds.AWS(),
+            provider_create_idempotency_token=receipt['client_token'],
+            provider_create_account_id=receipt['aws_account_id'])
+
+    assert exc_info.value.provider_negative_ack == receipt
+    patched_bulk_provision.assert_not_called()
+
+
+def test_bulk_provision_does_not_trust_malformed_provider_negative_ack(
+        patched_bulk_provision, monkeypatch, tmp_path):
+    receipt = _provider_negative_ack()
+    receipt['aws_account_id'] = '210987654321'
+    rejected = common.ProviderCreateRejectedError('untrusted rejection')
+    rejected.provider_negative_ack = receipt
+    monkeypatch.setattr(provisioner, '_bulk_provision',
+                        mock.MagicMock(side_effect=rejected))
+
+    with pytest.raises(common.ProviderCreateRejectedError):
+        _call_bulk_provision(
+            tmp_path,
+            cloud=clouds.AWS(),
+            provider_create_idempotency_token=receipt['client_token'],
+            provider_create_account_id='123456789012')
 
     patched_bulk_provision.assert_called_once()
 

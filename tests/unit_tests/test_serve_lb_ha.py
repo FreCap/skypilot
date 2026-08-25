@@ -14,6 +14,7 @@ from sky.serve import constants as serve_constants
 from sky.serve import controller
 from sky.serve import lb_ha
 from sky.serve import lb_k8s
+from sky.serve import replica_managers
 from sky.serve import route_projection
 from sky.serve import serve_utils
 
@@ -166,6 +167,56 @@ def test_session_ledger_fails_closed_for_missing_or_stale_evidence():
     assert stale.complete
     assert not stale.in_flight
     assert stale.unknown_urls == ['replica']
+
+
+def test_ha_drain_view_delivers_explicit_off_route_zero_to_tracker():
+    url = 'http://retired:8080'
+    manager = object.__new__(replica_managers.ReplicaManager)
+    manager._lb_in_flight_report = None
+    tracker = replica_managers._ReplicaDrainTracker(
+        manager, url, replica_managers.time.monotonic() - 1)
+    ctrl = _role_controller()
+    ctrl._replica_manager = manager
+    state = _state(lb_ha.LbCutoverPhase.STABLE, generation=7)
+    assert ctrl._lb_session_ledger.update(
+        'active', lb_ha.LbSlot.A, lb_ha.LbRole.ACTIVE, 7,
+        _report({}, {url: 0}, {url: 1}, {url: 0.0}, routing_urls=[]))
+
+    controller.SkyServeController._publish_ha_drain_view(
+        ctrl, _authority(), state)
+
+    assert manager._lb_in_flight_report is not None
+    assert manager._lb_in_flight_report[1] == {url: 0}
+    assert manager._lb_in_flight_report[2] == set()
+    assert manager._lb_in_flight_report[5] == 'ha-generation-7'
+    assert tracker()
+
+
+@pytest.mark.parametrize('report', [
+    None,
+    _report({}, {'http://retired:8080': 0}, {'http://retired:8080': 1},
+            {'http://retired:8080': 11.0}, routing_urls=[]),
+    _report({}, {'http://retired:8080': 1}, {'http://retired:8080': 1},
+            {'http://retired:8080': 0.0}, routing_urls=[]),
+])
+def test_ha_drain_view_keeps_missing_stale_or_positive_work_fail_closed(
+        report):
+    url = 'http://retired:8080'
+    manager = object.__new__(replica_managers.ReplicaManager)
+    manager._lb_in_flight_report = None
+    tracker = replica_managers._ReplicaDrainTracker(
+        manager, url, replica_managers.time.monotonic() - 1)
+    ctrl = _role_controller()
+    ctrl._replica_manager = manager
+    state = _state(lb_ha.LbCutoverPhase.STABLE, generation=7)
+    if report is not None:
+        assert ctrl._lb_session_ledger.update('active', lb_ha.LbSlot.A,
+                                              lb_ha.LbRole.ACTIVE, 7, report)
+
+    controller.SkyServeController._publish_ha_drain_view(
+        ctrl, _authority(), state)
+
+    assert not tracker()
 
 
 def test_session_ledger_requires_applied_drain_role_and_generation():

@@ -52,7 +52,7 @@ SPOT_JOBS_VERSION = '028'  # runtime-owned managed-job controller slots
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '058'  # exact asynchronous request dispatch ledger
+SERVE_VERSION = '059'  # exact ordinary-paid provider-absence projection
 SERVE_NON_POSTGRES_VERSION = '037'  # retained local/controller SQLite head
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 SERVE_MIGRATION_CEILING_ENV_VAR = (
@@ -294,8 +294,8 @@ def _validate_global_user_state_upgrade_start(
         return
     current_revision = get_current_alembic_revision(engine, section,
                                                     alembic_ini_path)
-    if (current_revision is not None and int(current_revision)
-            >= int(GLOBAL_USER_STATE_JOB_MINIMUM_REVISION)):
+    if (current_revision is not None and int(current_revision) >=
+            int(GLOBAL_USER_STATE_JOB_MINIMUM_REVISION)):
         return
     if (mode == 'bootstrap' and current_revision is None and
             _postgres_effective_schema_is_empty(engine)):

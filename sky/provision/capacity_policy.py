@@ -1,7 +1,7 @@
 """Provider capacity classification and exact cache-key policy."""
 from collections.abc import Iterable
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from sky import clouds
 from sky import exceptions
@@ -17,6 +17,15 @@ _QUOTA_ERROR_CODES = frozenset({
     'MaxSpotInstanceCountExceeded',
     'InstanceLimitExceeded',
 })
+_AWS_RUN_INSTANCES_NEGATIVE_ACK_HTTP_STATUSES = {
+    # EC2 documents InsufficientInstanceCapacity as a server error.  Its Query
+    # API response is the named atomic rejection, not a generic retryable 5xx.
+    'InsufficientInstanceCapacity': frozenset({500}),
+    'VcpuLimitExceeded': frozenset({400}),
+    'MaxSpotInstanceCountExceeded': frozenset({400}),
+    'InstanceLimitExceeded': frozenset({400}),
+}
+_AWS_RUN_INSTANCES_CLIENT_TOKEN_RE = re.compile(r'[0-9a-f]{64}')
 _PROVIDER_QUOTA_ERROR_CODES = _QUOTA_ERROR_CODES | frozenset({
     'QUOTA_EXCEEDED',
     'quotaExceeded',
@@ -65,6 +74,68 @@ _GCP_QUOTA_ERROR_CODES = frozenset({
 # conservatively unclassified instead of consuming unbounded controller work.
 _MAX_TERMINAL_FAILOVER_HISTORY_DEPTH = 32
 _MAX_TERMINAL_FAILOVER_HISTORY_NODES = 1024
+
+_PROVIDER_NEGATIVE_ACK_ATTR = 'provider_negative_ack'
+_PROVIDER_NEGATIVE_ACK_TOP_LEVEL_KEYS = frozenset({
+    'schema_version',
+    'provider',
+    'operation',
+    'reason',
+    'aws_account_id',
+    'aws_principal_arn',
+    'cluster_name_on_cloud',
+    'requested_count',
+    'market',
+    'instance_type',
+    'region',
+    'availability_zone',
+    'client_token',
+    'invocations',
+})
+_PROVIDER_NEGATIVE_ACK_INVOCATION_KEYS = frozenset({
+    'region',
+    'availability_zone',
+    'initial_nonterminated_instance_ids',
+    'resumed_instance_ids',
+    'created_instance_ids',
+    'successful_create_calls',
+    'ambiguous_create_calls',
+    'create_call_count',
+    'attempts',
+})
+_PROVIDER_NEGATIVE_ACK_ATTEMPT_KEYS = frozenset({
+    'provider_request_id',
+    'error_code',
+    'reason',
+    'http_status_code',
+    'aws_account_id',
+    'aws_principal_arn',
+    'region',
+    'availability_zone',
+    'subnet_id',
+    'market',
+    'instance_type',
+    'cluster_name_on_cloud',
+    'min_count',
+    'max_count',
+    'capacity_reservation_id',
+    'client_token',
+})
+
+
+def valid_aws_run_instances_negative_ack_http_status(
+        error_code: object, http_status_code: object) -> bool:
+    """Whether one exact EC2 code/status pair is a typed rejection."""
+    if not isinstance(error_code, str) or type(http_status_code) is not int:
+        return False
+    return http_status_code in _AWS_RUN_INSTANCES_NEGATIVE_ACK_HTTP_STATUSES.get(
+        error_code, ())
+
+
+def valid_aws_run_instances_client_token(value: object) -> bool:
+    """Whether a receipt carries SkyPilot's closed EC2 token encoding."""
+    return (isinstance(value, str) and
+            _AWS_RUN_INSTANCES_CLIENT_TOKEN_RE.fullmatch(value) is not None)
 
 
 def _iter_error_chain(error: BaseException) -> Iterable[BaseException]:
@@ -141,7 +212,7 @@ def _classify_capacity_error(cloud: 'clouds.Cloud',
 
 
 def _terminal_failover_leaves(
-    error: exceptions.ResourcesUnavailableError,
+    error: BaseException,
 ) -> tuple[list[tuple[BaseException, int]], int] | None:
     """Flatten nested terminal failover histories conservatively.
 
@@ -246,6 +317,317 @@ def classify_resources_unavailable_error(
     if not reasons:
         return None
     return 'quota' if 'quota' in reasons else 'capacity'
+
+
+def _canonical_provider_negative_ack_attempt(
+    value: object,
+    *,
+    reason: str,
+    aws_account_id: str,
+    aws_principal_arn: str,
+    cluster_name: str,
+    requested_count: int,
+    market: str,
+    instance_type: str,
+    region: str,
+    availability_zone: str,
+    client_token: str,
+) -> dict[str, Any] | None:
+    if (type(value) is not dict or
+            set(value) != _PROVIDER_NEGATIVE_ACK_ATTEMPT_KEYS):
+        return None
+    attempt = value
+    provider_request_id = attempt['provider_request_id']
+    error_code = attempt['error_code']
+    http_status_code = attempt['http_status_code']
+    subnet_id = attempt['subnet_id']
+    capacity_reservation_id = attempt['capacity_reservation_id']
+    if (not isinstance(provider_request_id, str) or not provider_request_id or
+            not isinstance(error_code, str) or not error_code or
+            not valid_aws_run_instances_negative_ack_http_status(
+                error_code, http_status_code) or
+            not isinstance(subnet_id, str) or not subnet_id or
+        (capacity_reservation_id is not None and
+         (not isinstance(capacity_reservation_id, str) or
+          not capacity_reservation_id))):
+        return None
+    if (attempt['reason'] != reason or
+            attempt['aws_account_id'] != aws_account_id or
+            attempt['aws_principal_arn'] != aws_principal_arn or
+            attempt['region'] != region or
+            attempt['availability_zone'] != availability_zone or
+            attempt['client_token'] != client_token or
+            attempt['market'] != market or
+            attempt['instance_type'] != instance_type or
+            attempt['cluster_name_on_cloud'] != cluster_name or
+            type(attempt['min_count']) is not int or
+            attempt['min_count'] != requested_count or
+            type(attempt['max_count']) is not int or
+            attempt['max_count'] != requested_count):
+        return None
+    expected_codes = (_CAPACITY_ERROR_CODES
+                      if reason == 'capacity' else _QUOTA_ERROR_CODES)
+    if error_code not in expected_codes:
+        return None
+    return {
+        'provider_request_id': provider_request_id,
+        'error_code': error_code,
+        'reason': reason,
+        'http_status_code': http_status_code,
+        'aws_account_id': aws_account_id,
+        'aws_principal_arn': aws_principal_arn,
+        'region': region,
+        'availability_zone': availability_zone,
+        'subnet_id': subnet_id,
+        'market': market,
+        'instance_type': instance_type,
+        'cluster_name_on_cloud': cluster_name,
+        'min_count': requested_count,
+        'max_count': requested_count,
+        'capacity_reservation_id': capacity_reservation_id,
+        'client_token': client_token,
+    }
+
+
+def validate_provider_negative_ack(
+    receipt: object,
+    *,
+    cluster_name: str,
+    requested_count: int | None = None,
+    client_token: str | None = None,
+    expected_aws_account_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Validate and copy a complete provider zero-effect receipt.
+
+    The schema is intentionally closed and composed only of JSON-compatible
+    built-in mappings/lists/scalars.  Callers may therefore persist the return
+    value and validate it again after restart without retaining exception
+    classes or provider SDK objects. ``cluster_name`` is the provider-native
+    cloud name used in instance tags, not a user-facing display name.
+    """
+    if (not isinstance(cluster_name, str) or not cluster_name or
+        (requested_count is not None and
+         (type(requested_count) is not int or requested_count < 1))):
+        return None
+    if (type(receipt) is not dict or
+            set(receipt) != _PROVIDER_NEGATIVE_ACK_TOP_LEVEL_KEYS):
+        return None
+    if (type(receipt['schema_version']) is not int or
+            receipt['schema_version'] != 1 or receipt['provider'] != 'aws' or
+            receipt['operation'] != 'RunInstances' or
+            receipt['reason'] not in ('capacity', 'quota') or
+            receipt['cluster_name_on_cloud'] != cluster_name or
+            receipt['market'] != 'spot'):
+        return None
+    receipt_count = receipt['requested_count']
+    if (type(receipt_count) is not int or receipt_count < 1 or
+        (requested_count is not None and receipt_count != requested_count)):
+        return None
+    reason = receipt['reason']
+    aws_account_id = receipt['aws_account_id']
+    aws_principal_arn = receipt['aws_principal_arn']
+    market = receipt['market']
+    instance_type = receipt['instance_type']
+    receipt_region = receipt['region']
+    receipt_availability_zone = receipt['availability_zone']
+    receipt_client_token = receipt['client_token']
+    principal_match = (re.fullmatch(
+        r'arn:(aws(?:-[a-z0-9]+)*):(iam|sts)::([0-9]{12}):(\S+)',
+        aws_principal_arn) if isinstance(aws_principal_arn, str) else None)
+    if (not isinstance(aws_account_id, str) or
+            re.fullmatch(r'[0-9]{12}', aws_account_id) is None or
+            principal_match is None or
+            principal_match.group(3) != aws_account_id or
+            not isinstance(instance_type, str) or not instance_type):
+        return None
+    if (expected_aws_account_id is not None and
+            receipt['aws_account_id'] != expected_aws_account_id):
+        return None
+    if (not valid_aws_run_instances_client_token(receipt_client_token) or
+        (client_token is not None and receipt_client_token != client_token)):
+        return None
+    if (not isinstance(receipt_region, str) or not receipt_region or
+            not isinstance(receipt_availability_zone, str) or
+            not receipt_availability_zone):
+        return None
+    invocations = receipt['invocations']
+    if type(invocations) is not list or not invocations:
+        return None
+
+    canonical_invocations: list[dict[str, Any]] = []
+    provider_request_ids: set[str] = set()
+    for invocation in invocations:
+        if (type(invocation) is not dict or
+                set(invocation) != _PROVIDER_NEGATIVE_ACK_INVOCATION_KEYS):
+            return None
+        region = invocation['region']
+        availability_zone = invocation['availability_zone']
+        if (not isinstance(region, str) or not region or
+                not isinstance(availability_zone, str) or
+                not availability_zone or region != receipt_region or
+                availability_zone != receipt_availability_zone):
+            return None
+        for empty_list_key in ('initial_nonterminated_instance_ids',
+                               'resumed_instance_ids', 'created_instance_ids'):
+            value = invocation[empty_list_key]
+            if type(value) is not list or value:
+                return None
+        if (type(invocation['successful_create_calls']) is not int or
+                invocation['successful_create_calls'] != 0 or
+                type(invocation['ambiguous_create_calls']) is not int or
+                invocation['ambiguous_create_calls'] != 0 or
+                type(invocation['create_call_count']) is not int or
+                invocation['create_call_count'] < 1):
+            return None
+        attempts = invocation['attempts']
+        if (type(attempts) is not list or not attempts or
+                invocation['create_call_count'] != len(attempts)):
+            return None
+        canonical_attempts: list[dict[str, Any]] = []
+        for attempt in attempts:
+            canonical_attempt = _canonical_provider_negative_ack_attempt(
+                attempt,
+                reason=reason,
+                aws_account_id=aws_account_id,
+                aws_principal_arn=aws_principal_arn,
+                cluster_name=cluster_name,
+                requested_count=receipt_count,
+                market=market,
+                instance_type=instance_type,
+                region=region,
+                availability_zone=availability_zone,
+                client_token=receipt_client_token)
+            if canonical_attempt is None:
+                return None
+            provider_request_id = canonical_attempt['provider_request_id']
+            if provider_request_id in provider_request_ids:
+                return None
+            provider_request_ids.add(provider_request_id)
+            canonical_attempts.append(canonical_attempt)
+        canonical_invocations.append({
+            'region': region,
+            'availability_zone': availability_zone,
+            'initial_nonterminated_instance_ids': [],
+            'resumed_instance_ids': [],
+            'created_instance_ids': [],
+            'successful_create_calls': 0,
+            'ambiguous_create_calls': 0,
+            'create_call_count': len(canonical_attempts),
+            'attempts': canonical_attempts,
+        })
+    return {
+        'schema_version': 1,
+        'provider': 'aws',
+        'operation': 'RunInstances',
+        'reason': reason,
+        'aws_account_id': aws_account_id,
+        'aws_principal_arn': aws_principal_arn,
+        'cluster_name_on_cloud': cluster_name,
+        'requested_count': receipt_count,
+        'market': market,
+        'instance_type': instance_type,
+        'region': receipt_region,
+        'availability_zone': receipt_availability_zone,
+        'client_token': receipt_client_token,
+        'invocations': canonical_invocations,
+    }
+
+
+def extract_provider_negative_ack(
+        error: BaseException) -> dict[str, Any] | None:
+    """Extract complete provider absence evidence from a failover graph.
+
+    Every terminal history leaf must contain exactly one independently valid
+    receipt in its explicit cause chain.  Any missing, mixed, malformed, too
+    large, or cyclic graph is deliberately UNKNOWN.
+    """
+    if not isinstance(error, BaseException):
+        return None
+    traversal = _terminal_failover_leaves(error)
+    if traversal is None:
+        return None
+    failures, visited = traversal
+    if not failures:
+        return None
+
+    canonical_receipts: list[dict[str, Any]] = []
+    expected_cluster_name: str | None = None
+    expected_requested_count: int | None = None
+    for failure, history_depth in failures:
+        cause_nodes = _terminal_leaf_cause_nodes(
+            failure,
+            history_depth=history_depth,
+            remaining_nodes=_MAX_TERMINAL_FAILOVER_HISTORY_NODES - visited)
+        if cause_nodes is None:
+            return None
+        visited += cause_nodes
+        receipt_values: list[object] = []
+        leaf: BaseException | None = failure
+        while leaf is not None:
+            leaf_dict = getattr(leaf, '__dict__', None)
+            if (type(leaf_dict) is dict and
+                    _PROVIDER_NEGATIVE_ACK_ATTR in leaf_dict):
+                receipt_values.append(leaf_dict[_PROVIDER_NEGATIVE_ACK_ATTR])
+            leaf = leaf.__cause__
+        if len(receipt_values) != 1:
+            return None
+        receipt_value = receipt_values[0]
+        if type(receipt_value) is not dict:
+            return None
+        cluster_name_value = receipt_value.get('cluster_name_on_cloud')
+        requested_count_value = receipt_value.get('requested_count')
+        if (not isinstance(cluster_name_value, str) or not cluster_name_value or
+                type(requested_count_value) is not int or
+                requested_count_value < 1):
+            return None
+        if expected_cluster_name is None:
+            expected_cluster_name = cluster_name_value
+            expected_requested_count = requested_count_value
+        elif (cluster_name_value != expected_cluster_name or
+              requested_count_value != expected_requested_count):
+            return None
+        canonical = validate_provider_negative_ack(
+            receipt_value,
+            cluster_name=cluster_name_value,
+            requested_count=requested_count_value)
+        if canonical is None:
+            return None
+        canonical_receipts.append(canonical)
+
+    assert expected_cluster_name is not None
+    assert expected_requested_count is not None
+    first = canonical_receipts[0]
+    common_keys = ('provider', 'operation', 'reason', 'aws_account_id',
+                   'aws_principal_arn', 'market', 'instance_type', 'region',
+                   'availability_zone', 'client_token')
+    if any(
+            any(receipt[key] != first[key]
+                for key in common_keys)
+            for receipt in canonical_receipts[1:]):
+        return None
+    aggregate = {
+        'schema_version': 1,
+        'provider': first['provider'],
+        'operation': first['operation'],
+        'reason': first['reason'],
+        'aws_account_id': first['aws_account_id'],
+        'aws_principal_arn': first['aws_principal_arn'],
+        'cluster_name_on_cloud': first['cluster_name_on_cloud'],
+        'requested_count': first['requested_count'],
+        'market': first['market'],
+        'instance_type': first['instance_type'],
+        'region': first['region'],
+        'availability_zone': first['availability_zone'],
+        'client_token': first['client_token'],
+        'invocations': [
+            invocation for receipt in canonical_receipts
+            for invocation in receipt['invocations']
+        ],
+    }
+    return validate_provider_negative_ack(
+        aggregate,
+        cluster_name=expected_cluster_name,
+        requested_count=expected_requested_count)
 
 
 def _is_quota_error(error: BaseException) -> bool:

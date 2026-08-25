@@ -1136,8 +1136,9 @@ MAX_NUMBER_OF_SERVICES_REACHED_ERROR = 'Max number of services reached'
 # Projection-v7 bootstrap-supervisor repair rotated it to epoch 7. The
 # protocol-v8 attested node-local cache bootstrap rotated it to epoch 8.
 # Protocol-v9 cache-leaf normalization rotated it to epoch 9. Protocol-v10's
-# shared-cache reserve correction rotates it to epoch 10: every live API,
-# controller, and executor participant and every service capability tuple must
-# agree before any new launch can carry projection protocol v10; the adjacent
-# cohort remains settlement-only.
-NON_POOL_CAPABILITY_COHORT_EPOCH = 10
+# shared-cache reserve correction rotated it to epoch 10. Protocol-v11's exact
+# ordinary-paid provider negative-ack settlement rotates it to epoch 11: every
+# live API, controller, and executor participant and every service capability
+# tuple must agree before a paid provider effect can rely on the new absence
+# semantics; the adjacent cohort remains settlement-only.
+NON_POOL_CAPABILITY_COHORT_EPOCH = 11

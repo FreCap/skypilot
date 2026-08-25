@@ -20,6 +20,7 @@ from sky.adaptors import aws
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.backends import backend_utils
 from sky.jobs.server import utils as server_jobs_utils
+from sky.provision import capacity_policy
 from sky.provision import common as provision_common
 from sky.provision import constants as provision_constants
 from sky.provision import instance_setup
@@ -166,6 +167,8 @@ def bulk_provision(
     ports_to_open_on_launch: list[int] | None = None,
     *,
     cluster_incarnation: str | None = None,
+    provider_create_idempotency_token: str | None = None,
+    provider_create_account_id: str | None = None,
     provider_effect_guard_factory: (provision_common.ProviderEffectGuardFactory
                                     | None) = None,
     kueue_admission_runtime: (provision_common.KueuePodAdmissionRuntime |
@@ -204,6 +207,8 @@ def bulk_provision(
         resume_stopped_nodes=True,
         ports_to_open_on_launch=ports_to_open_on_launch,
         cluster_incarnation=cluster_incarnation,
+        provider_create_idempotency_token=provider_create_idempotency_token,
+        provider_create_account_id=provider_create_account_id,
         provider_effect_guard_factory=provider_effect_guard_factory,
         kueue_admission_runtime=kueue_admission_runtime)
 
@@ -246,6 +251,24 @@ def bulk_provision(
             # service owner reconciles any already-created object.
             raise
         except Exception as exc:  # pylint: disable=broad-except
+            provider_negative_ack = None
+            if (isinstance(exc, provision_common.ProviderCreateRejectedError)
+                    and provider_create_idempotency_token is not None and
+                    provider_create_account_id is not None):
+                provider_negative_ack = (
+                    capacity_policy.validate_provider_negative_ack(
+                        getattr(exc, 'provider_negative_ack', None),
+                        cluster_name=cluster_name.name_on_cloud,
+                        requested_count=num_nodes,
+                        client_token=provider_create_idempotency_token,
+                        expected_aws_account_id=provider_create_account_id))
+            if provider_negative_ack is not None:
+                # The provider proved that this exact create had no effects.
+                # Re-canonicalize the attached receipt and preserve the typed
+                # rejection; a generic teardown would add provider I/O that
+                # can mask this durable evidence with StopFailoverError.
+                exc.provider_negative_ack = provider_negative_ack
+                raise
             if provider_effect_guard_factory is not None:
                 # The instrumented path is Kubernetes reserved fill. Its
                 # durable replica owner is the one cleanup authority; this

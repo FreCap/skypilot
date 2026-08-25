@@ -669,8 +669,8 @@ class SkyServeController:
                 f'{common_utils.format_exception(e)}')
             placement_policy_states = None
         self._autoscaler.load_cost_rebalance_state(
-            None if placement_policy_states is
-            None else placement_policy_states['cost_rebalance_state'])
+            None if placement_policy_states is None else
+            placement_policy_states['cost_rebalance_state'])
         self._configure_instance_aware_accelerators(service_spec)
         # [boltz fork] Reserved-capacity fill poller lifecycle: started
         # from run() when the service booted with the flag on, and
@@ -889,8 +889,8 @@ class SkyServeController:
             info: 'replica_managers.ReplicaInfo'
         ) -> tuple[str, str, int] | None:
             cached = self._lb_replica_cache.get(info.replica_id)
-            if (self._lb_replica_cache_record_ids.get(info.replica_id)
-                    != info.replica_record_id):
+            if (self._lb_replica_cache_record_ids.get(info.replica_id) !=
+                    info.replica_record_id):
                 return None
             return cached
 
@@ -1622,8 +1622,8 @@ class SkyServeController:
             current_source = capacity_admission.get_service_source_mode(
                 self._service_name)
             if (current_source is None and self._service_hash is not None) or (
-                    current_source is not None and current_source[0]
-                    is capacity_admission.DemandSourceMode.DURABLE_FEED):
+                    current_source is not None and current_source[0] is
+                    capacity_admission.DemandSourceMode.DURABLE_FEED):
                 return True
             self._reconcile_generation += 1
             reconcile_generation = self._reconcile_generation
@@ -2419,9 +2419,9 @@ class SkyServeController:
             # the first role response applied by the former active.
             clean = report.complete and report.local_in_flight == 0
         drain_started_at = state.drain_started_at
-        timed_out = (drain_started_at is not None and
-                     time.time() - drain_started_at
-                     >= self._lb_drain_timeout_seconds)
+        timed_out = (
+            drain_started_at is not None and
+            time.time() - drain_started_at >= self._lb_drain_timeout_seconds)
         if timed_out and not clean:
             logger.warning('Finishing HA LB drain after the bounded Pod '
                            f'termination budget for {self._service_name!r}.')
@@ -2594,8 +2594,8 @@ class SkyServeController:
         demand_transition_cancellation: asyncio.CancelledError | None = None
         demand_transition_invalidated_generation: int | None = None
 
-        async def run_demand_transition(phase: str, function: Callable, *args:
-                                        Any) -> Any:
+        async def run_demand_transition(phase: str, function: Callable,
+                                        *args: Any) -> Any:
             nonlocal demand_transition_cancellation
             operation = asyncio.create_task(
                 trace.run_in_executor(loop, phase, function, *args))
@@ -2758,8 +2758,7 @@ class SkyServeController:
                                           routing.legacy_selected)
             ready_by_slot = {
                 candidate_slot: {
-                    uid
-                    for uid in authority.ready_nonterminating_uids
+                    uid for uid in authority.ready_nonterminating_uids
                     if authority.slot_by_uid.get(uid) is candidate_slot
                 } for candidate_slot in lb_ha.LbSlot
             }
@@ -3555,9 +3554,9 @@ class SkyServeController:
         for field in _REPLICA_ACCELERATOR_COUNT_FIELDS:
             counts.setdefault(field, {})
 
-        autoscaler = self._autoscaler
-        if (include_replica_capacity_projection and
-                autoscaler.replica_unit == 'logical'):
+        autoscaler = (self._autoscaler
+                      if include_replica_capacity_projection else None)
+        if (autoscaler is not None and autoscaler.replica_unit == 'logical'):
             provisioning_statuses = {
                 serve_state.ReplicaStatus.PENDING,
                 serve_state.ReplicaStatus.PROVISIONING,
@@ -3567,8 +3566,9 @@ class SkyServeController:
             provisioning_capacity = 0
             for info in replica_infos:
                 status_property = info.status_property
-                retiring = (status_property.is_scale_down is True or getattr(
-                    status_property, 'preempted', False) is True)
+                retiring = (
+                    status_property.is_scale_down is True or
+                    getattr(status_property, 'preempted', False) is True)
                 if (info.is_terminal or
                         info.version != autoscaler.latest_version or retiring):
                     continue
@@ -3850,8 +3850,9 @@ class SkyServeController:
             service_spec: Any,
             candidate_autoscaler: autoscalers.Autoscaler | None = None) -> bool:
         """Whether routing and autoscaling share the exact-card contract."""
-        compatible_autoscaler = (self._autoscaler if candidate_autoscaler
-                                 is None else candidate_autoscaler)
+        compatible_autoscaler = (self._autoscaler
+                                 if candidate_autoscaler is None else
+                                 candidate_autoscaler)
         return (service_spec.load_balancing_policy
                 == 'instance_aware_least_load' and
                 isinstance(compatible_autoscaler,
@@ -4509,8 +4510,8 @@ class SkyServeController:
                 expected_installed_digest = (
                     prepared.source_digest if prepared.source_is_staged or
                     prepared.source_is_live else prepared.durable_digest)
-                if (hashlib.sha256(installed_bytes).hexdigest()
-                        != expected_installed_digest):
+                if (hashlib.sha256(installed_bytes).hexdigest() !=
+                        expected_installed_digest):
                     raise RuntimeError(
                         'Controller config snapshot changed between admission '
                         'and installation.')
@@ -4549,8 +4550,8 @@ class SkyServeController:
             raise RuntimeError(
                 'Service incarnation changed before LB migration.')
         if (expected_lifecycle_epoch is not None and
-                owner_record.get('lifecycle_epoch')
-                != expected_lifecycle_epoch):
+                owner_record.get('lifecycle_epoch') !=
+                expected_lifecycle_epoch):
             raise RuntimeError('Service lifecycle changed before LB migration.')
         service_hash = str(owner_record['hash'])
         assert actual_owner is not None
@@ -4735,9 +4736,9 @@ class SkyServeController:
                 placement_catalog = None
         needs_catalog = (validation_service.placement_contract.enabled and
                          placement_catalog is None)
-        needs_logical_validation = (authoritative_retry_service is None and
-                                    validation_service.uses_logical_replicas
-                                    is True)
+        needs_logical_validation = (
+            authoritative_retry_service is None and
+            validation_service.uses_logical_replicas is True)
         update_task = None
         if needs_catalog or needs_logical_validation:
             try:
@@ -5551,8 +5552,8 @@ class SkyServeController:
         Every optional diagnostic read fails unavailable; it cannot authorize
         a launch or make ``/autoscaler/info`` fail.
         """
-        enabled = (getattr(self._autoscaler, 'reserved_capacity_fill', False)
-                   is True)
+        enabled = (getattr(self._autoscaler, 'reserved_capacity_fill', False) is
+                   True)
         if not enabled:
             return self._reserved_fill_reconciliation_base(
                 enabled=False, authority_mode='disabled')
@@ -5694,30 +5695,30 @@ class SkyServeController:
                                 replica.reserved_fill is not True or
                                 replica.is_zero_cost is not True or
                                 replica.version != allocation.service_version or
-                                replica.reserved_fill_pool_key
-                                != snapshot.pool_key or
-                                replica.reserved_fill_service_generation
-                                != snapshot.service_generation or
-                                replica.reserved_fill_physical_cluster_uid
-                                != snapshot.physical_cluster_uid or
+                                replica.reserved_fill_pool_key !=
+                                snapshot.pool_key or
+                                replica.reserved_fill_service_generation !=
+                                snapshot.service_generation or
+                                replica.reserved_fill_physical_cluster_uid !=
+                                snapshot.physical_cluster_uid or
                                 replica.reserved_fill_kubernetes_context
                                 not in allowed_contexts or
-                                replica.reserved_fill_allocation_generation
-                                != allocation.allocation_generation or
-                                replica.reserved_fill_allocation_input_sha256
-                                != allocation.allocation_input_sha256 or replica
-                                .reserved_fill_allocation_claim_generation
-                                != allocation.allocation_claim_generation or
+                                replica.reserved_fill_allocation_generation !=
+                                allocation.allocation_generation or
+                                replica.reserved_fill_allocation_input_sha256 !=
+                                allocation.allocation_input_sha256 or replica.
+                                reserved_fill_allocation_claim_generation !=
+                                allocation.allocation_claim_generation or
                                 getattr(
                                     replica,
                                     'reserved_fill_reconciliation_gate_generation',
-                                    None)
-                                != allocation.reconciliation_gate_generation or
+                                    None) !=
+                                allocation.reconciliation_gate_generation or
                                 getattr(
                                     replica,
                                     'reserved_fill_reclaim_fleet_bundle_sha256',
-                                    None)
-                                != allocation.reclaim_fleet_bundle_sha256 or
+                                    None) !=
+                                allocation.reclaim_fleet_bundle_sha256 or
                                 getattr(
                                     replica,
                                     'reserved_fill_reclaim_policy_revision',
@@ -5725,19 +5726,18 @@ class SkyServeController:
                                 or getattr(
                                     replica,
                                     'reserved_fill_reclaim_provider_inventory_sha256',
-                                    None)
-                                != allocation.reclaim_provider_inventory_sha256
-                                or type(accelerator_count) is not int or
-                                accelerator_counts.get(accelerator)
-                                != accelerator_count or getattr(
+                                    None) !=
+                                allocation.reclaim_provider_inventory_sha256 or
+                                type(accelerator_count) is not int or
+                                accelerator_counts.get(accelerator) !=
+                                accelerator_count or getattr(
                                     replica,
                                     'reserved_fill_worker_projection_sha256',
                                     None) != projection_digests.get(accelerator)
                                 or replica.reserved_fill_observation_generation
                                 != snapshot.observation_generation or
-                                replica.reserved_fill_observation_sequence
-                                != snapshot.observation_sequence or
-                                not isinstance(
+                                replica.reserved_fill_observation_sequence !=
+                                snapshot.observation_sequence or not isinstance(
                                     replica.
                                     reserved_fill_intent_idempotency_key, str)
                                 or
@@ -5790,8 +5790,8 @@ class SkyServeController:
         """
         if (not self._scale_actuation_is_current(
                 actuation_generation, decision_autoscaler, decision_version) or
-                self._scale_reconcile_coordinator.generation
-                != notification_generation or
+                self._scale_reconcile_coordinator.generation !=
+                notification_generation or
                 self._reconcile_generation != demand_generation):
             return None
         decision_inputs = (
@@ -5810,8 +5810,8 @@ class SkyServeController:
         with self._routing_state_lock:
             if (not self._scale_actuation_is_current(
                     actuation_generation, decision_autoscaler, decision_version)
-                    or self._scale_reconcile_coordinator.generation
-                    != notification_generation or
+                    or self._scale_reconcile_coordinator.generation !=
+                    notification_generation or
                     self._reconcile_generation != demand_generation):
                 return None
             decision_autoscaler.set_spot_placer(
@@ -5987,10 +5987,10 @@ class SkyServeController:
             accelerators = (None if location is None else location.accelerators)
             if (snapshot is None or not isinstance(accelerators, dict) or
                     len(accelerators) != 1 or
-                    info.reserved_fill_service_generation
-                    != snapshot.service_generation or
-                    info.reserved_fill_physical_cluster_uid
-                    != snapshot.physical_cluster_uid):
+                    info.reserved_fill_service_generation !=
+                    snapshot.service_generation or
+                    info.reserved_fill_physical_cluster_uid !=
+                    snapshot.physical_cluster_uid):
                 raise ValueError('A same-allocation reserved-fill row has '
                                  'inconsistent durable pool attribution.')
             accelerator = str(next(iter(accelerators))).casefold()
@@ -6248,7 +6248,8 @@ class SkyServeController:
                     return None
                 canonical_economic[card] = count
             canonical_economic = {
-                card: canonical_economic.get(card, 0) for card in capacity_target
+                card: canonical_economic.get(card, 0)
+                for card in capacity_target
             }
             if sum(canonical_economic.values()) != sum(
                     capacity_target.values()):
@@ -6310,8 +6311,8 @@ class SkyServeController:
                     self._replica_manager.invalidate_logical_reconcile_state()
                     return
                 durable_demand_promoted = (
-                    demand_source is not None and demand_source[0]
-                    is capacity_admission.DemandSourceMode.DURABLE_FEED)
+                    demand_source is not None and demand_source[0] is
+                    capacity_admission.DemandSourceMode.DURABLE_FEED)
                 logical_reconcile_invalidated = False
                 if (durable_demand_promoted and
                         decision_autoscaler.reserved_capacity_fill):
@@ -6423,8 +6424,8 @@ class SkyServeController:
                             autoscaler_reconcile_generation = (
                                 decision_autoscaler.reconcile_generation)
                             if (type(autoscaler_reconcile_generation) is not int
-                                    or autoscaler_reconcile_generation
-                                    != durable_reconcile_generation):
+                                    or autoscaler_reconcile_generation !=
+                                    durable_reconcile_generation):
                                 logger.warning(
                                     'Suppressing durable logical demand '
                                     'because the collected autoscaler '
@@ -6650,8 +6651,8 @@ class SkyServeController:
                                     decision_version) or
                                     self._scale_reconcile_coordinator.generation
                                     != notification_generation or
-                                    self._reconcile_generation
-                                    != demand_generation):
+                                    self._reconcile_generation !=
+                                    demand_generation):
                                 return
                             if not (self._replica_manager.
                                     publish_logical_reconcile_state(
@@ -6935,12 +6936,11 @@ class SkyServeController:
                                      logical_scale_down_target.
                                      target_capacity_by_accelerator,
                                      logical_scale_down_target.
-                                     accelerator_shapes) != (
-                                         first.version,
-                                         first.reconcile_generation,
-                                         first.target_capacity,
-                                         first.target_capacity_by_accelerator,
-                                         first.accelerator_shapes)):
+                                     accelerator_shapes) !=
+                                    (first.version, first.reconcile_generation,
+                                     first.target_capacity,
+                                     first.target_capacity_by_accelerator,
+                                     first.accelerator_shapes)):
                                     _flush_logical_scale_down()
                             pending_logical_scale_down.append(
                                 logical_scale_down_target)
@@ -7056,7 +7056,8 @@ class SkyServeController:
                             service_name=self._service_name,
                             service_hash=self._service_hash,
                             max_live_paid_gpu_units=(
-                                self._replica_manager.max_live_paid_gpu_units))
+                                self._replica_manager.max_live_paid_gpu_units),
+                            allow_provider_identity_lookup=False)
                         paid_admission = (
                             paid_capacity.admission_snapshot_by_location(budget)
                         )
@@ -7100,9 +7101,9 @@ class SkyServeController:
                     'Could not snapshot reserved-fill reconciliation state: '
                     f'{common_utils.format_exception(e)}')
                 info['reserved_fill_reconciliation'] = {
-                    'enabled': (getattr(self._autoscaler,
-                                        'reserved_capacity_fill', False)
-                                is True),
+                    'enabled':
+                        (getattr(self._autoscaler, 'reserved_capacity_fill',
+                                 False) is True),
                     'authority_mode': 'unavailable',
                     'allocation_current': False,
                     'allocation_generation': None,

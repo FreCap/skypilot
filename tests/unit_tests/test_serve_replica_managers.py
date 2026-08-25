@@ -39,6 +39,7 @@ from spot_placer_test_utils import make_placer
 from sky import clouds
 from sky import exceptions
 from sky import skypilot_config
+from sky.events import api_models as event_api_models
 from sky.provision import common as provision_common
 from sky.serve import capacity_admission
 from sky.serve import ordinary_launch_binding
@@ -67,6 +68,30 @@ _DISABLED_PLACEMENT_CONTRACT = placement_policy.resolve_fresh_contract(
     None, pool=False)
 _LOGICAL_PLACEMENT_CONTRACT = placement_policy.resolve_fresh_contract(
     placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
+
+
+@pytest.fixture(autouse=True)
+def _account_scope_paid_pool_keys(monkeypatch):
+    original_pool_key = paid_capacity.pool_key
+
+    def _account_scoped_pool_key(location, **kwargs):
+        is_aws = str(location.cloud).casefold() == 'aws'
+        is_mock_aws = is_aws and not isinstance(location.cloud, clouds.AWS)
+        if is_aws and not isinstance(kwargs.get('aws_account_id'), str):
+            kwargs['aws_account_id'] = '123456789012'
+        key = original_pool_key(location, **kwargs)
+        if is_mock_aws:
+            payload = json.loads(key)
+            payload['version'] = 2
+            payload['provider_identity'] = {
+                'aws_account_id': kwargs['aws_account_id'],
+            }
+            key = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+        return key
+
+    monkeypatch.setattr(paid_capacity, 'pool_key', _account_scoped_pool_key)
+    monkeypatch.setattr(paid_capacity, '_active_aws_account_id_for_workspace',
+                        lambda *_args, **_kwargs: '123456789012')
 
 
 def test_decoded_bound_request_error_accepts_exact_safe_wrapper() -> None:
@@ -124,9 +149,14 @@ def _bound_non_pool_context(
     kind: ordinary_launch_binding.NonPoolLaunchProfileKind = (
         ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID),
 ) -> ordinary_launch_binding.BoundNonPoolLaunchContext:
+    replica_record_id = uuid.UUID('22222222-2222-4222-8222-222222222222')
+    authorization_reference = f'test:{kind.value}'
+    if kind is ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID:
+        authorization_reference = (f'paid-capacity:hash:{replica_record_id}:'
+                                   f'{_canonical_paid_pool_key()}')
     profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
         kind,
-        authorization_reference=f'test:{kind.value}',
+        authorization_reference=authorization_reference,
         authorization_generation=1,
         authorization_payload={'kind': kind.value})
     return ordinary_launch_binding.BoundNonPoolLaunchContext(
@@ -134,7 +164,7 @@ def _bound_non_pool_context(
         request_id='request-1',
         service_name='svc',
         replica_id=3,
-        replica_record_id=uuid.UUID('22222222-2222-4222-8222-222222222222'),
+        replica_record_id=replica_record_id,
         launch_generation=1,
         input_digest='a' * 64,
         profile=profile,
@@ -526,6 +556,91 @@ def _canonical_paid_pool_key(region='us-east-1'):
                              cloud_name='AWS',
                              instance_type='g6.xlarge')
     return paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+
+
+def _provider_negative_ack(reason='capacity', *, client_token='a' * 64):
+    error_code = ('InsufficientInstanceCapacity'
+                  if reason == 'capacity' else 'VcpuLimitExceeded')
+    cloud_name = 'svc-3-test-user'
+    return {
+        'schema_version': 1,
+        'provider': 'aws',
+        'operation': 'RunInstances',
+        'client_token': client_token,
+        'reason': reason,
+        'aws_account_id': '123456789012',
+        'aws_principal_arn': 'arn:aws:sts::123456789012:assumed-role/test/run',
+        'cluster_name_on_cloud': cloud_name,
+        'requested_count': 1,
+        'market': 'spot',
+        'instance_type': 'g6.xlarge',
+        'region': 'us-east-1',
+        'availability_zone': 'us-east-1a',
+        'invocations': [{
+            'region': 'us-east-1',
+            'availability_zone': 'us-east-1a',
+            'initial_nonterminated_instance_ids': [],
+            'resumed_instance_ids': [],
+            'created_instance_ids': [],
+            'successful_create_calls': 0,
+            'ambiguous_create_calls': 0,
+            'create_call_count': 1,
+            'attempts': [{
+                'client_token': client_token,
+                'provider_request_id': 'provider-request-1',
+                'error_code': error_code,
+                'reason': reason,
+                'http_status_code': (500 if reason == 'capacity' else 400),
+                'aws_account_id': '123456789012',
+                'aws_principal_arn': 'arn:aws:sts::123456789012:assumed-role/test/run',
+                'region': 'us-east-1',
+                'availability_zone': 'us-east-1a',
+                'subnet_id': 'subnet-a',
+                'market': 'spot',
+                'instance_type': 'g6.xlarge',
+                'cluster_name_on_cloud': cloud_name,
+                'min_count': 1,
+                'max_count': 1,
+                'capacity_reservation_id': None,
+            }],
+        }],
+    }
+
+
+def _request_error_with_provider_negative_ack(receipt):
+    leaf = provision_common.ProvisionerError('provider rejected RunInstances')
+    leaf.provider_negative_ack = receipt
+    error = exceptions.ResourcesUnavailableError(
+        'all provider locations failed', failover_history=[leaf])
+    return {
+        'object': error,
+        'type': type(error).__name__,
+        'message': str(error),
+    }
+
+
+def test_provider_negative_ack_survives_request_error_wire_round_trip():
+    receipt = _provider_negative_ack()
+    leaf = provision_common.ProvisionerError('provider rejected RunInstances')
+    leaf.provider_negative_ack = receipt
+    terminal = exceptions.ResourcesUnavailableError(
+        'all provider locations failed', failover_history=[leaf])
+    request = api_requests.Request(request_id='negative-ack-round-trip',
+                                   name='sky.launch',
+                                   entrypoint=lambda: None,
+                                   request_body=payloads.RequestBody(),
+                                   status=api_requests.RequestStatus.FAILED,
+                                   created_at=0.0,
+                                   user_id='test-user')
+
+    request.set_error(terminal)
+    decoded = request.get_error()
+
+    assert decoded is not None
+    error = replica_managers._decoded_bound_request_error(decoded)
+    assert error is not None
+    assert replica_managers.capacity_policy.extract_provider_negative_ack(
+        error) == receipt
 
 
 def test_replica_manager_rejects_legacy_service_without_workspace():
@@ -1597,7 +1712,7 @@ def _make_manager(service_name='svc', next_replica_id=1):
     mgr._spot_placer = None
     mgr._pending_version = None
     mgr._uses_logical_replicas = False
-    mgr._version_specs = {1: mock.Mock()}
+    mgr._version_specs = {1: mock.Mock(max_live_paid_gpu_units=100)}
     mgr._logical_exact_accelerator_shapes = {}
     mgr._logical_reconcile_snapshot = None
     mgr._logical_target = None
@@ -2450,6 +2565,61 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         assert kwargs['paid_capacity_pool_key'] is None
         assert kwargs['paid_capacity_outcome'] is None
 
+    @pytest.mark.parametrize(
+        ('reason', 'expected_outcome'),
+        [('capacity', paid_capacity.LaunchOutcome.CAPACITY_FAILURE),
+         ('quota', paid_capacity.LaunchOutcome.QUOTA_FAILURE)])
+    def test_paid_provider_absence_projects_closed_feedback_marker(
+            self, reason, expected_outcome):
+        manager = _make_manager()
+        manager._ordinary_launch_binding_authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=2,
+            generic=True)
+        context = _bound_non_pool_context(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+        pool_key = _canonical_paid_pool_key()
+        info = _fake_replica_info(
+            context.replica_id,
+            replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.replica_record_id = str(context.replica_record_id)
+        info.is_spot = True
+        info.paid_capacity_pool_key = pool_key
+        receipt = _provider_negative_ack(
+            reason,
+            client_token=ordinary_launch_binding.ordinary_paid_aws_client_token(
+                context))
+        projection = types.SimpleNamespace(
+            locked_replica_info=info,
+            request=types.SimpleNamespace(
+                error=_request_error_with_provider_negative_ack(receipt)),
+            status=api_requests.RequestStatus.FAILED,
+            cause=event_api_models.EventCause.HANDLER_FAILED,
+            context=context,
+            pre_effect_terminal=False,
+            service_job_id=None,
+            cancel_reason=None,
+            paid_capacity_pool_key=pool_key,
+            provider_evidence=(ordinary_launch_binding.ProviderEvidence.ABSENT),
+            provider_evidence_payload={'receipt': receipt})
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'update_replica_for_bound_ordinary_launch_in_transaction',
+                return_value=True) as persist:
+            assert manager._project_bound_ordinary_launch(
+                None, mock.sentinel.connection, projection)
+
+        assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+            info)
+        assert info.status_property.sky_launch_status == (
+            common_utils.ProcessStatus.FAILED)
+        assert info.status_property.failed_spot_availability is True
+        kwargs = persist.call_args.kwargs
+        assert kwargs['provider_launch_succeeded'] is False
+        assert kwargs['paid_capacity_pool_key'] == pool_key
+        assert kwargs['paid_capacity_outcome'] is expected_outcome
+
     def test_projected_provider_present_cleanup_finishes_normal_down_path(self):
         manager = _make_manager()
         runtime = manager._legacy_mutation_runtime_state()
@@ -2477,6 +2647,38 @@ class TestBoundOrdinaryLaunchManagerIntegration:
 
         manager._handle_sky_down_finish.assert_called_once_with(info,
                                                                 format_exc=None)
+
+    def test_projected_paid_absence_cleanup_is_database_only(self):
+        manager = _make_manager()
+        runtime = manager._legacy_mutation_runtime_state()
+        info = _fake_replica_info(
+            3, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.replica_record_id = str(
+            uuid.UUID('22222222-2222-4222-8222-222222222222'))
+        info.is_spot = True
+        info.paid_capacity_pool_key = _canonical_paid_pool_key()
+        info.status_property.sky_launch_status = common_utils.ProcessStatus.FAILED
+        info.status_property.failed_spot_availability = True
+        assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+            info)
+        assert not runtime.launch_thread_pool
+        assert not runtime.down_thread_pool
+        manager._handle_sky_down_finish = mock.Mock()
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=info), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'retire_bound_non_pool_projected_paid_provider_absence',
+                 return_value=True) as retire, \
+             mock.patch.object(replica_managers, 'terminate_cluster') \
+                 as provider_down:
+            assert manager._finalize_projected_provider_absence_cleanup(3)
+
+        retire.assert_called_once_with('svc', 3, info.replica_record_id)
+        manager._handle_sky_down_finish.assert_not_called()
+        provider_down.assert_not_called()
 
     def test_projected_provider_absence_restart_skips_provider_cleanup(self):
         manager = _make_manager()
@@ -5614,8 +5816,8 @@ class TestLaunchClusterRetry:
         launch.assert_not_called()
         assert request_ids[1] == 'request-id'
         wait.assert_called_once()
-        assert (wait.call_args.kwargs['api_auth_token_provider']
-                is replica_managers._required_controller_admin_auth_tokens)
+        assert (wait.call_args.kwargs['api_auth_token_provider'] is
+                replica_managers._required_controller_admin_auth_tokens)
 
     def test_reserved_fill_profile_rejects_post_admission_worker_submission(
             self, tmp_path):
@@ -6565,7 +6767,7 @@ class TestLaunchReplicaAvailabilityMaxRetry:
         manager._service_name = 'svc'
         manager.yaml_content = 'dummy: yaml'
         manager.latest_version = 1
-        manager._version_specs = {1: mock.Mock()}
+        manager._version_specs = {1: mock.Mock(max_live_paid_gpu_units=100)}
         manager._version_task_templates = {1: mock.Mock(name='task_template')}
         manager._launch_thread_pool = thread_utils.ThreadSafeDict()
         manager._replica_to_request_id = thread_utils.ThreadSafeDict()
@@ -6731,13 +6933,14 @@ class TestUpdateVersionBatchesPriorVersionYamls:
 
         def _get_specs(_service_name, versions):
             return {
-                version: service_spec.SkyServiceSpec(
-                    readiness_path='/',
-                    initial_delay_seconds=0,
-                    readiness_timeout_seconds=15,
-                    endpoint_probe_interval_seconds=10,
-                    lb_stream_timeout_seconds=30,
-                    min_replicas=1) for version in versions
+                version:
+                service_spec.SkyServiceSpec(readiness_path='/',
+                                            initial_delay_seconds=0,
+                                            readiness_timeout_seconds=15,
+                                            endpoint_probe_interval_seconds=10,
+                                            lb_stream_timeout_seconds=30,
+                                            min_replicas=1)
+                for version in versions
             }
 
         with mock.patch.object(replica_managers.serve_state,
@@ -11417,8 +11620,8 @@ class TestLogicalCapacityPlanning:
             replica_managers.time.monotonic() + 120)
         mgr._wait_for_idle_trackers = {
             info.replica_id: (mock.Mock(return_value=False),
-                              replica_managers.time.monotonic() + 300
-                             ) for info in candidates
+                              replica_managers.time.monotonic() + 300)
+            for info in candidates
         }
         mgr._logical_reconcile_snapshot = (
             replica_managers.LogicalReconcileSnapshot(
@@ -11428,9 +11631,7 @@ class TestLogicalCapacityPlanning:
                     survivor.replica_id: survivor.planned_capacity
                 },
                 in_flight_by_replica_id={
-                    **{
-                        info.replica_id: 0 for info in candidates
-                    },
+                    **{info.replica_id: 0 for info in candidates},
                     survivor.replica_id: 0,
                 },
                 unknown_replica_ids=frozenset(),
@@ -11600,8 +11801,8 @@ class TestLogicalCapacityPlanning:
         mgr._recovering_logical_retirement_ids = {1, 2, 3}
         mgr._wait_for_idle_trackers = {
             replica_id: (mock.Mock(return_value=False),
-                         replica_managers.time.monotonic() + 300
-                        ) for replica_id in (1, 2, 3)
+                         replica_managers.time.monotonic() + 300)
+            for replica_id in (1, 2, 3)
         }
         mgr._logical_reconcile_snapshot = (
             replica_managers.LogicalReconcileSnapshot(
@@ -11710,8 +11911,8 @@ class TestLogicalCapacityPlanning:
             mgr._recover_replica_operations()
 
         kwargs = mgr._register_wait_for_idle.call_args.kwargs
-        assert (kwargs['replica_url']
-                is replica_managers._REPLICA_URL_NOT_PROVIDED)
+        assert (kwargs['replica_url'] is
+                replica_managers._REPLICA_URL_NOT_PROVIDED)
 
     def test_recovery_busy_ambient_phase_defers_without_provider_lookup(self):
         retiring = self._recoverable_logical_retirement(1)
@@ -11885,6 +12086,123 @@ class TestLogicalCapacityPlanning:
         mgr._register_wait_for_idle.assert_called_once_with(
             retiring, deadline=math.inf, replica_url='http://replica:8000')
 
+    def test_fresh_zero_paid_retirement_isolates_ambiguous_bound_launch(self):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._service_hash = 'svc-hash'
+        mgr._controller_owner = (123, '10.0.0.5')
+        mgr._update_recovery_required = False
+        ambiguous = replica_managers.ReplicaInfo(replica_id=1,
+                                                 cluster_name='svc-1',
+                                                 replica_port='8080',
+                                                 is_spot=True,
+                                                 location=None,
+                                                 version=1,
+                                                 resources_override=None,
+                                                 planned_capacity=1)
+        ambiguous.is_zero_cost = False
+        ready = self._ready_backend(2, 1)
+        ready.is_zero_cost = False
+        infos = {info.replica_id: info for info in (ambiguous, ready)}
+        authority = replica_managers.paid_retirement.FreshZeroAuthority(
+            service_hash='svc-hash',
+            demand_source_epoch=2,
+            demand_feed_generation=7,
+            capacity_plan_generation=9,
+            capacity_plan_sha256='a' * 64,
+            route_generation=11)
+        mgr._register_wait_for_idle = mock.Mock()
+        unresolved = replica_managers._BoundOrdinaryLaunchUnresolvedError(
+            'durably ambiguous')
+
+        def _admit(_service_name, replica_id, *_args, **_kwargs):
+            return {
+                'replica_record_id': infos[replica_id].replica_record_id,
+                'route_url':
+                    (None if replica_id == 1 else 'http://replica-2:8000'),
+            }
+
+        def _terminate(replica_id, **_kwargs):
+            if replica_id == 1:
+                raise unresolved
+
+        mgr._terminate_replica = mock.Mock(side_effect=_terminate)
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_info_from_id',
+                side_effect=lambda _service_name, replica_id: infos[
+                    replica_id]), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'admit_paid_retirement',
+                 side_effect=_admit) as admit:
+            changed = mgr.reconcile_fresh_zero_paid_retirements(
+                authority, [ambiguous, ready])
+
+        assert changed
+        assert admit.call_count == 2
+        mgr._terminate_replica.assert_called_once_with(
+            1,
+            sync_down_logs=False,
+            replica_drain_delay_seconds=0,
+            is_scale_down=True,
+            in_flight_drain_cap_seconds=0)
+        mgr._register_wait_for_idle.assert_called_once_with(
+            ready, deadline=math.inf, replica_url='http://replica-2:8000')
+
+    @pytest.mark.parametrize('error_type', [
+        replica_managers._ReplicaLaunchOwnershipLostError,
+        RuntimeError,
+    ])
+    def test_fresh_zero_paid_retirement_propagates_non_ambiguous_error(
+            self, error_type):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._service_hash = 'svc-hash'
+        mgr._controller_owner = (123, '10.0.0.5')
+        mgr._update_recovery_required = False
+        replicas = []
+        for replica_id in (1, 2):
+            info = replica_managers.ReplicaInfo(
+                replica_id=replica_id,
+                cluster_name=f'svc-{replica_id}',
+                replica_port='8080',
+                is_spot=True,
+                location=None,
+                version=1,
+                resources_override=None,
+                planned_capacity=1)
+            info.is_zero_cost = False
+            replicas.append(info)
+        infos = {info.replica_id: info for info in replicas}
+        authority = replica_managers.paid_retirement.FreshZeroAuthority(
+            service_hash='svc-hash',
+            demand_source_epoch=2,
+            demand_feed_generation=7,
+            capacity_plan_generation=9,
+            capacity_plan_sha256='a' * 64,
+            route_generation=11)
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_info_from_id',
+                side_effect=lambda _service_name, replica_id: infos[
+                    replica_id]), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'admit_paid_retirement',
+                 return_value={
+                     'replica_record_id': replicas[0].replica_record_id,
+                     'route_url': None,
+                 }) as admit, \
+             mock.patch.object(mgr,
+                               '_terminate_replica',
+                               side_effect=error_type('lost authority')):
+            with pytest.raises(error_type, match='lost authority'):
+                mgr.reconcile_fresh_zero_paid_retirements(authority, replicas)
+
+        admit.assert_called_once()
+
     @pytest.mark.parametrize('idle', [False, True])
     def test_exact_paid_retirement_never_uses_elapsed_time(self, idle):
         mgr = _make_manager()
@@ -11945,6 +12263,130 @@ class TestLogicalCapacityPlanning:
             commit.assert_not_called()
             mgr._terminate_replica.assert_not_called()
             assert mgr._wait_for_idle_trackers[1][1] == math.inf
+
+    def test_active_paid_retirement_isolates_ambiguous_bound_launch(self):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._service_hash = 'svc-hash'
+        mgr._controller_owner = (123, '10.0.0.5')
+        mgr._drain_proof_stats_value = mock.Mock()
+        retiring = [self._ready_backend(replica_id, 1) for replica_id in (1, 2)]
+        for info in retiring:
+            info.is_zero_cost = False
+            info.status_property.is_scale_down = True
+            info.status_property.sky_down_status = (
+                common_utils.ProcessStatus.SCHEDULED)
+            info.status_property.wait_for_idle_before_termination = True
+            info.status_property.drain_cap_seconds = None
+        infos = {info.replica_id: info for info in retiring}
+        mgr._wait_for_idle_trackers = {
+            info.replica_id: (mock.Mock(return_value=True), math.inf)
+            for info in retiring
+        }
+        records = {
+            info.replica_id: {
+                'service_hash': 'svc-hash',
+                'replica_record_id': info.replica_record_id,
+                'demand_source_epoch': 2,
+                'demand_feed_generation': 7,
+                'capacity_plan_generation': 9,
+                'capacity_plan_sha256': 'a' * 64,
+                'route_generation': 11,
+                'route_url': f'http://replica-{info.replica_id}:8000',
+                'state': (replica_managers.paid_retirement.PaidRetirementState.
+                          ACTIVE.value),
+            } for info in retiring
+        }
+        unresolved = replica_managers._BoundOrdinaryLaunchUnresolvedError(
+            'durably ambiguous')
+
+        def _terminate(replica_id, **_kwargs):
+            if replica_id == 1:
+                raise unresolved
+
+        mgr._terminate_replica = mock.Mock(side_effect=_terminate)
+        with mock.patch.object(
+                replica_managers.paid_retirement,
+                'list_for_service',
+                return_value=records), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos_from_ids',
+                 return_value=infos), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={
+                     info.cluster_name: ('UP', 1) for info in retiring
+                 }), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'commit_paid_retirement',
+                 return_value=True) as commit:
+            mgr._refresh_wait_for_idle()
+
+        assert [call.args[1] for call in commit.call_args_list] == [1, 2]
+        assert [call.args[0] for call in mgr._terminate_replica.call_args_list
+               ] == [1, 2]
+
+    def test_committed_paid_retirement_isolates_ambiguous_bound_launch(self):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._service_hash = 'svc-hash'
+        mgr._controller_owner = (123, '10.0.0.5')
+        retiring = [self._ready_backend(replica_id, 1) for replica_id in (1, 2)]
+        for info in retiring:
+            info.is_zero_cost = False
+            info.status_property.is_scale_down = True
+            info.status_property.sky_down_status = (
+                common_utils.ProcessStatus.SCHEDULED)
+            # A lost commit acknowledgement can leave the process-local
+            # tracker while PostgreSQL already owns destructive authority.
+            info.status_property.wait_for_idle_before_termination = True
+            info.status_property.drain_cap_seconds = None
+        infos = {info.replica_id: info for info in retiring}
+        mgr._wait_for_idle_trackers = {
+            info.replica_id: (mock.Mock(return_value=False), math.inf)
+            for info in retiring
+        }
+        records = {
+            info.replica_id: {
+                'replica_record_id': info.replica_record_id,
+                'route_url': None,
+                'state': (replica_managers.paid_retirement.PaidRetirementState.
+                          COMMITTED.value),
+            } for info in retiring
+        }
+        unresolved = replica_managers._BoundOrdinaryLaunchUnresolvedError(
+            'durably ambiguous')
+
+        def _terminate(replica_id, **_kwargs):
+            if replica_id == 1:
+                raise unresolved
+
+        mgr._terminate_replica = mock.Mock(side_effect=_terminate)
+        with mock.patch.object(
+                replica_managers.paid_retirement,
+                'list_for_service',
+                return_value=records), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos_from_ids',
+                 return_value=infos), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={
+                     info.cluster_name: ('UP', 1) for info in retiring
+                 }), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'commit_paid_retirement') as commit:
+            mgr._refresh_wait_for_idle()
+
+        commit.assert_not_called()
+        assert [call.args[0] for call in mgr._terminate_replica.call_args_list
+               ] == [1, 2]
 
     def test_new_positive_generation_cancels_only_active_retirement(self):
         mgr = _make_manager()
@@ -12510,9 +12952,7 @@ class TestLogicalCapacityPlanning:
             version=2,
             observed_slots_by_replica_id={100: 1},
             in_flight_by_replica_id={
-                **{
-                    info.replica_id: 0 for info in candidates
-                },
+                **{info.replica_id: 0 for info in candidates},
                 100: 0,
             })
         mgr._logical_target = (2, 5, 25)
@@ -12540,9 +12980,7 @@ class TestLogicalCapacityPlanning:
             version=2,
             observed_slots_by_replica_id={100: 1},
             in_flight_by_replica_id={
-                **{
-                    info.replica_id: 0 for info in candidates
-                }, 100: 0
+                **{info.replica_id: 0 for info in candidates}, 100: 0
             })
         mgr._logical_target = (2, 5, 25)
         mgr._persist_replica.side_effect = [None] * 19 + [
@@ -13912,8 +14350,8 @@ class TestLogicalCapacityPlanning:
         else:
             mgr._terminate_replica.assert_not_called()
             assert not retiring.status_property.is_scale_down
-        assert (retiring.status_property.logical_retirement_bounded_deadline
-                is should_terminate)
+        assert (retiring.status_property.logical_retirement_bounded_deadline is
+                should_terminate)
         assert 9 not in mgr._wait_for_idle_trackers
 
     @pytest.mark.parametrize('guard', [
@@ -14413,11 +14851,11 @@ class TestLogicalCapacityPlanning:
         assert (retiring.status_property.sky_down_status ==
                 common_utils.ProcessStatus.RUNNING)
         assert retiring.status_property.logical_retirement_version is None
-        assert (retiring.status_property.logical_retirement_controller_epoch
-                is None)
+        assert (retiring.status_property.logical_retirement_controller_epoch is
+                None)
         assert (retiring.status_property.logical_retirement_generation is None)
-        assert (retiring.status_property.logical_retirement_target_capacity
-                is None)
+        assert (retiring.status_property.logical_retirement_target_capacity is
+                None)
         assert (retiring.status_property.logical_retirement_confirmed_generation
                 is None)
         assert not retiring.status_property.logical_retirement_bounded_deadline
@@ -15331,7 +15769,9 @@ class TestFailedCleanupReconciliation:
              mock.patch.object(manager, '_remove_replica') as remove:
             manager._handle_sky_down_finish(info, format_exc=None)
 
-        remove.assert_called_once_with(1, info.replica_record_id)
+        remove.assert_called_once_with(1,
+                                       info.replica_record_id,
+                                       allow_active_provider_free_pre_job=False)
         persist.assert_not_called()
         assert not manager._failed_cleanup_retry_attempts
         assert not manager._failed_cleanup_retry_at
@@ -15617,8 +16057,8 @@ class TestFailedCleanupReconciliation:
             assert manager._down_thread_pool[9] is fresh_thread
             assert (durable[9].status_property.sky_down_status ==
                     common_utils.ProcessStatus.SCHEDULED)
-            assert (durable[9].status_property.logical_retirement_version
-                    is None)
+            assert (durable[9].status_property.logical_retirement_version is
+                    None)
             assert not durable[9].is_ready
             assert manager._down_thread_pool[9] is fresh_thread
             assert (safe_thread_factory.call_args.kwargs['kwargs']
@@ -16069,9 +16509,10 @@ class TestPaidLocationLaunchBudget:
         manager._demand_should_skip_saturated_zero_cost = mock.Mock(
             return_value=False)
         keys = {
-            location: paid_capacity.pool_key(
-                location, workspace='default',
-                num_nodes=1) for location in (primary, hedge, third)
+            location: paid_capacity.pool_key(location,
+                                             workspace='default',
+                                             num_nodes=1)
+            for location in (primary, hedge, third)
         }
         budget = paid_capacity.LaunchBudget(
             remaining_by_location={
@@ -16130,9 +16571,10 @@ class TestPaidLocationLaunchBudget:
             return_value=False)
         locations = (primary, hedge, third)
         keys = {
-            location: paid_capacity.pool_key(
-                location, workspace='default',
-                num_nodes=1) for location in locations
+            location: paid_capacity.pool_key(location,
+                                             workspace='default',
+                                             num_nodes=1)
+            for location in locations
         }
         budget = paid_capacity.LaunchBudget(
             remaining_by_location={
