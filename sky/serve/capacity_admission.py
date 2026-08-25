@@ -1740,14 +1740,57 @@ def validate_paid_claim_in_connection(
             'Paid claim planner tuple is malformed.')
     now = connection.execute(
         sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
-    plan = connection.execute(
+    claim_plan = connection.execute(
         sqlalchemy.select(_PLANS).where(
             _PLANS.c.service_name == service['name'],
             _PLANS.c.generation == generation)).mappings().one_or_none()
-    if (plan is None or plan['service_hash'] != service['hash'] or
-            plan['content_sha256'] != claim_sha256):
+    if (claim_plan is None or claim_plan['service_hash'] != service['hash'] or
+            claim_plan['content_sha256'] != claim_sha256 or
+            claim_plan['service_lifecycle_epoch'] != service['lifecycle_epoch']
+            or claim_plan['service_version'] != service['current_version'] or
+            claim_plan['demand_source_epoch'] != claim_source_epoch or
+            claim_plan['protocol_version'] != PROTOCOL_VERSION):
         raise CapacityAdmissionConflict(
             'Paid claim lost its current fresh capacity-plan authority.')
+    claim_plan_payload = claim_plan['payload']
+    if (not isinstance(claim_plan_payload, Mapping) or
+            _sha256(claim_plan_payload) != claim_sha256):
+        raise CapacityAdmissionConflict(
+            'Capacity plan digest no longer matches its payload.')
+    head = connection.execute(
+        sqlalchemy.select(_HEADS).where(
+            _HEADS.c.service_name ==
+            service['name']).with_for_update()).mappings().one_or_none()
+    if head is None:
+        raise CapacityAdmissionConflict(
+            'Paid claim lost its current fresh capacity-plan authority.')
+    # A committed claim is durable capacity admission, not a speculative read
+    # of one forever-current planner generation.  An independent demand,
+    # route, or supply change can publish a semantic successor while launch
+    # binding is in progress.  That successor accounts for the already
+    # persisted paid replica in its existing-paid baseline; invalidating the
+    # claim solely because the fresh semantic head advanced strands cold
+    # launches before provider effect.  Prospective admission remains
+    # exact-head only.  Existing claims may instead revalidate against a fresh
+    # successor plan below, which must still fund the complete current paid
+    # inventory on this exact accelerator.
+    committed_successor_plan = bool(not prospective and
+                                    head['generation'] != generation)
+    if committed_successor_plan:
+        if head['generation'] < generation:
+            raise CapacityAdmissionConflict(
+                'Paid claim lost its current fresh capacity-plan authority.')
+        plan = connection.execute(
+            sqlalchemy.select(_PLANS).where(
+                _PLANS.c.service_name == service['name'], _PLANS.c.generation ==
+                head['generation'])).mappings().one_or_none()
+        if plan is None:
+            raise CapacityAdmissionConflict(
+                'Paid claim lost its current fresh capacity-plan authority.')
+        validation_generation = int(head['generation'])
+    else:
+        plan = claim_plan
+        validation_generation = generation
     payload = plan['payload']
     if not isinstance(payload, Mapping):
         raise CapacityAdmissionConflict('Capacity plan payload is malformed.')
@@ -1781,10 +1824,6 @@ def validate_paid_claim_in_connection(
         plan_reserved_fill_authority,
         reserved_fill_binding_required=reserved_fill_binding_required,
         protocol_and_service_prelocked=protocol_and_service_prelocked)
-    head = connection.execute(
-        sqlalchemy.select(_HEADS).where(
-            _HEADS.c.service_name ==
-            service['name']).with_for_update()).mappings().one_or_none()
     current_demand_generation = connection.execute(
         sqlalchemy.select(_DEMAND_GENERATIONS.c.generation).where(
             _DEMAND_GENERATIONS.c.service_name == service['name'],
@@ -1799,10 +1838,12 @@ def validate_paid_claim_in_connection(
             _ROUTE_SNAPSHOTS.c.service_name == service['name'],
             _ROUTE_SNAPSHOTS.c.generation
             == route_head['generation'])).mappings().one_or_none())
-    if (head is None or head['generation'] != generation or
+    if (head['generation'] != validation_generation or
             head['valid_until'] <= now or
             plan['service_hash'] != service['hash'] or
-            plan['content_sha256'] != claim_sha256 or
+        (not committed_successor_plan and
+         plan['content_sha256'] != claim_sha256) or
+            plan['protocol_version'] != PROTOCOL_VERSION or
             head['demand_feed_generation'] != current_demand_generation or
             head['demand_feed_generation'] < claim_demand_generation or
             plan['demand_source_epoch'] != claim_source_epoch or
@@ -1964,7 +2005,7 @@ def validate_paid_claim_in_connection(
         connection,
         service_name=service['name'],
         service_hash=service['hash'],
-        generation=generation,
+        generation=validation_generation,
         accounting_cards=accounting_cards)
     expected_paid = {
         card: baseline_paid.get(card, 0) + claim_units_by_card.get(card, 0)
@@ -1981,13 +2022,25 @@ def validate_paid_claim_in_connection(
                               baseline_allocation_reserved):
         raise CapacityAdmissionConflict(
             'Paid residual is not the exact post-reserved deficit.')
-    authorized = paid.get(accelerator, 0)
-    claimed = claim_units_by_card.get(accelerator, 0)
-    if prospective:
-        claimed += claim_units
-    if authorized <= 0 or claimed > authorized:
-        raise CapacityAdmissionConflict(
-            'Paid claims exceed the exact post-zero-cost residual.')
+    if committed_successor_plan:
+        paid_envelope = max(
+            0,
+            capacity_target.get(accelerator, 0) -
+            current_zero.get(accelerator, 0) -
+            current_pending_zero.get(accelerator, 0) -
+            current_allocation_reserved.get(accelerator, 0))
+        committed_paid = current_paid.get(accelerator, 0)
+        if (committed_paid < claim_units or committed_paid > paid_envelope):
+            raise CapacityAdmissionConflict(
+                'Paid claim lost its current fresh capacity-plan authority.')
+    else:
+        authorized = paid.get(accelerator, 0)
+        claimed = claim_units_by_card.get(accelerator, 0)
+        if prospective:
+            claimed += claim_units
+        if authorized <= 0 or claimed > authorized:
+            raise CapacityAdmissionConflict(
+                'Paid claims exceed the exact post-zero-cost residual.')
     # The first clock sample selects rows conservatively, but allocation,
     # route, capacity, and claim locks may all wait.  Provider-start authority
     # therefore ends on a fresh database-clock sample taken after every lock.

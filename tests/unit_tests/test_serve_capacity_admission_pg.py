@@ -1715,6 +1715,57 @@ def test_heartbeat_refresh_keeps_plan_and_bounded_claims(capacity_database):
                 prospective=True)
 
 
+def test_committed_claim_survives_successor_plan_that_accounts_for_it(
+        capacity_database):
+    engine, _, route_receipt = capacity_database
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    first = repository.publish(_plan(2))
+    first_claim = _insert_claim(engine, first, 10)
+
+    # Persisting the claim also persists its paid replica.  An independent
+    # demand change then mints a semantic successor that moves that unit from
+    # residual demand into the existing-paid baseline.  This successor is
+    # exactly what used to revoke the claim before its association/request
+    # could be committed.
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=2))
+    successor = repository.publish(_plan(2))
+    assert successor.generation == first.generation + 1
+    assert successor.remaining() == {'l4': 1}
+
+    with engine.begin() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        capacity_admission.validate_paid_claim_in_connection(connection,
+                                                             service,
+                                                             first_claim,
+                                                             prospective=False)
+
+    second_claim = _insert_claim(engine, successor, 11)
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=3, request_count=1))
+    fully_committed = repository.publish(_plan(2))
+    assert fully_committed.generation == successor.generation + 1
+    assert not fully_committed.remaining()
+    with engine.begin() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        capacity_admission.validate_paid_claim_in_connection(connection,
+                                                             service,
+                                                             first_claim,
+                                                             prospective=False)
+        capacity_admission.validate_paid_claim_in_connection(connection,
+                                                             service,
+                                                             second_claim,
+                                                             prospective=False)
+
+
 def test_zero_cost_commit_after_plan_revokes_paid_claim(capacity_database):
     engine, _, _ = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
