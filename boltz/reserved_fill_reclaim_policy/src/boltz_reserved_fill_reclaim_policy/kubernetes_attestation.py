@@ -14,14 +14,14 @@ from sky.adaptors import common as adaptor_common
 
 aws_adaptor = adaptor_common.LazyImport('sky.adaptors.aws')
 kubernetes_adaptor = adaptor_common.LazyImport('sky.adaptors.kubernetes')
+kueue_admission_lib = adaptor_common.LazyImport(
+    'sky.provision.kubernetes.kueue_admission')
 yaml = adaptor_common.LazyImport('yaml')
 botocore_credentials = adaptor_common.LazyImport('botocore.credentials')
 botocore_signers = adaptor_common.LazyImport('botocore.signers')
 
 _KUEUE_GROUP = 'kueue.x-k8s.io'
 _KUEUE_API_VERSIONS = ('v1beta2', 'v1beta1')
-_KUEUE_LIST_PAGE_LIMIT = 250
-_KUEUE_LIST_MAX_PAGES = 32
 _IRSA_ANNOTATION = 'eks.amazonaws.com/role-arn'
 _EKS_TOKEN_PREFIX = 'k8s-aws-v1.'
 _EKS_TOKEN_TTL_SECONDS = 60
@@ -343,241 +343,19 @@ def _require_active(value: Mapping[str, Any],
             f'Kueue object {name!r} is not current and Active.')
 
 
-def _preemption(spec: Mapping[str, Any]) -> dict[str, str]:
-    raw = _dict(spec.get('preemption'), 'ClusterQueue preemption')
-    borrow = raw.get('borrowWithinCohort')
-    if isinstance(borrow, Mapping):
-        borrow = borrow.get('policy')
-    result = {
-        'borrow_within_cohort': borrow,
-        'reclaim_within_cohort': raw.get('reclaimWithinCohort'),
-        'within_cluster_queue': raw.get('withinClusterQueue'),
-    }
-    if not all(isinstance(value, str) for value in result.values()):
-        raise KubernetesAttestationError(
-            'ClusterQueue preemption policy is incomplete.')
-    return result  # type: ignore[return-value]
-
-
-def _resource_groups(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Normalize the complete strict ClusterQueue resource topology."""
-    result: list[dict[str, Any]] = []
-    groups = _list(spec.get('resourceGroups'), 'ClusterQueue resource groups')
-    covered_inventory: set[str] = set()
-    group_signatures: set[frozenset[str]] = set()
-    quota_atoms: set[tuple[str, str]] = set()
-    for group in groups:
-        group_mapping = _dict(group, 'ClusterQueue resource group')
-        if set(group_mapping) != {'coveredResources', 'flavors'}:
-            raise KubernetesAttestationError(
-                'ClusterQueue resource group schema is not exact.')
-        covered_resources = _list(group_mapping.get('coveredResources'),
-                                  'ClusterQueue covered resources')
-        if (not covered_resources or any(not isinstance(item, str) or not item
-                                         for item in covered_resources) or
-                len(covered_resources) != len(set(covered_resources))):
-            raise KubernetesAttestationError(
-                'ClusterQueue covered resources are invalid.')
-        signature = frozenset(covered_resources)
-        if (signature in group_signatures or
-                covered_inventory.intersection(signature)):
-            raise KubernetesAttestationError(
-                'ClusterQueue has duplicate or overlapping resource groups.')
-        group_signatures.add(signature)
-        covered_inventory.update(signature)
-        normalized_flavors: list[dict[str, Any]] = []
-        flavors = _list(group_mapping.get('flavors'), 'ClusterQueue flavors')
-        if not flavors:
-            raise KubernetesAttestationError(
-                'ClusterQueue resource group has no flavors.')
-        flavor_names: set[str] = set()
-        for flavor in flavors:
-            flavor_mapping = _dict(flavor, 'ClusterQueue flavor')
-            if set(flavor_mapping) != {'name', 'resources'}:
-                raise KubernetesAttestationError(
-                    'ClusterQueue flavor schema is not exact.')
-            flavor_name = flavor_mapping.get('name')
-            if not isinstance(flavor_name, str) or not flavor_name:
-                raise KubernetesAttestationError(
-                    'ClusterQueue flavor name is invalid.')
-            if flavor_name in flavor_names:
-                raise KubernetesAttestationError(
-                    'ClusterQueue has duplicate flavors in one group.')
-            flavor_names.add(flavor_name)
-            normalized_resources: list[dict[str, str]] = []
-            resource_names: set[str] = set()
-            for resource in _list(flavor_mapping.get('resources'),
-                                  'ClusterQueue flavor resources'):
-                resource_mapping = _dict(resource,
-                                         'ClusterQueue flavor resource')
-                if set(resource_mapping) != {
-                        'name', 'nominalQuota', 'borrowingLimit'
-                }:
-                    raise KubernetesAttestationError(
-                        'ClusterQueue quota atom schema is not exact.')
-                resource_name = resource_mapping.get('name')
-                nominal = resource_mapping.get('nominalQuota')
-                borrowing = resource_mapping.get('borrowingLimit')
-                if (not isinstance(resource_name, str) or not resource_name or
-                        not isinstance(nominal, str) or not nominal or
-                        not isinstance(borrowing, str) or not borrowing):
-                    raise KubernetesAttestationError(
-                        'ClusterQueue quota atom is incomplete.')
-                atom = (flavor_name, resource_name)
-                if resource_name in resource_names or atom in quota_atoms:
-                    raise KubernetesAttestationError(
-                        'ClusterQueue has duplicate quota atoms.')
-                resource_names.add(resource_name)
-                quota_atoms.add(atom)
-                normalized_resources.append({
-                    'resource_name': resource_name,
-                    'nominal_quota': nominal,
-                    'borrowing_limit': borrowing,
-                })
-            if resource_names != signature:
-                raise KubernetesAttestationError(
-                    'ClusterQueue flavor does not cover its exact resource '
-                    'group.')
-            normalized_resources.sort(key=lambda item: item['resource_name'])
-            normalized_flavors.append({
-                'name': flavor_name,
-                'resources': normalized_resources,
-            })
-        normalized_flavors.sort(key=lambda item: item['name'])
-        result.append({
-            'covered_resources': sorted(covered_resources),
-            'flavors': normalized_flavors,
-        })
-    result.sort(key=lambda item: tuple(item['covered_resources']))
-    return result
-
-
-def _inventory_by_name(value: object,
-                       path: str) -> dict[str, Mapping[str, Any]]:
-    """Index one complete cluster-wide custom-resource inventory."""
-    result: dict[str, Mapping[str, Any]] = {}
-    for index, raw_item in enumerate(_list(value, path)):
-        item = _dict(raw_item, f'{path}[{index}]')
-        metadata = _dict(item.get('metadata'), f'{path}[{index}] metadata')
-        name = metadata.get('name')
-        if not isinstance(name, str) or not name or name in result:
-            raise KubernetesAttestationIndeterminateError(
-                f'Kubernetes returned duplicate or invalid {path} identity.')
-        result[name] = item
-    return result
-
-
-def _cohort_parent_for_closure(value: Mapping[str, Any],
-                               name: str) -> str | None:
-    spec = value.get('spec')
-    if spec is None:
-        return None
-    spec = _dict(spec, f'{name} Cohort membership spec')
-    parent_name = spec.get('parentName')
-    if parent_name is None:
-        return None
-    if not isinstance(parent_name, str) or not parent_name:
-        raise KubernetesAttestationIndeterminateError(
-            f'Kubernetes returned invalid {name} Cohort membership.')
-    return parent_name
-
-
-def _cluster_queue_cohort_for_closure(value: Mapping[str, Any],
-                                      name: str) -> str | None:
-    spec = _dict(value.get('spec'), f'{name} ClusterQueue membership spec')
-    cohort_name = spec.get('cohortName')
-    if cohort_name is None:
-        return None
-    if not isinstance(cohort_name, str) or not cohort_name:
-        raise KubernetesAttestationIndeterminateError(
-            f'Kubernetes returned invalid {name} ClusterQueue membership.')
-    return cohort_name
-
-
-def _validate_governed_kueue_closure(
-    queue_contract: Mapping[str, Any], snapshot: Mapping[str, Any]
-) -> tuple[dict[str, Mapping[str, Any]], dict[str, Mapping[str, Any]]]:
-    """Prove the complete inventory around the governed implicit cohort."""
-    cohort_contracts = {
-        cohort['name']: cohort for cohort in queue_contract['cohorts']
-    }
-    cluster_queue_contracts = {
-        queue['name']: queue for queue in queue_contract['cluster_queues']
-    }
-    observed_cohorts = _inventory_by_name(snapshot.get('cohort_inventory'),
-                                          'Cohort inventory')
-    observed_queues = _inventory_by_name(
-        snapshot.get('cluster_queue_inventory'), 'ClusterQueue inventory')
-    governed_cohorts = {
-        queue['cohort_name'] for queue in cluster_queue_contracts.values()
-    }
-    missing_cohorts = governed_cohorts.difference(observed_cohorts)
-    missing_queues = set(cluster_queue_contracts).difference(observed_queues)
-    if cohort_contracts and missing_cohorts:
-        raise KubernetesAttestationError(
-            'The governed Cohort inventory is missing reviewed objects.')
-    if missing_queues:
-        raise KubernetesAttestationError(
-            'The governed ClusterQueue inventory is missing reviewed '
-            'objects.')
-    for name, cohort in observed_cohorts.items():
-        parent_name = _cohort_parent_for_closure(cohort, name)
-        if (name in governed_cohorts and name not in cohort_contracts):
-            raise KubernetesAttestationError(
-                f'Explicit Cohort {name!r} replaces the reviewed implicit '
-                'flat cohort.')
-        if name not in cohort_contracts and parent_name in governed_cohorts:
-            raise KubernetesAttestationError(
-                f'Unreviewed Cohort {name!r} joins the governed Kueue '
-                'subtree.')
-    for name, queue in observed_queues.items():
-        cohort_name = _cluster_queue_cohort_for_closure(queue, name)
-        if (name not in cluster_queue_contracts and
-                cohort_name in governed_cohorts):
-            raise KubernetesAttestationError(
-                f'Unreviewed ClusterQueue {name!r} joins the governed Kueue '
-                'subtree.')
-    return observed_cohorts, observed_queues
-
-
-def _validate_cluster_queue(
-        value: Mapping[str, Any], *, contract: Mapping[str, Any],
-        expected_resource_groups: list[Mapping[str, Any]]) -> None:
-    name = contract['name']
+def _validate_external_cluster_queue(
+        value: Mapping[str, Any], *, name: str, namespace: str,
+        namespace_labels: Mapping[str, str]) -> None:
+    """Prove only the existing external lane needed for safe submission."""
     _require_active(value, name=name)
     spec = _dict(value.get('spec'), f'{name} spec')
-    expected_spec_keys = {
-        'cohortName', 'fairSharing', 'flavorFungibility', 'namespaceSelector',
-        'preemption', 'queueingStrategy', 'resourceGroups', 'stopPolicy'
-    }
-    if set(spec) != expected_spec_keys:
+    namespace_selector = spec.get('namespaceSelector')
+    if (not kueue_admission_lib.namespace_matches_selector(
+            namespace_selector, namespace_labels) or
+            spec.get('stopPolicy') not in (None, 'None')):
         raise KubernetesAttestationError(
-            f'ClusterQueue {name!r} spec schema is not exact.')
-    expected_selector = {
-        'matchLabels': {
-            'kubernetes.io/metadata.name': contract['namespace'],
-        }
-    }
-    fair_sharing = _dict(spec.get('fairSharing'), f'{name} fair-sharing policy')
-    fungibility = _dict(spec.get('flavorFungibility'),
-                        f'{name} flavor-fungibility policy')
-    expected_fungibility = {
-        'whenCanBorrow': contract['flavor_fungibility']['when_can_borrow'],
-        'whenCanPreempt': contract['flavor_fungibility']['when_can_preempt'],
-    }
-    if (spec.get('cohortName') != contract['cohort_name'] or
-            spec.get('namespaceSelector') != expected_selector or
-            spec.get('stopPolicy') != 'None' or
-            spec.get('queueingStrategy') != contract['queueing_strategy'] or
-            fair_sharing != {
-                'weight': contract['fair_sharing_weight']
-            } or fungibility != expected_fungibility or
-            _preemption(spec) != dict(contract['preemption']) or
-            _resource_groups(spec)
-            != [dict(item) for item in expected_resource_groups]):
-        raise KubernetesAttestationError(
-            f'ClusterQueue {name!r} does not match the reviewed reclaim '
-            'contract.')
+            f'ClusterQueue {name!r} does not admit the external namespace '
+            f'{namespace!r}.')
 
 
 def _validate_deployment(value: Mapping[str, Any], *, name: str, namespace: str,
@@ -732,8 +510,8 @@ def _validate_node_inventory(
                 _dict(node.get('status'),
                       f'{name} Node status').get('capacity'),
                 f'{name} Node capacity')
-            if (labels.get(contract['product_label_key'])
-                    != contract['product_label_value'] or
+            if (labels.get(contract['product_label_key']) !=
+                    contract['product_label_value'] or
                     capacity.get(contract['resource_name']) != str(
                         contract['capacity_per_node'])):
                 raise KubernetesAttestationError(
@@ -753,9 +531,10 @@ def _validate_node_inventory(
     return tuple(proofs)
 
 
-def _validate_kueue_snapshot(fleet_context: Mapping[str, Any],
-                             provider_context: Mapping[str, Any],
-                             snapshot: Mapping[str, Any]) -> tuple[str, str]:
+def _validate_kueue_snapshot(
+        fleet_context: Mapping[str, Any], provider_context: Mapping[str, Any],
+        snapshot: Mapping[str, Any],
+        namespace_labels: Mapping[str, str]) -> tuple[str, str]:
     admission = _dict(fleet_context.get('kueue_admission'),
                       'Kueue admission contract')
     enforcement = _dict(provider_context.get('kueue_enforcement'),
@@ -769,31 +548,22 @@ def _validate_kueue_snapshot(fleet_context: Mapping[str, Any],
         raise KubernetesAttestationError(
             'The WorkloadPriorityClass reclaim contract is invalid.')
 
-    queue_contract = _dict(admission['queues'], 'Kueue queue contract')
     local_queue_name = admission['local_queue_name']
     local_queue = _dict(snapshot.get('local_queue'), 'LocalQueue')
     _require_active(local_queue,
                     name=local_queue_name,
                     namespace=namespace_name)
     local_queue_spec = _dict(local_queue.get('spec'), 'LocalQueue spec')
-    cluster_queue_name = queue_contract['inference_cluster_queue']
+    cluster_queue_name = admission['cluster_queue_name']
     if (local_queue_spec.get('clusterQueue') != cluster_queue_name or
             local_queue_spec.get('stopPolicy') not in (None, 'None')):
         raise KubernetesAttestationError(
             'The inference LocalQueue target is invalid.')
-    _, observed_queues = _validate_governed_kueue_closure(
-        queue_contract, snapshot)
-
-    cluster_queue_contracts = {
-        queue['name']: queue for queue in queue_contract['cluster_queues']
-    }
-    profiles = _dict(queue_contract['quota_profiles'],
-                     'ClusterQueue quota profiles')
-    for name, contract in cluster_queue_contracts.items():
-        _validate_cluster_queue(
-            _dict(observed_queues[name], f'ClusterQueue {name}'),
-            contract=contract,
-            expected_resource_groups=profiles[contract['quota_profile']])
+    _validate_external_cluster_queue(_dict(snapshot.get('cluster_queue'),
+                                           'ClusterQueue'),
+                                     name=cluster_queue_name,
+                                     namespace=namespace_name,
+                                     namespace_labels=namespace_labels)
 
     controller = _dict(enforcement['controller'], 'Kueue controller contract')
     _validate_deployment(_dict(snapshot.get('kueue_controller'),
@@ -873,15 +643,17 @@ def _validate_snapshot(fleet_context: Mapping[str, Any],
     _metadata(priority, name=fleet_context['priority_class']['name'])
     if (priority.get('value') != fleet_context['priority_class']['value'] or
             priority.get('globalDefault') not in (None, False) or
-            priority.get('preemptionPolicy')
-            != fleet_context['priority_class']['preemption_policy']):
+            priority.get('preemptionPolicy') !=
+            fleet_context['priority_class']['preemption_policy']):
         raise KubernetesAttestationError(
             'The Pod PriorityClass reclaim contract is invalid.')
     local_queue_name: str | None = None
     cluster_queue_name: str | None = None
     if managed:
+        namespace_labels = _dict(namespace_metadata.get('labels', {}),
+                                 'Namespace labels')
         local_queue_name, cluster_queue_name = _validate_kueue_snapshot(
-            fleet_context, provider_context, snapshot)
+            fleet_context, provider_context, snapshot, namespace_labels)
 
     observed_flavors = _dict(snapshot.get('resource_flavors'),
                              'ResourceFlavor inventory')
@@ -991,54 +763,6 @@ def _get_kueue_object(custom: Any,
     raise KubernetesAttestationError('No supported Kueue API version exists.')
 
 
-def _list_kueue_objects(custom: Any, *, plural: str, deadline_monotonic: float,
-                        cancellation: threading.Event) -> list[Any]:
-    """Read one complete, bounded cluster-wide Kueue inventory."""
-    last_error: Exception | None = None
-    for version in _KUEUE_API_VERSIONS:
-        items: list[Any] = []
-        continuation: str | None = None
-        seen_tokens: set[str] = set()
-        for page_index in range(_KUEUE_LIST_MAX_PAGES):
-            _remaining(deadline_monotonic, cancellation)
-            kwargs = {
-                'group': _KUEUE_GROUP,
-                'version': version,
-                'plural': plural,
-                'limit': _KUEUE_LIST_PAGE_LIMIT,
-                '_request_timeout': _request_timeout(deadline_monotonic,
-                                                     cancellation),
-            }
-            if continuation is not None:
-                kwargs['_continue'] = continuation
-            try:
-                raw_page = custom.list_cluster_custom_object(**kwargs)
-            except kubernetes_adaptor.api_exception() as error:
-                last_error = error
-                if (page_index == 0 and getattr(error, 'status', None) == 404):
-                    break
-                raise
-            page = _dict(raw_page, f'{plural} list page')
-            items.extend(_list(page.get('items'), f'{plural} list items'))
-            metadata = _dict(page.get('metadata'), f'{plural} list metadata')
-            next_token = metadata.get('continue')
-            if next_token in (None, ''):
-                return items
-            if (not isinstance(next_token, str) or next_token in seen_tokens):
-                raise KubernetesAttestationIndeterminateError(
-                    f'Kubernetes returned invalid {plural} pagination.')
-            seen_tokens.add(next_token)
-            continuation = next_token
-        else:
-            raise KubernetesAttestationIndeterminateError(
-                f'Kubernetes exceeded the bounded {plural} inventory.')
-    if last_error is not None:
-        raise KubernetesAttestationNonconformanceError(
-            f'The required Kueue {plural!r} collection does not exist in a '
-            'supported API version.') from last_error
-    raise KubernetesAttestationError('No supported Kueue API version exists.')
-
-
 def _read_required(read: Callable[[], Any], *, subject: str) -> Any:
     """Classify an authenticated 404 as a completed negative observation."""
     try:
@@ -1111,12 +835,12 @@ def attest_context(fleet_context: Mapping[str,
                             deadline_monotonic, cancellation)),
                                    subject='Pod PriorityClass')),
                 'resource_flavors': {
-                    flavor['name']: _get_kueue_object(
-                        custom,
-                        plural='resourceflavors',
-                        name=flavor['name'],
-                        deadline_monotonic=(deadline_monotonic),
-                        cancellation=(cancellation))
+                    flavor['name']:
+                    _get_kueue_object(custom,
+                                      plural='resourceflavors',
+                                      name=flavor['name'],
+                                      deadline_monotonic=(deadline_monotonic),
+                                      cancellation=(cancellation))
                     for flavor in provider_context['resource_flavors']
                 },
                 'nodes': {
@@ -1165,14 +889,10 @@ def attest_context(fleet_context: Mapping[str,
                         deadline_monotonic=deadline_monotonic,
                         cancellation=cancellation,
                         namespace=namespace),
-                    'cohort_inventory': _list_kueue_objects(
-                        custom,
-                        plural='cohorts',
-                        deadline_monotonic=deadline_monotonic,
-                        cancellation=cancellation),
-                    'cluster_queue_inventory': _list_kueue_objects(
+                    'cluster_queue': _get_kueue_object(
                         custom,
                         plural='clusterqueues',
+                        name=kueue_admission['cluster_queue_name'],
                         deadline_monotonic=deadline_monotonic,
                         cancellation=cancellation),
                     'kueue_controller': _serialized(

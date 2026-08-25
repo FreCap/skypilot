@@ -17,6 +17,13 @@ teardown adjudication, followed by one homogeneous Helm rollout and a sustained
 older phase account below is historical chronology and is not an executable
 runbook.
 
+All PHX lane names in that historical chronology are audit facts, not current
+operator instructions. The current source contract is policy-bundle schema v7
+in `serve-multi-pool-reserved-capacity-fill.md`: namespace `boltz-research`,
+existing LocalQueue `be` -> existing ClusterQueue `research-be`, existing
+WorkloadPriorityClass `be-lt` at 11, and the server-owned Pod PriorityClass at
+-1000/`Never`. SkyPilot neither owns nor mutates the external Kueue topology.
+
 Source addendum (2026-08-25; not deployed or production-proven): paid demand
 and supply remain exact through the atomic replica/claim/cap-debit commit. Once
 that commit succeeds, the claim's one provider effect is authorized by its
@@ -240,10 +247,11 @@ can still materialize speculative replica rows before the actuation lane is
 owned. Their exact API errors show that Pods were rendered in
 `rescluster-k8s-prod-east1-preemptible-inference` without a
 `kueue.x-k8s.io/queue-name` label and were rejected by the namespace's
-fail-closed admission policy. The live PHX contract is LocalQueue `be` ->
-ClusterQueue `skypilot-be`; the `mt_hybrid` service workspace selects
-WorkloadPriorityClass `be-ls`, while the lower-throughput partition workspace
-uses `be-lt`. The selected Pod identity remains `skypilot-pool-sa` with Pod
+fail-closed admission policy. The then-live 2026-08-17 PHX contract was
+LocalQueue `be` -> ClusterQueue `skypilot-be`; the `mt_hybrid` service
+workspace selected WorkloadPriorityClass `be-ls`, while the lower-throughput
+partition workspace used `be-lt`. The selected Pod identity was
+`skypilot-pool-sa` with Pod
 PriorityClass `rescluster-k8s-prod-east1-preemptible-inference-low` (-1000,
 `Never`). Revision 408 replaces that stale embedded policy with schema-v3
 exact context contracts: east is explicitly unmanaged by Kueue and cannot
@@ -1608,9 +1616,9 @@ both are recorded deviations rather than new precedent. Subsequent additive
 rollouts use the canonical client-side render and atomic wait-for-jobs command
 above.
 
-The PHX fill admission correction is an operational prerequisite rather than a
-SkyPilot image pin. The exact live read on 2026-08-17 resolved the release
-contract for `boltz-l4-fleet`'s `mt_hybrid` workspace as:
+The following PHX fill-admission correction is a superseded historical gate,
+not an executable instruction. The exact live read on 2026-08-17 resolved the
+then-current release contract for `boltz-l4-fleet`'s `mt_hybrid` workspace as:
 
 - namespace `rescluster-k8s-prod-east1-preemptible-inference` and service
   account `skypilot-pool-sa`;
@@ -1936,7 +1944,8 @@ dark deployment gate.
   fence while cold paid authority and post-rollout `sky.launch` requests stay
   zero. Also prove a genuinely under-capacity held same-card target still
   retries within its existing wave budget.
-- [x] Replace the stale revision-407 PHX deployment-policy identities with
+- [x] Historical revision-408 gate: replace the stale revision-407 PHX
+  deployment-policy identities with
   LocalQueue `be`, ClusterQueue `skypilot-be`, WorkloadPriorityClass `be-ls`,
   and service account `skypilot-pool-sa`; deploy the correction dark in
   revision 408.

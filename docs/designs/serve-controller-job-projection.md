@@ -22,7 +22,12 @@ required before fleet teardown: exact-name, streaming, single-flight
 Kubernetes presence reads and one reusable readiness executor replace repeated
 full-Pod materialization and per-tick thread-pool construction. Neither source
 correction is deployed or production-proven yet.
-**Last updated:** 2026-08-24
+The current source successor references Simone's existing
+`boltz-research/be -> research-be` lane. Its deployment attestation proves
+only that external lane's identity and health; it does not mirror or own
+ClusterQueue, Cohort, quota, borrowing, fairness, or preemption policy.
+
+**Last updated:** 2026-08-25
 
 ## Goals
 
@@ -156,7 +161,7 @@ Kubernetes entry in the immutable placement catalog:
   "projection_version": 10,
   "candidate_id": "kubernetes-0002",
   "kubernetes_context": "phx_research_cluster_eks",
-  "namespace": "rescluster-k8s-phx",
+  "namespace": "boltz-research",
   "service_account_name": "skypilot-pool-sa",
   "scheduler_name": "default-scheduler",
   "priority_class_name": "rescluster-k8s-prod-east1-preemptible-inference-low",
@@ -199,10 +204,10 @@ used by reserved-fill claims, allocations, replica provenance, and launch
 fences.
 
 For the current PHX context, that existing contract is LocalQueue `be`, its
-observed ClusterQueue output `skypilot-be`, WorkloadPriorityClass `be-lt`, and
+observed ClusterQueue output `research-be`, WorkloadPriorityClass `be-lt`, and
 the independently projected Pod PriorityClass at numeric value `-1000` with
 `preemptionPolicy: Never`. The candidate persists `be` and `be-lt`; the
-admission receipt proves the `be` -> `skypilot-be` output. SkyPilot verifies
+admission receipt proves the `be` -> `research-be` output. SkyPilot verifies
 these objects from Simone's configuration and creates or mutates none of them.
 East keeps `kueue_admission: null` and its existing non-Kueue scheduler path.
 
@@ -1169,7 +1174,7 @@ affinity/resource key and count, priority class (numeric `-1000`,
 `preemptionPolicy: Never`), exact Kueue LocalQueue, required-managed gate, and
 WorkloadPriorityClass, exact v10 provisioning timeout, and exact v10 scratch
 contract. In PHX the LocalQueue must be `be`, the admitted ClusterQueue output
-must be `skypilot-be`, and the WorkloadPriorityClass must be `be-lt`, with Pod
+must be `research-be`, and the WorkloadPriorityClass must be `be-lt`, with Pod
 priority `-1000`/`Never`. Fresh-read each admitted Pod's exact `nodeName`,
 inspect that Node, and require the projected accelerator label key/value before
 counting it as usable capacity. On every already-advertised node-local
@@ -1219,7 +1224,7 @@ for this rollout.
   or changing Kubernetes policy. Prove every East grant is Ready or carries a
   fresh typed physical incompatibility reason.
 - Prove PHX continues to use Simone's unchanged LocalQueue `be` -> existing
-  ClusterQueue `skypilot-be`, WorkloadPriorityClass `be-lt`, and independent
+  ClusterQueue `research-be`, WorkloadPriorityClass `be-lt`, and independent
   Pod priority `-1000`/`Never`. Count only `POLICY_ADMITTED` capacity as usable.
   GPU-only inventory that
   Kueue rejects for joint CPU/topology fit is not part of the utilization

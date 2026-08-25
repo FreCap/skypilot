@@ -1009,67 +1009,7 @@ def _require_current_kueue_active(obj: Mapping, *, kind: str,
             'reconcile the current generation before launching this workload.')
 
 
-def _namespace_matches_kueue_selector(selector: Any,
-                                      labels: Mapping[str, str]) -> bool:
-    """Evaluates a Kubernetes metav1.LabelSelector against Namespace labels."""
-    # Kueue defines a nil ClusterQueue selector as matching no namespaces. An
-    # explicit empty object is the match-all selector.
-    if not isinstance(selector, Mapping):
-        return False
-    if not all(
-            isinstance(key, str) and isinstance(value, str)
-            for key, value in labels.items()):
-        return False
-    if set(selector) - {'matchLabels', 'matchExpressions'}:
-        return False
-
-    match_labels = selector.get('matchLabels', {})
-    if match_labels is None:
-        match_labels = {}
-    if not isinstance(match_labels, Mapping):
-        return False
-    for key, value in match_labels.items():
-        if not isinstance(key, str) or not isinstance(value, str):
-            return False
-        if labels.get(key) != value:
-            return False
-
-    match_expressions = selector.get('matchExpressions', [])
-    if match_expressions is None:
-        match_expressions = []
-    if not isinstance(match_expressions, list):
-        return False
-    for expression in match_expressions:
-        if not isinstance(expression, Mapping):
-            return False
-        if set(expression) - {'key', 'operator', 'values'}:
-            return False
-        key = expression.get('key')
-        operator = expression.get('operator')
-        values = expression.get('values', [])
-        if not isinstance(key, str) or not isinstance(operator, str):
-            return False
-        if values is None:
-            values = []
-        if not isinstance(values, list) or not all(
-                isinstance(value, str) for value in values):
-            return False
-
-        if operator == 'In':
-            if not values or key not in labels or labels[key] not in values:
-                return False
-        elif operator == 'NotIn':
-            if not values or (key in labels and labels[key] in values):
-                return False
-        elif operator == 'Exists':
-            if values or key not in labels:
-                return False
-        elif operator == 'DoesNotExist':
-            if values or key in labels:
-                return False
-        else:
-            return False
-    return True
+_namespace_matches_kueue_selector = (kueue_admission.namespace_matches_selector)
 
 
 def _get_required_namespace_labels(namespace: str,
@@ -1088,8 +1028,8 @@ def _get_required_namespace_labels(namespace: str,
     labels = getattr(metadata, 'labels', None)
     if labels is None:
         labels = {}
-    if getattr(metadata, 'name',
-               None) != namespace or not isinstance(labels, Mapping):
+    if getattr(metadata, 'name', None) != namespace or not isinstance(
+            labels, Mapping):
         raise config_lib.KubernetesError(
             f'Kubernetes returned an invalid response for Namespace '
             f'{namespace!r}. SkyPilot refused to create Pods.')
@@ -2295,8 +2235,8 @@ def _wait_for_required_kueue_admission(
     if lane_expectation is not None:
         assert lane_observer is not None
         if (lane_expectation.namespace != namespace or
-                lane_expectation.cluster_name_on_cloud
-                != cluster_name_on_cloud):
+                lane_expectation.cluster_name_on_cloud !=
+                cluster_name_on_cloud):
             raise config_lib.KubernetesError(
                 'Kueue lane expectation does not match the exact Pod lookup '
                 'scope.')
@@ -2722,8 +2662,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             '1, 2, 3, 4, 5, 6, 7, 8, 9, 10, or absent.') from error
     historical_rendered_projection = bool(
         serve_worker_projection_protocol_version is not None and
-        serve_worker_projection_protocol_version
-        != pod_spec_lib.SERVE_WORKER_PROJECTION_PROTOCOL_VERSION)
+        serve_worker_projection_protocol_version !=
+        pod_spec_lib.SERVE_WORKER_PROJECTION_PROTOCOL_VERSION)
     if (historical_rendered_projection and
         (not pod_spec_lib.serve_worker_projection_protocol_is_renderable(
             serve_worker_projection_protocol_version) or
@@ -2789,8 +2729,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
     if pod_spec_lib.serve_worker_projection_protocol_has_scratch(
             serve_worker_projection_protocol_version):
-        if (serve_worker_expected_scratch
-                is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+        if (serve_worker_expected_scratch is
+                _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
             raise config_lib.KubernetesError(
                 'Projection protocol v3/v4/v5/v6/v7/v8/v9/v10 requires the complete '
                 'worker '
@@ -2805,8 +2745,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             'scratch '
             'attestation contract.')
     if require_cache_bootstrap:
-        if (serve_worker_expected_cache
-                is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+        if (serve_worker_expected_cache is
+                _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
             raise config_lib.KubernetesError(
                 'Projection protocol v8/v9/v10 requires the complete worker cache '
                 'bootstrap attestation contract.')
@@ -2824,8 +2764,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             'Only projection protocol v8/v9/v10 may carry a worker cache bootstrap '
             'attestation contract.')
     if require_runtime_readiness:
-        if (serve_worker_expected_runtime_bootstrap_sha256
-                is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+        if (serve_worker_expected_runtime_bootstrap_sha256 is
+                _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
             raise config_lib.KubernetesError(
                 'Projection protocol v4/v5/v6/v7/v8/v9/v10 requires the complete '
                 'worker runtime '
@@ -2869,8 +2809,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     if strict_kueue_projection and (not all(priority_attestation_presence) or
                                     serve_worker_expected_service_account_name
                                     is _NO_SERVE_WORKER_IDENTITY_ATTESTATION or
-                                    serve_worker_expected_scheduler_name
-                                    is _NO_SERVE_WORKER_IDENTITY_ATTESTATION or
+                                    serve_worker_expected_scheduler_name is
+                                    _NO_SERVE_WORKER_IDENTITY_ATTESTATION or
                                     not all(accelerator_attestation_presence)):
         raise config_lib.KubernetesError(
             'A strict projection protocol requires the complete priority, '
@@ -2913,10 +2853,10 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             'Never, PreemptLowerPriority, or null.')
     if (serve_worker_expected_priority_class_name
             is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION and
-        ((serve_worker_expected_priority_class_name
-          is None) != (serve_worker_expected_priority_value is None) or
-         (serve_worker_expected_priority_class_name
-          is None) != (serve_worker_expected_preemption_policy is None))):
+        ((serve_worker_expected_priority_class_name is None) !=
+         (serve_worker_expected_priority_value is None) or
+         (serve_worker_expected_priority_class_name is None) !=
+         (serve_worker_expected_preemption_policy is None))):
         raise config_lib.KubernetesError(
             'The rendered SkyServe worker priority class, numeric value, and '
             'preemption policy must be configured together.')
@@ -2946,8 +2886,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 len(serve_worker_expected_accelerator_label_values) > 16 or
                 any(not isinstance(value, str) or not value
                     for value in serve_worker_expected_accelerator_label_values)
-                or len(set(serve_worker_expected_accelerator_label_values))
-                != len(serve_worker_expected_accelerator_label_values) or
+                or len(set(serve_worker_expected_accelerator_label_values)) !=
+                len(serve_worker_expected_accelerator_label_values) or
                 type(serve_worker_expected_accelerator_count) is not int or
                 serve_worker_expected_accelerator_count < 1):
             raise config_lib.KubernetesError(
@@ -3620,8 +3560,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         # preflight ClusterQueue) before publishing provisioning success.
         expected_pod_uids = (projected_expected_pod_uids
                              if projected_expected_pod_uids is not None else
-                             (running_pod_uids if admitted_kueue_pod_uids
-                              is None else admitted_kueue_pod_uids))
+                             (running_pod_uids if admitted_kueue_pod_uids is
+                              None else admitted_kueue_pod_uids))
         expected_pod_names = set(expected_pod_uids)
         if set(running_pod_uids) != expected_pod_names:
             raise config_lib.KubernetesError(

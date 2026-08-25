@@ -150,6 +150,71 @@ def _mapping(value: object) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def namespace_matches_selector(selector: Any, labels: Mapping[str,
+                                                              str]) -> bool:
+    """Evaluate a Kubernetes metav1.LabelSelector against Namespace labels.
+
+    Kueue defines a nil ClusterQueue selector as matching no namespaces.  An
+    explicit empty object is the match-all selector.
+    """
+    if not isinstance(selector, Mapping):
+        return False
+    if not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in labels.items()):
+        return False
+    if set(selector) - {'matchLabels', 'matchExpressions'}:
+        return False
+
+    match_labels = selector.get('matchLabels', {})
+    if match_labels is None:
+        match_labels = {}
+    if not isinstance(match_labels, Mapping):
+        return False
+    for key, value in match_labels.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            return False
+        if labels.get(key) != value:
+            return False
+
+    match_expressions = selector.get('matchExpressions', [])
+    if match_expressions is None:
+        match_expressions = []
+    if not isinstance(match_expressions, list):
+        return False
+    for expression in match_expressions:
+        if not isinstance(expression, Mapping):
+            return False
+        if set(expression) - {'key', 'operator', 'values'}:
+            return False
+        key = expression.get('key')
+        operator = expression.get('operator')
+        values = expression.get('values', [])
+        if not isinstance(key, str) or not isinstance(operator, str):
+            return False
+        if values is None:
+            values = []
+        if not isinstance(values, list) or not all(
+                isinstance(value, str) for value in values):
+            return False
+
+        if operator == 'In':
+            if not values or key not in labels or labels[key] not in values:
+                return False
+        elif operator == 'NotIn':
+            if not values or (key in labels and labels[key] in values):
+                return False
+        elif operator == 'Exists':
+            if values or key not in labels:
+                return False
+        elif operator == 'DoesNotExist':
+            if values or key in labels:
+                return False
+        else:
+            return False
+    return True
+
+
 def _reject(identity_name: str, actual: object, expected: object) -> NoReturn:
     raise KueuePodAdmissionClassificationError(identity_name, actual, expected)
 

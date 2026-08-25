@@ -2,7 +2,6 @@
 
 from collections.abc import Mapping
 import dataclasses
-import decimal
 from importlib import resources
 import hashlib
 import json
@@ -19,11 +18,8 @@ _ROLE_ARN_RE: Final = re.compile(
     r'role/[A-Za-z0-9+=,.@_/-]+$')
 _UUID_RE: Final = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-'
                              r'[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-_FLEET_HASH_DOMAIN: Final = b'boltz-reserved-fill/fleet/v5\x00'
+_FLEET_HASH_DOMAIN: Final = b'boltz-reserved-fill/fleet/v6\x00'
 _PROVIDER_HASH_DOMAIN: Final = b'boltz-reserved-fill/provider/v4\x00'
-_REQUIRED_QUEUE_RESOURCES: Final = frozenset(
-    {'cpu', 'memory', 'nvidia.com/gpu'})
-_RESOURCE_GROUP_KEYS: Final = frozenset({'covered_resources', 'flavors'})
 _REQUIRED_KUEUE_TAS_FEATURE_GATES: Final = frozenset({
     'AssignQueueLabelsForPods',
     'TASFailedNodeReplacement',
@@ -35,67 +31,14 @@ _REQUIRED_KUEUE_TAS_FEATURE_GATES: Final = frozenset({
     'TASReplaceNodeOnPodTermination',
     'TopologyAwareScheduling',
 })
-_RESOURCE_FLAVOR_KEYS: Final = frozenset({'name', 'resources'})
-_RESOURCE_QUOTA_KEYS: Final = frozenset(
-    {'resource_name', 'nominal_quota', 'borrowing_limit'})
-_CLUSTER_QUEUE_KEYS: Final = frozenset({
-    'cohort_name', 'fair_sharing_weight', 'flavor_fungibility', 'name',
-    'namespace', 'preemption', 'queueing_strategy', 'quota_profile'
-})
-_FLAVOR_FUNGIBILITY_KEYS: Final = frozenset(
-    {'when_can_borrow', 'when_can_preempt'})
-_QUANTITY_RE: Final = re.compile(
-    r'^(?P<number>[0-9]+(?:\.[0-9]+)?)'
-    r'(?P<suffix>n|u|m|k|K|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$')
-_DECIMAL_QUANTITY_SCALE: Final = {
-    '': decimal.Decimal(1),
-    'n': decimal.Decimal('1e-9'),
-    'u': decimal.Decimal('1e-6'),
-    'm': decimal.Decimal('1e-3'),
-    'k': decimal.Decimal('1e3'),
-    'K': decimal.Decimal('1e3'),
-    'M': decimal.Decimal('1e6'),
-    'G': decimal.Decimal('1e9'),
-    'T': decimal.Decimal('1e12'),
-    'P': decimal.Decimal('1e15'),
-    'E': decimal.Decimal('1e18'),
-    'Ki': decimal.Decimal(2)**10,
-    'Mi': decimal.Decimal(2)**20,
-    'Gi': decimal.Decimal(2)**30,
-    'Ti': decimal.Decimal(2)**40,
-    'Pi': decimal.Decimal(2)**50,
-    'Ei': decimal.Decimal(2)**60,
-}
-_WORKER_RESOURCE_PER_GPU: Final = {
-    'cpu': decimal.Decimal(4),
-    'memory': decimal.Decimal(16) * (decimal.Decimal(2)**30),
-    'nvidia.com/gpu': decimal.Decimal(1),
-}
 _RESERVED_FILL_POD_PRIORITY_CLASS: Final = (
     'rescluster-k8s-prod-east1-preemptible-inference-low')
 _RESERVED_FILL_POD_PRIORITY_VALUE: Final = -1000
 _RESERVED_FILL_WORKLOAD_PRIORITY_CLASS: Final = 'be-lt'
 _RESERVED_FILL_WORKLOAD_PRIORITY_VALUE: Final = 11
-_REVIEWED_KUEUE_COHORT: Final = 'shared-pool'
-_REVIEWED_FILL_QUEUES: Final = frozenset({'skypilot-be', 'skypilot-wa'})
-_REVIEWED_KUEUE_QUEUES: Final = {
-    'skypilot-be':
-        ('rescluster-k8s-prod-east1-preemptible-inference', 'BestEffortFIFO',
-         'Never', 'LowerPriority', 'LowerPriority'),
-    'skypilot-wa': ('rescluster-k8s-phx', 'BestEffortFIFO', 'Never',
-                    'LowerPriority', 'LowerPriority'),
-    'hyperpod-ns-research-clusterqueue':
-        ('hyperpod-ns-research', 'BestEffortFIFO', 'LowerPriority', 'Any',
-         'Never'),
-    'research-ha': ('boltz-research', 'StrictFIFO', 'Never', 'LowerPriority',
-                    'LowerPriority'),
-    'research-ma': ('boltz-research', 'StrictFIFO', 'Never', 'LowerPriority',
-                    'LowerPriority'),
-    'research-wa': ('boltz-research', 'BestEffortFIFO', 'Never',
-                    'LowerPriority', 'LowerPriority'),
-    'research-be': ('boltz-research', 'BestEffortFIFO', 'Never',
-                    'LowerPriority', 'LowerPriority'),
-}
+_RESERVED_FILL_NAMESPACE: Final = 'boltz-research'
+_RESERVED_FILL_LOCAL_QUEUE: Final = 'be'
+_RESERVED_FILL_CLUSTER_QUEUE: Final = 'research-be'
 
 
 class BundleValidationError(ValueError):
@@ -151,286 +94,6 @@ def _optional_role(value: object, path: str) -> str | None:
     if _ROLE_ARN_RE.fullmatch(role) is None:
         raise BundleValidationError(f'{path} must be null or an IAM role ARN.')
     return role
-
-
-def _quantity(value: object, path: str) -> decimal.Decimal:
-    quantity = _text(value, path)
-    match = _QUANTITY_RE.fullmatch(quantity)
-    if match is None:
-        raise BundleValidationError(
-            f'{path} must be a nonnegative Kubernetes quantity.')
-    return (decimal.Decimal(match.group('number')) *
-            _DECIMAL_QUANTITY_SCALE[match.group('suffix') or ''])
-
-
-def _validate_resource_groups(
-    value: object, path: str
-) -> dict[tuple[str, str], tuple[decimal.Decimal, decimal.Decimal]]:
-    """Validate the complete Kueue quota topology and index its atoms."""
-    groups = _list(value, path)
-    if not groups:
-        raise BundleValidationError(f'{path} must not be empty.')
-    covered_inventory: set[str] = set()
-    group_signatures: set[frozenset[str]] = set()
-    quota_inventory: dict[tuple[str, str], tuple[decimal.Decimal,
-                                                 decimal.Decimal]] = {}
-    for group_index, raw_group in enumerate(groups):
-        group_path = f'{path}[{group_index}]'
-        group = _mapping(raw_group, group_path)
-        _exact_keys(group, set(_RESOURCE_GROUP_KEYS), group_path)
-        covered_resources = [
-            _text(item, f'{group_path}.covered_resources') for item in _list(
-                group['covered_resources'], f'{group_path}.covered_resources')
-        ]
-        if (not covered_resources or
-                len(covered_resources) != len(set(covered_resources))):
-            raise BundleValidationError(
-                f'{group_path}.covered_resources must be nonempty and '
-                'unique.')
-        signature = frozenset(covered_resources)
-        if (signature in group_signatures or
-                covered_inventory.intersection(signature)):
-            raise BundleValidationError(
-                f'{path} has duplicate or overlapping resource groups.')
-        group_signatures.add(signature)
-        covered_inventory.update(signature)
-        if ('nvidia.com/gpu' in signature and
-                not _REQUIRED_QUEUE_RESOURCES.issubset(signature)):
-            raise BundleValidationError(
-                f'{group_path} must co-locate GPU, CPU, and memory quotas.')
-
-        flavors = _list(group['flavors'], f'{group_path}.flavors')
-        if not flavors:
-            raise BundleValidationError(
-                f'{group_path}.flavors must not be empty.')
-        flavor_names: set[str] = set()
-        for flavor_index, raw_flavor in enumerate(flavors):
-            flavor_path = f'{group_path}.flavors[{flavor_index}]'
-            flavor = _mapping(raw_flavor, flavor_path)
-            _exact_keys(flavor, set(_RESOURCE_FLAVOR_KEYS), flavor_path)
-            flavor_name = _text(flavor['name'], f'{flavor_path}.name')
-            if flavor_name in flavor_names:
-                raise BundleValidationError(
-                    f'{group_path} has duplicate flavors.')
-            flavor_names.add(flavor_name)
-            quota_rows = _list(flavor['resources'], f'{flavor_path}.resources')
-            resource_names: set[str] = set()
-            for resource_index, raw_resource in enumerate(quota_rows):
-                resource_path = (f'{flavor_path}.resources[{resource_index}]')
-                resource = _mapping(raw_resource, resource_path)
-                _exact_keys(resource, set(_RESOURCE_QUOTA_KEYS), resource_path)
-                resource_name = _text(resource['resource_name'],
-                                      f'{resource_path}.resource_name')
-                atom = (flavor_name, resource_name)
-                if (resource_name in resource_names or atom in quota_inventory):
-                    raise BundleValidationError(
-                        f'{path} has duplicate quota atoms.')
-                resource_names.add(resource_name)
-                quota_inventory[atom] = (
-                    _quantity(resource['nominal_quota'],
-                              f'{resource_path}.nominal_quota'),
-                    _quantity(resource['borrowing_limit'],
-                              f'{resource_path}.borrowing_limit'))
-            if resource_names != signature:
-                raise BundleValidationError(
-                    f'{flavor_path} must have exactly one quota atom for '
-                    'every covered resource.')
-    return quota_inventory
-
-
-def _validate_preemption(value: object, path: str) -> None:
-    policy = _mapping(value, path)
-    _exact_keys(policy, {
-        'borrow_within_cohort', 'reclaim_within_cohort', 'within_cluster_queue'
-    }, path)
-    allowed = {
-        'borrow_within_cohort': {'Never', 'LowerPriority'},
-        'reclaim_within_cohort': {'Never', 'LowerPriority', 'Any'},
-        'within_cluster_queue': {
-            'Never', 'LowerPriority', 'LowerOrNewerEqualPriority'
-        },
-    }
-    for key, accepted in allowed.items():
-        if policy[key] not in accepted:
-            raise BundleValidationError(f'{path}.{key} is unsupported.')
-
-
-def _validate_cluster_queue_contract(
-        value: object, path: str, *, cohort_names: set[str],
-        quota_profiles: set[str]) -> dict[str, Any]:
-    queue = _mapping(value, path)
-    _exact_keys(queue, set(_CLUSTER_QUEUE_KEYS), path)
-    for key in ('name', 'namespace', 'cohort_name', 'quota_profile'):
-        _text(queue[key], f'{path}.{key}')
-    if queue['cohort_name'] not in cohort_names:
-        raise BundleValidationError(
-            f'{path}.cohort_name must name a reviewed Cohort.')
-    if queue['quota_profile'] not in quota_profiles:
-        raise BundleValidationError(
-            f'{path}.quota_profile must name a reviewed quota profile.')
-    weight = _quantity(queue['fair_sharing_weight'],
-                       f'{path}.fair_sharing_weight')
-    if weight <= 0:
-        raise BundleValidationError(
-            f'{path}.fair_sharing_weight must be positive.')
-    fungibility = _mapping(queue['flavor_fungibility'],
-                           f'{path}.flavor_fungibility')
-    _exact_keys(fungibility, set(_FLAVOR_FUNGIBILITY_KEYS),
-                f'{path}.flavor_fungibility')
-    for key in _FLAVOR_FUNGIBILITY_KEYS:
-        if fungibility[key] not in ('Borrow', 'Preempt', 'TryNextFlavor'):
-            raise BundleValidationError(
-                f'{path}.flavor_fungibility.{key} is unsupported.')
-    if queue['queueing_strategy'] not in ('BestEffortFIFO', 'StrictFIFO'):
-        raise BundleValidationError(f'{path}.queueing_strategy is unsupported.')
-    _validate_preemption(queue['preemption'], f'{path}.preemption')
-    return queue
-
-
-def _validate_kueue_queue_topology(
-    value: object,
-    path: str,
-    *,
-    claimed_flavors: set[str],
-    inference_namespace: str,
-) -> None:
-    """Validate Simone's complete flat research/fill Kueue boundary."""
-    queues = _mapping(value, path)
-    _exact_keys(queues, {
-        'cluster_queues', 'cohorts', 'inference_cluster_queue', 'quota_profiles'
-    }, path)
-
-    cohort_rows = _list(queues['cohorts'], f'{path}.cohorts')
-    if cohort_rows:
-        raise BundleValidationError(
-            f'{path}.cohorts must not declare explicit Cohort objects; the '
-            'reviewed platform contract uses one implicit flat cohort.')
-
-    raw_profiles = _mapping(queues['quota_profiles'], f'{path}.quota_profiles')
-    if not raw_profiles:
-        raise BundleValidationError(f'{path}.quota_profiles must not be empty.')
-    quota_profiles: dict[str, dict[tuple[str, str],
-                                   tuple[decimal.Decimal,
-                                         decimal.Decimal]]] = {}
-    for profile_name, raw_groups in raw_profiles.items():
-        canonical_name = _text(profile_name, f'{path}.quota_profiles key')
-        quota_profiles[canonical_name] = _validate_resource_groups(
-            raw_groups, f'{path}.quota_profiles.{canonical_name}')
-
-    queue_rows = _list(queues['cluster_queues'], f'{path}.cluster_queues')
-    cluster_queues: dict[str, dict[str, Any]] = {}
-    for index, raw_queue in enumerate(queue_rows):
-        queue_path = f'{path}.cluster_queues[{index}]'
-        queue = _validate_cluster_queue_contract(
-            raw_queue,
-            queue_path,
-            cohort_names={_REVIEWED_KUEUE_COHORT},
-            quota_profiles=set(quota_profiles))
-        name = queue['name']
-        if name in cluster_queues:
-            raise BundleValidationError(
-                f'{path}.cluster_queues has duplicate names.')
-        cluster_queues[name] = queue
-    if set(cluster_queues) != set(_REVIEWED_KUEUE_QUEUES):
-        raise BundleValidationError(
-            f'{path}.cluster_queues is not the exact reviewed queue set.')
-    for name, (namespace, strategy, borrow_policy, reclaim_policy,
-               within_policy) in _REVIEWED_KUEUE_QUEUES.items():
-        queue = cluster_queues[name]
-        if (queue['namespace'] != namespace or
-                queue['cohort_name'] != _REVIEWED_KUEUE_COHORT or
-                queue['queueing_strategy'] != strategy or
-                queue['preemption']['borrow_within_cohort'] != borrow_policy or
-                queue['preemption']['reclaim_within_cohort'] != reclaim_policy
-                or
-                queue['preemption']['within_cluster_queue'] != within_policy):
-            raise BundleValidationError(
-                f'{path}.cluster_queues.{name} is not the exact reviewed '
-                'queue contract.')
-    inference_name = _text(queues['inference_cluster_queue'],
-                           f'{path}.inference_cluster_queue')
-    inference_queue = cluster_queues.get(inference_name)
-    if inference_queue is None:
-        raise BundleValidationError(
-            f'{path}.inference_cluster_queue is not in the closed queue set.')
-    if (inference_queue['namespace'] != inference_namespace or
-            inference_queue['cohort_name'] != _REVIEWED_KUEUE_COHORT):
-        raise BundleValidationError(
-            f'{path}.inference_cluster_queue must be in the reviewed flat '
-            'cohort and the inference namespace.')
-
-    fill_queues = [cluster_queues[name] for name in _REVIEWED_FILL_QUEUES]
-    research_queues = [
-        queue for name, queue in cluster_queues.items()
-        if name not in _REVIEWED_FILL_QUEUES
-    ]
-    for queue in fill_queues:
-        quotas = quota_profiles[queue['quota_profile']]
-        if any(nominal != 0 for nominal, _ in quotas.values()):
-            raise BundleValidationError(
-                f'{path}.cluster_queues.{queue["name"]} must be '
-                'zero-nominal fill.')
-
-    inference_quotas = quota_profiles[inference_queue['quota_profile']]
-    positive_inference_gpu_flavors = {
-        flavor for (flavor,
-                    resource_name), (_, borrowing) in inference_quotas.items()
-        if resource_name == 'nvidia.com/gpu' and borrowing > 0
-    }
-    if positive_inference_gpu_flavors != claimed_flavors:
-        raise BundleValidationError(
-            f'{path} positive fill GPU quotas must exactly cover the '
-            'accelerator contracts.')
-    for flavor in positive_inference_gpu_flavors:
-        gpu_borrowing = inference_quotas[(flavor, 'nvidia.com/gpu')][1]
-        if (gpu_borrowing <= 0 or
-                gpu_borrowing != gpu_borrowing.to_integral_value()):
-            raise BundleValidationError(
-                f'{path} must expose positive integral borrowed GPU capacity.')
-        for resource_name in _REQUIRED_QUEUE_RESOURCES:
-            inference_quota = inference_quotas.get((flavor, resource_name))
-            if inference_quota is None:
-                raise BundleValidationError(
-                    f'{path} must co-locate GPU, CPU, and memory quota atoms '
-                    'for every accelerator flavor.')
-            minimum_borrowing = (gpu_borrowing *
-                                 _WORKER_RESOURCE_PER_GPU[resource_name])
-            if inference_quota[1] < minimum_borrowing:
-                raise BundleValidationError(
-                    f'{path} {resource_name} borrowing cannot fit the '
-                    'reviewed workers.')
-
-    # Every fill queue must expose the same physical ceiling. Research nominal
-    # ownership sums to that ceiling exactly; this prevents a partial or
-    # overcommitted flat cohort from masquerading as reclaimability.
-    for queue in fill_queues:
-        if quota_profiles[queue['quota_profile']] != inference_quotas:
-            raise BundleValidationError(
-                f'{path}.cluster_queues.{queue["name"]} does not use the '
-                'exact reviewed fleet ceiling.')
-    for atom, (_, physical_limit) in inference_quotas.items():
-        research_nominal = sum(
-            quota_profiles[queue['quota_profile']].get(atom, (
-                decimal.Decimal(0), decimal.Decimal(0)))[0]
-            for queue in research_queues)
-        if research_nominal != physical_limit:
-            raise BundleValidationError(
-                f'{path} research nominal quota does not exactly own the '
-                f'physical limit for {atom!r}.')
-    for queue in research_queues:
-        quotas = quota_profiles[queue['quota_profile']]
-        for atom, (nominal, borrowing) in quotas.items():
-            physical = inference_quotas.get(atom)
-            if physical is None:
-                if nominal != 0 or borrowing != 0:
-                    raise BundleValidationError(
-                        f'{path} contains an unbounded extra research quota '
-                        f'atom {atom!r}.')
-                continue
-            if nominal > physical[1] or borrowing > physical[1]:
-                raise BundleValidationError(
-                    f'{path} research quota exceeds the physical ceiling for '
-                    f'{atom!r}.')
 
 
 def _validate_fleet_context(value: object, path: str) -> None:
@@ -535,11 +198,13 @@ def _validate_fleet_context(value: object, path: str) -> None:
     admission = _mapping(raw_admission, f'{path}.kueue_admission')
     _exact_keys(
         admission, {
-            'local_queue_name', 'queues', 'workload_priority_class_name',
-            'workload_priority_value'
+            'cluster_queue_name', 'local_queue_name',
+            'workload_priority_class_name', 'workload_priority_value'
         }, f'{path}.kueue_admission')
     _text(admission['local_queue_name'],
           f'{path}.kueue_admission.local_queue_name')
+    _text(admission['cluster_queue_name'],
+          f'{path}.kueue_admission.cluster_queue_name')
     _text(admission['workload_priority_class_name'],
           f'{path}.kueue_admission.workload_priority_class_name')
     _integer(admission['workload_priority_value'],
@@ -550,17 +215,16 @@ def _validate_fleet_context(value: object, path: str) -> None:
             f'{path}.kueue_admission.workload_priority_value exceeds '
             'Kubernetes limits.')
 
-    if (admission['workload_priority_class_name']
-            != _RESERVED_FILL_WORKLOAD_PRIORITY_CLASS or
-            admission['workload_priority_value']
-            != _RESERVED_FILL_WORKLOAD_PRIORITY_VALUE):
+    if (context['namespace'] != _RESERVED_FILL_NAMESPACE or
+            admission['local_queue_name'] != _RESERVED_FILL_LOCAL_QUEUE or
+            admission['cluster_queue_name'] != _RESERVED_FILL_CLUSTER_QUEUE or
+            admission['workload_priority_class_name'] !=
+            _RESERVED_FILL_WORKLOAD_PRIORITY_CLASS or
+            admission['workload_priority_value'] !=
+            _RESERVED_FILL_WORKLOAD_PRIORITY_VALUE):
         raise BundleValidationError(
-            f'{path}.kueue_admission is not the exact existing be-lt '
-            'WorkloadPriorityClass contract.')
-    _validate_kueue_queue_topology(admission['queues'],
-                                   f'{path}.kueue_admission.queues',
-                                   claimed_flavors=set(claimed_flavors),
-                                   inference_namespace=context['namespace'])
+            f'{path}.kueue_admission is not the exact existing '
+            'boltz-research/be -> research-be external-lane contract.')
 
 
 def _validate_deployment_contract(value: object, path: str, *,
@@ -734,8 +398,8 @@ def _validate_provider_context(value: object, path: str) -> None:
               f'{path}.node_inventory[{index}].product_label_value')
         _integer(node['capacity_per_node'],
                  f'{path}.node_inventory[{index}].capacity_per_node')
-        if (flavor_labels.get(inventory_flavor, {}).get(selector_key)
-                != selector_value):
+        if (flavor_labels.get(inventory_flavor, {}).get(selector_key) !=
+                selector_value):
             raise BundleValidationError(
                 f'{path}.node_inventory[{index}] selector is not owned by '
                 'its ResourceFlavor.')
@@ -764,29 +428,6 @@ def _normalized_section(section: dict[str, Any]) -> dict[str, Any]:
     normalized = json.loads(_canonical_bytes(section))
     normalized['contexts'].sort(key=lambda item: item['kubernetes_context'])
     for context in normalized['contexts']:
-        admission = context.get('kueue_admission')
-        queues = (admission.get('queues')
-                  if isinstance(admission, dict) else None)
-        if isinstance(queues, dict):
-            cohorts = queues.get('cohorts')
-            if isinstance(cohorts, list):
-                cohorts.sort(key=lambda item: item['name'])
-            cluster_queues = queues.get('cluster_queues')
-            if isinstance(cluster_queues, list):
-                cluster_queues.sort(key=lambda item: item['name'])
-            profiles = queues.get('quota_profiles')
-            if isinstance(profiles, dict):
-                for groups in profiles.values():
-                    if not isinstance(groups, list):
-                        continue
-                    for group in groups:
-                        group['covered_resources'].sort()
-                        group['flavors'].sort(key=lambda item: item['name'])
-                        for flavor in group['flavors']:
-                            flavor['resources'].sort(
-                                key=lambda item: item['resource_name'])
-                    groups.sort(
-                        key=lambda item: tuple(item['covered_resources']))
         accelerators = context.get('accelerators')
         if isinstance(accelerators, dict):
             for contract in accelerators.values():
@@ -854,7 +495,7 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
     root = _mapping(document, 'bundle')
     _exact_keys(root, {'schema_version', 'fleet', 'provider_inventory'},
                 'bundle')
-    if root['schema_version'] != 6:
+    if root['schema_version'] != 7:
         raise BundleValidationError(
             'Fleet bundle schema version is unsupported.')
     fleet = _mapping(root['fleet'], 'bundle.fleet')
@@ -935,10 +576,10 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
                 labels = flavor_labels.get(flavor)
                 node = node_inventory.get(flavor)
                 if (labels is None or node is None or
-                        labels.get(node['selector_label_key'])
-                        != node['selector_label_value'] or
-                        node['product_label_key']
-                        != contract['product_label_key'] or
+                        labels.get(node['selector_label_key']) !=
+                        node['selector_label_value'] or
+                        node['product_label_key'] !=
+                        contract['product_label_key'] or
                         node['product_label_value'] != product or
                         node['resource_name'] != contract['resource_name']):
                     raise BundleValidationError(

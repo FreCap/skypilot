@@ -32,6 +32,20 @@ quota, borrowing, preemption, Terraform/Terragrunt, KubeRay, IAM, or
 boltz-platform application change. Historical fleet and qualification receipts
 below are chronology, not current live state.
 
+Source successor (2026-08-25; policy revision `1.1.1491`, not deployed):
+policy-bundle schema v7 changes the PHX reference to Namespace
+`boltz-research` (UID
+`44f8d097-6591-46cf-9b8e-59deea8777e7`), LocalQueue `be`, ClusterQueue
+`research-be`, WorkloadPriorityClass `be-lt=11`, and the existing worker Pod
+PriorityClass at `-1000`/`Never`. It deletes the copied seven-ClusterQueue and
+Cohort/quota topology and replaces two cluster-wide LISTs with one exact
+ClusterQueue GET. Activation remains fail-closed until the externally owned
+`boltz-research/skypilot-pool-sa` exists, the audit identity can read the exact
+objects named by this contract, the controller writer can perform the existing
+SkyPilot Pod/Service lifecycle in `boltz-research`, and effective server config
+projects this namespace and lane. This change creates no ServiceAccount, RBAC,
+Kueue, IAM, or platform object.
+
 Deployed addendum (2026-08-25; PR #1716 / `1.1.1485`): the paid provider
 handoff and asynchronous drain observation now have one explicit atomic
 boundary. Before a paid claim commits, the current PostgreSQL demand,
@@ -557,7 +571,8 @@ creation, asymmetric grant damping, a shorter global poll without load
 qualification, or a Kueue change. That latency optimization is not required
 by the current production gate.
 
-Simone's Kueue configuration is unchanged. SkyPilot submits PHX fill through
+At that historical receipt, Simone's Kueue configuration was unchanged.
+SkyPilot submitted PHX fill through
 the existing `be` LocalQueue, which unchanged Kueue maps to the existing
 `skypilot-be` ClusterQueue, plus the existing `be-lt`
 WorkloadPriorityClass, default scheduler, `skypilot-pool-sa`, and independent
@@ -5347,10 +5362,11 @@ inference context that:
 - the inference namespace has an active LocalQueue selected by server-owned
   SkyPilot configuration;
 - in PHX that exact existing LocalQueue is `be`, its admitted output is the
-  existing ClusterQueue `skypilot-be`, and its WorkloadPriorityClass is the
+  existing ClusterQueue `research-be`, and its WorkloadPriorityClass is the
   existing `be-lt`; SkyPilot creates or mutates none of those objects;
-- the existing ClusterQueue admits that namespace and shares a reviewed preemption
-  domain with BCL/research workloads;
+- the existing ClusterQueue is active and admits the exact `boltz-research`
+  namespace; Kueue, rather than SkyPilot, remains authoritative for its quota,
+  cohort, borrowing, fairness, and preemption policy;
 - PHX fill uses the existing lowest Kueue WorkloadPriorityClass, `be-lt` at
   value 11, while the worker Pod independently uses the server-owned
   -1000/`Never` PriorityClass; SkyPilot does not manufacture a lower Kueue
@@ -5374,38 +5390,29 @@ ValidatingAdmissionPolicy read is an earlier, weaker snapshot and cannot
 strengthen that proof; making it mandatory only lets unrelated policy or RBAC
 drift stop otherwise safe fill.
 
-Policy-bundle schema v6 performs no ValidatingAdmissionPolicy reads and retains
+Policy-bundle schema v7 performs no ValidatingAdmissionPolicy reads and retains
 the exact controller/config, Pod webhooks, TAS feature gates, priority, flavor,
-immutable projection, and per-Pod lifecycle proofs. It additionally closes the
-fleet-side PHX inventory over zero explicit Cohort objects and all seven exact
-ClusterQueues, their namespace selectors, queueing/fungibility/fair-sharing
-settings, preemption tuples, and complete quota profiles. It proves that every
-queue remains in Simone's implicit flat `shared-pool`, both fill queues have
-zero nominal quota, and research nominal ownership sums to the physical ceiling
-exactly. It separately proves the existing `be-lt` WorkloadPriorityClass at 11
-and the server-owned worker Pod PriorityClass at -1000/`Never`; their numeric
-values need not match, and the existence of a Pod PriorityClass named `be-lt`
-is neither forbidden nor used as worker authority. Schema v5's removal of admission-policy authority
-advanced provider inventory from `provider/v3` to `provider/v4`; v6 leaves
-that provider domain unchanged and advances the changed fleet domain from
-`fleet/v4` to `fleet/v5`. `boltz-l4-fleet` creates direct core/v1 Pods and has
-no KubeRay, HPTO, or shared research-policy runtime dependency. Platform may
-evolve those unrelated defenses independently without changing fleet
-authority.
+immutable projection, and per-Pod lifecycle proofs. PHX references only the
+existing external lane identity `boltz-research/be` -> `research-be`, the
+existing `be-lt` WorkloadPriorityClass at 11, and the server-owned worker Pod
+PriorityClass at -1000/`Never`. It does not copy or validate Simone's
+ClusterQueue quota, cohort, borrowing, fairness, flavor-fungibility, or
+preemption configuration. Those remain Kueue-owned policy, and changing them
+must not require a SkyPilot release. Schema v7 leaves the provider domain at
+`provider/v4` and advances the changed fleet domain from `fleet/v5` to
+`fleet/v6`. `boltz-l4-fleet` creates direct core/v1 Pods and has no KubeRay,
+HPTO, or shared research-policy runtime dependency.
 
-Schema v6 obtains the Cohort and ClusterQueue facts from exactly two bounded,
-paginated, cluster-wide LISTs made by the per-spoke audit role. Those LIST
-payloads are the sole source for both the configured-object shape checks and
-membership closure; there are no per-name Cohort or ClusterQueue GETs. Every
-reviewed object must be present and retain its exact spec. No unexpected
-ClusterQueue may name the governed implicit `shared-pool`. The expected
-explicit Cohort inventory for that governed name is empty: an explicit
-`shared-pool` Cohort or an unexpected Cohort whose parent is `shared-pool`
-fails closed. This closes every foreign edge while allowing unrelated roots
-and subtrees elsewhere in the shared cluster. Duplicate or missing names,
-malformed membership specs,
-invalid or repeated continuation tokens, list errors, and pagination-cap
-exhaustion are indeterminate and therefore cannot publish or renew authority.
+Schema v7 obtains the exact PHX ClusterQueue with one named GET. It requires
+the LocalQueue and ClusterQueue to be active at their current generations, the
+LocalQueue to target `research-be`, the ClusterQueue not to be stopped or
+deleting, and its namespace selector to admit `boltz-research`. It deliberately
+does not LIST ClusterQueues or Cohorts: unrelated research topology is neither
+SkyPilot authority nor a reason to stop safe fill. A completed observation of a
+missing required object, malformed spec, stale condition, or selector mismatch
+is nonconformance and immediately invalidates authority. Authentication,
+transport, deadline, and other incomplete-read failures are indeterminate and
+cannot publish or renew authority.
 
 The evidence and enforcement boundary is one
 `ReservedFillReclaimPolicy`. It is a code-owned, typed deployment extension,
@@ -5614,62 +5621,52 @@ second scheduling path exists. The exact shared object contract is:
 |---|---|---|
 | Context | `prod_research_cluster_eks` | `phx_research_cluster_eks` |
 | Physical cluster UID | `14de98b4-cb7b-4f82-beb7-6f754a96f1dd` | `ba2dcdca-2a0d-447f-ad8a-31849a63c1d5` |
-| Namespace / service account | `rescluster-k8s-prod-east1-preemptible-inference` / `skypilot-pool-sa` | same |
+| Namespace / service account | `rescluster-k8s-prod-east1-preemptible-inference` / `skypilot-pool-sa` | `boltz-research` / `skypilot-pool-sa` |
 | Pod Identity | absent | absent |
-| Kueue admission | absent; east remains ordinary Pod scheduling | LocalQueue `be` -> ClusterQueue `skypilot-be`; existing WorkloadPriorityClass `be-lt` at 11; exact implicit flat `shared-pool` and seven-queue inventory |
+| Kueue admission | absent; east remains ordinary Pod scheduling | existing LocalQueue `be` -> ClusterQueue `research-be`; existing WorkloadPriorityClass `be-lt` at 11; no SkyPilot-owned queue topology |
 | Pod PriorityClass (spoke-module-owned) | `rescluster-k8s-prod-east1-preemptible-inference-low`, value -1000, `Never` | same |
 | Scheduler / topology authority | exact `gpu-binpack-scheduler` Deployment | Kubernetes `default-scheduler`; Kueue v0.19 TAS owns admission topology and no custom scheduler Deployment is permitted |
 | GPU resource | `nvidia.com/gpu` | `nvidia.com/gpu` |
 | Exact worker accelerator scheduling | `A100`: `nvidia.com/gpu.product=NVIDIA-A100-SXM4-40GB`, `nvidia.com/gpu`; `A100-80GB`: `nvidia.com/gpu.product=NVIDIA-A100-SXM4-80GB`, `nvidia.com/gpu` | `H200`: `nvidia.com/gpu.product=NVIDIA-H200`, `nvidia.com/gpu` |
 
-PHX retains the implicit flat Cohort name `shared-pool`; there is no Cohort
-object or hierarchy. ClusterQueues `skypilot-be`, `skypilot-wa`,
-`hyperpod-ns-research-clusterqueue`, `research-ha`, `research-ma`,
-`research-wa`, and `research-be` retain the exact specs introduced by Simone's
-Platform PRs #8407 and #8517. The two SkyPilot queues have zero nominal quota
-and use `Never`/`LowerPriority`/`LowerPriority` for borrow/reclaim/within-queue
-preemption. The legacy queue retains
-`LowerPriority`/`Any`/`Never`; the four class queues retain
-`Never`/`LowerPriority`/`LowerPriority`. The MA
-and WA nominal profiles sum to the physical 512 H200 / 12100 CPU / 120Ti memory
-/ 2048 EFA ceiling (plus the exact m6i CPU/memory atoms). East
-has no Kueue admission pair and must not be forced through a nonexistent
-queue. Bundle schema v6 retains one nullable `kueue_admission` object per fleet
-context and matching nullable `kueue_enforcement` object per provider context.
+PHX uses only Simone's existing `boltz-research/be` lane. SkyPilot neither owns
+nor mirrors the surrounding ClusterQueues, Cohorts, quotas, fairness,
+borrowing, or preemption policy. East has no Kueue admission pair and must not
+be forced through a nonexistent queue. Bundle schema v7 retains one nullable
+`kueue_admission` object per fleet context and matching nullable
+`kueue_enforcement` object per provider context.
 
 This choice preserves a real platform boundary rather than claiming a stronger
-one: Kueue `LowerPriority` reclaim does not select an equal-priority `be-lt`
-Workload as its victim. The independently injected -1000 Pod priority keeps an
-admitted research Pod above a fill Pod at kube-scheduler, while SkyPilot's
-zero-nominal grant is revoked when fresh provider capacity is no longer free.
-If the existing Kueue contract later needs stronger equal-tranche reclaim, that
-is a separately reviewed research-scheduling change owned in boltz-platform;
-SkyPilot must not synthesize it with a new priority or Cohort hierarchy.
+one. The existing `be-lt` WorkloadPriorityClass is the lowest platform-owned
+Kueue tranche available to SkyPilot, and the independently injected -1000 Pod
+priority keeps an admitted research Pod above a fill Pod at kube-scheduler.
+Whether Kueue admits, queues, or preempts that workload is determined entirely
+by Simone's current queue policy. If that policy cannot reclaim the lane as
+desired, it is a separately reviewed research-scheduling change owned in
+boltz-platform; SkyPilot must not synthesize it with a new priority, queue, or
+Cohort hierarchy.
 
 Both objects must be null or both non-null. Null selects the exact
 custom-scheduler reclaim authority and performs no Kueue reads; the typed
 projection must also carry `KUBERNETES_SCHEDULER`, null queue identities, and
 the reviewed scheduler name. It does not silently downgrade reclaim to Pod
-priority. The PHX pair binds `be`, `skypilot-be`,
-`be-lt`, the absence of an explicit governed Cohort object, and all seven
-ClusterQueues as one
-closed contract. Schema v6 retains schema v5's nullable provider
-custom-scheduler Deployment, exact Kueue TAS feature gates, and ResourceFlavor
-topology-name fields. Fleet `scheduler_name` remains a required string because
-it is part of the immutable worker projection; it is `default-scheduler` for
+priority. The PHX pair binds only `boltz-research`, `be`, `research-be`, and
+`be-lt` as the external lane contract. Schema v7 retains schema v6's nullable
+provider custom-scheduler Deployment, exact Kueue TAS feature gates, and
+ResourceFlavor topology-name fields. Fleet `scheduler_name` remains a required
+string because it is part of the immutable worker projection; it is
+`default-scheduler` for
 PHX and the custom deployment name for east.
 `ResourceFlavor.spec.topologyName` is exact provider inventory, not an
 authority discriminator: a provider-owned flavor may retain that field while
 an inference namespace remains outside Kueue. The nullable admission and
 enforcement pair plus the scheduler contract select the sole placement path.
-Schema v6 excludes the redundant ValidatingAdmissionPolicy snapshot from that
+Schema v7 excludes the redundant ValidatingAdmissionPolicy snapshot from that
 enforcement object; strict Pod preparation and synchronous/fresh lifecycle
 attestation remain the sole per-Pod runtime admission proof.
-The policy proves the exact LocalQueue target, complete Cohort inventory, and
-all seven current Active ClusterQueues when the pair is non-null, plus flat
-membership,
-namespace selectors, complete flavor/resource quotas,
-preemption policies, provider-owned ResourceFlavor instance selectors,
+The policy proves the exact active LocalQueue target and active ClusterQueue
+namespace admission when the pair is non-null, plus provider-owned
+ResourceFlavor instance selectors,
 WorkloadPriorityClass name/value, Pod PriorityClass, and the context's one
 scheduler/topology mode. For east it attests the immutable custom scheduler
 Deployment and both provider-owned ResourceFlavors' live
