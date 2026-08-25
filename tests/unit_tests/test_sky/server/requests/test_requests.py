@@ -13,6 +13,7 @@ import pytest
 
 from sky import core
 from sky import exceptions
+from sky.serve import capacity_admission
 from sky.server import constants as server_constants
 from sky.server.requests import payloads
 from sky.server.requests import requests
@@ -52,6 +53,30 @@ def test_unsafe_error_has_exact_safe_wrapper_metadata_shape() -> None:
         tampered[field] = value
         assert not requests.decoded_error_is_valid(tampered)
     assert not requests.decoded_error_is_valid({**decoded, 'extra': True})
+
+
+def test_unexported_skypilot_error_has_decodable_wrapper() -> None:
+    """A server-local SkyPilot error must not persist a malformed envelope."""
+    request = requests.Request(request_id='server-local-error',
+                               name='test-request',
+                               entrypoint=dummy,
+                               request_body=payloads.RequestBody(),
+                               status=RequestStatus.FAILED,
+                               created_at=0.0,
+                               user_id='test-user')
+    error = capacity_admission.CapacityAdmissionConflict(
+        'paid authority changed before provider effect')
+
+    request.set_error(error)
+
+    decoded = request.get_error()
+    assert decoded is not None
+    assert decoded['type'] == 'CapacityAdmissionConflict'
+    assert decoded['message'] == str(error)
+    assert type(decoded['object']) is exceptions.CloudError
+    assert decoded['object'].cloud_provider == 'sky'
+    assert decoded['object'].error_type == 'CapacityAdmissionConflict'
+    assert requests.decoded_error_is_valid(decoded)
 
 
 def _managed_request(

@@ -1844,7 +1844,10 @@ def validate_paid_claim_in_connection(
         (not committed_successor_plan and
          plan['content_sha256'] != claim_sha256) or
             plan['protocol_version'] != PROTOCOL_VERSION or
-            head['demand_feed_generation'] != current_demand_generation or
+            current_demand_generation is None or
+            head['demand_feed_generation'] > current_demand_generation or
+        (prospective and
+         head['demand_feed_generation'] != current_demand_generation) or
             head['demand_feed_generation'] < claim_demand_generation or
             plan['demand_source_epoch'] != claim_source_epoch or
             plan['service_lifecycle_epoch'] != service['lifecycle_epoch'] or
@@ -1896,13 +1899,39 @@ def validate_paid_claim_in_connection(
         'payload_sha256': row['payload_sha256'],
     } for row in fresh_reports]
     if (not current_watermark or
-            _sha256(current_watermark) != head['receipt_watermark_sha256'] or
+        (prospective and
+         _sha256(current_watermark) != head['receipt_watermark_sha256']) or
             any(row['complete'] is not True or row['protocol_version'] != 2
                 for row in fresh_reports) or
             not demand_state.reports_match_current_lb_authority(
                 fresh_reports, service)):
         raise CapacityAdmissionConflict(
             'Paid claim lost its fresh demand receipt watermark.')
+    if (not prospective and
+            demand_state.reports_prove_fresh_aggregate_zero(fresh_reports)):
+        raise CapacityAdmissionConflict(
+            'Fresh demand receipts revoked committed paid capacity.')
+    current_snapshot = demand_state.get_autoscaling_snapshot(
+        str(service['name']), str(service['hash']), connection=connection)
+    plan_normalized_demand = payload.get('normalized_demand')
+    changed_demand_fields = (
+        ['unavailable'] if current_snapshot is None or
+        not isinstance(plan_normalized_demand, Mapping) else [
+            key for key, value in current_snapshot.normalized_demand.items()
+            if _sha256({'value': plan_normalized_demand.get(key)}) != _sha256(
+                {'value': value})
+        ])
+    if changed_demand_fields:
+        raise CapacityAdmissionConflict(
+            'Paid claim demand semantics changed before provider effect: '
+            f'{changed_demand_fields}.')
+    # Reporter heartbeats advance the mutable receipt sequence even when
+    # their canonical demand semantics do not change.  The same fail-closed
+    # normalizer used by the controller above proves semantic equivalence
+    # inside this lock transaction; requiring byte-identical watermarks would
+    # otherwise make provider start race both HA reporters forever.
+    # Prospective claims remain exact-watermark above.  Aggregate zero remains
+    # the explicit early revocation contract above.
     for row in fresh_reports:
         report = row['payload']
         if (not isinstance(report, Mapping) or

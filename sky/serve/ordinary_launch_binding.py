@@ -2702,6 +2702,7 @@ def _resolve_non_pool_launch_profile_in_connection(
     replica: Mapping[str, Any],
     *,
     protocol_and_service_prelocked: bool = False,
+    validate_paid_provider_start: bool = True,
 ) -> tuple[NonPoolLaunchProfile, datetime.datetime | None]:
     """Recompute one profile from planner-owned durable authority."""
     _require_postgres(connection)
@@ -2713,7 +2714,7 @@ def _resolve_non_pool_launch_profile_in_connection(
     pool_key, paid_claim = _paid_claim_payload(connection, service, replica,
                                                info)
     paid_fresh_until = None
-    if paid_claim is not None:
+    if paid_claim is not None and validate_paid_provider_start:
         paid_fresh_until = capacity_admission.validate_paid_claim_in_connection(
             connection,
             service,
@@ -3430,13 +3431,15 @@ def _validate_profile_authority_in_connection(
     expected: NonPoolLaunchProfile,
     *,
     protocol_and_service_prelocked: bool = False,
+    validate_paid_provider_start: bool = True,
 ) -> datetime.datetime | None:
     """Recompute and exact-match planner authority at a commit boundary."""
     actual, paid_fresh_until = _resolve_non_pool_launch_profile_in_connection(
         connection,
         service,
         replica,
-        protocol_and_service_prelocked=protocol_and_service_prelocked)
+        protocol_and_service_prelocked=protocol_and_service_prelocked,
+        validate_paid_provider_start=validate_paid_provider_start)
     if actual != expected:
         raise OrdinaryLaunchBindingConflict(
             'Non-pool planner authorization changed before provider effect.')
@@ -4537,11 +4540,18 @@ def validate_effect_authority_in_connection(
                           association,
                           context,
                           require_launch_authorized=True)
+    # Mutable demand can revoke a paid claim only before the first provider
+    # effect.  Once PROVIDER_IO is durable, later phase transitions are
+    # bookkeeping for that same immutable profile and must complete even if
+    # demand or its short plan lease changes meanwhile.  Current desired state
+    # independently owns any compensating teardown.
+    provider_start = association[
+        'effect_phase'] == EffectPhase.NOT_STARTED.value
     paid_fresh_until = None
     if legacy_context:
         _, legacy_paid_claim = _paid_claim_payload(
             connection, service, replica, _locked_replica_info(replica))
-        if legacy_paid_claim is not None:
+        if legacy_paid_claim is not None and provider_start:
             paid_fresh_until = (
                 capacity_admission.validate_paid_claim_in_connection(
                     connection,
@@ -4561,7 +4571,8 @@ def validate_effect_authority_in_connection(
                 service,
                 replica,
                 context.profile,
-                protocol_and_service_prelocked=(planner_funding_candidate))
+                protocol_and_service_prelocked=(planner_funding_candidate),
+                validate_paid_provider_start=provider_start)
         if launch_context is None:
             raise OrdinaryLaunchBindingConflict(
                 'Generic provider effect has no immutable launch context.')

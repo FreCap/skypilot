@@ -963,66 +963,77 @@ def get_request_summary(service_name: str, service_hash: str) -> dict[str, Any]:
 
 
 def get_autoscaling_snapshot(
-        service_name: str,
-        service_hash: str) -> DurableAutoscalingSnapshot | None:
+    service_name: str,
+    service_hash: str,
+    *,
+    connection: sqlalchemy.engine.Connection | None = None,
+    _read_started_monotonic: float | None = None,
+) -> DurableAutoscalingSnapshot | None:
     """Read the sole promoted demand source and translate its exact routes.
 
     Unlike the public summary, this read fails closed on every incomplete
     reporter, mixed route generation, unknown URL identity, or source-mode
-    mismatch. It never calls a provider or controller.
+    mismatch. It never calls a provider or controller.  A caller that already
+    owns the canonical PostgreSQL locks may provide its transaction so this
+    same normalizer can prove demand semantics at an effect boundary.
     """
-    engine = _postgres_engine()
+    read_started_monotonic = (_read_started_monotonic if _read_started_monotonic
+                              is not None else time.monotonic())
+    if connection is None:
+        engine = _postgres_engine()
+        with engine.connect().execution_options(
+                isolation_level='REPEATABLE READ') as owned_connection:
+            with owned_connection.begin():
+                owned_connection.exec_driver_sql('SET TRANSACTION READ ONLY')
+                return get_autoscaling_snapshot(
+                    service_name,
+                    service_hash,
+                    connection=owned_connection,
+                    _read_started_monotonic=read_started_monotonic)
+
     reports_table = demand_state_schema.serve_lb_demand_reports_table
     generations = demand_state_schema.serve_demand_feed_generations_table
     routes = route_projection_schema.serve_route_snapshots_table
     route_heads = route_projection_schema.serve_route_heads_table
     services = serve_state_schema.services_table
-    read_started_monotonic = time.monotonic()
-    with engine.connect().execution_options(
-            isolation_level='REPEATABLE READ') as connection:
-        with connection.begin():
-            connection.exec_driver_sql('SET TRANSACTION READ ONLY')
-            now = connection.execute(
-                sqlalchemy.select(
-                    sqlalchemy.func.clock_timestamp())).scalar_one()
-            service = connection.execute(
-                sqlalchemy.select(services).where(
-                    services.c.name == service_name)).mappings().one_or_none()
-            if (service is None or service['hash'] != service_hash or
-                    service['pool'] != 0 or
-                    service['demand_source_mode'] != 'DURABLE_FEED' or
-                    service['demand_authority_capable'] is not True or
-                    service['demand_authority_controller_incarnation']
-                    != service['controller_incarnation'] or
-                    service['demand_authority_protocol_version'] != 1 or
-                    service['route_source_mode'] != 'DURABLE_PROJECTED' or
-                    service['route_projection_capable'] is not True or
-                    service['route_projection_controller_incarnation']
-                    != service['controller_incarnation'] or
-                    service['route_projection_protocol_version'] not in (1, 2)):
-                return None
-            generation = connection.execute(
-                sqlalchemy.select(generations.c.generation).where(
-                    generations.c.service_name == service_name,
-                    generations.c.service_hash ==
-                    service_hash)).scalar_one_or_none()
-            head = connection.execute(
-                sqlalchemy.select(route_heads).where(
-                    route_heads.c.service_name ==
-                    service_name)).mappings().one_or_none()
-            if (generation is None or head is None or
-                    head['valid_until'] <= now):
-                return None
-            route = connection.execute(
-                sqlalchemy.select(routes).where(
-                    routes.c.service_name == service_name, routes.c.generation
-                    == head['generation'])).mappings().one_or_none()
-            rows = connection.execute(
-                sqlalchemy.select(reports_table).where(
-                    reports_table.c.service_name == service_name,
-                    reports_table.c.service_hash == service_hash,
-                    reports_table.c.valid_until > now).order_by(
-                        reports_table.c.reporter_session_id)).mappings().all()
+    now = connection.execute(
+        sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+    service = connection.execute(
+        sqlalchemy.select(services).where(
+            services.c.name == service_name)).mappings().one_or_none()
+    if (service is None or service['hash'] != service_hash or
+            service['pool'] != 0 or
+            service['demand_source_mode'] != 'DURABLE_FEED' or
+            service['demand_authority_capable'] is not True or
+            service['demand_authority_controller_incarnation']
+            != service['controller_incarnation'] or
+            service['demand_authority_protocol_version'] != 1 or
+            service['route_source_mode'] != 'DURABLE_PROJECTED' or
+            service['route_projection_capable'] is not True or
+            service['route_projection_controller_incarnation']
+            != service['controller_incarnation'] or
+            service['route_projection_protocol_version'] not in (1, 2)):
+        return None
+    generation = connection.execute(
+        sqlalchemy.select(generations.c.generation).where(
+            generations.c.service_name == service_name,
+            generations.c.service_hash == service_hash)).scalar_one_or_none()
+    head = connection.execute(
+        sqlalchemy.select(route_heads).where(
+            route_heads.c.service_name ==
+            service_name)).mappings().one_or_none()
+    if generation is None or head is None or head['valid_until'] <= now:
+        return None
+    route = connection.execute(
+        sqlalchemy.select(routes).where(
+            routes.c.service_name == service_name, routes.c.generation ==
+            head['generation'])).mappings().one_or_none()
+    rows = connection.execute(
+        sqlalchemy.select(reports_table).where(
+            reports_table.c.service_name == service_name,
+            reports_table.c.service_hash == service_hash,
+            reports_table.c.valid_until > now).order_by(
+                reports_table.c.reporter_session_id)).mappings().all()
     if (route is None or route['service_hash'] != service_hash or
             route['service_lifecycle_epoch'] != service['lifecycle_epoch'] or
             route['controller_incarnation'] != service['controller_incarnation']

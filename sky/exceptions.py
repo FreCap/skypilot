@@ -48,12 +48,27 @@ def _sanitized_exception_envelope() -> dict[str, Any]:
     }
 
 
+def _deserializable_exception_class(
+        exception_type: Any) -> type[BaseException] | None:
+    """Resolve the closed exception registry understood by every client."""
+    if not isinstance(exception_type, str):
+        return None
+    if hasattr(builtins, exception_type):
+        exception_class = getattr(builtins, exception_type)
+    else:
+        exception_class = globals().get(exception_type)
+    if (not isinstance(exception_class, type) or
+            not issubclass(exception_class, Exception)):
+        return None
+    return exception_class
+
+
 def is_safe_exception(exc: BaseException) -> bool:
     """Returns True if the exception is safe to send to clients.
 
     Safe exceptions are:
     1. Built-in exceptions
-    2. SkyPilot's own exceptions
+    2. SkyPilot exceptions exported by this module
 
     Args:
         exc: The exception to check, accept BaseException to handle SystemExit
@@ -62,17 +77,13 @@ def is_safe_exception(exc: BaseException) -> bool:
     Returns:
         True if the exception is safe to send to clients, False otherwise.
     """
-    module = type(exc).__module__
-
-    # Builtin exceptions (e.g., ValueError, RuntimeError)
-    if module == 'builtins':
-        return True
-
-    # SkyPilot exceptions
-    if module.startswith('sky.'):
-        return True
-
-    return False
+    # The decoder resolves builtins by name and then classes exported by this
+    # module.  Keep the encoder's allowlist identical to that closed decoder
+    # registry: a class merely living below ``sky.*`` is not reconstructible
+    # by an older client and must use the client-safe CloudError envelope.
+    exception_class = type(exc)
+    return (_deserializable_exception_class(exception_class.__name__)
+            is exception_class)
 
 
 def wrap_exception(exc: BaseException) -> BaseException:
@@ -292,15 +303,9 @@ def _deserialize_exception(serialized: Any, *, depth: int,
             not all(isinstance(key, str) for key in raw_attributes) or
             'args' in raw_attributes):
         return RuntimeError(_MALFORMED_SERVER_ERROR)
-    if hasattr(builtins, exception_type):
-        exception_class = getattr(builtins, exception_type)
-    else:
-        exception_class = globals().get(exception_type, None)
+    exception_class = _deserializable_exception_class(exception_type)
     if exception_class is None:
         # An older client must not reflect a future server's type or payload.
-        return RuntimeError(_MALFORMED_SERVER_ERROR)
-    if (not isinstance(exception_class, type) or
-            not issubclass(exception_class, BaseException)):
         return RuntimeError(_MALFORMED_SERVER_ERROR)
     attributes = dict(raw_attributes)
     # `add_note` is an exception API, not ordinary forward-version state. Drop

@@ -1766,6 +1766,89 @@ def test_committed_claim_survives_successor_plan_that_accounts_for_it(
                                                              prospective=False)
 
 
+def test_committed_claim_survives_unpublished_semantic_heartbeats(
+        capacity_database):
+    engine, _, route_receipt = capacity_database
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    first = repository.publish(_plan(2))
+    first_claim = _insert_claim(engine, first, 10)
+
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=2))
+    successor = repository.publish(_plan(2))
+    assert successor.generation == first.generation + 1
+    assert successor.remaining() == {'l4': 1}
+
+    # Two HA heartbeats can advance the live feed again before the deferred
+    # provider handler starts.  The committed debit remains authorized by the
+    # fresh semantic successor; a prospective debit is still exact-feed only.
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=3, request_count=2))
+    with engine.begin() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        capacity_admission.validate_paid_claim_in_connection(connection,
+                                                             service,
+                                                             first_claim,
+                                                             prospective=False)
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                           match='fresh capacity-plan authority'):
+            capacity_admission.validate_paid_claim_in_connection(
+                connection, {
+                    **service, 'name': 'svc'
+                }, {
+                    **successor.claim_values('L4'), 'replica_id': 11
+                },
+                prospective=True)
+
+
+def test_fresh_aggregate_zero_revokes_committed_claim(capacity_database):
+    engine, _, route_receipt = capacity_database
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    authority = repository.publish(_plan(1))
+    claim = _insert_claim(engine, authority, 10)
+
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=0))
+    with engine.begin() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                           match='revoked committed paid capacity'):
+            capacity_admission.validate_paid_claim_in_connection(
+                connection, service, claim, prospective=False)
+
+
+def test_nonzero_demand_decrease_revokes_committed_claim(capacity_database):
+    engine, _, route_receipt = capacity_database
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=2))
+    authority = repository.publish(_plan(2))
+    claim = _insert_claim(engine, authority, 10)
+
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=3, request_count=1))
+    with engine.begin() as connection:
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                           match='demand semantics changed'):
+            capacity_admission.validate_paid_claim_in_connection(
+                connection, service, claim, prospective=False)
+
+
 def test_zero_cost_commit_after_plan_revokes_paid_claim(capacity_database):
     engine, _, _ = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
