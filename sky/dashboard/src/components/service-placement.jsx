@@ -70,6 +70,35 @@ export function formatHourlyPrice(price) {
     : 'Price unavailable';
 }
 
+export function formatPlacementHourlyPrice(price, costUnit) {
+  if (!Number.isFinite(price)) return 'Order price unavailable';
+  const suffix =
+    costUnit === 'gpu_slot_hour'
+      ? 'GPU-hr'
+      : costUnit === 'machine_hour'
+        ? 'machine-hr'
+        : 'ordering-unit';
+  return `$${price.toFixed(4)}/${suffix}`;
+}
+
+function placementPrice(location) {
+  return Number.isFinite(location.normalizedHourlyCost)
+    ? location.normalizedHourlyCost
+    : location.cachedHourlyCost;
+}
+
+function locationPageContractMatches(expected, actual, requestedOffset) {
+  return (
+    expected !== null &&
+    expected.paginationVersion === actual.paginationVersion &&
+    expected.orderSemantics === actual.orderSemantics &&
+    expected.costUnit === actual.costUnit &&
+    expected.orderGeneration === actual.orderGeneration &&
+    expected.totalLocations === actual.totalLocations &&
+    actual.pageOffset === requestedOffset
+  );
+}
+
 function locationCards(location) {
   if (!location.accelerators || typeof location.accelerators !== 'object') {
     return [];
@@ -108,65 +137,11 @@ export function filterPlacementLocations(locations, filters) {
       return false;
     }
     if (maxPrice !== null && Number.isFinite(maxPrice) && maxPrice >= 0) {
-      return (
-        Number.isFinite(location.cachedHourlyCost) &&
-        location.cachedHourlyCost <= maxPrice
-      );
+      const price = placementPrice(location);
+      return Number.isFinite(price) && price <= maxPrice;
     }
     return true;
   });
-}
-
-export function groupPlacementLocations(locations) {
-  const groups = new Map();
-  locations.forEach((location) => {
-    const provider = location.cloud || 'Unknown';
-    const region = location.region || '-';
-    const key = `${provider}\u0000${region}`;
-    if (!groups.has(key)) {
-      groups.set(key, {
-        provider,
-        region,
-        available: [],
-        unavailable: [],
-      });
-    }
-    const group = groups.get(key);
-    if (locationAvailability(location) === LOCATION_AVAILABILITY.UNAVAILABLE) {
-      group.unavailable.push(location);
-    } else {
-      group.available.push(location);
-    }
-  });
-
-  const compareLocations = (left, right) => {
-    const cardOrder = formatAccelerators(left.accelerators).localeCompare(
-      formatAccelerators(right.accelerators)
-    );
-    if (cardOrder !== 0) return cardOrder;
-    const leftPrice = Number.isFinite(left.cachedHourlyCost)
-      ? left.cachedHourlyCost
-      : Number.POSITIVE_INFINITY;
-    const rightPrice = Number.isFinite(right.cachedHourlyCost)
-      ? right.cachedHourlyCost
-      : Number.POSITIVE_INFINITY;
-    return (
-      leftPrice - rightPrice ||
-      (left.zone || '').localeCompare(right.zone || '')
-    );
-  };
-
-  return Array.from(groups.values())
-    .map((group) => ({
-      ...group,
-      available: group.available.sort(compareLocations),
-      unavailable: group.unavailable.sort(compareLocations),
-    }))
-    .sort(
-      (left, right) =>
-        left.provider.localeCompare(right.provider) ||
-        left.region.localeCompare(right.region)
-    );
 }
 
 function StatusPill({ children, tone = 'neutral' }) {
@@ -213,7 +188,7 @@ function FilterSelect({ label, value, options, onChange }) {
   );
 }
 
-function locationTooltip(location) {
+function locationTooltip(location, costUnit) {
   const availability = locationAvailability(location);
   const availabilityLabel = {
     [LOCATION_AVAILABILITY.AVAILABLE_SPOT]: 'Eligible spot',
@@ -225,7 +200,11 @@ function locationTooltip(location) {
     `Eligibility: ${availabilityLabel}`,
     `Instance type: ${location.instanceType || '-'}`,
     `Card: ${formatAccelerators(location.accelerators)}`,
-    `Price: ${formatHourlyPrice(location.cachedHourlyCost)}`,
+    `Placement price: ${formatPlacementHourlyPrice(
+      location.normalizedHourlyCost,
+      costUnit
+    )}`,
+    `Machine price: ${formatHourlyPrice(location.cachedHourlyCost)}`,
     `Status: ${locationDisplayStatus(location)}`,
     `Stored: ${location.storedStatus || '-'} · Effective: ${location.effectiveStatus || '-'}`,
   ];
@@ -247,49 +226,24 @@ function locationTooltip(location) {
   return details.join('\n');
 }
 
-function LocationChip({ location }) {
+function LocationStatus({ location }) {
   const availability = locationAvailability(location);
-  const tone = {
-    [LOCATION_AVAILABILITY.AVAILABLE_SPOT]:
-      'border-emerald-200 bg-emerald-50 text-emerald-800',
-    [LOCATION_AVAILABILITY.AVAILABLE_ON_DEMAND]:
-      'border-sky-200 bg-sky-50 text-sky-800',
-    [LOCATION_AVAILABILITY.UNAVAILABLE]:
-      'border-red-200 bg-red-50 text-red-800',
+  const label = {
+    [LOCATION_AVAILABILITY.AVAILABLE_SPOT]: 'Eligible spot',
+    [LOCATION_AVAILABILITY.AVAILABLE_ON_DEMAND]: 'Eligible on-demand',
+    [LOCATION_AVAILABILITY.UNAVAILABLE]: 'Ineligible',
   }[availability];
-  const details = locationTooltip(location);
+  const tone =
+    availability === LOCATION_AVAILABILITY.UNAVAILABLE ? 'error' : 'active';
   return (
-    <span
-      tabIndex={0}
-      title={details}
-      aria-label={details}
-      className={`inline-flex cursor-help items-center gap-1.5 rounded-md border px-2 py-1 text-xs ${tone}`}
-    >
-      <span className="font-medium">
-        {location.instanceType || formatAccelerators(location.accelerators)}
-      </span>
-      {location.instanceType && (
-        <span className="opacity-80">
-          {formatAccelerators(location.accelerators)}
-        </span>
-      )}
-      <span className="opacity-80">
-        {formatHourlyPrice(location.cachedHourlyCost)}
-      </span>
-    </span>
-  );
-}
-
-function LocationList({ locations }) {
-  if (locations.length === 0) return <span className="text-gray-400">-</span>;
-  return (
-    <div className="flex flex-wrap gap-1.5">
-      {locations.map((location, index) => (
-        <LocationChip
-          key={`${location.zone}-${formatAccelerators(location.accelerators)}-${location.useSpot}-${index}`}
-          location={location}
-        />
-      ))}
+    <div>
+      <StatusPill tone={tone}>{label}</StatusPill>
+      <div className="mt-1 text-xs text-gray-500">
+        {locationDisplayStatus(location)}
+        {location.paidAdmission?.state
+          ? ` · paid ${location.paidAdmission.state}`
+          : ''}
+      </div>
     </div>
   );
 }
@@ -322,10 +276,6 @@ function PlacerStateCard({ state, loadingMore, requestPending, onLoadMore }) {
     () => filterPlacementLocations(locations, filters),
     [locations, filters]
   );
-  const groups = useMemo(
-    () => groupPlacementLocations(filteredLocations),
-    [filteredLocations]
-  );
   const setFilter = (name, value) =>
     setFilters((current) => ({ ...current, [name]: value }));
   const hasActiveFilters =
@@ -334,15 +284,20 @@ function PlacerStateCard({ state, loadingMore, requestPending, onLoadMore }) {
     filters.card !== ALL_FILTER_VALUE ||
     filters.availability !== ALL_FILTER_VALUE ||
     filters.maxPrice !== '';
+  const hasCatalogCostOrder =
+    state.orderSemantics === 'catalog_normalized_cost_then_location_identity';
 
   return (
     <Card>
       <div className="border-b px-4 py-3">
-        <h3 className="font-semibold">Service fallback locations</h3>
+        <h3 className="font-semibold">Candidate catalog — not launches</h3>
         <p className="mt-1 text-sm text-gray-500">
-          One row per provider and region. Eligible means the controller may
-          attempt a launch; it does not promise live provider inventory. Hover a
-          card for its exact instance, admission state, and next probe.
+          {hasCatalogCostOrder
+            ? 'Catalog sorted by normalized cost; equal-price display order uses location identity. Actual selection applies ACTIVE status, requested accelerator card, zero-cost preference, paid admission, and frontier gates. '
+            : 'This controller version does not report a normalized catalog-cost order. '}
+          Eligible means the controller may attempt a launch; it does not
+          promise live provider inventory. Benched and otherwise ineligible
+          candidates remain visible.
         </p>
       </div>
       {!state.available ? (
@@ -415,7 +370,11 @@ function PlacerStateCard({ state, loadingMore, requestPending, onLoadMore }) {
               onChange={(value) => setFilter('availability', value)}
             />
             <label className="w-36 text-xs font-medium text-gray-600">
-              <span className="mb-1 block">Maximum price</span>
+              <span className="mb-1 block">
+                {hasCatalogCostOrder
+                  ? 'Maximum placement price'
+                  : 'Maximum machine price'}
+              </span>
               <input
                 type="number"
                 min="0"
@@ -446,7 +405,7 @@ function PlacerStateCard({ state, loadingMore, requestPending, onLoadMore }) {
               </button>
             )}
           </div>
-          {groups.length === 0 ? (
+          {filteredLocations.length === 0 ? (
             <div className="p-5 text-sm text-gray-500">
               No placement locations match these filters.
             </div>
@@ -455,28 +414,56 @@ function PlacerStateCard({ state, loadingMore, requestPending, onLoadMore }) {
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="w-52">Provider / region</TableHead>
-                    <TableHead>Eligible</TableHead>
-                    <TableHead>Ineligible</TableHead>
+                    <TableHead>Provider / location</TableHead>
+                    <TableHead>Shape</TableHead>
+                    <TableHead>Eligibility</TableHead>
+                    <TableHead>Placement price</TableHead>
+                    <TableHead>Machine price</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {groups.map((group) => (
-                    <TableRow key={`${group.provider}-${group.region}`}>
-                      <TableCell>
-                        <div className="font-medium">{group.provider}</div>
-                        <div className="text-xs text-gray-500">
-                          {group.region}
-                        </div>
-                      </TableCell>
-                      <TableCell className="align-top">
-                        <LocationList locations={group.available} />
-                      </TableCell>
-                      <TableCell className="align-top">
-                        <LocationList locations={group.unavailable} />
-                      </TableCell>
-                    </TableRow>
-                  ))}
+                  {filteredLocations.map((location, index) => {
+                    const details = locationTooltip(location, state.costUnit);
+                    return (
+                      <TableRow
+                        key={`${location.cloud}-${location.region}-${location.zone}-${location.instanceType}-${formatAccelerators(location.accelerators)}-${location.useSpot}-${index}`}
+                        title={details}
+                        aria-label={details}
+                        tabIndex={0}
+                        className="cursor-help"
+                      >
+                        <TableCell>
+                          <div className="font-medium">{location.cloud}</div>
+                          <div className="text-xs text-gray-500">
+                            {location.region || '-'}
+                            {location.zone ? ` / ${location.zone}` : ''}
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <div className="font-medium">
+                            {location.instanceType || '-'}
+                          </div>
+                          <div className="text-xs text-gray-500">
+                            {formatAccelerators(location.accelerators)}
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <LocationStatus location={location} />
+                        </TableCell>
+                        <TableCell className="font-medium">
+                          {formatPlacementHourlyPrice(
+                            location.normalizedHourlyCost,
+                            state.costUnit
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {Number.isFinite(location.cachedHourlyCost)
+                            ? `$${location.cachedHourlyCost.toFixed(4)}/machine-hr`
+                            : 'Price unavailable'}
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
                 </TableBody>
               </Table>
             </div>
@@ -583,6 +570,15 @@ function outcomeTone(outcome) {
   return 'error';
 }
 
+function historyPriceSource(priceSource) {
+  if (priceSource === 'catalog_at_decision') {
+    return 'Catalog estimate at decision';
+  }
+  return priceSource
+    ? priceSource.replaceAll('_', ' ')
+    : 'Price source unavailable';
+}
+
 function HistoryCard({ history, loadingMore, requestPending, onLoadMore }) {
   const [expanded, setExpanded] = useState(new Set());
   const toggle = (eventId) => {
@@ -598,9 +594,11 @@ function HistoryCard({ history, loadingMore, requestPending, onLoadMore }) {
       <div className="border-b px-4 py-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h3 className="font-semibold">Placement decisions (24h)</h3>
+            <h3 className="font-semibold">Actual placement attempts (24h)</h3>
             <p className="mt-1 text-sm text-gray-500">
-              Prices are snapshots from the exact resource at decision time.
+              Only provider launch attempts appear here. Displayed prices are
+              catalog machine-price estimates captured at decision time, not
+              provider billing.
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -616,7 +614,7 @@ function HistoryCard({ history, loadingMore, requestPending, onLoadMore }) {
         <SectionUnavailable label="Placement history" />
       ) : history.events.length === 0 ? (
         <div className="p-5 text-sm text-gray-500">
-          No placement decisions have been recorded in this window.
+          No provider launch attempts have been recorded in this window.
         </div>
       ) : (
         <div className="divide-y">
@@ -649,9 +647,16 @@ function HistoryCard({ history, loadingMore, requestPending, onLoadMore }) {
                     </div>
                     <div className="flex items-start justify-between gap-2 md:justify-end">
                       <div className="text-right text-sm">
-                        {event.hourlyPrice != null
-                          ? `$${event.hourlyPrice.toFixed(4)}/hr`
-                          : '-'}
+                        <div>
+                          {event.hourlyPrice != null
+                            ? `$${event.hourlyPrice.toFixed(4)}/machine-hr`
+                            : '-'}
+                        </div>
+                        {event.hourlyPrice != null && (
+                          <div className="text-xs text-gray-500">
+                            {historyPriceSource(event.priceSource)}
+                          </div>
+                        )}
                       </div>
                       <StatusPill tone={outcomeTone(event.outcome)}>
                         {(event.outcome || 'unknown').replaceAll('_', ' ')}
@@ -668,6 +673,9 @@ function HistoryCard({ history, loadingMore, requestPending, onLoadMore }) {
                     </div>
                     <div>
                       Accelerators: {formatAccelerators(event.accelerators)}
+                    </div>
+                    <div>
+                      Price source: {historyPriceSource(event.priceSource)}
                     </div>
                     {event.errorCode && (
                       <div>Error code: {event.errorCode}</div>
@@ -711,7 +719,12 @@ export function ServicePlacement({ serviceName }) {
   const requestPending = pendingAction !== null;
 
   const fetchData = useCallback(
-    async ({ cursor = null, locationOffset = 0, append = null } = {}) => {
+    async ({
+      cursor = null,
+      locationOffset = 0,
+      append = null,
+      expectedLocationPage = null,
+    } = {}) => {
       if (!serviceName) return;
       const requestVersion = requestVersionRef.current + 1;
       requestVersionRef.current = requestVersion;
@@ -720,14 +733,44 @@ export function ServicePlacement({ serviceName }) {
       setPendingAction(append || 'refresh');
       setError(null);
       try {
-        const next = await getServicePlacement({
+        const placementRequest = {
           serviceName,
           cursor,
           locationOffset,
-        });
+        };
+        if (expectedLocationPage?.orderGeneration) {
+          placementRequest.locationOrderGeneration =
+            expectedLocationPage.orderGeneration;
+        }
+        const next = await getServicePlacement(placementRequest);
         if (!isCurrentRequest()) return;
-        if (append === 'append-locations' && !next.placerState.available) {
+        if (
+          append === 'append-locations' &&
+          !next.placerState.available &&
+          next.placerState.reason !== 'catalog_order_changed'
+        ) {
           setError('Failed to load more placement locations.');
+          return;
+        }
+        if (
+          append === 'append-locations' &&
+          (next.placerState.reason === 'catalog_order_changed' ||
+            !locationPageContractMatches(
+              expectedLocationPage,
+              next.placerState,
+              locationOffset
+            ))
+        ) {
+          // A controller/API rolling upgrade or catalog-policy change can
+          // change page ordering between requests. Never append across that
+          // boundary: atomically replace the view with a fresh first page.
+          const reset = await getServicePlacement({ serviceName });
+          if (!isCurrentRequest()) return;
+          if (!reset.placerState.available) {
+            setError('Failed to reload the changed placement catalog.');
+            return;
+          }
+          setData(reset);
           return;
         }
         if (append === 'append-history' && !next.history.available) {
@@ -819,18 +862,6 @@ export function ServicePlacement({ serviceName }) {
         </button>
       </div>
       {error && <div className="text-sm text-red-700">{error}</div>}
-      <PlacerStateCard
-        state={data.placerState}
-        loadingMore={loadingMoreLocations}
-        requestPending={requestPending}
-        onLoadMore={() =>
-          fetchData({
-            locationOffset: data.placerState.nextOffset,
-            append: 'append-locations',
-          })
-        }
-      />
-      <CapacityHintsCard state={data.capacityHints} />
       <HistoryCard
         history={data.history}
         loadingMore={loadingMoreHistory}
@@ -842,6 +873,25 @@ export function ServicePlacement({ serviceName }) {
           })
         }
       />
+      <PlacerStateCard
+        state={data.placerState}
+        loadingMore={loadingMoreLocations}
+        requestPending={requestPending}
+        onLoadMore={() =>
+          fetchData({
+            locationOffset: data.placerState.nextOffset,
+            append: 'append-locations',
+            expectedLocationPage: {
+              paginationVersion: data.placerState.paginationVersion,
+              orderSemantics: data.placerState.orderSemantics,
+              costUnit: data.placerState.costUnit,
+              orderGeneration: data.placerState.orderGeneration,
+              totalLocations: data.placerState.totalLocations,
+            },
+          })
+        }
+      />
+      <CapacityHintsCard state={data.capacityHints} />
     </div>
   );
 }

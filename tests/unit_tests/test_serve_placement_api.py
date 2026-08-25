@@ -62,9 +62,14 @@ def test_placement_uses_exact_service_incarnation(monkeypatch):
                             limit=10,
                             cursor='cursor-a',
                             location_limit=25,
-                            location_offset=50)
+                            location_offset=50,
+                            location_order_generation='a' * 64)
 
-    placer.assert_called_once_with('svc', 'hash-a', limit=25, offset=50)
+    placer.assert_called_once_with('svc',
+                                   'hash-a',
+                                   limit=25,
+                                   offset=50,
+                                   expected_order_generation='a' * 64)
     capacity.assert_called_once_with('svc', 'hash-a')
     history.assert_called_once_with('svc',
                                     'hash-a',
@@ -142,6 +147,8 @@ def test_placement_rechecks_server_derived_owner_scope(monkeypatch):
     'location_offset': -1
 }, {
     'location_offset': 100_001
+}, {
+    'location_order_generation': 'not-a-generation'
 }])
 def test_placement_payload_rejects_unbounded_inputs(overrides):
     with pytest.raises(ValueError):

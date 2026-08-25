@@ -1412,6 +1412,8 @@ class ServePublicPlacementBody(RequestBody):
     # initialized creates a sky.client <-> sky.serve package cycle.
     location_limit: int = pydantic.Field(default=100, ge=1, le=100)
     location_offset: int = pydantic.Field(default=0, ge=0, le=100_000)
+    location_order_generation: str | None = pydantic.Field(
+        default=None, min_length=64, max_length=64, pattern=r'^[0-9a-f]{64}$')
 
 
 class ServePlacementBody(ServePublicPlacementBody):

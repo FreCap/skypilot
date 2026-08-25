@@ -233,17 +233,40 @@ def _get_to_controller_with_retry(service_name: str, expected_service_hash: str,
                                              **kwargs)
 
 
+def _is_placement_order_generation(value: Any) -> bool:
+    return (isinstance(value, str) and len(value) == 64 and
+            all(character in '0123456789abcdef' for character in value))
+
+
 def _normalize_placement_page(payload: dict[str, Any], *, limit: int,
                               offset: int) -> dict[str, Any]:
     """Normalize paged and rolling-upgrade placement responses."""
     locations = payload.get('locations')
     if locations is None:
+        if payload.get('available') is not False:
+            raise ValueError(
+                'Available placement-state response must include locations.')
+        if payload.get('reason') == 'catalog_order_changed':
+            if (payload.get('pagination_version')
+                    != constants.PLACEMENT_STATE_PAGINATION_VERSION):
+                raise ValueError(
+                    'Changed placement catalog has an invalid version.')
+            order_generation = payload.get('order_generation')
+            if not _is_placement_order_generation(order_generation):
+                raise ValueError(
+                    'Changed placement catalog has an invalid generation.')
         return payload
     if not isinstance(locations, list):
         raise ValueError('Placement-state locations must be a list.')
 
     pagination_version = payload.get('pagination_version')
-    if pagination_version == constants.PLACEMENT_STATE_PAGINATION_VERSION:
+    if pagination_version in (
+            constants.PLACEMENT_STATE_COMPATIBLE_PAGINATION_VERSIONS):
+        if (pagination_version == constants.PLACEMENT_STATE_PAGINATION_VERSION
+                and payload.get('enabled') is not False):
+            order_generation = payload.get('order_generation')
+            if not _is_placement_order_generation(order_generation):
+                raise ValueError('Placement-state order generation is invalid.')
         page_offset = payload.get('page_offset')
         next_offset = payload.get('next_offset')
         total_locations = payload.get('total_locations')
@@ -281,7 +304,8 @@ def _normalize_placement_page(payload: dict[str, Any], *, limit: int,
     page_end = offset + len(page)
     normalized = dict(payload)
     normalized.update({
-        'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+        'pagination_version':
+            constants.PLACEMENT_STATE_LEGACY_PAGINATION_VERSION,
         'page_offset': offset,
         'next_offset': page_end if page_end < len(locations) else None,
         'total_locations': len(locations),
@@ -298,6 +322,7 @@ def get_service_placement_state(
     *,
     limit: int = constants.PLACEMENT_STATE_DEFAULT_PAGE_SIZE,
     offset: int = 0,
+    expected_order_generation: str | None = None,
 ) -> dict[str, Any]:
     """Read one bounded page of a controller's resident placer state."""
     if (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or
@@ -306,15 +331,18 @@ def get_service_placement_state(
     if (not isinstance(offset, int) or isinstance(offset, bool) or offset < 0 or
             offset > constants.PLACEMENT_STATE_MAX_OFFSET):
         raise ValueError('Placement-state offset is invalid.')
+    params: dict[str, Any] = {
+        'limit': limit,
+        'offset': offset,
+        'include_paid_admission': True,
+    }
+    if expected_order_generation is not None:
+        params['expected_order_generation'] = expected_order_generation
     response = _get_to_controller_with_retry(
         service_name,
         expected_service_hash,
         constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
-        params={
-            'limit': limit,
-            'offset': offset,
-            'include_paid_admission': True,
-        },
+        params=params,
         timeout=_CONTROLLER_HTTP_TIMEOUT_SECONDS)
     response.raise_for_status()
     payload = response.json()

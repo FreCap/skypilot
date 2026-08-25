@@ -351,6 +351,7 @@ def placement(
         cursor: str | None = None,
         location_limit: int = serve_constants.PLACEMENT_STATE_DEFAULT_PAGE_SIZE,
         location_offset: int = 0,
+        location_order_generation: str | None = None,
         authorized_owner_user_id: str | None = None) -> dict[str, Any]:
     """Return bounded placement state for one exact service incarnation."""
     if authorized_owner_user_id is None:
@@ -374,7 +375,8 @@ def placement(
             service_name,
             service_hash,
             limit=location_limit,
-            offset=location_offset)
+            offset=location_offset,
+            expected_order_generation=location_order_generation)
     except Exception as e:  # pylint: disable=broad-except
         logger.debug('Placement-state read failed for %r: %s', service_name, e)
         placer_state = _unavailable_section('controller_unavailable')
@@ -415,6 +417,7 @@ def authorized_placement(
         cursor: str | None = None,
         location_limit: int = serve_constants.PLACEMENT_STATE_DEFAULT_PAGE_SIZE,
         location_offset: int = 0,
+        location_order_generation: str | None = None,
         *,
         authorized_owner_user_id: str | None) -> dict[str, Any]:
     """Execute placement with the API-server-derived authorization scope.
@@ -429,6 +432,7 @@ def authorized_placement(
         cursor=cursor,
         location_limit=location_limit,
         location_offset=location_offset,
+        location_order_generation=location_order_generation,
         authorized_owner_user_id=authorized_owner_user_id,
     )
 
