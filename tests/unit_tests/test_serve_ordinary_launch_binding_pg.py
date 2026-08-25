@@ -884,6 +884,42 @@ def test_current_paid_effect_accepts_current_worker_projection(
     _assert_current_paid_provider_effect_is_permitted(binding_database)
 
 
+def test_paid_plan_is_mutable_only_before_provider_effect(
+        binding_database, monkeypatch) -> None:
+    identity, _, launch_context = _admit_generic_paid(binding_database)
+    claim = _Claim(identity.request_id, 1, str(uuid.uuid4()), str(uuid.uuid4()))
+    original_validate = (
+        binding.capacity_admission.validate_paid_claim_in_connection)
+    validations = 0
+
+    def _validate(connection, service, paid_claim, **kwargs):
+        nonlocal validations
+        validations += 1
+        if validations > 1:
+            raise binding.capacity_admission.CapacityAdmissionConflict(
+                'A mutable demand heartbeat must not abort effect bookkeeping.')
+        return original_validate(connection, service, paid_claim, **kwargs)
+
+    monkeypatch.setattr(binding.capacity_admission,
+                        'validate_paid_claim_in_connection', _validate)
+    with binding.non_pool_provider_effect_guard(
+            launch_context,
+            claim,
+            claim_validator=lambda _connection, _association_id, _claim: True):
+        binding.begin_service_job_io(launch_context)
+        binding.record_service_job(launch_context, 17)
+
+    assert validations == 1
+    with binding_database.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(binding.ordinary_launch_associations_table).where(
+                binding.ordinary_launch_associations_table.c.association_id ==
+                identity.association_id)).mappings().one()
+    assert association['effect_phase'] == (
+        binding.EffectPhase.SERVICE_JOB_RECORDED.value)
+    assert association['service_job_id'] == 17
+
+
 @pytest.mark.parametrize('history_distance', [1, 2])
 def test_historical_cohort_cannot_start_provider_effect(
         binding_database, monkeypatch, history_distance) -> None:

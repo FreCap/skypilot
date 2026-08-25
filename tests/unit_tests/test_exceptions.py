@@ -398,6 +398,26 @@ def test_wrap_unsafe_exceptions():
     assert str(sky_safe) == 'test cluster'
 
 
+def test_unregistered_skypilot_exception_uses_safe_wrapper():
+    """Module origin alone does not make an exception wire-decodable."""
+
+    class ServerLocalError(RuntimeError):
+        pass
+
+    ServerLocalError.__module__ = 'sky.serve.synthetic'
+    error = ServerLocalError('server-local failure')
+
+    assert not exceptions.is_safe_exception(error)
+    serialized = exceptions.serialize_exception(error)
+    restored = exceptions.deserialize_exception(serialized)
+
+    assert serialized['type'] == 'CloudError'
+    assert type(restored) is exceptions.CloudError
+    assert restored.cloud_provider == 'sky'
+    assert restored.error_type == 'ServerLocalError'
+    assert restored.args == ('server-local failure',)
+
+
 def test_skypilot_exception_with_notes_round_trips():
     """Notes must not be passed to a SkyPilot exception's constructor.
 
