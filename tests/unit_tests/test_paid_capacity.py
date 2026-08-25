@@ -1407,7 +1407,7 @@ def test_delayed_third_pool_can_use_a_cheaper_existing_region():
     assert budget.frontier_limit_overrides == {('l4',): 3}
 
 
-def test_delayed_third_pool_ignores_opaque_pool_shape_after_age_proof():
+def test_delayed_third_pool_fails_closed_for_opaque_pool_identity():
     first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
     third = make_location('eu-west-1', {'L4': 1}, cloud_name='AWS')
@@ -1424,12 +1424,12 @@ def test_delayed_third_pool_ignores_opaque_pool_shape_after_age_proof():
                                sort_keys=True,
                                separators=(',', ':'))
     budget.owned_pool_keys_by_frontier[('l4',)].remove(first_key)
-    budget.owned_pool_keys_by_frontier[('l4',)].add(malformed_key)
+    budget.unknown_owned_pool_keys.add(malformed_key)
     budget.newest_claimed_at_by_pool_key[malformed_key] = 900
 
     with mock.patch.object(paid_capacity.time, 'time', return_value=1000):
-        assert paid_capacity.select_location(placer, budget) == third
-    assert budget.frontier_limit_overrides == {('l4',): 3}
+        assert paid_capacity.select_location(placer, budget) is None
+    assert not budget.frontier_limit_overrides
 
 
 def test_delayed_third_pool_requires_age_for_every_unresolved_sibling():

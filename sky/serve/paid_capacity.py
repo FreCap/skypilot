@@ -1076,6 +1076,7 @@ def select_location(
                           current_frontier < maximum_frontier and
                           delay is not None and youngest_age is not None and
                           youngest_age >= delay and
+                          not budget.unknown_owned_pool_keys and
                           not _owned_pool_has_headroom(budget, key))
             if can_expand:
                 # The frontier is a concurrency bound, not a price policy.
