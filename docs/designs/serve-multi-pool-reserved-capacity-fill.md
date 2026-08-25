@@ -5636,6 +5636,31 @@ be forced through a nonexistent queue. Bundle schema v7 retains one nullable
 `kueue_admission` object per fleet context and matching nullable
 `kueue_enforcement` object per provider context.
 
+SkyPilot owns only the access boundary required to use that external lane. The
+canonical PHX objects are checked in at
+`boltz/reserved_fill_reclaim_policy/manifests/phx-external-lane-access.yaml`.
+They create a tokenless `boltz-research/skypilot-pool-sa` with no RBAC, bind the
+control-plane IAM group to the existing direct-Pod/Service lifecycle verbs in
+`boltz-research`, and give the audit group named reads for only the Namespace,
+ServiceAccount, `be` LocalQueue, and `research-be` ClusterQueue that were not
+already part of its provider inventory proof. The worker Pod cannot read or
+mutate Kubernetes objects. Neither control-plane nor audit access can mutate a
+LocalQueue, ClusterQueue, WorkloadPriorityClass, PriorityClass, Cohort, quota,
+fairness, borrowing, or preemption rule. Broad historical read-only inventory
+permissions owned by the external Kueue chart are not an authority dependency:
+schema v7 performs one named `research-be` GET and no ClusterQueue or Cohort
+LIST.
+
+The 2026-08-25 activation evidence is Helm revision 614 on immutable image
+`1.1.1491@sha256:97bb62bfc758869d30794e4a7ade6525d5e156213fb594607e4b20ad2675631b`.
+The live policy preflight completed successfully with fleet digest
+`54bb1b7d733e7f9faafa6c3fa98397581ea7baec207f1ebb70109514545bf94b` and
+provider digest
+`63286f2bc455c2dede19454c67a395a79cd01a1c229069661887543dbb771f2f`.
+PostgreSQL server-config revision 4 selects `boltz-research` for
+`mt_hybrid`/`phx_research_cluster_eks`; all API, controller, and executor
+replicas independently read back that exact revision and effective Namespace.
+
 This choice preserves a real platform boundary rather than claiming a stronger
 one. The existing `be-lt` WorkloadPriorityClass is the lowest platform-owned
 Kueue tranche available to SkyPilot, and the independently injected -1000 Pod
