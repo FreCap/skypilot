@@ -1,18 +1,19 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Current status (2026-08-23 07:48 UTC): `boltz-l4-fleet` lifecycle 94/version 1
-uses PostgreSQL-authoritative `DURABLE_INTENT` actuation and
-`SEQUENCED_ACTIVE` generation 36. PR #1679 is deployed as release `1.1.1449` /
-Helm revision 573 and completed the supported lifecycle-93 purge plus clean
-lifecycle-94 recreation. PR #1680 is deployed homogeneously as release
-`1.1.1450` / Helm revision 575 at merge
-`b311dd2775c150895918121cbf2b16c0ba21f5dd`; its generation-35-to-36
-active-to-active CAS is complete and must not be repeated. The next permissible
-authorization is one generation 36-to-37 CAS only after the reviewed historical-
-cleanup change is merged and deployed homogeneously and the exact preflight in
-`serve-multi-pool-reserved-capacity-fill.md` passes. That document is
-authoritative for live rollout state and evidence. The older phase account below
-is historical chronology and is not an executable runbook.
+Current status (2026-08-25 04:00 UTC): the isolated
+`boltz-l4-fleet-spot100` qualification service is on release `1.1.1483` / Helm
+revision 605 with a 100-GPU positive paid cap and a Spot-only AWS/GCP catalog.
+The first 10,000-request attempt completed all 550 requests it dispatched but
+materialized only two GPUs. Production evidence isolated two source defects:
+paid UNKNOWN replacements omitted the ordinary demand-plan tuple, and an
+idle paid retirement could remain permanently `ACTIVE` after equivalent-zero
+demand/route heartbeats advanced. Both corrections are source-complete and
+locally focused-test green, but are not yet merged, deployed, or production
+proven. The next gate is one homogeneous Helm rollout, supported cleanup of the
+two retained v1483 Spot instances, and a sustained 512-concurrency rerun that
+requires target 100, 100 provider-backed ready GPU slots, 10,000 successful
+requests, no On-Demand effects, and complete teardown. The older phase account
+below is historical chronology and is not an executable runbook.
 
 Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
 #1504. PR #1521's partial-coverage in-flight observability, the complete G1S
@@ -800,11 +801,28 @@ telemetry change can pretend the effect did not happen.
 
 Spot is a paid market for this contract. It may be preferred over On-Demand by
 the existing placement policy, but neither market is authorized without a
-positive residual. Reserved-fill admission can never select either market.
-Cost rebalance, unknown-capacity replacement, and system recovery remain
-separate generic profiles with their existing exact predecessor/recovery
-authority; they cannot consume an ordinary demand-plan residual or silently
-become ordinary scale-up.
+positive residual. Reserved-fill admission can never select either market. An
+unknown-capacity replacement selected inside a mixed demand wave keeps its
+separate exact predecessor/observation profile, but that profile grants no
+additional purchase authority: when its selected placement is paid, it debits
+the same immutable ordinary demand-plan residual as every other paid row in
+the wave. If no residual remains, no additional paid replacement is allowed;
+effective capacity may remain below target until the predecessor becomes
+terminal or zero-cost capacity is admitted. At most one nonterminal
+replacement may cite the same exact predecessor record, card, and width. The
+immutable authorization scalar on the replica row makes that deduplication
+survive reconciliation ticks, acknowledgement loss, and controller restarts.
+This makes every fresh paid demand-wave provider effect use one PostgreSQL
+funding path and keeps replacement attribution orthogonal to cost authority.
+Cost rebalance and system recovery retain their separate exact
+predecessor/recovery profiles; they cannot silently become ordinary scale-up.
+
+The 2026-08-25 Spot qualification caught the transitional opposite behavior:
+paid unknown-capacity replacements were given only predecessor authority, so
+their claims had a null plan tuple. Generic provider admission rejected those
+rows, and their committed inventory also invalidated the next ordinary row in
+the same wave. Restoring the single paid-funding path is the steady-state
+contract, not a compatibility exception.
 
 ### Zero-cost actuation intent
 
@@ -1390,9 +1408,23 @@ publishes a nonempty all-zero capacity target. Every paid replica is then made
 off-route atomically with an `ACTIVE` retirement intent. A never-ready replica
 may commit immediately; a previously routable replica has no deadline-based
 escape and becomes `COMMITTED` only after its retained exact route URL reports
-idle. Positive demand can cancel only an `ACTIVE` intent under a strictly newer
-demand generation. `COMMITTED` is irreversible and recovery re-drives it with
-a zero-second teardown cap.
+idle. At that irreversible commit, PostgreSQL may atomically rebase the intent
+to monotonic current heads only when the locked successor plan is still fresh,
+still proves aggregate zero, has an all-zero nonempty target, and has no paid
+residual. This treats equivalent zero-demand heartbeats as freshness renewal
+instead of permanent invalidation while keeping positive demand, expired
+heads, ownership changes, source-epoch changes, and nonzero residuals
+fail-closed. Positive demand can cancel only an `ACTIVE` intent under a
+strictly newer demand generation. `COMMITTED` is irreversible and recovery
+re-drives it with a zero-second teardown cap.
+
+The 2026-08-25 Spot qualification found the missing successor case live: two
+idle AWS Spot L4 replicas stayed `SHUTTING_DOWN` because their `ACTIVE`
+retirements cited plan/demand/route generations 111/1528/269 while semantically
+equivalent fresh-zero heads advanced. Neither retirement reached the down
+request or provider-effect boundary. The atomic equivalent-zero rebase is the
+steady-state correction; refreshing timers, weakening idle proof, or deleting
+the rows would not satisfy this contract.
 
 Local evidence on 2026-08-17 includes the complete Serve controller, replica
 manager, Serve state, concurrency autoscaler, demand, capacity-admission,

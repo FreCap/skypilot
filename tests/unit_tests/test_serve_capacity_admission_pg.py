@@ -1061,6 +1061,85 @@ def test_fill_disabled_durable_service_uses_not_applicable(
             is capacity_admission.ReservedFillPlanAuthorityMode.NOT_APPLICABLE)
 
 
+def test_durable_unknown_replacement_requires_and_persists_plan_tuple(
+        capacity_database):
+    engine, _, _ = capacity_database
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+    replica_id = 301
+    info = replica_managers.ReplicaInfo(
+        replica_id=replica_id,
+        cluster_name=f'svc-{replica_id}',
+        replica_port='8000',
+        is_spot=True,
+        location=None,
+        version=1,
+        resources_override={'accelerators': {
+            'L4': 1,
+        }},
+        unknown_capacity_replacement=True)
+    admission_kwargs = {
+        'pool_key': 'gcp:L4',
+        'priority': 50,
+        'base_limit': 10,
+        'max_limit': 10,
+        'max_live_paid_gpu_units': 10,
+        'now': None,
+        'success_ttl_seconds': 60.0,
+        'waiter_ttl_seconds': 60.0,
+        'expected_controller_owner': (123, '10.0.0.5'),
+    }
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='unbound paid claim'):
+        serve_state.try_add_replica_with_paid_capacity_claim(
+            'svc', 'svc-hash', replica_id, info, **admission_kwargs)
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.replica_id).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id ==
+                    replica_id)).scalar_one_or_none() is None
+        assert connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.paid_capacity_claims_table.c.replica_id).
+            where(
+                serve_state_schema.paid_capacity_claims_table.c.service_name ==
+                'svc',
+                serve_state_schema.paid_capacity_claims_table.c.replica_id ==
+                replica_id)).scalar_one_or_none() is None
+
+    assert serve_state.try_add_replica_with_paid_capacity_claim(
+        'svc',
+        'svc-hash',
+        replica_id,
+        info,
+        capacity_plan_claim=authority.claim_values('l4'),
+        **admission_kwargs) == 'acquired'
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.replica_state,
+                serve_state_schema.paid_capacity_claims_table.c.
+                capacity_plan_generation,
+                serve_state_schema.paid_capacity_claims_table.c.
+                capacity_plan_sha256,
+            ).join(
+                serve_state_schema.paid_capacity_claims_table,
+                sqlalchemy.and_(
+                    serve_state_schema.paid_capacity_claims_table.c.service_name
+                    == serve_state_schema.replicas_table.c.service_name,
+                    serve_state_schema.paid_capacity_claims_table.c.replica_id
+                    == serve_state_schema.replicas_table.c.replica_id)).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        'svc', serve_state_schema.replicas_table.c.replica_id ==
+                        replica_id)).mappings().one()
+    assert row['replica_state']['unknown_capacity_replacement'] is True
+    assert row['capacity_plan_generation'] == authority.generation
+    assert row['capacity_plan_sha256'] == authority.content_sha256
+
+
 def test_fill_enabled_direct_plan_fails_after_durable_activation(
         capacity_database):
     engine, incarnation, _ = capacity_database

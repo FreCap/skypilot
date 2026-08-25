@@ -118,6 +118,11 @@ def _sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
+def capacity_plan_content_sha256(payload: Any) -> str:
+    """Return the canonical digest used by persisted capacity plans."""
+    return _sha256(payload)
+
+
 def _positive_int(value: Any, field: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ValueError(f'{field} must be a positive integer.')
@@ -1336,14 +1341,13 @@ class CapacityAdmissionRepository:
             if (not isinstance(demand_generation, int) or
                     demand_generation <= plan.demand_feed_generation or
                     current_snapshot is None or
-                    current_snapshot.demand_feed_generation !=
-                    demand_generation or
-                    current_snapshot.demand_source_epoch !=
-                    plan.demand_source_epoch or
+                    current_snapshot.demand_feed_generation != demand_generation
+                    or current_snapshot.demand_source_epoch
+                    != plan.demand_source_epoch or
                     current_snapshot.route_generation != plan.route_generation
                     or current_snapshot.route_sha256 != plan.route_sha256 or
-                    current_snapshot.route_source_epoch !=
-                    plan.route_source_epoch or _changed_demand_semantics(
+                    current_snapshot.route_source_epoch
+                    != plan.route_source_epoch or _changed_demand_semantics(
                         plan.normalized_demand,
                         current_snapshot.normalized_demand)):
                 raise CapacityAdmissionConflict(
@@ -1974,10 +1978,10 @@ def validate_paid_claim_in_connection(
     current_snapshot = demand_state.get_autoscaling_snapshot(
         str(service['name']), str(service['hash']), connection=connection)
     plan_normalized_demand = payload.get('normalized_demand')
-    changed_demand_fields = (
-        ['unavailable'] if current_snapshot is None else
-        _changed_demand_semantics(plan_normalized_demand,
-                                  current_snapshot.normalized_demand))
+    changed_demand_fields = ([
+        'unavailable'
+    ] if current_snapshot is None else _changed_demand_semantics(
+        plan_normalized_demand, current_snapshot.normalized_demand))
     if changed_demand_fields:
         raise CapacityAdmissionConflict(
             'Paid claim demand semantics changed before provider effect: '

@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 import dataclasses
+import datetime
 import enum
 from typing import Any
 import uuid
@@ -10,7 +11,9 @@ import sqlalchemy
 from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
 
+from sky.serve import capacity_admission
 from sky.serve import capacity_admission_schema
+from sky.serve import demand_state
 from sky.serve import demand_state_schema
 from sky.serve import route_projection_schema
 from sky.serve import serve_state_schema
@@ -168,7 +171,14 @@ def _owner_matches(
         owner.get('pool') in (0, False) and
         owner.get('demand_source_mode') == 'DURABLE_FEED' and
         owner.get('demand_source_epoch') == authority.demand_source_epoch and
+        owner.get('demand_authority_capable') is True and
+        owner.get('demand_authority_controller_incarnation')
+        == owner.get('controller_incarnation') and
+        owner.get('demand_authority_protocol_version') == 1 and
         owner.get('route_source_mode') == 'DURABLE_PROJECTED' and
+        owner.get('route_projection_capable') is True and
+        owner.get('route_projection_controller_incarnation')
+        == owner.get('controller_incarnation') and
         owner.get('route_projection_protocol_version') == 2 and
         owner.get('controller_pid') == expected_controller_owner[0] and
         owner.get('controller_ip') == expected_controller_owner[1])
@@ -179,7 +189,9 @@ def _lock_authority(
     service_name: str,
     authority: FreshZeroAuthority,
     expected_controller_owner: tuple[int | None, str | None],
-) -> Mapping[str, Any]:
+    *,
+    allow_equivalent_successor: bool = False,
+) -> tuple[Mapping[str, Any], FreshZeroAuthority, datetime.datetime | None]:
     owner = session.execute(
         sqlalchemy.select(_SERVICES).where(_SERVICES.c.name == service_name).
         with_for_update()).mappings().one_or_none()
@@ -198,8 +210,9 @@ def _lock_authority(
             service_name).with_for_update()).mappings().one_or_none()
     route_generation = (None
                         if route_head is None else route_head['generation'])
-    if (demand_generation != authority.demand_feed_generation or
-            route_generation != authority.route_generation):
+    if (not allow_equivalent_successor and
+        (demand_generation != authority.demand_feed_generation or
+         route_generation != authority.route_generation)):
         raise PaidRetirementConflict(
             'Fresh-zero demand or route generation advanced.')
     now = session.execute(sqlalchemy.select(
@@ -208,11 +221,14 @@ def _lock_authority(
         sqlalchemy.select(_CAPACITY_PLAN_HEADS).where(
             _CAPACITY_PLAN_HEADS.c.service_name ==
             service_name).with_for_update()).mappings().one_or_none()
+    plan_generation = (authority.capacity_plan_generation
+                       if not allow_equivalent_successor or plan_head is None
+                       else plan_head['generation'])
     plan = session.execute(
         sqlalchemy.select(_CAPACITY_PLANS).where(
             _CAPACITY_PLANS.c.service_name == service_name,
-            _CAPACITY_PLANS.c.generation == authority.capacity_plan_generation).
-        with_for_update()).mappings().one_or_none()
+            _CAPACITY_PLANS.c.generation ==
+            plan_generation).with_for_update()).mappings().one_or_none()
     payload = None if plan is None else plan['payload']
     normalized = (payload.get('normalized_demand') if isinstance(
         payload, Mapping) else None)
@@ -220,16 +236,38 @@ def _lock_authority(
         payload, Mapping) else None)
     paid_residual = (payload.get('paid_residual_by_accelerator') if isinstance(
         payload, Mapping) else None)
+    try:
+        payload_digest = capacity_admission.capacity_plan_content_sha256(
+            payload)
+    except ValueError as error:
+        raise PaidRetirementConflict(
+            'Fresh-zero capacity plan integrity validation failed.') from error
     if (plan_head is None or plan is None or route_head is None or
+            type(demand_generation) is not int or demand_generation < 1 or
+            type(route_generation) is not int or route_generation < 1 or
+            type(plan_generation) is not int or plan_generation < 1 or
+        (allow_equivalent_successor and
+         (demand_generation < authority.demand_feed_generation or
+          route_generation < authority.route_generation or
+          plan_generation < authority.capacity_plan_generation)) or
             route_head['valid_until'] <= now or
-            plan_head['generation'] != authority.capacity_plan_generation or
+            plan_head['generation'] != plan_generation or
             plan_head['valid_until'] <= now or
-            plan_head['demand_feed_generation']
-            != authority.demand_feed_generation or
-            plan['content_sha256'] != authority.capacity_plan_sha256 or
+            plan_head['demand_feed_generation'] != demand_generation or
+            type(plan['demand_feed_generation']) is not int or
+            plan['demand_feed_generation'] < 1 or
+            plan['demand_feed_generation'] > demand_generation or
+            plan['route_generation'] != route_generation or
             plan['service_hash'] != authority.service_hash or
+            plan['service_lifecycle_epoch'] != owner.get('lifecycle_epoch') or
+            plan['service_version'] != owner.get('current_version') or
             plan['demand_source_epoch'] != authority.demand_source_epoch or
-            plan['route_generation'] != authority.route_generation or
+            plan['route_source_epoch'] != owner.get('route_source_epoch') or
+            plan['protocol_version'] != capacity_admission.PROTOCOL_VERSION or
+            payload_digest != plan['content_sha256'] or
+        (not allow_equivalent_successor and
+         (plan['content_sha256'] != authority.capacity_plan_sha256 or
+          plan_generation != authority.capacity_plan_generation)) or
             not isinstance(normalized, Mapping) or
             normalized.get('fresh_aggregate_zero') is not True or
             not isinstance(targets, Mapping) or not targets or any(
@@ -237,7 +275,29 @@ def _lock_authority(
                 for count in targets.values()) or paid_residual != {}):
         raise PaidRetirementConflict(
             'Fresh-zero capacity plan is no longer authoritative.')
-    return owner
+    snapshot = demand_state.get_autoscaling_snapshot(
+        service_name, authority.service_hash, connection=session.connection())
+    reconcile = None if snapshot is None else snapshot.reconcile_authority
+    if (snapshot is None or reconcile is None or
+            snapshot.fresh_aggregate_zero is not True or
+            snapshot.demand_source_epoch != authority.demand_source_epoch or
+            snapshot.demand_feed_generation != demand_generation or
+            snapshot.route_generation != route_generation or
+            snapshot.route_sha256 != plan['route_sha256'] or
+            snapshot.route_source_epoch != plan['route_source_epoch'] or
+            reconcile.service_lifecycle_epoch != owner.get('lifecycle_epoch') or
+            reconcile.service_version != owner.get('current_version')):
+        raise PaidRetirementConflict(
+            'Fresh-zero demand reports no longer authorize retirement.')
+    final_valid_until = min(route_head['valid_until'], plan_head['valid_until'],
+                            reconcile.valid_until)
+    return owner, FreshZeroAuthority(
+        service_hash=authority.service_hash,
+        demand_source_epoch=authority.demand_source_epoch,
+        demand_feed_generation=demand_generation,
+        capacity_plan_generation=plan_generation,
+        capacity_plan_sha256=plan['content_sha256'],
+        route_generation=route_generation), final_valid_until
 
 
 def admit_in_session(
@@ -258,8 +318,9 @@ def admit_in_session(
     if type(requires_idle_proof) is not bool:
         raise PaidRetirementConflict('Idle-proof requirement is invalid.')
     record_id = _canonical_record_id(replica_record_id)
-    owner = _lock_authority(session, service_name, authority,
-                            expected_controller_owner)
+    owner, _, final_valid_until = _lock_authority(session, service_name,
+                                                  authority,
+                                                  expected_controller_owner)
     replica = session.execute(
         sqlalchemy.select(
             _REPLICAS.c.version,
@@ -305,6 +366,9 @@ def admit_in_session(
             route_url = lease['route_url']
     now = session.execute(sqlalchemy.select(
         sqlalchemy.func.clock_timestamp())).scalar_one()
+    if final_valid_until is None or final_valid_until <= now:
+        raise PaidRetirementConflict(
+            'Fresh-zero evidence expired while locking retirement state.')
     state = (PaidRetirementState.ACTIVE.value
              if requires_idle_proof else PaidRetirementState.COMMITTED.value)
     values = {
@@ -357,27 +421,96 @@ def commit_in_session(
 ) -> bool:
     """Irreversibly commit teardown after exact zero-occupancy proof."""
     record_id = _canonical_record_id(replica_record_id)
-    _lock_authority(session, service_name, authority, expected_controller_owner)
+    _, current_authority, final_valid_until = _lock_authority(
+        session,
+        service_name,
+        authority,
+        expected_controller_owner,
+        allow_equivalent_successor=True)
+    retirement = session.execute(
+        sqlalchemy.select(_RETIREMENTS).where(
+            _RETIREMENTS.c.service_name == service_name,
+            _RETIREMENTS.c.replica_id ==
+            replica_id).with_for_update()).mappings().one_or_none()
+    if (retirement is None or retirement['replica_record_id'] != record_id or
+            retirement['service_hash'] != authority.service_hash or
+            retirement['demand_source_epoch'] != authority.demand_source_epoch
+            or retirement['demand_feed_generation']
+            != authority.demand_feed_generation or
+            retirement['capacity_plan_generation']
+            != authority.capacity_plan_generation or
+            retirement['capacity_plan_sha256'] != authority.capacity_plan_sha256
+            or retirement['route_generation'] != authority.route_generation or
+            retirement['requires_idle_proof'] is not True or
+            not isinstance(retirement['route_url'], str) or
+            not retirement['route_url'] or
+            retirement['state'] != PaidRetirementState.ACTIVE.value):
+        return False
+    replica = session.execute(
+        sqlalchemy.select(
+            _REPLICAS.c.version,
+            _REPLICAS.c.status,
+            _REPLICAS.c.sky_down_status,
+            _REPLICAS.c.replica_state['replica_record_id'].as_string().label(
+                'replica_record_id'),
+            _REPLICAS.c.replica_state['is_zero_cost'].as_boolean().label(
+                'is_zero_cost'),
+            _REPLICAS.c.replica_state['status_property']
+            ['is_scale_down'].as_boolean().label('is_scale_down'),
+            _REPLICAS.c.replica_state['status_property']
+            ['preempted'].as_boolean().label('preempted'),
+            _REPLICAS.c.replica_state['status_property']
+            ['purged'].as_boolean().label('purged'),
+            _REPLICAS.c.replica_state['status_property']
+            ['wait_for_idle_before_termination'].as_boolean().label(
+                'wait_for_idle_before_termination'),
+        ).where(_REPLICAS.c.service_name == service_name, _REPLICAS.c.replica_id
+                == replica_id).with_for_update()).mappings().one_or_none()
+    if (replica is None or replica['replica_record_id'] != replica_record_id or
+            replica['version'] != retirement['service_version'] or
+            replica['is_zero_cost'] is not False or
+            replica['status'] != 'SHUTTING_DOWN' or
+            replica['sky_down_status'] != 'SCHEDULED' or
+            replica['is_scale_down'] is not True or
+            replica['preempted'] is not False or
+            replica['purged'] is not False or
+            replica['wait_for_idle_before_termination'] is not True):
+        raise PaidRetirementConflict(
+            'Paid retirement target is no longer the exact off-route replica.')
+    active_route = session.execute(
+        sqlalchemy.select(_ROUTE_LEASES.c.replica_id).where(
+            _ROUTE_LEASES.c.service_name == service_name,
+            _ROUTE_LEASES.c.service_hash == authority.service_hash,
+            _ROUTE_LEASES.c.replica_id == replica_id,
+            _ROUTE_LEASES.c.replica_record_id == record_id,
+            _ROUTE_LEASES.c.revoked_at.is_(None),
+        ).with_for_update()).scalar_one_or_none()
+    if active_route is not None:
+        raise PaidRetirementConflict(
+            'Paid retirement target regained an active route lease.')
     now = session.execute(sqlalchemy.select(
         sqlalchemy.func.clock_timestamp())).scalar_one()
+    if final_valid_until is None or final_valid_until <= now:
+        raise PaidRetirementConflict(
+            'Fresh-zero evidence expired while locking retirement state.')
     result = session.execute(
         sqlalchemy.update(_RETIREMENTS).where(
             _RETIREMENTS.c.service_name == service_name,
             _RETIREMENTS.c.replica_id == replica_id,
             _RETIREMENTS.c.replica_record_id == record_id,
+            _RETIREMENTS.c.service_hash == authority.service_hash,
             _RETIREMENTS.c.demand_source_epoch == authority.demand_source_epoch,
-            _RETIREMENTS.c.demand_feed_generation ==
-            authority.demand_feed_generation,
-            _RETIREMENTS.c.capacity_plan_generation ==
-            authority.capacity_plan_generation,
-            _RETIREMENTS.c.capacity_plan_sha256 ==
-            authority.capacity_plan_sha256,
-            _RETIREMENTS.c.route_generation == authority.route_generation,
             _RETIREMENTS.c.state == PaidRetirementState.ACTIVE.value,
-        ).values(state=PaidRetirementState.COMMITTED.value,
-                 committed_at=now,
-                 cancelled_at=None,
-                 updated_at=now))
+        ).values(
+            state=PaidRetirementState.COMMITTED.value,
+            demand_feed_generation=(current_authority.demand_feed_generation),
+            capacity_plan_generation=(
+                current_authority.capacity_plan_generation),
+            capacity_plan_sha256=current_authority.capacity_plan_sha256,
+            route_generation=current_authority.route_generation,
+            committed_at=now,
+            cancelled_at=None,
+            updated_at=now))
     return result.rowcount == 1
 
 

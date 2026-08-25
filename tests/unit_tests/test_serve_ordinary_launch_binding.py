@@ -231,6 +231,31 @@ def test_replacement_planner_authorization_is_exact_and_canonical() -> None:
         'target_capacity': 8,
         'target_capacity_by_accelerator': [['A100', 4], ['L4', 4]],
     }
+    assert binding.decode_replacement_predecessor_authorization(
+        authorization,
+        binding.NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT,
+        expected_authority=authority) == (
+            binding.ReplacementPredecessorIdentity(
+                replica_id=9,
+                replica_record_id=str(predecessor),
+                service_version=2))
+    malformed_authorizations = []
+    for field in ('authorization_version', 'observation'):
+        malformed = copy.deepcopy(authorization)
+        malformed.pop(field)
+        malformed_authorizations.append(malformed)
+    malformed = copy.deepcopy(authorization)
+    malformed['observation']['accelerator_shapes'] = [['L4', 1], ['A100', 8]]
+    malformed_authorizations.append(malformed)
+    malformed = copy.deepcopy(authorization)
+    malformed['service_hash'] = 'stale-hash'
+    malformed_authorizations.append(malformed)
+    for malformed in malformed_authorizations:
+        with pytest.raises(ValueError, match='malformed|canonical|stale'):
+            binding.decode_replacement_predecessor_authorization(
+                malformed,
+                binding.NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT,
+                expected_authority=authority)
     assert binding.build_replacement_planner_authorization(
         binding.NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT,
         dataclasses.replace(authority,
