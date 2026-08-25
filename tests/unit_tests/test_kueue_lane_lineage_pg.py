@@ -431,7 +431,8 @@ def _install_materialized_graph(
     info.reserved_fill_reclaim_policy_revision = 'reclaim-v1'
     info.reserved_fill_reclaim_provider_inventory_sha256 = 'c' * 64
     info.reserved_fill_worker_projection_sha256 = _PROJECTION
-    info.reserved_fill_observation_generation = 1
+    info.reserved_fill_observation_generation = int(
+        intent_row['observation_generation'])
     info.reserved_fill_observation_sequence = int(
         intent_row['observation_sequence'])
     info.reserved_fill_intent_idempotency_key = intent_key
@@ -537,12 +538,21 @@ def _install_pre_effect_terminal_reserved_fill_graph(
     admission_state: kueue_lane_lineage.KueueAdmissionState = (
         kueue_lane_lineage.KueueAdmissionState.INTENT_PENDING),
     cancel_before_terminal: bool = False,
+    cancel_after_terminal: bool = False,
+    cancel_reason: str = 'replica-teardown',
+    terminal_cause: str = 'dispatcher_submit_failed',
+    initialize_protocol: bool = True,
+    install_observation: bool | None = None,
+    observation_generation: int = 1,
 ) -> tuple[uuid.UUID, uuid.UUID, str]:
     """Install the exact provider-free projection retained by row 465."""
+    if cancel_before_terminal and cancel_after_terminal:
+        raise ValueError('Fixture cancellation timing must be unique.')
     identity = _identity()
     _insert_intent(engine,
                    intent_key,
                    ordinal=replica_id - 1,
+                   observation_generation=observation_generation,
                    observation_sequence=replica_id - 1,
                    ordinary_zero_cost_admission_sequence=replica_id - 1)
     with engine.begin() as connection:
@@ -554,10 +564,13 @@ def _install_pre_effect_terminal_reserved_fill_graph(
                                              intent_key,
                                              replica_id=replica_id,
                                              provider_generation=replica_id + 8)
-    _install_canonical_cleanup_profile_authority(engine,
-                                                 intent_key=intent_key,
-                                                 replica_id=replica_id,
-                                                 association_id=association_id)
+    _install_canonical_cleanup_profile_authority(
+        engine,
+        intent_key=intent_key,
+        replica_id=replica_id,
+        association_id=association_id,
+        initialize_protocol=(initialize_protocol),
+        install_observation=(install_observation))
     if admission_state is kueue_lane_lineage.KueueAdmissionState.POD_WAITING:
         receipt = _receipt(admission_state,
                            intent_key,
@@ -591,11 +604,11 @@ def _install_pre_effect_terminal_reserved_fill_graph(
             association)
         if cancel_before_terminal:
             ordinary_launch_binding.request_cancel_in_connection(
-                connection, context, 'replica-teardown')
+                connection, context, cancel_reason)
         now = _postgres_now(connection)
         evidence = ordinary_launch_binding.TerminalEvidence(
             status=ordinary_launch_binding.TerminalStatus.FAILED,
-            cause='dispatcher_submit_failed',
+            cause=terminal_cause,
             execution_generation=1,
             quiescence_required=True,
             quiesced_generation=1,
@@ -604,6 +617,9 @@ def _install_pre_effect_terminal_reserved_fill_graph(
             connection, context,
             evidence) is (ordinary_launch_binding.StartupClassification.
                           PRE_EFFECT_TERMINALIZE)
+        if cancel_after_terminal:
+            ordinary_launch_binding.request_cancel_in_connection(
+                connection, context, cancel_reason)
         assert ordinary_launch_binding.project_in_connection(
             connection, context, pre_effect_terminal=True, service_job_id=None)
         association = connection.execute(
@@ -623,7 +639,7 @@ def _install_pre_effect_terminal_reserved_fill_graph(
                 payload_json={},
                 execution_class='normal',
                 status='FAILED',
-                terminal_cause='dispatcher_submit_failed',
+                terminal_cause=terminal_cause,
                 created_at=now,
                 schedule_type='short',
                 user_id='test-user',
@@ -934,8 +950,8 @@ def _install_retirable_materialized_graph(
                 kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED):
             raise ValueError('Unsupported fixture admission state.')
         policy_admitted = (
-            admission_state is
-            kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED)
+            admission_state
+            is kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED)
         receipt = _receipt(
             admission_state,
             intent_key,
@@ -1611,6 +1627,30 @@ def _mark_service_shutting_down(engine: sqlalchemy.engine.Engine) -> None:
         ordinary_launch_binding.ServiceTeardownDisposition.MARKED_BOUND)
 
 
+def _mark_replica_failed_cleanup(
+    engine: sqlalchemy.engine.Engine,
+    replica_id: int,
+) -> None:
+    """Project the terminal unmaterialized state retained by rows 49/50."""
+    replicas = serve_state_schema.replicas_table
+    with engine.begin() as connection:
+        row = connection.execute(
+            sqlalchemy.select(replicas).where(
+                replicas.c.service_name == _SERVICE,
+                replicas.c.replica_id == replica_id)).mappings().one()
+        info = serve_state.decode_replica_state_for_authority(
+            row['replica_state_version'], row['replica_state'])
+        info.status_property.sky_launch_status = common_utils.ProcessStatus.FAILED
+        info.status_property.sky_down_status = None
+        info.status_property.service_ready_now = False
+        values = serve_state._replica_row_values(  # pylint: disable=protected-access
+            _SERVICE, replica_id, info)
+        connection.execute(
+            sqlalchemy.update(replicas).where(
+                replicas.c.service_name == _SERVICE,
+                replicas.c.replica_id == replica_id).values(**values))
+
+
 def _claim_restricted_teardown_owner(
 ) -> ordinary_launch_binding.ControllerBindingAuthority:
     authority = ordinary_launch_binding.claim_controller_incarnation(
@@ -1870,6 +1910,509 @@ def test_live_pre_effect_fill_retirement_rejects_cancel_or_pod_authority(
 
     assert _admissionless_graph_snapshot(admission_database,
                                          association_id) == before
+
+
+@pytest.mark.parametrize('service_status', ('SHUTTING_DOWN', 'FAILED_CLEANUP'))
+def test_whole_service_retires_cancelled_pre_effect_fill_without_provider_io(
+        admission_database, monkeypatch, service_status) -> None:
+    """Rows 49/50 retire from no-effect proof, never fabricated absence."""
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, request_id = (
+        _install_pre_effect_terminal_reserved_fill_graph(
+            admission_database,
+            repository,
+            intent_key=key,
+            cancel_after_terminal=True,
+            cancel_reason='service-teardown',
+            terminal_cause='handler_failed'))
+    _mark_replica_failed_cleanup(admission_database, 1)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+    if service_status == 'FAILED_CLEANUP':
+        with admission_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    _SERVICE).values(status=service_status))
+
+    provider_phase = mock.Mock(
+        side_effect=AssertionError('pre-effect proof entered provider phase'))
+    pod_probe = mock.Mock(
+        side_effect=AssertionError('pre-effect proof read a Pod'))
+    cluster_probe = mock.Mock(
+        side_effect=AssertionError('pre-effect proof read a cluster'))
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        provider_phase)
+    monkeypatch.setattr(kubernetes_adaptor, 'core_api', pod_probe)
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        cluster_probe)
+
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with admission_database.connect() as connection:
+        association_before = dict(
+            connection.execute(
+                sqlalchemy.select(associations).where(
+                    associations.c.association_id ==
+                    association_id)).mappings().one())
+        request_before = dict(
+            connection.execute(
+                sqlalchemy.select(request_postgres_schema.REQUESTS).where(
+                    request_postgres_schema.REQUESTS.c.request_id ==
+                    request_id)).mappings().one())
+    graph_before = _admissionless_graph_snapshot(admission_database,
+                                                 association_id)
+    with admission_database.connect() as connection:
+        decision = (
+            repository.
+            load_admissionless_physical_absence_probe_target_in_connection(
+                connection,
+                service_name=_SERVICE,
+                replica_id=1,
+                replica_record_id=record_id))
+    assert decision.state is (
+        kueue_lane_lineage.PhysicalAbsenceLoadState.ALREADY_PROVEN)
+    assert kueue_lane_observer.project_exact_pod_absence_after_teardown(
+        _SERVICE, 1, record_id)
+    assert kueue_lane_observer.project_exact_pod_absence_after_teardown(
+        _SERVICE, 1, record_id)
+    provider_phase.assert_not_called()
+    pod_probe.assert_not_called()
+    cluster_probe.assert_not_called()
+    assert _admissionless_graph_snapshot(admission_database,
+                                         association_id) == graph_before
+    with admission_database.connect() as connection:
+        association_after_observation = dict(
+            connection.execute(
+                sqlalchemy.select(associations).where(
+                    associations.c.association_id ==
+                    association_id)).mappings().one())
+        request_after_observation = dict(
+            connection.execute(
+                sqlalchemy.select(request_postgres_schema.REQUESTS).where(
+                    request_postgres_schema.REQUESTS.c.request_id ==
+                    request_id)).mappings().one())
+    assert association_after_observation == association_before
+    assert request_after_observation == request_before
+
+    if service_status == 'FAILED_CLEANUP':
+        # The supported purge retry re-enters SHUTTING_DOWN before its final
+        # compare-and-delete transaction.  The read-only no-effect decision
+        # above is deliberately valid in both terminal service states.
+        with admission_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name ==
+                    _SERVICE).values(status='SHUTTING_DOWN'))
+    assert serve_state.remove_service_completely(
+        _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+    _assert_retired_graph(admission_database,
+                          intent_keys=(key,),
+                          replica_ids=(1,),
+                          association_ids=(association_id,))
+    with admission_database.connect() as connection:
+        association_after = dict(
+            connection.execute(
+                sqlalchemy.select(associations).where(
+                    associations.c.association_id ==
+                    association_id)).mappings().one())
+        request_after = dict(
+            connection.execute(
+                sqlalchemy.select(request_postgres_schema.REQUESTS).where(
+                    request_postgres_schema.REQUESTS.c.request_id ==
+                    request_id)).mappings().one())
+        service_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.services_table)).scalar_one()
+    assert association_after == association_before
+    assert association_after['provider_evidence'] == 'NOT_QUERIED'
+    assert request_after == request_before
+    assert service_count == 0
+
+
+def test_whole_service_retires_cancelled_pre_effect_batch_atomically(
+        admission_database, monkeypatch) -> None:
+    """The exact two-row production shape commits in one delete boundary."""
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    first_key = _canonical_intent_key(observation_sequence=0,
+                                      ordinary_zero_cost_admission_sequence=0)
+    second_key = _canonical_intent_key(ordinal=1,
+                                       observation_generation=2,
+                                       observation_sequence=1,
+                                       ordinary_zero_cost_admission_sequence=1)
+    first_record, first_association, first_request = (
+        _install_pre_effect_terminal_reserved_fill_graph(
+            admission_database,
+            repository,
+            intent_key=first_key,
+            replica_id=1,
+            cancel_after_terminal=True,
+            cancel_reason='service-teardown',
+            terminal_cause='handler_failed'))
+    second_record, second_association, second_request = (
+        _install_pre_effect_terminal_reserved_fill_graph(
+            admission_database,
+            repository,
+            intent_key=second_key,
+            replica_id=2,
+            cancel_after_terminal=True,
+            cancel_reason='service-teardown',
+            terminal_cause='handler_failed',
+            initialize_protocol=False,
+            install_observation=True,
+            observation_generation=2))
+    _mark_replica_failed_cleanup(admission_database, 1)
+    _mark_replica_failed_cleanup(admission_database, 2)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+    provider_phase = mock.Mock(
+        side_effect=AssertionError('pre-effect batch entered provider phase'))
+    pod_probe = mock.Mock(
+        side_effect=AssertionError('pre-effect batch read a Pod'))
+    cluster_probe = mock.Mock(
+        side_effect=AssertionError('pre-effect batch read a cluster'))
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        provider_phase)
+    monkeypatch.setattr(kubernetes_adaptor, 'core_api', pod_probe)
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        cluster_probe)
+
+    assert serve_state.remove_service_completely(
+        _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+    _assert_retired_graph(admission_database,
+                          intent_keys=(first_key, second_key),
+                          replica_ids=(1, 2),
+                          association_ids=(first_association,
+                                           second_association))
+    provider_phase.assert_not_called()
+    pod_probe.assert_not_called()
+    cluster_probe.assert_not_called()
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    requests = request_postgres_schema.REQUESTS
+    with admission_database.connect() as connection:
+        retained_associations = connection.execute(
+            sqlalchemy.select(associations.c.association_id,
+                              associations.c.provider_evidence).where(
+                                  associations.c.association_id.in_((
+                                      first_association,
+                                      second_association,
+                                  )))).mappings().all()
+        retained_requests = connection.execute(
+            sqlalchemy.select(requests.c.request_id).where(
+                requests.c.request_id.in_(
+                    (first_request, second_request)))).scalars().all()
+    assert {
+        row['association_id']: row['provider_evidence']
+        for row in retained_associations
+    } == {
+        first_association: 'NOT_QUERIED',
+        second_association: 'NOT_QUERIED',
+    }
+    assert set(retained_requests) == {first_request, second_request}
+    assert not serve_state.remove_service_completely(
+        _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+
+
+def test_whole_service_retires_mixed_pre_effect_and_provider_absent_batch(
+        admission_database, monkeypatch) -> None:
+    """Mutually exclusive no-effect and observed-absence proofs may coexist."""
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    pre_effect_key = _canonical_intent_key(
+        observation_sequence=0, ordinary_zero_cost_admission_sequence=0)
+    pre_effect_record, pre_effect_association, pre_effect_request = (
+        _install_pre_effect_terminal_reserved_fill_graph(
+            admission_database,
+            repository,
+            intent_key=pre_effect_key,
+            replica_id=1,
+            cancel_after_terminal=True,
+            cancel_reason='service-teardown',
+            terminal_cause='handler_failed'))
+    (provider_absent_key, provider_absent_record, provider_absent_association,
+     provider_absent_request) = _install_generation_fenced_pre_job_graph(
+         admission_database,
+         admission_state=(
+             kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED),
+         replica_id=2,
+         initialize_protocol=False)
+    _mark_replica_failed_cleanup(admission_database, 1)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+    provider_phase = mock.Mock(
+        side_effect=AssertionError('mixed clean batch entered provider phase'))
+    pod_probe = mock.Mock(
+        side_effect=AssertionError('mixed clean batch read a Pod'))
+    cluster_probe = mock.Mock(
+        side_effect=AssertionError('mixed clean batch read a cluster'))
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        provider_phase)
+    monkeypatch.setattr(kubernetes_adaptor, 'core_api', pod_probe)
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        cluster_probe)
+
+    assert serve_state.remove_service_completely(
+        _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+    _assert_retired_graph(admission_database,
+                          intent_keys=(pre_effect_key, provider_absent_key),
+                          replica_ids=(1, 2),
+                          association_ids=(pre_effect_association,
+                                           provider_absent_association))
+    provider_phase.assert_not_called()
+    pod_probe.assert_not_called()
+    cluster_probe.assert_not_called()
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    requests = request_postgres_schema.REQUESTS
+    with admission_database.connect() as connection:
+        retained_associations = connection.execute(
+            sqlalchemy.select(associations.c.association_id,
+                              associations.c.replica_record_id,
+                              associations.c.provider_evidence).where(
+                                  associations.c.association_id.in_((
+                                      pre_effect_association,
+                                      provider_absent_association,
+                                  )))).mappings().all()
+        retained_requests = set(
+            connection.execute(
+                sqlalchemy.select(requests.c.request_id).where(
+                    requests.c.request_id.in_((
+                        pre_effect_request,
+                        provider_absent_request,
+                    )))).scalars().all())
+    evidence = {
+        row['association_id']: row['provider_evidence']
+        for row in retained_associations
+    }
+    assert evidence == {
+        pre_effect_association: 'NOT_QUERIED',
+        provider_absent_association: 'ABSENT',
+    }
+    assert {
+        row['association_id']: row['replica_record_id']
+        for row in retained_associations
+    } == {
+        pre_effect_association: pre_effect_record,
+        provider_absent_association: provider_absent_record,
+    }
+    assert retained_requests == {pre_effect_request, provider_absent_request}
+
+
+@pytest.mark.parametrize('invalid_authority', (
+    'terminal-request-mismatch',
+    'quiescence-mismatch',
+    'malformed-cancellation',
+    'retention-pin',
+    'paid-claim',
+    'provider-absence',
+))
+def test_whole_service_pre_effect_batch_rolls_back_on_one_invalid_authority(
+        admission_database, monkeypatch, invalid_authority) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    first_key = _canonical_intent_key(observation_sequence=0,
+                                      ordinary_zero_cost_admission_sequence=0)
+    second_key = _canonical_intent_key(ordinal=1,
+                                       observation_generation=2,
+                                       observation_sequence=1,
+                                       ordinary_zero_cost_admission_sequence=1)
+    first_record, first_association, _ = (
+        _install_pre_effect_terminal_reserved_fill_graph(
+            admission_database,
+            repository,
+            intent_key=first_key,
+            replica_id=1,
+            cancel_after_terminal=True,
+            cancel_reason='service-teardown',
+            terminal_cause='handler_failed'))
+    second_record, second_association, second_request = (
+        _install_pre_effect_terminal_reserved_fill_graph(
+            admission_database,
+            repository,
+            intent_key=second_key,
+            replica_id=2,
+            cancel_after_terminal=True,
+            cancel_reason='service-teardown',
+            terminal_cause='handler_failed',
+            initialize_protocol=False,
+            install_observation=True,
+            observation_generation=2))
+    _mark_replica_failed_cleanup(admission_database, 1)
+    _mark_replica_failed_cleanup(admission_database, 2)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+    requests = request_postgres_schema.REQUESTS
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    if invalid_authority == 'terminal-request-mismatch':
+        with admission_database.begin() as connection:
+            connection.exec_driver_sql(
+                f'ALTER TABLE {requests.name} DISABLE TRIGGER USER')
+            connection.execute(
+                sqlalchemy.update(requests).where(
+                    requests.c.request_id == second_request).values(
+                        terminal_cause='explicit_cancel',
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+            connection.exec_driver_sql(
+                f'ALTER TABLE {requests.name} ENABLE TRIGGER USER')
+    elif invalid_authority == 'quiescence-mismatch':
+        with admission_database.begin() as connection:
+            connection.exec_driver_sql(
+                f'ALTER TABLE {requests.name} DISABLE TRIGGER USER')
+            connection.execute(
+                sqlalchemy.update(requests).where(
+                    requests.c.request_id == second_request).values(
+                        execution_quiesced_generation=2,
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+            connection.exec_driver_sql(
+                f'ALTER TABLE {requests.name} ENABLE TRIGGER USER')
+    elif invalid_authority == 'malformed-cancellation':
+        with admission_database.begin() as connection:
+            connection.exec_driver_sql(
+                f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
+            connection.execute(
+                sqlalchemy.update(associations).where(
+                    associations.c.association_id == second_association).values(
+                        cancel_reason='x' * 129,
+                        updated_at=sqlalchemy.func.clock_timestamp()))
+            connection.exec_driver_sql(
+                f'ALTER TABLE {associations.name} ENABLE TRIGGER USER')
+    elif invalid_authority == 'retention-pin':
+        with admission_database.begin() as connection:
+            request_postgres.insert_request_retention_pin_in_transaction(
+                connection, second_request, 'reserved-fill-test.v1',
+                second_association)
+    elif invalid_authority == 'paid-claim':
+        with admission_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_pools_table).values(
+                        pool_key='forbidden-paid-pool',
+                        current_limit=1,
+                        successes_since_resize=0,
+                        updated_at=time.time()))
+            connection.execute(
+                sqlalchemy.insert(
+                    serve_state_schema.paid_capacity_claims_table).values(
+                        service_name=_SERVICE,
+                        service_hash=_SERVICE_HASH,
+                        replica_id=2,
+                        pool_key='forbidden-paid-pool',
+                        priority=1,
+                        claimed_at=time.time()))
+    elif invalid_authority == 'provider-absence':
+        _set_physical_provider_evidence(
+            admission_database, second_association,
+            ordinary_launch_binding.ProviderEvidence.ABSENT)
+    first_before = _admissionless_graph_snapshot(admission_database,
+                                                 first_association)
+    second_before = _admissionless_graph_snapshot(admission_database,
+                                                  second_association)
+
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict):
+        serve_state.remove_service_completely(
+            _SERVICE, _SERVICE_HASH, expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+
+    assert _admissionless_graph_snapshot(admission_database,
+                                         first_association) == first_before
+    assert _admissionless_graph_snapshot(admission_database,
+                                         second_association) == second_before
+    assert {
+        row['replica_state']['replica_record_id']
+        for row in first_before['replicas']
+    } == {str(first_record), str(second_record)}
+    with admission_database.connect() as connection:
+        if invalid_authority == 'retention-pin':
+            assert connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    request_postgres_schema.REQUEST_RETENTION_PINS).where(
+                        request_postgres_schema.REQUEST_RETENTION_PINS.c.
+                        request_id == second_request)).scalar_one() == 1
+        elif invalid_authority == 'paid-claim':
+            assert connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    serve_state_schema.paid_capacity_claims_table).where(
+                        serve_state_schema.paid_capacity_claims_table.c.
+                        service_name == _SERVICE,
+                        serve_state_schema.paid_capacity_claims_table.c.
+                        replica_id == 2)).scalar_one() == 1
+
+
+def test_cancelled_pre_effect_fill_remains_closed_while_service_is_live(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, _ = (
+        _install_pre_effect_terminal_reserved_fill_graph(
+            admission_database,
+            repository,
+            intent_key=key,
+            cancel_after_terminal=True,
+            cancel_reason='service-teardown',
+            terminal_cause='handler_failed'))
+    _mark_replica_failed_cleanup(admission_database, 1)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    provider_phase = mock.Mock(
+        side_effect=AssertionError('live rejection entered provider phase'))
+    pod_probe = mock.Mock(
+        side_effect=AssertionError('live rejection read a Pod'))
+    cluster_probe = mock.Mock(
+        side_effect=AssertionError('live rejection read a cluster'))
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        provider_phase)
+    monkeypatch.setattr(kubernetes_adaptor, 'core_api', pod_probe)
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        cluster_probe)
+    before = _admissionless_graph_snapshot(admission_database, association_id)
+
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict):
+        kueue_lane_observer.project_exact_pod_absence_after_teardown(
+            _SERVICE, 1, record_id)
+
+    assert _admissionless_graph_snapshot(admission_database,
+                                         association_id) == before
+    provider_phase.assert_not_called()
+    pod_probe.assert_not_called()
+    cluster_probe.assert_not_called()
+
+
+def test_whole_service_cancelled_pre_effect_rejects_retained_pod_authority(
+        admission_database, monkeypatch) -> None:
+    repository = kueue_lane_lineage.KueueAdmissionRepository(admission_database)
+    key = _canonical_intent_key(observation_sequence=0,
+                                ordinary_zero_cost_admission_sequence=0)
+    record_id, association_id, _ = (
+        _install_pre_effect_terminal_reserved_fill_graph(
+            admission_database,
+            repository,
+            intent_key=key,
+            admission_state=kueue_lane_lineage.KueueAdmissionState.POD_WAITING,
+            cancel_after_terminal=True,
+            cancel_reason='service-teardown',
+            terminal_cause='handler_failed'))
+    _mark_replica_failed_cleanup(admission_database, 1)
+    _configure_serve_state_for_kueue_retirement(monkeypatch, admission_database)
+    _mark_service_shutting_down(admission_database)
+    provider_phase = mock.Mock(
+        side_effect=AssertionError('Pod rejection entered provider phase'))
+    pod_probe = mock.Mock(side_effect=AssertionError('Pod rejection read Pod'))
+    cluster_probe = mock.Mock(
+        side_effect=AssertionError('Pod rejection read cluster'))
+    monkeypatch.setattr(kueue_lane_observer.provider_phase, 'provider_phase',
+                        provider_phase)
+    monkeypatch.setattr(kubernetes_adaptor, 'core_api', pod_probe)
+    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
+                        cluster_probe)
+    before = _admissionless_graph_snapshot(admission_database, association_id)
+
+    with pytest.raises(kueue_lane_lineage.KueueAdmissionConflict,
+                       match='pending admission'):
+        kueue_lane_observer.project_exact_pod_absence_after_teardown(
+            _SERVICE, 1, record_id)
+
+    assert _admissionless_graph_snapshot(admission_database,
+                                         association_id) == before
+    provider_phase.assert_not_called()
+    pod_probe.assert_not_called()
+    cluster_probe.assert_not_called()
 
 
 @pytest.mark.parametrize('effect_phase', (None, 'PROVIDER_IO'))
@@ -2529,8 +3072,8 @@ def test_whole_service_teardown_retires_provider_absent_admissionless_graph(
                                   associations.c.association_id ==
                                   association_id)).mappings().one()
         assert evidence['provider_evidence'] == 'ABSENT'
-        assert (evidence['provider_evidence_observed_at'] >=
-                evidence['execution_quiesced_at'])
+        assert (evidence['provider_evidence_observed_at']
+                >= evidence['execution_quiesced_at'])
         assert evidence['provider_evidence_payload'] == {
             'association_id': str(association_id),
             'cluster_name': f'{_SERVICE}-1',

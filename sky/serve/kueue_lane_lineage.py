@@ -617,22 +617,43 @@ def _is_provider_absent_pre_job_association(
                 association['provider_evidence'] == 'ABSENT')
 
 
-def _is_non_cancelled_pre_effect_terminal_association(
-        association: Mapping[str, Any]) -> bool:
-    """Accept only the closed provider-free request-rejection projection."""
+def _is_pre_effect_terminal_association(
+    association: Mapping[str, Any],
+    *,
+    allow_cancel_requested: bool,
+) -> bool:
+    """Accept one exact closed projection for an effect that never began.
+
+    A live service may recycle only a non-cancelled rejection.  Irreversible
+    whole-service teardown may also consume its own durable cancellation after
+    the copied terminal/quiescence receipt proves that no provider handler can
+    survive.  The caller owns that lifecycle distinction; this helper keeps
+    the shared no-effect shape byte-exact.
+    """
+    if type(allow_cancel_requested) is not bool:
+        raise TypeError('allow_cancel_requested must be a boolean.')
     try:
         terminal_generation = association['terminal_execution_generation']
         terminal_status = association['terminal_status']
         terminal_cause = association['terminal_cause']
+        cancel_reason = association['cancel_reason']
+        cancel_requested_at = association['cancel_requested_at']
+        if allow_cancel_requested:
+            cancel_shape_valid = bool(
+                (cancel_reason is None and cancel_requested_at is None) or
+                (isinstance(cancel_reason, str) and bool(cancel_reason) and
+                 len(cancel_reason) <= 128 and
+                 isinstance(cancel_requested_at, datetime.datetime)))
+        else:
+            cancel_shape_valid = bool(cancel_reason is None and
+                                      cancel_requested_at is None)
         return bool(
             association['resolution'] == 'PRE_EFFECT_TERMINAL' and
             association['reconciliation_outcome'] == 'PRE_EFFECT_TERMINAL' and
             association['effect_phase'] == 'NOT_STARTED' and
             association['service_job_id'] is None and
             association['result_recorded_at'] is None and
-            association['ambiguity_code'] is None and
-            association['cancel_reason'] is None and
-            association['cancel_requested_at'] is None and
+            association['ambiguity_code'] is None and cancel_shape_valid and
             terminal_status in _TERMINAL_STATUSES and
             isinstance(terminal_cause, str) and bool(terminal_cause) and
             type(terminal_generation) is int and terminal_generation >= 0 and
@@ -648,6 +669,13 @@ def _is_non_cancelled_pre_effect_terminal_association(
             association['provider_evidence_digest'] is None)
     except (KeyError, TypeError, ValueError):
         return False
+
+
+def _is_non_cancelled_pre_effect_terminal_association(
+        association: Mapping[str, Any]) -> bool:
+    """Accept only the live-service provider-free rejection projection."""
+    return _is_pre_effect_terminal_association(association,
+                                               allow_cancel_requested=False)
 
 
 def _validate_provider_absent_pre_job_admission(
@@ -1241,14 +1269,25 @@ def _validate_admissionless_retirement_rows_in_connection(
         association_id=association['association_id'],
         cluster_name=info.cluster_name)
     target.validate()
+    pre_effect_terminal = _is_pre_effect_terminal_association(
+        association, allow_cancel_requested=True)
     evidence = association['provider_evidence']
+    if pre_effect_terminal and evidence != 'NOT_QUERIED':
+        raise KueueAdmissionConflict(
+            'Pre-effect teardown must preserve exact NOT_QUERIED provider '
+            'evidence.')
     if evidence == 'NOT_QUERIED':
         if (association['provider_evidence_observed_at'] is not None or
                 association['provider_evidence_payload'] is not None or
                 association['provider_evidence_digest'] is not None):
             raise KueueAdmissionConflict(
                 'Admissionless teardown requires fresh provider absence.')
-        absence_state = PhysicalAbsenceLoadState.NEEDS_PROBE
+        # PRE_EFFECT_TERMINAL plus exact executor quiescence is stronger than
+        # a provider read: the effect boundary was never entered.  Preserve
+        # NOT_QUERIED and do not manufacture an ABSENT observation.
+        absence_state = (PhysicalAbsenceLoadState.ALREADY_PROVEN
+                         if pre_effect_terminal else
+                         PhysicalAbsenceLoadState.NEEDS_PROBE)
     elif evidence == 'ABSENT':
         expected_payload, expected_digest = (
             ordinary_launch_binding._reserved_fill_provider_evidence(  # pylint: disable=protected-access
@@ -1671,6 +1710,10 @@ class KueueAdmissionRepository:
             association['service_job_id'] > 0)
         provider_absent_pre_job = _is_provider_absent_pre_job_association(
             association)
+        whole_service_pre_effect_terminal = bool(
+            service['status'] in ('SHUTTING_DOWN', 'FAILED_CLEANUP') and
+            _is_pre_effect_terminal_association(association,
+                                                allow_cancel_requested=True))
         if (allow_generation_fenced_normal_failure and
                 not provider_absent_pre_job):
             # A materialized service job retains the normal exact-Pod path.
@@ -1678,10 +1721,12 @@ class KueueAdmissionRepository:
         if (allow_whole_service_retained_pod_receipt and materialized_launch):
             # A materialized service job retains the normal exact-Pod path.
             return None
-        if not materialized_launch and not provider_absent_pre_job:
+        if (not materialized_launch and not provider_absent_pre_job and
+                not whole_service_pre_effect_terminal):
             raise KueueAdmissionConflict(
                 'Admissionless teardown is neither a materialized service '
-                'launch nor a provider-absent pre-job launch.')
+                'launch nor a provider-absent pre-job launch nor an exact '
+                'whole-service pre-effect terminal launch.')
         if provider_absent_pre_job:
             try:
                 association, _ = (
@@ -1714,6 +1759,12 @@ class KueueAdmissionRepository:
             raise KueueAdmissionConflict(
                 'Admissionless teardown found multiple request receipts.')
         request = request_rows[0] if request_rows else None
+        if (whole_service_pre_effect_terminal and
+            (request is None or
+             not _terminal_request_matches_association(request, association))):
+            raise KueueAdmissionConflict(
+                'Whole-service pre-effect teardown lost its exact terminal '
+                'request receipt.')
         queue = request_postgres_schema.QUEUE
         queue_rows = connection.execute(
             _locked(
@@ -1740,11 +1791,19 @@ class KueueAdmissionRepository:
                                 _ADMISSIONS.c.intent_idempotency_key))
         ).mappings().all()
         if admission_rows:
-            if len(admission_rows) != 1 or not provider_absent_pre_job:
+            if (len(admission_rows) != 1 or
+                    not (provider_absent_pre_job or
+                         whole_service_pre_effect_terminal)):
                 raise KueueAdmissionConflict(
                     'Admissionless teardown found materialized admission '
                     'authority.')
+            if (whole_service_pre_effect_terminal and admission_rows[0]['state']
+                    != KueueAdmissionState.INTENT_PENDING.value):
+                raise KueueAdmissionConflict(
+                    'Whole-service pre-effect teardown requires an exact '
+                    'pending admission with no Pod authority.')
             if (allow_whole_service_retained_pod_receipt and
+                    not whole_service_pre_effect_terminal and
                     admission_rows[0]['state'] not in {
                         KueueAdmissionState.POD_WAITING.value,
                         KueueAdmissionState.POLICY_ADMITTED.value,
@@ -1753,6 +1812,8 @@ class KueueAdmissionRepository:
                     'Whole-service pre-job retirement lost its exact retained '
                     'Pod receipt.')
             admission_mode = (
+                _ProviderAbsentPreJobAdmissionMode.PENDING_ONLY
+                if whole_service_pre_effect_terminal else
                 _ProviderAbsentPreJobAdmissionMode.PENDING_OR_RETAINED_POD if
                 (allow_whole_service_retained_pod_receipt or
                  allow_generation_fenced_normal_failure) else
@@ -1767,7 +1828,8 @@ class KueueAdmissionRepository:
                 replica_record_id=replica_record_id,
                 mode=admission_mode)
         elif (allow_generation_fenced_normal_failure or
-              allow_whole_service_retained_pod_receipt):
+              allow_whole_service_retained_pod_receipt or
+              whole_service_pre_effect_terminal):
             raise KueueAdmissionConflict(
                 'Pre-job retirement lost its exact Kueue admission.')
         if claim_rows or queue_rows or pin_rows:
@@ -1794,6 +1856,13 @@ class KueueAdmissionRepository:
                 'Admissionless pre-job teardown requires canonical provider '
                 'absence.')
         if provider_absent_pre_job:
+            _validate_provider_absent_pre_job_replica(graph.replica_info)
+        if whole_service_pre_effect_terminal:
+            if (graph.provider_absence_state
+                    is not PhysicalAbsenceLoadState.ALREADY_PROVEN):
+                raise KueueAdmissionConflict(
+                    'Whole-service pre-effect teardown lost its no-effect '
+                    'authority.')
             _validate_provider_absent_pre_job_replica(graph.replica_info)
         return graph
 
@@ -3125,12 +3194,14 @@ class KueueAdmissionRepository:
                 'Kueue retirement requires one exact launch association.')
 
         # A successful admitted launch uses an exact Pod 404 receipt.  An
-        # interrupted pre-materialization launch retains the older canonical
-        # physical-cluster absence envelope.  These are the only two accepted
-        # provider-clean retirement shapes.
+        # interrupted post-boundary launch retains the canonical physical-
+        # cluster absence envelope.  A terminal NOT_STARTED launch needs no
+        # provider observation at all: exact quiescence proves the effect
+        # boundary was never entered.  These are the closed retirement shapes.
         checked_associations: dict[int, Mapping[str, Any]] = {}
         normal_teardown_ids: set[int] = set()
         provider_free_pre_job_ids: set[int] = set()
+        provider_free_pre_effect_ids: set[int] = set()
         for replica_id in sorted(identity_by_replica):
             association = associations_by_replica[replica_id][0]
             if (association['resolution'] == 'PROJECTED' and
@@ -3140,6 +3211,13 @@ class KueueAdmissionRepository:
                     association['service_job_id'] > 0):
                 checked_associations[replica_id] = association
                 normal_teardown_ids.add(replica_id)
+                continue
+            active_service = service['status'] not in ('SHUTTING_DOWN',
+                                                       'FAILED_CLEANUP')
+            if (not active_service and _is_pre_effect_terminal_association(
+                    association, allow_cancel_requested=True)):
+                checked_associations[replica_id] = association
+                provider_free_pre_effect_ids.add(replica_id)
                 continue
             try:
                 checked, checked_info = (
@@ -3155,8 +3233,6 @@ class KueueAdmissionRepository:
                     checked_info):
                 checked_associations[replica_id] = checked
                 continue
-            active_service = service['status'] not in ('SHUTTING_DOWN',
-                                                       'FAILED_CLEANUP')
             if (_is_provider_absent_pre_job_association(checked) and
                 (not active_service or allow_active_provider_free_pre_job)):
                 checked_associations[replica_id] = checked
@@ -3277,8 +3353,15 @@ class KueueAdmissionRepository:
                     'Kueue retirement graph is not exact and provider-clean.')
 
             provider_free_pre_job = replica_id in provider_free_pre_job_ids
+            provider_free_pre_effect = (replica_id
+                                        in provider_free_pre_effect_ids)
             provider_free_graph: _AdmissionlessTeardownGraph | None = None
-            if provider_free_pre_job:
+            if provider_free_pre_job or provider_free_pre_effect:
+                if (provider_free_pre_effect and
+                    (not request_is_exact or admission is None)):
+                    raise KueueAdmissionConflict(
+                        'Whole-service pre-effect retirement requires its '
+                        'exact terminal request and pending admission.')
                 active_service = service['status'] not in ('SHUTTING_DOWN',
                                                            'FAILED_CLEANUP')
                 provider_free_graph = (
@@ -3297,6 +3380,10 @@ class KueueAdmissionRepository:
                         allow_generation_fenced_normal_failure=active_service))
                 if (provider_free_graph.provider_absence_state
                         is not PhysicalAbsenceLoadState.ALREADY_PROVEN):
+                    if provider_free_pre_effect:
+                        raise KueueAdmissionConflict(
+                            'Whole-service pre-effect retirement lost its '
+                            'no-effect authority.')
                     raise KueueAdmissionConflict(
                         'Provider-free pre-job retirement requires canonical '
                         'provider absence.')
@@ -3351,7 +3438,17 @@ class KueueAdmissionRepository:
             if replica_id in admissionless_replica_ids:
                 raise KueueAdmissionConflict(
                     'Kueue admission appeared after retirement discovery.')
-            if provider_free_pre_job:
+            if provider_free_pre_effect:
+                _validate_provider_absent_pre_job_admission(
+                    connection,
+                    admission,
+                    intent,
+                    identity,
+                    association,
+                    replica_id=replica_id,
+                    replica_record_id=expected_records[replica_id],
+                    mode=_ProviderAbsentPreJobAdmissionMode.PENDING_ONLY)
+            elif provider_free_pre_job:
                 _validate_provider_absent_pre_job_admission(
                     connection,
                     admission,
