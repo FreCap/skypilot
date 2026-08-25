@@ -4,17 +4,19 @@ Last updated: 2026-08-25
 
 Status: **the reserved-capacity path remains production-proven against the
 unchanged scheduler-authorized denominator. The control plane is now SkyPilot
-release `1.1.1485`, Helm revision 607. PR #1716's immutable paid-provider
-handoff is deployed, and the clean Spot-only `boltz-l4-fleet-spot100`
-qualification has produced real Spot provider effects with no On-Demand
-capacity. The target-100 / 10,000-request proof is still running. It exposed a
-remaining provider-handoff progress defect: fresh load-balancer reports can
-name adjacent valid route snapshots while the route head advances during
-normal scale-out, but `1.1.1485` requires every report to name the exact latest
-head. The bounded correction below is the next source, deployment, and live
-qualification gate. The historical `boltz-l4-fleet` teardown also remains
-`SHUTTING_DOWN` with two retained ambiguous ordinary-paid replica rows; these
-must not be deleted without durable provider-absence evidence.**
+release `1.1.1487`, Helm revision 608. PR #1717's bounded committed-provider
+route handoff and PR #1718's placement-cost display correction are deployed.
+The clean Spot-only `boltz-l4-fleet-spot100` qualification has produced real
+Spot provider effects with no On-Demand capacity, but the target-100 / 10,000-
+request proof is still running. Live qualification exposed the current
+prospective-admission defect: the in-memory normalized demand uses integer
+replica-ID map keys, PostgreSQL JSONB persists them as strings, and the exact
+semantic comparison therefore rejects identical demand before any claim or
+provider effect. The source-bound canonicalization below is the next source,
+deployment, and live qualification gate. The historical `boltz-l4-fleet`
+teardown also remains `SHUTTING_DOWN` with two retained ambiguous ordinary-paid
+replica rows; these must not be deleted without durable provider-absence
+evidence.**
 
 The two Spot VMs retained by the prior `1.1.1483`/`.1541` canary are fully
 terminated at the provider. Their down requests are terminal and execution-
@@ -47,6 +49,29 @@ committed Spot launches without weakening prospective reserved-before-paid or
 global-cap admission.
 
 Qualification correction (2026-08-25; source and production proof pending):
+`normalized_demand.in_flight_by_replica_id` is a JSON-domain semantic map. Its
+keys are canonical decimal strings at the demand-state boundary, before either
+capacity-plan hashing or PostgreSQL persistence. Runtime
+`request_information.in_flight_by_replica_id` retains integer keys for the
+autoscaler and replica manager. This split is intentional: JSON object keys
+cannot remain integers, and IDs such as `42` and `116` otherwise sort
+numerically in memory but lexicographically after JSONB roundtrip. The two
+byte representations then hash differently even when every count is equal,
+causing every prospective paid admission to fail closed before a replica row,
+claim, association, request, or provider call is created.
+
+The correction changes no scaling target, capacity accounting, provider or
+region order, global paid cap, Kueue policy, infrastructure object, schema, or
+migration. The complete placement catalog remains the diagnostic surface; the
+hot selector logs only the selected location and candidate count instead of
+serializing hundreds of immutable catalog entries for every attempt. A real-
+PostgreSQL regression proves that runtime integer identity and durable string
+identity coexist and that a persisted plan validates prospectively after its
+JSONB roundtrip. Production must then prove claims advance from the cheapest
+eligible normalized-cost pool, never create On-Demand capacity, and continue
+toward the exact 100-GPU / 10,000-request gate.
+
+Earlier qualification correction (2026-08-25; deployed in `1.1.1487`):
 the fresh current-authority load-balancer reports used by the committed-claim
 provider guard are not a barrier over one route-head generation. A normal
 backend readiness change may publish route generation N+1 while one current LB
@@ -997,7 +1022,7 @@ boundaries.
 | PR #1678 duplicate-up and observer lock-order correction | Complete at `38ec24342` | Complete in Helm 572 | Complete at gate 34 | Duplicate-up, takeover, 180-second stale horizon, and +30 control-plane/HA/error checks passed; the coincident eight-card v6 readiness wave was superseded by supported provider teardown |
 | Kueue non-mutation | No source change | No rendered chart change | Not applicable | Complete: both normalized PRE and POST hashes are equal |
 | Paid residual | Complete | Complete with the local provider's cap-ten qualification envelope | Activated but idle | Source/real-PostgreSQL tests qualify commit-before-residual and drain. Idle production and the 32-GPU refill created no paid claim, waiter, or replica because reserved capacity covered the denominator. An authenticated positive bounded Spot residual and complete drain remain the sole open production behavior exercise. |
-| Immutable paid handoff and restart-safe async drain observation (#1716) | Complete at `407bade13`; no schema or migration | Complete in `1.1.1485` / Helm 607 | Active for the clean `boltz-l4-fleet-spot100` qualification | Partially proven: three real Spot provider effects committed and launched with zero On-Demand capacity. Normal route churn then exposed the adjacent-snapshot handoff defect corrected by the pending bounded follow-up; sustained target-100 demand, 10,000 terminal requests, cold-LB explicit-zero retirement, and complete provider/debit drain remain open gates. |
+| Immutable paid handoff and restart-safe async drain observation (#1716) | Complete at `407bade13`; no schema or migration | Complete in `1.1.1485` / Helm 607; the adjacent-route correction from #1717 is deployed in `1.1.1487` / Helm 608 | Active for the clean `boltz-l4-fleet-spot100` qualification | Partially proven: five real Spot provider effects committed and launched with zero On-Demand capacity, and #1717 removed the adjacent-route handoff blocker. The current open source/deployment/live gate is canonical JSON replica-ID keys in normalized demand; sustained target-100 demand, 10,000 terminal requests, cold-LB explicit-zero retirement, and complete provider/debit drain remain open gates. |
 | Protocol-v7 bootstrap and N-1 terminal-cleanup correction (#1679) | Complete at `40a0832bd` | Complete in `1.1.1449` / Helm 573 | Complete at gate 35 | Complete: lifecycle 93 purged and lifecycle 94 recreated without manual deletion |
 | Fill throughput and HA lock-starvation correction (#1680) | Complete at `b311dd277` | Complete in `1.1.1450` / Helm 575 | Complete at gate 36 | Historical East batch proof committed 16 intents together and made all 16 Ready with zero generation-36 `grant_expired` intents. The formerly pending PHX cleanup/deployment is superseded by the lifecycle-96/Helm-586 receipt. |
 | Generation-fenced pre-job cleanup (#1682) | Complete at `73c40a3fe` | Complete in `1.1.1452` / Helm 576 | Complete at gate 37 | Complete: PHX 194/194 Kueue-admitted Ready plus four topology-withheld; East 328/328 physical GPUs assigned; zero paid claims/waiters |

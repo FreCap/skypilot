@@ -1186,8 +1186,12 @@ class SpotPlacer:
         # selection falls through to the next-cheapest ACTIVE candidate.
         selected = self._min_cost_location(active_locations)
         self._consume_retry_if_benched(selected)
-        logger.info(f'Active locations: {active_locations}\n'
-                    f'Selected location: {selected}\n')
+        # Large heterogeneous catalogs routinely contain hundreds of entries.
+        # Emitting every candidate for every replica turns the hot placement
+        # path into multi-megabyte log churn; the durable placement snapshot is
+        # the complete diagnostic surface.
+        logger.info('Selected location %s from %d active candidate(s).',
+                    selected, len(active_locations))
         return selected
 
     def ranked_active_locations(

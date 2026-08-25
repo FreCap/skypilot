@@ -1284,10 +1284,21 @@ def get_autoscaling_snapshot(
         } for (priority,
                accelerators), (count, recent_count) in sorted(totals.items())]
 
+    # ``normalized_demand`` crosses a JSONB boundary before paid admission
+    # compares it with a freshly reconstructed snapshot.  JSON object keys are
+    # strings, while ``request_information`` intentionally keeps integer
+    # replica IDs for autoscaler/runtime use.  Canonicalize only the durable
+    # semantic projection here.  Otherwise IDs such as 42 and 116 sort
+    # numerically before persistence but lexicographically afterwards, making
+    # identical demand look different and permanently fencing paid launches.
+    normalized_in_flight = {
+        str(replica_id): translated_in_flight[replica_id]
+        for replica_id in sorted(translated_in_flight)
+    }
     normalized_demand = {
         'configured_accelerators': list(configured_accelerators or ()),
         'recent_request_count': len(timestamps),
-        'in_flight_by_replica_id': translated_in_flight,
+        'in_flight_by_replica_id': normalized_in_flight,
         'unknown_in_flight_replica_ids': sorted(unknown_ids),
         'queue_depth': queue_depth,
         'rejected_in_window': rejected,
