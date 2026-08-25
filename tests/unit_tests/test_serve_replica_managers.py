@@ -10756,7 +10756,7 @@ class TestLogicalCapacityPlanning:
         local_scan.assert_not_called()
         grouped_scan.assert_called_once_with()
 
-    def test_mixed_unknown_replacement_only_binds_ordinary_paid_launches(self):
+    def test_mixed_unknown_replacement_and_ordinary_share_paid_authority(self):
         mgr = _make_manager()
         mgr._ordinary_launch_binding_authority = _binding_authority(
             ordinary_launch_binding.BindingMode.BOUND, generic=True)
@@ -10771,15 +10771,18 @@ class TestLogicalCapacityPlanning:
                 unknown_replica_ids=frozenset({1}),
                 received_at=replica_managers.time.monotonic()))
         mgr._logical_target = (1, 9, 3)
-        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(
-            return_value=False)
+        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
         authority = mock.sentinel.paid_authority
         seen = []
 
         def _append_launch(_override, _used_ids, existing, _budget, **kwargs):
             is_replacement = kwargs.get('unknown_capacity_replacement', False)
-            seen.append(
-                (is_replacement, kwargs.get('paid_launch_authority')))
+            seen.append((
+                is_replacement,
+                kwargs.get('unknown_capacity_replacement_authorization')
+                is not None,
+                kwargs.get('paid_launch_authority'),
+            ))
             replica_id = len(existing) + 1
             info = replica_managers.ReplicaInfo(
                 replica_id=replica_id,
@@ -10800,15 +10803,15 @@ class TestLogicalCapacityPlanning:
              mock.patch.object(mgr,
                                '_scale_up_one_locked',
                                side_effect=_append_launch):
-            mgr.scale_up_to_logical_capacity(
-                target_capacity=3,
-                version=1,
-                reconcile_generation=9,
-                replace_unknown_replica_ids=(1,),
-                launch_budget=3,
-                paid_launch_authority=authority)
+            mgr.scale_up_to_logical_capacity(target_capacity=3,
+                                             version=1,
+                                             reconcile_generation=9,
+                                             replace_unknown_replica_ids=(1,),
+                                             launch_budget=3,
+                                             paid_launch_authority=authority)
 
-        assert seen == [(True, None), (False, authority), (False, authority)]
+        assert seen == [(True, True, authority), (False, False, authority),
+                        (False, False, authority)]
 
     def test_existing_zero_capacity_replacement_prevents_recursive_launch(self):
         mgr = _make_manager()
@@ -10831,10 +10834,27 @@ class TestLogicalCapacityPlanning:
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
         mgr._logical_target = (1, 9, 8)
+        authorization = (
+            ordinary_launch_binding.build_replacement_planner_authorization(
+                ordinary_launch_binding.NonPoolLaunchProfileKind.
+                UNKNOWN_CAPACITY_REPLACEMENT,
+                _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                                   generic=True),
+                predecessor_replica_id=1,
+                predecessor_record_id=original.replica_record_id,
+                predecessor_service_version=1,
+                observation_generation=9,
+                observation_service_version=1,
+                target_capacity=8))
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[original, replacement]), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_non_pool_launch_authorizations',
+                 return_value={(2, replacement.replica_record_id):
+                               authorization}), \
              mock.patch.object(mgr, '_scale_up_one_locked') as launch:
             mgr.scale_up_to_logical_capacity(target_capacity=8,
                                              version=1,
@@ -10842,6 +10862,69 @@ class TestLogicalCapacityPlanning:
                                              replace_unknown_replica_ids=(1,))
 
         launch.assert_not_called()
+
+    def test_durable_predecessor_binding_is_not_reused_for_new_demand(self):
+        mgr = _make_manager()
+        mgr._ordinary_launch_binding_authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND, generic=True)
+        mgr._uses_logical_replicas = True
+        original = self._ready_backend(1, 1)
+        replacement = self._ready_backend(2, 1)
+        replacement.unknown_capacity_replacement = True
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=9,
+                observed_slots_by_replica_id={
+                    1: 0,
+                    2: 1,
+                },
+                in_flight_by_replica_id={
+                    1: 0,
+                    2: 0,
+                },
+                unknown_replica_ids=frozenset({1}),
+                received_at=replica_managers.time.monotonic()))
+        mgr._logical_target = (1, 9, 2)
+        authority = mock.sentinel.paid_authority
+        authorization = (
+            ordinary_launch_binding.build_replacement_planner_authorization(
+                ordinary_launch_binding.NonPoolLaunchProfileKind.
+                UNKNOWN_CAPACITY_REPLACEMENT,
+                mgr._ordinary_launch_binding_authority,
+                predecessor_replica_id=1,
+                predecessor_record_id=original.replica_record_id,
+                predecessor_service_version=1,
+                observation_generation=8,
+                observation_service_version=1,
+                target_capacity=1))
+        seen = []
+
+        def _launch(_override, _ids, _infos, _budget, **kwargs):
+            seen.append(
+                (kwargs.get('unknown_capacity_replacement',
+                            False), kwargs.get('paid_launch_authority')))
+            return _accepted_launch_result(3)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[original, replacement]), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_non_pool_launch_authorizations',
+                 return_value={(2, replacement.replica_record_id):
+                               authorization}), \
+             mock.patch.object(mgr,
+                               '_scale_up_one_locked',
+                               side_effect=_launch):
+            mgr.scale_up_to_logical_capacity(target_capacity=2,
+                                             version=1,
+                                             reconcile_generation=9,
+                                             replace_unknown_replica_ids=(1,),
+                                             launch_budget=1,
+                                             paid_launch_authority=authority)
+
+        assert seen == [(False, authority)]
 
     def test_known_capacity_clears_replacement_incident_marker(self):
         mgr = _make_manager()
@@ -15749,7 +15832,9 @@ class TestPaidLocationLaunchBudget:
         assert not existing
         manager._persist_new_replica.assert_not_called()
 
-    def test_paid_launch_binds_exact_planner_tuple_before_persistence(self):
+    @pytest.mark.parametrize('unknown_replacement', [False, True])
+    def test_paid_launch_binds_exact_planner_tuple_before_persistence(
+            self, unknown_replacement):
         paid = make_location('us-east-1', {'L4': 4}, cloud_name='AWS')
         manager = self._manager({paid: 1.0})
         manager._next_replica_id = 7
@@ -15780,11 +15865,17 @@ class TestPaidLocationLaunchBudget:
                  paid_capacity,
                  'try_persist_claim',
                  return_value=paid_capacity.ClaimResult.ACQUIRED) as persist:
+            replacement_authorization = ({
+                'authorization_version': 1
+            } if unknown_replacement else None)
             result = manager._scale_up_one_locked(
                 {'accelerators': {
                     'L4': 4
                 }},
                 set(), [],
+                unknown_capacity_replacement=unknown_replacement,
+                unknown_capacity_replacement_authorization=(
+                    replacement_authorization),
                 paid_launch_authority=authority)
 
         assert result == _accepted_launch_result(
@@ -15797,6 +15888,10 @@ class TestPaidLocationLaunchBudget:
             'capacity_plan_accelerator': 'l4',
             'capacity_plan_units': 4,
         }
+        persisted = persist.call_args.kwargs['replica_info']
+        assert persisted.unknown_capacity_replacement is unknown_replacement
+        assert (persisted.non_pool_launch_authorization ==
+                replacement_authorization)
 
     def test_paid_plan_race_releases_selection_without_row_or_thread(self):
         paid = make_location('us-east-1', {'L4': 4}, cloud_name='AWS')

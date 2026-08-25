@@ -10242,7 +10242,43 @@ class SkyPilotReplicaManager(ReplicaManager):
             info.replica_id in snapshot.unknown_replica_ids and
             info.version == version and not info.is_terminal
         }
-        unpaired_unknown_predecessor_ids = set(unknown_predecessors)
+        active_replacement_infos = [
+            info for info in existing_replica_infos
+            if info.version == version and not info.is_terminal and
+            info.unknown_capacity_replacement is True
+        ]
+        replacement_authorizations = (
+            serve_state.get_replica_non_pool_launch_authorizations(
+                self._service_name,
+                [info.replica_id for info in active_replacement_infos]))
+        paired_unknown_predecessor_ids: set[int] = set()
+        for replacement in active_replacement_infos:
+            authorization = replacement_authorizations.get(
+                (replacement.replica_id, replacement.replica_record_id))
+            try:
+                predecessor = (
+                    ordinary_launch_binding.
+                    decode_replacement_predecessor_authorization(
+                        authorization,
+                        ordinary_launch_binding.NonPoolLaunchProfileKind.
+                        UNKNOWN_CAPACITY_REPLACEMENT,
+                        expected_authority=(
+                            self._ordinary_launch_binding_authority)))
+            except ValueError:
+                # Malformed or legacy rows cannot prove that they cover an
+                # exact predecessor. They remain committed capacity, but must
+                # not suppress a correctly attributed successor.
+                continue
+            candidate = unknown_predecessors.get(predecessor.replica_id)
+            if (candidate is None or candidate.replica_record_id
+                    != predecessor.replica_record_id or
+                    candidate.version != predecessor.service_version or
+                    replacement.planned_capacity != candidate.planned_capacity
+                    or _replica_card(replacement) != _replica_card(candidate)):
+                continue
+            paired_unknown_predecessor_ids.add(candidate.replica_id)
+        unpaired_unknown_predecessor_ids = (set(unknown_predecessors) -
+                                            paired_unknown_predecessor_ids)
 
         def _committed_capacity(
                 capacity_snapshot: LogicalReconcileSnapshot) -> int:
@@ -10447,11 +10483,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 target_capacity_by_accelerator=(
                                     target_capacity_by_accelerator),
                                 accelerator_shapes=accelerator_shapes))
-            elif paid_launch_authority is not None:
-                # A mixed wave may first replace unknown capacity and then
-                # continue into ordinary shortfall. Replacements have their
-                # own bounded authorization; only ordinary rows debit the
-                # ordered demand plan.
+            if paid_launch_authority is not None:
+                # Replacement attribution proves which uncertain backend may
+                # be overlapped; it grants no purchase authority. Every paid
+                # row in a mixed wave debits the same immutable demand plan so
+                # provider admission and the next row see one exact inventory.
                 launch_kwargs['paid_launch_authority'] = paid_launch_authority
             launch_result = self._scale_up_one_locked(
                 resources_override,

@@ -2135,6 +2135,101 @@ def build_replacement_planner_authorization(
     return result
 
 
+@dataclasses.dataclass(frozen=True)
+class ReplacementPredecessorIdentity:
+    """Immutable identity cited by one replacement authorization."""
+
+    replica_id: int
+    replica_record_id: str
+    service_version: int
+
+
+def _decode_unknown_capacity_observation(
+    raw: Any,) -> tuple[dict[str, Any], int, int, int]:
+    expected_keys = {
+        'accelerator_shapes', 'classification', 'reconcile_generation',
+        'service_version', 'target_capacity', 'target_capacity_by_accelerator'
+    }
+    if (not isinstance(raw, dict) or set(raw) != expected_keys or
+            raw.get('classification') != 'UNKNOWN'):
+        raise ValueError('Unknown-capacity observation authority is malformed.')
+    generation = _positive_int(raw.get('reconcile_generation'),
+                               'reconcile_generation')
+    service_version = _positive_int(raw.get('service_version'),
+                                    'observation_service_version')
+    target_capacity = _nonnegative_int(raw.get('target_capacity'),
+                                       'target_capacity')
+    for field, positive in (('target_capacity_by_accelerator', False),
+                            ('accelerator_shapes', True)):
+        state = raw.get(field)
+        if not isinstance(state, list):
+            raise ValueError(
+                'Unknown-capacity accelerator authority is malformed.')
+        normalized_cards = []
+        for item in state:
+            if (not isinstance(item, list) or len(item) != 2 or
+                    not isinstance(item[0], str) or not item[0] or
+                    isinstance(item[1], bool) or not isinstance(item[1], int) or
+                    item[1] < int(positive)):
+                raise ValueError(
+                    'Unknown-capacity accelerator authority is malformed.')
+            normalized_cards.append(item[0].casefold())
+        if (normalized_cards != sorted(normalized_cards) or
+                len(normalized_cards) != len(set(normalized_cards))):
+            raise ValueError(
+                'Unknown-capacity accelerator authority is not canonical.')
+    return raw, generation, service_version, target_capacity
+
+
+def decode_replacement_predecessor_authorization(
+    raw: Any,
+    kind: NonPoolLaunchProfileKind,
+    *,
+    expected_authority: ControllerBindingAuthority | None = None,
+) -> ReplacementPredecessorIdentity:
+    """Decode one complete immutable authorization and its predecessor."""
+    if kind not in (NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT,
+                    NonPoolLaunchProfileKind.COST_REBALANCE):
+        raise ValueError('Only replacement profiles cite a predecessor.')
+    expected_keys = {
+        'authorization_version', 'predecessor', 'profile_kind',
+        'service_binding_epoch', 'service_hash', 'service_lifecycle_epoch'
+    }
+    if kind == NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT:
+        expected_keys.add('observation')
+    if (not isinstance(raw, dict) or set(raw) != expected_keys or
+            raw.get('authorization_version') != 1 or
+            raw.get('profile_kind') != kind.value):
+        raise ValueError('Replacement planner authorization is malformed.')
+    binding_epoch = _positive_int(raw.get('service_binding_epoch'),
+                                  'service_binding_epoch')
+    service_hash = _nonempty(raw.get('service_hash'), 'service_hash')
+    lifecycle_epoch = _positive_int(raw.get('service_lifecycle_epoch'),
+                                    'service_lifecycle_epoch')
+    if expected_authority is not None:
+        if not isinstance(expected_authority, ControllerBindingAuthority):
+            raise ValueError('Expected binding authority is malformed.')
+        if (binding_epoch != expected_authority.binding_epoch or
+                service_hash != expected_authority.service_hash or
+                lifecycle_epoch != expected_authority.service_lifecycle_epoch):
+            raise ValueError('Replacement planner authorization is stale.')
+    if kind == NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT:
+        _decode_unknown_capacity_observation(raw.get('observation'))
+    predecessor = raw.get('predecessor')
+    if not isinstance(predecessor, dict) or set(predecessor) != {
+            'replica_id', 'replica_record_id', 'service_version'
+    }:
+        raise ValueError('Replacement predecessor authority is malformed.')
+    return ReplacementPredecessorIdentity(
+        replica_id=_positive_int(predecessor.get('replica_id'),
+                                 'predecessor_replica_id'),
+        replica_record_id=str(
+            _canonical_uuid(predecessor.get('replica_record_id'),
+                            'predecessor_record_id')),
+        service_version=_positive_int(predecessor.get('service_version'),
+                                      'predecessor_service_version'))
+
+
 def _replacement_planner_authorization(
     connection: sqlalchemy.engine.Connection,
     service: Mapping[str, Any],
@@ -2162,20 +2257,8 @@ def _replacement_planner_authorization(
             != service.get('lifecycle_epoch')):
         raise OrdinaryLaunchBindingConflict(
             'Replacement planner authorization is malformed or stale.')
-    predecessor = raw.get('predecessor')
-    if not isinstance(predecessor, dict) or set(predecessor) != {
-            'replica_id', 'replica_record_id', 'service_version'
-    }:
-        raise OrdinaryLaunchBindingConflict(
-            'Replacement predecessor authority is malformed.')
     try:
-        predecessor_id = _positive_int(predecessor.get('replica_id'),
-                                       'predecessor_replica_id')
-        predecessor_record_id = str(
-            _canonical_uuid(predecessor.get('replica_record_id'),
-                            'predecessor_record_id'))
-        predecessor_version = _positive_int(predecessor.get('service_version'),
-                                            'predecessor_service_version')
+        predecessor = decode_replacement_predecessor_authorization(raw, kind)
     except ValueError as error:
         raise OrdinaryLaunchBindingConflict(
             'Replacement predecessor authority is malformed.') from error
@@ -2183,13 +2266,13 @@ def _replacement_planner_authorization(
         sqlalchemy.select(serve_state_schema.replicas_table).where(
             serve_state_schema.replicas_table.c.service_name == service['name'],
             serve_state_schema.replicas_table.c.replica_id ==
-            predecessor_id)).mappings().one_or_none()
+            predecessor.replica_id)).mappings().one_or_none()
     if predecessor_row is None:
         raise OrdinaryLaunchBindingConflict(
             'Replacement predecessor no longer exists.')
     predecessor_info = _locked_replica_info(predecessor_row)
-    if (predecessor_info.replica_record_id != predecessor_record_id or
-            predecessor_info.version != predecessor_version or
+    if (predecessor_info.replica_record_id != predecessor.replica_record_id or
+            predecessor_info.version != predecessor.service_version or
             predecessor_info.version != info.version or
             predecessor_info.is_terminal):
         raise OrdinaryLaunchBindingConflict(
@@ -2643,23 +2726,10 @@ def _unknown_capacity_replacement_payload(
     authorization, predecessor_info = _replacement_planner_authorization(
         connection, service, replica, info,
         NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT)
-    observation = authorization.get('observation')
-    expected_observation_keys = {
-        'accelerator_shapes', 'classification', 'reconcile_generation',
-        'service_version', 'target_capacity', 'target_capacity_by_accelerator'
-    }
-    if (not isinstance(observation, dict) or
-            set(observation) != expected_observation_keys or
-            observation.get('classification') != 'UNKNOWN'):
-        raise OrdinaryLaunchBindingConflict(
-            'Unknown-capacity observation authority is malformed.')
     try:
-        generation = _positive_int(observation.get('reconcile_generation'),
-                                   'reconcile_generation')
-        observation_version = _positive_int(observation.get('service_version'),
-                                            'observation_service_version')
-        target_capacity = _nonnegative_int(observation.get('target_capacity'),
-                                           'target_capacity')
+        observation, generation, observation_version, target_capacity = (
+            _decode_unknown_capacity_observation(
+                authorization.get('observation')))
     except ValueError as error:
         raise OrdinaryLaunchBindingConflict(
             'Unknown-capacity observation authority is malformed.') from error
@@ -2667,25 +2737,6 @@ def _unknown_capacity_replacement_payload(
             info.planned_capacity):
         raise OrdinaryLaunchBindingConflict(
             'Unknown-capacity observation no longer authorizes this shape.')
-    for field, positive in (('target_capacity_by_accelerator', False),
-                            ('accelerator_shapes', True)):
-        state = observation.get(field)
-        if not isinstance(state, list):
-            raise OrdinaryLaunchBindingConflict(
-                'Unknown-capacity accelerator authority is malformed.')
-        normalized_cards = []
-        for item in state:
-            if (not isinstance(item, list) or len(item) != 2 or
-                    not isinstance(item[0], str) or not item[0] or
-                    isinstance(item[1], bool) or not isinstance(item[1], int) or
-                    item[1] < int(positive)):
-                raise OrdinaryLaunchBindingConflict(
-                    'Unknown-capacity accelerator authority is malformed.')
-            normalized_cards.append(item[0].casefold())
-        if normalized_cards != sorted(normalized_cards) or len(
-                normalized_cards) != len(set(normalized_cards)):
-            raise OrdinaryLaunchBindingConflict(
-                'Unknown-capacity accelerator authority is not canonical.')
     return ({
         'authorization': authorization,
         'funding': None,

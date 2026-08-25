@@ -2683,6 +2683,52 @@ def test_serve047_replica_planner_authorization_is_initial_insert_only(
                         non_pool_launch_authorization=authorization))
 
 
+def test_replacement_authorization_reader_needs_no_association(
+        binding_database) -> None:
+    record_id = uuid.uuid4()
+    info = replica_managers.ReplicaInfo(replica_id=4,
+                                        cluster_name='svc-4',
+                                        replica_port='8080',
+                                        is_spot=True,
+                                        location=None,
+                                        version=2,
+                                        resources_override=None)
+    info.replica_record_id = str(record_id)
+    authorization = {
+        'authorization_version': 1,
+        'predecessor': {
+            'replica_id': 3,
+            'replica_record_id': str(_RECORD_ID),
+            'service_version': 2,
+        },
+        'profile_kind': 'UNKNOWN_CAPACITY_REPLACEMENT',
+    }
+    with binding_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                service_name='svc',
+                replica_id=4,
+                replica_state_version=1,
+                status='PROVISIONING',
+                version=2,
+                cluster_name='svc-4',
+                is_spot=True,
+                replica_state=info.to_storage_dict(),
+                non_pool_launch_authorization=authorization))
+
+    assert serve_state.get_replica_non_pool_launch_authorizations(
+        'svc', [4, 404]) == {
+            (4, str(record_id)): authorization
+        }
+    with binding_database.connect() as connection:
+        associations = connection.execute(
+            sqlalchemy.select(
+                binding.ordinary_launch_associations_table.c.replica_id).where(
+                    binding.ordinary_launch_associations_table.c.replica_id ==
+                    4)).fetchall()
+    assert associations == []
+
+
 def test_serve047_rejects_incapable_controller_takeover(
         binding_database) -> None:
     with binding_database.begin() as connection:

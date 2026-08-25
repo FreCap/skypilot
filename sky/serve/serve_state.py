@@ -5938,7 +5938,6 @@ def try_add_replica_with_paid_capacity_claim(
             require_planner=not bool(
                 transaction_replica_info.cost_rebalance_for_replica_id
                 is not None or
-                transaction_replica_info.unknown_capacity_replacement or
                 transaction_replica_info.system_recovery_launch_intent
                 is not None),
             protocol_and_service_prelocked=True)
@@ -7614,6 +7613,44 @@ def get_replica_infos_from_ids(
                         replicas_table.c.replica_id.in_(sorted(
                             set(replica_ids)))))).fetchall()
     return {row[0]: _replica_from_state(row[1], row[2]) for row in rows}
+
+
+def get_replica_non_pool_launch_authorizations(
+    service_name: str,
+    replica_ids: list[int],
+) -> dict[tuple[int, str], dict[str, Any]]:
+    """Read immutable planner authority, fenced by replica-record identity.
+
+    The authorization is intentionally not part of generic ``ReplicaInfo``
+    JSON: status writers must never mutate it.  Replacement planning still
+    needs the scalar to suppress a duplicate successor after a controller
+    restart, so this reader returns only complete mapping values keyed by the
+    physical row's exact, decoded identity.
+    """
+    if not replica_ids:
+        return {}
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                replicas_table.c.replica_id,
+                replicas_table.c.replica_state_version,
+                replicas_table.c.replica_state,
+                replicas_table.c.non_pool_launch_authorization,
+            ).where(
+                replicas_table.c.service_name == service_name,
+                replicas_table.c.replica_id.in_(sorted(set(replica_ids))),
+            )).fetchall()
+    result: dict[tuple[int, str], dict[str, Any]] = {}
+    for replica_id, state_version, state, authorization in rows:
+        if not isinstance(authorization, dict):
+            continue
+        info = _replica_from_state(state_version, state)
+        if info.replica_id != replica_id:
+            continue
+        result[(replica_id,
+                info.replica_record_id)] = copy.deepcopy(authorization)
+    return result
 
 
 def get_replica_ids(service_name: str) -> set[int]:
