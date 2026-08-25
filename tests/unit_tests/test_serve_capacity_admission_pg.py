@@ -1840,6 +1840,89 @@ def test_heartbeat_refresh_keeps_plan_and_bounded_claims(capacity_database):
                 prospective=True)
 
 
+def test_normalized_demand_uses_json_replica_id_keys(capacity_database):
+    """The semantic plan must be stable across its PostgreSQL JSONB roundtrip."""
+    engine, incarnation, _ = capacity_database
+    urls = ('http://replica-42:8000', 'http://replica-116:8000')
+    record_ids = (str(uuid.uuid4()), str(uuid.uuid4()))
+    response = _route_response()
+    response['replica_info'] = {
+        url: {
+            'gpu_type': 'L4',
+            'gpu_count': '1',
+        } for url in urls
+    }
+    identities = {
+        url: {
+            'replica_id': replica_id,
+            'replica_record_id': record_id,
+            'service_version': 1,
+            'gpu_type': 'L4',
+            'gpu_count': 1,
+            'advertised': True,
+            'alias_expires_at': None,
+        } for url, replica_id, record_id in zip(urls, (42, 116), record_ids)
+    }
+    route = route_projection.RouteProjectionRepository(engine).publish(
+        route_projection.RoutePublisherIdentity(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            controller_incarnation=incarnation,
+            controller_owner_epoch=4,
+            controller_pid=123,
+            controller_ip='10.0.0.5'),
+        1,
+        response,
+        identities,
+        set(record_ids),
+        ttl_seconds=60)
+    report = _demand_report(time.time(), route, sequence=2, request_count=2)
+    report.update(
+        http_in_flight={url: 1 for url in urls},
+        async_occupancy={url: 0 for url in urls},
+        occupancy_sample_generation={url: 2 for url in urls},
+        occupancy_sample_age_seconds={url: 0.1 for url in urls},
+        occupancy_sampled_urls=list(urls),
+        total_slots_by_url={url: 1 for url in urls},
+        routing_urls=list(urls),
+    )
+    demand_state.ingest_report('svc', 'svc-hash', report)
+    snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
+    assert snapshot is not None
+    assert snapshot.request_information['in_flight_by_replica_id'] == {
+        42: 1,
+        116: 1,
+    }
+    assert snapshot.normalized_demand['in_flight_by_replica_id'] == {
+        '42': 1,
+        '116': 1,
+    }
+
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(2))
+    with engine.begin() as connection:
+        persisted = connection.execute(
+            sqlalchemy.select(
+                capacity_admission_schema.serve_capacity_plans_table.c.payload).
+            where(capacity_admission_schema.serve_capacity_plans_table.c.
+                  service_name == 'svc')).scalar_one()
+        assert persisted['normalized_demand']['in_flight_by_replica_id'] == {
+            '42': 1,
+            '116': 1,
+        }
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        capacity_admission.validate_paid_claim_in_connection(connection, {
+            **service, 'name': 'svc'
+        }, {
+            **authority.claim_values('L4'), 'replica_id': 42
+        },
+                                                             prospective=True)
+
+
 def test_committed_claim_rechecks_immutable_plan_debit_ledger(
         capacity_database):
     engine, _, _ = capacity_database
