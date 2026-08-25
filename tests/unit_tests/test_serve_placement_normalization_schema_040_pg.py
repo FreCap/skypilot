@@ -245,6 +245,8 @@ def _insert_manifest(connection: sqlalchemy.engine.Connection,
 
 def test_serve040_lineage_and_postgresql_only() -> None:
     assert migration_utils.SERVE_VERSION == '059'
+    assert placement_normalization_authority.RECOGNIZED_ADDITIVE_REVISIONS == (
+        frozenset(f'{revision:03d}' for revision in range(40, 60)))
     sqlite = sqlalchemy.create_engine('sqlite://')
     config = migration_utils.get_alembic_config(sqlite,
                                                 migration_utils.SERVE_DB_NAME)
@@ -1078,11 +1080,11 @@ def test_serve040_runtime_authority_rejects_wrong_revision(serve040) -> None:
 
 @pytest.mark.parametrize('revision', [
     '041', '042', '043', '044', '045', '046', '047', '048', '049', '050', '051',
-    '052', '053', '054', '055'
+    '052', '053', '054', '055', '056', '057', '058', '059'
 ])
 def test_serve040_runtime_authority_accepts_recognized_additive_head(
         serve040, revision: str) -> None:
-    if revision == '055':
+    if int(revision) >= 55:
         # Serve055's FK target is owned by the global user-state lineage. The
         # production migration job establishes it before advancing Serve.
         global_user_state_schema.user_table.create(serve040, checkfirst=True)
