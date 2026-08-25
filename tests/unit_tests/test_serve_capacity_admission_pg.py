@@ -1715,6 +1715,70 @@ def test_heartbeat_refresh_keeps_plan_and_bounded_claims(capacity_database):
                 prospective=True)
 
 
+def test_plan_publication_rebases_equivalent_heartbeat(capacity_database):
+    engine, _, route_receipt = capacity_database
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    plan = _plan(1)
+    plan = dataclasses.replace(plan,
+                               normalized_demand={
+                                   **plan.normalized_demand,
+                                   'autoscaler_target': 1,
+                                   'replica_unit': 'logical',
+                               })
+
+    receipt = demand_state.ingest_report(
+        'svc', 'svc-hash', _demand_report(time.time(),
+                                          route_receipt,
+                                          sequence=2))
+    authority = repository.publish(plan)
+
+    current = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
+    assert current is not None
+    assert authority.demand_feed_generation == receipt.generation
+    assert authority.demand_feed_generation == current.demand_feed_generation
+    with engine.connect() as connection:
+        head = connection.execute(
+            sqlalchemy.select(
+                capacity_admission_schema.serve_capacity_plan_heads_table).
+            where(capacity_admission_schema.serve_capacity_plan_heads_table.c.
+                  service_name == 'svc')).mappings().one()
+        published = connection.execute(
+            sqlalchemy.select(
+                capacity_admission_schema.serve_capacity_plans_table).where(
+                    capacity_admission_schema.serve_capacity_plans_table.c.
+                    service_name == 'svc')).mappings().one()
+    assert head['demand_feed_generation'] == receipt.generation
+    assert head['receipt_watermark_sha256'] == capacity_admission._sha256(
+        current.receipt_watermark)
+    assert published['demand_feed_generation'] == receipt.generation
+    assert published['payload']['normalized_demand']['autoscaler_target'] == 1
+
+
+def test_plan_publication_rejects_advanced_demand_change(capacity_database):
+    engine, _, route_receipt = capacity_database
+    plan = _plan(1)
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=2))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='advanced with changed or unavailable semantics'):
+        capacity_admission.CapacityAdmissionRepository(engine).publish(plan)
+
+
+@pytest.mark.parametrize(('expected', 'current'), [
+    ({
+        'queue_depth': None
+    }, {}),
+    ({}, {
+        'queue_depth': None
+    }),
+])
+def test_demand_semantics_rejects_missing_and_extra_keys(expected, current):
+    assert capacity_admission._changed_demand_semantics(
+        expected, current) == ['queue_depth']
+
+
 def test_committed_claim_survives_successor_plan_that_accounts_for_it(
         capacity_database):
     engine, _, route_receipt = capacity_database

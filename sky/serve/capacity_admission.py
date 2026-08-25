@@ -1235,6 +1235,41 @@ def _validate_optimistic_capacity_projection(
         raise CapacityAdmissionConflict(changed)
 
 
+_PLAN_DERIVED_DEMAND_FIELDS = frozenset({
+    'autoscaler_target',
+    'demand_target_by_accelerator',
+    'replica_unit',
+})
+
+
+def _changed_demand_semantics(expected: Any,
+                              current: Mapping[str, Any]) -> list[str]:
+    """Return reporter-owned demand fields that differ from a new snapshot.
+
+    Capacity plans append autoscaler-derived explanation fields to the
+    reporter snapshot. Those fields are not heartbeat semantics; every other
+    field is compared with exact key presence as well as exact value.
+    """
+    if not isinstance(expected, Mapping):
+        return ['unavailable']
+    expected = {
+        key: value
+        for key, value in expected.items()
+        if key not in _PLAN_DERIVED_DEMAND_FIELDS
+    }
+    current = {
+        key: value
+        for key, value in current.items()
+        if key not in _PLAN_DERIVED_DEMAND_FIELDS
+    }
+    keys = set(expected) | set(current)
+    return [
+        str(key) for key in sorted(
+            keys, key=repr) if key not in expected or key not in current or
+        _sha256({'value': expected[key]}) != _sha256({'value': current[key]})
+    ]
+
+
 def get_service_source_mode(
         service_name: str) -> tuple[DemandSourceMode, int] | None:
     """Read the current per-service demand owner without provider access."""
@@ -1275,7 +1310,7 @@ class CapacityAdmissionRepository:
     @staticmethod
     def _validate_sources(connection: sqlalchemy.engine.Connection,
                           plan: CapacityPlanInput,
-                          service: Mapping[str, Any]) -> None:
+                          service: Mapping[str, Any]) -> CapacityPlanInput:
         if (service['hash'] != plan.service_hash or
                 service['lifecycle_epoch'] != plan.service_lifecycle_epoch or
                 service['current_version'] != plan.service_version or
@@ -1296,8 +1331,31 @@ class CapacityAdmissionRepository:
                 _DEMAND_GENERATIONS.c.service_hash ==
                 plan.service_hash).with_for_update()).scalar_one_or_none()
         if demand_generation != plan.demand_feed_generation:
-            raise CapacityAdmissionConflict(
-                'Demand feed advanced before plan publication.')
+            current_snapshot = demand_state.get_autoscaling_snapshot(
+                plan.service_name, plan.service_hash, connection=connection)
+            if (not isinstance(demand_generation, int) or
+                    demand_generation <= plan.demand_feed_generation or
+                    current_snapshot is None or
+                    current_snapshot.demand_feed_generation !=
+                    demand_generation or
+                    current_snapshot.demand_source_epoch !=
+                    plan.demand_source_epoch or
+                    current_snapshot.route_generation != plan.route_generation
+                    or current_snapshot.route_sha256 != plan.route_sha256 or
+                    current_snapshot.route_source_epoch !=
+                    plan.route_source_epoch or _changed_demand_semantics(
+                        plan.normalized_demand,
+                        current_snapshot.normalized_demand)):
+                raise CapacityAdmissionConflict(
+                    'Demand feed advanced with changed or unavailable '
+                    'semantics before plan publication.')
+            # Heartbeats advance the durable sequence even when the canonical
+            # demand decision is unchanged. Rebind to the exact locked receipt
+            # so planning does not have to race the heartbeat interval.
+            plan = dataclasses.replace(
+                plan,
+                demand_feed_generation=current_snapshot.demand_feed_generation,
+                receipt_watermark=current_snapshot.receipt_watermark)
         reports = connection.execute(
             sqlalchemy.select(_DEMAND_REPORTS).where(
                 _DEMAND_REPORTS.c.service_name == plan.service_name,
@@ -1375,6 +1433,7 @@ class CapacityAdmissionRepository:
                     != plan.route_source_epoch):
                 raise CapacityAdmissionConflict(
                     'Demand report does not name the exact fresh route.')
+        return plan
 
     def project_reserved_supply(
         self,
@@ -1467,7 +1526,6 @@ class CapacityAdmissionRepository:
         if not accounting_cards:
             raise ValueError(
                 'capacity_target_by_accelerator must not be empty.')
-        watermark_sha256 = _sha256(_canonical_watermark(plan.receipt_watermark))
         if not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
             raise ValueError('ttl_seconds must be positive.')
         with self.engine.begin() as connection:
@@ -1502,7 +1560,9 @@ class CapacityAdmissionRepository:
                 raise CapacityAdmissionConflict(
                     'Capacity plan reserved-fill authority does not match its '
                     'service actuation mode and target.')
-            self._validate_sources(connection, plan, service)
+            plan = self._validate_sources(connection, plan, service)
+            watermark_sha256 = _sha256(
+                _canonical_watermark(plan.receipt_watermark))
             validated_allocation = None
             if allocation_bound:
                 validated_allocation = (
@@ -1915,12 +1975,9 @@ def validate_paid_claim_in_connection(
         str(service['name']), str(service['hash']), connection=connection)
     plan_normalized_demand = payload.get('normalized_demand')
     changed_demand_fields = (
-        ['unavailable'] if current_snapshot is None or
-        not isinstance(plan_normalized_demand, Mapping) else [
-            key for key, value in current_snapshot.normalized_demand.items()
-            if _sha256({'value': plan_normalized_demand.get(key)}) != _sha256(
-                {'value': value})
-        ])
+        ['unavailable'] if current_snapshot is None else
+        _changed_demand_semantics(plan_normalized_demand,
+                                  current_snapshot.normalized_demand))
     if changed_demand_fields:
         raise CapacityAdmissionConflict(
             'Paid claim demand semantics changed before provider effect: '

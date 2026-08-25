@@ -10756,6 +10756,60 @@ class TestLogicalCapacityPlanning:
         local_scan.assert_not_called()
         grouped_scan.assert_called_once_with()
 
+    def test_mixed_unknown_replacement_only_binds_ordinary_paid_launches(self):
+        mgr = _make_manager()
+        mgr._ordinary_launch_binding_authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND, generic=True)
+        mgr._uses_logical_replicas = True
+        original = self._ready_backend(1, 1)
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=9,
+                observed_slots_by_replica_id={1: 0},
+                in_flight_by_replica_id={1: 0},
+                unknown_replica_ids=frozenset({1}),
+                received_at=replica_managers.time.monotonic()))
+        mgr._logical_target = (1, 9, 3)
+        mgr._uses_shared_zero_cost_demand_budget = mock.Mock(
+            return_value=False)
+        authority = mock.sentinel.paid_authority
+        seen = []
+
+        def _append_launch(_override, _used_ids, existing, _budget, **kwargs):
+            is_replacement = kwargs.get('unknown_capacity_replacement', False)
+            seen.append(
+                (is_replacement, kwargs.get('paid_launch_authority')))
+            replica_id = len(existing) + 1
+            info = replica_managers.ReplicaInfo(
+                replica_id=replica_id,
+                cluster_name=f'svc-{replica_id}',
+                replica_port='8080',
+                is_spot=True,
+                location=None,
+                version=1,
+                resources_override=None,
+                planned_capacity=1)
+            info.unknown_capacity_replacement = is_replacement
+            existing.append(info)
+            return _accepted_launch_result(replica_id)
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[original]), \
+             mock.patch.object(mgr,
+                               '_scale_up_one_locked',
+                               side_effect=_append_launch):
+            mgr.scale_up_to_logical_capacity(
+                target_capacity=3,
+                version=1,
+                reconcile_generation=9,
+                replace_unknown_replica_ids=(1,),
+                launch_budget=3,
+                paid_launch_authority=authority)
+
+        assert seen == [(True, None), (False, authority), (False, authority)]
+
     def test_existing_zero_capacity_replacement_prevents_recursive_launch(self):
         mgr = _make_manager()
         mgr._uses_logical_replicas = True
