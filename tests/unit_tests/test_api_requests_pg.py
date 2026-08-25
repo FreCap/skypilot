@@ -2764,6 +2764,62 @@ def test_paid_provider_negative_ack_projects_and_releases_debits_atomically(
     assert pool['last_failure_at'] is not None
 
 
+def test_service_teardown_settles_exact_paid_provider_negative_ack(
+        bound_request_database, monkeypatch) -> None:
+    """Teardown uses the same exact ABSENT reducer as the live manager."""
+    graph = _prepare_paid_provider_absence_graph(bound_request_database,
+                                                 monkeypatch)
+    teardown = ordinary_launch_binding.begin_service_teardown_if_owner(
+        'gc-service', 'gc-service-hash', (123, '10.0.0.2'))
+    assert teardown.authority is not None
+    info = serve_state.get_replica_info_from_id('gc-service', 3)
+    assert info is not None
+
+    cleanup_contexts = service._settle_bound_ordinary_launches_for_teardown(
+        teardown.authority, [info])
+
+    assert cleanup_contexts == {}
+    with graph.engine.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id ==
+                  graph.context.association_id)).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                'gc-service', serve_state_schema.replicas_table.c.replica_id ==
+                3)).mappings().one()
+        claim_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(serve_state_schema.paid_capacity_claims_table).where(
+                serve_state_schema.paid_capacity_claims_table.c.service_name ==
+                'gc-service')).scalar_one()
+        pin_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(request_postgres.REQUEST_RETENTION_PINS).where(
+                request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+                graph.context.request_id)).scalar_one()
+        pool = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.paid_capacity_pools_table).where(
+                    serve_state_schema.paid_capacity_pools_table.c.pool_key ==
+                    graph.pool_key)).mappings().one()
+    projected_info = replica_managers.ReplicaInfo.from_storage_dict(
+        replica['replica_state'])
+    assert association['resolution'] == (
+        ordinary_launch_binding.Resolution.PROJECTED.value)
+    assert replica['ordinary_launch_association_id'] is None
+    assert claim_count == pin_count == 0
+    assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+        projected_info)
+    assert projected_info.status_property.failed_spot_availability
+    assert pool['last_failure_at'] is not None
+
+
 @pytest.mark.parametrize('failure_stage', [
     'after_paid_feedback',
     'after_pointer_clear',

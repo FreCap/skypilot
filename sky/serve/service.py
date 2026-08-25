@@ -990,6 +990,91 @@ def _exit_on_ownership_loss(
     _orphan_exit(controller_process)
 
 
+def _claim_teardown_recovery_controller(
+    service_name: str,
+    service_incarnation: str,
+    expected_parent_owner: tuple[int | None, str | None],
+    new_parent_owner: tuple[int, str | None],
+    *,
+    expected_lifecycle_epoch: int | None,
+    expected_status: serve_state.ServiceStatus | None,
+    binding_expected_recovery_version: int | None,
+    legacy_expected_recovery_version: int | None,
+) -> ordinary_launch_binding.ControllerBindingAuthority | None:
+    """Claim teardown recovery and orphan-exit only on an owner-fence loss."""
+    try:
+        authority = ordinary_launch_binding.claim_controller_incarnation(
+            service_name,
+            service_incarnation,
+            expected_parent_owner,
+            uuid.uuid4(),
+            new_parent_owner=new_parent_owner,
+            expected_lifecycle_epoch=expected_lifecycle_epoch,
+            expected_status=expected_status,
+            expected_recovery_version=binding_expected_recovery_version)
+    except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
+        _exit_on_ownership_loss(False, service_name,
+                                'claiming teardown recovery', None)
+        # `_orphan_exit()` does not return. Keep tests and future alternative
+        # exit implementations from accidentally continuing as an owner.
+        raise
+    if authority is not None:
+        return authority
+
+    claimed = serve_state.update_service_controller_pid_if_owner(
+        service_name,
+        expected_service_hash=service_incarnation,
+        expected_controller_pid=expected_parent_owner[0],
+        expected_controller_ip=expected_parent_owner[1],
+        controller_pid=new_parent_owner[0],
+        controller_ip=new_parent_owner[1],
+        expected_lifecycle_epoch=expected_lifecycle_epoch,
+        expected_status=expected_status,
+        expected_recovery_version=legacy_expected_recovery_version)
+    _exit_on_ownership_loss(claimed, service_name, 'claiming teardown recovery',
+                            None)
+    if not claimed:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Legacy teardown recovery lost its controller-owner compare-and-set.'
+        )
+    return None
+
+
+def _settle_teardown_recovery_launches(
+    service_name: str,
+    service_incarnation: str,
+    expected_parent_owner: tuple[int | None, str | None],
+    authority: ordinary_launch_binding.ControllerBindingAuthority,
+) -> bool:
+    """Settle exact launches without mistaking evidence conflict for HA loss."""
+    try:
+        replica_infos = serve_state.get_replica_infos(service_name)
+        _settle_bound_ordinary_launches_for_teardown(authority, replica_infos)
+        if not serve_utils.quiesce_service_replica_launch_requests(
+                service_name,
+                replica_infos,
+                continue_guard=lambda: serve_state.service_owner_matches(
+                    service_name, service_incarnation, expected_parent_owner),
+                include_terminal_history=True):
+            logger.warning(
+                f'Deferring teardown recovery for {service_name!r} until every '
+                'prior launch execution is quiescent.')
+            return False
+    except ordinary_launch_binding.OrdinaryLaunchBindingConflict as e:
+        logger.warning(
+            f'Deferring teardown recovery for {service_name!r}: exact launch '
+            'evidence remains unresolved; this is not a controller ownership '
+            f'loss: {common_utils.format_exception(e)}')
+        return False
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(
+            f'Could not prepare exact launch cancellation for teardown '
+            f'recovery of {service_name!r}: '
+            f'{common_utils.format_exception(e)}')
+        return False
+    return True
+
+
 def _verify_fresh_non_pool_launch_authority(
     authority: ordinary_launch_binding.ControllerBindingAuthority | None,
     *,
@@ -1649,15 +1734,12 @@ def _project_bound_ordinary_launch_for_teardown(
         provider_evidence == ordinary_launch_binding.ProviderEvidence.ABSENT)
     provider_present_cleanup = (
         provider_evidence == ordinary_launch_binding.ProviderEvidence.PRESENT)
+    provider_absence_projection = None
     if provider_absent:
-        context = projection.context
-        if (not isinstance(context,
-                           ordinary_launch_binding.BoundNonPoolLaunchContext) or
-                context.profile.kind != ordinary_launch_binding.
-                NonPoolLaunchProfileKind.RESERVED_FILL or
-                projection.pre_effect_terminal or
-                projection.service_job_id is not None or
-                projection.paid_capacity_pool_key is not None):
+        provider_absence_projection = (
+            non_pool_launch_reconciliation.
+            apply_exact_provider_absence_replica_projection(projection))
+        if provider_absence_projection is None:
             return False
     if provider_present_cleanup:
         context = projection.context
@@ -1692,10 +1774,7 @@ def _project_bound_ordinary_launch_for_teardown(
         status.logical_retirement_bounded_deadline = False
         status.logical_retirement_committed = False
     elif provider_absent:
-        if (info.status_property.sky_launch_status
-                != common_utils.ProcessStatus.INTERRUPTED):
-            info.status_property.sky_launch_status = (
-                common_utils.ProcessStatus.FAILED)
+        assert provider_absence_projection is not None
     elif (info.status_property.sky_launch_status
           != common_utils.ProcessStatus.INTERRUPTED):
         if projection.status.value == 'SUCCEEDED':
@@ -1704,11 +1783,17 @@ def _project_bound_ordinary_launch_for_teardown(
         else:
             info.status_property.sky_launch_status = (
                 common_utils.ProcessStatus.FAILED)
-    paid_outcome: paid_capacity.LaunchOutcome | None = (
-        paid_capacity.LaunchOutcome.SUCCESS if projection.status.value
-        == 'SUCCEEDED' else paid_capacity.LaunchOutcome.OTHER_FAILURE)
+    if provider_absence_projection is not None:
+        paid_outcome = provider_absence_projection.paid_capacity_outcome
+    else:
+        paid_outcome = (paid_capacity.LaunchOutcome.SUCCESS
+                        if projection.status.value == 'SUCCEEDED' else
+                        paid_capacity.LaunchOutcome.OTHER_FAILURE)
     if projection.paid_capacity_pool_key is None:
         paid_outcome = None
+    paid_capacity_pool_key = (provider_absence_projection.paid_capacity_pool_key
+                              if provider_absence_projection is not None else
+                              projection.paid_capacity_pool_key)
     return serve_state.update_replica_for_bound_ordinary_launch_in_transaction(
         connection,
         authority.service_name,
@@ -1721,40 +1806,60 @@ def _project_bound_ordinary_launch_for_teardown(
                                    not provider_absent and
                                    not provider_present_cleanup and
                                    projection.status.value == 'SUCCEEDED'),
-        paid_capacity_pool_key=projection.paid_capacity_pool_key,
+        paid_capacity_pool_key=paid_capacity_pool_key,
         paid_capacity_outcome=paid_outcome)
 
 
-def _reconcile_bound_reserved_fill_ambiguity_for_teardown(
+def _reconcile_bound_provider_ambiguity_for_teardown(
     authority: ordinary_launch_binding.ControllerBindingAuthority,
     info: Any,
     context: Any,
     projector: Callable[..., bool],
 ) -> ordinary_launch_binding.BoundNonPoolLaunchContext | None:
-    """Resolve only the exact provider-backed reserved-fill ambiguity."""
-    if (not isinstance(context,
-                       ordinary_launch_binding.BoundNonPoolLaunchContext) or
-            context.profile.kind
-            != ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
+    """Resolve only an ambiguity with exact provider-absence authority."""
+    if not isinstance(context,
+                      ordinary_launch_binding.BoundNonPoolLaunchContext):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-            'Provider reconciliation cannot authorize an ordinary or '
-            'protocol-v1 ambiguous launch.')
-    if request_postgres.bound_non_pool_provider_present_cleanup_is_authorized(
-            context, authority):
+            'Provider reconciliation cannot authorize a protocol-v1 '
+            'ambiguous launch.')
+    profile_kind = context.profile.kind
+    if profile_kind not in (
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider reconciliation cannot authorize an ambiguous '
+            f'{profile_kind.value} launch.')
+    if (profile_kind
+            == ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL
+            and request_postgres.
+            bound_non_pool_provider_present_cleanup_is_authorized(
+                context, authority)):
         return context
     observation = non_pool_launch_reconciliation.reconcile(
         context, info, authority, projector)
     if observation.evidence == ordinary_launch_binding.ProviderEvidence.ABSENT:
         return None
-    if (observation.evidence == ordinary_launch_binding.ProviderEvidence.PRESENT
-            and request_postgres.
+    if (profile_kind
+            == ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL
+            and observation.evidence
+            == ordinary_launch_binding.ProviderEvidence.PRESENT and
+            request_postgres.
             bound_non_pool_provider_present_cleanup_is_authorized(
                 context, authority)):
         return context
     raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
         'Teardown provider reconciliation returned '
-        f'{observation.evidence.value} for reserved-fill replica '
+        f'{observation.evidence.value} for {profile_kind.value} replica '
         f'{info.replica_id}; refusing provider cleanup.')
+
+
+def _supports_bound_provider_reconciliation(context: Any) -> bool:
+    """Whether an exact bound profile has a closed provider evidence path."""
+    return (isinstance(context,
+                       ordinary_launch_binding.BoundNonPoolLaunchContext) and
+            context.profile.kind
+            in (ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+                ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID))
 
 
 def _settle_bound_ordinary_launches_for_teardown(
@@ -1775,41 +1880,37 @@ def _settle_bound_ordinary_launches_for_teardown(
         if target is None:
             continue
         context = target.context
-        reconcile_reserved_fill = False
-        if (isinstance(context,
-                       ordinary_launch_binding.BoundNonPoolLaunchContext) and
-                context.profile.kind ==
-                ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
+        reconcile_provider_ambiguity = False
+        if _supports_bound_provider_reconciliation(context):
             inspection = request_postgres.inspect_bound_ordinary_launch(
                 authority.service_name, info.replica_id, info.replica_record_id)
             if inspection is None or inspection.context != context:
                 raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                    'Teardown lost the exact reserved-fill association while '
+                    'Teardown lost the exact provider-backed association while '
                     f'inspecting replica {info.replica_id}.')
-            reconcile_reserved_fill = (
+            reconcile_provider_ambiguity = (
                 _bound_ordinary_launch_disposition(inspection) == 'AMBIGUOUS')
         durable_reason = target.cancel_reason
         # First pass: make every exact cancellation reachable before waiting
         # for any one executor's quiescence. Provider authority is
         # service-scoped, so reducing replica N before cancelling N+1 could
         # otherwise let one stuck request delay cancellation for all peers.
-        # A terminal protocol-v2 reserved-fill ambiguity is no longer a
-        # cancellable request. Its exact physical identity is instead reduced
-        # through the provider-evidence state machine below. All provider I/O
-        # remains outside the inspection/reduction transactions.
-        if not reconcile_reserved_fill:
+        # A terminal provider-backed ambiguity is no longer a cancellable
+        # request. Its exact provider evidence is instead reduced through the
+        # reconciliation state machine below. All provider I/O remains outside
+        # the inspection/reduction transactions.
+        if not reconcile_provider_ambiguity:
             request_postgres.request_bound_ordinary_launch_cancel(
                 context, authority, durable_reason or 'service-teardown')
-        targets.append((info, target, reconcile_reserved_fill))
+        targets.append((info, target, reconcile_provider_ambiguity))
 
     provider_present_cleanup_contexts: dict[tuple[
         int, str], ordinary_launch_binding.BoundNonPoolLaunchContext] = {}
-    for info, target, reconcile_reserved_fill in targets:
+    for info, target, reconcile_provider_ambiguity in targets:
         context = target.context
-        if reconcile_reserved_fill:
-            cleanup_context = (
-                _reconcile_bound_reserved_fill_ambiguity_for_teardown(
-                    authority, info, context, projector))
+        if reconcile_provider_ambiguity:
+            cleanup_context = (_reconcile_bound_provider_ambiguity_for_teardown(
+                authority, info, context, projector))
             if cleanup_context is not None:
                 provider_present_cleanup_contexts[(
                     info.replica_id, info.replica_record_id)] = cleanup_context
@@ -1820,17 +1921,13 @@ def _settle_bound_ordinary_launches_for_teardown(
         while True:
             disposition = _bound_ordinary_launch_disposition(reduction)
             if disposition == 'AMBIGUOUS':
-                if (not isinstance(
-                        context,
-                        ordinary_launch_binding.BoundNonPoolLaunchContext) or
-                        context.profile.kind != ordinary_launch_binding.
-                        NonPoolLaunchProfileKind.RESERVED_FILL):
+                if not _supports_bound_provider_reconciliation(context):
                     raise (ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                         'Teardown found a durably ambiguous ordinary launch '
                         f'for replica {info.replica_id}; refusing provider '
                         'cleanup.'))
                 cleanup_context = (
-                    _reconcile_bound_reserved_fill_ambiguity_for_teardown(
+                    _reconcile_bound_provider_ambiguity_for_teardown(
                         authority, info, context, projector))
                 if cleanup_context is not None:
                     provider_present_cleanup_contexts[(
@@ -2483,75 +2580,39 @@ def _start(service_name: str,
                     service_name, service_incarnation,
                     (recovery_expected_controller_pid,
                      recovery_expected_controller_ip)))
-            pre_teardown_authority = teardown_result.authority
-            if teardown_result.disposition != (
-                    ordinary_launch_binding.ServiceTeardownDisposition.
-                    UNSUPPORTED):
-                # The atomic admission fence advances any prior teardown
-                # status (including FAILED_CLEANUP) to the status accepted by
-                # the exclusive ownership transfer below.
-                teardown_claim_expected_status = (
-                    serve_state.ServiceStatus.SHUTTING_DOWN)
-            if pre_teardown_authority is not None:
-                pre_teardown_replicas = serve_state.get_replica_infos(
-                    service_name)
-                _settle_bound_ordinary_launches_for_teardown(
-                    pre_teardown_authority, pre_teardown_replicas)
-                if not serve_utils.quiesce_service_replica_launch_requests(
-                        service_name,
-                        pre_teardown_replicas,
-                        continue_guard=lambda:
-                        serve_state.service_owner_matches(
-                            service_name, service_incarnation,
-                            (recovery_expected_controller_pid,
-                             recovery_expected_controller_ip)),
-                        include_terminal_history=True):
-                    logger.warning(
-                        f'Deferring teardown recovery for {service_name!r} '
-                        'until every prior launch execution is quiescent.')
-                    return
         except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
             _exit_on_ownership_loss(False, service_name,
-                                    'preparing teardown recovery', None)
+                                    'beginning teardown recovery', None)
+            return
         except Exception as e:  # pylint: disable=broad-except
             logger.warning(
-                f'Could not prepare exact launch cancellation for teardown '
-                f'recovery of {service_name!r}: '
+                f'Could not begin teardown recovery for {service_name!r}: '
                 f'{common_utils.format_exception(e)}')
             return
-        teardown_binding_authority = None
-        try:
-            teardown_binding_authority = (
-                ordinary_launch_binding.claim_controller_incarnation(
-                    service_name,
-                    service_incarnation, (recovery_expected_controller_pid,
-                                          recovery_expected_controller_ip),
-                    uuid.uuid4(),
-                    new_parent_owner=(os.getpid(), pod_ip),
-                    expected_lifecycle_epoch=(
-                        recovery_expected_lifecycle_epoch),
-                    expected_status=teardown_claim_expected_status,
-                    expected_recovery_version=(recovery_version
-                                               if recovery_snapshot is not None
-                                               else None)))
-        except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
-            _exit_on_ownership_loss(False, service_name,
-                                    'claiming teardown recovery', None)
-        if teardown_binding_authority is None:
-            claimed = serve_state.update_service_controller_pid_if_owner(
-                service_name,
-                expected_service_hash=service_incarnation,
-                expected_controller_pid=recovery_expected_controller_pid,
-                expected_controller_ip=recovery_expected_controller_ip,
-                controller_pid=os.getpid(),
-                controller_ip=pod_ip,
-                expected_lifecycle_epoch=recovery_expected_lifecycle_epoch,
-                expected_status=teardown_claim_expected_status,
-                expected_recovery_version=recovery_expected_version)
-        else:
-            claimed = True
-        _exit_on_ownership_loss(claimed, service_name,
-                                'claiming teardown recovery', None)
+        pre_teardown_authority = teardown_result.authority
+        if teardown_result.disposition != (
+                ordinary_launch_binding.ServiceTeardownDisposition.UNSUPPORTED):
+            # The atomic admission fence advances any prior teardown status
+            # (including FAILED_CLEANUP) to the status accepted by the
+            # exclusive ownership transfer below.
+            teardown_claim_expected_status = (
+                serve_state.ServiceStatus.SHUTTING_DOWN)
+        if pre_teardown_authority is not None:
+            if not _settle_teardown_recovery_launches(
+                    service_name, service_incarnation,
+                (recovery_expected_controller_pid,
+                 recovery_expected_controller_ip), pre_teardown_authority):
+                return
+        _claim_teardown_recovery_controller(
+            service_name,
+            service_incarnation,
+            (recovery_expected_controller_pid, recovery_expected_controller_ip),
+            (os.getpid(), pod_ip),
+            expected_lifecycle_epoch=recovery_expected_lifecycle_epoch,
+            expected_status=teardown_claim_expected_status,
+            binding_expected_recovery_version=(
+                recovery_version if recovery_snapshot is not None else None),
+            legacy_expected_recovery_version=recovery_expected_version)
         logger.info(f'Recovering service {service_name} in status '
                     f'{service["status"].value}: resuming teardown instead of '
                     'serving.')

@@ -18,6 +18,7 @@ persistent recovery loop.
 # pylint: disable=protected-access
 import types
 from unittest import mock
+import uuid
 
 import pytest
 
@@ -376,6 +377,120 @@ def test_service_teardown_cancels_every_target_before_reducing(monkeypatch):
 
     assert events == [('cancel', 'association-1'), ('cancel', 'association-2'),
                       ('reduce', 'association-1'), ('reduce', 'association-2')]
+
+
+def test_teardown_keeps_pre_token_paid_ambiguity_fail_closed(monkeypatch):
+    """A cohort without immutable create identity is never guessed absent."""
+    info = _replica(1)
+    profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+        authorization_reference='paid-capacity:test',
+        authorization_generation=1,
+        authorization_payload={'pool': 'test'})
+    context = ordinary_launch_binding.BoundNonPoolLaunchContext(
+        association_id=uuid.UUID('11111111-1111-4111-8111-111111111111'),
+        request_id='request-1',
+        service_name='svc',
+        replica_id=1,
+        replica_record_id=uuid.UUID(info.replica_record_id),
+        launch_generation=1,
+        input_digest='a' * 64,
+        profile=profile,
+        capability_cohort_epoch=(
+            ordinary_launch_binding.ORDINARY_PAID_AWS_CLIENT_TOKEN_COHORT_FLOOR
+            - 1),
+        capability_profile_set_digest=(
+            ordinary_launch_binding.supported_non_pool_profile_set_digest()),
+        receipt_protocol_version=1)
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='no supported AWS create token'):
+        ordinary_launch_binding.ordinary_paid_aws_client_token(context)
+    authority = types.SimpleNamespace(
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        service_name='svc')
+    target = types.SimpleNamespace(context=context, cancel_reason=None)
+    inspection = types.SimpleNamespace(context=context, disposition='AMBIGUOUS')
+    cancel = mock.Mock()
+    reduce = mock.Mock()
+    reconcile = mock.Mock(return_value=types.SimpleNamespace(
+        evidence=ordinary_launch_binding.ProviderEvidence.UNKNOWN))
+    monkeypatch.setattr(service.request_postgres,
+                        'lookup_bound_ordinary_launch_cancel_target',
+                        mock.Mock(return_value=target))
+    monkeypatch.setattr(service.request_postgres,
+                        'inspect_bound_ordinary_launch',
+                        mock.Mock(return_value=inspection))
+    monkeypatch.setattr(service.request_postgres,
+                        'request_bound_ordinary_launch_cancel', cancel)
+    monkeypatch.setattr(service.request_postgres,
+                        'reduce_bound_ordinary_launch', reduce)
+    monkeypatch.setattr(service.non_pool_launch_reconciliation, 'reconcile',
+                        reconcile)
+
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='UNKNOWN for ORDINARY_PAID replica'):
+        service._settle_bound_ordinary_launches_for_teardown(authority, [info])
+
+    cancel.assert_not_called()
+    reduce.assert_not_called()
+    reconcile.assert_called_once()
+
+
+def test_teardown_recovery_evidence_conflict_does_not_orphan(
+        monkeypatch, caplog):
+    authority = mock.sentinel.authority
+    conflict = ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+        'provider absence is unproven')
+    orphan_exit = mock.Mock()
+    monkeypatch.setattr(serve_state, 'get_replica_infos',
+                        lambda _service_name: [_replica(1)])
+    monkeypatch.setattr(service, '_settle_bound_ordinary_launches_for_teardown',
+                        mock.Mock(side_effect=conflict))
+    monkeypatch.setattr(
+        service.serve_utils, 'quiesce_service_replica_launch_requests',
+        mock.Mock(side_effect=AssertionError('unresolved rows cannot quiesce')))
+    monkeypatch.setattr(service, '_orphan_exit', orphan_exit)
+
+    assert not service._settle_teardown_recovery_launches(
+        'svc', 'incarnation-a', (123, '10.0.0.2'), authority)
+
+    orphan_exit.assert_not_called()
+    assert 'not a controller ownership loss' in caplog.text
+    assert 'provider absence is unproven' in caplog.text
+
+
+def test_teardown_recovery_two_claimants_orphan_only_cas_loser(monkeypatch):
+    winner = mock.sentinel.authority
+    loser_conflict = ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+        'controller parent-owner fence changed')
+    claim = mock.Mock(side_effect=[winner, loser_conflict])
+    orphan_exit = mock.Mock()
+    monkeypatch.setattr(service.ordinary_launch_binding,
+                        'claim_controller_incarnation', claim)
+    monkeypatch.setattr(
+        serve_state, 'update_service_controller_pid_if_owner',
+        mock.Mock(side_effect=AssertionError(
+            'PostgreSQL binding claims never use legacy CAS')))
+    monkeypatch.setattr(service, '_orphan_exit', orphan_exit)
+    kwargs = {
+        'expected_lifecycle_epoch': 4,
+        'expected_status': serve_state.ServiceStatus.SHUTTING_DOWN,
+        'binding_expected_recovery_version': 2,
+        'legacy_expected_recovery_version': 2,
+    }
+
+    assert service._claim_teardown_recovery_controller(
+        'svc', 'incarnation-a', (123, '10.0.0.2'),
+        (456, '10.0.0.3'), **kwargs) is winner
+    orphan_exit.assert_not_called()
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='parent-owner fence changed'):
+        service._claim_teardown_recovery_controller('svc', 'incarnation-a',
+                                                    (123, '10.0.0.2'),
+                                                    (789, '10.0.0.4'), **kwargs)
+
+    orphan_exit.assert_called_once_with(None)
 
 
 def test_finalize_does_not_ack_or_delete_until_launches_quiesce(monkeypatch):

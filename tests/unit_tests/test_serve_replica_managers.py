@@ -40,8 +40,10 @@ from sky import clouds
 from sky import exceptions
 from sky import skypilot_config
 from sky.events import api_models as event_api_models
+from sky.provision import capacity_policy
 from sky.provision import common as provision_common
 from sky.serve import capacity_admission
+from sky.serve import non_pool_launch_reconciliation
 from sky.serve import ordinary_launch_binding
 from sky.serve import ordinary_launch_handoff
 from sky.serve import paid_capacity
@@ -106,11 +108,12 @@ def test_decoded_bound_request_error_accepts_exact_safe_wrapper() -> None:
     decoded = request.get_error()
 
     assert decoded is not None
-    restored = replica_managers._decoded_bound_request_error(decoded)
+    restored = non_pool_launch_reconciliation.decoded_request_error(decoded)
     assert type(restored) is exceptions.CloudError
     tampered = dict(decoded)
     tampered['message'] = 'tampered'
-    assert replica_managers._decoded_bound_request_error(tampered) is None
+    assert non_pool_launch_reconciliation.decoded_request_error(
+        tampered) is None
 
 
 def _binding_authority(mode=ordinary_launch_binding.BindingMode.LEGACY,
@@ -637,10 +640,9 @@ def test_provider_negative_ack_survives_request_error_wire_round_trip():
     decoded = request.get_error()
 
     assert decoded is not None
-    error = replica_managers._decoded_bound_request_error(decoded)
+    error = non_pool_launch_reconciliation.decoded_request_error(decoded)
     assert error is not None
-    assert replica_managers.capacity_policy.extract_provider_negative_ack(
-        error) == receipt
+    assert capacity_policy.extract_provider_negative_ack(error) == receipt
 
 
 def test_replica_manager_rejects_legacy_service_without_workspace():

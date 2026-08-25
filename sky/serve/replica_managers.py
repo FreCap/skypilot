@@ -40,7 +40,6 @@ from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
-from sky.provision import capacity_policy
 from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
 from sky.serve import drain_observability
@@ -98,7 +97,6 @@ logger = sky_logging.init_logger(__name__)
 ordinary_launch_binding = adaptors_common.LazyImport(
     'sky.serve.ordinary_launch_binding')
 request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
-api_requests = adaptors_common.LazyImport('sky.server.requests.requests')
 reserved_fill_admission = adaptors_common.LazyImport(
     'sky.server.requests.reserved_fill_admission')
 kueue_lane_observer = adaptors_common.LazyImport(
@@ -812,17 +810,6 @@ def _bound_reduction_request_id(reduction: Any) -> str:
     return request_id
 
 
-def _decoded_bound_request_error(error: Any) -> BaseException | None:
-    """Extract the exception from the exact durable request error shape."""
-    if isinstance(error, BaseException):
-        return error
-    if not api_requests.decoded_error_is_valid(error):
-        return None
-    error_object = error['object']
-    assert isinstance(error_object, BaseException)
-    return error_object
-
-
 def _wait_for_bound_ordinary_launch(
     replica_id: int,
     cluster_name: str,
@@ -922,7 +909,7 @@ def _wait_for_bound_ordinary_launch(
     def _request_error(projection: Any) -> BaseException | None:
         request = getattr(projection, 'request', None)
         error = getattr(request, 'error', None)
-        return _decoded_bound_request_error(error)
+        return non_pool_launch_reconciliation.decoded_request_error(error)
 
     def _finish_projection(projection: Any,
                            waiter_error: BaseException | None = None) -> None:
@@ -4273,7 +4260,7 @@ class SkyPilotReplicaManager(ReplicaManager):
     @staticmethod
     def _bound_launch_capacity_reason(launch_cloud: clouds.Cloud | None,
                                       error: Any) -> str | None:
-        error = _decoded_bound_request_error(error)
+        error = non_pool_launch_reconciliation.decoded_request_error(error)
         if (launch_cloud is None or
                 not isinstance(error, exceptions.ResourcesUnavailableError)):
             return None
@@ -4294,69 +4281,12 @@ class SkyPilotReplicaManager(ReplicaManager):
         provider_present_cleanup = (getattr(
             projection, 'provider_evidence',
             None) == ordinary_launch_binding.ProviderEvidence.PRESENT)
-        paid_provider_absent = False
-        provider_negative_ack = None
+        provider_absence_projection = None
         if provider_absent:
-            absence_context = projection.context
-            if (not isinstance(
-                    absence_context,
-                    ordinary_launch_binding.BoundNonPoolLaunchContext) or
-                    projection.pre_effect_terminal or
-                    projection.service_job_id is not None):
-                return False
-            if (absence_context.profile.kind == ordinary_launch_binding.
-                    NonPoolLaunchProfileKind.RESERVED_FILL):
-                if projection.paid_capacity_pool_key is not None:
-                    return False
-            elif (absence_context.profile.kind == ordinary_launch_binding.
-                  NonPoolLaunchProfileKind.ORDINARY_PAID):
-                paid_provider_absent = True
-                decoded_error = _decoded_bound_request_error(request_error)
-                evidence_payload = getattr(projection,
-                                           'provider_evidence_payload', None)
-                expected_receipt = (evidence_payload.get('receipt')
-                                    if isinstance(evidence_payload, Mapping)
-                                    else None)
-                expected_cloud_name = (
-                    expected_receipt.get('cluster_name_on_cloud') if isinstance(
-                        expected_receipt, Mapping) else None)
-                try:
-                    expected_client_token = (
-                        ordinary_launch_binding.ordinary_paid_aws_client_token(
-                            absence_context))
-                    expected_aws_account_id = (
-                        ordinary_launch_binding.
-                        ordinary_paid_aws_account_id_from_pool_key(
-                            projection.paid_capacity_pool_key))
-                except (TypeError, ValueError,
-                        ordinary_launch_binding.OrdinaryLaunchBindingConflict):
-                    return False
-                provider_negative_ack = (
-                    capacity_policy.extract_provider_negative_ack(decoded_error)
-                    if decoded_error is not None else None)
-                provider_negative_ack = (
-                    capacity_policy.validate_provider_negative_ack(
-                        provider_negative_ack,
-                        cluster_name=expected_cloud_name,
-                        client_token=expected_client_token,
-                        expected_aws_account_id=expected_aws_account_id)
-                    if isinstance(expected_cloud_name, str) and
-                    expected_cloud_name else None)
-                if (provider_negative_ack is None or
-                        provider_negative_ack != expected_receipt or
-                        projection.status.value != 'FAILED' or
-                        projection.cause.value != 'handler_failed' or
-                        not isinstance(projection.paid_capacity_pool_key, str)
-                        or not projection.paid_capacity_pool_key or
-                        info.paid_capacity_pool_key !=
-                        projection.paid_capacity_pool_key or
-                        info.is_spot is not True or
-                        info.is_zero_cost is not False or
-                        info.reserved_fill is not False or
-                        info.service_job_id is not None):
-                    return False
-                reason = provider_negative_ack['reason']
-            else:
+            provider_absence_projection = (
+                non_pool_launch_reconciliation.
+                apply_exact_provider_absence_replica_projection(projection))
+            if provider_absence_projection is None:
                 return False
         if provider_present_cleanup:
             cleanup_context = projection.context
@@ -4417,20 +4347,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             # physical resource is absent, never publish the replica as ready
             # or stamp a zero-cost materialization even if the handler had
             # reported success before disappearing.
-            if (info.status_property.sky_launch_status !=
-                    common_utils.ProcessStatus.INTERRUPTED):
-                info.status_property.sky_launch_status = (
-                    common_utils.ProcessStatus.FAILED)
-            if paid_provider_absent:
-                info.status_property.failed_spot_availability = True
-                if reason == 'quota':
-                    paid_outcome = paid_capacity.LaunchOutcome.QUOTA_FAILURE
-                elif reason == 'capacity':
-                    paid_outcome = paid_capacity.LaunchOutcome.CAPACITY_FAILURE
-                else:
-                    return False
-            else:
-                paid_outcome = None
+            assert provider_absence_projection is not None
+            paid_outcome = provider_absence_projection.paid_capacity_outcome
         elif provider_present_cleanup:
             # PRESENT proves the exact physical allocation exists, not that
             # launch succeeded.  Preserve the association and request pin;
@@ -4498,6 +4416,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                     return False
         if projection.paid_capacity_pool_key is None:
             paid_outcome = None
+        paid_capacity_pool_key = (
+            provider_absence_projection.paid_capacity_pool_key
+            if provider_absence_projection is not None else
+            projection.paid_capacity_pool_key)
         authority = self._ordinary_launch_binding_authority
         if authority is None:
             return False
@@ -4513,7 +4435,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                        not provider_absent and
                                        not provider_present_cleanup and
                                        status == 'SUCCEEDED'),
-            paid_capacity_pool_key=projection.paid_capacity_pool_key,
+            paid_capacity_pool_key=paid_capacity_pool_key,
             paid_capacity_outcome=paid_outcome)
 
     def _bound_ordinary_launch_callbacks(

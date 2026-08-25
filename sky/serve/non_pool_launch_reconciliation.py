@@ -11,15 +11,20 @@ absence.
 from __future__ import annotations
 
 from collections.abc import Callable
+from collections.abc import Mapping
 import dataclasses
 import time
 from typing import Any
 
 from sky.adaptors import common as adaptors_common
+from sky.provision import capacity_policy
 from sky.serve import ordinary_launch_binding
+from sky.serve import paid_capacity
 from sky.serve import reserved_capacity
+from sky.utils import common_utils
 
 request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
+api_requests = adaptors_common.LazyImport('sky.server.requests.requests')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -28,6 +33,108 @@ class ProviderObservation:
 
     evidence: ordinary_launch_binding.ProviderEvidence
     payload: dict[str, Any]
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderAbsenceReplicaProjection:
+    """Validated replica and paid-capacity result for exact absence."""
+
+    paid_capacity_pool_key: str | None
+    paid_capacity_outcome: paid_capacity.LaunchOutcome | None
+
+
+def decoded_request_error(error: Any) -> BaseException | None:
+    """Extract the exception from the exact durable request error shape."""
+    if isinstance(error, BaseException):
+        return error
+    if not api_requests.decoded_error_is_valid(error):
+        return None
+    error_object = error['object']
+    assert isinstance(error_object, BaseException)
+    return error_object
+
+
+def apply_exact_provider_absence_replica_projection(
+        projection: Any) -> ProviderAbsenceReplicaProjection | None:
+    """Validate exact ABSENT evidence and update its locked replica copy.
+
+    This is the single replica-side reducer for provider absence.  The caller
+    remains responsible for committing the replica, association, retention
+    pin, and paid claim in one PostgreSQL transaction.  This function performs
+    no provider or database I/O.
+    """
+    if (getattr(projection, 'provider_evidence', None) !=
+            ordinary_launch_binding.ProviderEvidence.ABSENT):
+        return None
+    context = getattr(projection, 'context', None)
+    if (not isinstance(context,
+                       ordinary_launch_binding.BoundNonPoolLaunchContext) or
+            projection.pre_effect_terminal or
+            projection.service_job_id is not None):
+        return None
+
+    info = projection.locked_replica_info
+    pool_key = projection.paid_capacity_pool_key
+    paid_outcome = None
+    if (context.profile.kind ==
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
+        if pool_key is not None:
+            return None
+    elif (context.profile.kind ==
+          ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+        request = getattr(projection, 'request', None)
+        decoded_error = decoded_request_error(getattr(request, 'error', None))
+        evidence_payload = getattr(projection, 'provider_evidence_payload',
+                                   None)
+        expected_receipt = (evidence_payload.get('receipt') if isinstance(
+            evidence_payload, Mapping) else None)
+        expected_cloud_name = (expected_receipt.get('cluster_name_on_cloud') if
+                               isinstance(expected_receipt, Mapping) else None)
+        try:
+            expected_client_token = (
+                ordinary_launch_binding.ordinary_paid_aws_client_token(context))
+            expected_aws_account_id = (
+                ordinary_launch_binding.
+                ordinary_paid_aws_account_id_from_pool_key(pool_key))
+        except (TypeError, ValueError,
+                ordinary_launch_binding.OrdinaryLaunchBindingConflict):
+            return None
+        provider_negative_ack = (
+            capacity_policy.extract_provider_negative_ack(decoded_error)
+            if decoded_error is not None else None)
+        provider_negative_ack = capacity_policy.validate_provider_negative_ack(
+            provider_negative_ack,
+            cluster_name=expected_cloud_name,
+            client_token=expected_client_token,
+            expected_aws_account_id=expected_aws_account_id) if isinstance(
+                expected_cloud_name, str) and expected_cloud_name else None
+        status = getattr(getattr(projection, 'status', None), 'value', None)
+        cause = getattr(getattr(projection, 'cause', None), 'value', None)
+        if (provider_negative_ack is None or
+                provider_negative_ack != expected_receipt or
+                status != 'FAILED' or cause != 'handler_failed' or
+                not isinstance(pool_key, str) or not pool_key or
+                info.paid_capacity_pool_key != pool_key or
+                info.is_spot is not True or info.is_zero_cost is not False or
+                info.reserved_fill is not False or
+                info.service_job_id is not None):
+            return None
+        reason = provider_negative_ack['reason']
+        if reason == 'quota':
+            paid_outcome = paid_capacity.LaunchOutcome.QUOTA_FAILURE
+        elif reason == 'capacity':
+            paid_outcome = paid_capacity.LaunchOutcome.CAPACITY_FAILURE
+        else:
+            return None
+        info.status_property.failed_spot_availability = True
+    else:
+        return None
+
+    if (info.status_property.sky_launch_status !=
+            common_utils.ProcessStatus.INTERRUPTED):
+        info.status_property.sky_launch_status = common_utils.ProcessStatus.FAILED
+    return ProviderAbsenceReplicaProjection(paid_capacity_pool_key=pool_key,
+                                            paid_capacity_outcome=paid_outcome)
 
 
 def _reserved_fill_observation_payload(
