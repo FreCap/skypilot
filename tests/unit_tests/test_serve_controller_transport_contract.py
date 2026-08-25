@@ -112,14 +112,18 @@ def test_fixed_local_owner_skips_database_and_preserves_timeout(monkeypatch):
 
 def test_placement_state_contract_validates_response_object():
     response = mock.Mock()
-    response.json.return_value = {'replicas': []}
+    response.json.return_value = {
+        'available': False,
+        'reason': 'controller_unavailable',
+    }
     with mock.patch.object(controller_transport,
                            '_get_to_controller_with_retry',
                            return_value=response) as request:
-        assert serve_utils.get_service_placement_state('svc',
-                                                       'incarnation-a') == {
-                                                           'replicas': []
-                                                       }
+        assert serve_utils.get_service_placement_state(
+            'svc', 'incarnation-a') == {
+                'available': False,
+                'reason': 'controller_unavailable',
+            }
     request.assert_called_once_with(
         'svc',
         'incarnation-a',
@@ -138,6 +142,17 @@ def test_placement_state_contract_validates_response_object():
                            return_value=response):
         with pytest.raises(ValueError,
                            match='Placement-state response must be an object'):
+            serve_utils.get_service_placement_state('svc', 'incarnation-a')
+
+    response.json.return_value = {
+        'available': True,
+        'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+        'order_generation': 'a' * 64,
+    }
+    with mock.patch.object(controller_transport,
+                           '_get_to_controller_with_retry',
+                           return_value=response):
+        with pytest.raises(ValueError, match='must include locations'):
             serve_utils.get_service_placement_state('svc', 'incarnation-a')
 
 
@@ -164,6 +179,8 @@ def test_placement_state_pages_a_legacy_controller_response():
     assert payload['next_offset'] == 4
     assert payload['total_locations'] == 5
     assert payload['truncated'] is True
+    assert payload['pagination_version'] == (
+        constants.PLACEMENT_STATE_LEGACY_PAGINATION_VERSION)
 
 
 def test_placement_state_accepts_an_exact_bounded_controller_page():
@@ -172,6 +189,7 @@ def test_placement_state_accepts_an_exact_bounded_controller_page():
         'available': True,
         'enabled': True,
         'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+        'order_generation': 'a' * 64,
         'page_offset': 100,
         'next_offset': None,
         'total_locations': 101,
@@ -183,19 +201,142 @@ def test_placement_state_accepts_an_exact_bounded_controller_page():
     response.json.return_value = expected
     with mock.patch.object(controller_transport,
                            '_get_to_controller_with_retry',
+                           return_value=response) as request:
+        actual = serve_utils.get_service_placement_state(
+            'svc',
+            'incarnation-a',
+            limit=1,
+            offset=100,
+            expected_order_generation=('a' * 64))
+
+    assert actual is expected
+    request.assert_called_once_with(
+        'svc',
+        'incarnation-a',
+        constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
+        params={
+            'limit': 1,
+            'offset': 100,
+            'include_paid_admission': True,
+            'expected_order_generation': 'a' * 64,
+        },
+        timeout=serve_utils._CONTROLLER_HTTP_TIMEOUT_SECONDS)
+
+
+def test_placement_state_accepts_previous_order_during_rolling_upgrade():
+    response = mock.Mock()
+    expected = {
+        'available': True,
+        'enabled': True,
+        'pagination_version':
+            constants.PLACEMENT_STATE_LEGACY_PAGINATION_VERSION,
+        'page_offset': 1,
+        'next_offset': None,
+        'total_locations': 2,
+        'locations': [{
+            'region': 'legacy-second'
+        }],
+        'truncated': False,
+    }
+    response.json.return_value = expected
+    with mock.patch.object(controller_transport,
+                           '_get_to_controller_with_retry',
                            return_value=response):
         actual = serve_utils.get_service_placement_state('svc',
                                                          'incarnation-a',
                                                          limit=1,
-                                                         offset=100)
+                                                         offset=1)
 
     assert actual is expected
+
+
+@pytest.mark.parametrize('order_generation', [None, '', 'a' * 63, 'A' * 64])
+def test_current_placement_page_requires_valid_order_generation(
+        order_generation):
+    response = mock.Mock()
+    response.json.return_value = {
+        'available': True,
+        'enabled': True,
+        'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+        'order_generation': order_generation,
+        'page_offset': 0,
+        'next_offset': None,
+        'total_locations': 1,
+        'locations': [{
+            'region': 'only'
+        }],
+        'truncated': False,
+    }
+    with mock.patch.object(controller_transport,
+                           '_get_to_controller_with_retry',
+                           return_value=response):
+        with pytest.raises(ValueError, match='order generation'):
+            serve_utils.get_service_placement_state('svc', 'incarnation-a')
+
+
+def test_disabled_current_placement_page_needs_no_order_generation():
+    response = mock.Mock()
+    expected = {
+        'available': True,
+        'enabled': False,
+        'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+        'page_offset': 0,
+        'next_offset': None,
+        'total_locations': 0,
+        'locations': [],
+        'truncated': False,
+    }
+    response.json.return_value = expected
+    with mock.patch.object(controller_transport,
+                           '_get_to_controller_with_retry',
+                           return_value=response):
+        actual = serve_utils.get_service_placement_state('svc', 'incarnation-a')
+
+    assert actual is expected
+
+
+def test_catalog_order_change_response_is_validated_and_preserved():
+    response = mock.Mock()
+    expected = {
+        'available': False,
+        'reason': 'catalog_order_changed',
+        'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+        'order_generation': 'b' * 64,
+    }
+    response.json.return_value = expected
+    with mock.patch.object(controller_transport,
+                           '_get_to_controller_with_retry',
+                           return_value=response):
+        actual = serve_utils.get_service_placement_state(
+            'svc',
+            'incarnation-a',
+            limit=1,
+            offset=1,
+            expected_order_generation='a' * 64)
+
+    assert actual is expected
+
+    response.json.return_value = {
+        **expected,
+        'order_generation': 'malformed',
+    }
+    with mock.patch.object(controller_transport,
+                           '_get_to_controller_with_retry',
+                           return_value=response):
+        with pytest.raises(ValueError, match='invalid generation'):
+            serve_utils.get_service_placement_state(
+                'svc',
+                'incarnation-a',
+                limit=1,
+                offset=1,
+                expected_order_generation='a' * 64)
 
 
 def test_placement_state_rejects_a_mismatched_controller_page():
     response = mock.Mock()
     response.json.return_value = {
         'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+        'order_generation': 'a' * 64,
         'page_offset': 0,
         'next_offset': None,
         'total_locations': 1,

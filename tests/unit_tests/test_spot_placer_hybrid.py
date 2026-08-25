@@ -889,6 +889,15 @@ run: echo hi
         per_gpu = _make_per_gpu_placer(costs)
         assert per_gpu.select_next_location() == four_gpu
         assert per_gpu.ranked_active_locations() == [four_gpu, one_gpu]
+        snapshot = per_gpu.placement_snapshot()
+        assert snapshot['cost_unit'] == 'gpu_slot_hour'
+        assert [entry['accelerators']['L4'] for entry in snapshot['locations']
+               ] == [4, 1]
+        assert [
+            entry['normalized_hourly_cost'] for entry in snapshot['locations']
+        ] == [0.15, 0.2]
+        assert [entry['cached_hourly_cost'] for entry in snapshot['locations']
+               ] == [0.6, 0.2]
 
     def test_ranked_active_locations_matches_selection_and_stabilizes_ties(
             self, monkeypatch):

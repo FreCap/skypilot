@@ -1223,7 +1223,7 @@ def _resident_placement_page():
     return {
         'available': True,
         'enabled': True,
-        'pagination_version': 1,
+        'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
         'page_offset': 0,
         'next_offset': None,
         'total_locations': 1,
@@ -1257,7 +1257,11 @@ def test_placement_route_default_is_resident_only(monkeypatch):
     get_replicas.assert_not_called()
     build_budget.assert_not_called()
     placer.placement_snapshot.assert_called_once_with(
-        limit=100, offset=0, paid_admission_by_location=None)
+        limit=100,
+        offset=0,
+        paid_admission_by_location=None,
+        expected_order_generation=None,
+        service_incarnation='incarnation-a')
 
 
 def test_placement_route_replica_read_failure_preserves_resident_page(
@@ -1286,16 +1290,23 @@ def test_placement_route_replica_read_failure_preserves_resident_page(
     get_replicas.assert_called_once_with('svc')
     build_budget.assert_not_called()
     placer.placement_snapshot.assert_called_once_with(
-        limit=100, offset=0, paid_admission_by_location=None)
+        limit=100,
+        offset=0,
+        paid_admission_by_location=None,
+        expected_order_generation=None,
+        service_incarnation='incarnation-a')
 
 
 def test_placement_route_opt_in_includes_paid_admission(monkeypatch):
     ctrl = _make_update_controller()
     admission = {'location-a': {'state': 'allowed'}}
 
-    def _placement_snapshot(*, limit, offset, paid_admission_by_location):
+    def _placement_snapshot(*, limit, offset, paid_admission_by_location,
+                            expected_order_generation, service_incarnation):
         assert limit == 25
         assert offset == 50
+        assert expected_order_generation == 'a' * 64
+        assert service_incarnation == 'incarnation-a'
         return {
             **_resident_placement_page(),
             'page_offset': offset,
@@ -1327,6 +1338,7 @@ def test_placement_route_opt_in_includes_paid_admission(monkeypatch):
                           params={
                               'limit': 25,
                               'offset': 50,
+                              'expected_order_generation': 'a' * 64,
                               'include_paid_admission': True,
                           })
 

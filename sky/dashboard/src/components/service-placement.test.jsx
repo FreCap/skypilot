@@ -12,7 +12,7 @@ import {
   filterPlacementLocations,
   formatAccelerators,
   formatHourlyPrice,
-  groupPlacementLocations,
+  formatPlacementHourlyPrice,
   LOCATION_AVAILABILITY,
   locationAvailability,
   locationDisplayStatus,
@@ -34,13 +34,36 @@ function deferred() {
   return { promise, reject, resolve };
 }
 
+const ORDER_GENERATION_A = 'a'.repeat(64);
+const ORDER_GENERATION_B = 'b'.repeat(64);
+
 const placement = {
   serviceName: 'svc',
   placerState: {
     available: true,
     enabled: true,
     retrySeconds: 600,
+    paginationVersion: 2,
+    pageOffset: 0,
+    costUnit: 'gpu_slot_hour',
+    orderSemantics: 'catalog_normalized_cost_then_location_identity',
+    orderGeneration: ORDER_GENERATION_A,
     locations: [
+      {
+        cloud: 'GCP',
+        region: 'us-central1',
+        zone: 'us-central1-a',
+        instanceType: 'g2-standard-4',
+        accelerators: { L4: 1 },
+        useSpot: true,
+        storedStatus: 'ACTIVE',
+        effectiveStatus: 'ACTIVE',
+        probeEligible: false,
+        benchedAt: null,
+        nextProbeAt: null,
+        cachedHourlyCost: 0.35,
+        normalizedHourlyCost: 0.35,
+      },
       {
         cloud: 'AWS',
         region: 'us-east-1',
@@ -55,25 +78,12 @@ const placement = {
         benchedAt: 1000,
         nextProbeAt: 1600,
         cachedHourlyCost: 0.45,
+        normalizedHourlyCost: 0.45,
         paidAdmission: {
           state: 'probe',
           poolRemaining: 1,
           serviceRemaining: 12,
         },
-      },
-      {
-        cloud: 'AWS',
-        region: 'us-east-1',
-        zone: 'us-east-1b',
-        instanceType: 'g6.2xlarge',
-        accelerators: { A100: 1 },
-        useSpot: false,
-        storedStatus: 'ACTIVE',
-        effectiveStatus: 'ACTIVE',
-        probeEligible: false,
-        benchedAt: null,
-        nextProbeAt: null,
-        cachedHourlyCost: 3.25,
       },
       {
         cloud: 'AWS',
@@ -88,20 +98,22 @@ const placement = {
         benchedAt: 1000,
         nextProbeAt: 9999999999,
         cachedHourlyCost: 2.5,
+        normalizedHourlyCost: 2.5,
       },
       {
-        cloud: 'GCP',
-        region: 'us-central1',
-        zone: 'us-central1-a',
-        instanceType: 'g2-standard-4',
-        accelerators: { L4: 1 },
-        useSpot: true,
+        cloud: 'AWS',
+        region: 'us-east-1',
+        zone: 'us-east-1b',
+        instanceType: 'g6.2xlarge',
+        accelerators: { A100: 1 },
+        useSpot: false,
         storedStatus: 'ACTIVE',
         effectiveStatus: 'ACTIVE',
         probeEligible: false,
         benchedAt: null,
         nextProbeAt: null,
-        cachedHourlyCost: 0.35,
+        cachedHourlyCost: 3.25,
+        normalizedHourlyCost: 3.25,
       },
     ],
     truncated: false,
@@ -142,6 +154,10 @@ it('formats shape and retry state', () => {
   expect(formatAccelerators({})).toBe('-');
   expect(formatHourlyPrice(1.25)).toBe('$1.2500/hr');
   expect(formatHourlyPrice(null)).toBe('Price unavailable');
+  expect(formatPlacementHourlyPrice(0.125, 'gpu_slot_hour')).toBe(
+    '$0.1250/GPU-hr'
+  );
+  expect(formatPlacementHourlyPrice(0.5, null)).toBe('$0.5000/ordering-unit');
   expect(
     locationDisplayStatus({
       storedStatus: 'PREEMPTED',
@@ -165,16 +181,7 @@ it('formats shape and retry state', () => {
   ).toBe(LOCATION_AVAILABILITY.UNAVAILABLE);
 });
 
-it('groups one row per provider-region and filters card, availability, and price', () => {
-  const groups = groupPlacementLocations(placement.placerState.locations);
-  expect(groups).toHaveLength(2);
-  expect(groups[0]).toMatchObject({
-    provider: 'AWS',
-    region: 'us-east-1',
-  });
-  expect(groups[0].available).toHaveLength(2);
-  expect(groups[0].unavailable).toHaveLength(1);
-
+it('filters candidates without changing the server placement order', () => {
   const filtered = filterPlacementLocations(placement.placerState.locations, {
     provider: 'all',
     region: 'all',
@@ -186,8 +193,46 @@ it('groups one row per provider-region and filters card, availability, and price
   expect(filtered[0]).toMatchObject({
     cloud: 'GCP',
     region: 'us-central1',
-    cachedHourlyCost: 0.35,
+    normalizedHourlyCost: 0.35,
   });
+
+  const normalizedCheaperThanMachine = {
+    ...placement.placerState.locations[0],
+    cachedHourlyCost: 0.8,
+    normalizedHourlyCost: 0.2,
+  };
+  expect(
+    filterPlacementLocations([normalizedCheaperThanMachine], {
+      provider: 'all',
+      region: 'all',
+      card: 'all',
+      availability: 'all',
+      maxPrice: '0.4',
+    })
+  ).toEqual([normalizedCheaperThanMachine]);
+});
+
+it('does not claim cost ordering for an older controller response', async () => {
+  getServicePlacement.mockResolvedValueOnce({
+    ...placement,
+    placerState: {
+      ...placement.placerState,
+      costUnit: null,
+      orderSemantics: null,
+      locations: placement.placerState.locations.map((location) => ({
+        ...location,
+        normalizedHourlyCost: null,
+      })),
+    },
+  });
+
+  render(<ServicePlacement serviceName="svc" />);
+
+  expect(
+    await screen.findByText(/does not report a normalized catalog-cost order/)
+  ).toBeTruthy();
+  expect(screen.getAllByText('Order price unavailable')).toHaveLength(4);
+  expect(screen.getByText('Maximum machine price')).toBeTruthy();
 });
 
 it('loads once on mount and only refreshes manually', async () => {
@@ -195,16 +240,19 @@ it('loads once on mount and only refreshes manually', async () => {
   try {
     render(<ServicePlacement serviceName="svc" />);
 
-    expect(await screen.findByText('Service fallback locations')).toBeTruthy();
-    const awsRow = screen
-      .getByRole('cell', { name: /AWS us-east-1/ })
-      .closest('tr');
-    expect(within(awsRow).getByText('L4:1')).toBeTruthy();
-    expect(within(awsRow).getByText('$0.4500/hr')).toBeTruthy();
-    expect(within(awsRow).getByText('A100:1')).toBeTruthy();
-    expect(within(awsRow).getByText('$3.2500/hr')).toBeTruthy();
-    expect(within(awsRow).getByText('H100:1')).toBeTruthy();
-    expect(within(awsRow).getByText('$2.5000/hr')).toBeTruthy();
+    expect(
+      await screen.findByText('Candidate catalog — not launches')
+    ).toBeTruthy();
+    const l4Row = screen.getByRole('row', { name: /Zone: us-east-1a/ });
+    expect(within(l4Row).getByText('L4:1')).toBeTruthy();
+    expect(within(l4Row).getByText('$0.4500/GPU-hr')).toBeTruthy();
+    expect(within(l4Row).getByText('$0.4500/machine-hr')).toBeTruthy();
+    const a100Row = screen.getByRole('row', { name: /Zone: us-east-1b/ });
+    expect(within(a100Row).getByText('A100:1')).toBeTruthy();
+    expect(within(a100Row).getByText('$3.2500/GPU-hr')).toBeTruthy();
+    const h100Row = screen.getByRole('row', { name: /Zone: us-east-1c/ });
+    expect(within(h100Row).getByText('H100:1')).toBeTruthy();
+    expect(within(h100Row).getByText('$2.5000/GPU-hr')).toBeTruthy();
     expect(
       screen.getByLabelText(
         /Eligibility: Eligible spot[\s\S]*Probe eligible since/
@@ -219,6 +267,29 @@ it('loads once on mount and only refreshes manually', async () => {
     expect(screen.getByText('gcp')).toBeTruthy();
     expect(screen.getByText('g2-standard-4 (L4:1)')).toBeTruthy();
     expect(screen.getByText(/exact instance demand/)).toBeTruthy();
+    expect(
+      screen.getByText(/Actual selection applies ACTIVE status/)
+    ).toBeTruthy();
+    expect(
+      screen
+        .getAllByRole('row')
+        .filter((row) => row.hasAttribute('aria-label'))
+        .map((row) => row.getAttribute('aria-label').split('\n')[0])
+    ).toEqual([
+      'Zone: us-central1-a',
+      'Zone: us-east-1a',
+      'Zone: us-east-1c',
+      'Zone: us-east-1b',
+    ]);
+    expect(
+      screen
+        .getAllByRole('heading', { level: 3 })
+        .map((heading) => heading.textContent)
+    ).toEqual([
+      'Actual placement attempts (24h)',
+      'Candidate catalog — not launches',
+      'Launch suppression',
+    ]);
     expect(getServicePlacement).toHaveBeenCalledTimes(1);
 
     await act(async () => {
@@ -236,13 +307,13 @@ it('loads once on mount and only refreshes manually', async () => {
 
 it('filters the compact rows and clears all filters', async () => {
   render(<ServicePlacement serviceName="svc" />);
-  expect(await screen.findByText('$3.2500/hr')).toBeTruthy();
+  expect(await screen.findByText('$3.2500/GPU-hr')).toBeTruthy();
 
   fireEvent.change(screen.getByLabelText('Provider filter'), {
     target: { value: 'GCP' },
   });
-  expect(screen.queryByRole('cell', { name: /AWS us-east-1/ })).toBeNull();
-  expect(screen.getByRole('cell', { name: /GCP us-central1/ })).toBeTruthy();
+  expect(screen.queryByRole('row', { name: /Zone: us-east-1a/ })).toBeNull();
+  expect(screen.getByRole('row', { name: /Zone: us-central1-a/ })).toBeTruthy();
 
   fireEvent.change(screen.getByLabelText('Provider filter'), {
     target: { value: 'all' },
@@ -250,8 +321,8 @@ it('filters the compact rows and clears all filters', async () => {
   fireEvent.change(screen.getByLabelText('Region filter'), {
     target: { value: 'us-central1' },
   });
-  expect(screen.queryByRole('cell', { name: /AWS us-east-1/ })).toBeNull();
-  expect(screen.getByRole('cell', { name: /GCP us-central1/ })).toBeTruthy();
+  expect(screen.queryByRole('row', { name: /Zone: us-east-1a/ })).toBeNull();
+  expect(screen.getByRole('row', { name: /Zone: us-central1-a/ })).toBeTruthy();
 
   fireEvent.change(screen.getByLabelText('Region filter'), {
     target: { value: 'all' },
@@ -259,9 +330,9 @@ it('filters the compact rows and clears all filters', async () => {
   fireEvent.change(screen.getByLabelText('Eligibility filter'), {
     target: { value: LOCATION_AVAILABILITY.AVAILABLE_ON_DEMAND },
   });
-  expect(screen.getByText('$3.2500/hr')).toBeTruthy();
-  expect(screen.queryByText('$0.4500/hr')).toBeNull();
-  expect(screen.queryByText('$2.5000/hr')).toBeNull();
+  expect(screen.getByText('$3.2500/GPU-hr')).toBeTruthy();
+  expect(screen.queryByText('$0.4500/GPU-hr')).toBeNull();
+  expect(screen.queryByText('$2.5000/GPU-hr')).toBeNull();
 
   fireEvent.change(screen.getByLabelText('Eligibility filter'), {
     target: { value: 'all' },
@@ -272,13 +343,13 @@ it('filters the compact rows and clears all filters', async () => {
   fireEvent.change(screen.getByLabelText('Maximum price filter'), {
     target: { value: '0.4' },
   });
-  expect(screen.getByText('$0.3500/hr')).toBeTruthy();
-  expect(screen.queryByText('$0.4500/hr')).toBeNull();
+  expect(screen.getByText('$0.3500/GPU-hr')).toBeTruthy();
+  expect(screen.queryByText('$0.4500/GPU-hr')).toBeNull();
 
   fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }));
-  expect(screen.getByText('$0.4500/hr')).toBeTruthy();
-  expect(screen.getByText('$3.2500/hr')).toBeTruthy();
-  expect(screen.getByText('$2.5000/hr')).toBeTruthy();
+  expect(screen.getByText('$0.4500/GPU-hr')).toBeTruthy();
+  expect(screen.getByText('$3.2500/GPU-hr')).toBeTruthy();
+  expect(screen.getByText('$2.5000/GPU-hr')).toBeTruthy();
 });
 
 it('exposes next-probe detail on the unavailable card hover target', async () => {
@@ -318,9 +389,7 @@ it('ignores a stale response after the service route changes', async () => {
     });
     await Promise.resolve();
   });
-  expect(
-    await screen.findByRole('cell', { name: /AWS svc-b-region/ })
-  ).toBeTruthy();
+  expect(await screen.findByText('svc-b-region')).toBeTruthy();
 
   await act(async () => {
     first.resolve({
@@ -338,8 +407,8 @@ it('ignores a stale response after the service route changes', async () => {
     });
     await Promise.resolve();
   });
-  expect(screen.getByRole('cell', { name: /AWS svc-b-region/ })).toBeTruthy();
-  expect(screen.queryByRole('cell', { name: /AWS svc-a-region/ })).toBeNull();
+  expect(screen.getByText('svc-b-region')).toBeTruthy();
+  expect(screen.queryByText('svc-a-region')).toBeNull();
 });
 
 it('loads older decisions with the opaque cursor and appends them', async () => {
@@ -354,6 +423,8 @@ it('loads older decisions with the opaque cursor and appends them', async () => 
             clusterName: 'svc-new',
             observedAt: 2000,
             outcome: 'succeeded',
+            hourlyPrice: 0.1541,
+            priceSource: 'catalog_at_decision',
           },
         ],
         nextCursor: 'older-cursor',
@@ -377,6 +448,9 @@ it('loads older decisions with the opaque cursor and appends them', async () => 
 
   render(<ServicePlacement serviceName="svc" />);
   expect(await screen.findByText('svc-new')).toBeTruthy();
+  expect(screen.getByText('$0.1541/machine-hr')).toBeTruthy();
+  expect(screen.getByText('Catalog estimate at decision')).toBeTruthy();
+  expect(screen.getByText(/not provider billing/)).toBeTruthy();
 
   fireEvent.click(screen.getByRole('button', { name: 'Load older decisions' }));
 
@@ -424,21 +498,141 @@ it('loads the next bounded location page and preserves the first page', async ()
     });
 
   render(<ServicePlacement serviceName="svc" />);
-  expect(
-    await screen.findByRole('cell', { name: /AWS first-region/ })
-  ).toBeTruthy();
+  expect(await screen.findByText('first-region')).toBeTruthy();
 
   fireEvent.click(screen.getByRole('button', { name: 'Load more locations' }));
 
-  expect(
-    await screen.findByRole('cell', { name: /AWS second-region/ })
-  ).toBeTruthy();
-  expect(screen.getByRole('cell', { name: /AWS first-region/ })).toBeTruthy();
+  expect(await screen.findByText('second-region')).toBeTruthy();
+  expect(screen.getByText('first-region')).toBeTruthy();
   expect(getServicePlacement).toHaveBeenLastCalledWith({
     serviceName: 'svc',
     cursor: null,
     locationOffset: 1,
+    locationOrderGeneration: ORDER_GENERATION_A,
   });
+});
+
+it('reloads page zero instead of mixing different catalog orders', async () => {
+  getServicePlacement
+    .mockResolvedValueOnce({
+      ...placement,
+      placerState: {
+        ...placement.placerState,
+        paginationVersion: 1,
+        orderSemantics: null,
+        orderGeneration: null,
+        locations: [
+          {
+            ...placement.placerState.locations[0],
+            region: 'legacy-first',
+          },
+        ],
+        nextOffset: 1,
+        totalLocations: 2,
+        truncated: true,
+      },
+    })
+    .mockResolvedValueOnce({
+      ...placement,
+      placerState: {
+        ...placement.placerState,
+        pageOffset: 1,
+        locations: [
+          {
+            ...placement.placerState.locations[1],
+            region: 'must-not-append',
+          },
+        ],
+        nextOffset: null,
+        totalLocations: 2,
+        truncated: false,
+      },
+    })
+    .mockResolvedValueOnce({
+      ...placement,
+      placerState: {
+        ...placement.placerState,
+        locations: [
+          {
+            ...placement.placerState.locations[0],
+            region: 'fresh-first',
+          },
+        ],
+        nextOffset: 1,
+        totalLocations: 2,
+        truncated: true,
+      },
+    });
+
+  render(<ServicePlacement serviceName="svc" />);
+  expect(await screen.findByText('legacy-first')).toBeTruthy();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Load more locations' }));
+
+  expect(await screen.findByText('fresh-first')).toBeTruthy();
+  expect(screen.queryByText('legacy-first')).toBeNull();
+  expect(screen.queryByText('must-not-append')).toBeNull();
+  expect(getServicePlacement).toHaveBeenCalledTimes(3);
+  expect(getServicePlacement).toHaveBeenLastCalledWith({ serviceName: 'svc' });
+});
+
+it('reloads page zero when the server rejects a stale order token', async () => {
+  getServicePlacement
+    .mockResolvedValueOnce({
+      ...placement,
+      placerState: {
+        ...placement.placerState,
+        locations: [
+          {
+            ...placement.placerState.locations[0],
+            region: 'stale-first',
+          },
+        ],
+        nextOffset: 1,
+        totalLocations: 2,
+        truncated: true,
+      },
+    })
+    .mockResolvedValueOnce({
+      ...placement,
+      placerState: {
+        available: false,
+        reason: 'catalog_order_changed',
+        orderGeneration: ORDER_GENERATION_B,
+        locations: [],
+      },
+    })
+    .mockResolvedValueOnce({
+      ...placement,
+      placerState: {
+        ...placement.placerState,
+        orderGeneration: ORDER_GENERATION_B,
+        locations: [
+          {
+            ...placement.placerState.locations[0],
+            region: 'current-first',
+          },
+        ],
+        nextOffset: 1,
+        totalLocations: 2,
+        truncated: true,
+      },
+    });
+
+  render(<ServicePlacement serviceName="svc" />);
+  expect(await screen.findByText('stale-first')).toBeTruthy();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Load more locations' }));
+
+  expect(await screen.findByText('current-first')).toBeTruthy();
+  expect(screen.queryByText('stale-first')).toBeNull();
+  expect(getServicePlacement).toHaveBeenNthCalledWith(2, {
+    serviceName: 'svc',
+    cursor: null,
+    locationOffset: 1,
+    locationOrderGeneration: ORDER_GENERATION_A,
+  });
+  expect(getServicePlacement).toHaveBeenLastCalledWith({ serviceName: 'svc' });
 });
 
 it('preserves and retries a location page after a fail-soft response', async () => {
@@ -469,16 +663,14 @@ it('preserves and retries a location page after a fail-soft response', async () 
     });
 
   render(<ServicePlacement serviceName="svc" />);
-  expect(
-    await screen.findByRole('cell', { name: /AWS first-region/ })
-  ).toBeTruthy();
+  expect(await screen.findByText('first-region')).toBeTruthy();
 
   fireEvent.click(screen.getByRole('button', { name: 'Load more locations' }));
 
   expect(
     await screen.findByText('Failed to load more placement locations.')
   ).toBeTruthy();
-  expect(screen.getByRole('cell', { name: /AWS first-region/ })).toBeTruthy();
+  expect(screen.getByText('first-region')).toBeTruthy();
   const retry = screen.getByRole('button', { name: 'Load more locations' });
   expect(retry).toBeEnabled();
 
@@ -488,6 +680,7 @@ it('preserves and retries a location page after a fail-soft response', async () 
     serviceName: 'svc',
     cursor: null,
     locationOffset: 1,
+    locationOrderGeneration: ORDER_GENERATION_A,
   });
 });
 

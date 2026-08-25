@@ -9,11 +9,14 @@ therefore never picked up. The TTL decay retries each benched location
 with one probe launch per window.
 """
 # pylint: disable=redefined-outer-name,protected-access,unused-variable
+from unittest import mock
+
 import pytest
 from spot_placer_test_utils import make_location
 from spot_placer_test_utils import make_placer
 
 from sky import clouds
+from sky.serve import constants
 from sky.serve import spot_placer
 
 
@@ -204,30 +207,103 @@ class TestPreemptionTtlRetry:
             for item in snapshot['locations']
         }
         assert prices == {'seoul': 1.0, 'oregon': 2.0, 'iowa': 3.0}
+        assert snapshot['cost_unit'] == 'machine_hour'
+        assert snapshot['order_semantics'] == (
+            'catalog_normalized_cost_then_location_identity')
+        assert {
+            item['region']: item['normalized_hourly_cost']
+            for item in snapshot['locations']
+        } == prices
 
     def test_snapshot_pages_all_resident_locations_deterministically(
             self, placer_and_locations):
         placer, cheap, other, third = placer_and_locations
 
         first = placer.placement_snapshot(limit=2)
-        second = placer.placement_snapshot(limit=2, offset=first['next_offset'])
+        second = placer.placement_snapshot(
+            limit=2,
+            offset=first['next_offset'],
+            expected_order_generation=first['order_generation'])
 
         assert first['page_offset'] == 0
+        assert first[
+            'pagination_version'] == constants.PLACEMENT_STATE_PAGINATION_VERSION
         assert first['next_offset'] == 2
         assert first['total_locations'] == 3
         assert first['truncated'] is True
+        assert len(first['order_generation']) == 64
+        assert second['order_generation'] == first['order_generation']
         assert second['page_offset'] == 2
         assert second['next_offset'] is None
         assert second['total_locations'] == 3
         assert second['truncated'] is False
-        expected_regions = [
-            location.region
-            for location in sorted((cheap, other, third),
-                                   key=lambda item: item.sort_key())
-        ]
         assert [
             item['region'] for item in first['locations'] + second['locations']
-        ] == expected_regions
+        ] == [cheap.region, other.region, third.region]
+
+    @pytest.mark.parametrize('expected_order_generation', [None, '0' * 64])
+    def test_noninitial_snapshot_page_requires_exact_order_generation(
+            self, placer_and_locations, expected_order_generation):
+        placer, cheap, other, third = placer_and_locations
+
+        snapshot = placer.placement_snapshot(
+            limit=1,
+            offset=1,
+            expected_order_generation=expected_order_generation)
+
+        assert snapshot['available'] is False
+        assert snapshot['reason'] == 'catalog_order_changed'
+        assert snapshot['pagination_version'] == (
+            constants.PLACEMENT_STATE_PAGINATION_VERSION)
+        assert len(snapshot['order_generation']) == 64
+        assert 'locations' not in snapshot
+
+    def test_snapshot_rejects_page_when_workspace_membership_changes(
+            self, placer_and_locations):
+        placer, cheap, other, third = placer_and_locations
+
+        with mock.patch.object(placer,
+                               '_workspace_eligible_locations',
+                               side_effect=[{cheap, other}, {other, third}]):
+            first = placer.placement_snapshot(limit=1)
+            second = placer.placement_snapshot(
+                limit=1,
+                offset=first['next_offset'],
+                expected_order_generation=first['order_generation'])
+
+        assert first['total_locations'] == 2
+        assert [entry['region'] for entry in first['locations']
+               ] == [cheap.region]
+        assert second['available'] is False
+        assert second['reason'] == 'catalog_order_changed'
+        assert second['order_generation'] != first['order_generation']
+        assert 'locations' not in second
+
+    def test_snapshot_rejects_page_from_previous_service_incarnation(
+            self, placer_and_locations):
+        placer, cheap, other, third = placer_and_locations
+
+        first = placer.placement_snapshot(limit=1, service_incarnation='hash-a')
+        second = placer.placement_snapshot(
+            limit=1,
+            offset=first['next_offset'],
+            expected_order_generation=first['order_generation'],
+            service_incarnation='hash-b')
+
+        assert second['available'] is False
+        assert second['reason'] == 'catalog_order_changed'
+        assert second['order_generation'] != first['order_generation']
+        assert 'locations' not in second
+
+    def test_snapshot_breaks_equal_cost_ties_by_location_identity(self):
+        later = make_location('zeta', cloud_name='AWS')
+        earlier = make_location('alpha', cloud_name='AWS')
+        placer = make_placer({later: 1.0, earlier: 1.0})
+
+        snapshot = placer.placement_snapshot()
+
+        assert [item['region'] for item in snapshot['locations']
+               ] == ['alpha', 'zeta']
 
     def test_snapshot_default_page_is_bounded(self):
         locations = [

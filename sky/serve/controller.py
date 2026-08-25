@@ -7016,6 +7016,11 @@ class SkyServeController:
                 le=serve_constants.PLACEMENT_STATE_MAX_PAGE_SIZE),
             offset: int = fastapi.Query(
                 default=0, ge=0, le=serve_constants.PLACEMENT_STATE_MAX_OFFSET),
+            expected_order_generation: str | None = fastapi.Query(
+                default=None,
+                min_length=64,
+                max_length=64,
+                pattern=r'^[0-9a-f]{64}$'),
             include_paid_admission: bool = fastapi.Query(default=False),
         ) -> fastapi.Response:
             # Pre-pagination API processes call this route without query
@@ -7067,7 +7072,9 @@ class SkyServeController:
                 content = placer.placement_snapshot(
                     limit=limit,
                     offset=offset,
-                    paid_admission_by_location=paid_admission)
+                    paid_admission_by_location=paid_admission,
+                    expected_order_generation=expected_order_generation,
+                    service_incarnation=self._service_hash)
             return responses.JSONResponse(content=content, status_code=200)
 
         @self._app.get(

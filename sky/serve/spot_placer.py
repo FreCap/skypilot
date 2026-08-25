@@ -4,6 +4,8 @@ import collections
 from collections.abc import Mapping
 import dataclasses
 import enum
+import hashlib
+import json
 import math
 import os
 import re
@@ -66,6 +68,8 @@ _PLACEMENT_CATALOG_SCHEMA_VERSION = 1
 # placement JSON remains versioned independently of the API wire version.
 PLACEMENT_CATALOG_SCHEMA_VERSION = _PLACEMENT_CATALOG_SCHEMA_VERSION
 _PLACEMENT_CATALOG_MAX_LOCATIONS = 100_000
+_PLACEMENT_SNAPSHOT_ORDER_SEMANTICS = (
+    'catalog_normalized_cost_then_location_identity')
 
 
 def _normalize_image_id(
@@ -1624,7 +1628,10 @@ class SpotPlacer:
         self,
         limit: int = constants.PLACEMENT_STATE_DEFAULT_PAGE_SIZE,
         offset: int = 0,
-        paid_admission_by_location: dict[Location, dict[str, Any]] | None = None
+        paid_admission_by_location: dict[Location, dict[str, Any]] |
+        None = None,
+        expected_order_generation: str | None = None,
+        service_incarnation: str | None = None,
     ) -> dict[str, Any]:
         """Serialize one page of resident retry state without provider calls."""
         if (not isinstance(limit, int) or isinstance(limit, bool) or
@@ -1638,9 +1645,50 @@ class SpotPlacer:
         now = time.time()
         retry_seconds = _preemption_retry_seconds()
         eligible_locations = self._workspace_eligible_locations()
-        locations = sorted((location for location in self.location2status
-                            if location in eligible_locations),
-                           key=lambda location: location.sort_key())
+        # This is catalog display order, not a promise that the selector will
+        # attempt every preceding row. Runtime selection additionally applies
+        # ACTIVE/card/zero-cost/admission/frontier gates. The identity key
+        # makes equal-price display order stable across restarts and page reads;
+        # eligibility stays on each row so a benched candidate is explained.
+        locations = sorted(
+            (location for location in self.location2status
+             if location in eligible_locations),
+            key=lambda location:
+            (self._normalized_location_cost(location), location.sort_key()))
+        # Workspace policy is re-read for every request. Bind later pages to
+        # this complete ordered catalog so a policy/cost change cannot shift
+        # offsets and silently duplicate or omit rows in the caller's view.
+        order_locations = []
+        for location in locations:
+            normalized_cost = self._normalized_location_cost(location)
+            order_locations.append({
+                'identity': location.sort_key(),
+                'normalized_hourly_cost':
+                    (normalized_cost if math.isfinite(normalized_cost) else None
+                    ),
+            })
+        order_payload = {
+            'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+            'order_semantics': _PLACEMENT_SNAPSHOT_ORDER_SEMANTICS,
+            'cost_unit': self.placement_contract.cost_unit,
+            # Prevent a same-name service recreation with an identical catalog
+            # from appending its page to the previous incarnation's view.
+            'service_incarnation': service_incarnation,
+            'locations': order_locations,
+        }
+        order_generation = hashlib.sha256(
+            json.dumps(order_payload,
+                       sort_keys=True,
+                       separators=(',', ':'),
+                       allow_nan=False).encode('utf-8')).hexdigest()
+        if offset > 0 and expected_order_generation != order_generation:
+            return {
+                'available': False,
+                'reason': 'catalog_order_changed',
+                'pagination_version':
+                    constants.PLACEMENT_STATE_PAGINATION_VERSION,
+                'order_generation': order_generation,
+            }
         entries = []
         page_end = min(len(locations), offset + limit)
         for location in locations[offset:page_end]:
@@ -1659,6 +1707,10 @@ class SpotPlacer:
             cached_cost = self.location2cost.get(location)
             if cached_cost is not None and not math.isfinite(cached_cost):
                 cached_cost = None
+            raw_normalized_cost = self._normalized_location_cost(location)
+            entry_normalized_cost: float | None = raw_normalized_cost
+            if not math.isfinite(raw_normalized_cost):
+                entry_normalized_cost = None
             entry = {
                 'cloud': str(location.cloud),
                 'region': location.region,
@@ -1675,6 +1727,7 @@ class SpotPlacer:
                 'retry_reserved_at': retry_reserved_at,
                 'next_probe_at': next_probe_at,
                 'cached_hourly_cost': cached_cost,
+                'normalized_hourly_cost': entry_normalized_cost,
             }
             if paid_admission_by_location is not None:
                 admission = paid_admission_by_location.get(location)
@@ -1690,6 +1743,9 @@ class SpotPlacer:
             'total_locations': len(locations),
             'retry_seconds': retry_seconds,
             'observed_at': now,
+            'cost_unit': self.placement_contract.cost_unit,
+            'order_semantics': _PLACEMENT_SNAPSHOT_ORDER_SEMANTICS,
+            'order_generation': order_generation,
             'status_semantics':
                 ('Controller eligibility only; ACTIVE does not guarantee live '
                  'provider capacity.'),

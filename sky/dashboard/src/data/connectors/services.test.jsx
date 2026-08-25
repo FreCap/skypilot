@@ -2017,11 +2017,14 @@ describe('service placement', () => {
     placer_state: {
       available: true,
       enabled: true,
-      pagination_version: 1,
+      pagination_version: 2,
       page_offset: 0,
       next_offset: null,
       total_locations: 1,
       retry_seconds: 600,
+      cost_unit: 'gpu_slot_hour',
+      order_semantics: 'catalog_normalized_cost_then_location_identity',
+      order_generation: 'a'.repeat(64),
       status_semantics: 'Eligibility is not live inventory.',
       locations: [
         {
@@ -2037,6 +2040,8 @@ describe('service placement', () => {
           probe_eligible: true,
           benched_at: 1000,
           next_probe_at: 1600,
+          cached_hourly_cost: 0.44,
+          normalized_hourly_cost: 0.11,
           paid_admission: {
             state: 'cooldown',
             pool_remaining: 0,
@@ -2079,6 +2084,7 @@ describe('service placement', () => {
           zone: 'us-east-1a',
           instance_type: 'g6.4xlarge',
           hourly_price: 0.25,
+          price_source: 'catalog_at_decision',
         },
       ],
     },
@@ -2096,6 +2102,8 @@ describe('service placement', () => {
       storedStatus: 'PREEMPTED',
       effectiveStatus: 'ACTIVE',
       nextProbeAt: 1600,
+      cachedHourlyCost: 0.44,
+      normalizedHourlyCost: 0.11,
       paidAdmission: {
         state: 'cooldown',
         poolRemaining: 0,
@@ -2107,10 +2115,13 @@ describe('service placement', () => {
       'Eligibility is not live inventory.'
     );
     expect(placement.placerState).toMatchObject({
-      paginationVersion: 1,
+      paginationVersion: 2,
       pageOffset: 0,
       nextOffset: null,
       totalLocations: 1,
+      costUnit: 'gpu_slot_hour',
+      orderSemantics: 'catalog_normalized_cost_then_location_identity',
+      orderGeneration: 'a'.repeat(64),
     });
     expect(placement.capacityHints.hints[0]).toMatchObject({
       kind: 'capacity',
@@ -2123,6 +2134,7 @@ describe('service placement', () => {
       eventId: 'event-a',
       attemptOrdinal: 0,
       hourlyPrice: 0.25,
+      priceSource: 'catalog_at_decision',
     });
   });
 
@@ -2137,6 +2149,7 @@ describe('service placement', () => {
       cursor: 'cursor-a',
       locationLimit: 25,
       locationOffset: 50,
+      locationOrderGeneration: 'a'.repeat(64),
     });
 
     expect(apiClient.post).toHaveBeenCalledWith('/serve/placement', {
@@ -2146,6 +2159,7 @@ describe('service placement', () => {
       cursor: 'cursor-a',
       location_limit: 25,
       location_offset: 50,
+      location_order_generation: 'a'.repeat(64),
     });
     expect(apiClient.get).toHaveBeenCalledWith(
       `/api/get?request_id=${REQUEST_ID}`

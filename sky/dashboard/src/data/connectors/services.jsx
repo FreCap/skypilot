@@ -1644,6 +1644,9 @@ export function normalizeServicePlacement(payload) {
       enabled: placer.enabled === true,
       retrySeconds: finiteOrNull(placer.retry_seconds),
       observedAt: finiteOrNull(placer.observed_at),
+      costUnit: placer.cost_unit || null,
+      orderSemantics: placer.order_semantics || null,
+      orderGeneration: placer.order_generation || null,
       statusSemantics: placer.status_semantics || null,
       truncated: placer.truncated === true,
       paginationVersion: finiteOrNull(placer.pagination_version),
@@ -1665,6 +1668,7 @@ export function normalizeServicePlacement(payload) {
             benchedAt: finiteOrNull(location.benched_at),
             nextProbeAt: finiteOrNull(location.next_probe_at),
             cachedHourlyCost: finiteOrNull(location.cached_hourly_cost),
+            normalizedHourlyCost: finiteOrNull(location.normalized_hourly_cost),
             paidAdmission: location.paid_admission
               ? {
                   state: location.paid_admission.state || null,
@@ -1741,15 +1745,20 @@ export async function getServicePlacement({
   cursor = null,
   locationLimit = 100,
   locationOffset = 0,
+  locationOrderGeneration = null,
 }) {
-  const response = await apiClient.post('/serve/placement', {
+  const requestBody = {
     service_name: serviceName,
     hours,
     limit,
     cursor,
     location_limit: locationLimit,
     location_offset: locationOffset,
-  });
+  };
+  if (locationOrderGeneration !== null) {
+    requestBody.location_order_generation = locationOrderGeneration;
+  }
+  const response = await apiClient.post('/serve/placement', requestBody);
   if (!response.ok) {
     const error = new Error(
       `Failed to request service placement (${response.status})`
