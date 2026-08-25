@@ -8522,9 +8522,14 @@ class SkyPilotReplicaManager(ReplicaManager):
             # whole wave of launches. Append each accepted replica so shared
             # zero-cost capacity accounting sees the in-wave reservations.
             existing_replica_infos.append(info)
-        # Don't start right now; we will start it later in _refresh_thread_pool
-        # to avoid too many sky.launch running at the same time.
+        # Don't start right now; _refresh_thread_pool owns the shared launch
+        # limit and final ownership/target fences.  Wake it immediately,
+        # though: a planner-bound paid claim can be invalidated by the next
+        # five-second demand report, while the periodic fallback is twenty
+        # seconds.  Waiting for that fallback made a continuously reporting
+        # load balancer starve every cold paid launch before provider I/O.
         legacy_runtime.launch_thread_pool[replica_id] = t
+        legacy_runtime.launch_completion_event.set()
         return launch_result
 
     def _demand_should_skip_zero_cost(
