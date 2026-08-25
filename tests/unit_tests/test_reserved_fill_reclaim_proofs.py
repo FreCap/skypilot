@@ -446,9 +446,9 @@ def test_serve054_schema_is_postgresql_only_and_bounded(proof_engine,
     config = migration_utils.get_alembic_config(proof_engine,
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
-    assert scripts.get_heads() == ['058']
+    assert scripts.get_heads() == ['059']
     assert scripts.get_revision('054').down_revision == '053'
-    assert migration_utils.SERVE_VERSION == '058'
+    assert migration_utils.SERVE_VERSION == '059'
     inspector = sqlalchemy.inspect(proof_engine)
     assert (proof_schema.serve_reserved_fill_reclaim_provider_proofs_table.name
             in inspector.get_table_names())
@@ -1499,8 +1499,8 @@ def test_disposable_boundary_kills_stalled_proof_family(proof_engine):
         elapsed = time.monotonic() - started
         assert future.boundary_result is not None
         assert future.boundary_result.family_drained
-        assert (future.boundary_result.outcome.kind
-                is request_process.InvocationOutcomeKind.FAILED)
+        assert (future.boundary_result.outcome.kind is
+                request_process.InvocationOutcomeKind.FAILED)
     finally:
         executor.shutdown()
 

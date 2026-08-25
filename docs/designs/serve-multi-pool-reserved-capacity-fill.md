@@ -2,30 +2,35 @@
 
 Last updated: 2026-08-25
 
-Status: **the reserved-capacity path remains production-proven against the
-unchanged scheduler-authorized denominator. The control plane is now SkyPilot
-release `1.1.1487`, Helm revision 608. PR #1717's bounded committed-provider
-route handoff and PR #1718's placement-cost display correction are deployed.
-The clean Spot-only `boltz-l4-fleet-spot100` qualification has produced real
-Spot provider effects with no On-Demand capacity, but the target-100 / 10,000-
-request proof is still running. Live qualification exposed the current
-prospective-admission defect: the in-memory normalized demand uses integer
-replica-ID map keys, PostgreSQL JSONB persists them as strings, and the exact
-semantic comparison therefore rejects identical demand before any claim or
-provider effect. The source-bound canonicalization below is the next source,
-deployment, and live qualification gate. The historical `boltz-l4-fleet`
-teardown also remains `SHUTTING_DOWN` with two retained ambiguous ordinary-paid
-replica rows; these must not be deleted without durable provider-absence
-evidence.**
+Status: **the reserved-capacity path was production-proven against prior
+unchanged scheduler-authorized denominators, but the current Spot-only test
+service is not a reserved-capacity qualification. The control plane remains
+SkyPilot release `1.1.1488`, Helm revision 609. The live
+`boltz-l4-fleet-spot100` definition has no East A100, East A100-80GB, or PHX
+H200 candidates, so it cannot consume the current audited free denominator of
+60 East plus 180 PHX GPUs. Its 32 stale `SHUTTING_DOWN` rows are controller
+state, not live provider capacity. A complete 18-region AWS census at
+2026-08-25 13:42:55 UTC found zero active fleet instances, zero open fleet
+Spot requests, and zero retained fleet EBS volumes after the exact 26 backing
+instances were terminated at 12:30:56 UTC.**
 
-The two Spot VMs retained by the prior `1.1.1483`/`.1541` canary are fully
-terminated at the provider. Their down requests are terminal and execution-
-quiesced, but controller recovery currently refuses to erase the ambiguous
-ordinary-paid rows without durable provider-absence adjudication; it therefore
-retries rather than completing service removal. PostgreSQL remains the sole
-central correctness authority, Helm storage is disabled, and no EFS/PVC
-correctness path is present. Historical fleet and qualification receipts below
-are chronology, not current live state.
+**The source correction for future exact AWS create rejections and the
+per-replica retirement-liveness correction are implemented and qualified but
+not yet deployed. Six historical cohort-10 launches still lack the new
+immutable negative-ack receipt and therefore remain conservatively ambiguous;
+the new path does not fabricate retrospective evidence for them. A fresh
+single-path service lifecycle, renewed dynamic reserved denominator, exact
+100-L4-Spot-GPU residual, 10,000-request exercise, natural paid drain, and the
+immediate/+10/+30 provider-absence horizon remain open.**
+
+PostgreSQL remains the sole central correctness authority, Helm storage is
+disabled, and no EFS/PVC correctness path is present. The final SkyPilot worker
+projection uses only the existing Simone-owned `boltz-research/be` lane and the
+existing `-1000`/`Never` Pod priority. It has no dependency on the separately
+created `skypilot-be` or `skypilot-wa` queues and makes no ClusterQueue, cohort,
+quota, borrowing, preemption, Terraform/Terragrunt, KubeRay, IAM, or
+boltz-platform application change. Historical fleet and qualification receipts
+below are chronology, not current live state.
 
 Deployed addendum (2026-08-25; PR #1716 / `1.1.1485`): the paid provider
 handoff and asynchronous drain observation now have one explicit atomic
@@ -70,6 +75,156 @@ identity coexist and that a persisted plan validates prospectively after its
 JSONB roundtrip. Production must then prove claims advance from the cheapest
 eligible normalized-cost pool, never create On-Demand capacity, and continue
 toward the exact 100-GPU / 10,000-request gate.
+
+Ordinary-paid provider-rejection correction (2026-08-25; source complete,
+deployment and production proof pending): the first `1.1.1488` Spot wave proved that the
+JSON correction works, but six exact single-node AWS attempts returned
+`InsufficientInstanceCapacity`. Their requests are terminal and execution-
+quiesced, yet the associations remain provider-`UNKNOWN` because ordinary-paid
+profiles retain no provider UID. The six claims therefore reduce the attainable
+physical Ready count from 100 to 94. This is not a Spot price-order or launch-
+concurrency failure: the selector tried cheaper eligible pools first, every
+provider effect used Spot, and observed provider concurrency reached 21.
+
+The steady-state correction records an additive, immutable provider-create
+rejection receipt on the exact failed request. Cohort 11 first makes the
+provider effect idempotent. Every ordinary-paid AWS association derives one
+64-character lowercase hexadecimal EC2 `ClientToken` as
+`sha256("skypilot-serve-paid:" + canonical_association_uuid)`. Runtime
+authority overwrites any task-provided token, and the same association reuses
+that token across executor loss, retries, and supported N/N-1 replay. An
+accepted `RunInstances` call whose response is lost can therefore be replayed
+without creating a second instance; changed request parameters instead produce
+`IdempotentParameterMismatch` and fail closed as an indeterminate create rather
+than authorizing cleanup or placement failover.
+
+The token owns exactly one immutable EC2 parameter set. Before any EC2 cluster
+inventory or create effect, the provider path requires one exact availability
+zone, one exact nonempty subnet, no targeted capacity reservation, a fresh STS
+account equal to the association's frozen account, and a provider-native
+subnet-to-zone lookup equal to the frozen zone. Multi-subnet and targeted-
+reservation configurations fail the provider fence before `RunInstances`
+rather than reusing the token across different parameters. The preflight
+subnet result is retained for rejection validation, so a transient lookup
+after a typed rejection cannot strand an otherwise exact zero-effect action.
+The observed principal ARN is receipt audit evidence only; the stable AWS
+account, not a rotating assumed-role session ARN, is association authority.
+
+The outer association has already durably entered `PROVIDER_IO` before this
+provider-specific read-only preflight. STS/session/EC2-client or subnet
+observation unavailability therefore pauses and durably requeues the same API
+request and association with a bounded delay; it never terminalizes, fails
+over, or invokes provider teardown. This is required even when the current
+generation made no create call, because an earlier generation may have reached
+`RunInstances` and lost its response. The conserved paid claim and global debit
+remain held while proof is unavailable. On recovery, the same association and
+ClientToken replay, either adopting the prior create or producing exact typed
+absence. Malformed local token/scope and observed account or subnet/AZ mismatch
+remain terminal fences, not retryable proof outages.
+
+Once the exact `RunInstances` SDK call begins, the result has only two failure
+classes. `ProviderCreateRejectedError` is terminal and may carry absence only
+when every attempted call forms the closed provider-negative-ack receipt below.
+`ProviderCreateAmbiguousError` is an execution pause for every lost, timed-out,
+transport-failed, malformed, mixed, or otherwise unrecognized outcome. Local
+retries and later executor replay use the same frozen association and EC2
+`ClientToken`; an eventual success is adopted and an eventual exact rejection
+may settle normally. The ambiguous type bypasses provisioner teardown, backend
+post-teardown cleanup, capacity blocklisting, and placement failover. The exact
+rejection type also bypasses both generic cleanup layers, but each layer first
+revalidates its receipt against the immutable cluster name, full node count,
+token, and AWS account. A forged or malformed typed rejection therefore falls
+back to conservative cleanup instead of acquiring zero-effect authority.
+
+AWS paid-pool identity is version 2 and includes the server-observed 12-digit
+AWS account. Non-AWS pools retain their existing version-1 identity so this
+AWS-only correction does not reset their admission history. The authoritative
+planner resolves the AWS account once per budget snapshot through the standard
+workspace-scoped cloud identity contract; uncertainty removes only AWS paid
+candidates and preserves zero-cost Kubernetes and other paid providers. The
+dashboard performs no provider identity read: it reuses one exact account
+already frozen in a replica's paid-pool key, or omits advisory AWS admission
+until the launch path freezes one. Unmanaged and non-PostgreSQL admission keep
+their preexisting account-unscoped local window without any account lookup.
+Account-unscoped version-1 AWS keys are decodeable only for historical
+settlement and cannot authorize cohort-11 admission, adoption, provider I/O,
+or absence settlement. Persisted legacy keys are never rewritten using the
+controller's ambient current account.
+
+An AWS absence receipt is valid only for the in-tree `RunInstances` call,
+after the exact provider-native cluster inventory is empty of every
+nonterminated instance (`shutting-down` still counts as present) and the
+launch chose neither a stopped-instance resume nor any other pre-existing
+resource. Inventory is a necessary zero-effect check, not the idempotency
+authority: EC2 inventory is eventually consistent, while the association
+token prevents a lost success from becoming a duplicate. The receipt binds
+the exact association token, frozen AWS account, observed principal, region,
+exact availability zone and subnet, Spot market, instance type, exact provider
+cluster tag/name, and full requested node count. `MinCount` and `MaxCount` must
+both equal that full count; the provider error must be one of the closed atomic
+code/status pairs (`InsufficientInstanceCapacity`/HTTP 500, or one of the three
+supported quota codes/HTTP 400); and the response must include its provider
+request ID. A generic or differently coded 5xx remains an ambiguous-create
+pause. Every
+attempted create and every terminal failover-history leaf must carry a valid
+receipt for the same exact cluster, token, account, and full demand. No prior
+attempt may have created, reserved, resumed, returned an instance, or produced
+an ambiguous provider response, even when a later attempt rejects atomically.
+A timeout, lost response without successful idempotent replay, malformed
+response, unknown code, mixed receipt, token/account mismatch, or missing
+identity field retains provider-`UNKNOWN` while requeueing the same association;
+it never terminalizes, cleans up, or fails over. A partial create or successful
+create followed by setup failure remains provider-`UNKNOWN` under normal exact-
+provider reconciliation and is not provider-absence evidence.
+
+The request layer publishes a canonical association-and-replica-bound provider
+`ABSENT` envelope only after locking and revalidating the exact request as
+`FAILED` with cause `HANDLER_FAILED`, a non-null decodable serialized error,
+null return, execution generation at least one, exact quiescence, no queue
+delivery, active retention pin, no service job, `PROVIDER_IO`, and the exact
+bound paid claim and placement. It re-extracts the complete receipt from that
+locked error and exact-compares it with the proposed envelope; callers and a
+previously stored association payload are not receipt authority. The
+projection transaction repeats that locked-request extraction and comparison.
+The expected provider cluster name is independently derived from the frozen
+association display name, tenant scope, and AWS naming limits; the receipt
+cannot nominate its own name, and the display and provider names are expected
+to differ by the user suffix.
+It then projects the failed replica and capacity/quota pool feedback derived
+solely from the validated receipt, clears the exact association pointer,
+releases the request pin and paid claim/global debit, and commits the
+`PROJECTED` history. A restart-safe row-only retirement authority then
+revalidates the same terminal execution, canonical association evidence, null
+replica pointer, deleted pin, and absence of any live claim/global debit before
+deleting that exact replica record. This path performs no provider operation
+and does not enter ordinary `sky down`. A missing SkyPilot cluster row, an
+operator cloud census, or a capacity-looking message is never absence
+evidence. The released pin makes the request eligible for normal garbage
+collection: retirement exact-compares the request again when it is still
+present, but after collection relies on the immutable `PROJECTED` association
+receipt/digest and copied terminal/quiescence facts, so a crash between
+projection and row deletion cannot wedge capacity.
+
+This adds no table or column and no second launch path. Migration 059 updates
+the static SQLAlchemy `serve047_provider_absence_projection_ck` definition and
+widens that installed check, the matching
+`skyserve042_guard_ordinary_association` transition trigger, and the
+`skyserve042_guard_replica_binding` pointer-clear arm from reserved fill to the
+exact `ORDINARY_PAID`/paid-pool/terminal-failed shape; it does not rewrite
+retained rows. It requires account-scoped pool-key version 2 for new cohort-11
+AWS ordinary-paid associations while retaining version 1 for non-AWS pools,
+and requires every projected AWS absence receipt to carry the same account and
+a well-formed token. Row-dependent `CASE` guards leave cohort-10 and older
+non-JSON keys settlement-only without ever casting them to JSON during
+migration. The receipt is an additive plain mapping inside the
+already-versioned request error. N-1/N-2 readers ignore it and remain
+fail-closed; a current reader of an old request without it also remains
+`UNKNOWN`. Because the new receipt changes which post-provider result can
+release a paid debit, the homogeneous launch cohort rotates from 10 to 11. New
+admission and provider I/O require exact cohort 11. Broad recovery remains
+N/N-1, and N-2 may only finish row retirement after the same immutable
+projected-absence, terminal-quiescence, released-pin, and zero-live-paid-
+authority proof.
 
 Earlier qualification correction (2026-08-25; deployed in `1.1.1487`):
 the fresh current-authority load-balancer reports used by the committed-claim
@@ -895,6 +1050,61 @@ may improve throughput later, but it is not part of this liveness correction.
 At that design revision the source, focused PostgreSQL/controller tests,
 homogeneous Helm deployment, and fresh full-capacity/no-paid-spill horizon were
 open. PR #1686 and the production receipt above close those capacity gates.
+
+## Current executable closeout
+
+This is the only executable rollout sequence in this document as of
+2026-08-25. Earlier numbered rollout sections are retained evidence and must
+not be replayed.
+
+1. Merge the cohort-11 ordinary-paid provider-outcome correction and the
+   per-replica retirement isolation correction. Build one image and deploy it
+   homogeneously to both API writers, both Serve controller writers, and all
+   three request executors with direct Helm `--reuse-values`. Require migration
+   059 and the same immutable image digest on every writer before allowing a
+   fresh provider effect.
+2. Retire `boltz-l4-fleet-spot100` through the supported typed whole-service
+   purge. Require PostgreSQL service, replica, association, request-pin, paid-
+   claim, waiter, retirement, load-balancer, and provider absence before
+   reusing an identity. The six cohort-10 rows have no retrospective cohort-11
+   receipt: do not manually reinterpret or delete them. Because this is a
+   test-only deployment and interruption is explicitly accepted, use a new
+   clean service identity if supported purge cannot retire that historical
+   graph.
+3. Recreate one heterogeneous `boltz-l4-fleet` from the canonical local,
+   no-EFS definition: East A100-40, East A100-80GB, PHX H200, then AWS/GCP L4
+   Spot residual; `min_replicas: 0`, fill floor zero,
+   `utilization_gate: false`, `max_replicas >= 340`, and a qualification paid
+   ceiling of 100 logical GPUs. Configure no On-Demand candidate and no task-
+   owned Kubernetes namespace, queue, scheduler, ServiceAccount, priority, or
+   storage override.
+4. Immediately recompute the denominator. East spends every healthy compatible
+   physically free GPU. PHX submits at Simone's existing
+   `boltz-research/be` LocalQueue with the existing `-1000`/`Never` Pod
+   priority and counts only Kueue-admitted capacity as spendable. Make no
+   Kueue-policy mutation. Prove every denominator unit is represented by one
+   exact durable intent, admitted/provisioning worker, or Ready worker, with
+   zero paid authority while reserved capacity covers demand.
+5. Apply authenticated compatible demand beyond committed reserved supply.
+   Prove reserved supply commits before paid residual, exactly 100 logical L4
+   Spot GPU units can become live, no On-Demand instance is created, and
+   normalized-cost order tries the cheapest eligible pools first. Exact typed
+   provider rejections must release their claim/global debit atomically and
+   allow another eligible pool; ambiguous outcomes must replay the same
+   association token without failover or duplicate creation.
+6. Send exactly 10,000 encrypted logical requests with stable unique IDs and
+   durable result targets. Refill below the bounded queue limit, and require
+   exactly 10,000 terminal successes with no duplicate, missing, failed, or
+   unresolved request. While active, verify fresh queued, processing,
+   in-flight, completed, and rejected telemetry in the service API/dashboard.
+7. Stop demand and retain the positive paid ceiling until natural retirement
+   completes. Require zero paid replica, claim, waiter, and global debit; zero
+   AWS/GCP fleet instance and Spot request; zero residual provider volume; no
+   `SHUTTING_DOWN` tail; and continued alignment of reserved fill with the
+   recomputed East/PHX denominator.
+8. Repeat the full PostgreSQL, scheduler, request, and provider census
+   immediately, at +10 minutes, at +30 minutes, and through one complete
+   stale/quiescence interval. Only those receipts complete the initiative.
 
 ## Historical executable closeout (completed; do not execute)
 
@@ -8991,22 +9201,18 @@ authorizes a Kueue or non-SkyPilot infrastructure change.
   with zero non-200, receipt lookup, failed, missing-artifact, timed-out, or
   unsettled result and no nonterminal ledger tail.
 - [ ] Exercise the approved genuinely uncovered paid Spot residual and drain.
-  The v10 recreation, reserved-capacity receipt, final +30 horizon, and provider
-  observers have passed; the remaining inputs are operator-supplied protected-
-  endpoint authentication and a real encrypted request factory. Use local
-  provider commit `a69fb3409ede26f98c02f7730f764021c1ef0146`: 100 L4-only
-  requests that carry
-  `X-SkyServe-Compatible-Accelerators: L4` and unique presigned result/marker
-  targets in the production encryption envelope,
-  concurrency 16, at most ten logical L4 units, Spot-only 1/2/4/8-GPU widths,
-  at most ten physical machines, the configured 18 AWS and 18 GCP eligible
-  regions, and at most one hour from first paid claim to provider-proven
-  absence. The compute envelope is approximately `$1.606/hour` at the observed
-  floor and a conservative `$21.2462/hour` ceiling, excluding disk and
-  transfer. Closed Platform PRs #8841/#8842 are not deployment authority. Keep
-  cap ten enabled through successful natural drain; returning it to zero early
-  would not prove positive-cap idle retirement. Choose the permanent finite
-  spend cap separately afterward.
+  Deploy the current cohort-11 source, cleanly recreate the heterogeneous
+  service, and use authenticated encrypted L4-compatible demand beyond the
+  freshly committed reserved supply. Reach exactly 100 logical L4 Spot GPU
+  units with no On-Demand capacity, then complete exactly 10,000 terminal
+  request successes through bounded queue refill. Keep the positive cap enabled
+  through natural drain; returning it to zero early would not prove idle
+  retirement. Require provider-proven AWS/GCP instance, Spot-request, and
+  residual-volume absence plus zero paid PostgreSQL authority immediately,
+  at +10, at +30, and through the complete stale/quiescence interval. Closed
+  Platform PRs #8841/#8842 are not deployment authority; this exercise uses
+  only the local service definition and the direct Helm-deployed SkyPilot
+  release.
 - [x] Pass typed provider present/absent/unknown/replaced,
   legacy-real-effect, lost-ACK, poisoned-row progress, broker conservation,
   no-paid-spill, and full restart/adoption tests. Focused unit and real-

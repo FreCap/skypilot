@@ -219,6 +219,91 @@ def test_profile_without_durable_provider_uid_remains_unknown(
     assert observed.payload['reason'] == 'profile-has-no-durable-provider-uid'
 
 
+def test_ordinary_paid_reconcile_prefers_exact_terminal_negative_ack(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    authority = object()
+    payload = {
+        'association_id': str(context.association_id),
+        'cluster_name': 'svc-3',
+        'probe_contract': 'aws-run-instances-negative-ack-v1',
+        'profile_kind': 'ORDINARY_PAID',
+        'receipt': {
+            'provider': 'aws',
+        },
+        'replica_record_id': str(context.replica_record_id),
+        'result': 'ABSENT',
+    }
+    calls = []
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_provider_reconciliation_ready',
+                        lambda *_args: True)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_provider_absence_is_recorded',
+                        lambda *_args: False)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_terminal_provider_absence_payload',
+                        lambda *_args: payload)
+    monkeypatch.setattr(
+        reconciliation, 'observe_provider', lambda *_args: pytest.fail(
+            'an exact request receipt must replace guessed provider state'))
+    monkeypatch.setattr(
+        reconciliation.request_postgres,
+        'record_bound_non_pool_provider_evidence',
+        lambda _context, _authority, evidence, observed_payload: calls.append(
+            ('record', evidence, observed_payload)))
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'project_bound_non_pool_provider_absence',
+                        lambda *_args, **_kwargs: calls.append(('project',)))
+
+    observed = reconciliation.reconcile(
+        context, types.SimpleNamespace(cluster_name='svc-3'), authority,
+        lambda *_args: True)
+
+    assert observed == reconciliation.ProviderObservation(
+        ordinary_launch_binding.ProviderEvidence.ABSENT, payload)
+    assert calls == [('record', ordinary_launch_binding.ProviderEvidence.ABSENT,
+                      payload), ('project',)]
+
+
+def test_ordinary_paid_reconcile_without_exact_receipt_remains_unknown(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    authority = object()
+    calls = []
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_provider_reconciliation_ready',
+                        lambda *_args: True)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_provider_absence_is_recorded',
+                        lambda *_args: False)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_terminal_provider_absence_payload',
+                        lambda *_args: None)
+    monkeypatch.setattr(
+        reconciliation.request_postgres,
+        'record_bound_non_pool_provider_evidence',
+        lambda _context, _authority, evidence, payload: calls.append(
+            ('record', evidence, payload)))
+    monkeypatch.setattr(
+        reconciliation.request_postgres,
+        'project_bound_non_pool_provider_absence', lambda *_args, **_kwargs:
+        pytest.fail('UNKNOWN must never release paid capacity'))
+
+    observed = reconciliation.reconcile(
+        context, types.SimpleNamespace(cluster_name='svc-3'), authority,
+        lambda *_args: True)
+
+    assert observed.evidence == ordinary_launch_binding.ProviderEvidence.UNKNOWN
+    assert observed.payload['reason'] == 'profile-has-no-durable-provider-uid'
+    assert calls == [
+        ('record', ordinary_launch_binding.ProviderEvidence.UNKNOWN,
+         observed.payload)
+    ]
+
+
 @pytest.mark.parametrize(
     ('evidence', 'expected_calls'),
     ((ordinary_launch_binding.ProviderEvidence.ABSENT, ['record', 'project']),

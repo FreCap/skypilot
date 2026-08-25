@@ -45,6 +45,20 @@ pytestmark = pytest.mark.xdist_group(
 _SUBMISSION_ID = uuid.UUID('11111111-1111-4111-8111-111111111111')
 _RECORD_ID = uuid.UUID('22222222-2222-4222-8222-222222222222')
 _CONTROLLER_ID = uuid.UUID('33333333-3333-4333-8333-333333333333')
+_CURRENT_PAID_POOL_KEY = json.dumps(
+    {
+        'version': 1,
+        'workspace': 'workspace-a',
+        'cloud': 'gcp',
+        'region': 'us-central1',
+        'zone': 'us-central1-a',
+        'instance_type': 'g2-standard-4',
+        'accelerators': [['L4', 1.0]],
+        'use_spot': True,
+        'num_nodes': 1,
+    },
+    sort_keys=True,
+    separators=(',', ':'))
 
 
 def _system_recovery_intent(
@@ -774,18 +788,19 @@ def _admit_generic_paid(
             expected_binding_epoch=5,
             participant_barrier_passed=lambda _connection: True,
             legacy_requests_drained=lambda _connection: True)
-        state = _stored_replica_state({'paid_capacity_pool_key': 'pool-a'})
+        state = _stored_replica_state(
+            {'paid_capacity_pool_key': _CURRENT_PAID_POOL_KEY})
         connection.execute(
             sqlalchemy.update(serve_state_schema.replicas_table).where(
                 serve_state_schema.replicas_table.c.service_name == 'svc',
                 serve_state_schema.replicas_table.c.replica_id == 3).values(
                     status='PROVISIONING',
-                    paid_capacity_pool_key='pool-a',
+                    paid_capacity_pool_key=_CURRENT_PAID_POOL_KEY,
                     replica_state=state))
         connection.execute(
             sqlalchemy.insert(
                 serve_state_schema.paid_capacity_pools_table).values(
-                    pool_key='pool-a',
+                    pool_key=_CURRENT_PAID_POOL_KEY,
                     current_limit=1,
                     successes_since_resize=0,
                     updated_at=time.time()))
@@ -795,7 +810,7 @@ def _admit_generic_paid(
                     service_name='svc',
                     service_hash='svc-hash',
                     replica_id=3,
-                    pool_key='pool-a',
+                    pool_key=_CURRENT_PAID_POOL_KEY,
                     priority=1,
                     claimed_at=time.time()))
 
@@ -871,7 +886,7 @@ def test_current_paid_effect_accepts_current_worker_projection(
         binding_database) -> None:
     current_protocol = (
         kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
-    assert current_protocol == 9
+    assert current_protocol == 10
     with binding_database.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.version_specs_table).where(
@@ -882,6 +897,41 @@ def test_current_paid_effect_accepts_current_worker_projection(
                     ]))
 
     _assert_current_paid_provider_effect_is_permitted(binding_database)
+
+
+def test_current_paid_effect_reenters_same_provider_io_after_pause(
+        binding_database) -> None:
+    """A quiesced proof-outage retry reuses, rather than widens, authority."""
+    identity, _, launch_context = _admit_generic_paid(binding_database)
+    first_claim = _Claim(identity.request_id, 1, str(uuid.uuid4()),
+                         str(uuid.uuid4()))
+    with binding.non_pool_provider_effect_guard(
+            launch_context,
+            first_claim,
+            claim_validator=lambda _connection, _association_id, _claim: True
+    ) as first_authorization:
+        first_revision = first_authorization.owner_revision
+
+    # ExecutionPausedError is consumed by the request executor only after the
+    # first invocation family is quiescent. Its delayed delivery receives a
+    # fresh execution claim but retains this exact immutable association.
+    retry_claim = _Claim(identity.request_id, 2, str(uuid.uuid4()),
+                         str(uuid.uuid4()))
+    with binding.non_pool_provider_effect_guard(
+            launch_context,
+            retry_claim,
+            claim_validator=lambda _connection, _association_id, _claim: True
+    ) as retry_authorization:
+        assert retry_authorization.owner_revision == first_revision
+        assert retry_authorization.context == first_authorization.context
+
+    with binding_database.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(binding.ordinary_launch_associations_table).where(
+                binding.ordinary_launch_associations_table.c.association_id ==
+                identity.association_id)).mappings().one()
+    assert association['effect_phase'] == binding.EffectPhase.PROVIDER_IO.value
+    assert association['owner_revision'] == first_revision
 
 
 def test_paid_plan_is_mutable_only_before_provider_effect(
@@ -936,8 +986,8 @@ def test_historical_cohort_cannot_start_provider_effect(
         _generic_controller_authority(),
         non_pool_capability_cohort_epoch=historical_cohort)
     assert not authority.generic_launches_required
-    assert (authority.retained_non_pool_settlement_allowed
-            is (history_distance == 1))
+    assert (authority.retained_non_pool_settlement_allowed is
+            (history_distance == 1))
     with binding_database.begin() as connection:
         if history_distance == 1:
             association = binding.lock_reduction_authority_in_connection(
@@ -1083,7 +1133,7 @@ def _reserved_fill_cleanup_rows(
 def test_reserved_fill_cleanup_accepts_exact_adjacent_cohort_tuple(
         binding_database, monkeypatch) -> None:
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
-    assert current_cohort == 10
+    assert current_cohort == 11
     service, replica, association, expected_profile = (
         _reserved_fill_cleanup_rows(current_cohort - 1, current_cohort - 1))
     validated: list[binding.NonPoolLaunchProfile] = []
@@ -1112,7 +1162,7 @@ def test_retained_v7_v8_reserved_fill_graph_settles_provider_absence(
     current_cohort = binding.NON_POOL_CAPABILITY_COHORT_EPOCH
     current_projection = (
         kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
-    assert (current_cohort, current_projection) == (10, 10)
+    assert (current_cohort, current_projection) == (11, 10)
     historical_cohort = current_cohort - history_distance
     historical_projection = current_projection - history_distance
     info = _reserved_fill_replica_info()
@@ -1136,6 +1186,12 @@ def test_retained_v7_v8_reserved_fill_graph_settles_provider_absence(
         historical_code.setattr(
             binding, 'resolve_non_pool_launch_profile_in_connection',
             lambda *_args, **_kwargs: profile)
+        # The retained writer predates the scalar committed-intent edge now
+        # required for a current provider effect. Reproduce its frozen JSON
+        # profile directly; the test below exercises cleanup-only validation,
+        # never current admission or launch authority.
+        historical_code.setattr(binding, '_reserved_fill_payload',
+                                lambda *_args, **_kwargs: profile_payload)
         with binding_database.begin() as connection:
             connection.execute(
                 sqlalchemy.update(serve_state_schema.replicas_table).where(
@@ -2065,7 +2121,7 @@ def test_retained_v7_v8_reserved_fill_graph_settles_provider_absence(
 def test_reserved_fill_cleanup_rejects_older_or_mismatched_cohorts(
         binding_database, monkeypatch, service_cohort,
         association_cohort) -> None:
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 10
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 11
     service, replica, association, _ = _reserved_fill_cleanup_rows(
         service_cohort, association_cohort)
     profile_validation_called = False
@@ -4044,7 +4100,7 @@ class _Claim:
     worker_instance_id: str
 
 
-def test_legacy_paid_effect_revalidates_planner_under_protocol_prefix(
+def test_legacy_paid_effect_revalidates_planner_only_before_provider_io(
         binding_database, monkeypatch) -> None:
     state = _stored_replica_state({'paid_capacity_pool_key': 'pool-a'})
     with binding_database.begin() as connection:
@@ -4100,7 +4156,10 @@ def test_legacy_paid_effect_revalidates_planner_under_protocol_prefix(
 
     assert events == ['protocol', 'planner']
 
+    replay_planner_calls = []
+
     def _expiring_validate(_connection, _service, _paid_claim, **kwargs):
+        replay_planner_calls.append(True)
         assert kwargs == {'protocol_and_service_prelocked': True}
         return (datetime.datetime.now(datetime.timezone.utc) +
                 datetime.timedelta(milliseconds=100))
@@ -4112,11 +4171,13 @@ def test_legacy_paid_effect_revalidates_planner_under_protocol_prefix(
     monkeypatch.setattr(binding.capacity_admission,
                         'validate_paid_claim_in_connection', _expiring_validate)
     context = _bound_context(identity, admission.launch_generation)
-    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
-                       match='expired while locking its request'):
-        with binding_database.begin() as connection:
-            binding.validate_effect_authority_in_connection(
-                connection, context, claim, _delayed_claim_validator)
+    with binding_database.begin() as connection:
+        binding.validate_effect_authority_in_connection(
+            connection, context, claim, _delayed_claim_validator)
+    # PROVIDER_IO is the immutable effect boundary. Replaying bookkeeping for
+    # that same launch must retain the original paid claim instead of asking a
+    # newer mutable planner snapshot to re-authorize an already-started call.
+    assert replay_planner_calls == []
 
 
 def test_effect_guard_service_job_and_projection_are_monotonic(

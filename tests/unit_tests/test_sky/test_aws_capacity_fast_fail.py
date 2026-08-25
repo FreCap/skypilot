@@ -7,18 +7,40 @@ from typing import Dict, List
 import botocore.exceptions
 import pytest
 
+from sky import exceptions
 from sky.provision import common as provision_common
 from sky.provision import constants as provision_constants
 from sky.provision.aws import instance as aws_instance
 from sky.provision.aws import instance_requests
 
+_AWS_ACCOUNT_ID = '123456789012'
+_OTHER_AWS_ACCOUNT_ID = '210987654321'
+_AWS_CLIENT_TOKEN = 'a' * 64
+_OTHER_AWS_CLIENT_TOKEN = 'b' * 64
 
-def _client_error(code: str) -> botocore.exceptions.ClientError:
-    return botocore.exceptions.ClientError(
-        {'Error': {
+
+def _client_error(
+    code: str,
+    *,
+    request_id: str | None = 'provider-request-1',
+    http_status_code: int | None = None,
+    operation_name: str = 'RunInstances',
+) -> botocore.exceptions.ClientError:
+    if http_status_code is None:
+        http_status_code = (500
+                            if code == 'InsufficientInstanceCapacity' else 400)
+    response = {
+        'Error': {
             'Code': code,
             'Message': code,
-        }}, 'RunInstances')
+        }
+    }
+    if request_id is not None:
+        response['ResponseMetadata'] = {
+            'RequestId': request_id,
+            'HTTPStatusCode': http_status_code,
+        }
+    return botocore.exceptions.ClientError(response, operation_name)
 
 
 def _node_config(subnets: List[str], *, spot: bool) -> Dict:
@@ -35,6 +57,134 @@ def _node_config(subnets: List[str], *, spot: bool) -> Dict:
 def _create(fake_ec2, node_config, *, single_zone: bool):
     return aws_instance._create_instances(fake_ec2, 'cluster', node_config, {},
                                           1, True, 0, single_zone)
+
+
+class _InitialInstances:
+
+    def __init__(self, instances=None):
+        self.instances = [] if instances is None else instances
+        self.filters = []
+
+    def filter(self, **kwargs):
+        self.filters.append(kwargs)
+        return self.instances
+
+
+class _RunInstancesEC2:
+
+    def __init__(self, create, initial_instances=None):
+        self.instances = _InitialInstances(initial_instances)
+        self.meta = SimpleNamespace(
+            client=SimpleNamespace(meta=SimpleNamespace(
+                region_name='us-east-1'),
+                                   create_tags=lambda **_: None))
+        self._create = create
+        self.create_calls = []
+
+    def create_instances(self, **kwargs):
+        self.create_calls.append(kwargs)
+        return self._create(**kwargs)
+
+
+class _RequestSession:
+    """Minimal AWS session for lazy identity and subnet lookups."""
+
+    def __init__(
+            self,
+            account_id=_AWS_ACCOUNT_ID,
+            principal_arn=('arn:aws:sts::123456789012:assumed-role/test/run'),
+            subnet_zones=None,
+            identity_error: BaseException | None = None,
+            subnet_error: BaseException | None = None):
+        self.account_id = account_id
+        self.principal_arn = principal_arn
+        self.subnet_zones = ({
+            'subnet-a': 'us-east-1a'
+        } if subnet_zones is None else subnet_zones)
+        self.identity_error = identity_error
+        self.subnet_error = subnet_error
+        self.client_calls = []
+
+    def client(self, service_name, region_name=None):
+        assert region_name == 'us-east-1'
+        self.client_calls.append(service_name)
+        if service_name == 'sts':
+
+            def _get_caller_identity():
+                if self.identity_error is not None:
+                    raise self.identity_error
+                return {
+                    'Account': self.account_id,
+                    'Arn': self.principal_arn,
+                }
+
+            return SimpleNamespace(get_caller_identity=_get_caller_identity)
+        assert service_name == 'ec2'
+
+        def _describe_subnets(SubnetIds):
+            if self.subnet_error is not None:
+                raise self.subnet_error
+            return {
+                'Subnets': [{
+                    'SubnetId': subnet_id,
+                    'AvailabilityZone': self.subnet_zones[subnet_id],
+                } for subnet_id in SubnetIds if subnet_id in self.subnet_zones]
+            }
+
+        def _describe_instances(InstanceIds):
+            return {
+                'Reservations': [{
+                    'Instances': [{
+                        'InstanceId': instance_id,
+                        'InstanceType': 'g6.4xlarge',
+                        'Placement': {
+                            'AvailabilityZone': 'us-east-1a'
+                        },
+                        'InstanceLifecycle': 'spot',
+                    } for instance_id in InstanceIds]
+                }]
+            }
+
+        return SimpleNamespace(describe_subnets=_describe_subnets,
+                               describe_instances=_describe_instances)
+
+
+def _run_config(*,
+                count: int = 1,
+                availability_zone: str = 'us-east-1a',
+                spot: bool = True,
+                capacity_reservation_ids=None,
+                resume_stopped_nodes: bool = True,
+                provider_create_idempotency_token: str |
+                None = _AWS_CLIENT_TOKEN,
+                provider_create_account_id: str | None = _AWS_ACCOUNT_ID):
+    node_config = _node_config(['subnet-a'], spot=spot)
+    if capacity_reservation_ids is not None:
+        node_config['CapacityReservationSpecification'] = {
+            'CapacityReservationTarget': {
+                'CapacityReservationId': capacity_reservation_ids,
+            }
+        }
+    return provision_common.ProvisionConfig(
+        provider_config={
+            'availability_zone': availability_zone,
+            'use_internal_ips': False,
+        },
+        authentication_config={},
+        docker_config={},
+        node_config=node_config,
+        count=count,
+        tags={},
+        resume_stopped_nodes=resume_stopped_nodes,
+        ports_to_open_on_launch=None,
+        provider_create_idempotency_token=(provider_create_idempotency_token),
+        provider_create_account_id=provider_create_account_id)
+
+
+def _install_run_instances_fakes(monkeypatch, ec2, *, session=None):
+    monkeypatch.setattr(aws_instance, '_default_ec2_resource', lambda _: ec2)
+    monkeypatch.setattr(aws_instance.aws, 'resource', lambda *_, **__: ec2)
+    monkeypatch.setattr(aws_instance.aws, 'session', lambda *_, **__: session)
 
 
 def test_create_instances_projects_request_without_mutating_node_config():
@@ -179,8 +329,8 @@ def test_create_instances_tags_all_resources_and_reserves_managed_marker():
 def test_instance_request_helpers_keep_instance_facade():
     assert (aws_instance._create_instances
             is not instance_requests.create_instances)
-    assert (aws_instance._is_single_zone_request
-            is instance_requests._is_single_zone_request)
+    assert (aws_instance._is_single_zone_request is
+            instance_requests._is_single_zone_request)
 
 
 @pytest.mark.parametrize('name',
@@ -233,14 +383,19 @@ def test_run_instances_passes_single_zone_signal(monkeypatch):
                                count,
                                associate_public_ip_address,
                                max_efa_interfaces,
-                               is_single_zone_request=False):
+                               is_single_zone_request=False,
+                               provider_create_idempotency_token=None):
         del (ec2_fail_fast, cluster_name, node_config, tags, count,
-             associate_public_ip_address, max_efa_interfaces)
+             associate_public_ip_address, max_efa_interfaces,
+             provider_create_idempotency_token)
         observed.append(is_single_zone_request)
         return [created]
 
     monkeypatch.setattr(aws_instance, '_default_ec2_resource', lambda _: ec2)
     monkeypatch.setattr(aws_instance.aws, 'resource', lambda *_, **__: ec2)
+    request_session = _RequestSession()
+    monkeypatch.setattr(aws_instance.aws, 'session',
+                        lambda *_, **__: request_session)
     monkeypatch.setattr(aws_instance, '_create_instances',
                         _fake_create_instances)
     config = provision_common.ProvisionConfig(provider_config={
@@ -265,6 +420,583 @@ def test_run_instances_passes_single_zone_signal(monkeypatch):
 
     assert observed == [True]
     assert record.created_instance_ids == ['i-created']
+    # Successful launches retain only the existing post-create EC2/STS
+    # identity capture; negative-ack identity/subnet reads are lazy.
+    assert request_session.client_calls == ['ec2', 'sts']
+
+
+def test_fresh_spot_rejection_attaches_complete_provider_negative_ack(
+        monkeypatch):
+
+    def _reject(**kwargs):
+        assert kwargs['MinCount'] == kwargs['MaxCount'] == 2
+        assert kwargs['ClientToken'] == _AWS_CLIENT_TOKEN
+        raise _client_error('InsufficientInstanceCapacity',
+                            request_id='provider-request-capacity')
+
+    ec2 = _RunInstancesEC2(_reject)
+    session = _RequestSession()
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+
+    with pytest.raises(provision_common.ProvisionerError) as exc_info:
+        aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                   _run_config(count=2))
+
+    receipt = exc_info.value.provider_negative_ack
+    assert not hasattr(
+        exc_info.value,
+        instance_requests._AWS_RUN_INSTANCES_NEGATIVE_ACK_CANDIDATE_ATTR)
+    assert receipt == {
+        'schema_version': 1,
+        'provider': 'aws',
+        'operation': 'RunInstances',
+        'reason': 'capacity',
+        'aws_account_id': '123456789012',
+        'aws_principal_arn': 'arn:aws:sts::123456789012:assumed-role/test/run',
+        'cluster_name_on_cloud': 'sky-cluster',
+        'requested_count': 2,
+        'market': 'spot',
+        'instance_type': 'g6.4xlarge',
+        'region': 'us-east-1',
+        'availability_zone': 'us-east-1a',
+        'client_token': _AWS_CLIENT_TOKEN,
+        'invocations': [{
+            'region': 'us-east-1',
+            'availability_zone': 'us-east-1a',
+            'initial_nonterminated_instance_ids': [],
+            'resumed_instance_ids': [],
+            'created_instance_ids': [],
+            'successful_create_calls': 0,
+            'ambiguous_create_calls': 0,
+            'create_call_count': 1,
+            'attempts': [{
+                'provider_request_id': 'provider-request-capacity',
+                'error_code': 'InsufficientInstanceCapacity',
+                'reason': 'capacity',
+                'http_status_code': 500,
+                'aws_account_id': '123456789012',
+                'aws_principal_arn': 'arn:aws:sts::123456789012:assumed-role/test/run',
+                'region': 'us-east-1',
+                'availability_zone': 'us-east-1a',
+                'subnet_id': 'subnet-a',
+                'market': 'spot',
+                'instance_type': 'g6.4xlarge',
+                'cluster_name_on_cloud': 'sky-cluster',
+                'min_count': 2,
+                'max_count': 2,
+                'capacity_reservation_id': None,
+                'client_token': _AWS_CLIENT_TOKEN,
+            }],
+        }],
+    }
+    # The initial inventory query explicitly includes shutting-down objects;
+    # their absence is therefore part of the provider-native proof.
+    assert ec2.instances.filters[0]['Filters'][0]['Values'] == [
+        'pending', 'running', 'stopping', 'stopped', 'shutting-down'
+    ]
+    assert session.client_calls == ['sts', 'ec2']
+
+
+def test_fresh_spot_quota_rejection_attaches_typed_negative_ack(monkeypatch):
+
+    def _reject(**kwargs):
+        del kwargs
+        raise _client_error('MaxSpotInstanceCountExceeded',
+                            request_id='provider-request-quota')
+
+    ec2 = _RunInstancesEC2(_reject)
+    session = _RequestSession()
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+
+    with pytest.raises(provision_common.ProvisionerError) as exc_info:
+        aws_instance.run_instances('us-east-1', 'display-name', 'cloud-name',
+                                   _run_config())
+
+    receipt = exc_info.value.provider_negative_ack
+    assert receipt['reason'] == 'quota'
+    assert receipt['cluster_name_on_cloud'] == 'cloud-name'
+    assert receipt['invocations'][0]['attempts'][0]['error_code'] == (
+        'MaxSpotInstanceCountExceeded')
+
+
+@pytest.mark.parametrize(
+    ('error_kwargs', 'availability_zone', 'spot'),
+    [
+        ({
+            'request_id': None
+        }, 'us-east-1a', True),
+        ({
+            'http_status_code': 400
+        }, 'us-east-1a', True),
+        ({
+            'http_status_code': 503
+        }, 'us-east-1a', True),
+        ({
+            'operation_name': 'DescribeInstances'
+        }, 'us-east-1a', True),
+        ({}, 'us-east-1a,us-east-1b', True),
+        ({}, 'us-east-1a', False),
+    ],
+)
+def test_provider_negative_ack_missing_scope_fails_closed(
+        monkeypatch, error_kwargs, availability_zone, spot):
+    monkeypatch.setattr(aws_instance, 'BOTO_CREATE_MAX_RETRIES', 1)
+
+    def _reject(**kwargs):
+        del kwargs
+        raise _client_error('InsufficientInstanceCapacity', **error_kwargs)
+
+    ec2 = _RunInstancesEC2(_reject)
+    session = _RequestSession()
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+
+    expected_error = (exceptions.ServeReplicaLaunchFenceError
+                      if ',' in availability_zone else
+                      exceptions.ProviderCreateAmbiguousError)
+    with pytest.raises(expected_error) as exc_info:
+        aws_instance.run_instances(
+            'us-east-1', 'unused', 'sky-cluster',
+            _run_config(availability_zone=availability_zone, spot=spot))
+
+    assert not hasattr(exc_info.value, 'provider_negative_ack')
+
+
+def test_bound_account_mismatch_precedes_inventory_and_run_instances(
+        monkeypatch):
+
+    def _unexpected_run_instances(**kwargs):
+        pytest.fail(f'RunInstances must not be called: {kwargs!r}')
+
+    ec2 = _RunInstancesEC2(_unexpected_run_instances)
+    session = _RequestSession(
+        account_id=_OTHER_AWS_ACCOUNT_ID,
+        principal_arn=(
+            'arn:aws:sts::210987654321:assumed-role/test/rotated-session'))
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+
+    with pytest.raises(exceptions.ServeReplicaLaunchFenceError) as exc_info:
+        aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                   _run_config())
+
+    assert 'provider scope' in str(exc_info.value)
+    assert ec2.instances.filters == []
+    assert ec2.create_calls == []
+    assert session.client_calls == ['sts']
+    assert not hasattr(exc_info.value, 'provider_negative_ack')
+
+
+@pytest.mark.parametrize('proof_layer', [
+    'resource',
+    'session',
+    'identity',
+    'subnet',
+    'ec2-client',
+    'inventory-query',
+    'inventory-attribute',
+])
+def test_bound_provider_proof_unavailability_requeues_same_association(
+        monkeypatch, proof_layer):
+    """Read-only proof outages pause instead of terminalizing PROVIDER_IO."""
+
+    def _unexpected_run_instances(**kwargs):
+        pytest.fail(f'RunInstances must not be called: {kwargs!r}')
+
+    class _UnreadableInstance:
+
+        @property
+        def id(self):
+            raise TimeoutError('instance attributes unavailable')
+
+    initial_instances = ([_UnreadableInstance()]
+                         if proof_layer == 'inventory-attribute' else None)
+    ec2 = _RunInstancesEC2(_unexpected_run_instances, initial_instances)
+    if proof_layer == 'inventory-query':
+
+        def _unavailable_inventory(**_):
+            raise TimeoutError('instance inventory unavailable')
+
+        ec2.instances.filter = _unavailable_inventory
+    session = _RequestSession(
+        identity_error=(TimeoutError('sts unavailable')
+                        if proof_layer == 'identity' else None),
+        subnet_error=(TimeoutError('subnet unavailable')
+                      if proof_layer == 'subnet' else None))
+
+    def _default_resource(_):
+        if proof_layer == 'resource':
+            raise TimeoutError('credentials unavailable')
+        return ec2
+
+    def _session(*_, **__):
+        if proof_layer == 'session':
+            raise TimeoutError('session unavailable')
+        return session
+
+    resource_calls = 0
+
+    def _resource(*_, **__):
+        nonlocal resource_calls
+        resource_calls += 1
+        if proof_layer == 'ec2-client':
+            raise TimeoutError('EC2 client unavailable')
+        return ec2
+
+    monkeypatch.setattr(aws_instance, '_default_ec2_resource',
+                        _default_resource)
+    monkeypatch.setattr(aws_instance.aws, 'session', _session)
+    monkeypatch.setattr(aws_instance.aws, 'resource', _resource)
+
+    with pytest.raises(exceptions.ExecutionPausedError) as exc_info:
+        aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                   _run_config())
+
+    assert exc_info.value.retry_wait_seconds > 0
+    assert 'same immutable ordinary-paid AWS association' in (
+        exc_info.value.hint)
+    assert len(ec2.instances.filters) == (1 if proof_layer
+                                          == 'inventory-attribute' else 0)
+    assert ec2.create_calls == []
+    if proof_layer in ('resource', 'session'):
+        assert session.client_calls == []
+    elif proof_layer == 'identity':
+        assert session.client_calls == ['sts']
+    else:
+        assert session.client_calls == ['sts', 'ec2']
+    assert resource_calls == (0 if proof_layer in ('resource', 'session',
+                                                   'identity', 'subnet') else 1)
+
+
+@pytest.mark.parametrize(
+    ('client_token', 'account_id'),
+    [
+        (None, _AWS_ACCOUNT_ID),
+        (_AWS_CLIENT_TOKEN, None),
+        ('not-a-valid-client-token', _AWS_ACCOUNT_ID),
+    ],
+)
+def test_partial_or_invalid_bound_provider_scope_precedes_provider_io(
+        monkeypatch, client_token, account_id):
+
+    def _unexpected_run_instances(**kwargs):
+        pytest.fail(f'RunInstances must not be called: {kwargs!r}')
+
+    ec2 = _RunInstancesEC2(_unexpected_run_instances)
+    session = _RequestSession()
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+
+    with pytest.raises(exceptions.ServeReplicaLaunchFenceError) as exc_info:
+        aws_instance.run_instances(
+            'us-east-1', 'unused', 'sky-cluster',
+            _run_config(provider_create_idempotency_token=client_token,
+                        provider_create_account_id=account_id))
+
+    assert ec2.instances.filters == []
+    assert ec2.create_calls == []
+    assert not hasattr(exc_info.value, 'provider_negative_ack')
+
+
+def test_tokenized_paid_launch_rejects_multiple_subnets_before_ec2_io(
+        monkeypatch):
+
+    def _unexpected_run_instances(**kwargs):
+        pytest.fail(f'RunInstances must not be called: {kwargs!r}')
+
+    ec2 = _RunInstancesEC2(_unexpected_run_instances)
+    session = _RequestSession(subnet_zones={
+        'subnet-a': 'us-east-1a',
+        'subnet-b': 'us-east-1a',
+    })
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+    config = _run_config()
+    config.node_config['SubnetIds'] = ['subnet-a', 'subnet-b']
+
+    with pytest.raises(exceptions.ServeReplicaLaunchFenceError):
+        aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster', config)
+
+    assert ec2.instances.filters == []
+    assert ec2.create_calls == []
+    assert session.client_calls == []
+
+
+def test_missing_client_token_cannot_produce_provider_negative_ack(monkeypatch):
+
+    def _reject(**kwargs):
+        assert 'ClientToken' not in kwargs
+        raise _client_error('InsufficientInstanceCapacity')
+
+    ec2 = _RunInstancesEC2(_reject)
+    session = _RequestSession()
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+
+    with pytest.raises(provision_common.ProvisionerError) as exc_info:
+        aws_instance.run_instances(
+            'us-east-1', 'unused', 'sky-cluster',
+            _run_config(provider_create_idempotency_token=None,
+                        provider_create_account_id=None))
+
+    assert len(ec2.create_calls) == 1
+    assert not hasattr(exc_info.value, 'provider_negative_ack')
+
+
+def test_provider_request_token_mismatch_cannot_produce_negative_ack(
+        monkeypatch):
+    original_create_instances = aws_instance._create_instances
+
+    def _create_with_mismatched_token(*args, **kwargs):
+        assert kwargs['provider_create_idempotency_token'] == _AWS_CLIENT_TOKEN
+        kwargs['provider_create_idempotency_token'] = _OTHER_AWS_CLIENT_TOKEN
+        return original_create_instances(*args, **kwargs)
+
+    def _reject(**kwargs):
+        assert kwargs['ClientToken'] == _OTHER_AWS_CLIENT_TOKEN
+        raise _client_error('InsufficientInstanceCapacity')
+
+    ec2 = _RunInstancesEC2(_reject)
+    session = _RequestSession()
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+    monkeypatch.setattr(aws_instance, '_create_instances',
+                        _create_with_mismatched_token)
+
+    with pytest.raises(exceptions.ProviderCreateAmbiguousError) as exc_info:
+        aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                   _run_config())
+
+    assert len(ec2.create_calls) == 1
+    assert not hasattr(exc_info.value, 'provider_negative_ack')
+    assert not hasattr(
+        exc_info.value,
+        instance_requests._AWS_RUN_INSTANCES_NEGATIVE_ACK_CANDIDATE_ATTR)
+
+
+def test_lost_success_retry_uses_same_client_token_and_adopts_result(
+        monkeypatch):
+    monkeypatch.setattr(instance_requests.time, 'sleep', lambda _: None)
+    created = SimpleNamespace(id='i-idempotently-created',
+                              tags=[],
+                              placement={'AvailabilityZone': 'us-east-1a'})
+    instances_by_token = {}
+    observed_tokens = []
+
+    def _create_or_replay(**kwargs):
+        token = kwargs['ClientToken']
+        observed_tokens.append(token)
+        if token not in instances_by_token:
+            # Model EC2 accepting the request but the successful response being
+            # lost. The next invocation with the same token returns that one
+            # already-created instance rather than creating a duplicate.
+            instances_by_token[token] = [created]
+            raise _client_error('ServiceUnavailable',
+                                request_id='provider-response-lost',
+                                http_status_code=503)
+        return instances_by_token[token]
+
+    ec2 = _RunInstancesEC2(_create_or_replay)
+    session = _RequestSession()
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+
+    record = aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                        _run_config())
+
+    assert observed_tokens == [_AWS_CLIENT_TOKEN, _AWS_CLIENT_TOKEN]
+    assert len(instances_by_token) == 1
+    assert record.created_instance_ids == ['i-idempotently-created']
+    assert record.head_instance_id == 'i-idempotently-created'
+
+
+def test_shutting_down_initial_instance_prevents_negative_ack(monkeypatch):
+    shutting_down = SimpleNamespace(id='i-shutting-down',
+                                    state={'Name': 'shutting-down'},
+                                    tags=[])
+
+    def _reject(**kwargs):
+        del kwargs
+        raise _client_error('InsufficientInstanceCapacity')
+
+    ec2 = _RunInstancesEC2(_reject, [shutting_down])
+    session = _RequestSession()
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+
+    with pytest.raises(exceptions.ProviderCreateAmbiguousError) as exc_info:
+        aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                   _run_config())
+
+    assert not hasattr(exc_info.value, 'provider_negative_ack')
+    assert session.client_calls == ['sts', 'ec2']
+
+
+def test_ambiguous_transport_outcome_replays_same_token_and_adopts_result(
+        monkeypatch):
+    monkeypatch.setattr(instance_requests.utils, 'BOTO_MAX_RETRIES', 1)
+    monkeypatch.setattr(aws_instance, 'BOTO_CREATE_MAX_RETRIES', 1)
+    created = SimpleNamespace(id='i-created-after-replay',
+                              tags=[],
+                              placement={'AvailabilityZone': 'us-east-1a'})
+    observed_tokens = []
+
+    def _create_or_replay(**kwargs):
+        observed_tokens.append(kwargs['ClientToken'])
+        if len(observed_tokens) == 1:
+            raise botocore.exceptions.ReadTimeoutError(
+                endpoint_url='https://ec2.us-east-1.amazonaws.com')
+        return [created]
+
+    ec2 = _RunInstancesEC2(_create_or_replay)
+    session = _RequestSession()
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+    config = _run_config()
+
+    with pytest.raises(exceptions.ProviderCreateAmbiguousError) as exc_info:
+        aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster', config)
+
+    assert 'same immutable ordinary-paid association' in exc_info.value.hint
+    round_tripped = pickle.loads(pickle.dumps(exc_info.value))
+    assert isinstance(round_tripped, exceptions.ProviderCreateAmbiguousError)
+    assert round_tripped.retry_wait_seconds == exc_info.value.retry_wait_seconds
+    record = aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                        config)
+
+    assert observed_tokens == [_AWS_CLIENT_TOKEN, _AWS_CLIENT_TOKEN]
+    assert record.created_instance_ids == ['i-created-after-replay']
+
+
+@pytest.mark.parametrize(('error_type', 'error_kwargs'), [
+    (botocore.exceptions.EndpointConnectionError, {
+        'endpoint_url': 'https://ec2.example'
+    }),
+    (botocore.exceptions.ConnectTimeoutError, {
+        'endpoint_url': 'https://ec2.example'
+    }),
+    (botocore.exceptions.ConnectionClosedError, {
+        'endpoint_url': 'https://ec2.example',
+        'request': None,
+        'response': None,
+    }),
+    (botocore.exceptions.ProxyConnectionError, {
+        'proxy_url': 'https://proxy.example'
+    }),
+    (botocore.exceptions.SSLError, {
+        'endpoint_url': 'https://ec2.example',
+        'error': 'TLS failure',
+    }),
+])
+def test_tokenized_botocore_transport_errors_pause_fail_closed(
+        monkeypatch, error_type, error_kwargs):
+    monkeypatch.setattr(instance_requests.utils, 'BOTO_MAX_RETRIES', 1)
+    monkeypatch.setattr(aws_instance, 'BOTO_CREATE_MAX_RETRIES', 1)
+
+    def _unavailable(**kwargs):
+        assert kwargs['ClientToken'] == _AWS_CLIENT_TOKEN
+        raise error_type(**error_kwargs)
+
+    ec2 = _RunInstancesEC2(_unavailable)
+    session = _RequestSession()
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+
+    with pytest.raises(exceptions.ProviderCreateAmbiguousError):
+        aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                   _run_config())
+
+
+def test_exhausted_retryable_server_errors_pause_same_token(monkeypatch):
+    monkeypatch.setattr(instance_requests.time, 'sleep', lambda _: None)
+    monkeypatch.setattr(instance_requests.utils, 'BOTO_MAX_RETRIES', 2)
+    observed_tokens = []
+
+    def _unavailable(**kwargs):
+        observed_tokens.append(kwargs['ClientToken'])
+        raise _client_error('ServiceUnavailable',
+                            request_id=f'request-{len(observed_tokens)}',
+                            http_status_code=503)
+
+    ec2 = _RunInstancesEC2(_unavailable)
+    session = _RequestSession()
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+
+    with pytest.raises(exceptions.ProviderCreateAmbiguousError):
+        aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                   _run_config())
+
+    assert observed_tokens == [_AWS_CLIENT_TOKEN, _AWS_CLIENT_TOKEN]
+
+
+def test_retryable_server_error_before_capacity_rejection_is_ambiguous(
+        monkeypatch):
+    monkeypatch.setattr(instance_requests.time, 'sleep', lambda _: None)
+    calls = 0
+
+    def _reject(**kwargs):
+        nonlocal calls
+        del kwargs
+        calls += 1
+        if calls == 1:
+            raise _client_error('ServiceUnavailable',
+                                request_id='provider-request-ambiguous',
+                                http_status_code=503)
+        raise _client_error('InsufficientInstanceCapacity',
+                            request_id='provider-request-capacity')
+
+    ec2 = _RunInstancesEC2(_reject)
+    session = _RequestSession()
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+
+    with pytest.raises(exceptions.ProviderCreateAmbiguousError) as exc_info:
+        aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                   _run_config())
+
+    assert calls == 2
+    assert not hasattr(exc_info.value, 'provider_negative_ack')
+    assert not hasattr(
+        exc_info.value,
+        instance_requests._AWS_RUN_INSTANCES_NEGATIVE_ACK_CANDIDATE_ATTR)
+    assert session.client_calls == ['sts', 'ec2']
+
+
+def test_subnet_provider_az_mismatch_prevents_negative_ack(monkeypatch):
+
+    def _reject(**kwargs):
+        del kwargs
+        raise _client_error('InsufficientInstanceCapacity')
+
+    ec2 = _RunInstancesEC2(_reject)
+    session = _RequestSession(subnet_zones={'subnet-a': 'us-east-1b'})
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+
+    with pytest.raises(exceptions.ServeReplicaLaunchFenceError) as exc_info:
+        aws_instance.run_instances('us-east-1', 'unused', 'sky-cluster',
+                                   _run_config())
+
+    assert not hasattr(exc_info.value, 'provider_negative_ack')
+    assert not hasattr(
+        exc_info.value,
+        instance_requests._AWS_RUN_INSTANCES_NEGATIVE_ACK_CANDIDATE_ATTR)
+    assert session.client_calls == ['sts', 'ec2']
+    assert ec2.create_calls == []
+
+
+def test_tokenized_paid_launch_rejects_targeted_reservation_before_ec2_io(
+        monkeypatch):
+    calls = 0
+
+    def _unexpected_create(**kwargs):
+        nonlocal calls
+        calls += 1
+        pytest.fail(f'RunInstances must not be called: {kwargs!r}')
+
+    ec2 = _RunInstancesEC2(_unexpected_create)
+    session = _RequestSession()
+    _install_run_instances_fakes(monkeypatch, ec2, session=session)
+
+    with pytest.raises(exceptions.ServeReplicaLaunchFenceError) as exc_info:
+        aws_instance.run_instances(
+            'us-east-1', 'display-name', 'cloud-name',
+            _run_config(count=2, capacity_reservation_ids=['cr-1']))
+
+    assert calls == 0
+    assert not hasattr(exc_info.value, 'provider_negative_ack')
+    assert not hasattr(
+        exc_info.value,
+        instance_requests._AWS_RUN_INSTANCES_NEGATIVE_ACK_CANDIDATE_ATTR)
+    assert session.client_calls == []
 
 
 def test_run_instances_tags_resumed_instance_with_reserved_marker(monkeypatch):

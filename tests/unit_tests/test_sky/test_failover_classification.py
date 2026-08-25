@@ -39,6 +39,8 @@ _CAPACITY_POLICY_SIGNATURES = {
     '_terminal_failover_leaves': '(error)',
     '_terminal_leaf_cause_nodes': '(failure, *, history_depth, remaining_nodes)',
     'classify_resources_unavailable_error': '(cloud, error)',
+    'validate_provider_negative_ack': '(receipt, *, cluster_name, requested_count=None, client_token=None, expected_aws_account_id=None)',
+    'extract_provider_negative_ack': '(error)',
     '_is_quota_error': '(error)',
     '_canonical_accelerators': '(to_provision)',
     '_capacity_cache_cloud_name': '(to_provision)',
@@ -108,8 +110,8 @@ def _resolve_failover_policy_symbol(path: str):
 
 
 def test_failover_error_policy_historical_contract():
-    assert (backend._RSYNC_NOT_FOUND_MESSAGE
-            is failover_error_policy._RSYNC_NOT_FOUND_MESSAGE)
+    assert (backend._RSYNC_NOT_FOUND_MESSAGE is
+            failover_error_policy._RSYNC_NOT_FOUND_MESSAGE)
     for handler_name in ('FailoverCloudErrorHandlerV1',
                          'FailoverCloudErrorHandlerV2'):
         handler = getattr(backend, handler_name)
@@ -142,6 +144,80 @@ def _aggregate_error(*codes: str) -> provision_common.ProvisionerError:
     } for code in codes]
     if codes:
         error.__cause__ = _FakeClientError(codes[-1])
+    return error
+
+
+def _provider_negative_ack(*,
+                           reason: str = 'capacity',
+                           cluster_name: str = 'sky-cluster',
+                           requested_count: int = 2,
+                           region: str = 'us-east-1',
+                           availability_zone: str = 'us-east-1a',
+                           provider_request_id: str = 'request-1') -> dict:
+    client_token = 'a' * 64
+    error_code = ('InsufficientInstanceCapacity'
+                  if reason == 'capacity' else 'VcpuLimitExceeded')
+    return {
+        'schema_version': 1,
+        'provider': 'aws',
+        'operation': 'RunInstances',
+        'client_token': client_token,
+        'reason': reason,
+        'aws_account_id': '123456789012',
+        'aws_principal_arn': 'arn:aws:sts::123456789012:assumed-role/test/run',
+        'cluster_name_on_cloud': cluster_name,
+        'requested_count': requested_count,
+        'market': 'spot',
+        'instance_type': 'g6.4xlarge',
+        'region': region,
+        'availability_zone': availability_zone,
+        'invocations': [{
+            'region': region,
+            'availability_zone': availability_zone,
+            'initial_nonterminated_instance_ids': [],
+            'resumed_instance_ids': [],
+            'created_instance_ids': [],
+            'successful_create_calls': 0,
+            'ambiguous_create_calls': 0,
+            'create_call_count': 1,
+            'attempts': [{
+                'client_token': client_token,
+                'provider_request_id': provider_request_id,
+                'error_code': error_code,
+                'reason': reason,
+                'http_status_code': (500 if reason == 'capacity' else 400),
+                'aws_account_id': '123456789012',
+                'aws_principal_arn': 'arn:aws:sts::123456789012:assumed-role/test/run',
+                'region': region,
+                'availability_zone': availability_zone,
+                'subnet_id': f'subnet-{availability_zone}',
+                'market': 'spot',
+                'instance_type': 'g6.4xlarge',
+                'cluster_name_on_cloud': cluster_name,
+                'min_count': requested_count,
+                'max_count': requested_count,
+                'capacity_reservation_id': None,
+            }],
+        }],
+    }
+
+
+def _error_with_provider_negative_ack(receipt: dict) -> Exception:
+    error = provision_common.ProvisionerError('provider rejected request')
+    error.provider_negative_ack = receipt
+    return error
+
+
+def _typed_error_with_provider_negative_ack(
+        receipt: dict) -> provision_common.ProviderCreateRejectedError:
+    error = provision_common.ProviderCreateRejectedError(
+        'provider rejected create')
+    error.provider_negative_ack = receipt
+    error.errors = [{
+        'code': receipt['invocations'][0]['attempts'][0]['error_code'],
+        'message': 'provider rejected create',
+    }]
+    error.requested_count = receipt['requested_count']
     return error
 
 
@@ -334,6 +410,130 @@ def test_terminal_resources_unavailable_requires_all_structured_evidence():
         ])
     assert backend.classify_resources_unavailable_error(clouds.AWS(),
                                                         mixed) is None
+
+
+def test_provider_negative_ack_validator_returns_closed_canonical_copy():
+    receipt = _provider_negative_ack()
+
+    canonical = backend.validate_provider_negative_ack(
+        receipt, cluster_name='sky-cluster', requested_count=2)
+
+    assert canonical == receipt
+    assert canonical is not receipt
+    assert canonical['invocations'] is not receipt['invocations']
+    assert backend.validate_provider_negative_ack(
+        receipt, cluster_name='other-cluster', requested_count=2) is None
+    assert backend.validate_provider_negative_ack(
+        receipt, cluster_name='sky-cluster', requested_count=1) is None
+
+
+@pytest.mark.parametrize(('path', 'value'), [
+    (('schema_version',), 2),
+    (('aws_account_id',), 'not-an-account'),
+    (('aws_principal_arn',), ''),
+    (('market',), 'on_demand'),
+    (('region',), 'eu-south-2'),
+    (('availability_zone',), 'us-east-1b'),
+    (('instance_type',), 'g6.2xlarge'),
+    (('invocations', 0, 'initial_nonterminated_instance_ids'), ['i-live']),
+    (('invocations', 0, 'resumed_instance_ids'), ['i-stopped']),
+    (('invocations', 0, 'successful_create_calls'), 1),
+    (('invocations', 0, 'ambiguous_create_calls'), 1),
+    (('invocations', 0, 'attempts', 0, 'http_status_code'), 400),
+    (('invocations', 0, 'attempts', 0, 'aws_principal_arn'),
+     'arn:aws:sts::123456789012:assumed-role/other/run'),
+    (('invocations', 0, 'attempts', 0, 'provider_request_id'), ''),
+    (('invocations', 0, 'attempts', 0, 'min_count'), 1),
+    (('invocations', 0, 'attempts', 0, 'availability_zone'), 'us-east-1b'),
+    (('invocations', 0, 'attempts', 0, 'subnet_id'), ''),
+    (('invocations', 0, 'attempts', 0, 'error_code'), 'RequestLimitExceeded'),
+])
+def test_provider_negative_ack_validator_fails_closed(path, value):
+    receipt = pickle.loads(pickle.dumps(_provider_negative_ack()))
+    target = receipt
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+
+    assert backend.validate_provider_negative_ack(
+        receipt, cluster_name='sky-cluster', requested_count=2) is None
+
+
+@pytest.mark.parametrize('principal_arn', [
+    'not-an-arn',
+    'arn:aws:ec2::123456789012:instance/i-1234',
+    'arn:aws:sts:us-east-1:123456789012:assumed-role/test/run',
+    'arn:aws:sts::123456789012:',
+    'arn:not-aws:sts::123456789012:assumed-role/test/run',
+    'arn:aws:sts::123456789012:assumed role/test/run',
+])
+def test_provider_negative_ack_validator_rejects_malformed_principal_arn(
+        principal_arn):
+    receipt = _provider_negative_ack()
+    receipt['aws_principal_arn'] = principal_arn
+    receipt['invocations'][0]['attempts'][0][
+        'aws_principal_arn'] = principal_arn
+
+    assert backend.validate_provider_negative_ack(
+        receipt, cluster_name='sky-cluster', requested_count=2) is None
+
+
+def test_provider_negative_ack_validator_rejects_principal_account_mismatch():
+    receipt = _provider_negative_ack()
+    receipt['aws_account_id'] = '210987654321'
+    receipt['invocations'][0]['attempts'][0]['aws_account_id'] = '210987654321'
+
+    assert backend.validate_provider_negative_ack(
+        receipt, cluster_name='sky-cluster', requested_count=2) is None
+
+
+def test_provider_negative_ack_extractor_aggregates_every_nested_leaf():
+    east = _provider_negative_ack(provider_request_id='request-east')
+    second = _provider_negative_ack(provider_request_id='request-second')
+    terminal = _nested_terminal_error(_error_with_provider_negative_ack(east),
+                                      _error_with_provider_negative_ack(second))
+
+    aggregate = backend.extract_provider_negative_ack(terminal)
+
+    assert aggregate is not None
+    assert aggregate['reason'] == 'capacity'
+    assert aggregate['cluster_name_on_cloud'] == 'sky-cluster'
+    assert aggregate['requested_count'] == 2
+    assert [invocation['region'] for invocation in aggregate['invocations']
+           ] == ['us-east-1', 'us-east-1']
+    assert backend.validate_provider_negative_ack(
+        aggregate, cluster_name='sky-cluster', requested_count=2) == aggregate
+    round_tripped = pickle.loads(pickle.dumps(terminal))
+    assert backend.extract_provider_negative_ack(round_tripped) == aggregate
+
+
+def test_provider_negative_ack_extractor_rejects_mixed_or_missing_leaf():
+    capacity = _error_with_provider_negative_ack(_provider_negative_ack())
+    quota = _error_with_provider_negative_ack(
+        _provider_negative_ack(reason='quota',
+                               provider_request_id='quota-request'))
+    missing = provision_common.ProvisionerError('untyped failure')
+
+    assert backend.extract_provider_negative_ack(
+        _nested_terminal_error(capacity, quota)) is None
+    assert backend.extract_provider_negative_ack(
+        _nested_terminal_error(capacity, missing)) is None
+
+
+def test_provider_negative_ack_extractor_rejects_cycles_and_duplicates():
+    receipt = _provider_negative_ack()
+    cause_cycle = _error_with_provider_negative_ack(receipt)
+    wrapper = RuntimeError('wrapper')
+    cause_cycle.__cause__ = wrapper
+    wrapper.__cause__ = cause_cycle
+    assert backend.extract_provider_negative_ack(
+        _nested_terminal_error(cause_cycle)) is None
+
+    duplicate = _error_with_provider_negative_ack(receipt)
+    duplicate_cause = _error_with_provider_negative_ack(receipt)
+    duplicate.__cause__ = duplicate_cause
+    assert backend.extract_provider_negative_ack(
+        _nested_terminal_error(duplicate)) is None
 
 
 def _nested_terminal_error(
@@ -769,7 +969,10 @@ def _call_retry_zones(provisioner,
                       *,
                       num_nodes=1,
                       dryrun=False,
-                      skip_if_config_hash_matches=None):
+                      skip_if_config_hash_matches=None,
+                      cloud_user_identity=None):
+    if cloud_user_identity is None:
+        cloud_user_identity = ['arn:aws:iam::123456789012:role/test', 'acct']
     return provisioner._retry_zones(
         to_provision=to_provision,
         num_nodes=num_nodes,
@@ -777,7 +980,7 @@ def _call_retry_zones(provisioner,
         dryrun=dryrun,
         stream_logs=False,
         cluster_name='test-cluster',
-        cloud_user_identity=['arn:aws:iam::123456789012:role/test', 'acct'],
+        cloud_user_identity=cloud_user_identity,
         prev_cluster_status=None,
         prev_handle=None,
         prev_cluster_ever_up=False,
@@ -916,6 +1119,130 @@ def test_retry_zones_preserves_structured_provider_failure(
     assert exc_info.value.failover_history == [provider_error]
     assert backend.classify_resources_unavailable_error(
         clouds.AWS(), exc_info.value) == 'capacity'
+
+
+@pytest.mark.parametrize('provider_outcome', ['negative-ack', 'ambiguous'])
+def test_retry_zones_paid_provider_outcome_cleanup_contract(
+        tmp_path, monkeypatch, provider_outcome):
+    provisioner = _early_retry_provisioner(tmp_path, monkeypatch)
+    provisioner._local_wheel_path = None
+    provisioner._wheel_hash = None
+    provisioner._active_cluster_hash = None
+    provisioner._is_managed = False
+    provisioner._workload_type = 'service'
+    provisioner._is_launched_by_jobs_controller = False
+    provisioner._extra_launch_context = {
+        ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY: 2,
+    }
+    provisioner._validate_service_replica_launch_preflight = lambda: None
+    provisioner._service_replica_launch_provider_guard = (
+        lambda: contextlib.nullcontext())
+    to_provision = _to_provision()
+    receipt = _provider_negative_ack(cluster_name='test-cluster',
+                                     requested_count=1)
+    provider_error = (_typed_error_with_provider_negative_ack(receipt)
+                      if provider_outcome == 'negative-ack' else
+                      exceptions.ProviderCreateAmbiguousError(
+                          'RunInstances response lost',
+                          hint='replay same association and ClientToken',
+                          retry_wait_seconds=5))
+    bound_context = types.SimpleNamespace(
+        profile=types.SimpleNamespace(kind=ordinary_launch_binding.
+                                      NonPoolLaunchProfileKind.ORDINARY_PAID),
+        capability_cohort_epoch=(ordinary_launch_binding.
+                                 ORDINARY_PAID_AWS_CLIENT_TOKEN_COHORT_FLOOR),
+    )
+
+    monkeypatch.setattr(clouds.AWS, 'check_quota_available', lambda *_: True)
+    monkeypatch.setattr(provisioner, '_yield_zones',
+                        lambda *_: iter([[clouds.Zone('us-east-1a')]]))
+    monkeypatch.setattr(backend, '_capacity_cache_exhausted_zone_names',
+                        lambda *_: set())
+    monkeypatch.setattr(backend, '_get_image_demand_attribution',
+                        lambda *_: mock.MagicMock())
+    monkeypatch.setattr(backend, '_resolve_container_image_for_placement',
+                        lambda resources, **_: resources)
+    monkeypatch.setattr(backend, '_get_cluster_config_template',
+                        lambda *_: '/tmp/template')
+    monkeypatch.setattr(
+        backend.backend_utils, 'write_cluster_config', lambda *_, **__: {
+            'ray': '/tmp/cluster.yaml',
+            'cluster_name_on_cloud': 'test-cluster',
+        })
+    monkeypatch.setattr(backend, '_get_workload_attribution', lambda *_:
+                        (None, None))
+    monkeypatch.setattr(backend.global_user_state, 'add_or_update_cluster',
+                        lambda *_, **__: 'cluster-hash')
+    monkeypatch.setattr(backend.global_user_state, 'add_cluster_event',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.global_user_state,
+                        'set_owner_identity_for_cluster', lambda *_, **__: None)
+    monkeypatch.setattr(backend.usage_lib.messages.usage,
+                        'update_final_cluster_status', lambda *_: None)
+    monkeypatch.setattr(backend.controller_utils.Controllers, 'from_name',
+                        lambda *_: None)
+    bulk_provision = mock.Mock(side_effect=provider_error)
+    monkeypatch.setattr(backend.provisioner, '_BUILTIN_BULK_PROVISION',
+                        bulk_provision)
+    monkeypatch.setattr(backend.provisioner, 'bulk_provision', bulk_provision)
+    cleanup = mock.Mock(
+        side_effect=AssertionError('provider cleanup must be skipped'))
+    monkeypatch.setattr(backend.CloudVmRayBackend, 'post_teardown_cleanup',
+                        cleanup)
+    blocklist = mock.Mock()
+    monkeypatch.setattr(backend.FailoverCloudErrorHandlerV2,
+                        'update_blocklist_on_error', blocklist)
+    monkeypatch.setattr(backend, '_record_service_placement_event',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.capacity_cache, 'mark_exhausted',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(ordinary_launch_binding, 'has_bound_launch_context',
+                        lambda *_: True)
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'parse_bound_non_pool_launch_context',
+                        lambda *_: bound_context)
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'ordinary_paid_aws_client_token',
+                        lambda *_: receipt['client_token'])
+    monkeypatch.setattr(ordinary_launch_binding, 'ordinary_paid_aws_account_id',
+                        lambda *_: receipt['aws_account_id'])
+
+    expected_error = (exceptions.ResourcesUnavailableError
+                      if provider_outcome == 'negative-ack' else
+                      exceptions.ProviderCreateAmbiguousError)
+    with pytest.raises(expected_error) as exc_info:
+        _call_retry_zones(provisioner,
+                          to_provision,
+                          cloud_user_identity=[
+                              'arn:aws:iam::123456789012:role/test',
+                              '123456789012'
+                          ])
+
+    cleanup.assert_not_called()
+    bulk_provision.assert_called_once()
+    assert bulk_provision.call_args.kwargs[
+        'provider_create_idempotency_token'] == receipt['client_token']
+    if provider_outcome == 'negative-ack':
+        assert len(exc_info.value.failover_history) == 1
+        failover_record = exc_info.value.failover_history[0]
+        assert type(failover_record) is provision_common.ProvisionerError
+        assert str(failover_record) == str(provider_error)
+        assert failover_record.requested_count == provider_error.requested_count
+        assert failover_record.provider_negative_ack == receipt
+        assert backend.extract_provider_negative_ack(exc_info.value) == receipt
+        # The terminal request wire shallow-pickles failover-history leaves.
+        # Simulate an N-1/N-2 reader which predates the live-only subtype: the
+        # stable base leaf and additive receipt must still decode exactly.
+        serialized_error = exceptions.serialize_exception(exc_info.value)
+        encoded_error = pickle.dumps(serialized_error)
+        monkeypatch.delattr(provision_common, 'ProviderCreateRejectedError')
+        decoded_error = exceptions.deserialize_exception(
+            pickle.loads(encoded_error))
+        assert backend.extract_provider_negative_ack(decoded_error) == receipt
+        blocklist.assert_called_once()
+    else:
+        assert exc_info.value is provider_error
+        blocklist.assert_not_called()
 
 
 def test_retry_zones_passes_template_override_to_config_writer(
@@ -1340,9 +1667,8 @@ def test_new_provisioner_post_bulk_callback_is_authoritative(
         'bulk_provision',
         'deploy_vars:post_bulk',
     ]
-    assert {
-        key: writer_results[0][key] for key in writer_variables
-    } == writer_variables
+    assert {key: writer_results[0][key] for key in writer_variables
+           } == writer_variables
     assert result['resources_vars'] == post_bulk_variables
     assert result['provision_record'] is provision_record
     bulk_provision.assert_called_once()
@@ -1555,9 +1881,8 @@ def test_new_provisioner_short_circuit_skips_bulk_and_post_bulk_callback(
         'resources_deploy_vars',
         'deploy_vars:writer',
     ]
-    assert {
-        key: writer_results[0][key] for key in writer_variables
-    } == writer_variables
+    assert {key: writer_results[0][key] for key in writer_variables
+           } == writer_variables
     assert result['provisioning_skipped'] is provisioning_skipped
     bulk_provision.assert_not_called()
     cleanup.assert_not_called()
@@ -1676,11 +2001,9 @@ def test_only_reserved_fill_builtin_kubernetes_splits_provider_effect_guard(
                     builtin,
                     guard_factory,
                     reserved_fill=True) is None
-    assert selector(clouds.DO(),
-                    builtin,
-                    builtin,
-                    guard_factory,
-                    reserved_fill=True) is None
+    assert selector(
+        clouds.DO(), builtin, builtin, guard_factory,
+        reserved_fill=True) is None
     assert selector(clouds.Kubernetes(),
                     builtin,
                     builtin,
@@ -2003,8 +2326,8 @@ def test_reserved_fill_backend_installs_successful_adoption_guard(
         skip_unnecessary_provisioning=True)
 
     assert result == (handle, False)
-    assert (backend_instance._reserved_fill_materialized_guard_factory
-            is fresh_guard)
+    assert (backend_instance._reserved_fill_materialized_guard_factory is
+            fresh_guard)
     assert backend_instance._reserved_fill_pod_materialized is True
     assert events.count('guard-enter') >= 3
     provision_with_retries.assert_called_once_with(task, to_provision_config,

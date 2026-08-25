@@ -1353,7 +1353,8 @@ def test_placement_route_opt_in_includes_paid_admission(monkeypatch):
                                          globally_managed=True,
                                          service_name='svc',
                                          service_hash='incarnation-a',
-                                         max_live_paid_gpu_units=None)
+                                         max_live_paid_gpu_units=None,
+                                         allow_provider_identity_lookup=False)
     admission_snapshot.assert_called_once_with(budget)
 
 
@@ -2102,8 +2103,8 @@ class TestServiceUpdateReconciler:
         assert prepared.source_is_live is False
         assert prepared.durable_bytes == durable_bytes
         assert secret.encode() not in prepared.durable_bytes
-        assert prepared.config.get_nested(('docker', 'run_options'),
-                                          None) is None
+        assert prepared.config.get_nested(
+            ('docker', 'run_options'), None) is None
         write_receipt.assert_not_called()
         receipt = serve_utils.get_config_snapshot_receipt(str(staged))
         if receipt_state == 'missing':
@@ -3721,8 +3722,9 @@ class TestGetLbReplicaInfo:
             id(info): controller.reserved_capacity.ProtocolV2CleanupFence(
                 kubernetes_context=('east'
                                     if info.replica_id <= 420 else 'phx'),
-                physical_cluster_uid=('east-uid' if info.replica_id <= 420 else
-                                      'phx-uid')) for info in infos
+                physical_cluster_uid=('east-uid'
+                                      if info.replica_id <= 420 else 'phx-uid'))
+            for info in infos
         }
         physical_provider_entries = []
 
@@ -4175,8 +4177,9 @@ class TestAutoscalerRuntimeSnapshot:
                 'unknown_in_flight_replica_ids': sorted(unknown_replica_ids),
                 'observed_slots_by_replica_id': observed_slots,
                 'unknown_capacity_replica_ids': sorted(unknown_replica_ids),
-                'reconcile_generation': (generation if request_generation
-                                         is None else request_generation),
+                'reconcile_generation':
+                    (generation
+                     if request_generation is None else request_generation),
                 'queue_depth': 0,
                 'rejected_in_window': 0,
                 'rejected_in_recent_window': 0,
@@ -7223,8 +7226,8 @@ class TestAuthoritativeLbReportIngestion:
                     report))
 
         assert response.status_code == 200
-        assert (json.loads(response.body)['request_history_accepted']
-                is history_accepted)
+        assert (json.loads(response.body)['request_history_accepted'] is
+                history_accepted)
 
     def test_provider_phase_timeout_aborts_lb_sync_before_publication(self):
         ctrl, info, report = self._controller_and_report()
@@ -8233,8 +8236,8 @@ class TestReservedCapacityPollerStart:
             start_mock.call_args_list[0].args[0]()
             poller_loop.assert_called_once()
             poller_kwargs = poller_loop.call_args.kwargs
-            assert (poller_kwargs['actuation_epoch_lock']
-                    is ctrl._get_actuation_epoch_lock())
+            assert (poller_kwargs['actuation_epoch_lock'] is
+                    ctrl._get_actuation_epoch_lock())
             generation = poller_kwargs['get_actuation_generation']()
             assert generation == ctrl.get_actuation_generation()
             assert poller_kwargs['actuation_generation_is_current'](generation)
@@ -8245,8 +8248,8 @@ class TestReservedCapacityPollerStart:
             assert 'wake_event' not in poller_kwargs
             poller_ambiguity_callback = (poller_kwargs['on_ambiguous_boundary'])
             assert poller_ambiguity_callback.__self__ is ctrl
-            assert (poller_ambiguity_callback.__func__
-                    is ctrl._handle_reclaim_proof_boundary_ambiguity.__func__)
+            assert (poller_ambiguity_callback.__func__ is
+                    ctrl._handle_reclaim_proof_boundary_ambiguity.__func__)
 
     def test_without_placer_is_inert(self):
         ctrl = self._controller_with(placer=None)

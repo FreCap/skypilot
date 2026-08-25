@@ -371,6 +371,17 @@ class ProvisionerError(RuntimeError):
     requested_count: int | None = None
 
 
+class ProviderCreateRejectedError(ProvisionerError):
+    """A provider-native create rejection with exact zero-effect evidence.
+
+    The provisioner which raises this type must attach a closed
+    ``provider_negative_ack`` receipt.  Cleanup layers must independently
+    validate that receipt against their immutable request scope before using
+    it to skip provider teardown.
+    """
+    provider_negative_ack: dict[str, Any]
+
+
 class StopFailoverError(Exception):
     """Exception for stopping failover.
 
@@ -418,6 +429,18 @@ class ProvisionConfig:
     cluster_incarnation: str | None = dataclasses.field(default=None,
                                                         kw_only=True,
                                                         repr=False)
+    # Runtime-only idempotency identity for one logical provider create.  It
+    # is deliberately separate from node_config so a persisted task or user
+    # override cannot nominate the provider request identity.
+    provider_create_idempotency_token: str | None = dataclasses.field(
+        default=None, kw_only=True, repr=False, compare=False)
+    # Account scope durably bound by the owning Serve association before the
+    # first provider create.  The provider revalidates it with STS before any
+    # EC2 inventory or mutation, preventing cross-account replay.
+    provider_create_account_id: str | None = dataclasses.field(default=None,
+                                                               kw_only=True,
+                                                               repr=False,
+                                                               compare=False)
     # Runtime-only authorization boundary. Built-in provisioners enter this
     # immediately around bounded provider mutations and release it before
     # passive capacity/readiness waits.
@@ -442,6 +465,8 @@ class ProvisionConfig:
         config = dataclasses.asdict(serializable)
         # This internal identity is not part of the provision-log contract.
         config.pop('cluster_incarnation', None)
+        config.pop('provider_create_idempotency_token', None)
+        config.pop('provider_create_account_id', None)
         config.pop('provider_effect_guard_factory', None)
         config.pop('kueue_admission_runtime', None)
 

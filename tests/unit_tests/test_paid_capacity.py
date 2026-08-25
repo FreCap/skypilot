@@ -14,7 +14,28 @@ from sky.utils import common_utils
 
 
 @pytest.fixture(autouse=True)
-def _clear_paid_capacity_config_cache():
+def _clear_paid_capacity_config_cache(monkeypatch):
+    original_pool_key = paid_capacity.pool_key
+
+    def _account_scoped_pool_key(location, **kwargs):
+        is_mock_aws = (str(location.cloud).casefold() == 'aws' and
+                       not isinstance(location.cloud, paid_capacity.clouds.AWS))
+        if (str(location.cloud).casefold() == 'aws' and
+                not isinstance(kwargs.get('aws_account_id'), str)):
+            kwargs['aws_account_id'] = '123456789012'
+        key = original_pool_key(location, **kwargs)
+        if is_mock_aws:
+            payload = json.loads(key)
+            payload['version'] = 2
+            payload['provider_identity'] = {
+                'aws_account_id': kwargs['aws_account_id'],
+            }
+            key = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+        return key
+
+    monkeypatch.setattr(paid_capacity, 'pool_key', _account_scoped_pool_key)
+    monkeypatch.setattr(paid_capacity, '_active_aws_account_id_for_workspace',
+                        lambda *_args, **_kwargs: '123456789012')
     paid_capacity._parse_positive_int.cache_clear()
     paid_capacity._parse_service_limit_profiles.cache_clear()
     paid_capacity._warn_service_max_below_floor.cache_clear()
@@ -82,11 +103,24 @@ def test_pool_key_distinguishes_every_provider_capacity_dimension():
     assert base != paid_capacity.pool_key(a100_80, workspace='w1', num_nodes=1)
     changed_instance = make_location('us-east-1', {'A100': 1}, cloud_name='AWS')
     changed_instance.instance_type = 'p4de.24xlarge'
-    assert base != paid_capacity.pool_key(changed_instance,
-                                          workspace='w1',
-                                          num_nodes=1)
+    assert base != paid_capacity.pool_key(
+        changed_instance, workspace='w1', num_nodes=1)
     assert base != paid_capacity.pool_key(a100, workspace='w2', num_nodes=1)
     assert base != paid_capacity.pool_key(a100, workspace='w1', num_nodes=2)
+
+
+def test_non_aws_pool_key_retains_existing_v1_identity():
+    location = make_location('us-central1', {'L4': 1}, cloud_name='GCP')
+    location.instance_type = 'g2-standard-4'
+
+    payload = json.loads(
+        paid_capacity.pool_key(location, workspace='w1', num_nodes=1))
+
+    assert payload['version'] == 1
+    assert 'provider_identity' not in payload
+    stale_v2 = dict(payload, version=2, provider_identity=None)
+    assert paid_capacity.pool_key_payload(
+        json.dumps(stale_v2, sort_keys=True, separators=(',', ':'))) is None
 
 
 def test_pool_key_normalizes_equivalent_accelerator_counts():
@@ -1101,6 +1135,74 @@ def test_legacy_local_snapshot_only_debits_unresolved_rows(monkeypatch):
     paid_capacity._parse_positive_int.cache_clear()
 
 
+def test_unmanaged_budget_never_resolves_aws_provider_identity(monkeypatch):
+    location = paid_capacity.spot_placer.Location(
+        cloud=paid_capacity.clouds.AWS(),
+        region='us-east-1',
+        zone='us-east-1a',
+        accelerators={'L4': 1},
+        use_spot=True,
+        instance_type='g6.xlarge')
+    placer = make_placer({location: 1.0})
+    identity = mock.Mock(side_effect=AssertionError(
+        'unmanaged admission must not resolve provider identity'))
+    monkeypatch.setattr(paid_capacity, '_active_aws_account_id_for_locations',
+                        identity)
+
+    budget = paid_capacity.build_launch_budget(placer,
+                                               workspace='w',
+                                               existing_replica_infos=[],
+                                               globally_managed=False)
+
+    identity.assert_not_called()
+    payload = paid_capacity.pool_key_payload(
+        budget.pool_key_by_location[location])
+    assert payload is not None
+    assert payload['version'] == 1
+    assert 'provider_identity' not in payload
+
+
+def test_provider_free_budget_reuses_only_committed_aws_account(monkeypatch):
+    location = paid_capacity.spot_placer.Location(
+        cloud=paid_capacity.clouds.AWS(),
+        region='us-east-1',
+        zone='us-east-1a',
+        accelerators={'L4': 1},
+        use_spot=True,
+        instance_type='g6.xlarge')
+    placer = make_placer({location: 1.0})
+    info = _pending_info(1, location)
+    info.paid_capacity_pool_key = paid_capacity.pool_key(
+        location, workspace='w', num_nodes=1, aws_account_id='123456789012')
+    identity = mock.Mock(side_effect=AssertionError(
+        'read-only admission must not resolve provider identity'))
+    monkeypatch.setattr(paid_capacity, '_active_aws_account_id_for_locations',
+                        identity)
+
+    def _states(keys, **_):
+        return {key: {'remaining': 1} for key in keys}
+
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=True), mock.patch.object(
+                               paid_capacity.serve_state,
+                               'get_paid_capacity_pool_states',
+                               side_effect=_states):
+        budget = paid_capacity.build_launch_budget(
+            placer,
+            workspace='w',
+            existing_replica_infos=[info],
+            globally_managed=True,
+            allow_provider_identity_lookup=False)
+
+    identity.assert_not_called()
+    payload = paid_capacity.pool_key_payload(
+        budget.pool_key_by_location[location])
+    assert payload is not None
+    assert payload['version'] == 2
+    assert payload['provider_identity'] == {'aws_account_id': '123456789012'}
+
+
 def test_non_postgresql_backend_uses_legacy_local_window(monkeypatch):
     monkeypatch.delenv(paid_capacity._BASE_LIMIT_ENV_VAR, raising=False)
     paid_capacity._parse_positive_int.cache_clear()
@@ -1554,8 +1656,8 @@ def test_full_l4_frontier_does_not_block_independent_a100():
         })
 
     assert paid_capacity.select_location(
-        placer, budget, allowed_locations={l4_primary, l4_hedge,
-                                           l4_third}) is None
+        placer, budget, allowed_locations={l4_primary, l4_hedge, l4_third
+                                          }) is None
     assert budget.feedback_deferred_frontiers == {('l4',)}
     assert paid_capacity.select_location(placer,
                                          budget,
@@ -1647,12 +1749,16 @@ def test_restart_restores_missing_claim_from_persisted_pool_key():
     info = _pending_info(1, location)
     info.paid_capacity_pool_key = 'persisted-pool'
 
-    with mock.patch.object(paid_capacity,
-                           'central_authority_available',
-                           return_value=True), mock.patch.object(
-                               paid_capacity.serve_state,
-                               'adopt_paid_capacity_claims',
-                               return_value=True) as adopt:
+    with mock.patch.object(
+            paid_capacity, 'central_authority_available',
+            return_value=True), mock.patch.object(
+                paid_capacity.serve_state,
+                'adopt_paid_capacity_claims',
+                return_value=True) as adopt, mock.patch.object(
+                    paid_capacity,
+                    '_active_aws_account_id_for_locations',
+                    side_effect=RuntimeError(
+                        'identity must not be resolved')) as identity:
         assert paid_capacity.adopt_existing_claims(
             service_name='svc',
             service_hash='hash',
@@ -1664,6 +1770,7 @@ def test_restart_restores_missing_claim_from_persisted_pool_key():
 
     claims = adopt.call_args.args[2]
     assert claims == [(1, 'persisted-pool', 20, info)]
+    identity.assert_not_called()
 
 
 def test_restart_skips_ambiguous_legacy_instance_type_claim():
@@ -1700,12 +1807,16 @@ def test_restart_claim_adoption_reads_central_catalog_only():
     placer.zero_cost_locations = mock.Mock(wraps=placer.zero_cost_locations)
     info = _pending_info(1, paid)
 
-    with mock.patch.object(paid_capacity,
-                           'central_authority_available',
-                           return_value=True), mock.patch.object(
-                               paid_capacity.serve_state,
-                               'adopt_paid_capacity_claims',
-                               return_value=True) as adopt:
+    with mock.patch.object(
+            paid_capacity, 'central_authority_available',
+            return_value=True), mock.patch.object(
+                paid_capacity.serve_state,
+                'adopt_paid_capacity_claims',
+                return_value=True) as adopt, mock.patch.object(
+                    paid_capacity,
+                    '_active_aws_account_id_for_locations',
+                    side_effect=RuntimeError(
+                        'identity must not be resolved')) as identity:
         assert paid_capacity.adopt_existing_claims(
             service_name='svc',
             service_hash='hash',
@@ -1715,7 +1826,13 @@ def test_restart_claim_adoption_reads_central_catalog_only():
             replica_infos=[info],
             priority=20)
 
-    assert len(adopt.call_args.args[2]) == 1
+    claims = adopt.call_args.args[2]
+    assert len(claims) == 1
+    adopted_pool = paid_capacity.pool_key_payload(claims[0][1])
+    assert adopted_pool is not None
+    assert adopted_pool['version'] == 1
+    assert 'provider_identity' not in adopted_pool
+    identity.assert_not_called()
     placer.zero_cost_locations.assert_called_once_with()
 
 
