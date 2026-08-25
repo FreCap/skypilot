@@ -5261,6 +5261,78 @@ class TestAutoscalerRuntimeSnapshot:
             sequenced_reserved_fill=False,
             reserved_fill_allocation_map=None)
 
+    def test_promoted_mixed_logical_wave_forwards_paid_authority(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        scaler = self._logical_durable_autoscaler(target=3)
+        scaler.logical_target_state = (1, 3, 3, (('L4', 3),), (('L4', 1),))
+        ctrl._autoscaler = scaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        authority = mock.Mock()
+        target = autoscalers.LogicalScaleTarget(
+            version=1,
+            reconcile_generation=3,
+            target_capacity=3,
+            target_capacity_by_accelerator=(('L4', 3),),
+            accelerator_shapes=(('L4', 1),),
+            replace_unknown_replica_ids=(1,),
+            launch_budget=3,
+            launch_priority=20,
+            launch_priority_by_accelerator=(('L4', 20),),
+            cold_launch_authority_by_accelerator=(('L4', 3),))
+        decision = autoscalers.AutoscalerDecision(
+            autoscalers.AutoscalerDecisionOperator.SCALE_UP, target)
+
+        with mock.patch.object(
+                controller.capacity_admission,
+                'get_service_source_mode',
+                return_value=(controller.capacity_admission.DemandSourceMode.
+                              DURABLE_FEED, 1)), \
+             mock.patch.object(
+                 controller.demand_state,
+                 'get_autoscaling_snapshot',
+                 return_value=self._durable_snapshot(
+                     observed_slots={1: 0},
+                     in_flight={1: 0},
+                     unknown_replica_ids={1})), \
+             mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1]}), \
+             mock.patch.object(
+                 autoscalers,
+                 'generate_controller_scaling_decisions',
+                 return_value=[decision]), \
+             mock.patch.object(ctrl,
+                               '_persist_cost_rebalance_state',
+                               return_value=True), \
+             mock.patch.object(ctrl,
+                               '_publish_ordered_paid_authority',
+                               return_value=authority) as publish:
+            ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
+
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_called_once_with(  # pylint: disable=line-too-long
+            3,
+            1,
+            3,
+            replace_unknown_replica_ids=(1,),
+            launch_budget=3,
+            launch_priority=20,
+            launch_priority_by_accelerator={'L4': 20},
+            cold_launch_authority_by_accelerator={'L4': 3},
+            target_capacity_by_accelerator={'L4': 3},
+            accelerator_shapes={'L4': 1},
+            paid_launch_authority=authority)
+        publish.assert_called_once_with(  # pylint: disable=protected-access
+            scaler,
+            1,
+            sequenced_reserved_fill=False,
+            reserved_fill_allocation_map=None)
+
     def test_promoted_zero_target_still_publishes_revoking_plan(self):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access

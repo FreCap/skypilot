@@ -68,7 +68,6 @@ _admission_summary_log_lock = threading.Lock()
 _admission_summary_log_signature: tuple[Any, ...] | None = None
 _admission_summary_logged_at = 0.0
 FrontierKey = tuple[str, ...]
-FailureDomainKey = tuple[str, str]
 
 
 class ClaimResult(enum.Enum):
@@ -129,9 +128,6 @@ class LaunchBudget:
     stop_sequence: int = 0
     max_frontier_limit: int | None = None
     frontier_feedback_delay_seconds: int | None = None
-    failure_domain_by_location: dict[spot_placer.Location,
-                                     FailureDomainKey] = (dataclasses.field(
-                                         default_factory=dict))
     newest_claimed_at_by_pool_key: dict[str, float] = dataclasses.field(
         default_factory=dict)
     unknown_claim_age_pool_keys: set[str] = dataclasses.field(
@@ -524,11 +520,6 @@ def frontier_key(location: spot_placer.Location) -> FrontierKey:
                key=str.casefold))
 
 
-def failure_domain(location: spot_placer.Location) -> FailureDomainKey:
-    """Return the provider-region failure domain for one location."""
-    return (str(location.cloud).casefold(), location.region)
-
-
 def _pool_key_payload(key: str) -> dict[str, Any] | None:
     try:
         payload = json.loads(key)
@@ -580,21 +571,6 @@ def frontier_key_from_pool_key(key: str) -> FrontierKey | None:
     if payload is None:
         return None
     return tuple(accelerator[0] for accelerator in payload['accelerators'])
-
-
-def failure_domain_from_pool_key(key: str) -> FailureDomainKey | None:
-    """Recover a provider-region domain from one versioned exact pool key."""
-    if frontier_key_from_pool_key(key) is None:
-        return None
-    payload = _pool_key_payload(key)
-    if payload is None:
-        return None
-    cloud = payload.get('cloud')
-    region = payload.get('region')
-    if (not isinstance(cloud, str) or not cloud or
-            not isinstance(region, str) or not region):
-        return None
-    return (cloud.casefold(), region)
 
 
 def _legacy_local_remaining(
@@ -853,9 +829,6 @@ def build_launch_budget(
     frontier_keys = {
         location: frontier_key(location) for location in paid_locations
     }
-    failure_domains = {
-        location: failure_domain(location) for location in paid_locations
-    }
     owned_by_frontier: dict[FrontierKey,
                             set[str]] = collections.defaultdict(set)
     oldest_by_frontier: dict[FrontierKey, float] = {}
@@ -936,7 +909,6 @@ def build_launch_budget(
         max_frontier_limit=configured_max_frontier,
         frontier_feedback_delay_seconds=(exploration_feedback_delay_seconds()),
         frontier_key_by_location=frontier_keys,
-        failure_domain_by_location=failure_domains,
         owned_pool_keys_by_frontier=dict(owned_by_frontier),
         unknown_owned_pool_keys=unknown_owned_pool_keys,
         oldest_claimed_at_by_frontier=oldest_by_frontier,
@@ -981,18 +953,6 @@ def _frontier_limits_by_key(budget: LaunchBudget) -> dict[FrontierKey, int]:
     return result
 
 
-def _owned_failure_domains(budget: LaunchBudget,
-                           key: FrontierKey) -> set[FailureDomainKey] | None:
-    """Return known owned domains, failing closed on opaque identities."""
-    domains = set()
-    for pool in _owned_pool_keys(budget, key):
-        domain = failure_domain_from_pool_key(pool)
-        if domain is None:
-            return None
-        domains.add(domain)
-    return domains
-
-
 def _youngest_unresolved_claim_age_seconds(budget: LaunchBudget,
                                            key: FrontierKey) -> float | None:
     """Return the age of the newest unresolved claim in an owned cohort."""
@@ -1016,37 +976,6 @@ def _owned_pool_has_headroom(budget: LaunchBudget, key: FrontierKey) -> bool:
         budget.remaining_by_location.get(location, 0) > 0 and
         budget.pool_key_by_location.get(location) in owned
         for location in budget.remaining_by_location)
-
-
-def _prefer_new_failure_domain_openings(
-    budget: LaunchBudget,
-    candidates: set[spot_placer.Location],
-) -> set[spot_placer.Location]:
-    """Prefer a different provider-region when opening a normal hedge."""
-    preferred = set(candidates)
-    by_frontier: dict[FrontierKey,
-                      set[spot_placer.Location]] = collections.defaultdict(set)
-    for location in candidates:
-        key = budget.frontier_key_by_location.get(location,
-                                                  frontier_key(location))
-        by_frontier[key].add(location)
-    for key, locations in by_frontier.items():
-        owned = _owned_pool_keys(budget, key)
-        domains = _owned_failure_domains(budget, key)
-        if not owned or domains is None:
-            continue
-        unowned = {
-            location for location in locations
-            if budget.pool_key_by_location.get(location) not in owned
-        }
-        new_domain = {
-            location for location in unowned
-            if budget.failure_domain_by_location.get(
-                location, failure_domain(location)) not in domains
-        }
-        if new_domain:
-            preferred.difference_update(unowned - new_domain)
-    return preferred
 
 
 def _defer_frontier(budget: LaunchBudget, key: FrontierKey) -> None:
@@ -1130,8 +1059,6 @@ def select_location(
                 eligible_paid.add(location)
             else:
                 blocked_by_frontier[key].add(location)
-        eligible_paid = _prefer_new_failure_domain_openings(
-            budget, eligible_paid)
         for key, blocked_locations in blocked_by_frontier.items():
             if any(
                     budget.frontier_key_by_location.get(
@@ -1145,23 +1072,21 @@ def select_location(
                 int(budget.max_frontier_limit or current_frontier))
             delay = budget.frontier_feedback_delay_seconds
             youngest_age = _youngest_unresolved_claim_age_seconds(budget, key)
-            owned_domains = _owned_failure_domains(budget, key)
             can_expand = (key not in budget.frontier_limit_overrides and
                           current_frontier < maximum_frontier and
                           delay is not None and youngest_age is not None and
                           youngest_age >= delay and
-                          owned_domains is not None and
+                          not budget.unknown_owned_pool_keys and
                           not _owned_pool_has_headroom(budget, key))
             if can_expand:
-                assert owned_domains is not None
-                new_domain_locations = {
-                    location for location in blocked_locations
-                    if budget.failure_domain_by_location.get(
-                        location, failure_domain(location)) not in owned_domains
-                }
-                if new_domain_locations:
-                    expansion_candidates.update(new_domain_locations)
-                    continue
+                # The frontier is a concurrency bound, not a price policy.
+                # Once every owned exact pool has exhausted its bounded
+                # unresolved allowance, widen to the cheapest eligible exact
+                # pool.  Provider/region diversity follows only when it is
+                # actually cheaper or cheaper pools are inactive/cooling down;
+                # it must not override the placer's canonical cost order.
+                expansion_candidates.update(blocked_locations)
+                continue
             if key not in budget.feedback_deferred_frontiers:
                 _defer_frontier(budget, key)
     if skip_zero_cost_preference and active_paid and not eligible_paid:
@@ -1200,16 +1125,14 @@ def select_location(
         expanded_limit = min(maximum_frontier, previous_limit + 1)
         budget.frontier_limit_overrides[key] = expanded_limit
         youngest_age = _youngest_unresolved_claim_age_seconds(budget, key)
-        domain = budget.failure_domain_by_location.get(selected,
-                                                       failure_domain(selected))
         card = ','.join(key) if key else 'cpu'
-        logger.info(
-            'Paid-capacity exploration frontier expanded after delayed '
-            f'feedback: card={card}, from_limit={previous_limit}, '
-            f'to_limit={expanded_limit}, '
-            'youngest_unresolved_claim_age_seconds='
-            f'{max(0, int(youngest_age or 0))}, '
-            f'candidate_cloud={domain[0]}, candidate_region={domain[1]}.')
+        logger.info('Paid-capacity exploration frontier expanded after delayed '
+                    f'feedback: card={card}, from_limit={previous_limit}, '
+                    f'to_limit={expanded_limit}, '
+                    'youngest_unresolved_claim_age_seconds='
+                    f'{max(0, int(youngest_age or 0))}, '
+                    f'candidate_cloud={str(selected.cloud).casefold()}, '
+                    f'candidate_region={selected.region}.')
     return selected
 
 

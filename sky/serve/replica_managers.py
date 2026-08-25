@@ -10400,8 +10400,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                     paid_location_launch_budget is not None):
                 launch_kwargs['paid_location_launch_budget'] = (
                     paid_location_launch_budget)
-            if paid_launch_authority is not None:
-                launch_kwargs['paid_launch_authority'] = paid_launch_authority
             if paid_authority_left is not None:
                 launch_kwargs['paid_launch_allowed'] = item_paid_launch_allowed
             elif not item_paid_launch_allowed:
@@ -10449,6 +10447,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 target_capacity_by_accelerator=(
                                     target_capacity_by_accelerator),
                                 accelerator_shapes=accelerator_shapes))
+            elif paid_launch_authority is not None:
+                # A mixed wave may first replace unknown capacity and then
+                # continue into ordinary shortfall. Replacements have their
+                # own bounded authorization; only ordinary rows debit the
+                # ordered demand plan.
+                launch_kwargs['paid_launch_authority'] = paid_launch_authority
             launch_result = self._scale_up_one_locked(
                 resources_override,
                 used_replica_ids,

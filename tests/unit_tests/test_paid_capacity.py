@@ -68,10 +68,6 @@ def _exploration_budget(locations,
         max_frontier_limit=max_frontier,
         frontier_feedback_delay_seconds=delay,
         frontier_key_by_location={location: ('l4',) for location in locations},
-        failure_domain_by_location={
-            location: paid_capacity.failure_domain(location)
-            for location in locations
-        },
         owned_pool_keys_by_frontier={('l4',): owned_keys},
         newest_claimed_at_by_pool_key=newest)
 
@@ -134,27 +130,6 @@ def test_malformed_pool_identity_fails_closed_for_frontier(mutation):
     malformed = json.dumps(payload, sort_keys=True, separators=(',', ':'))
 
     assert paid_capacity.frontier_key_from_pool_key(malformed) is None
-    assert paid_capacity.failure_domain_from_pool_key(malformed) is None
-
-
-def test_failure_domain_uses_provider_and_region_only():
-    location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
-    location.zone = 'us-east-1a'
-    location.instance_type = 'g6.xlarge'
-    key = paid_capacity.pool_key(location, workspace='w', num_nodes=1)
-
-    assert paid_capacity.failure_domain(location) == ('aws', 'us-east-1')
-    assert paid_capacity.failure_domain_from_pool_key(key) == ('aws',
-                                                               'us-east-1')
-    assert paid_capacity.failure_domain_from_pool_key('opaque') is None
-    payload = json.loads(key)
-    payload['region'] = None
-    assert paid_capacity.failure_domain_from_pool_key(
-        json.dumps(payload)) is None
-    payload = json.loads(key)
-    payload['accelerators'] = 'malformed'
-    assert paid_capacity.failure_domain_from_pool_key(
-        json.dumps(payload)) is None
 
 
 def test_default_limits_and_invalid_failure_cooldown(monkeypatch):
@@ -606,10 +581,6 @@ def test_global_snapshot_uses_shared_headroom_by_exact_pool():
     assert budget.frontier_limit == 2
     assert budget.max_frontier_limit == 3
     assert budget.frontier_feedback_delay_seconds == 30
-    assert budget.failure_domain_by_location == {
-        cheap: ('aws', 'us-east-1'),
-        expensive: ('aws', 'us-west-2'),
-    }
     assert zero not in budget.pool_key_by_location
     get_states.assert_called_once()
 
@@ -1274,7 +1245,7 @@ def test_cold_large_wave_opens_only_two_l4_pools_before_feedback():
     assert budget.feedback_deferred_frontiers == {('l4',)}
 
 
-def test_normal_second_pool_prefers_a_new_provider_region():
+def test_normal_second_pool_preserves_cost_order_across_regions():
     primary = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     same_domain = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     different_domain = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
@@ -1291,6 +1262,19 @@ def test_normal_second_pool_prefers_a_new_provider_region():
                                  owned_locations=[primary],
                                  remaining=[0, 4, 4])
 
+    assert paid_capacity.select_location(placer, budget) == same_domain
+
+
+def test_owned_cheapest_pool_keeps_headroom_before_opening_another_pool():
+    primary = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    different_domain = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    placer = make_placer({primary: 0.5, different_domain: 2.0})
+    budget = _exploration_budget([primary, different_domain],
+                                 owned_locations=[primary],
+                                 remaining=[1, 4])
+
+    assert paid_capacity.select_location(placer, budget) == primary
+    paid_capacity.debit(budget, primary)
     assert paid_capacity.select_location(placer, budget) == different_domain
 
 
@@ -1330,7 +1314,7 @@ def test_delayed_third_pool_waits_for_the_youngest_unresolved_claim():
     assert budget.feedback_deferred_frontiers == {('l4',)}
 
 
-def test_delayed_third_pool_uses_only_a_new_provider_region():
+def test_delayed_third_pool_preserves_cost_order_across_regions():
     first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
     same_domain = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
@@ -1356,7 +1340,7 @@ def test_delayed_third_pool_uses_only_a_new_provider_region():
         selected = paid_capacity.select_location(placer, budget)
         snapshot = paid_capacity.admission_snapshot_by_location(budget)
 
-    assert selected == third_domain
+    assert selected == same_domain
     assert budget.frontier_limit_overrides == {('l4',): 3}
     assert budget.feedback_deferred_frontiers == set()
     message = info.call_args.args[0]
@@ -1364,15 +1348,14 @@ def test_delayed_third_pool_uses_only_a_new_provider_region():
     assert 'to_limit=3' in message
     assert 'youngest_unresolved_claim_age_seconds=100' in message
     assert 'candidate_cloud=aws' in message
-    assert 'candidate_region=eu-west-1' in message
+    assert 'candidate_region=us-east-1' in message
     assert budget.pool_key_by_location[first] not in message
-    assert snapshot[third_domain]['frontier_limit'] == 3
-    assert snapshot[third_domain]['frontier_max_limit'] == 3
+    assert snapshot[same_domain]['frontier_limit'] == 3
+    assert snapshot[same_domain]['frontier_max_limit'] == 3
     assert snapshot[first]['frontier_owned']
-    assert not snapshot[third_domain]['frontier_owned']
-    assert snapshot[third_domain]['frontier_owned_pool_count'] == 2
-    assert snapshot[third_domain][
-        'youngest_unresolved_claim_age_seconds'] == 100
+    assert not snapshot[same_domain]['frontier_owned']
+    assert snapshot[same_domain]['frontier_owned_pool_count'] == 2
+    assert snapshot[same_domain]['youngest_unresolved_claim_age_seconds'] == 100
 
 
 @pytest.mark.parametrize('missing_age,max_frontier', [(True, 3), (False, 2)])
@@ -1397,7 +1380,7 @@ def test_delayed_third_pool_fails_closed_without_age_or_when_disabled(
     assert not budget.frontier_limit_overrides
 
 
-def test_delayed_third_pool_requires_a_distinct_failure_domain():
+def test_delayed_third_pool_can_use_a_cheaper_existing_region():
     first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
     east_alternate = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
@@ -1419,10 +1402,12 @@ def test_delayed_third_pool_requires_a_distinct_failure_domain():
                                  claimed_at=900)
 
     with mock.patch.object(paid_capacity.time, 'time', return_value=1000):
-        assert paid_capacity.select_location(placer, budget) is None
+        assert paid_capacity.select_location(placer, budget) == east_alternate
+
+    assert budget.frontier_limit_overrides == {('l4',): 3}
 
 
-def test_delayed_third_pool_fails_closed_on_malformed_owned_domain():
+def test_delayed_third_pool_fails_closed_for_opaque_pool_identity():
     first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
     second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
     third = make_location('eu-west-1', {'L4': 1}, cloud_name='AWS')
@@ -1439,7 +1424,7 @@ def test_delayed_third_pool_fails_closed_on_malformed_owned_domain():
                                sort_keys=True,
                                separators=(',', ':'))
     budget.owned_pool_keys_by_frontier[('l4',)].remove(first_key)
-    budget.owned_pool_keys_by_frontier[('l4',)].add(malformed_key)
+    budget.unknown_owned_pool_keys.add(malformed_key)
     budget.newest_claimed_at_by_pool_key[malformed_key] = 900
 
     with mock.patch.object(paid_capacity.time, 'time', return_value=1000):

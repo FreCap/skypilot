@@ -6898,8 +6898,7 @@ class SkyServeController:
                                         target_capacity_by_accelerator)
                                 replacement_kwargs['accelerator_shapes'] = dict(
                                     logical_target.accelerator_shapes)
-                            if (not logical_target.replace_unknown_replica_ids
-                                    and scaling_option.reason != autoscalers.
+                            if (scaling_option.reason != autoscalers.
                                     AutoscalerDecisionReason.COST_REBALANCE and
                                     ordered_paid_authority is not None):
                                 replacement_kwargs['paid_launch_authority'] = (
