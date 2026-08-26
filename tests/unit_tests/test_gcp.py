@@ -430,10 +430,12 @@ def test_compute_instance_labels_new_persistent_disks(monkeypatch):
         'owner': 'research',
         provision_constants.TAG_SKYPILOT_MANAGED:
             provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+        provision_constants.TAG_RAY_CLUSTER_NAME: 'cluster',
     }
     assert disks[1]['initializeParams']['labels'] == {
         provision_constants.TAG_SKYPILOT_MANAGED:
             provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+        provision_constants.TAG_RAY_CLUSTER_NAME: 'cluster',
     }
     assert 'initializeParams' not in disks[2]
     assert disks[3]['initializeParams']['labels'] == {'owner': 'research'}
@@ -501,6 +503,7 @@ def test_mig_instance_template_labels_new_persistent_disks(monkeypatch):
     assert template_config['disks'][0]['initializeParams']['labels'] == {
         provision_constants.TAG_SKYPILOT_MANAGED:
             provision_constants.SKYPILOT_MANAGED_TAG_VALUE,
+        provision_constants.TAG_RAY_CLUSTER_NAME: 'cluster',
     }
 
 

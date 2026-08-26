@@ -3,9 +3,10 @@
 Provider observation is deliberately separate from association reduction.
 Reserved-fill profiles retain an immutable physical provider identity. An
 ordinary-paid AWS Spot failure may instead carry an exact zero-effect create
-receipt on its terminal request. Other profiles and incomplete receipts remain
-``UNKNOWN``; a missing SkyPilot cluster record is never promoted into provider
-absence.
+receipt on its terminal request. A quiescent ordinary-paid GCP Spot launch is
+observed against its immutable project, zone, instance, and disk identity.
+Other profiles and incomplete evidence remain ``UNKNOWN``; a missing SkyPilot
+cluster record is never promoted into provider absence.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import dataclasses
 import time
 from typing import Any
 
+from sky import exceptions
 from sky.adaptors import common as adaptors_common
 from sky.provision import capacity_policy
 from sky.serve import ordinary_launch_binding
@@ -25,6 +27,13 @@ from sky.utils import common_utils
 
 request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
 api_requests = adaptors_common.LazyImport('sky.server.requests.requests')
+provision = adaptors_common.LazyImport('sky.provision')
+gcp_provision = adaptors_common.LazyImport('sky.provision.gcp')
+gcp_cloud = adaptors_common.LazyImport('sky.clouds.gcp')
+
+_GCP_EMPTY_CENSUS_INTERVAL_SECONDS = 2.0
+_GCP_POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS = 420.0
+_GCP_POST_TEARDOWN_ABSENCE_POLL_SECONDS = 2.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -86,47 +95,76 @@ def apply_exact_provider_absence_replica_projection(
         decoded_error = decoded_request_error(getattr(request, 'error', None))
         evidence_payload = getattr(projection, 'provider_evidence_payload',
                                    None)
-        expected_receipt = (evidence_payload.get('receipt') if isinstance(
+        probe_contract = (evidence_payload.get('probe_contract') if isinstance(
             evidence_payload, Mapping) else None)
-        expected_cloud_name = (expected_receipt.get('cluster_name_on_cloud') if
-                               isinstance(expected_receipt, Mapping) else None)
-        try:
-            expected_client_token = (
-                ordinary_launch_binding.ordinary_paid_aws_client_token(context))
-            expected_aws_account_id = (
-                ordinary_launch_binding.
-                ordinary_paid_aws_account_id_from_pool_key(pool_key))
-        except (TypeError, ValueError,
-                ordinary_launch_binding.OrdinaryLaunchBindingConflict):
-            return None
-        provider_negative_ack = (
-            capacity_policy.extract_provider_negative_ack(decoded_error)
-            if decoded_error is not None else None)
-        provider_negative_ack = capacity_policy.validate_provider_negative_ack(
-            provider_negative_ack,
-            cluster_name=expected_cloud_name,
-            client_token=expected_client_token,
-            expected_aws_account_id=expected_aws_account_id) if isinstance(
-                expected_cloud_name, str) and expected_cloud_name else None
         status = getattr(getattr(projection, 'status', None), 'value', None)
         cause = getattr(getattr(projection, 'cause', None), 'value', None)
-        if (provider_negative_ack is None or
-                provider_negative_ack != expected_receipt or
-                status != 'FAILED' or cause != 'handler_failed' or
-                not isinstance(pool_key, str) or not pool_key or
-                info.paid_capacity_pool_key != pool_key or
-                info.is_spot is not True or info.is_zero_cost is not False or
-                info.reserved_fill is not False or
-                info.service_job_id is not None):
-            return None
-        reason = provider_negative_ack['reason']
-        if reason == 'quota':
-            paid_outcome = paid_capacity.LaunchOutcome.QUOTA_FAILURE
-        elif reason == 'capacity':
-            paid_outcome = paid_capacity.LaunchOutcome.CAPACITY_FAILURE
+        common_shape_matches = bool(
+            status == 'FAILED' and cause == 'handler_failed' and
+            isinstance(pool_key, str) and bool(pool_key) and
+            info.paid_capacity_pool_key == pool_key and info.is_spot is True and
+            info.is_zero_cost is False and info.reserved_fill is False and
+            info.service_job_id is None)
+        if probe_contract == 'gcp-vm-disk-operation-presence-v1':
+            if (not common_shape_matches or
+                    evidence_payload.get('result') != 'ABSENT' or
+                    evidence_payload.get('instance_ids') != [] or
+                    evidence_payload.get('disk_ids') != [] or not isinstance(
+                        evidence_payload.get('create_operation_targets'),
+                        Mapping) or
+                    evidence_payload['create_operation_targets'].get('inflight')
+                    != []):
+                return None
+            reason = None
+            if isinstance(decoded_error, exceptions.ResourcesUnavailableError):
+                reason = capacity_policy.classify_resources_unavailable_error(
+                    gcp_cloud.GCP(), decoded_error)
+            if reason == 'quota':
+                paid_outcome = paid_capacity.LaunchOutcome.QUOTA_FAILURE
+            elif reason == 'capacity':
+                paid_outcome = paid_capacity.LaunchOutcome.CAPACITY_FAILURE
+            else:
+                paid_outcome = paid_capacity.LaunchOutcome.OTHER_FAILURE
+            info.status_property.failed_spot_availability = True
         else:
-            return None
-        info.status_property.failed_spot_availability = True
+            expected_receipt = (evidence_payload.get('receipt') if isinstance(
+                evidence_payload, Mapping) else None)
+            expected_cloud_name = (expected_receipt.get('cluster_name_on_cloud')
+                                   if isinstance(expected_receipt, Mapping) else
+                                   None)
+            try:
+                expected_client_token = (
+                    ordinary_launch_binding.ordinary_paid_aws_client_token(
+                        context))
+                expected_aws_account_id = (
+                    ordinary_launch_binding.
+                    ordinary_paid_aws_account_id_from_pool_key(pool_key))
+            except (TypeError, ValueError,
+                    ordinary_launch_binding.OrdinaryLaunchBindingConflict):
+                return None
+            provider_negative_ack = (
+                capacity_policy.extract_provider_negative_ack(decoded_error)
+                if decoded_error is not None else None)
+            provider_negative_ack = (
+                capacity_policy.validate_provider_negative_ack(
+                    provider_negative_ack,
+                    cluster_name=expected_cloud_name,
+                    client_token=expected_client_token,
+                    expected_aws_account_id=expected_aws_account_id)
+                if isinstance(expected_cloud_name, str) and expected_cloud_name
+                else None)
+            if (provider_negative_ack is None or
+                    provider_negative_ack != expected_receipt or
+                    not common_shape_matches):
+                return None
+            reason = provider_negative_ack['reason']
+            if reason == 'quota':
+                paid_outcome = paid_capacity.LaunchOutcome.QUOTA_FAILURE
+            elif reason == 'capacity':
+                paid_outcome = paid_capacity.LaunchOutcome.CAPACITY_FAILURE
+            else:
+                return None
+            info.status_property.failed_spot_availability = True
     else:
         return None
 
@@ -154,9 +192,156 @@ def _reserved_fill_observation_payload(
     }
 
 
+def _gcp_observation_payload(
+    context: ordinary_launch_binding.BoundNonPoolLaunchContext,
+    replica_info: Any,
+    provider_identity: Mapping[str, Any],
+    instance_ids: list[str],
+    disk_ids: list[str],
+    create_operation_targets: Mapping[str, list[str]],
+    evidence: ordinary_launch_binding.ProviderEvidence,
+) -> dict[str, Any]:
+    """Build one closed exact-resource GCP observation envelope."""
+    return {
+        'association_id': str(context.association_id),
+        'cluster_name': getattr(replica_info, 'cluster_name', None),
+        'create_operation_targets': dict(create_operation_targets),
+        'disk_ids': disk_ids,
+        'instance_ids': instance_ids,
+        'probe_contract': 'gcp-vm-disk-operation-presence-v1',
+        'profile_kind': context.profile.kind.value,
+        'provider_identity': dict(provider_identity),
+        'replica_record_id': str(context.replica_record_id),
+        'result': evidence.value,
+    }
+
+
+def _query_gcp_paid_provider_census(
+    replica_info: Any,
+    provider_identity: Mapping[str, Any],
+) -> tuple[list[str], list[str], dict[str, list[str]]]:
+    """Perform one uncached VM, disk, and retained-operation census."""
+    provider_config = {
+        'availability_zone': provider_identity['zone'],
+        'project_id': provider_identity['project_id'],
+    }
+    instances = provision.query_instances(
+        provider_name='gcp',
+        cluster_name=str(getattr(replica_info, 'cluster_name', '')),
+        cluster_name_on_cloud=provider_identity['cluster_name_on_cloud'],
+        provider_config=provider_config,
+        non_terminated_only=False)
+    disks = gcp_provision.query_managed_boot_disks(
+        provider_identity['cluster_name_on_cloud'], provider_config)
+    create_targets = gcp_provision.query_instance_create_operation_targets(
+        provider_identity['cluster_name_on_cloud'], provider_config)
+    return sorted(instances), sorted(disks), create_targets
+
+
+def _gcp_unknown_observation(
+    base: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    reason: str,
+    instance_ids: list[str],
+    disk_ids: list[str],
+    create_operation_targets: Mapping[str, list[str]],
+) -> ProviderObservation:
+    """Build a non-authorizing GCP observation with complete census facts."""
+    return ProviderObservation(
+        ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
+            **base,
+            'create_operation_targets': dict(create_operation_targets),
+            'disk_ids': disk_ids,
+            'instance_ids': instance_ids,
+            'provider_identity': dict(identity),
+            'reason': reason,
+        })
+
+
+def _observe_gcp_paid_provider(
+    context: ordinary_launch_binding.BoundNonPoolLaunchContext,
+    replica_info: Any,
+    authority: ordinary_launch_binding.ControllerBindingAuthority,
+) -> ProviderObservation:
+    """Query frozen GCP VM, disk, and retained create-operation identity."""
+    identity = request_postgres.bound_non_pool_gcp_provider_identity(
+        context, authority)
+    base = {
+        'association_id': str(context.association_id),
+        'cluster_name': getattr(replica_info, 'cluster_name', None),
+        'probe_contract': 'gcp-vm-disk-operation-presence-v1',
+        'profile_kind': context.profile.kind.value,
+        'replica_record_id': str(context.replica_record_id),
+    }
+    if identity is None:
+        return ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
+                **base,
+                'reason': 'missing-immutable-gcp-provider-identity',
+            })
+    try:
+        instance_ids, disk_ids, create_targets = (
+            _query_gcp_paid_provider_census(replica_info, identity))
+    except Exception as error:  # pylint: disable=broad-except
+        return ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
+                **base,
+                'error_type': type(error).__name__,
+                'provider_identity': identity,
+                'reason': 'gcp-provider-read-failed',
+            })
+    if instance_ids or disk_ids:
+        evidence = ordinary_launch_binding.ProviderEvidence.PRESENT
+        return ProviderObservation(
+            evidence,
+            _gcp_observation_payload(context, replica_info, identity,
+                                     instance_ids, disk_ids, create_targets,
+                                     evidence))
+    if create_targets['inflight']:
+        return _gcp_unknown_observation(base, identity,
+                                        'gcp-create-operation-in-flight',
+                                        instance_ids, disk_ids, create_targets)
+    completed_targets = sorted(create_targets['failed'] +
+                               create_targets['succeeded'])
+    if not request_postgres.bound_non_pool_gcp_provider_absence_is_settled(
+            context, authority, completed_create_targets=completed_targets):
+        return _gcp_unknown_observation(base, identity,
+                                        'gcp-legacy-create-settling',
+                                        instance_ids, disk_ids, create_targets)
+    # A retained operation can become visible or materialize a VM after the
+    # first empty read. Require a second complete uncached census; operation
+    # retention is the durable fence, and this quiet interval closes list
+    # propagation races around terminal request quiescence.
+    time.sleep(_GCP_EMPTY_CENSUS_INTERVAL_SECONDS)
+    try:
+        instance_ids, disk_ids, create_targets = (
+            _query_gcp_paid_provider_census(replica_info, identity))
+    except Exception as error:  # pylint: disable=broad-except
+        return ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
+                **base,
+                'error_type': type(error).__name__,
+                'provider_identity': identity,
+                'reason': 'gcp-provider-second-read-failed',
+            })
+    if instance_ids or disk_ids:
+        evidence = ordinary_launch_binding.ProviderEvidence.PRESENT
+    elif create_targets['inflight']:
+        return _gcp_unknown_observation(base, identity,
+                                        'gcp-create-operation-in-flight',
+                                        instance_ids, disk_ids, create_targets)
+    else:
+        evidence = ordinary_launch_binding.ProviderEvidence.ABSENT
+    return ProviderObservation(
+        evidence,
+        _gcp_observation_payload(context, replica_info, identity, instance_ids,
+                                 disk_ids, create_targets, evidence))
+
+
 def observe_provider(
     context: ordinary_launch_binding.BoundNonPoolLaunchContext,
     replica_info: Any,
+    authority: ordinary_launch_binding.ControllerBindingAuthority | None = None,
 ) -> ProviderObservation:
     """Read only the exact provider identity retained by the profile."""
     if not isinstance(context,
@@ -168,6 +353,10 @@ def observe_provider(
         'profile_kind': context.profile.kind.value,
         'replica_record_id': str(context.replica_record_id),
     }
+    if (context.profile.kind
+            == ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID
+            and authority is not None):
+        return _observe_gcp_paid_provider(context, replica_info, authority)
     if (context.profile.kind !=
             ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
         return ProviderObservation(
@@ -285,6 +474,78 @@ def _reduce_observation(
             context, authority, project_replica_result=project_replica_result)
 
 
+def terminate_gcp_paid_provider_allocation(
+    context: ordinary_launch_binding.BoundNonPoolLaunchContext,
+    replica_info: Any,
+    authority: ordinary_launch_binding.ControllerBindingAuthority,
+    project_replica_result: Callable[..., bool],
+    *,
+    continue_guard: Callable[[], bool] | None = None,
+) -> ProviderObservation:
+    """Delete one exact GCP allocation and require fresh provider absence."""
+    if (context.profile.kind !=
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID or
+            not request_postgres.
+            bound_non_pool_provider_present_cleanup_is_authorized(
+                context, authority)):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'GCP provider cleanup lacks exact durable PRESENT authority.')
+    identity = request_postgres.bound_non_pool_gcp_provider_identity(
+        context, authority)
+    if identity is None:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'GCP provider cleanup lost its immutable request identity.')
+    if continue_guard is not None and not continue_guard():
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'GCP provider cleanup lost controller authority before teardown.')
+    deadline = (time.monotonic() + _GCP_POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS)
+    provider_config = {
+        'availability_zone': identity['zone'],
+        'project_id': identity['project_id'],
+    }
+    last_cleanup_error: BaseException | None = None
+    while True:
+        if time.monotonic() >= deadline:
+            timeout_error = ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'GCP provider cleanup has no fresh exact VM, disk, and create-'
+                'operation ABSENT observation.')
+            if last_cleanup_error is not None:
+                raise timeout_error from last_cleanup_error
+            raise timeout_error
+        if continue_guard is not None and not continue_guard():
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'GCP provider cleanup lost authority while deleting the exact '
+                'allocation.')
+        try:
+            instance_ids, _, create_targets = _query_gcp_paid_provider_census(
+                replica_info, identity)
+            if instance_ids or create_targets['inflight']:
+                # Standard SkyPilot down does not wait for VM disappearance and
+                # its cluster row can disappear first. Repeat this exact native
+                # delete idempotently until the frozen provider census is empty.
+                provision.terminate_instances(
+                    provider_name='gcp',
+                    cluster_name_on_cloud=identity['cluster_name_on_cloud'],
+                    provider_config=provider_config)
+                time.sleep(_GCP_POST_TEARDOWN_ABSENCE_POLL_SECONDS)
+                continue
+            # Boot disks can remain attached while a just-deleted VM drains.
+            # Retry resource-in-use/deleting failures under the same deadline.
+            gcp_provision.terminate_managed_boot_disks(
+                identity['cluster_name_on_cloud'], provider_config)
+            last_cleanup_error = None
+        except Exception as error:  # pylint: disable=broad-except
+            last_cleanup_error = error
+        observation = _observe_gcp_paid_provider(context, replica_info,
+                                                 authority)
+        if (observation.evidence is
+                ordinary_launch_binding.ProviderEvidence.ABSENT):
+            break
+        time.sleep(_GCP_POST_TEARDOWN_ABSENCE_POLL_SECONDS)
+    _reduce_observation(context, authority, project_replica_result, observation)
+    return observation
+
+
 def reconcile_post_teardown_absence(
     context: ordinary_launch_binding.BoundNonPoolLaunchContext,
     replica_info: Any,
@@ -342,6 +603,6 @@ def reconcile(
             observation = ProviderObservation(
                 ordinary_launch_binding.ProviderEvidence.ABSENT, paid_payload)
     if observation is None:
-        observation = observe_provider(context, replica_info)
+        observation = observe_provider(context, replica_info, authority)
     _reduce_observation(context, authority, project_replica_result, observation)
     return observation

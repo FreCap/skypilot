@@ -150,6 +150,25 @@ def _gc_paid_pool_key(*,
         separators=(',', ':'))
 
 
+def _gc_gcp_paid_pool_key(*,
+                          region: str = 'us-east4',
+                          zone: str = 'us-east4-a') -> str:
+    return json.dumps(
+        {
+            'accelerators': [['l4', 1]],
+            'cloud': 'gcp',
+            'instance_type': 'g2-standard-4',
+            'num_nodes': 1,
+            'region': region,
+            'use_spot': True,
+            'version': 1,
+            'workspace': 'workspace-a',
+            'zone': zone,
+        },
+        sort_keys=True,
+        separators=(',', ':'))
+
+
 def _gc_cloud_cluster_name() -> str:
     return common_utils.make_cluster_name_on_cloud_for_user(
         'gc-service-3',
@@ -628,6 +647,16 @@ def _prepare_paid_provider_absence_graph(
     assert profile.kind is (
         ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
     launch_body = _gc_unbound_non_pool_launch_body()
+    launch_body.override_skypilot_config = {
+        'active_workspace': 'workspace-a',
+        'workspaces': {
+            'workspace-a': {
+                'gcp': {
+                    'project_id': 'boltz-498512',
+                },
+            },
+        },
+    }
     launch_body.env_vars[constants.USER_ID_ENV_VAR] = 'tenant-a'
     launch_body.env_vars[constants.USER_ENV_VAR] = 'Tenant A'
     launch_body.client_api_version = 77
@@ -712,6 +741,10 @@ def _prepare_paid_provider_absence_graph(
             sqlalchemy.delete(request_postgres.QUEUE).where(
                 request_postgres.QUEUE.c.request_id == context.request_id))
         now = sqlalchemy.func.clock_timestamp()
+        quiesced_at = (
+            datetime.datetime.now(datetime.timezone.utc) -
+            datetime.timedelta(seconds=ordinary_launch_binding.
+                               ORDINARY_PAID_GCP_ABSENCE_SETTLE_SECONDS + 1))
         connection.execute(
             sqlalchemy.update(request_postgres.REQUESTS).where(
                 request_postgres.REQUESTS.c.request_id ==
@@ -722,7 +755,7 @@ def _prepare_paid_provider_absence_graph(
                     execution_generation=1,
                     execution_quiescence_required=True,
                     execution_quiesced_generation=1,
-                    execution_quiesced_at=now,
+                    execution_quiesced_at=quiesced_at,
                     error=_gc_provider_negative_ack_error(receipt),
                     finished_at=now,
                     updated_at=now))
@@ -2762,6 +2795,153 @@ def test_paid_provider_negative_ack_projects_and_releases_debits_atomically(
     assert pool['successes_since_resize'] == 0
     assert pool['last_success_at'] is None
     assert pool['last_failure_at'] is not None
+
+
+def test_gcp_paid_exact_label_absence_projects_and_releases_debits_atomically(
+        bound_request_database, monkeypatch) -> None:
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database, monkeypatch, pool_key=_gc_gcp_paid_pool_key())
+    identity = request_postgres.bound_non_pool_gcp_provider_identity(
+        graph.context, graph.authority)
+    assert identity == {
+        'cluster_name_on_cloud':
+            common_utils.make_cluster_name_on_cloud_for_user(
+                'gc-service-3',
+                max_length=clouds.GCP.max_cluster_name_length(),
+                cluster_name_hash_length=clouds.GCP.cluster_name_hash_length(),
+                user_hash='tenant-a'),
+        'instance_type': 'g2-standard-4',
+        'num_nodes': 1,
+        'project_id': 'boltz-498512',
+        'region': 'us-east4',
+        'use_spot': True,
+        'workspace': 'workspace-a',
+        'zone': 'us-east4-a',
+    }
+    payload = {
+        'association_id': str(graph.context.association_id),
+        'cluster_name': 'gc-service-3',
+        'create_operation_targets': {
+            'failed': [],
+            'inflight': [],
+            'succeeded': [],
+        },
+        'disk_ids': [],
+        'instance_ids': [],
+        'probe_contract': 'gcp-vm-disk-operation-presence-v1',
+        'profile_kind': 'ORDINARY_PAID',
+        'provider_identity': identity,
+        'replica_record_id': str(_GC_REPLICA_RECORD_ID),
+        'result': 'ABSENT',
+    }
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        graph.context, graph.authority,
+        ordinary_launch_binding.ProviderEvidence.ABSENT, payload)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'gc-service'
+    manager._ordinary_launch_binding_authority = graph.authority
+    assert request_postgres.project_bound_non_pool_provider_absence(
+        graph.context,
+        graph.authority,
+        project_replica_result=lambda connection, projection: manager.
+        _project_bound_ordinary_launch(None, connection, projection))
+    with graph.engine.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id ==
+                  graph.context.association_id)).mappings().one()
+        claim_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(
+                serve_state_schema.paid_capacity_claims_table)).scalar_one()
+        pin_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(
+                request_postgres.REQUEST_RETENTION_PINS)).scalar_one()
+    assert association['resolution'] == 'PROJECTED'
+    assert association['provider_evidence_payload'] == payload
+    assert claim_count == pin_count == 0
+
+
+def test_gcp_paid_provider_identity_uses_frozen_region_for_project(
+        bound_request_database, monkeypatch) -> None:
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database, monkeypatch, pool_key=_gc_gcp_paid_pool_key())
+    original_resolver = (request_postgres.skypilot_config.
+                         get_effective_workspace_region_config_from_snapshot)
+    project_reads = []
+
+    def _regional_project_resolver(config_snapshot, cloud, keys, **kwargs):
+        if cloud == 'gcp' and keys == ('project_id',):
+            project_reads.append(kwargs)
+            if kwargs.get('region') == 'us-east4':
+                return 'regional-project'
+        return original_resolver(config_snapshot, cloud, keys, **kwargs)
+
+    monkeypatch.setattr(request_postgres.skypilot_config,
+                        'get_effective_workspace_region_config_from_snapshot',
+                        _regional_project_resolver)
+
+    identity = request_postgres.bound_non_pool_gcp_provider_identity(
+        graph.context, graph.authority)
+
+    assert identity is not None
+    assert identity['project_id'] == 'regional-project'
+    assert project_reads == [{
+        'region': 'us-east4',
+        'workspace': 'workspace-a',
+    }]
+
+
+def test_gcp_paid_exact_presence_authorizes_only_immediate_cleanup(
+        bound_request_database, monkeypatch) -> None:
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database, monkeypatch, pool_key=_gc_gcp_paid_pool_key())
+    identity = request_postgres.bound_non_pool_gcp_provider_identity(
+        graph.context, graph.authority)
+    assert identity is not None
+    resource_name = (f'{identity["cluster_name_on_cloud"]}'
+                     '-head-1234abcd-compute')
+    payload = {
+        'association_id': str(graph.context.association_id),
+        'cluster_name': 'gc-service-3',
+        'create_operation_targets': {
+            'failed': [],
+            'inflight': [],
+            'succeeded': [resource_name],
+        },
+        'disk_ids': [resource_name],
+        'instance_ids': [resource_name],
+        'probe_contract': 'gcp-vm-disk-operation-presence-v1',
+        'profile_kind': 'ORDINARY_PAID',
+        'provider_identity': identity,
+        'replica_record_id': str(_GC_REPLICA_RECORD_ID),
+        'result': 'PRESENT',
+    }
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        graph.context, graph.authority,
+        ordinary_launch_binding.ProviderEvidence.PRESENT, payload)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'gc-service'
+    manager._ordinary_launch_binding_authority = graph.authority
+    assert request_postgres.authorize_bound_non_pool_provider_present_cleanup(
+        graph.context,
+        graph.authority,
+        project_replica_result=lambda connection, projection: manager.
+        _project_bound_ordinary_launch(None, connection, projection))
+    info = serve_state.get_replica_info_from_id('gc-service', 3)
+    assert info is not None
+    assert ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+        info, require_scheduled=True)
+    assert info.paid_capacity_pool_key == graph.pool_key
+    assert request_postgres.bound_non_pool_provider_present_cleanup_is_authorized(
+        graph.context, graph.authority)
 
 
 def test_service_teardown_settles_exact_paid_provider_negative_ack(

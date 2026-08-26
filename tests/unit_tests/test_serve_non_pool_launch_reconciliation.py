@@ -5,8 +5,11 @@ import uuid
 
 import pytest
 
+from sky import exceptions
+from sky.provision import common as provision_common
 from sky.serve import non_pool_launch_reconciliation as reconciliation
 from sky.serve import ordinary_launch_binding
+from sky.serve import paid_capacity
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 
@@ -219,6 +222,353 @@ def test_profile_without_durable_provider_uid_remains_unknown(
     assert observed.payload['reason'] == 'profile-has-no-durable-provider-uid'
 
 
+@pytest.mark.parametrize(
+    ('instances', 'disks', 'expected'),
+    [({}, [], ordinary_launch_binding.ProviderEvidence.ABSENT),
+     ({
+         'svc-3-abc-head-1234abcd-compute': (object(), None)
+     }, [], ordinary_launch_binding.ProviderEvidence.PRESENT),
+     ({}, ['svc-3-abc-head-1234abcd-compute'
+          ], ordinary_launch_binding.ProviderEvidence.PRESENT)])
+def test_gcp_paid_observation_uses_frozen_exact_label_scope(
+        monkeypatch: pytest.MonkeyPatch, instances, disks,
+        expected: ordinary_launch_binding.ProviderEvidence) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    identity = {
+        'cluster_name_on_cloud': 'svc-3-abc',
+        'instance_type': 'g2-standard-4',
+        'num_nodes': 1,
+        'project_id': 'boltz-498512',
+        'region': 'us-east4',
+        'use_spot': True,
+        'workspace': 'workspace-a',
+        'zone': 'us-east4-a',
+    }
+    monkeypatch.setattr(
+        reconciliation.request_postgres, 'bound_non_pool_gcp_provider_identity',
+        lambda actual_context, actual_authority: identity
+        if (actual_context, actual_authority) ==
+        (context, 'authority') else pytest.fail('wrong GCP identity authority'))
+    calls = []
+    monkeypatch.setattr(reconciliation.provision, 'query_instances',
+                        lambda **kwargs: calls.append(kwargs) or instances)
+    monkeypatch.setattr(reconciliation.gcp_provision,
+                        'query_managed_boot_disks', lambda *_args: disks)
+    monkeypatch.setattr(
+        reconciliation.gcp_provision, 'query_instance_create_operation_targets',
+        lambda *_args: {
+            'failed': [],
+            'inflight': [],
+            'succeeded': [],
+        })
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_gcp_provider_absence_is_settled',
+                        lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(reconciliation.time, 'sleep', lambda _seconds: None)
+
+    observed = reconciliation.observe_provider(
+        context, types.SimpleNamespace(cluster_name='svc-3'), 'authority')
+
+    assert observed.evidence is expected
+    assert observed.payload['provider_identity'] == identity
+    assert observed.payload['instance_ids'] == sorted(instances)
+    assert observed.payload['disk_ids'] == disks
+    expected_calls = (
+        2 if expected is ordinary_launch_binding.ProviderEvidence.ABSENT else 1)
+    assert calls == [{
+        'provider_name': 'gcp',
+        'cluster_name': 'svc-3',
+        'cluster_name_on_cloud': 'svc-3-abc',
+        'provider_config': {
+            'availability_zone': 'us-east4-a',
+            'project_id': 'boltz-498512',
+        },
+        'non_terminated_only': False,
+    }] * expected_calls
+
+
+def test_gcp_done_error_insert_and_empty_resources_is_absent(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    identity = {
+        'cluster_name_on_cloud': 'svc-3-abc',
+        'instance_type': 'g2-standard-4',
+        'num_nodes': 1,
+        'project_id': 'boltz-498512',
+        'region': 'us-east4',
+        'use_spot': True,
+        'workspace': 'workspace-a',
+        'zone': 'us-east4-a',
+    }
+    failed_target = 'svc-3-abc-head-1234abcd-compute'
+    operation_targets = {
+        'failed': [failed_target],
+        'inflight': [],
+        'succeeded': [],
+    }
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_gcp_provider_identity',
+                        lambda *_args: identity)
+    monkeypatch.setattr(reconciliation.provision, 'query_instances',
+                        lambda **_kwargs: {})
+    monkeypatch.setattr(reconciliation.gcp_provision,
+                        'query_managed_boot_disks', lambda *_args: [])
+    monkeypatch.setattr(reconciliation.gcp_provision,
+                        'query_instance_create_operation_targets',
+                        lambda *_args: operation_targets)
+    settled_calls = []
+    monkeypatch.setattr(
+        reconciliation.request_postgres,
+        'bound_non_pool_gcp_provider_absence_is_settled',
+        lambda *_args, **kwargs: settled_calls.append(kwargs) or True)
+    monkeypatch.setattr(reconciliation.time, 'sleep', lambda _seconds: None)
+
+    observed = reconciliation.observe_provider(
+        context, types.SimpleNamespace(cluster_name='svc-3'), 'authority')
+
+    assert observed.evidence is ordinary_launch_binding.ProviderEvidence.ABSENT
+    assert observed.payload['create_operation_targets'] == operation_targets
+    assert settled_calls == [{
+        'completed_create_targets': [failed_target],
+    }]
+
+
+def test_gcp_non_done_insert_and_empty_resources_is_unknown(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    identity = {
+        'cluster_name_on_cloud': 'svc-3-abc',
+        'project_id': 'boltz-498512',
+        'zone': 'us-east4-a',
+    }
+    inflight_target = 'svc-3-abc-head-1234abcd-compute'
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_gcp_provider_identity',
+                        lambda *_args: identity)
+    monkeypatch.setattr(reconciliation.provision, 'query_instances',
+                        lambda **_kwargs: {})
+    monkeypatch.setattr(reconciliation.gcp_provision,
+                        'query_managed_boot_disks', lambda *_args: [])
+    monkeypatch.setattr(
+        reconciliation.gcp_provision, 'query_instance_create_operation_targets',
+        lambda *_args: {
+            'failed': [],
+            'inflight': [inflight_target],
+            'succeeded': [],
+        })
+    monkeypatch.setattr(
+        reconciliation.request_postgres,
+        'bound_non_pool_gcp_provider_absence_is_settled', lambda *_args, **
+        _kwargs: pytest.fail('in-flight create must not reach absence gate'))
+
+    observed = reconciliation.observe_provider(
+        context, types.SimpleNamespace(cluster_name='svc-3'), 'authority')
+
+    assert observed.evidence is ordinary_launch_binding.ProviderEvidence.UNKNOWN
+    assert observed.payload['reason'] == 'gcp-create-operation-in-flight'
+    assert observed.payload['create_operation_targets']['inflight'] == [
+        inflight_target
+    ]
+
+
+def test_gcp_paid_observation_fails_closed_without_frozen_project(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_gcp_provider_identity',
+                        lambda *_args: None)
+    monkeypatch.setattr(
+        reconciliation.provision, 'query_instances', lambda **_kwargs: pytest.
+        fail('missing frozen identity must not reach GCP'))
+
+    observed = reconciliation.observe_provider(
+        context, types.SimpleNamespace(cluster_name='svc-3'), object())
+
+    assert observed.evidence is ordinary_launch_binding.ProviderEvidence.UNKNOWN
+    assert observed.payload[
+        'reason'] == 'missing-immutable-gcp-provider-identity'
+
+
+def test_gcp_paid_present_cleanup_deletes_disks_and_waits_for_combined_absence(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    replica = types.SimpleNamespace(cluster_name='svc-3')
+    identity = {
+        'cluster_name_on_cloud': 'svc-3-abc',
+        'project_id': 'boltz-498512',
+        'zone': 'us-east4-a',
+    }
+    events = []
+    monkeypatch.setattr(
+        reconciliation.request_postgres,
+        'bound_non_pool_provider_present_cleanup_is_authorized',
+        lambda *_args: True)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_gcp_provider_identity',
+                        lambda *_args: identity)
+    censuses = iter([
+        (['svc-3-abc-head-1234abcd-compute'], [], {
+            'failed': [],
+            'inflight': [],
+            'succeeded': [],
+        }),
+        ([], ['svc-3-abc-head-1234abcd-compute'], {
+            'failed': [],
+            'inflight': [],
+            'succeeded': [],
+        }),
+    ])
+    monkeypatch.setattr(
+        reconciliation, '_query_gcp_paid_provider_census',
+        lambda *_args: events.append('census') or next(censuses))
+    monkeypatch.setattr(reconciliation.provision, 'terminate_instances',
+                        lambda **_kwargs: events.append('terminate-instances'))
+    monkeypatch.setattr(reconciliation.gcp_provision,
+                        'terminate_managed_boot_disks',
+                        lambda *_args: events.append('terminate-disks'))
+    observations = iter([
+        reconciliation.ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.ABSENT, {
+                'instance_ids': [],
+                'disk_ids': [],
+            }),
+    ])
+    monkeypatch.setattr(
+        reconciliation, '_observe_gcp_paid_provider',
+        lambda *_args: events.append('observe') or next(observations))
+    monkeypatch.setattr(reconciliation, '_reduce_observation',
+                        lambda *_args: events.append('reduce'))
+    monkeypatch.setattr(reconciliation.time, 'sleep',
+                        lambda _seconds: events.append('sleep'))
+
+    observed = reconciliation.terminate_gcp_paid_provider_allocation(
+        context,
+        replica,
+        object(),
+        lambda *_args: True,
+        continue_guard=lambda: True)
+
+    assert observed.evidence is ordinary_launch_binding.ProviderEvidence.ABSENT
+    assert events == [
+        'census', 'terminate-instances', 'sleep', 'census', 'terminate-disks',
+        'observe', 'reduce'
+    ]
+
+
+def test_gcp_paid_cleanup_retries_disk_detach_failure(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    replica = types.SimpleNamespace(cluster_name='svc-3')
+    identity = {
+        'cluster_name_on_cloud': 'svc-3-abc',
+        'project_id': 'boltz-498512',
+        'zone': 'us-east4-a',
+    }
+    events = []
+    monkeypatch.setattr(
+        reconciliation.request_postgres,
+        'bound_non_pool_provider_present_cleanup_is_authorized',
+        lambda *_args: True)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_gcp_provider_identity',
+                        lambda *_args: identity)
+    monkeypatch.setattr(
+        reconciliation, '_query_gcp_paid_provider_census', lambda *_args:
+        ([], ['svc-3-abc-head-1234abcd-compute'], {
+            'failed': [],
+            'inflight': [],
+            'succeeded': [],
+        }))
+    disk_attempts = iter([RuntimeError('disk is still attached'), None])
+
+    def _terminate_disks(*_args):
+        events.append('terminate-disks')
+        error = next(disk_attempts)
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(reconciliation.gcp_provision,
+                        'terminate_managed_boot_disks', _terminate_disks)
+    observations = iter([
+        reconciliation.ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.PRESENT, {}),
+        reconciliation.ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.ABSENT, {}),
+    ])
+    monkeypatch.setattr(reconciliation, '_observe_gcp_paid_provider',
+                        lambda *_args: next(observations))
+    monkeypatch.setattr(reconciliation, '_reduce_observation',
+                        lambda *_args: events.append('reduce'))
+    monkeypatch.setattr(reconciliation.time, 'sleep', lambda _seconds: None)
+
+    observed = reconciliation.terminate_gcp_paid_provider_allocation(
+        context, replica, object(), lambda *_args: True)
+
+    assert observed.evidence is ordinary_launch_binding.ProviderEvidence.ABSENT
+    assert events == ['terminate-disks', 'terminate-disks', 'reduce']
+
+
+@pytest.mark.parametrize(('code', 'expected'), [
+    ('ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS',
+     paid_capacity.LaunchOutcome.CAPACITY_FAILURE),
+    ('QUOTA_EXCEEDED', paid_capacity.LaunchOutcome.QUOTA_FAILURE),
+    ('UNSUPPORTED_PROVIDER_FAILURE', paid_capacity.LaunchOutcome.OTHER_FAILURE)
+])
+def test_gcp_exact_absence_preserves_typed_provider_failure(code, expected):
+    provider_error = provision_common.ProvisionerError('GCP create failed')
+    provider_error.errors = [{'code': code, 'message': code}]
+    location_error = exceptions.ResourcesUnavailableError(
+        'location unavailable', failover_history=[provider_error])
+    request_error = exceptions.ResourcesUnavailableError(
+        'optimizer exhausted', failover_history=[location_error])
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    pool_key = 'gcp-pool'
+    status_property = types.SimpleNamespace(
+        sky_launch_status=reconciliation.common_utils.ProcessStatus.FAILED,
+        failed_spot_availability=False)
+    info = types.SimpleNamespace(paid_capacity_pool_key=pool_key,
+                                 is_spot=True,
+                                 is_zero_cost=False,
+                                 reserved_fill=False,
+                                 service_job_id=None,
+                                 status_property=status_property)
+    projection = types.SimpleNamespace(
+        provider_evidence=ordinary_launch_binding.ProviderEvidence.ABSENT,
+        provider_evidence_payload={
+            'probe_contract': 'gcp-vm-disk-operation-presence-v1',
+            'result': 'ABSENT',
+            'instance_ids': [],
+            'disk_ids': [],
+            'create_operation_targets': {
+                'failed': [],
+                'inflight': [],
+                'succeeded': [],
+            },
+        },
+        context=context,
+        pre_effect_terminal=False,
+        service_job_id=None,
+        locked_replica_info=info,
+        paid_capacity_pool_key=pool_key,
+        request=types.SimpleNamespace(error=request_error),
+        status=types.SimpleNamespace(value='FAILED'),
+        cause=types.SimpleNamespace(value='handler_failed'))
+
+    result = reconciliation.apply_exact_provider_absence_replica_projection(
+        projection)
+
+    assert result is not None
+    assert result.paid_capacity_outcome is expected
+    assert status_property.failed_spot_availability is True
+
+
 def test_ordinary_paid_reconcile_prefers_exact_terminal_negative_ack(
         monkeypatch: pytest.MonkeyPatch) -> None:
     context = _context(
@@ -282,6 +632,9 @@ def test_ordinary_paid_reconcile_without_exact_receipt_remains_unknown(
     monkeypatch.setattr(reconciliation.request_postgres,
                         'bound_non_pool_terminal_provider_absence_payload',
                         lambda *_args: None)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_gcp_provider_identity',
+                        lambda *_args: None)
     monkeypatch.setattr(
         reconciliation.request_postgres,
         'record_bound_non_pool_provider_evidence',
@@ -297,7 +650,8 @@ def test_ordinary_paid_reconcile_without_exact_receipt_remains_unknown(
         lambda *_args: True)
 
     assert observed.evidence == ordinary_launch_binding.ProviderEvidence.UNKNOWN
-    assert observed.payload['reason'] == 'profile-has-no-durable-provider-uid'
+    assert observed.payload[
+        'reason'] == 'missing-immutable-gcp-provider-identity'
     assert calls == [
         ('record', ordinary_launch_binding.ProviderEvidence.UNKNOWN,
          observed.payload)

@@ -1143,8 +1143,9 @@ MAX_NUMBER_OF_SERVICES_REACHED_ERROR = 'Max number of services reached'
 # protocol-v8 attested node-local cache bootstrap rotated it to epoch 8.
 # Protocol-v9 cache-leaf normalization rotated it to epoch 9. Protocol-v10's
 # shared-cache reserve correction rotated it to epoch 10. Protocol-v11's exact
-# ordinary-paid provider negative-ack settlement rotates it to epoch 11: every
-# live API, controller, and executor participant and every service capability
-# tuple must agree before a paid provider effect can rely on the new absence
-# semantics; the adjacent cohort remains settlement-only.
-NON_POOL_CAPABILITY_COHORT_EPOCH = 11
+# ordinary-paid AWS negative-ack settlement rotated it to epoch 11. Protocol-v12
+# retains timed-out GCE operation evidence and reconciles exact VM, disk, and
+# create-operation state. Every live API, controller, and executor participant
+# and every service capability tuple must agree before a new paid provider
+# effect can rely on these semantics; adjacent cohorts remain settlement-only.
+NON_POOL_CAPABILITY_COHORT_EPOCH = 12

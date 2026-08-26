@@ -123,7 +123,7 @@ def test_non_pool_profile_envelope_is_closed_and_canonical() -> None:
 
 def test_supported_non_pool_profile_set_digest_is_stable_and_complete() -> None:
     digest = binding.supported_non_pool_profile_set_digest()
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 11
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 12
     assert len(digest) == 64
     assert digest == binding.supported_non_pool_profile_set_digest()
     assert set(binding._PROFILE_AUTHORIZATION_KIND) == set(  # pylint: disable=protected-access
@@ -923,7 +923,7 @@ def test_non_pool_identity_and_context_are_structurally_distinct() -> None:
     binding.install_bound_non_pool_context(body, identity, 7)
     context = body.extra_launch_context
     assert context[binding.PROFILE_KIND_KEY] == 'ORDINARY_PAID'
-    assert context[binding.CAPABILITY_COHORT_EPOCH_KEY] == 11
+    assert context[binding.CAPABILITY_COHORT_EPOCH_KEY] == 12
     parsed = binding.parse_bound_non_pool_launch_context(context)
     assert isinstance(parsed, binding.BoundNonPoolLaunchContext)
     assert parsed.profile == identity.profile

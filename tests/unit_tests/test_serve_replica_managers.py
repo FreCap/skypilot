@@ -604,6 +604,16 @@ def _canonical_paid_pool_key(region='us-east-1'):
     return paid_capacity.pool_key(location, workspace='w', num_nodes=1)
 
 
+def _canonical_gcp_paid_pool_key():
+    location = make_location('us-central1',
+                             accelerators={'L4': 1},
+                             use_spot=True,
+                             cloud_name='GCP',
+                             instance_type='g2-standard-4')
+    location.zone = 'us-central1-a'
+    return paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+
+
 def _provider_negative_ack(reason='capacity', *, client_token='a' * 64):
     error_code = ('InsufficientInstanceCapacity'
                   if reason == 'capacity' else 'VcpuLimitExceeded')
@@ -2554,20 +2564,29 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         settle.assert_not_called()
         reconcile.assert_not_called()
 
-    def test_provider_present_cleanup_restart_skips_ordinary_settlement(self):
+    @pytest.mark.parametrize('profile_kind, cleanup_fence', [
+        (ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+         mock.sentinel.cleanup_fence),
+        (ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID, None),
+    ])
+    def test_provider_present_cleanup_with_missing_cluster_schedules_exact_down(
+            self, profile_kind, cleanup_fence):
         manager = _make_manager()
         manager._ordinary_launch_binding_authority = _binding_authority(
             ordinary_launch_binding.BindingMode.BOUND,
             binding_epoch=2,
             generic=True)
-        context = _bound_non_pool_context(
-            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+        context = _bound_non_pool_context(profile_kind)
         info = _fake_replica_info(
             context.replica_id,
             replica_managers.serve_state.ReplicaStatus.PROVISIONING)
         info.replica_record_id = str(context.replica_record_id)
-        info.reserved_fill = True
-        info.is_zero_cost = True
+        info.reserved_fill = (profile_kind == ordinary_launch_binding.
+                              NonPoolLaunchProfileKind.RESERVED_FILL)
+        info.is_zero_cost = info.reserved_fill
+        if not info.reserved_fill:
+            info.is_spot = True
+            info.paid_capacity_pool_key = _canonical_gcp_paid_pool_key()
         status = info.status_property
         status.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
         status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
@@ -2600,14 +2619,13 @@ class TestBoundOrdinaryLaunchManagerIntegration:
              mock.patch.object(
                  replica_managers.reserved_capacity,
                  'parse_protocol_v2_cleanup_fence',
-                 return_value=mock.sentinel.cleanup_fence), \
+                 return_value=cleanup_fence), \
              mock.patch.object(
                  replica_managers.global_user_state,
                  'cluster_with_name_exists',
                  return_value=False), \
              mock.patch.object(
-                 manager,
-                 '_schedule_non_pool_provider_reconciliation') as reconcile:
+                 manager, '_handle_sky_down_finish') as finish:
             manager._terminate_replica(context.replica_id,
                                        replica_drain_delay_seconds=0,
                                        is_scale_down=True,
@@ -2615,7 +2633,12 @@ class TestBoundOrdinaryLaunchManagerIntegration:
 
         settle.assert_not_called()
         projected_absence.assert_not_called()
-        reconcile.assert_called_once_with(info, context)
+        finish.assert_not_called()
+        down_thread = manager._legacy_mutation_runtime_state().down_thread_pool[
+            context.replica_id]
+        assert isinstance(down_thread, replica_managers._ReplicaDownThread)
+        assert down_thread._kwargs['expected_cluster_record_uuid'] is None
+        assert down_thread._kwargs['cleanup_fence'] is cleanup_fence
 
     def test_provider_present_projection_persists_only_immediate_cleanup(self):
         manager = _make_manager()

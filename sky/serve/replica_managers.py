@@ -2502,6 +2502,38 @@ def terminate_bound_non_pool_provider_present_cluster(
     **terminate_kwargs: Any,
 ) -> None:
     """Down one exact PRESENT allocation, then project fresh ABSENT proof."""
+    if (binding_context.profile.kind ==
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+        expected_cluster_record_uuid = terminate_kwargs.get(
+            'expected_cluster_record_uuid')
+        if expected_cluster_record_uuid is None:
+            if terminate_kwargs.get('cleanup_fence') is not None:
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'Paid GCP cleanup acquired a reserved-fill fence.')
+            (non_pool_launch_reconciliation.
+             terminate_gcp_paid_provider_allocation)(
+                 binding_context,
+                 replica_info,
+                 authority,
+                 project_replica_result,
+                 continue_guard=terminate_kwargs.get('continue_guard'))
+            return
+        # A live exact SkyPilot cluster row retains the complete backend
+        # teardown context. Use it to remove the provider object and cluster
+        # metadata, then independently prove the frozen GCP label is absent.
+        terminate_cluster(cluster_name, replica_drain_delay_seconds,
+                          **terminate_kwargs)
+        observation = (
+            non_pool_launch_reconciliation.
+            terminate_gcp_paid_provider_allocation)(
+                binding_context,
+                replica_info,
+                authority,
+                project_replica_result,
+                continue_guard=terminate_kwargs.get('continue_guard'))
+        assert (observation.evidence is
+                ordinary_launch_binding.ProviderEvidence.ABSENT)
+        return
     absence_receipt = terminate_cluster(cluster_name,
                                         replica_drain_delay_seconds,
                                         **terminate_kwargs)
@@ -4323,15 +4355,32 @@ class SkyPilotReplicaManager(ReplicaManager):
             if (not isinstance(
                     cleanup_context,
                     ordinary_launch_binding.BoundNonPoolLaunchContext) or
-                    cleanup_context.profile.kind != ordinary_launch_binding.
-                    NonPoolLaunchProfileKind.RESERVED_FILL or
                     projection.pre_effect_terminal or
                     projection.service_job_id is not None or
-                    projection.paid_capacity_pool_key is not None or
                     info.service_job_id is not None or
-                    info.paid_capacity_pool_key is not None or
-                    info.is_zero_cost is not True or
                     info.zero_cost_materialization_sequence is not None):
+                return False
+            if (cleanup_context.profile.kind == ordinary_launch_binding.
+                    NonPoolLaunchProfileKind.RESERVED_FILL):
+                shape_matches = bool(
+                    projection.paid_capacity_pool_key is None and
+                    info.paid_capacity_pool_key is None and
+                    info.is_zero_cost is True)
+            elif (cleanup_context.profile.kind == ordinary_launch_binding.
+                  NonPoolLaunchProfileKind.ORDINARY_PAID):
+                pool_key = projection.paid_capacity_pool_key
+                pool_identity = (paid_capacity.pool_key_payload(pool_key)
+                                 if isinstance(pool_key, str) else None)
+                shape_matches = bool(
+                    isinstance(pool_identity, Mapping) and
+                    pool_identity.get('cloud') == 'gcp' and
+                    pool_identity.get('use_spot') is True and
+                    info.paid_capacity_pool_key == pool_key and
+                    info.is_spot is True and info.is_zero_cost is False and
+                    info.reserved_fill is False)
+            else:
+                shape_matches = False
+            if not shape_matches:
                 return False
             status_property = info.status_property
             status_property.sky_launch_status = (
@@ -4386,7 +4435,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             # launch succeeded.  Preserve the association and request pin;
             # the existing UID-fenced down worker must obtain fresh ABSENT
             # evidence before either can be settled.
-            paid_outcome = None
+            # OTHER_FAILURE is the paid-pool reducer's neutral outcome: it
+            # persists this cleanup marker without resizing the pool or
+            # releasing the still-live exact claim.
+            paid_outcome = paid_capacity.LaunchOutcome.OTHER_FAILURE
         elif status == 'SUCCEEDED':
             # Teardown writes INTERRUPTED before exact cancellation.  A request
             # may race that cancel and finish successfully, but its result must
@@ -5004,8 +5056,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         binding_context = target.context
         if (not isinstance(binding_context,
                            ordinary_launch_binding.BoundNonPoolLaunchContext) or
-                binding_context.profile.kind !=
-                ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
+                binding_context.profile.kind not in
+            (ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+             ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)):
             return None
         if not (request_postgres.
                 bound_non_pool_provider_present_cleanup_is_authorized(
@@ -10896,25 +10949,24 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         logger.info(f'preempted: {info.status_property.preempted}, '
                     f'replica_id: {replica_id}')
-        # If the cluster does not exist, it means either the cluster never
-        # exists (e.g., the cluster is scaled down before it gets a chance to
-        # provision) or the cluster is preempted and cleaned up by the status
-        # refresh. In this case, we skip spawning a new down thread to save
-        # controller resources.
+        # A missing cluster-table row is not provider absence.  Exact PRESENT
+        # evidence takes precedence and must run provider-native cleanup; its
+        # immutable identity does not depend on the cluster table.  A reserved
+        # cleanup fence likewise still requires a provider absence proof.  We
+        # may finish inline only when neither authority exists.
         if not global_user_state.cluster_with_name_exists(info.cluster_name):
-            if cleanup_fence is not None:
-                if provider_present_cleanup_context is not None:
-                    # The durable record disappeared after exact PRESENT was
-                    # authorized.  Only a fresh provider ABSENT read may now
-                    # settle the association and remove the replica.
-                    self._schedule_non_pool_provider_reconciliation(
-                        info, provider_present_cleanup_context)
-                    return
+            if provider_present_cleanup_context is not None:
+                # Continue into the exact down worker below.  Ordinary-paid
+                # GCP cleanup uses the immutable request identity directly;
+                # reserved fill uses its physical cleanup fence.
+                pass
+            elif cleanup_fence is not None:
                 # Protocol-v2 absence is a provider observation.  Route this
                 # through the normal down worker even when the cluster-table
                 # row is already gone; terminate_cluster is idempotent and the
                 # wrapper obtains the exact post-teardown Pod receipt without
                 # holding the fleet mutex.
+                pass
             else:
                 # There is no provider identity to prove. Finish the
                 # provider-free legacy row inline.

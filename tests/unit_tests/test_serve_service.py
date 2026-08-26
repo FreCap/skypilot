@@ -1714,7 +1714,14 @@ def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
         expected_replica_record_id=(present.replica_record_id))
 
 
-def test_cleanup_routes_provider_present_marker_through_exact_termination():
+@pytest.mark.parametrize('profile_kind, cluster_record_present', [
+    (service.ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+     True),
+    (service.ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+     False),
+])
+def test_cleanup_routes_provider_present_marker_through_exact_termination(
+        profile_kind, cluster_record_present):
 
     class SynchronousThread:
 
@@ -1742,9 +1749,12 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination():
                                    binding_epoch=2,
                                    generic=True)
     record_id = uuid.UUID('22222222-2222-4222-8222-222222222222')
+    reserved_fill = profile_kind is binding.NonPoolLaunchProfileKind.RESERVED_FILL
+    authorization_reference = ('reserved-fill:test' if reserved_fill else
+                               f'paid-capacity:test:{record_id}:pool')
     profile = binding.NonPoolLaunchProfile.create(
-        binding.NonPoolLaunchProfileKind.RESERVED_FILL,
-        authorization_reference='reserved-fill:test',
+        profile_kind,
+        authorization_reference=authorization_reference,
         authorization_generation=7,
         authorization_payload={'pool_key': 'pool-a'})
     context = binding.BoundNonPoolLaunchContext(
@@ -1778,20 +1788,39 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination():
         logical_retirement_confirmed_generation=None,
         logical_retirement_bounded_deadline=False,
         logical_retirement_committed=False)
+    paid_pool_key = None
+    if not reserved_fill:
+        paid_pool_key = json.dumps(
+            {
+                'accelerators': [['l4', 1]],
+                'cloud': 'gcp',
+                'instance_type': 'g2-standard-4',
+                'num_nodes': 1,
+                'region': 'us-central1',
+                'use_spot': True,
+                'version': 1,
+                'workspace': 'w',
+                'zone': 'us-central1-a',
+            },
+            sort_keys=True,
+            separators=(',', ':'))
     info = mock.Mock(replica_id=3,
                      replica_record_id=str(record_id),
                      cluster_name='svc-a-r3',
-                     reserved_fill=True,
-                     is_zero_cost=True,
+                     reserved_fill=reserved_fill,
+                     is_zero_cost=reserved_fill,
+                     is_spot=not reserved_fill,
                      service_job_id=None,
-                     paid_capacity_pool_key=None,
+                     paid_capacity_pool_key=paid_pool_key,
                      zero_cost_materialization_sequence=None,
                      status_property=status)
     assert binding.replica_has_provider_present_cleanup_marker(
         info, require_scheduled=True)
     lifecycle_lock = mock.Mock(epoch=31)
-    cleanup_fence = service.reserved_capacity.ProtocolV2CleanupFence(
+    cleanup_fence = (service.reserved_capacity.ProtocolV2CleanupFence(
         kubernetes_context='phx-context', physical_cluster_uid='phx-uid')
+                     if reserved_fill else None)
+    existing_cluster_names = ({'svc-a-r3'} if cluster_record_present else set())
     expected_owner = (4242, '10.4.7.7')
 
     with mock.patch.object(serve_state,
@@ -1806,7 +1835,7 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination():
                            'get_service_lifecycle_epoch', return_value=31), \
          mock.patch.object(service.serve_utils,
                            'get_existing_replica_cluster_names',
-                           return_value={'svc-a-r3'}), \
+                           return_value=existing_cluster_names), \
          mock.patch.object(service.reserved_capacity,
                            'parse_protocol_v2_cleanup_fence',
                            return_value=cleanup_fence), \
@@ -1831,6 +1860,13 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination():
              'bound_non_pool_provider_present_cleanup_is_authorized',
              return_value=True), \
          mock.patch.object(
+             service.non_pool_launch_reconciliation,
+             'reconcile',
+             return_value=service.non_pool_launch_reconciliation.
+             ProviderObservation(
+                 service.ordinary_launch_binding.ProviderEvidence.PRESENT,
+                 {})) as reconcile, \
+         mock.patch.object(
              service.replica_managers,
              'terminate_bound_non_pool_provider_present_cluster'
          ) as exact_terminate, \
@@ -1854,7 +1890,14 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination():
     assert exact_terminate.call_args.args[:3] == (context, info, authority)
     assert callable(exact_terminate.call_args.args[3])
     assert exact_terminate.call_args.args[4] == info.cluster_name
-    assert exact_terminate.call_args.kwargs['cleanup_fence'] == cleanup_fence
+    if cleanup_fence is None:
+        assert 'cleanup_fence' not in exact_terminate.call_args.kwargs
+        reconcile.assert_called_once()
+        assert reconcile.call_args.kwargs['force_provider_read'] is True
+    else:
+        assert (
+            exact_terminate.call_args.kwargs['cleanup_fence'] == cleanup_fence)
+        reconcile.assert_not_called()
     assert status.sky_launch_status == (
         service.common_utils.ProcessStatus.INTERRUPTED)
     remove.assert_called_once()

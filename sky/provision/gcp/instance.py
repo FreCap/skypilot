@@ -116,6 +116,135 @@ def query_instances(
     return statuses
 
 
+def _managed_compute_resource_name_pattern(
+        cluster_name_on_cloud: str) -> re.Pattern:
+    """Return the exact generated-name namespace of one GCE cluster."""
+    return re.compile(
+        rf'{re.escape(cluster_name_on_cloud)}-(?:head|worker)-'
+        rf'[a-z0-9]{{{instance_utils.INSTANCE_NAME_UUID_LEN}}}-compute')
+
+
+def query_managed_boot_disks(
+    cluster_name_on_cloud: str,
+    provider_config: dict[str, Any],
+) -> list[str]:
+    """List only launch-created boot disks attributable to one GCE cluster.
+
+    Current launches stamp every initialized persistent disk with both the
+    managed marker and exact cluster label.  The immutable request contract
+    also excludes custom data volumes.  Requiring the generated boot-disk name
+    in addition to the managed marker keeps provider evidence and deletion on
+    the same exact namespace even if an unrelated disk carries the cluster
+    label.
+    """
+    zone = provider_config['availability_zone']
+    project_id = provider_config['project_id']
+    compute = instance_utils.GCPComputeInstance.load_resource()
+    request = compute.disks().list(
+        project=project_id,
+        zone=zone,
+        filter=(f'labels.{provision_constants.TAG_SKYPILOT_MANAGED} = '
+                f'{provision_constants.SKYPILOT_MANAGED_TAG_VALUE}'))
+    pattern = _managed_compute_resource_name_pattern(cluster_name_on_cloud)
+    names: set[str] = set()
+    while request is not None:
+        response = request.execute(num_retries=instance_utils.GCP_MAX_RETRIES)
+        for disk in response.get('items', []):
+            name = disk.get('name')
+            labels = disk.get('labels', {})
+            if (isinstance(name, str) and
+                    pattern.fullmatch(name) is not None and
+                    labels.get(provision_constants.TAG_SKYPILOT_MANAGED)
+                    == provision_constants.SKYPILOT_MANAGED_TAG_VALUE):
+                names.add(name)
+        request = compute.disks().list_next(previous_request=request,
+                                            previous_response=response)
+    return sorted(names)
+
+
+def query_instance_create_operation_targets(
+    cluster_name_on_cloud: str,
+    provider_config: dict[str, Any],
+) -> dict[str, list[str]]:
+    """Classify exact VM targets of retained GCE create operations."""
+    if re.fullmatch(r'[a-z0-9-]+', cluster_name_on_cloud) is None:
+        raise ValueError('Invalid GCP cluster name for operation census.')
+    zone = provider_config['availability_zone']
+    project_id = provider_config['project_id']
+    compute = instance_utils.GCPComputeInstance.load_resource()
+    # GCE evaluates ``eq`` as a regular expression for this field. GCP cluster
+    # names contain only lowercase letters, digits, and hyphens, so the exact
+    # prefix has no active regex metacharacters. The generated-name check below
+    # still owns authority; this server-side filter only keeps the census cheap.
+    target_filter = f'targetLink eq .*{cluster_name_on_cloud}.*'
+    request = compute.zoneOperations().list(project=project_id,
+                                            zone=zone,
+                                            filter=target_filter)
+    pattern = _managed_compute_resource_name_pattern(cluster_name_on_cloud)
+    target_states: dict[str, set[str]] = {}
+    while request is not None:
+        response = request.execute(num_retries=instance_utils.GCP_MAX_RETRIES)
+        for operation in response.get('items', []):
+            operation_type = operation.get('operationType')
+            target_link = operation.get('targetLink')
+            target_name = (target_link.rsplit('/', 1)[-1] if isinstance(
+                target_link, str) else None)
+            if (not isinstance(operation_type, str) or
+                    not operation_type.casefold().endswith('insert') or
+                    not isinstance(target_name, str) or
+                    pattern.fullmatch(target_name) is None):
+                continue
+            if operation.get('status') != 'DONE':
+                state = 'inflight'
+            elif operation.get('error'):
+                state = 'failed'
+            else:
+                state = 'succeeded'
+            target_states.setdefault(target_name, set()).add(state)
+        request = compute.zoneOperations().list_next(previous_request=request,
+                                                     previous_response=response)
+    inflight = {
+        target for target, states in target_states.items()
+        if 'inflight' in states
+    }
+    succeeded = {
+        target for target, states in target_states.items()
+        if target not in inflight and 'succeeded' in states
+    }
+    failed = set(target_states) - inflight - succeeded
+    return {
+        'failed': sorted(failed),
+        'inflight': sorted(inflight),
+        'succeeded': sorted(succeeded),
+    }
+
+
+def terminate_managed_boot_disks(
+    cluster_name_on_cloud: str,
+    provider_config: dict[str, Any],
+) -> None:
+    """Delete only exact orphaned launch-created boot disks for a cluster."""
+    zone = provider_config['availability_zone']
+    project_id = provider_config['project_id']
+    names = query_managed_boot_disks(cluster_name_on_cloud, provider_config)
+    if not names:
+        return
+    handler = instance_utils.GCPComputeInstance
+    compute = handler.load_resource()
+    operations = []
+    for name in names:
+        try:
+            operations.append(compute.disks().delete(
+                project=project_id, zone=zone,
+                disk=name).execute(num_retries=instance_utils.GCP_MAX_RETRIES))
+        except gcp.http_error_exception() as error:
+            status_code = getattr(getattr(error, 'resp', None), 'status', None)
+            if status_code != 404:
+                raise
+    for operation in operations:
+        handler.wait_for_operation(operation, project_id, zone=zone)
+
+
 def _wait_for_operations(
     handlers_to_operations: dict[type[instance_utils.GCPInstance], list[dict]],
     project_id: str,

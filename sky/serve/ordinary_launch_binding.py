@@ -50,6 +50,7 @@ reserved_fill_planner = adaptors_common.LazyImport(
 capacity_policy = adaptors_common.LazyImport('sky.provision.capacity_policy')
 paid_capacity = adaptors_common.LazyImport('sky.serve.paid_capacity')
 aws_cloud = adaptors_common.LazyImport('sky.clouds.aws')
+gcp_cloud = adaptors_common.LazyImport('sky.clouds.gcp')
 kueue_lane_lineage = adaptors_common.LazyImport('sky.serve.kueue_lane_lineage')
 system_oom_recovery = adaptors_common.LazyImport(
     'sky.serve.system_oom_recovery')
@@ -99,6 +100,14 @@ NON_POOL_CAPABILITY_COHORT_EPOCH = (
 # without a ClientToken and can never acquire provider-absence authority from
 # a later tokenized retry.
 ORDINARY_PAID_AWS_CLIENT_TOKEN_COHORT_FLOOR = 11
+# Cohort 12 is the first cohort whose GCP create timeout preserves the zone
+# operation record and whose provider reconciliation reads VM, disk, and
+# in-flight create-operation state.  A cohort-12 binary may conservatively
+# recover retained cohort-11 rows after the legacy settling horizon, but a
+# cohort-11 binary must never advertise this provider-evidence contract.
+ORDINARY_PAID_GCP_OPERATION_EVIDENCE_COHORT_FLOOR = 12
+ORDINARY_PAID_GCP_ABSENCE_SETTLE_SECONDS = 300
+_GCP_PROJECT_ID_RE = re.compile(r'[a-z][a-z0-9-]{4,28}[a-z0-9]')
 TOMBSTONE_RETENTION_DAYS = 60
 MAX_GC_BATCH_SIZE = 500
 _SHA256_RE = re.compile(r'[0-9a-f]{64}')
@@ -6805,6 +6814,73 @@ def ordinary_paid_cluster_name_on_cloud(association: Mapping[str, Any]) -> str:
         user_hash=tenant_scope)
 
 
+def ordinary_paid_gcp_provider_identity(
+    association: Mapping[str, Any],
+    *,
+    project_id: str,
+) -> dict[str, Any]:
+    """Build the exact GCP allocation identity retained by a paid request.
+
+    The paid-pool key freezes placement while the request freezes its effective
+    workspace configuration.  The request layer must supply ``project_id``
+    from that exact retained request; this helper deliberately never consults
+    today's ambient workspace.
+    """
+    if (not isinstance(project_id, str) or
+            _GCP_PROJECT_ID_RE.fullmatch(project_id) is None):
+        raise OrdinaryLaunchBindingConflict(
+            'Ordinary-paid GCP launch has no exact project ID.')
+    pool_key = association.get('paid_capacity_pool_key')
+    if not isinstance(pool_key, str) or not pool_key:
+        raise OrdinaryLaunchBindingConflict(
+            'Ordinary-paid GCP launch has no exact paid pool identity.')
+    identity = paid_capacity.pool_key_payload(pool_key)
+    if (not isinstance(identity, Mapping) or identity.get('cloud') != 'gcp' or
+            identity.get('version') != 1 or
+            identity.get('use_spot') is not True or
+            not isinstance(identity.get('workspace'), str) or
+            not identity['workspace'] or
+            not isinstance(identity.get('region'), str) or
+            not identity['region'] or
+            not isinstance(identity.get('zone'), str) or not identity['zone'] or
+            not isinstance(identity.get('instance_type'), str) or
+            not identity['instance_type'] or
+            type(identity.get('num_nodes')) is not int or  # pylint: disable=unidiomatic-typecheck
+            identity['num_nodes'] < 1):
+        raise OrdinaryLaunchBindingConflict(
+            'Ordinary-paid GCP launch has no exact Spot placement.')
+    cluster_name = _nonempty(association.get('cluster_name'), 'cluster_name')
+    tenant_scope = _nonempty(association.get('tenant_scope'), 'tenant_scope')
+    cluster_name_on_cloud = common_utils.make_cluster_name_on_cloud_for_user(
+        cluster_name,
+        max_length=gcp_cloud.GCP.max_cluster_name_length(),
+        cluster_name_hash_length=gcp_cloud.GCP.cluster_name_hash_length(),
+        user_hash=tenant_scope)
+    return {
+        'cluster_name_on_cloud': cluster_name_on_cloud,
+        'instance_type': identity['instance_type'],
+        'num_nodes': identity['num_nodes'],
+        'project_id': project_id,
+        'region': identity['region'],
+        'use_spot': True,
+        'workspace': identity['workspace'],
+        'zone': identity['zone'],
+    }
+
+
+def ordinary_paid_gcp_resource_name_matches(
+    provider_identity: Mapping[str, Any],
+    resource_name: object,
+) -> bool:
+    """Whether one VM/disk name is in the exact generated cluster namespace."""
+    cluster_name = provider_identity.get('cluster_name_on_cloud')
+    if not isinstance(cluster_name, str) or not isinstance(resource_name, str):
+        return False
+    pattern = re.compile(
+        rf'{re.escape(cluster_name)}-(?:head|worker)-[a-z0-9]{{8}}-compute')
+    return pattern.fullmatch(resource_name) is not None
+
+
 def ordinary_paid_aws_client_token(context: BoundNonPoolLaunchContext) -> str:
     """Return the versioned EC2 idempotency token for one paid association."""
     if not isinstance(context, BoundNonPoolLaunchContext):
@@ -6866,15 +6942,92 @@ def _ordinary_paid_provider_evidence(
     *,
     evidence_payload: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
-    """Validate the canonical exact AWS create-rejection envelope."""
-    if evidence is not ProviderEvidence.ABSENT:
-        raise OrdinaryLaunchBindingConflict(
-            'Ordinary-paid negative acknowledgement must prove absence.')
+    """Validate one canonical exact paid-provider evidence envelope."""
     candidate_payload = (association.get('provider_evidence_payload')
                          if evidence_payload is None else evidence_payload)
     if not isinstance(candidate_payload, Mapping):
         raise OrdinaryLaunchBindingConflict(
             'Ordinary-paid provider absence has no typed evidence envelope.')
+    probe_contract = candidate_payload.get('probe_contract')
+    if probe_contract == 'gcp-vm-disk-operation-presence-v1':
+        if evidence not in (ProviderEvidence.ABSENT, ProviderEvidence.PRESENT):
+            raise OrdinaryLaunchBindingConflict(
+                'Ordinary-paid GCP evidence must prove presence or absence.')
+        expected_keys = {
+            'association_id', 'cluster_name', 'create_operation_targets',
+            'disk_ids', 'instance_ids', 'probe_contract', 'profile_kind',
+            'provider_identity', 'replica_record_id', 'result'
+        }
+        provider_identity = candidate_payload.get('provider_identity')
+        project_id = (provider_identity.get('project_id') if isinstance(
+            provider_identity, Mapping) else None)
+        expected_identity = ordinary_paid_gcp_provider_identity(
+            association, project_id=project_id)
+        instance_ids = candidate_payload.get('instance_ids')
+        disk_ids = candidate_payload.get('disk_ids')
+        create_targets = candidate_payload.get('create_operation_targets')
+        operation_target_lists = (tuple(
+            create_targets.get(key)
+            for key in ('failed', 'inflight',
+                        'succeeded')) if isinstance(create_targets, Mapping) and
+                                  set(create_targets)
+                                  == {'failed', 'inflight', 'succeeded'} else
+                                  (None, None, None))
+        if (set(candidate_payload) != expected_keys or
+                not isinstance(provider_identity, Mapping) or
+                dict(provider_identity) != expected_identity or
+                not isinstance(instance_ids, list) or
+                any(not ordinary_paid_gcp_resource_name_matches(
+                    expected_identity, instance_id)
+                    for instance_id in instance_ids) or
+                instance_ids != sorted(set(instance_ids)) or
+                not isinstance(disk_ids, list) or
+                any(not ordinary_paid_gcp_resource_name_matches(
+                    expected_identity, disk_id) for disk_id in disk_ids) or
+                disk_ids != sorted(set(disk_ids)) or
+                any(not isinstance(targets, list)
+                    for targets in operation_target_lists) or
+                any(not ordinary_paid_gcp_resource_name_matches(
+                    expected_identity, target)
+                    for targets in operation_target_lists
+                    for target in (targets or [])) or
+                any(targets != sorted(set(targets or []))
+                    for targets in operation_target_lists) or
+                len(set().union(*(set(targets or [])
+                                  for targets in operation_target_lists))) !=
+                sum(len(targets or []) for targets in operation_target_lists) or
+            (evidence is ProviderEvidence.ABSENT and
+             (instance_ids or disk_ids or operation_target_lists[1])) or
+            (evidence is ProviderEvidence.PRESENT and
+             not (instance_ids or disk_ids))):
+            raise OrdinaryLaunchBindingConflict(
+                'Ordinary-paid GCP provider evidence is not canonical.')
+        payload = {
+            'association_id': str(association['association_id']),
+            'cluster_name': cluster_name,
+            'create_operation_targets': dict(create_targets),
+            'disk_ids': disk_ids,
+            'instance_ids': instance_ids,
+            'probe_contract': 'gcp-vm-disk-operation-presence-v1',
+            'profile_kind': NonPoolLaunchProfileKind.ORDINARY_PAID.value,
+            'provider_identity': expected_identity,
+            'replica_record_id': str(association['replica_record_id']),
+            'result': evidence.value,
+        }
+        if dict(candidate_payload) != payload:
+            raise OrdinaryLaunchBindingConflict(
+                'Ordinary-paid GCP provider evidence changed its allocation.')
+        digest = _canonical_sha256({
+            'association_id': str(association['association_id']),
+            'evidence': evidence.value,
+            'payload': payload,
+            'profile_digest': association['profile_digest'],
+        })
+        return payload, digest
+
+    if evidence is not ProviderEvidence.ABSENT:
+        raise OrdinaryLaunchBindingConflict(
+            'Ordinary-paid negative acknowledgement must prove absence.')
     receipt = candidate_payload.get('receipt')
     expected_cluster_name_on_cloud = ordinary_paid_cluster_name_on_cloud(
         association)
@@ -6937,11 +7090,20 @@ def replica_has_provider_present_cleanup_marker(
                                  common_utils.ProcessStatus.RUNNING,
                                  common_utils.ProcessStatus.FAILED,
                              })
-    return bool(
+    reserved_shape = bool(
         getattr(replica_info, 'reserved_fill', None) is True and
         getattr(replica_info, 'is_zero_cost', None) is True and
+        getattr(replica_info, 'paid_capacity_pool_key', None) is None)
+    pool_key = getattr(replica_info, 'paid_capacity_pool_key', None)
+    paid_gcp_shape = bool(
+        getattr(replica_info, 'reserved_fill', None) is False and
+        getattr(replica_info, 'is_zero_cost', None) is False and
+        getattr(replica_info, 'is_spot', None) is True and
+        isinstance(pool_key, str) and bool(pool_key) and
+        (paid_capacity.pool_key_payload(pool_key) or {}).get('cloud') == 'gcp')
+    return bool(
+        (reserved_shape or paid_gcp_shape) and
         getattr(replica_info, 'service_job_id', None) is None and
-        getattr(replica_info, 'paid_capacity_pool_key', None) is None and
         getattr(replica_info, 'zero_cost_materialization_sequence',
                 None) is None and
         status.sky_launch_status == common_utils.ProcessStatus.INTERRUPTED and
@@ -7007,23 +7169,44 @@ def provider_presence_cleanup_authority_in_connection(
     if not isinstance(context, BoundNonPoolLaunchContext):
         raise TypeError('context must be a BoundNonPoolLaunchContext.')
     values = _terminal_values(terminal_evidence)
+    profile_kind = context.profile.kind
     lifecycle, service, replica, association = _lock_effect_rows(
-        connection, context, require_paid_claim=False)
+        connection,
+        context,
+        require_paid_claim=(profile_kind is
+                            NonPoolLaunchProfileKind.ORDINARY_PAID))
     _validate_effect_rows(lifecycle,
                           service,
                           replica,
                           association,
                           context,
                           allowed_resolutions=frozenset({Resolution.AMBIGUOUS}))
-    if (context.profile.kind != NonPoolLaunchProfileKind.RESERVED_FILL or
-            association['reconciliation_outcome'] !=
+    if (association['reconciliation_outcome'] !=
             ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value or
             association['provider_evidence'] != ProviderEvidence.PRESENT.value
-            or association['effect_phase']
-            not in (EffectPhase.PROVIDER_IO.value,
-                    EffectPhase.SERVICE_JOB_IO.value) or
-            association['service_job_id'] is not None or
-            association['paid_capacity_pool_key'] is not None):
+            or association['service_job_id'] is not None):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider presence cannot authorize cleanup for this launch '
+            'profile or phase.')
+    if profile_kind is NonPoolLaunchProfileKind.RESERVED_FILL:
+        shape_matches = bool(association['effect_phase']
+                             in (EffectPhase.PROVIDER_IO.value,
+                                 EffectPhase.SERVICE_JOB_IO.value) and
+                             association['paid_capacity_pool_key'] is None)
+    elif profile_kind is NonPoolLaunchProfileKind.ORDINARY_PAID:
+        pool_key = association['paid_capacity_pool_key']
+        pool_identity = (paid_capacity.pool_key_payload(pool_key) if isinstance(
+            pool_key, str) else None)
+        shape_matches = bool(
+            association['effect_phase'] == EffectPhase.PROVIDER_IO.value and
+            isinstance(pool_identity, Mapping) and
+            pool_identity.get('cloud') == 'gcp' and
+            pool_identity.get('use_spot') is True and
+            association['terminal_status'] == TerminalStatus.FAILED.value and
+            association['terminal_cause'] == 'handler_failed')
+    else:
+        shape_matches = False
+    if not shape_matches:
         raise OrdinaryLaunchBindingConflict(
             'Provider presence cannot authorize cleanup for this launch '
             'profile or phase.')
@@ -7039,22 +7222,36 @@ def provider_presence_cleanup_authority_in_connection(
         raise OrdinaryLaunchBindingConflict(
             'Provider presence predates exact executor quiescence.')
     info = _locked_replica_info(replica)
-    if (info.service_job_id is not None or
-            info.paid_capacity_pool_key is not None or
-            info.is_zero_cost is not True or
-            info.zero_cost_materialization_sequence is not None):
-        raise OrdinaryLaunchBindingConflict(
-            'Provider-present cleanup requires an unmaterialized zero-cost '
-            'replica with no service job or paid-capacity identity.')
-    # The provider effect has already happened.  Current allocation and gate
-    # generations may advance while its exact physical object is being
-    # reconciled, so cleanup must revalidate the immutable committed intent
-    # and admission-time profile instead of asking today's planner to
-    # re-authorize yesterday's launch.
-    _validate_reserved_fill_cleanup_profile_in_connection(
-        connection, service, replica, context.profile)
-    expected_payload, expected_digest = _reserved_fill_provider_evidence(
-        association, info, ProviderEvidence.PRESENT)
+    if profile_kind is NonPoolLaunchProfileKind.RESERVED_FILL:
+        if (info.service_job_id is not None or
+                info.paid_capacity_pool_key is not None or
+                info.is_zero_cost is not True or
+                info.zero_cost_materialization_sequence is not None):
+            raise OrdinaryLaunchBindingConflict(
+                'Provider-present cleanup requires an unmaterialized '
+                'zero-cost replica with no service job or paid identity.')
+        # The provider effect has already happened. Current allocation and gate
+        # generations may advance while its exact physical object is being
+        # reconciled, so validate the immutable admission-time profile.
+        _validate_reserved_fill_cleanup_profile_in_connection(
+            connection, service, replica, context.profile)
+        expected_payload, expected_digest = _reserved_fill_provider_evidence(
+            association, info, ProviderEvidence.PRESENT)
+    else:
+        if (info.service_job_id is not None or info.is_spot is not True or
+                info.is_zero_cost is not False or
+                info.reserved_fill is not False or info.paid_capacity_pool_key
+                != association['paid_capacity_pool_key']):
+            raise OrdinaryLaunchBindingConflict(
+                'Provider-present cleanup lost its exact paid GCP profile.')
+        _validate_profile_authority_in_connection(
+            connection,
+            service,
+            replica,
+            context.profile,
+            validate_paid_provider_start=False)
+        expected_payload, expected_digest = _ordinary_paid_provider_evidence(
+            association, info.cluster_name, ProviderEvidence.PRESENT)
     if association['provider_evidence_payload'] != expected_payload:
         raise OrdinaryLaunchBindingConflict(
             'Provider presence does not name the exact physical replica.')

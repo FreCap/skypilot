@@ -5,8 +5,11 @@ from sky.provision.gcp.instance import cleanup_custom_multi_network
 from sky.provision.gcp.instance import cleanup_ports
 from sky.provision.gcp.instance import get_cluster_info
 from sky.provision.gcp.instance import open_ports
+from sky.provision.gcp.instance import query_instance_create_operation_targets
 from sky.provision.gcp.instance import query_instances
+from sky.provision.gcp.instance import query_managed_boot_disks
 from sky.provision.gcp.instance import run_instances
 from sky.provision.gcp.instance import stop_instances
 from sky.provision.gcp.instance import terminate_instances
+from sky.provision.gcp.instance import terminate_managed_boot_disks
 from sky.provision.gcp.instance import wait_instances

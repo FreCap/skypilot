@@ -419,8 +419,9 @@ def _provider_present_cleanup_context(
             authority.binding_mode != ordinary_launch_binding.BindingMode.BOUND
             or not marker or not isinstance(
                 context, ordinary_launch_binding.BoundNonPoolLaunchContext) or
-            context.profile.kind !=
-            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL or
+            context.profile.kind not in
+        (ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+         ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID) or
             context.service_name != authority.service_name or
             context.replica_id != info.replica_id or
             str(context.replica_record_id) != info.replica_record_id or
@@ -505,14 +506,25 @@ def _prepare_provider_present_cleanup(
                 authority,
                 projector,
                 force_provider_read=True)
+            if (observation.evidence ==
+                    ordinary_launch_binding.ProviderEvidence.ABSENT):
+                contexts.pop(key)
+                projected_absence_keys.add(key)
+                continue
+            if (observation.evidence
+                    == ordinary_launch_binding.ProviderEvidence.PRESENT and
+                    cleanup_context.profile.kind == ordinary_launch_binding.
+                    NonPoolLaunchProfileKind.ORDINARY_PAID):
+                # Unlike Kubernetes UID-fenced fill, GCP's immutable project,
+                # zone, and exact cluster label support provider-native cleanup
+                # even when the local cluster row was never committed.
+                continue
             if (observation.evidence !=
                     ordinary_launch_binding.ProviderEvidence.ABSENT):
                 raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                     'A provider-present cleanup marker lost its SkyPilot '
                     'cluster record, but fresh exact provider evidence is '
                     f'{observation.evidence.value}.')
-            contexts.pop(key)
-            projected_absence_keys.add(key)
         except Exception as error:  # pylint: disable=broad-except
             failures[key] = common_utils.format_exception(error)
             contexts.pop(key, None)
@@ -1749,15 +1761,31 @@ def _project_bound_ordinary_launch_for_teardown(
         context = projection.context
         if (not isinstance(context,
                            ordinary_launch_binding.BoundNonPoolLaunchContext) or
-                context.profile.kind !=
-                ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL
-                or projection.pre_effect_terminal or
+                projection.pre_effect_terminal or
                 projection.service_job_id is not None or
-                projection.paid_capacity_pool_key is not None or
                 info.service_job_id is not None or
-                info.paid_capacity_pool_key is not None or
-                info.is_zero_cost is not True or
                 info.zero_cost_materialization_sequence is not None):
+            return False
+        if (context.profile.kind ==
+                ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
+            shape_matches = bool(projection.paid_capacity_pool_key is None and
+                                 info.paid_capacity_pool_key is None and
+                                 info.is_zero_cost is True)
+        elif (context.profile.kind ==
+              ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+            pool_key = projection.paid_capacity_pool_key
+            pool_identity = (paid_capacity.pool_key_payload(pool_key)
+                             if isinstance(pool_key, str) else None)
+            shape_matches = bool(
+                isinstance(pool_identity, dict) and
+                pool_identity.get('cloud') == 'gcp' and
+                pool_identity.get('use_spot') is True and
+                info.paid_capacity_pool_key == pool_key and
+                info.is_spot is True and info.is_zero_cost is False and
+                info.reserved_fill is False)
+        else:
+            shape_matches = False
+        if not shape_matches:
             return False
         status = info.status_property
         status.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
@@ -1834,21 +1862,15 @@ def _reconcile_bound_provider_ambiguity_for_teardown(
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Provider reconciliation cannot authorize an ambiguous '
             f'{profile_kind.value} launch.')
-    if (profile_kind
-            == ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL
-            and request_postgres.
-            bound_non_pool_provider_present_cleanup_is_authorized(
-                context, authority)):
+    if (request_postgres.bound_non_pool_provider_present_cleanup_is_authorized(
+            context, authority)):
         return context
     observation = non_pool_launch_reconciliation.reconcile(
         context, info, authority, projector)
     if observation.evidence == ordinary_launch_binding.ProviderEvidence.ABSENT:
         return None
-    if (profile_kind
-            == ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL
-            and observation.evidence
-            == ordinary_launch_binding.ProviderEvidence.PRESENT and
-            request_postgres.
+    if (observation.evidence == ordinary_launch_binding.ProviderEvidence.PRESENT
+            and request_postgres.
             bound_non_pool_provider_present_cleanup_is_authorized(
                 context, authority)):
         return context

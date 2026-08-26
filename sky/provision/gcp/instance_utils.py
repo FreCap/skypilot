@@ -172,7 +172,8 @@ def selflink_to_name(selflink: str) -> str:
     return selflink.rsplit('/', 1)[-1]
 
 
-def _add_managed_label_to_new_persistent_disks(config: dict) -> None:
+def _add_managed_label_to_new_persistent_disks(config: dict,
+                                               cluster_name: str) -> None:
     """Labels persistent disks initialized as part of an instance launch."""
     for disk in config.get('disks', []):
         disk_type = disk.get('type', constants.NETWORK_STORAGE_TYPE)
@@ -189,6 +190,7 @@ def _add_managed_label_to_new_persistent_disks(config: dict) -> None:
         disk_labels = dict(initialize_params.get('labels', {}))
         disk_labels[provision_constants.TAG_SKYPILOT_MANAGED] = (
             provision_constants.SKYPILOT_MANAGED_TAG_VALUE)
+        disk_labels[provision_constants.TAG_RAY_CLUSTER_NAME] = cluster_name
         initialize_params['labels'] = disk_labels
 
 
@@ -536,15 +538,13 @@ class GCPComputeInstance(GCPInstance):
             logger.debug(f'wait_for_operation: Retry waiting for operation '
                          f'{operation["name"]} to finish (result: {result})...')
         else:
+            # Deleting a Compute Engine Operation only removes its metadata; it
+            # does not cancel the underlying create.  Retain the operation so
+            # exact provider reconciliation can see a still-running insert and
+            # cannot mistake an empty VM census for durable absence.
             logger.warning('wait_for_operation: Timeout waiting for creation '
-                           'operation, cancelling the operation ...')
-            remaining_timeout = max(timeout - (time.time() - wait_start), 1)
-            try:
-                result = call_operation(operation_caller.delete,
-                                        remaining_timeout)
-            except gcp.http_error_exception() as e:
-                logger.debug('wait_for_operation: failed to cancel operation '
-                             f'due to error: {e}')
+                           'operation; retaining the operation record for '
+                           'provider reconciliation.')
             errors = [{
                 'code': 'TIMEOUT',
                 'message': f'Timeout waiting for operation {operation["name"]}',
@@ -743,7 +743,7 @@ class GCPComputeInstance(GCPInstance):
                     provision_constants.TAG_SKYPILOT_CLUSTER_NAME: cluster_name
                 }),
         })
-        _add_managed_label_to_new_persistent_disks(config)
+        _add_managed_label_to_new_persistent_disks(config, cluster_name)
 
         all_names = []
         if 'reservationAffinity' in config:
@@ -1093,7 +1093,7 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
                     provision_constants.TAG_SKYPILOT_CLUSTER_NAME: cluster_name,
                 }),
         })
-        _add_managed_label_to_new_persistent_disks(config)
+        _add_managed_label_to_new_persistent_disks(config, cluster_name)
         cls._convert_selflinks_in_config(config)
 
         # Convert label values to string and lowercase per MIG API requirement.
