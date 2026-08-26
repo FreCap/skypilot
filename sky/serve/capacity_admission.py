@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from collections.abc import Mapping
+from collections.abc import Sequence
 import dataclasses
 import datetime
 import enum
@@ -1298,8 +1299,8 @@ def _canonical_normalized_compatibility_profiles(
         if (not isinstance(priority, int) or isinstance(priority, bool) or
                 not 0 <= priority <= 100 or
                 not isinstance(raw_accelerators, list) or
-                not raw_accelerators or len(raw_accelerators) >
-                constants.LB_REQUEST_ACCELERATORS_MAX_ITEMS or not all(
+                not raw_accelerators or len(raw_accelerators)
+                > constants.LB_REQUEST_ACCELERATORS_MAX_ITEMS or not all(
                     isinstance(card, str) and card for card in raw_accelerators)
                 or len(set(raw_accelerators)) != len(raw_accelerators) or
                 not isinstance(count, int) or isinstance(count, bool) or
@@ -1363,21 +1364,21 @@ def _changed_prospective_demand_semantics(expected: Any,
     current_compatibility = current['compatibility_demand']
     if (not isinstance(expected_compatibility, Mapping) or
             not isinstance(current_compatibility, Mapping) or
-            set(expected_compatibility) !=
-            _NORMALIZED_COMPATIBILITY_DEMAND_FIELDS or
-            set(current_compatibility) !=
-            _NORMALIZED_COMPATIBILITY_DEMAND_FIELDS):
+            set(expected_compatibility)
+            != _NORMALIZED_COMPATIBILITY_DEMAND_FIELDS or
+            set(current_compatibility)
+            != _NORMALIZED_COMPATIBILITY_DEMAND_FIELDS):
         return changed or ['compatibility_demand']
 
     expected_profiles = {
         field: _canonical_normalized_compatibility_profiles(
-            expected_compatibility[field])
-        for field in _NORMALIZED_COMPATIBILITY_DEMAND_FIELDS
+            expected_compatibility[field]
+        ) for field in _NORMALIZED_COMPATIBILITY_DEMAND_FIELDS
     }
     current_profiles = {
         field: _canonical_normalized_compatibility_profiles(
-            current_compatibility[field])
-        for field in _NORMALIZED_COMPATIBILITY_DEMAND_FIELDS
+            current_compatibility[field]
+        ) for field in _NORMALIZED_COMPATIBILITY_DEMAND_FIELDS
     }
     if (any(profiles is None for profiles in expected_profiles.values()) or
             any(profiles is None for profiles in current_profiles.values())):
@@ -2499,6 +2500,73 @@ def validate_paid_claim_in_connection(
         raise CapacityAdmissionConflict(
             'Paid claim freshness expired while validation waited.')
     return paid_fresh_until
+
+
+def validate_prospective_paid_claim_batch_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    claims: Sequence[Mapping[str, Any]],
+    *,
+    protocol_and_service_prelocked: bool = False,
+) -> datetime.datetime:
+    """Validate one bounded planner-authority batch before any writes.
+
+    Every member must carry the same immutable plan authority.  Units are
+    summed by the exact debit card before the existing prospective validator
+    observes the database, so multiple members cannot each independently pass
+    against the same residual.  The caller retains the transaction and locks
+    while persisting the accepted batch graph.
+    """
+    if (not isinstance(claims, Sequence) or
+            isinstance(claims, (str, bytes, bytearray)) or not claims):
+        raise CapacityAdmissionConflict(
+            'Paid claim batch must be a nonempty ordered sequence.')
+    authority_fields = ('capacity_plan_generation', 'capacity_plan_sha256',
+                        'demand_feed_generation', 'demand_source_epoch')
+    first = claims[0]
+    if not isinstance(first, Mapping):
+        raise CapacityAdmissionConflict(
+            'Paid claim batch contains a malformed claim.')
+    authority = tuple(first.get(field) for field in authority_fields)
+    if any(value is None for value in authority):
+        raise CapacityAdmissionConflict(
+            'Paid claim batch has no exact planner authority.')
+
+    units_by_card: dict[str, int] = {}
+    representative_by_card: dict[str, Mapping[str, Any]] = {}
+    for claim in claims:
+        if not isinstance(claim, Mapping):
+            raise CapacityAdmissionConflict(
+                'Paid claim batch contains a malformed claim.')
+        if tuple(claim.get(field) for field in authority_fields) != authority:
+            raise CapacityAdmissionConflict(
+                'Paid claim batch spans multiple planner authorities.')
+        card = claim.get('capacity_plan_accelerator')
+        units = claim.get('capacity_plan_units')
+        if (not isinstance(card, str) or not card or
+                not isinstance(units, int) or isinstance(units, bool) or
+                units <= 0):
+            raise CapacityAdmissionConflict(
+                'Paid claim batch contains a malformed planner debit.')
+        representative_by_card.setdefault(card, claim)
+        units_by_card[card] = units_by_card.get(card, 0) + units
+
+    freshness_horizons: list[datetime.datetime] = []
+    for card in sorted(units_by_card):
+        aggregate_claim = dict(representative_by_card[card])
+        aggregate_claim['capacity_plan_units'] = units_by_card[card]
+        paid_fresh_until = validate_paid_claim_in_connection(
+            connection,
+            service,
+            aggregate_claim,
+            prospective=True,
+            require_planner=True,
+            protocol_and_service_prelocked=protocol_and_service_prelocked)
+        if paid_fresh_until is None:
+            raise CapacityAdmissionConflict(
+                'Paid claim batch has no exact planner authority.')
+        freshness_horizons.append(paid_fresh_until)
+    return min(freshness_horizons)
 
 
 def promote_service_in_connection(

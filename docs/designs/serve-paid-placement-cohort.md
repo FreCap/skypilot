@@ -2,9 +2,35 @@
 
 _Created: 2026-07-22_
 _Expanded: 2026-07-23_
-_Last updated: 2026-08-01_
+_Last updated: 2026-08-26_
 
 ## Status
+
+The depth, service-envelope, accelerator-frontier, priority, and durable
+provider-feedback policy in this document is deployed and remains
+authoritative. A 2026-08-26 GCP qualification exposed a transaction-cardinality
+defect below that policy: a nominal 100-wide wave persisted each paid replica
+in its own transaction, and every committed provisioning row advanced the
+projected route before the remaining prospective claims could commit. GCP
+usually produced a `RUNNING` VM 10-30 seconds after commitment, but repeated
+route-plan self-invalidation stretched 100 Spot L4 VMs to 27 minutes 53
+seconds.
+
+The active amendment changes paid claim acquisition from N singleton commits
+to one bounded PostgreSQL transaction for the accepted batch. It does not
+increase any default bound. Unknown pools still begin at four, the cold
+service envelope remains 16, the normal per-card frontier remains two, and all
+priority, price-order, cooldown, adaptive-depth, worker, and Spot-only gates
+still clip the batch. The transaction inserts only the accepted replicas and
+their paid claims. It deliberately does not create a second request-admission
+protocol: after commit, the existing generic non-pool path binds each replica's
+association, immutable API request, queue row, and retention pin, and the
+existing launch-reservation batch charges process capacity before workers
+start. The new transaction may use advisory process headroom only to bound its
+prepared size; Phase B remains the sole P authority and may leave committed
+`SCHEDULED` rows inert. A row between those boundaries cannot make a provider
+call. The deployed `1.1.1507` singleton path is safe but is not the final
+throughput contract.
 
 The PostgreSQL global paid-capacity authority shipped with database migration
 027. PR #909 reduced its exact-pool bootstrap from 60 to four, added a sticky
@@ -413,48 +439,82 @@ The central database contains one pool row per exact key and one claim row per
 service incarnation and replica ID. The service row serializes the per-service
 envelope and per-card frontier; the pool row serializes the exact-pool limit.
 
-Claim acquisition uses this transaction protocol:
+Claim acquisition uses this bounded-batch transaction protocol:
 
-1. Lock and validate the service-owner row, reconcile its orphan claims, and
-   re-read every valid unresolved claim for the service incarnation. Reject a
-   new identity with `service_saturated` when the service already owns its
-   configured envelope (16 claims by default), withdrawing all of that
-   incarnation's paid waiters while holding only the service row.
-2. For an existing replica identity, compare the requested exact pool with its
-   durable claim while holding only the service row. The same pool proceeds
-   idempotently. A different pool fails immediately, before candidate-pool,
-   waiter, or replica mutation.
-3. Derive durable ownership for the candidate's canonical accelerator card.
-   If a new pool would exceed the configured card frontier, reconcile every
-   waiter/card for the service incarnation while holding only the service row,
-   delete each waiter that is outside its now-owned frontier, commit, and
-   return `feedback_pending`. This rejection path never locks the candidate or
-   any other paid-capacity pool row.
-4. Only an eligible claim locks the candidate pool row. While holding the
-   service row and that one pool row, expire stale positive evidence, apply
-   priority admission, compare active claims with the current exact-pool
-   limit, and atomically persist the replica and claim on `ACQUIRED`.
-5. Commit the acquisition before any cross-pool waiter cleanup. If the accepted
-   claim fills the service envelope or a card frontier, immediately run a
-   separate transaction that locks only the service row, reconstructs every
-   card's current ownership, and reconciles every waiter for the service
-   incarnation. A full service envelope removes all its waiters; otherwise the
-   cleanup deletes each waiter outside its now-owned card frontier. It never
-   holds a paid-capacity pool row, avoiding cross-pool lock cycles.
+1. Before the transaction, the existing placer freezes an ordered candidate
+   for each logical slot from one advisory budget. Each candidate has one exact
+   location, pool key, replica/record identity, priority, width, and immutable
+   plan debit. No replica is prepared for two alternative locations, and a
+   rejected identity is never reassigned inside the transaction.
+2. Acquire the zero-cost protocol observation lock, lifecycle row, and service
+   owner row in the deployed paid-admission order. Read an advisory claim
+   snapshot only to discover every retained pool that must join the sorted lock
+   set; do not prune or otherwise mutate claim/waiter state yet. Bound the
+   prepared set by the caller's configured batch maximum. Process headroom is
+   advisory here; only the later P transaction authoritatively limits started
+   workers. A normal cold service therefore cannot acquire 100 merely because
+   100 were prepared.
+3. Ensure and lock every distinct pool named by a candidate or the advisory
+   retained-claim snapshot in canonical pool-key order. Only after all those
+   locks are held, authoritatively reread and prune stale claims, reconstruct
+   per-card ownership, and clip accepted members at the configured service
+   envelope and global paid-GPU cap. Under the same locks, apply
+   positive-evidence expiry, adaptive pool depth, accelerator frontier, and
+   priority waiter ordering. Exact-pool saturation defers that
+   member but permits later already-prepared members for distinct logical slots
+   to continue in frozen cheapest-first order. A higher-priority waiter or a
+   full frontier stops later candidates for that accelerator card; service or
+   paid-GPU saturation stops the wave. No rejection selects a new alternative
+   in-transaction. The next fresh tick may place only never-committed slots.
+   The transaction refreshes each denied pool's waiter with its existing
+   `first_wait_at`/TTL semantics. If one pool is acquired and then saturated by
+   a later member in the same batch, the final saturated waiter refresh wins
+   over the earlier acquired-waiter removal. Cross-pool cleanup remains the
+   established postcommit service-row-only transaction.
+4. Exact-match the current demand, route, reserved allocation, capacity graph,
+   and one capacity-plan authority once per distinct debit card in the same
+   transaction. Sum all accepted incoming units by card before its validation
+   against existing same-plan claims. A stale graph or insufficient residual
+   rejects the transaction; it never preserves candidate identities across a
+   refreshed plan.
+5. Insert the accepted policy-valid subset's replica rows and paid claims in
+   deterministic order with `sky_launch_status=SCHEDULED`, then commit before
+   registering or starting any launch worker. An insert error rolls back every
+   new replica and claim in the subset. No batch table, association, request,
+   queue row, retention pin, or execution claim is added by this transaction.
+   Any plan-freshness conflict, ownership loss, SQL error, or member-insert
+   error rolls back every Phase-A mutation, including waiter changes and pool
+   evidence normalization. A deliberate policy denial may commit waiter-only
+   state; a successful subset commits its final per-pool waiter effects with
+   its replica and claim rows.
+6. After commit, the manager registers the already-built ordinary launch
+   workers. The existing launch-reservation transaction charges the process P
+   budget in a batch, and each worker uses the canonical generic non-pool
+   binding path before provider I/O. A crash anywhere after the claim commit
+   leaves ordinary unresolved replica rows that recovery exact-matches by
+   replica identity. An association-less Phase-A replica+claim pair has no
+   provider-effect authority: recovery atomically retires the pair with the
+   existing proof-backed pre-admission primitive, wakes reconciliation, and a
+   fresh plan may mint a new identity. If binding won the row-lock race,
+   recovery adopts the exact association and request instead of retiring it.
 
-Every denied result writes no replica or claim and starts no launch thread;
-pool saturation may still publish its short-lived priority waiter. The main
-admission lock order is always service row then candidate pool row. Outcome and
-release transactions lock the service row before their deterministically
-ordered affected pool rows. The post-commit cleanup is deliberately
-service-row-only.
+The returned result names the committed members and each typed deferral. A
+lost transaction acknowledgement is not inferred from a nonexistent batch
+manifest. The caller fails closed and enqueues only the frozen member
+identities for supervised reconciliation after releasing the manager lock.
+That pass retires and replans exact association-less pairs, adopts exact bound
+pairs, and treats absent identities as no-ops. It retries transient failures
+without touching unrelated locally queued work. Startup recovery applies the
+same per-identity rule after process death. PostgreSQL cannot expose a partial
+transaction; mixed replica/claim state is corruption, not an ordinary
+`AMBIGUOUS` result.
 
-`ACQUIRED` therefore atomically persists the replica and claim, while waiter
-withdrawal is a separate liveness operation. If the follow-up cleanup raises
-or the process exits, admission still returns `ACQUIRED`; it must not report a
-failure that could trigger a duplicate launch. The committed claim remains
-authoritative, and abandoned waiters expire under the bounded 45-second
-heartbeat TTL if immediate cleanup does not run.
+The lock order is zero-cost protocol observation, lifecycle row, service owner
+row, distinct paid pool rows sorted by canonical key, plan/demand/report/route/
+allocation/capacity rows, and member replica/claim rows in deterministic order.
+Outcome and release transactions retain service-before-sorted-pools ordering.
+Request binding is a later transaction and therefore cannot invert paid-pool
+locks. The post-commit waiter cleanup remains deliberately service-row-only.
 
 Claims remain active while the matching durable replica is PENDING or
 PROVISIONING. Success, failure, terminal transition, deletion, service
@@ -698,33 +758,26 @@ The wave-local budget decrements service headroom and increments its owned set
 after every accepted claim, so a single large batch cannot outrun either
 snapshot.
 
-The snapshot is not the concurrency authority. Every claim transaction first
-locks and validates the current service-incarnation row, then re-reads all
-valid unresolved claims for both the service envelope and the candidate's
-canonical card. The caller passes the base frontier plus the candidate card's
-effective delayed-expansion limit. If the candidate pool is not already owned
-and the re-read finds that effective frontier full, the transaction withdraws
-now-ineligible waiters across every card frontier and returns
-`feedback_pending` without inserting a waiter, replica, or claim and without
-locking any pool row. Only after envelope and frontier eligibility are proven
-does it lock and evaluate the candidate pool row. This serializes overlapping
-batches and old/new controller handoff even when they select different pool
-rows, so two stale snapshots cannot open both a third and fourth pool.
+The snapshot is not the concurrency authority. The atomic claim transaction
+first locks and validates the current service incarnation, discovers every
+candidate and retained service pool, locks those pool rows in canonical sorted
+order, and only then prunes stale claims. It evaluates the frozen members in
+order against the re-read service envelope, each candidate card's effective
+frontier, exact-pool depth, and priority. This serializes overlapping batches
+and old/new controller handoff even when they select different pool rows, so
+two stale snapshots cannot open both a third and fourth pool.
 
-Priority waiter insertion happens after frontier eligibility is proven. A
-service may leave a waiter on a saturated pool while it still has a frontier
-slot. A frontier rejection withdraws out-of-frontier waiters before any pool
-lock. An acquisition that fills the frontier commits the replica and claim
-first, then uses the separate service-row-only cleanup transaction described
-above to evaluate every waiter/card and delete waiters outside each now-owned
-set. Unknown or malformed owned claim keys count against every card during
-that reconciliation. No transaction holds one candidate pool while deleting
-waiters associated with other pools. A stale high-priority waiter therefore
-normally stops blocking peers immediately. If cleanup fails, the already
-committed acquisition still returns `ACQUIRED`; the 45-second waiter TTL is
-the bounded fallback. Pools saturated by another service still return
-`saturated`, allowing the caller to try the next candidate while its own
-frontier and service envelope have space.
+Priority waiter refresh and exact-pool evaluation happen while all named pool
+rows are locked. A saturated member may leave a waiter and later independent
+members may still acquire; a frontier or higher-priority deferral stops only
+that card, while a service-wide limit stops the wave. An acquisition that
+fills a frontier commits the selected replica+claim subset first, then uses
+the separate service-row-only cleanup transaction described above to evaluate
+every waiter/card and delete waiters outside each now-owned set. Unknown or
+malformed owned claim keys count against every card during that reconciliation.
+No postcommit cleanup transaction holds a pool row. If cleanup fails, the
+already committed subset remains authoritative and the 45-second waiter TTL is
+the bounded fallback.
 
 PENDING and PROVISIONING claims intentionally have no age-based expiry:
 automatically releasing one while its provider mutation is ambiguous could
@@ -907,16 +960,18 @@ their heartbeat; an abandoned attempt stops refreshing and expires after the
 `SKYPILOT_SERVE_PAID_LOCATION_WAITER_TTL_SECONDS`. This prevents stale high
 priority demand from starving peers without requiring durable scale-up wave
 identifiers.
-A service/card rejected because its exploration frontier is full reconciles
-every waiter/card while holding only the service row and before locking any
-candidate pool. A successful acquisition commits first; when it fills the
-service envelope or a card frontier, a separate follow-up transaction locks
-only the service row and performs the same service-wide reconciliation.
-Unknown or malformed owned claim keys count against every relevant card during
-both paths. This split prevents cross-pool deadlocks and keeps claim persistence
-independent from cleanup. If the follow-up fails, admission still returns
-`ACQUIRED`; the committed launch is not retried. The 45-second waiter TTL is
-the bounded fallback for the abandoned waiter set.
+A batch locks the service row and then every candidate and retained exact-pool
+row in canonical sorted order before refreshing or deleting any waiter or
+claim. Frontier rejection is evaluated while those locks are held, and its
+candidate waiters commit with the deliberate policy-denial result. A successful
+subset commits first; when it fills the service envelope or a card frontier, a
+separate follow-up transaction locks only the service row and performs
+service-wide reconciliation. Unknown or malformed owned claim keys count
+against every relevant card during both paths. The sorted-pool boundary
+prevents cross-pool lock inversion, while the follow-up keeps global cleanup
+independent from claim persistence. If the follow-up fails, admission still
+returns `ACQUIRED`; the committed launch is not retried. The 45-second waiter
+TTL is the bounded fallback for the abandoned waiter set.
 A saturated pool may spill the wave to the next compatible paid pool. A
 lower-priority claim deferred by an already-waiting higher-priority service
 does not exhaust that pool or spill to a more expensive pool; it waits for a
@@ -939,7 +994,27 @@ zero-cost placement for the deferred card.
 
 ### Upgrade and restart
 
-There are three distinct mixed-version transitions.
+There are four distinct mixed-version transitions.
+
+The 2026-08-26 atomic-batch amendment adds no table, column, API payload, or
+executor request shape. Service-owner fencing permits only one current
+fresh-admission writer for a service, so a singleton and batch writer cannot
+interleave for that service. The exact deployed `1.1.1507` cohort can decode,
+adopt, bind, serve, and clean the unchanged rows; this is the required rollback
+target. Broader N-1/N-2 authority remains exactly as declared by the umbrella
+compatibility matrix: readable state is not permission for an N-2 writer to
+start a provider effect.
+
+Rollback is operational, not cleanup-only. A rollback may return new paid
+admission to the slower singleton transaction, while already-committed
+`SCHEDULED` replica+claim pairs continue through the same P reservation and
+generic binding paths. The batch transaction is all-or-nothing, but no durable
+manifest records its historical boundary. After a process death, a successor
+enumerates complete inert replica+claim pairs individually. It atomically
+retires and replans association-less pairs, and adopts only pairs whose exact
+generic association already committed; it does not infer missing or deferred
+members of the prior in-memory wave. A row has no queue visibility or
+provider-effect authority until the later generic binding transaction commits.
 
 Migration 027 creates empty additive pool, claim, and waiter tables. During a
 026-to-027 rollout, each new controller transactionally adopts unresolved
@@ -1027,8 +1102,12 @@ the operational rollout resolver.
 - service-envelope and accelerator-frontier accounting;
 - pure ramp, reset, and expiry policy;
 - conversion of central state into location availability;
-- atomic claim integration with Serve persistence; and
+- pure selection-budget integration plus one-member and batch claim APIs; and
 - outcome batching and redacted observability.
+
+No new request-admission module or batch table is introduced. The batch is the
+same paid-capacity authority already owned by `paid_capacity.py` and
+`serve_state.py`, applied to an ordered tuple instead of one candidate.
 
 The internal orchestration interface is:
 
@@ -1047,16 +1126,17 @@ select_location(
     allowed_locations,
 ) -> Location | None
 
-try_persist_claim(
+try_persist_claim_batch(
     service_name,
     service_hash,
-    replica_id,
-    replica_info,
-    location,
+    prepared_members,
     budget,
-    priority,
     controller_owner,
-) -> ClaimResult
+) -> ClaimBatchResult
+
+try_persist_claim(
+    ...,
+) -> ClaimResult  # compatibility wrapper over a one-member batch
 
 defer_for_priority(
     budget,
@@ -1109,22 +1189,42 @@ persist_completed_launches(
 `FEEDBACK_PENDING`, `HIGHER_PRIORITY_WAITING`, `OWNERSHIP_LOST`, or
 `LEGACY_LOCAL`.
 
-`serve_state.py` owns the PostgreSQL transaction, storage primitives, and
-waiter ordering performed inside the admission transaction. It also owns the
-frontier-rejection cleanup under the service lock and the separate
-service-row-only cleanup that follows a committed frontier-filling
-acquisition. It calls the central module's pure `effective_limit()` and
-`record_outcomes()` policy functions while holding the exact pool lock. Logs
-expose counts and limits, not raw pool keys containing workspace identity.
+`serve_state.py` owns the PostgreSQL transaction for the `SCHEDULED` replica,
+claim, debit, and waiter policy. It validates summed incoming plan units once
+per distinct debit card in the same transaction, then commits before the
+existing launch-reservation and common non-pool request transactions. It also
+owns frontier-rejection cleanup under the service lock
+and the separate service-row-only cleanup that follows a frontier-filling
+acquisition. The historical singleton public function delegates to the same
+staging primitive with one member; it is not a second policy implementation.
+It calls the central module's pure `effective_limit()` and `record_outcomes()`
+functions while holding sorted exact-pool locks. Logs expose counts and limits,
+not raw pool keys containing workspace identity.
 
 `replica_managers.py` retains only orchestration:
 
 1. ask the central module for apparent eligible locations;
-2. let the existing spot placer select the cheapest candidate;
-3. request an atomic claimed persist;
-4. enqueue a launch only on `ACQUIRED`; and
+2. let the existing spot placer assign one exact cheapest-first location to
+   each ordered intended member under the advisory depth, service, frontier,
+   priority, and cost policy;
+3. submit one bounded atomic replica+claim batch and retain only its committed
+   members;
+4. register those members with the existing P-reservation and generic binding
+   machinery after commit; and
 5. report completed launch outcomes in one deterministic batch before
    scheduling replica teardown.
+
+The manager never starts a provider worker between claim commits because there
+is one claim transaction. A transaction-acknowledgement failure signals
+exact-identity reconciliation and does not rebuild the wave inside the
+ambiguous call. Once the proof-backed pass retires an association-less pair,
+ordinary reconciliation may compute a fresh plan and identity. Provider
+parallelism comes from the existing P reservation, generic request queue, and
+long-worker pool after commit, not from weakening route freshness or holding a
+PostgreSQL lock across provider I/O. Queue visibility begins at the later
+per-member generic binding commit; executors may claim immediately, and
+manager adoption is reconstructible reconciliation rather than an effect
+prerequisite.
 
 `SERVICE_SATURATED` exhausts paid admission for the service-wide wave.
 `FEEDBACK_PENDING` defers only the affected accelerator card, so independent
@@ -1211,6 +1311,11 @@ capacity without deriving either durable claim envelope from it.
 
 | Changed invariant | Test proof |
 | --- | --- |
+| One nominal paid wave validates one immutable plan and atomically commits its ordered policy-valid `SCHEDULED` replica+claim subset before any worker is registered | Real-PostgreSQL 100-member claim test plus replica-manager no-worker-before-commit test |
+| A member insert fault rolls back every new replica and claim; transaction-acknowledgement loss fails closed, scopes recovery to exact frozen identities, retires and replans association-less pairs, adopts bound pairs, and never infers a batch manifest | Real-PostgreSQL failpoint, lost-ack, exact-scope in-process recovery, and restart tests |
+| A multi-pool batch acquires the service row then exact-pool rows in canonical sorted order and never exceeds the service envelope, card frontier, adaptive pool depth, plan residual, or global paid cap; later P admission independently prevents started workers from exceeding process capacity | Real-PostgreSQL sorted-lock instrumentation and saturation tests, aggregate summed-debit tests, plus retained cross-pool concurrency and P-reservation regressions |
+| A route, demand, allocation, report, or capacity-graph change before the transaction rejects every member; route publication after commit does not revoke an already committed batch | Capacity-plan conflict/rollback tests plus retained capacity-plan CAS tests |
+| A default cold batch remains clipped to pool depth 4, service envelope 16, and card frontier 2; an explicit isolated qualification requires effective service limit, summed locked pool headroom, accelerator frontier, process/global cap, and aggregate long-worker capacity all at least 100 | Pure configuration, manager integration, rendered-Helm, and real-PostgreSQL qualification-profile tests |
 | Default and invalid fallback are 4; maximum is at least bootstrap | Pure configuration tests |
 | Failure cooldown defaults to ten minutes and rejects invalid overrides | Pure configuration tests |
 | Exact keys distinguish workspace, cloud, region, zone, instance type, accelerator shape, Spot mode, and node count | Pool-key equality tests |
@@ -1227,7 +1332,7 @@ capacity without deriving either durable claim envelope from it.
 | Opening a second or delayed third pool prefers a provider-region not already represented by owned exact pools; same-domain fallback remains available before the normal frontier fills, while malformed owned identity prevents delayed expansion | Pure failure-domain selection and malformed-key tests |
 | Two overlapping claims for one service/card race on different candidates with one slot left; the service-row lock admits exactly one, the other returns `feedback_pending`, and neither a replica nor waiter leaks | Real-PostgreSQL concurrency test |
 | Service/frontier exhaustion suppresses only fresh paid admission: physical waves continue zero-cost reserved demand/fill and durable recovery-pinned cost-rebalance until a full pass makes no progress, while fresh cost replacements remain subject to paid admission and logical card loops continue zero-cost placement | Physical regressions with an envelope-blocked paid-only override ordered before later reserved fill, fresh rebalance admission-denial tests, durable replacement recovery tests, paid frontier and priority deferral followed by later real fill, exhausted-envelope zero-cost demand, initial service-envelope exhaustion and pre-existing frontier/priority stops across a 400-entry wave, plus logical exact-card zero-cost progress tests |
-| A frontier rejection reconciles every waiter/card under only the service lock before any pool lock, using each card's effective limit; an expanded L4 frontier does not widen A100, and unknown or malformed owned keys still count against every card | Real-PostgreSQL waiter/frontier, per-card-limit, and malformed-key tests |
+| A frontier rejection follows service-then-sorted-pool locking and commits only its candidate waiter effects; the later service-wide cleanup uses only the service lock and each card's effective limit. An expanded L4 frontier does not widen A100, and unknown or malformed owned keys still count against every card | Real-PostgreSQL sorted-lock, waiter/frontier, per-card-limit, and malformed-key tests |
 | A frontier- or envelope-filling acquisition commits first and cleans in a separate service-row-only transaction; cleanup failure still returns `ACQUIRED` and the stale waiter expires within the 45-second TTL | Real-PostgreSQL lock-order, failure-injection, and TTL tests |
 | A high-priority service waits on saturated A, then fills its frontier on B/C; its waiter on A is withdrawn after commit so a lower-priority service can acquire released A headroom without waiting for TTL | Real-PostgreSQL waiter/frontier interaction test |
 | Same-service saturation leaves target shortfall instead of persisting more PENDING rows; success deepens an existing frontier pool; typed failure closes it but cannot free its slot until every unresolved sibling drains; no existing claim is revoked | Physical/logical large-wave and outcome-transition tests |
@@ -1306,12 +1411,14 @@ its card frontier becomes full. Confirm the acquisition commits before
 out-of-frontier waiter cleanup, cleanup takes only the service-row lock, and a
 lower-priority service can use released headroom in A without waiting 45
 seconds. Add an unknown or malformed owned claim key and waiters on multiple
-cards; confirm one service-row-only reconciliation evaluates every waiter/card,
-counts that owned key against every frontier, and removes each newly
-ineligible waiter. Exercise the `feedback_pending` path and confirm it cleans
-before any candidate-pool lock. Inject a follow-up cleanup failure after an
-acquisition commit and confirm admission still returns `ACQUIRED`, the durable
-launch is not retried, and the stale waiter expires within the 45-second TTL.
+cards; confirm one service-row-only follow-up reconciliation evaluates every
+waiter/card, counts that owned key against every frontier, and removes each
+newly ineligible waiter. Exercise the `feedback_pending` path and confirm it
+locks the service row and every candidate/retained pool in canonical order
+before mutating waiter or claim state. Inject a follow-up cleanup failure after
+an acquisition commit and confirm admission still returns `ACQUIRED`, the
+durable launch is not retried, and the stale waiter expires within the
+45-second TTL.
 
 Restart with unresolved claims filling a card frontier. Confirm recovery
 re-drives each stable cluster at its persisted exact pool and that repeating

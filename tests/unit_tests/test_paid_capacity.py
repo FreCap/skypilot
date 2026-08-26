@@ -103,8 +103,9 @@ def test_pool_key_distinguishes_every_provider_capacity_dimension():
     assert base != paid_capacity.pool_key(a100_80, workspace='w1', num_nodes=1)
     changed_instance = make_location('us-east-1', {'A100': 1}, cloud_name='AWS')
     changed_instance.instance_type = 'p4de.24xlarge'
-    assert base != paid_capacity.pool_key(
-        changed_instance, workspace='w1', num_nodes=1)
+    assert base != paid_capacity.pool_key(changed_instance,
+                                          workspace='w1',
+                                          num_nodes=1)
     assert base != paid_capacity.pool_key(a100, workspace='w2', num_nodes=1)
     assert base != paid_capacity.pool_key(a100, workspace='w1', num_nodes=2)
 
@@ -1270,8 +1271,8 @@ def test_claim_clamps_priority_and_returns_typed_result():
         frontier_limit_overrides={('l4',): 3})
     info = _pending_info(1, location)
     with mock.patch.object(paid_capacity.serve_state,
-                           'try_add_replica_with_paid_capacity_claim',
-                           return_value='acquired') as claim:
+                           'try_add_replicas_with_paid_capacity_claims',
+                           return_value=['acquired']) as claim:
         result = paid_capacity.try_persist_claim(service_name='svc',
                                                  service_hash='hash',
                                                  controller_owner=(1,
@@ -1283,14 +1284,70 @@ def test_claim_clamps_priority_and_returns_typed_result():
                                                  priority=1000)
 
     assert result is paid_capacity.ClaimResult.ACQUIRED
-    assert claim.call_args.kwargs['priority'] == (
+    persistence_specs = claim.call_args.args[2]
+    assert len(persistence_specs) == 1
+    assert persistence_specs[0].candidate.priority == (
         constants.LB_REQUEST_PRIORITY_MAX)
+    assert persistence_specs[0].pool_key == budget.pool_key_by_location[
+        location]
     assert claim.call_args.kwargs['service_limit'] == 24
     assert claim.call_args.kwargs['max_live_paid_gpu_units'] == 8
-    assert claim.call_args.kwargs['frontier_key'] == ('l4',)
-    assert claim.call_args.kwargs['frontier_limit'] == 3
+    assert persistence_specs[0].frontier_key == ('l4',)
+    assert persistence_specs[0].frontier_limit == 3
     assert claim.call_args.kwargs['frontier_default_limit'] == 2
     assert claim.call_args.kwargs['frontier_limits_by_key'] == {('l4',): 3}
+
+
+def test_claim_batch_returns_exact_typed_members_and_publishes_only_committed():
+    first = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    second = make_location('us-west-2', {'L4': 1}, cloud_name='AWS')
+    first.instance_type = 'g6.xlarge'
+    second.instance_type = 'g6.2xlarge'
+    budget = paid_capacity.LaunchBudget(
+        remaining_by_location={
+            first: 1,
+            second: 1
+        },
+        pool_key_by_location={
+            first: paid_capacity.pool_key(first, workspace='w', num_nodes=1),
+            second: paid_capacity.pool_key(second, workspace='w', num_nodes=1),
+        },
+        states_by_pool_key={},
+        globally_managed=True,
+        frontier_key_by_location={
+            first: ('l4',),
+            second: ('l4',)
+        },
+        frontier_limit=2)
+    first_info = _pending_info(1, first)
+    second_info = _pending_info(2, second)
+    candidates = (
+        paid_capacity.PaidClaimCandidate(1, first_info, first, 20),
+        paid_capacity.PaidClaimCandidate(2, second_info, second, 20),
+    )
+
+    with mock.patch.object(paid_capacity.serve_state,
+                           'try_add_replicas_with_paid_capacity_claims',
+                           return_value=['acquired', 'saturated']):
+        result = paid_capacity.try_persist_claim_batch(
+            service_name='svc',
+            service_hash='hash',
+            controller_owner=(1, '10.0.0.1'),
+            candidates=candidates,
+            budget=budget)
+
+    assert result == paid_capacity.PaidClaimBatchResult((
+        paid_capacity.PaidClaimBatchMemberResult(
+            1, first_info.replica_record_id,
+            paid_capacity.ClaimResult.ACQUIRED),
+        paid_capacity.PaidClaimBatchMemberResult(
+            2, second_info.replica_record_id,
+            paid_capacity.ClaimResult.SATURATED),
+    ))
+    assert result.committed_members == result.members[:1]
+    assert first_info.paid_capacity_pool_key == budget.pool_key_by_location[
+        first]
+    assert second_info.paid_capacity_pool_key is None
 
 
 def test_saturated_pool_exhaustion_spills_to_next_pool():
@@ -1656,8 +1713,8 @@ def test_full_l4_frontier_does_not_block_independent_a100():
         })
 
     assert paid_capacity.select_location(
-        placer, budget, allowed_locations={l4_primary, l4_hedge, l4_third
-                                          }) is None
+        placer, budget, allowed_locations={l4_primary, l4_hedge,
+                                           l4_third}) is None
     assert budget.feedback_deferred_frontiers == {('l4',)}
     assert paid_capacity.select_location(placer,
                                          budget,

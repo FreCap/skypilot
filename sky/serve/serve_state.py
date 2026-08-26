@@ -1043,8 +1043,8 @@ def add_service(
                 where(
                     ephemeral_storage_cleanup_intents_table.c.service_name ==
                     name,
-                    ephemeral_storage_cleanup_intents_table.c.resource_scope !=
-                    resource_scope).distinct()).scalars().all()
+                    ephemeral_storage_cleanup_intents_table.c.resource_scope
+                    != resource_scope).distinct()).scalars().all()
             if orphan_storage_scopes:
                 session.rollback()
                 raise OrphanedStorageCleanupIntentsError(
@@ -1223,10 +1223,10 @@ def attest_service_owner_user_id(
                 service['lifecycle_epoch'] != authority.service_lifecycle_epoch
                 or service['controller_pid'] != authority.controller_pid or
                 service['controller_ip'] != authority.controller_ip or
-                service['controller_incarnation'] !=
-                authority.controller_incarnation or
-                service['controller_owner_epoch'] !=
-                authority.controller_owner_epoch):
+                service['controller_incarnation']
+                != authority.controller_incarnation or
+                service['controller_owner_epoch']
+                != authority.controller_owner_epoch):
             raise ServiceOwnerAuthorityError(
                 'Controller lost authority before service-owner attestation.')
         user = session.execute(
@@ -2405,8 +2405,8 @@ def _quarantine_aware_version_sql_expression(
     """Build the SQL equivalent of `_select_quarantine_aware_version`."""
     quarantine_dominates = sqlalchemy.and_(
         latest_quarantined.isnot(None),
-        sqlalchemy.or_(latest_applicable.is_(None),
-                       latest_applicable < latest_quarantined))
+        sqlalchemy.or_(latest_applicable.is_(None), latest_applicable
+                       < latest_quarantined))
     return sqlalchemy.case((quarantine_dominates, latest_applied_applicable),
                            else_=latest_applicable)
 
@@ -2601,8 +2601,10 @@ def get_service_version_terminal_states(
                         wanted.outerjoin(
                             services_table, services_table.c.name ==
                             wanted.c.service_name))).mappings().all())
-    states = {(str(row['service_name']), int(row['version'])): row
-              for row in version_states}
+    states = {
+        (str(row['service_name']), int(row['version'])): row
+        for row in version_states
+    }
     result: dict[tuple[str, int, str], bool] = {}
     for identity in identities:
         name, version, service_hash = identity
@@ -3106,8 +3108,8 @@ def service_replica_launch_fence_snapshot(
 
     try:
         normalized_exclusion = normalize_binding_excluded_launch_context(
-            launch_context if binding_excluded_launch_context is None else
-            binding_excluded_launch_context)
+            launch_context if binding_excluded_launch_context is
+            None else binding_excluded_launch_context)
     except ValueError:
         return None
     excluded_replica_id = (
@@ -3227,29 +3229,31 @@ def reserved_fill_committed_launch_authority_holds(
                     service_row['hash'] != service_hash or
                     service_row['resource_scope'] != service_hash or
                     service_row['current_version'] != fence.service_version or
-                    service_row['reserved_fill_actuation_mode'] !=
-                    zero_cost_actuation.ActuationMode.DURABLE_INTENT.value or
+                    service_row['reserved_fill_actuation_mode']
+                    != zero_cost_actuation.ActuationMode.DURABLE_INTENT.value or
                     service_row['reserved_fill_actuation_capable'] is not True
-                    or
-                    service_row['reserved_fill_actuation_controller_incarnation']
+                    or service_row[
+                        'reserved_fill_actuation_controller_incarnation']
                     != service_row['controller_incarnation'] or
-                    service_row['reserved_fill_actuation_protocol_version'] !=
-                    zero_cost_actuation.PROTOCOL_VERSION or
+                    service_row['reserved_fill_actuation_protocol_version']
+                    != zero_cost_actuation.PROTOCOL_VERSION or
                     service_row['ordinary_launch_binding_mode'] != 'bound' or
                     service_row['ordinary_launch_binding_capable'] is not True
                     or service_row['non_pool_launch_binding_capable']
                     is not True or
-                    service_row['non_pool_launch_controller_incarnation'] !=
-                    service_row['controller_incarnation'] or
-                    service_row['non_pool_launch_binding_protocol_version'] !=
-                    ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION or
+                    service_row['non_pool_launch_controller_incarnation']
+                    != service_row['controller_incarnation'] or
+                    service_row['non_pool_launch_binding_protocol_version']
+                    != ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION
+                    or
                     service_row['non_pool_launch_capability_profile_set_digest']
                     != ordinary_launch_binding.
                     supported_non_pool_profile_set_digest() or
-                    service_row['non_pool_launch_capability_cohort_epoch'] !=
-                    ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH or
-                    service_row['non_pool_launch_receipt_protocol_version'] !=
-                    ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION):
+                    service_row['non_pool_launch_capability_cohort_epoch']
+                    != ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+                    or service_row['non_pool_launch_receipt_protocol_version']
+                    != ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION
+               ):
                 return False
             intent = (
                 zero_cost_actuation.committed_intent_for_replica_in_connection(
@@ -3278,28 +3282,29 @@ def reserved_fill_committed_launch_authority_holds(
                     zero_cost_actuation.IntentState.COMMITTED.value,
                 )).mappings().one_or_none()
             if (intent is None or intent_owner is None or
-                    intent_owner['service_lifecycle_epoch'] !=
-                    service_row['lifecycle_epoch'] or
-                    intent_owner['actuation_epoch'] !=
-                    service_row['reserved_fill_actuation_epoch'] or
+                    intent_owner['service_lifecycle_epoch']
+                    != service_row['lifecycle_epoch'] or
+                    intent_owner['actuation_epoch']
+                    != service_row['reserved_fill_actuation_epoch'] or
                     intent.service_version != fence.service_version or
                     intent.pool_key != fence.pool_key or
                     intent.service_generation != fence.service_generation or
                     intent.physical_cluster_uid != fence.physical_cluster_uid or
-                    intent.allowed_locations[0].region !=
-                    fence.kubernetes_context or intent.accelerator.casefold() !=
-                    fence.accelerator.casefold() or
+                    intent.allowed_locations[0].region
+                    != fence.kubernetes_context or
+                    intent.accelerator.casefold()
+                    != fence.accelerator.casefold() or
                     intent.accelerator_count != fence.accelerator_count or
-                    intent.reconciliation_gate_generation !=
-                    fence.reconciliation_gate_generation or
-                    intent.reclaim_fleet_bundle_sha256 !=
-                    fence.reclaim_fleet_bundle_sha256 or
-                    intent.reclaim_policy_revision !=
-                    fence.reclaim_policy_revision or
-                    intent.reclaim_provider_inventory_sha256 !=
-                    fence.reclaim_provider_inventory_sha256 or
-                    intent.worker_projection_sha256 !=
-                    fence.worker_projection_sha256):
+                    intent.reconciliation_gate_generation
+                    != fence.reconciliation_gate_generation or
+                    intent.reclaim_fleet_bundle_sha256
+                    != fence.reclaim_fleet_bundle_sha256 or
+                    intent.reclaim_policy_revision
+                    != fence.reclaim_policy_revision or
+                    intent.reclaim_provider_inventory_sha256
+                    != fence.reclaim_provider_inventory_sha256 or
+                    intent.worker_projection_sha256
+                    != fence.worker_projection_sha256):
                 return False
             version_row = connection.execute(
                 sqlalchemy.select(
@@ -3317,8 +3322,8 @@ def reserved_fill_committed_launch_authority_holds(
                     fence,
                     version_row['worker_placement_projections'],
                     require_current_protocol=True))
-            if (projected_admission.worker_projection_sha256 !=
-                    intent.worker_projection_sha256):
+            if (projected_admission.worker_projection_sha256
+                    != intent.worker_projection_sha256):
                 return False
             expected_scope = (
                 reserved_fill_reclaim_attestation.ReclaimLaunchScope(
@@ -3935,8 +3940,8 @@ def _validate_system_recovery_transition(
     # Entering quarantine is always a legal fail-closed transition.  It does
     # not authorize any simultaneous capability promotion.
     if desired_quarantine is not None:
-        if (_system_recovery_disposition(desired) !=
-                _system_recovery_disposition(current)):
+        if (_system_recovery_disposition(desired)
+                != _system_recovery_disposition(current)):
             raise ReplicaSystemRecoveryMutationRejected(
                 'Quarantine cannot change recovery disposition.')
         return
@@ -4219,8 +4224,8 @@ def _reject_generic_reserved_fill_insert(
 def _lock_service_row_if_present_for_replica_write(session: orm.Session,
                                                    service_name: str) -> None:
     """Take lifecycle/service mutexes before any PostgreSQL replica row."""
-    if (session.bind is None or session.bind.dialect.name !=
-            db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+    if (session.bind is None or session.bind.dialect.name
+            != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
         return
     _lifecycle_epoch_matches_in_session(session, service_name, None)
     session.execute(
@@ -4263,9 +4268,8 @@ def _lock_and_merge_existing_replica_rows_in_session(
     if {int(row.replica_id) for row in rows} != set(replica_ids):
         return None
     latest_by_id = {
-        int(row.replica_id): _replica_from_state(row.replica_state_version,
-                                                 row.replica_state)
-        for row in rows
+        int(row.replica_id): _replica_from_state(
+            row.replica_state_version, row.replica_state) for row in rows
     }
     if any(incoming.replica_record_id !=
            latest_by_id[replica_id].replica_record_id
@@ -4572,8 +4576,8 @@ def update_replica_for_bound_ordinary_launch_in_transaction(
         if (not isinstance(paid_capacity_pool_key, str) or
                 not paid_capacity_pool_key or not isinstance(
                     paid_capacity_outcome, paid_capacity.LaunchOutcome) or
-                transaction_replica_info.paid_capacity_pool_key !=
-                paid_capacity_pool_key):
+                transaction_replica_info.paid_capacity_pool_key
+                != paid_capacity_pool_key):
             return False
         claim = connection.execute(
             sqlalchemy.select(paid_capacity_claims_table).where(
@@ -4766,9 +4770,9 @@ def _upsert_replica_rows_in_session(
             replicas_table.c.service_name == sqlalchemy.bindparam(
                 '_expected_service_name'), replicas_table.c.replica_id ==
             sqlalchemy.bindparam('_expected_replica_id')).values({
-                column_name:
-                sqlalchemy.bindparam(f'_replica_{column_name}',
-                                     type_=replicas_table.c[column_name].type)
+                column_name: sqlalchemy.bindparam(
+                    f'_replica_{column_name}',
+                    type_=replicas_table.c[column_name].type)
                 for column_name in value_column_names
             })
         for start in range(0, len(replica_infos), chunk_size):
@@ -5696,6 +5700,542 @@ def _current_max_live_paid_gpu_units_in_session(
     return True, cap
 
 
+def try_add_replicas_with_paid_capacity_claims(
+    service_name: str,
+    service_hash: str,
+    persistence_specs: list[paid_capacity.PaidClaimPersistenceSpec],
+    *,
+    base_limit: int,
+    max_limit: int,
+    service_limit: int | None = None,
+    max_live_paid_gpu_units: int | None = None,
+    now: float | None,
+    success_ttl_seconds: float,
+    failure_cooldown_seconds: float = 10 * 60,
+    waiter_ttl_seconds: float,
+    expected_controller_owner: tuple[int | None, str | None] | None,
+    frontier_default_limit: int | None = None,
+    frontier_limits_by_key: dict[paid_capacity.FrontierKey, int] | None = None,
+) -> list[str]:
+    """Atomically persist an ordered policy-valid paid replica/claim subset."""
+    persistence_specs = list(persistence_specs)
+    if not persistence_specs:
+        return []
+    if service_limit is not None and service_limit <= 0:
+        raise ValueError('Paid-capacity service limit must be positive.')
+    if frontier_default_limit is not None and frontier_default_limit <= 0:
+        raise ValueError('Paid-capacity default frontier must be positive.')
+    if frontier_limits_by_key is not None and any(
+            limit <= 0 for limit in frontier_limits_by_key.values()):
+        raise ValueError('Paid-capacity per-card frontiers must be positive.')
+    if (max_live_paid_gpu_units is not None and
+        (isinstance(max_live_paid_gpu_units, bool) or
+         not isinstance(max_live_paid_gpu_units, int) or
+         max_live_paid_gpu_units < 0)):
+        raise ValueError('max_live_paid_gpu_units must be an integer >= 0.')
+
+    replica_ids = []
+    replica_record_ids = []
+    for spec in persistence_specs:
+        candidate = spec.candidate
+        _validate_replica_row_identity(candidate.replica_id,
+                                       candidate.replica_info)
+        if _replica_has_zero_cost_authority(candidate.replica_info):
+            raise ValueError('A zero-cost or reserved-fill replica cannot '
+                             'enter the paid-capacity claim path.')
+        if not isinstance(spec.pool_key, str) or not spec.pool_key:
+            raise ValueError('Paid-capacity pool key must be nonempty.')
+        if spec.frontier_limit <= 0:
+            raise ValueError('Paid-capacity frontier must be positive.')
+        parsed_frontier = paid_capacity.frontier_key_from_pool_key(
+            spec.pool_key)
+        if (parsed_frontier is not None and
+                parsed_frontier != spec.frontier_key):
+            raise ValueError(
+                'Paid-capacity pool and frontier identities disagree.')
+        width = candidate.replica_info.planned_capacity
+        if (type(width) is not int or  # pylint: disable=unidiomatic-typecheck
+                width < 1):
+            raise ValueError('Paid replica planned_capacity must be a '
+                             'positive integer GPU width.')
+        claim_units = (candidate.capacity_plan_claim or
+                       {}).get('capacity_plan_units')
+        if claim_units is not None and claim_units != width:
+            raise ValueError('Paid claim planner debit must match the '
+                             'replica GPU width.')
+        replica_ids.append(candidate.replica_id)
+        replica_record_ids.append(candidate.replica_info.replica_record_id)
+    if len(set(replica_ids)) != len(replica_ids):
+        raise ValueError('Paid claim batch replica IDs must be unique.')
+    if len(set(replica_record_ids)) != len(replica_record_ids):
+        raise ValueError('Paid claim batch record identities must be unique.')
+
+    engine = _db_manager.get_engine()
+    results: list[str | None] = [None] * len(persistence_specs)
+    reconcile_waiters = False
+    with orm.Session(engine) as session:
+        # This is the established global -> lifecycle -> service -> sorted
+        # pool order. Plan/demand/route/allocation locks are acquired later by
+        # the prospective batch validator.
+        lock_zero_cost_protocol_for_bound_launch_observation(
+            session.connection())
+        owner = _lock_service_owner_row_in_session(session,
+                                                   service_name,
+                                                   service_hash,
+                                                   expected_controller_owner,
+                                                   require_launch_allowed=True)
+        if owner is None:
+            session.rollback()
+            return ['ownership_lost'] * len(persistence_specs)
+
+        cap_readable, authoritative_paid_gpu_cap = (
+            _current_max_live_paid_gpu_units_in_session(session, service_name,
+                                                        owner.current_version))
+        if not cap_readable:
+            session.rollback()
+            return ['service_saturated'] * len(persistence_specs)
+        max_live_paid_gpu_units = authoritative_paid_gpu_cap
+        if (max_live_paid_gpu_units is not None and engine.dialect.name
+                != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
+            session.rollback()
+            return ['service_saturated'] * len(persistence_specs)
+
+        service_claims, _ = (_valid_paid_capacity_service_claims_in_session(
+            session, service_name, service_hash))
+        service_claim_by_replica_id = dict(service_claims)
+        existing_replica_ids_at_start = set(service_claim_by_replica_id)
+        for spec in persistence_specs:
+            existing_pool_key = service_claim_by_replica_id.get(
+                spec.candidate.replica_id)
+            if (existing_pool_key is not None and
+                    existing_pool_key != spec.pool_key):
+                raise ValueError(
+                    'A paid-capacity replica claim cannot move between exact '
+                    'provider pools during a recovery re-drive.')
+
+        live_paid_gpu_units = 0
+        if max_live_paid_gpu_units is not None:
+            live_paid_rows = session.execute(
+                sqlalchemy.select(
+                    replicas_table.c.replica_state,
+                    replicas_table.c.sky_down_status).where(
+                        replicas_table.c.service_name == service_name)).all()
+            for replica_state, sky_down_status in live_paid_rows:
+                is_paid = (not isinstance(replica_state, Mapping) or
+                           replica_state.get('is_zero_cost') is not True)
+                if (not is_paid or sky_down_status
+                        == common_utils.ProcessStatus.SUCCEEDED.value):
+                    continue
+                planned_capacity = (replica_state.get('planned_capacity')
+                                    if isinstance(replica_state, Mapping) else
+                                    None)
+                if (type(planned_capacity) is not int or  # pylint: disable=unidiomatic-typecheck
+                        planned_capacity < 1):
+                    planned_capacity = 1
+                live_paid_gpu_units += planned_capacity
+
+        first_new_spec = next(
+            (spec for spec in persistence_specs
+             if spec.candidate.replica_id not in existing_replica_ids_at_start),
+            None)
+        has_existing_candidate = any(
+            spec.candidate.replica_id in existing_replica_ids_at_start
+            for spec in persistence_specs)
+        if (not has_existing_candidate and first_new_spec is not None and
+            ((service_limit is not None and
+              len(service_claims) >= service_limit) or
+             (max_live_paid_gpu_units is not None and live_paid_gpu_units +
+              first_new_spec.candidate.replica_info.planned_capacity
+              > max_live_paid_gpu_units))):
+            _withdraw_all_paid_capacity_waiters_in_session(
+                session, service_name, service_hash)
+            session.commit()
+            return ['service_saturated'] * len(persistence_specs)
+
+        retained_service_pool_keys = set(
+            session.execute(
+                sqlalchemy.select(paid_capacity_claims_table.c.pool_key).where(
+                    paid_capacity_claims_table.c.service_name == service_name,
+                    paid_capacity_claims_table.c.service_hash ==
+                    service_hash)).scalars())
+        distinct_pool_keys = sorted(
+            {spec.pool_key for spec in persistence_specs} |
+            retained_service_pool_keys)
+        for pool_key in distinct_pool_keys:
+            _ensure_paid_capacity_pool_in_session(session, engine, pool_key,
+                                                  base_limit, now)
+        pool_rows = {}
+        for pool_key in distinct_pool_keys:
+            pool_rows[pool_key] = _paid_capacity_pool_row_for_update(
+                session, pool_key)
+        transaction_now = _paid_capacity_clock_timestamp(session, now)
+
+        # Claim-row cleanup is deliberately after every named exact-pool lock.
+        # A competing service may already hold one of these pools while
+        # pruning the same stale row; mutating it before this point would
+        # invert the canonical service -> sorted pools -> claims order.
+        service_claims, stale_service_claims = (
+            _valid_paid_capacity_service_claims_in_session(
+                session, service_name, service_hash))
+        _delete_paid_capacity_claims_in_session(session, stale_service_claims)
+        service_claim_by_replica_id = dict(service_claims)
+        existing_replica_ids_at_start = set(service_claim_by_replica_id)
+
+        valid_claims_by_pool = {}
+        effective_limit_by_pool = {}
+        for pool_key in distinct_pool_keys:
+            pool = pool_rows[pool_key]
+            if pool.last_failure_at is None:
+                effective_limit, reset = paid_capacity.effective_limit(
+                    pool.current_limit,
+                    pool.last_success_at,
+                    bootstrap_limit=base_limit,
+                    ceiling_limit=max_limit,
+                    now=transaction_now,
+                    ttl_seconds=success_ttl_seconds)
+                if reset or effective_limit != pool.current_limit:
+                    session.execute(
+                        sqlalchemy.update(paid_capacity_pools_table).where(
+                            paid_capacity_pools_table.c.pool_key == pool_key).
+                        values(current_limit=effective_limit,
+                               successes_since_resize=(
+                                   0 if reset else pool.successes_since_resize),
+                               last_success_at=(None if reset else
+                                                pool.last_success_at),
+                               updated_at=transaction_now))
+            else:
+                admission = paid_capacity.effective_admission_limit(
+                    pool.current_limit,
+                    pool.last_success_at,
+                    pool.last_failure_at,
+                    bootstrap_limit=base_limit,
+                    ceiling_limit=max_limit,
+                    now=transaction_now,
+                    success_ttl=success_ttl_seconds,
+                    failure_cooldown=failure_cooldown_seconds)
+                effective_limit = admission.limit
+            effective_limit_by_pool[pool_key] = effective_limit
+            valid_claims, stale_claims = (
+                _valid_paid_capacity_claims_in_session(session, pool_key))
+            _delete_paid_capacity_claims_in_session(session, stale_claims)
+            valid_claims_by_pool[pool_key] = set(valid_claims)
+
+        owned_by_frontier: dict[paid_capacity.FrontierKey,
+                                set[str]] = collections.defaultdict(set)
+        unknown_owned_pool_keys = set()
+        for _, pool_key in service_claims:
+            parsed = paid_capacity.frontier_key_from_pool_key(pool_key)
+            if parsed is None:
+                unknown_owned_pool_keys.add(pool_key)
+            else:
+                owned_by_frontier[parsed].add(pool_key)
+
+        accepted_indices = []
+        stopped_frontiers: dict[paid_capacity.FrontierKey, str] = {}
+        service_stopped = False
+        service_claim_count = len(service_claims)
+        service_identity = (service_name, service_hash)
+
+        def _refresh_waiter(pool_key: str, priority: int) -> None:
+            session.execute(
+                sqlalchemy.delete(paid_capacity_waiters_table).where(
+                    paid_capacity_waiters_table.c.pool_key == pool_key,
+                    paid_capacity_waiters_table.c.heartbeat_at
+                    < transaction_now - waiter_ttl_seconds))
+            current_service_incarnation = sqlalchemy.exists().where(
+                services_table.c.name ==
+                paid_capacity_waiters_table.c.service_name,
+                services_table.c.hash ==
+                paid_capacity_waiters_table.c.service_hash)
+            session.execute(
+                sqlalchemy.delete(paid_capacity_waiters_table).where(
+                    paid_capacity_waiters_table.c.pool_key == pool_key,
+                    sqlalchemy.not_(current_service_incarnation)))
+            waiter_insert = _upsert_insert_func(engine)(
+                paid_capacity_waiters_table).values(
+                    pool_key=pool_key,
+                    service_name=service_name,
+                    service_hash=service_hash,
+                    priority=priority,
+                    first_wait_at=transaction_now,
+                    heartbeat_at=transaction_now)
+            session.execute(
+                waiter_insert.on_conflict_do_update(
+                    index_elements=['pool_key', 'service_name', 'service_hash'],
+                    set_={
+                        'priority': priority,
+                        'heartbeat_at': transaction_now,
+                    }))
+
+        for index, spec in enumerate(persistence_specs):
+            candidate = spec.candidate
+            replica_id = candidate.replica_id
+            identity = (service_name, service_hash, replica_id)
+            is_existing = replica_id in existing_replica_ids_at_start
+            if is_existing:
+                accepted_indices.append(index)
+                results[index] = 'acquired'
+                continue
+            if service_stopped:
+                results[index] = 'service_saturated'
+                continue
+
+            width = candidate.replica_info.planned_capacity
+            if (service_limit is not None and
+                    service_claim_count >= service_limit):
+                service_stopped = True
+                reconcile_waiters = True
+                results[index] = 'service_saturated'
+                continue
+            if (max_live_paid_gpu_units is not None and
+                    live_paid_gpu_units + width > max_live_paid_gpu_units):
+                service_stopped = True
+                reconcile_waiters = True
+                results[index] = 'service_saturated'
+                continue
+
+            stopped_result = stopped_frontiers.get(spec.frontier_key)
+            priority = max(
+                constants.LB_REQUEST_PRIORITY_MIN,
+                min(constants.LB_REQUEST_PRIORITY_MAX, candidate.priority))
+            if stopped_result is not None:
+                _refresh_waiter(spec.pool_key, priority)
+                results[index] = stopped_result
+                continue
+
+            owned_pool_keys = (owned_by_frontier[spec.frontier_key] |
+                               unknown_owned_pool_keys)
+            if (spec.pool_key not in owned_pool_keys and
+                    len(owned_pool_keys) >= spec.frontier_limit):
+                _refresh_waiter(spec.pool_key, priority)
+                results[index] = 'feedback_pending'
+                stopped_frontiers[spec.frontier_key] = 'feedback_pending'
+                reconcile_waiters = True
+                continue
+
+            _refresh_waiter(spec.pool_key, priority)
+            best_waiter = session.execute(
+                sqlalchemy.select(
+                    paid_capacity_waiters_table.c.service_name,
+                    paid_capacity_waiters_table.c.service_hash).where(
+                        paid_capacity_waiters_table.c.pool_key ==
+                        spec.pool_key).order_by(
+                            paid_capacity_waiters_table.c.priority.desc(),
+                            paid_capacity_waiters_table.c.first_wait_at,
+                            paid_capacity_waiters_table.c.service_name).limit(
+                                1)).fetchone()
+            if best_waiter is None:
+                raise RuntimeError(
+                    'Paid-capacity waiter disappeared during admission.')
+            if (len(valid_claims_by_pool[spec.pool_key])
+                    >= effective_limit_by_pool[spec.pool_key]):
+                results[index] = 'saturated'
+                continue
+            if (best_waiter.service_name,
+                    best_waiter.service_hash) != service_identity:
+                results[index] = 'higher_priority_waiting'
+                stopped_frontiers[spec.frontier_key] = (
+                    'higher_priority_waiting')
+                continue
+
+            pool = pool_rows[spec.pool_key]
+            if pool.last_failure_at is not None:
+                session.execute(
+                    sqlalchemy.update(paid_capacity_pools_table).where(
+                        paid_capacity_pools_table.c.pool_key ==
+                        spec.pool_key).values(current_limit=1,
+                                              successes_since_resize=0,
+                                              last_success_at=None,
+                                              updated_at=transaction_now))
+            valid_claims_by_pool[spec.pool_key].add(identity)
+            service_claim_by_replica_id[replica_id] = spec.pool_key
+            service_claims.append((replica_id, spec.pool_key))
+            service_claim_count += 1
+            live_paid_gpu_units += width
+            owned_by_frontier[spec.frontier_key].add(spec.pool_key)
+            accepted_indices.append(index)
+            results[index] = 'acquired'
+            session.execute(
+                sqlalchemy.delete(paid_capacity_waiters_table).where(
+                    paid_capacity_waiters_table.c.pool_key == spec.pool_key,
+                    paid_capacity_waiters_table.c.service_name == service_name,
+                    paid_capacity_waiters_table.c.service_hash == service_hash))
+            if (service_limit is not None and
+                    service_claim_count >= service_limit):
+                reconcile_waiters = True
+            if (len(owned_by_frontier[spec.frontier_key] |
+                    unknown_owned_pool_keys) >= spec.frontier_limit):
+                reconcile_waiters = True
+
+        locked_service = session.execute(
+            sqlalchemy.select(services_table).where(
+                services_table.c.name ==
+                service_name).with_for_update()).mappings().one()
+        prospective_claims = []
+        existing_indices = []
+        for index in accepted_indices:
+            spec = persistence_specs[index]
+            candidate = spec.candidate
+            if candidate.replica_id in existing_replica_ids_at_start:
+                existing_indices.append(index)
+                continue
+            prospective_claim = dict(candidate.capacity_plan_claim or {})
+            prospective_claim.update(service_name=service_name,
+                                     service_hash=service_hash,
+                                     replica_id=candidate.replica_id)
+            require_planner = not bool(
+                candidate.replica_info.cost_rebalance_for_replica_id is not None
+                or candidate.replica_info.system_recovery_launch_intent
+                is not None)
+            if candidate.capacity_plan_claim:
+                prospective_claims.append(prospective_claim)
+            else:
+                capacity_admission.validate_paid_claim_in_connection(
+                    session.connection(),
+                    locked_service,
+                    prospective_claim,
+                    prospective=True,
+                    require_planner=require_planner,
+                    protocol_and_service_prelocked=True)
+
+        if prospective_claims:
+            capacity_admission.validate_prospective_paid_claim_batch_in_connection(
+                session.connection(),
+                locked_service,
+                prospective_claims,
+                protocol_and_service_prelocked=True)
+
+        for index in existing_indices:
+            spec = persistence_specs[index]
+            candidate = spec.candidate
+            existing_claim = session.execute(
+                sqlalchemy.select(paid_capacity_claims_table).where(
+                    paid_capacity_claims_table.c.service_name == service_name,
+                    paid_capacity_claims_table.c.service_hash == service_hash,
+                    paid_capacity_claims_table.c.replica_id ==
+                    candidate.replica_id)).mappings().one()
+            capacity_admission.validate_paid_claim_in_connection(
+                session.connection(),
+                locked_service,
+                existing_claim,
+                prospective=False,
+                require_planner=not bool(
+                    candidate.replica_info.cost_rebalance_for_replica_id
+                    is not None or
+                    candidate.replica_info.system_recovery_launch_intent
+                    is not None),
+                protocol_and_service_prelocked=True)
+
+        transaction_infos = {}
+        for index in accepted_indices:
+            spec = persistence_specs[index]
+            info = copy.deepcopy(spec.candidate.replica_info)
+            info.paid_capacity_pool_key = spec.pool_key
+            transaction_infos[index] = info
+
+        if existing_indices:
+            existing_infos = [(persistence_specs[index].candidate.replica_id,
+                               transaction_infos[index])
+                              for index in existing_indices]
+            existing_replica_ids = sorted(
+                replica_id for replica_id, _ in existing_infos)
+            existing_rows = session.execute(
+                sqlalchemy.select(
+                    replicas_table.c.replica_id,
+                    replicas_table.c.replica_state_version,
+                    replicas_table.c.replica_state).where(
+                        replicas_table.c.service_name == service_name,
+                        replicas_table.c.replica_id.in_(existing_replica_ids)).
+                order_by(
+                    replicas_table.c.replica_id).with_for_update()).fetchall()
+            if ([int(row.replica_id) for row in existing_rows]
+                    != existing_replica_ids):
+                session.rollback()
+                return ['ownership_lost'] * len(persistence_specs)
+            current_by_replica_id = {
+                int(row.replica_id): _replica_from_state(
+                    row.replica_state_version,
+                    row.replica_state) for row in existing_rows
+            }
+            if any(current_by_replica_id[replica_id].replica_id != replica_id or
+                   current_by_replica_id[replica_id].replica_record_id !=
+                   info.replica_record_id
+                   for replica_id, info in existing_infos):
+                session.rollback()
+                return ['ownership_lost'] * len(persistence_specs)
+            if any(
+                    _replica_has_zero_cost_authority(
+                        current_by_replica_id[replica_id])
+                    for replica_id in existing_replica_ids):
+                raise ValueError('A zero-cost or reserved-fill row cannot be '
+                                 'replayed through a paid-capacity claim.')
+            persisted_infos = _upsert_replica_rows_in_session(
+                session,
+                engine,
+                service_name,
+                existing_infos,
+                expected_replica_exists=True)
+            if persisted_infos is None:
+                session.rollback()
+                return ['ownership_lost'] * len(persistence_specs)
+            if any(
+                    _replica_has_zero_cost_authority(info)
+                    for _, info in persisted_infos):
+                raise ValueError('A zero-cost or reserved-fill row cannot be '
+                                 'replayed through a paid-capacity claim.')
+
+        existing_index_set = set(existing_indices)
+        for index in accepted_indices:
+            spec = persistence_specs[index]
+            candidate = spec.candidate
+            if index not in existing_index_set:
+                replica_insert = _upsert_insert_func(engine)(
+                    replicas_table).values(**_initial_replica_row_values(
+                        engine, service_name, candidate.replica_id,
+                        transaction_infos[index]))
+                session.execute(replica_insert)
+            claim_values = {
+                'service_name': service_name,
+                'service_hash': service_hash,
+                'replica_id': candidate.replica_id,
+                'pool_key': spec.pool_key,
+                'priority': max(
+                    constants.LB_REQUEST_PRIORITY_MIN,
+                    min(constants.LB_REQUEST_PRIORITY_MAX, candidate.priority)),
+                'claimed_at': transaction_now,
+                **dict(candidate.capacity_plan_claim or {}),
+            }
+            claim_insert = _upsert_insert_func(engine)(
+                paid_capacity_claims_table).values(**claim_values)
+            session.execute(
+                claim_insert.on_conflict_do_update(
+                    index_elements=[
+                        'service_name', 'service_hash', 'replica_id'
+                    ],
+                    set_={
+                        'pool_key': spec.pool_key,
+                        'priority': claim_values['priority'],
+                    }))
+        session.commit()
+
+    assert all(result is not None for result in results)
+    if reconcile_waiters:
+        try:
+            _reconcile_ineligible_paid_capacity_waiters(
+                service_name,
+                service_hash,
+                service_limit=service_limit,
+                frontier_limit=frontier_default_limit,
+                frontier_limits_by_key=frontier_limits_by_key,
+                expected_controller_owner=expected_controller_owner)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                'Committed paid-capacity batch but failed to withdraw '
+                'ineligible waiters; they will expire by TTL. Details: %s',
+                common_utils.format_exception(e))
+    return typing.cast(list[str], results)
+
+
 def try_add_replica_with_paid_capacity_claim(
     service_name: str,
     service_hash: str,
@@ -5719,379 +6259,42 @@ def try_add_replica_with_paid_capacity_claim(
     frontier_limits_by_key: dict[paid_capacity.FrontierKey, int] | None = None,
     capacity_plan_claim: Mapping[str, Any] | None = None,
 ) -> str:
-    """Atomically persist one replica and its global paid-capacity claim."""
-    _validate_replica_row_identity(replica_id, replica_info)
-    if _replica_has_zero_cost_authority(replica_info):
-        raise ValueError('A zero-cost or reserved-fill replica cannot enter '
-                         'the paid-capacity claim path.')
-    transaction_replica_info = copy.deepcopy(replica_info)
-    engine = _db_manager.get_engine()
-    if (max_live_paid_gpu_units is not None and
-        (isinstance(max_live_paid_gpu_units, bool) or
-         not isinstance(max_live_paid_gpu_units, int) or
-         max_live_paid_gpu_units < 0)):
-        raise ValueError('max_live_paid_gpu_units must be an integer >= 0.')
-    reconcile_waiters = False
-    with orm.Session(engine) as session:
-        # A planner-bound claim may carry reserved-fill allocation authority.
-        # Share-lock the global protocol before the service/pool rows so claim
-        # admission composes with allocation writers in canonical order.
-        lock_zero_cost_protocol_for_bound_launch_observation(
-            session.connection())
-        locked_service = _lock_service_owner_row_in_session(
-            session,
-            service_name,
-            service_hash,
-            expected_controller_owner,
-            require_launch_allowed=True)
-        if locked_service is None:
-            session.rollback()
-            return 'ownership_lost'
-        cap_readable, authoritative_paid_gpu_cap = (
-            _current_max_live_paid_gpu_units_in_session(
-                session, service_name, locked_service.current_version))
-        if not cap_readable:
-            # Production services always have one committed elected spec. A
-            # missing or malformed row cannot prove that paid launch is safe.
-            session.rollback()
-            return 'service_saturated'
-        # The caller's value is an advisory fast-path only. Re-read the elected
-        # immutable policy under the same service lock that serializes replica
-        # admission, so an in-flight old-version manager cannot weaken a cap
-        # that a service update has already committed.
-        max_live_paid_gpu_units = authoritative_paid_gpu_cap
-        if (max_live_paid_gpu_units is not None and engine.dialect.name !=
-                db_utils.SQLAlchemyDialect.POSTGRESQL.value):
-            session.rollback()
-            return 'service_saturated'
-        if service_limit is not None and service_limit <= 0:
-            raise ValueError('Paid-capacity service limit must be positive.')
-        if frontier_limit is not None and frontier_limit <= 0:
-            raise ValueError('Paid-capacity frontier must be positive.')
-        if frontier_default_limit is not None and frontier_default_limit <= 0:
-            raise ValueError('Paid-capacity default frontier must be positive.')
-        if frontier_limits_by_key is not None and any(
-                limit <= 0 for limit in frontier_limits_by_key.values()):
-            raise ValueError(
-                'Paid-capacity per-card frontiers must be positive.')
-        if (frontier_key is None) != (frontier_limit is None):
-            raise ValueError(
-                'Paid-capacity frontier key and limit must be set together.')
-
-        identity = (service_name, service_hash, replica_id)
-        service_claims, stale_service_claims = (
-            _valid_paid_capacity_service_claims_in_session(
-                session, service_name, service_hash))
-        _delete_paid_capacity_claims_in_session(session, stale_service_claims)
-        is_existing_service_claim = any(
-            claim_replica_id == replica_id
-            for claim_replica_id, _ in service_claims)
-        existing_service_pool_key = next(
-            (claim_pool_key
-             for claim_replica_id, claim_pool_key in service_claims
-             if claim_replica_id == replica_id), None)
-        if (existing_service_pool_key is not None and
-                existing_service_pool_key != pool_key):
-            raise ValueError(
-                'A paid-capacity replica claim cannot move between exact '
-                'provider pools during a recovery re-drive.')
-        if (max_live_paid_gpu_units is not None and
-                not is_existing_service_claim):
-            incoming_paid_gpu_units = getattr(replica_info, 'planned_capacity',
-                                              None)
-            if (type(incoming_paid_gpu_units) is not int or  # pylint: disable=unidiomatic-typecheck
-                    incoming_paid_gpu_units < 1):
-                raise ValueError(
-                    'Paid replica planned_capacity must be a positive '
-                    'integer GPU width.')
-            # Read JSON under the already-held service lock and apply the
-            # exact conservative predicate in Python. PostgreSQL JSON casts
-            # would reject malformed retained values (for example a legacy
-            # string or object), but every value other than literal ``true``
-            # must debit the paid cap rather than fail open or abort admission.
-            live_paid_rows = session.execute(
-                sqlalchemy.select(
-                    replicas_table.c.replica_state,
-                    replicas_table.c.sky_down_status).where(
-                        replicas_table.c.service_name == service_name)).all()
-            live_paid_gpu_units = 0
-            for replica_state, sky_down_status in live_paid_rows:
-                is_paid = (not isinstance(replica_state, Mapping) or
-                           replica_state.get('is_zero_cost') is not True)
-                if (not is_paid or sky_down_status
-                        == common_utils.ProcessStatus.SUCCEEDED.value):
-                    continue
-                planned_capacity = (replica_state.get('planned_capacity')
-                                    if isinstance(replica_state, Mapping) else
-                                    None)
-                if (type(planned_capacity) is not int or  # pylint: disable=unidiomatic-typecheck
-                        planned_capacity < 1):
-                    planned_capacity = 1
-                live_paid_gpu_units += planned_capacity
-            if (live_paid_gpu_units + incoming_paid_gpu_units >
-                    max_live_paid_gpu_units):
-                # The service row is the admission lock, so this count and a
-                # subsequent replica+claim insert are one serialized decision.
-                # Cleanup-unproven rows retain their debit even after their
-                # transient paid claim has resolved.
-                _withdraw_all_paid_capacity_waiters_in_session(
-                    session, service_name, service_hash)
-                session.commit()
-                return 'service_saturated'
-        frontier_owned_pool_keys: set[str] | None = None
-        if (service_limit is not None and
-                len(service_claims) >= service_limit and
-                not is_existing_service_claim):
-            # The service row is the only admission lock held here, so
-            # deleting waiters across pools cannot form a pool-lock cycle.
-            _withdraw_all_paid_capacity_waiters_in_session(
-                session, service_name, service_hash)
-            session.commit()
-            return 'service_saturated'
-
-        if frontier_key is not None:
-            assert frontier_limit is not None
-            candidate_frontier_key = (
-                paid_capacity.frontier_key_from_pool_key(pool_key))
-            if (candidate_frontier_key is not None and
-                    candidate_frontier_key != frontier_key):
-                raise ValueError(
-                    'Paid-capacity pool and frontier identities disagree.')
-            frontier_owned_pool_keys = {
-                claim_pool_key for _, claim_pool_key in service_claims
-                if (paid_capacity.frontier_key_from_pool_key(claim_pool_key) in
-                    (None, frontier_key))
-            }
-            if (pool_key not in frontier_owned_pool_keys and
-                    len(frontier_owned_pool_keys) >= frontier_limit):
-                _withdraw_ineligible_frontier_waiters_in_session(
-                    session, service_name, service_hash, service_claims,
-                    frontier_default_limit or frontier_limit,
-                    frontier_limits_by_key)
-                session.commit()
-                return 'feedback_pending'
-        _ensure_paid_capacity_pool_in_session(session, engine, pool_key,
-                                              base_limit, now)
-        pool = _paid_capacity_pool_row_for_update(session, pool_key)
-        now = _paid_capacity_clock_timestamp(session, now)
-        if pool.last_failure_at is None:
-            effective_limit, reset = paid_capacity.effective_limit(
-                pool.current_limit,
-                pool.last_success_at,
-                bootstrap_limit=base_limit,
-                ceiling_limit=max_limit,
-                now=now,
-                ttl_seconds=success_ttl_seconds)
-            if reset or effective_limit != pool.current_limit:
-                session.execute(
-                    sqlalchemy.update(paid_capacity_pools_table).where(
-                        paid_capacity_pools_table.c.pool_key == pool_key).
-                    values(current_limit=effective_limit,
-                           successes_since_resize=(0 if reset else
-                                                   pool.successes_since_resize),
-                           last_success_at=(None
-                                            if reset else pool.last_success_at),
-                           updated_at=now))
-        else:
-            admission = paid_capacity.effective_admission_limit(
-                pool.current_limit,
-                pool.last_success_at,
-                pool.last_failure_at,
-                bootstrap_limit=base_limit,
-                ceiling_limit=max_limit,
-                now=now,
-                success_ttl=success_ttl_seconds,
-                failure_cooldown=failure_cooldown_seconds)
-            effective_limit = admission.limit
-
-        valid_claims, stale_claims = _valid_paid_capacity_claims_in_session(
-            session, pool_key)
-        _delete_paid_capacity_claims_in_session(session, stale_claims)
-
-        is_existing_claim = identity in valid_claims
-        locked_service = session.execute(
-            sqlalchemy.select(services_table).where(
-                services_table.c.name ==
-                service_name).with_for_update()).mappings().one()
-        if is_existing_claim:
-            existing_claim = session.execute(
-                sqlalchemy.select(paid_capacity_claims_table).where(
-                    paid_capacity_claims_table.c.service_name == service_name,
-                    paid_capacity_claims_table.c.service_hash == service_hash,
-                    paid_capacity_claims_table.c.replica_id ==
-                    replica_id)).mappings().one()
-            prospective_claim = dict(existing_claim)
-        else:
-            prospective_claim = dict(capacity_plan_claim or {})
-            prospective_claim.update(service_name=service_name,
-                                     service_hash=service_hash,
-                                     replica_id=replica_id)
-        capacity_admission.validate_paid_claim_in_connection(
-            session.connection(),
-            locked_service,
-            prospective_claim,
-            prospective=not is_existing_claim,
-            require_planner=not bool(
-                transaction_replica_info.cost_rebalance_for_replica_id
-                is not None or
-                transaction_replica_info.system_recovery_launch_intent
-                is not None),
-            protocol_and_service_prelocked=True)
-        if is_existing_claim:
-            existing_replica = session.execute(
-                sqlalchemy.select(
-                    replicas_table.c.replica_state_version,
-                    replicas_table.c.replica_state).where(
-                        replicas_table.c.service_name == service_name,
-                        replicas_table.c.replica_id ==
-                        replica_id).with_for_update()).one_or_none()
-            if existing_replica is None:
-                session.rollback()
-                return 'ownership_lost'
-            persisted_replica = _replica_from_state(
-                existing_replica.replica_state_version,
-                existing_replica.replica_state)
-            if _replica_has_zero_cost_authority(persisted_replica):
-                raise ValueError('A zero-cost or reserved-fill row cannot be '
-                                 'replayed through a paid-capacity claim.')
-        if not is_existing_claim:
-            session.execute(
-                sqlalchemy.delete(paid_capacity_waiters_table).where(
-                    paid_capacity_waiters_table.c.pool_key == pool_key,
-                    paid_capacity_waiters_table.c.heartbeat_at <
-                    now - waiter_ttl_seconds))
-            current_service_incarnation = sqlalchemy.exists().where(
-                services_table.c.name ==
-                paid_capacity_waiters_table.c.service_name,
-                services_table.c.hash ==
-                paid_capacity_waiters_table.c.service_hash)
-            session.execute(
-                sqlalchemy.delete(paid_capacity_waiters_table).where(
-                    paid_capacity_waiters_table.c.pool_key == pool_key,
-                    sqlalchemy.not_(current_service_incarnation)))
-            waiter_insert = _upsert_insert_func(engine)(
-                paid_capacity_waiters_table).values(pool_key=pool_key,
-                                                    service_name=service_name,
-                                                    service_hash=service_hash,
-                                                    priority=priority,
-                                                    first_wait_at=now,
-                                                    heartbeat_at=now)
-            session.execute(
-                waiter_insert.on_conflict_do_update(
-                    index_elements=['pool_key', 'service_name', 'service_hash'],
-                    set_={
-                        'priority': priority,
-                        'heartbeat_at': now,
-                    }))
-            best_waiter = session.execute(
-                sqlalchemy.select(
-                    paid_capacity_waiters_table.c.service_name,
-                    paid_capacity_waiters_table.c.service_hash).where(
-                        paid_capacity_waiters_table.c.pool_key ==
-                        pool_key).order_by(
-                            paid_capacity_waiters_table.c.priority.desc(),
-                            paid_capacity_waiters_table.c.first_wait_at,
-                            paid_capacity_waiters_table.c.service_name).limit(
-                                1)).fetchone()
-            if best_waiter is None:
-                raise RuntimeError(
-                    'Paid-capacity waiter disappeared during admission.')
-            if len(valid_claims) >= effective_limit:
-                session.commit()
-                return 'saturated'
-            if (best_waiter.service_name,
-                    best_waiter.service_hash) != (service_name, service_hash):
-                session.commit()
-                return 'higher_priority_waiting'
-            if pool.last_failure_at is not None:
-                # The row-lock-serialized first post-cooldown claim marks the
-                # sole probe. A revision-027 controller may conservatively
-                # clobber this marker, but can never clear last_failure_at.
-                session.execute(
-                    sqlalchemy.update(paid_capacity_pools_table).where(
-                        paid_capacity_pools_table.c.pool_key ==
-                        pool_key).values(current_limit=1,
-                                         successes_since_resize=0,
-                                         last_success_at=None,
-                                         updated_at=now))
-
-        transaction_replica_info.paid_capacity_pool_key = pool_key
-        if is_existing_claim:
-            # Re-delivery of an exact durable claim updates the same replica
-            # record.  The immutable record identity fence prevents a stale
-            # manager incarnation from adopting that claim.
-            persisted_infos = _upsert_replica_rows_in_session(
-                session,
-                engine,
-                service_name, [(replica_id, transaction_replica_info)],
-                expected_replica_exists=True)
-            if persisted_infos is None:
-                session.rollback()
-                return 'ownership_lost'
-        else:
-            replica_insert = _upsert_insert_func(engine)(replicas_table).values(
-                **_initial_replica_row_values(engine, service_name, replica_id,
-                                              transaction_replica_info))
-            session.execute(replica_insert)
-        claim_values = {
-            'service_name': service_name,
-            'service_hash': service_hash,
-            'replica_id': replica_id,
-            'pool_key': pool_key,
-            'priority': priority,
-            'claimed_at': now,
-            **dict(capacity_plan_claim or {}),
-        }
-        claim_insert = _upsert_insert_func(engine)(
-            paid_capacity_claims_table).values(**claim_values)
-        session.execute(
-            claim_insert.on_conflict_do_update(
-                index_elements=['service_name', 'service_hash', 'replica_id'],
-                set_={
-                    'pool_key': pool_key,
-                    'priority': priority,
-                }))
-        service_claim_count_after = (len(service_claims) +
-                                     (0 if is_existing_service_claim else 1))
-        if (service_limit is not None and
-                service_claim_count_after >= service_limit):
-            reconcile_waiters = True
-        if frontier_owned_pool_keys is not None:
-            assert frontier_key is not None
-            assert frontier_limit is not None
-            frontier_owned_pool_keys.add(pool_key)
-            if len(frontier_owned_pool_keys) >= frontier_limit:
-                reconcile_waiters = True
-        if not is_existing_claim:
-            session.execute(
-                sqlalchemy.delete(paid_capacity_waiters_table).where(
-                    paid_capacity_waiters_table.c.pool_key == pool_key,
-                    paid_capacity_waiters_table.c.service_name == service_name,
-                    paid_capacity_waiters_table.c.service_hash == service_hash))
-        session.commit()
-    # Publish caller-visible paid provenance only after the row and claim are
-    # durable. A rejected exact-row replay or failed commit leaves the manager
-    # object unchanged, matching the zero-cost sequence publication contract.
-    replica_info.paid_capacity_pool_key = pool_key
-    if reconcile_waiters:
-        # Cross-pool waiter cleanup must not share a transaction with a pool
-        # row lock: crossed waiters for two services could otherwise deadlock.
-        # The claim is already durable, so cleanup is best effort and the
-        # waiter TTL remains the bounded fallback after a process crash.
-        try:
-            _reconcile_ineligible_paid_capacity_waiters(
-                service_name,
-                service_hash,
-                service_limit=service_limit,
-                frontier_limit=frontier_default_limit or frontier_limit,
-                frontier_limits_by_key=frontier_limits_by_key,
-                expected_controller_owner=expected_controller_owner)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.warning(
-                'Committed paid-capacity claim but failed to withdraw '
-                'ineligible waiters; they will expire by TTL. '
-                f'Details: {common_utils.format_exception(e)}')
-    return 'acquired'
+    """Persist one claim through the canonical ordered batch policy."""
+    if (frontier_key is None) != (frontier_limit is None):
+        raise ValueError(
+            'Paid-capacity frontier key and limit must be set together.')
+    candidate = paid_capacity.PaidClaimCandidate(
+        replica_id=replica_id,
+        replica_info=replica_info,
+        location=typing.cast(Any, None),
+        priority=priority,
+        capacity_plan_claim=capacity_plan_claim)
+    effective_frontier_key = (frontier_key or
+                              paid_capacity.frontier_key_from_pool_key(pool_key)
+                              or ('legacy-unbounded', pool_key))
+    persistence_spec = paid_capacity.PaidClaimPersistenceSpec(
+        candidate=candidate,
+        pool_key=pool_key,
+        frontier_key=effective_frontier_key,
+        frontier_limit=(frontier_limit
+                        if frontier_limit is not None else 2**31 - 1))
+    result = try_add_replicas_with_paid_capacity_claims(
+        service_name,
+        service_hash, [persistence_spec],
+        base_limit=base_limit,
+        max_limit=max_limit,
+        service_limit=service_limit,
+        max_live_paid_gpu_units=max_live_paid_gpu_units,
+        now=now,
+        success_ttl_seconds=success_ttl_seconds,
+        failure_cooldown_seconds=failure_cooldown_seconds,
+        waiter_ttl_seconds=waiter_ttl_seconds,
+        expected_controller_owner=expected_controller_owner,
+        frontier_default_limit=frontier_default_limit or frontier_limit,
+        frontier_limits_by_key=frontier_limits_by_key)[0]
+    if result == 'acquired':
+        replica_info.paid_capacity_pool_key = pool_key
+    return result
 
 
 def adopt_paid_capacity_claims(
@@ -6268,8 +6471,8 @@ def add_or_update_replicas_with_paid_capacity_outcomes(
             if pool.last_failure_at is not None:
                 probe_succeeded = (pool.current_limit == 1 and any(
                     outcome == paid_capacity.LaunchOutcome.SUCCESS and
-                    claimed_at >=
-                    (pool.last_failure_at + failure_cooldown_seconds)
+                    claimed_at >= (pool.last_failure_at +
+                                   failure_cooldown_seconds)
                     for outcome, claimed_at in pool_outcomes))
                 if not probe_succeeded:
                     continue
@@ -6456,8 +6659,8 @@ def _transition_paid_retirement(
             return False
         locked_record_ids = _lock_replica_record_ids_in_session(
             session, engine, service_name, [replica_id])
-        if (locked_record_ids is None or locked_record_ids.get(replica_id) !=
-                replica_info.replica_record_id):
+        if (locked_record_ids is None or locked_record_ids.get(replica_id)
+                != replica_info.replica_record_id):
             session.rollback()
             return False
         try:
@@ -6559,8 +6762,8 @@ def _logical_retirement_reports_are_current(
     now: datetime.datetime,
 ) -> bool:
     """Revalidate exact LB and occupancy evidence at the database clock."""
-    if (not rows or _logical_retirement_receipt_watermark(rows) !=
-            authority.receipt_watermark or
+    if (not rows or _logical_retirement_receipt_watermark(rows)
+            != authority.receipt_watermark or
             not demand_state.reports_match_current_lb_authority(rows, service)):
         return False
     complete = all(row['complete'] is True and row['protocol_version'] == 2
@@ -6580,11 +6783,11 @@ def _logical_retirement_reports_are_current(
         if (not isinstance(payload, Mapping) or
                 payload.get('protocol_version') != 2 or
                 payload.get('routing_version') != authority.service_version or
-                payload.get('route_projection_generation') !=
-                authority.route_generation or
+                payload.get('route_projection_generation')
+                != authority.route_generation or
                 payload.get('route_projection_sha256') != authority.route_sha256
-                or payload.get('route_source_epoch') !=
-                authority.route_source_epoch):
+                or payload.get('route_source_epoch')
+                != authority.route_source_epoch):
             return False
         try:
             role = lb_ha.LbRole(payload.get('applied_role'))
@@ -6662,9 +6865,8 @@ def _logical_retirement_precommit_matches(
         current_status.logical_retirement_controller_epoch
         == expected_logical_controller_epoch and
         type(retirement_version) is int and  # pylint: disable=unidiomatic-typecheck
-        retirement_version == authority.service_version
-        and type(current.version) is int
-        and current.version <= retirement_version
+        retirement_version == authority.service_version and type(
+            current.version) is int and current.version <= retirement_version
         and type(selection_generation) is int and selection_generation >= 0
         and selection_generation < authority.demand_feed_generation
         and type(selection_target) is int and selection_target >= 0 and
@@ -6839,9 +7041,9 @@ def commit_logical_retirement(
             sqlalchemy.select(reports).where(
                 reports.c.service_name == service_name,
                 reports.c.service_hash == expected_service_hash,
-                reports.c.valid_until > report_query_now).order_by(
-                    reports.c.reporter_session_id).with_for_update()).mappings(
-                    ).all()
+                reports.c.valid_until
+                > report_query_now).order_by(reports.c.reporter_session_id).
+            with_for_update()).mappings().all()
 
         route_heads = route_projection_schema.serve_route_heads_table
         routes = route_projection_schema.serve_route_snapshots_table
@@ -6886,16 +7088,16 @@ def commit_logical_retirement(
                 route_head['valid_until'] <= now or
                 route['content_sha256'] != authority.route_sha256 or
                 route['service_hash'] != expected_service_hash or
-                route['service_lifecycle_epoch'] !=
-                authority.service_lifecycle_epoch or
+                route['service_lifecycle_epoch']
+                != authority.service_lifecycle_epoch or
                 route['service_version'] != authority.service_version or
-                str(route['controller_incarnation']) !=
-                authority.controller_incarnation or
-                route['controller_owner_epoch'] !=
-                authority.controller_owner_epoch or
+                str(route['controller_incarnation'])
+                != authority.controller_incarnation or
+                route['controller_owner_epoch']
+                != authority.controller_owner_epoch or
                 route['protocol_version'] != 1 or
-                route['producer_protocol_version'] !=
-                service['route_projection_protocol_version']):
+                route['producer_protocol_version']
+                != service['route_projection_protocol_version']):
             session.rollback()
             return LogicalRetirementCommitResult(
                 LogicalRetirementCommitState.REJECTED)
@@ -8200,8 +8402,8 @@ def reserve_replica_launches_running_if_capacity(
                                        row['replica_state'])
             association_id = row['ordinary_launch_association_id']
             if (info.replica_record_id != replica_record_id or
-                    info.status_property.sky_launch_status !=
-                    common_utils.ProcessStatus.SCHEDULED or
+                    info.status_property.sky_launch_status
+                    != common_utils.ProcessStatus.SCHEDULED or
                     info.status_property.sky_down_status is not None or
                 (require_bound and association_id is None) or
                 (not require_bound and association_id is not None)):
@@ -8282,8 +8484,8 @@ def restore_never_started_replica_launch_to_scheduled(
         info = _replica_from_state(row['replica_state_version'],
                                    row['replica_state'])
         if (info.replica_record_id != replica_record_id or
-                info.status_property.sky_launch_status !=
-                common_utils.ProcessStatus.RUNNING or
+                info.status_property.sky_launch_status
+                != common_utils.ProcessStatus.RUNNING or
                 info.status_property.sky_down_status is not None or
                 row['ordinary_launch_association_id'] is not None):
             session.rollback()
@@ -8337,8 +8539,8 @@ def restore_never_started_replica_teardown_to_scheduled(
         info = _replica_from_state(row['replica_state_version'],
                                    row['replica_state'])
         if (info.replica_record_id != replica_record_id or
-                info.status_property.sky_down_status !=
-                common_utils.ProcessStatus.RUNNING):
+                info.status_property.sky_down_status
+                != common_utils.ProcessStatus.RUNNING):
             session.rollback()
             return None
         info.status_property.sky_down_status = (
@@ -8517,8 +8719,8 @@ def reserve_replica_teardowns_running_if_capacity(
                                        row.replica_state)
             launch_status = info.status_property.sky_launch_status
             if (info.replica_record_id != replica_record_id or
-                    info.status_property.sky_down_status !=
-                    common_utils.ProcessStatus.SCHEDULED or launch_status
+                    info.status_property.sky_down_status
+                    != common_utils.ProcessStatus.SCHEDULED or launch_status
                     in (None, common_utils.ProcessStatus.SCHEDULED,
                         common_utils.ProcessStatus.RUNNING) or
                     not _bound_launch_is_quiesced_for_teardown_in_session(
@@ -8532,8 +8734,8 @@ def reserve_replica_teardowns_running_if_capacity(
             expected_logical_commit = (
                 expected_logical_retirement_commits.get(replica_id))
             if (expected_logical_commit is not None and
-                    logical_retirement_commit_identity(info) !=
-                    expected_logical_commit):
+                    logical_retirement_commit_identity(info)
+                    != expected_logical_commit):
                 continue
             info.status_property.sky_down_status = (
                 common_utils.ProcessStatus.RUNNING)
@@ -8753,8 +8955,8 @@ def add_or_update_version(
     legacy_controller_config_snapshot = (
         _validate_legacy_controller_config_snapshot(
             legacy_controller_config_snapshot))
-    if ((legacy_controller_config_snapshot is None) !=
-        (legacy_controller_applied_version is None)):
+    if ((legacy_controller_config_snapshot is None)
+            != (legacy_controller_applied_version is None)):
         raise ValueError('First protocol activation must provide the legacy '
                          'controller config and exact applied version '
                          'together.')
@@ -9788,9 +9990,8 @@ def _validate_protocol_v4_current_inventory(
             'fixed receipt-reader bound.')
 
     current_service_hashes = {
-        service_name:
-        placement_normalization_manifest.ServiceHashObservation(False, None)
-        for service_name in candidate_services
+        service_name: placement_normalization_manifest.ServiceHashObservation(
+            False, None) for service_name in candidate_services
     }
     service_rows = session.execute(
         sqlalchemy.select(services_table.c.name, services_table.c.hash).where(
@@ -10362,8 +10563,8 @@ def quarantine_version(
                 if (owner is None or (expected_service_hash is not None and
                                       owner.hash != expected_service_hash) or
                     (expected_controller_owner is not None and
-                     (owner.controller_pid, owner.controller_ip) !=
-                     expected_controller_owner)):
+                     (owner.controller_pid, owner.controller_ip)
+                     != expected_controller_owner)):
                     session.rollback()
                     return False
             existing = session.execute(
@@ -11808,8 +12009,8 @@ def remove_authoritative_reserved_fill_claim(
             sqlalchemy.select(reserved_fill_service_claim_sets_table).where(
                 reserved_fill_service_claim_sets_table.c.service_name ==
                 service_name).with_for_update()).fetchone()
-        if (set_row is None or set_row.claim_set_state !=
-                RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2 or
+        if (set_row is None or set_row.claim_set_state
+                != RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2 or
             (expected_service_generation is not None and
              int(set_row.generation) != expected_service_generation)):
             session.rollback()
@@ -11895,8 +12096,8 @@ def prune_authoritative_reserved_fill_claim_sets(
                 reserved_fill_service_claim_sets_table.c.service_name).where(
                     reserved_fill_service_claim_sets_table.c.claim_set_state ==
                     RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2,
-                    reserved_fill_service_claim_sets_table.c.heartbeat_ts <
-                    expired_before).with_for_update()).fetchall()
+                    reserved_fill_service_claim_sets_table.c.heartbeat_ts
+                    < expired_before).with_for_update()).fetchall()
         names = [str(row[0]) for row in rows]
         if names:
             session.execute(
@@ -11906,8 +12107,8 @@ def prune_authoritative_reserved_fill_claim_sets(
                 sqlalchemy.delete(reserved_fill_service_claim_sets_table).where(
                     reserved_fill_service_claim_sets_table.c.service_name.in_(
                         names),
-                    reserved_fill_service_claim_sets_table.c.heartbeat_ts <
-                    expired_before))
+                    reserved_fill_service_claim_sets_table.c.heartbeat_ts
+                    < expired_before))
             session.execute(
                 sqlalchemy.delete(reserved_fill_claims_table).where(
                     reserved_fill_claims_table.c.service_name.in_(names)))
@@ -12057,8 +12258,8 @@ def prune_reserved_fill_claims(expired_before: float) -> list[str]:
         candidates = [
             row[0] for row in session.execute(
                 sqlalchemy.select(reserved_fill_claims_table.c.service_name).
-                where(reserved_fill_claims_table.c.heartbeat_ts < expired_before
-                     )).fetchall()
+                where(reserved_fill_claims_table.c.heartbeat_ts <
+                      expired_before)).fetchall()
         ]
         if not candidates:
             session.commit()
@@ -12437,8 +12638,8 @@ def publish_reserved_fill_round(
                 if (committed_observation is None or
                         not committed_observation.is_authoritative_at(
                             database_now) or
-                        committed_observation.materialization_sequence !=
-                        observation_materialization_sequence or
+                        committed_observation.materialization_sequence
+                        != observation_materialization_sequence or
                         committed_observation.observed_at != snapshot_time):
                     session.rollback()
                     return False
@@ -12570,8 +12771,8 @@ def _reserved_fill_replica_row_values(
         return None
     persisted_pool_key = replica_info.reserved_fill_pool_key
     if (persisted_pool_key != pool_key or
-            _reserved_fill_pool_key_protocol(persisted_pool_key) !=
-            expected_protocol_version):
+            _reserved_fill_pool_key_protocol(persisted_pool_key)
+            != expected_protocol_version):
         return None
     row_values = _replica_row_values(service_name, replica_id, replica_info)
     replica_state = row_values.get('replica_state')
@@ -12656,8 +12857,8 @@ def _stage_postgres_replica_if_round_epoch(
                 expected_actuation_mode is not None):
             raise ValueError('Standalone staging is protocol-v1 only.')
     elif (expected_protocol_version != RESERVED_FILL_PROTOCOL_V2 or
-          expected_actuation_mode !=
-          zero_cost_actuation.ActuationMode.DURABLE_INTENT.value):
+          expected_actuation_mode
+          != zero_cost_actuation.ActuationMode.DURABLE_INTENT.value):
         raise ValueError('Protocol-v2 staging requires one durable intent.')
     engine = connection.engine
     session = connection
@@ -12754,8 +12955,8 @@ def _stage_postgres_replica_if_round_epoch(
         except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
             return None
         if (persisted_info.replica_record_id != str(replica_record_id) or
-                committed_intent is None or committed_intent.idempotency_key !=
-                actuation_lease.intent.idempotency_key):
+                committed_intent is None or committed_intent.idempotency_key
+                != actuation_lease.intent.idempotency_key):
             return None
         return StagedReservedFillReplica(replica_id=replica_id,
                                          caller_info=replica_info,
@@ -12826,10 +13027,10 @@ def _stage_postgres_replica_if_round_epoch(
                     int(edge.service_generation) != current_service_generation
                     for edge in edge_rows) or matching is None or
                 matching.physical_cluster_uid != expected_physical_cluster_uid
-                or transaction_replica_info.reserved_fill_service_generation !=
-                expected_service_generation or
-                transaction_replica_info.reserved_fill_physical_cluster_uid !=
-                expected_physical_cluster_uid or
+                or transaction_replica_info.reserved_fill_service_generation
+                != expected_service_generation or
+                transaction_replica_info.reserved_fill_physical_cluster_uid
+                != expected_physical_cluster_uid or
                 not isinstance(transaction_accelerator, str)):
             return None
         sequence_table = (
@@ -12864,8 +13065,8 @@ def _stage_postgres_replica_if_round_epoch(
             except ValueError:
                 return None
             if (set_row.service_version != transaction_replica_info.version or
-                    matching_projection_map.get(transaction_accelerator) !=
-                    transaction_replica_info.
+                    matching_projection_map.get(transaction_accelerator)
+                    != transaction_replica_info.
                     reserved_fill_worker_projection_sha256 or
                     any(value is None for value in attribution)):
                 # An old speculative decision cannot persist after the
@@ -12897,14 +13098,14 @@ def _stage_postgres_replica_if_round_epoch(
                     not isinstance(intent_idempotency_key, str) or re.fullmatch(
                         r'[0-9a-f]{64}', intent_idempotency_key) is None):
                 return None
-            if (gate_generation !=
-                    sequence_row['reconciliation_gate_generation'] or
-                    reclaim_fleet_bundle_sha256 !=
-                    sequence_row['reclaim_fleet_bundle_sha256'] or
-                    reclaim_policy_revision !=
-                    sequence_row['reclaim_policy_revision'] or
-                    reclaim_provider_inventory_sha256 !=
-                    sequence_row['reclaim_provider_inventory_sha256']):
+            if (gate_generation
+                    != sequence_row['reconciliation_gate_generation'] or
+                    reclaim_fleet_bundle_sha256
+                    != sequence_row['reclaim_fleet_bundle_sha256'] or
+                    reclaim_policy_revision
+                    != sequence_row['reclaim_policy_revision'] or
+                    reclaim_provider_inventory_sha256
+                    != sequence_row['reclaim_provider_inventory_sha256']):
                 return None
             allocation_table = (pool_capacity_observation_schema.
                                 reserved_fill_service_allocation_table)
@@ -12913,35 +13114,35 @@ def _stage_postgres_replica_if_round_epoch(
                     allocation_table.c.service_name ==
                     service_name)).mappings().one_or_none()
             if (allocation_row is None or
-                    allocation_row['allocation_gate_generation'] !=
-                    gate_generation):
+                    allocation_row['allocation_gate_generation']
+                    != gate_generation):
                 return None
             allocation_map = allocation_row['allocation_map']
             if (type(allocation_map) is not dict or allocation_map.get(
-                    'ordinary_zero_cost_admission_sequence_high_water') !=
-                    expected_ordinary_zero_cost_admission_sequence or
-                    allocation_map.get('reconciliation_gate_generation') !=
-                    gate_generation or
-                    allocation_map.get('reclaim_fleet_bundle_sha256') !=
-                    reclaim_fleet_bundle_sha256 or
-                    allocation_map.get('reclaim_policy_revision') !=
-                    reclaim_policy_revision or
-                    allocation_map.get('reclaim_provider_inventory_sha256') !=
-                    reclaim_provider_inventory_sha256):
+                    'ordinary_zero_cost_admission_sequence_high_water')
+                    != expected_ordinary_zero_cost_admission_sequence or
+                    allocation_map.get('reconciliation_gate_generation')
+                    != gate_generation or
+                    allocation_map.get('reclaim_fleet_bundle_sha256')
+                    != reclaim_fleet_bundle_sha256 or
+                    allocation_map.get('reclaim_policy_revision')
+                    != reclaim_policy_revision or
+                    allocation_map.get('reclaim_provider_inventory_sha256')
+                    != reclaim_provider_inventory_sha256):
                 return None
             assert actuation_lease is not None
             assert transaction_location is not None
             proof_intent = actuation_lease.intent
             proof_context = proof_intent.allowed_locations[0].region
             if (proof_intent.reconciliation_gate_generation != gate_generation
-                    or proof_intent.reclaim_fleet_bundle_sha256 !=
-                    reclaim_fleet_bundle_sha256 or
-                    proof_intent.reclaim_policy_revision !=
-                    reclaim_policy_revision or
-                    proof_intent.reclaim_provider_inventory_sha256 !=
-                    reclaim_provider_inventory_sha256 or
-                    proof_intent.physical_cluster_uid !=
-                    expected_physical_cluster_uid or
+                    or proof_intent.reclaim_fleet_bundle_sha256
+                    != reclaim_fleet_bundle_sha256 or
+                    proof_intent.reclaim_policy_revision
+                    != reclaim_policy_revision or
+                    proof_intent.reclaim_provider_inventory_sha256
+                    != reclaim_provider_inventory_sha256 or
+                    proof_intent.physical_cluster_uid
+                    != expected_physical_cluster_uid or
                     proof_context != transaction_location.region):
                 return None
             proof_identity = (
@@ -12971,8 +13172,8 @@ def _stage_postgres_replica_if_round_epoch(
                     type(current_ordinary_sequence) is not int or
                     current_ordinary_sequence < 0 or
                     current_ordinary_sequence > current_sequence or
-                    current_ordinary_sequence !=
-                    expected_ordinary_zero_cost_admission_sequence or
+                    current_ordinary_sequence
+                    != expected_ordinary_zero_cost_admission_sequence or
                     current_sequence >= 2**63 - 1):
                 return None
             admission_sequence = current_sequence + 1
@@ -13061,8 +13262,8 @@ def _persist_protocol_v1_sqlite(
             sqlalchemy.or_(
                 reserved_fill_rounds_table.c.epoch != expected_epoch,
                 reserved_fill_rounds_table.c.fence_pending != 0,
-                reserved_fill_rounds_table.c.protocol_version !=
-                expected_protocol_version)).exists()
+                reserved_fill_rounds_table.c.protocol_version
+                != expected_protocol_version)).exists()
     live_claim = sqlalchemy.select(
         reserved_fill_claims_table.c.service_name).where(
             reserved_fill_claims_table.c.service_name == service_name,

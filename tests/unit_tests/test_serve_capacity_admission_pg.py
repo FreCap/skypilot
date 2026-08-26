@@ -841,6 +841,22 @@ def _validate_prospective_claim(engine, claim) -> None:
             protocol_and_service_prelocked=True)
 
 
+def _validate_prospective_claim_batch(engine, claims):
+    with engine.begin() as connection:
+        serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+            connection)
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).mappings().one()
+        return (capacity_admission.
+                validate_prospective_paid_claim_batch_in_connection(
+                    connection,
+                    service,
+                    claims,
+                    protocol_and_service_prelocked=True))
+
+
 def _mock_prospective_snapshot_normalized_demand(monkeypatch, transform):
     original = demand_state.get_autoscaling_snapshot
     observed = []
@@ -2065,6 +2081,87 @@ def test_prospective_claim_accepts_later_clock_arrival_expiry(
         assert snapshot.route_generation == planned_snapshot.route_generation
         assert snapshot.route_sha256 == planned_snapshot.route_sha256
     assert authority.remaining() == {'l4': 1}
+
+
+def test_prospective_claim_batch_sums_same_card_before_writes(
+        capacity_database):
+    engine, _, _ = capacity_database
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(2))
+    claim = authority.claim_values('L4')
+
+    fresh_until = _validate_prospective_claim_batch(engine, [claim, claim])
+
+    assert fresh_until > datetime.datetime.now(datetime.timezone.utc)
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table)).scalar_one(
+                ) == 0
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='Paid claims exceed'):
+        _validate_prospective_claim_batch(engine, [claim, claim, claim])
+
+
+def test_prospective_claim_batch_includes_prior_committed_debits(
+        capacity_database):
+    engine, _, _ = capacity_database
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(2))
+    claim = authority.claim_values('L4')
+    _insert_claim(engine, authority, 10)
+
+    _validate_prospective_claim_batch(engine, [claim])
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='Paid claims exceed'):
+        _validate_prospective_claim_batch(engine, [claim, claim])
+
+
+def test_prospective_claim_batch_groups_each_exact_debit_card(
+        capacity_database):
+    engine, _, _ = capacity_database
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(5, capacity_target_by_accelerator={
+            'l4': 2,
+            'h200': 3,
+        }))
+    l4 = authority.claim_values('L4')
+    h200 = authority.claim_values('H200')
+
+    _validate_prospective_claim_batch(engine, [l4, h200, l4, h200, h200])
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='Paid claims exceed'):
+        _validate_prospective_claim_batch(engine,
+                                          [l4, h200, l4, h200, h200, h200])
+
+
+@pytest.mark.parametrize('claims, message',
+                         [([], 'nonempty ordered sequence'),
+                          ([{}], 'no exact planner authority')],
+                         ids=['empty', 'unbound'])
+def test_prospective_claim_batch_requires_exact_authority(
+        capacity_database, claims, message):
+    engine, _, _ = capacity_database
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match=message):
+        _validate_prospective_claim_batch(engine, claims)
+
+
+def test_prospective_claim_batch_rejects_mixed_plan_authorities(
+        capacity_database):
+    engine, _, _ = capacity_database
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(2))
+    claim = authority.claim_values('L4')
+    mismatched = {
+        **claim,
+        'demand_feed_generation': claim['demand_feed_generation'] + 1,
+    }
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='multiple planner authorities'):
+        _validate_prospective_claim_batch(engine, [claim, mismatched])
 
 
 @pytest.mark.parametrize('mutation',

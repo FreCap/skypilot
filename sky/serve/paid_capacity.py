@@ -8,6 +8,7 @@ provider pool.
 import collections
 from collections.abc import Iterable
 from collections.abc import Mapping
+from collections.abc import Sequence
 import dataclasses
 import enum
 import functools
@@ -85,6 +86,48 @@ class ClaimResult(enum.Enum):
     HIGHER_PRIORITY_WAITING = 'higher_priority_waiting'
     OWNERSHIP_LOST = 'ownership_lost'
     LEGACY_LOCAL = 'legacy_local'
+
+
+@dataclasses.dataclass(frozen=True)
+class PaidClaimCandidate:
+    """One frozen exact-location member of a paid admission wave."""
+
+    replica_id: int
+    replica_info: 'replica_managers.ReplicaInfo'
+    location: spot_placer.Location
+    priority: int
+    capacity_plan_claim: Mapping[str, Any] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class PaidClaimBatchMemberResult:
+    """Authoritative Phase-A result for one exact replica record."""
+
+    replica_id: int
+    replica_record_id: str
+    claim_result: ClaimResult
+
+
+@dataclasses.dataclass(frozen=True)
+class PaidClaimBatchResult:
+    """Ordered results from one atomic paid replica/claim transaction."""
+
+    members: tuple[PaidClaimBatchMemberResult, ...]
+
+    @property
+    def committed_members(self) -> tuple[PaidClaimBatchMemberResult, ...]:
+        return tuple(member for member in self.members
+                     if member.claim_result is ClaimResult.ACQUIRED)
+
+
+@dataclasses.dataclass(frozen=True)
+class PaidClaimPersistenceSpec:
+    """Exact database-facing policy inputs for one frozen candidate."""
+
+    candidate: PaidClaimCandidate
+    pool_key: str
+    frontier_key: FrontierKey
+    frontier_limit: int
 
 
 class LaunchOutcome(enum.Enum):
@@ -750,10 +793,9 @@ def _log_admission_summary(states: dict[str, dict[str, Any]],
             live_paid_gpu_units is not None):
         paid_gpu_units_remaining = max(
             0, max_live_paid_gpu_units - live_paid_gpu_units)
-    signature = (len(states), tuple(sorted(state_counts.items())),
-                 overage_pools > 0, service_remaining == 0,
-                 max_live_paid_gpu_units, live_paid_gpu_units,
-                 paid_gpu_units_remaining)
+    signature = (len(states), tuple(sorted(state_counts.items())), overage_pools
+                 > 0, service_remaining == 0, max_live_paid_gpu_units,
+                 live_paid_gpu_units, paid_gpu_units_remaining)
     observed_at = time.monotonic()
     global _admission_summary_log_signature
     global _admission_summary_logged_at
@@ -800,8 +842,8 @@ def _live_paid_gpu_units(
     for info in existing_replica_infos:
         down_status = info.status_property.sky_down_status
         down_status_value = getattr(down_status, 'value', down_status)
-        if (info.is_zero_cost is not True and down_status_value !=
-                common_utils.ProcessStatus.SUCCEEDED.value):
+        if (info.is_zero_cost is not True and down_status_value
+                != common_utils.ProcessStatus.SUCCEEDED.value):
             planned_capacity = getattr(info, 'planned_capacity', None)
             if (type(planned_capacity) is not int or  # pylint: disable=unidiomatic-typecheck
                     planned_capacity < 1):
@@ -922,10 +964,9 @@ def build_launch_budget(
         # PostgreSQL authority to freeze an account nor needs provider identity
         # to enforce its process-local unresolved-launch window.
         keys = {
-            location: _legacy_pool_key(location,
-                                       workspace=workspace,
-                                       num_nodes=placer.num_nodes)
-            for location in paid_locations
+            location: _legacy_pool_key(
+                location, workspace=workspace,
+                num_nodes=placer.num_nodes) for location in paid_locations
         }
         if max_live_paid_gpu_units is not None:
             # A configured hard cost bound requires the shared PostgreSQL
@@ -976,11 +1017,11 @@ def build_launch_budget(
                 if not isinstance(location.cloud, clouds.AWS)
             ]
     keys = {
-        location: pool_key(location,
-                           workspace=workspace,
-                           num_nodes=placer.num_nodes,
-                           aws_account_id=aws_account_id)
-        for location in paid_locations
+        location: pool_key(
+            location,
+            workspace=workspace,
+            num_nodes=placer.num_nodes,
+            aws_account_id=aws_account_id) for location in paid_locations
     }
 
     states = serve_state.get_paid_capacity_pool_states(
@@ -1445,6 +1486,99 @@ def service_exhausted(budget: LaunchBudget | None) -> bool:
               budget.paid_gpu_units_remaining <= 0)))
 
 
+def try_persist_claim_batch(
+    *,
+    service_name: str,
+    service_hash: str | None,
+    controller_owner: tuple[int | None, str | None] | None,
+    candidates: Sequence[PaidClaimCandidate],
+    budget: LaunchBudget,
+) -> PaidClaimBatchResult:
+    """Atomically persist one ordered subset of paid replica claims."""
+    candidates = tuple(candidates)
+    if not candidates:
+        return PaidClaimBatchResult(())
+
+    identities = []
+    for candidate in candidates:
+        identities.append(
+            (candidate.replica_id, candidate.replica_info.replica_record_id))
+    if len(set(identities)) != len(identities):
+        raise ValueError('Paid claim batch candidate identities must be '
+                         'unique.')
+    if len({replica_id for replica_id, _ in identities}) != len(identities):
+        raise ValueError('Paid claim batch replica IDs must be unique.')
+    if len({record_id for _, record_id in identities}) != len(identities):
+        raise ValueError('Paid claim batch record identities must be unique.')
+
+    if not budget.globally_managed or service_hash is None:
+        result = (ClaimResult.SERVICE_SATURATED
+                  if budget.max_live_paid_gpu_units is not None else
+                  ClaimResult.LEGACY_LOCAL)
+        return PaidClaimBatchResult(
+            tuple(
+                PaidClaimBatchMemberResult(replica_id, replica_record_id,
+                                           result)
+                for replica_id, replica_record_id in identities))
+
+    persistence_specs = []
+    for candidate in candidates:
+        try:
+            key = budget.pool_key_by_location[candidate.location]
+        except KeyError as error:
+            raise ValueError('Paid claim candidate location is absent from '
+                             'its frozen launch budget.') from error
+        candidate_frontier = budget.frontier_key_by_location.get(
+            candidate.location, frontier_key(candidate.location))
+        effective_frontier = _effective_frontier_limit(budget,
+                                                       candidate_frontier)
+        if effective_frontier is None:
+            effective_frontier = exploration_frontier()
+        bounded_candidate = dataclasses.replace(
+            candidate,
+            priority=max(
+                constants.LB_REQUEST_PRIORITY_MIN,
+                min(constants.LB_REQUEST_PRIORITY_MAX, candidate.priority)))
+        persistence_specs.append(
+            PaidClaimPersistenceSpec(candidate=bounded_candidate,
+                                     pool_key=key,
+                                     frontier_key=candidate_frontier,
+                                     frontier_limit=effective_frontier))
+
+    results = serve_state.try_add_replicas_with_paid_capacity_claims(
+        service_name,
+        service_hash,
+        persistence_specs,
+        base_limit=base_limit(),
+        max_limit=max_limit(),
+        service_limit=(budget.service_claim_limit if budget.service_claim_limit
+                       is not None else service_limit()),
+        max_live_paid_gpu_units=budget.max_live_paid_gpu_units,
+        now=None,
+        success_ttl_seconds=success_ttl_seconds(),
+        failure_cooldown_seconds=failure_cooldown_seconds(),
+        waiter_ttl_seconds=waiter_ttl_seconds(),
+        frontier_default_limit=(budget.frontier_limit if budget.frontier_limit
+                                is not None else exploration_frontier()),
+        frontier_limits_by_key=_frontier_limits_by_key(budget),
+        expected_controller_owner=controller_owner,
+    )
+    members = []
+    for spec, result_value in zip(persistence_specs, results, strict=True):
+        result = ClaimResult(result_value)
+        candidate = spec.candidate
+        if result is ClaimResult.ACQUIRED:
+            # Publish caller-visible provenance only after the whole batch
+            # transaction is durable.
+            candidate.replica_info.paid_capacity_pool_key = spec.pool_key
+        members.append(
+            PaidClaimBatchMemberResult(
+                replica_id=candidate.replica_id,
+                replica_record_id=candidate.replica_info.replica_record_id,
+                claim_result=result))
+    return PaidClaimBatchResult(tuple(members))
+
+
 def try_persist_claim(
     *,
     service_name: str,
@@ -1457,42 +1591,17 @@ def try_persist_claim(
     priority: int,
     capacity_plan_claim: Mapping[str, Any] | None = None,
 ) -> ClaimResult:
-    """Atomically persist a replica row and exact-pool capacity claim."""
-    if not budget.globally_managed or service_hash is None:
-        if budget.max_live_paid_gpu_units is not None:
-            return ClaimResult.SERVICE_SATURATED
-        return ClaimResult.LEGACY_LOCAL
-    key = budget.pool_key_by_location[location]
-    candidate_frontier = budget.frontier_key_by_location.get(
-        location, frontier_key(location))
-    effective_frontier = _effective_frontier_limit(budget, candidate_frontier)
-    if effective_frontier is None:
-        effective_frontier = exploration_frontier()
-    result = serve_state.try_add_replica_with_paid_capacity_claim(
-        service_name,
-        service_hash,
-        replica_id,
-        replica_info,
-        pool_key=key,
-        priority=max(constants.LB_REQUEST_PRIORITY_MIN,
-                     min(constants.LB_REQUEST_PRIORITY_MAX, priority)),
-        base_limit=base_limit(),
-        max_limit=max_limit(),
-        service_limit=(budget.service_claim_limit if budget.service_claim_limit
-                       is not None else service_limit()),
-        max_live_paid_gpu_units=budget.max_live_paid_gpu_units,
-        now=None,
-        success_ttl_seconds=success_ttl_seconds(),
-        failure_cooldown_seconds=failure_cooldown_seconds(),
-        waiter_ttl_seconds=waiter_ttl_seconds(),
-        frontier_key=candidate_frontier,
-        frontier_limit=effective_frontier,
-        frontier_default_limit=(budget.frontier_limit if budget.frontier_limit
-                                is not None else exploration_frontier()),
-        frontier_limits_by_key=_frontier_limits_by_key(budget),
-        expected_controller_owner=controller_owner,
-        capacity_plan_claim=capacity_plan_claim)
-    return ClaimResult(result)
+    """Persist one claim through the canonical paid batch transaction."""
+    candidate = PaidClaimCandidate(replica_id=replica_id,
+                                   replica_info=replica_info,
+                                   location=location,
+                                   priority=priority,
+                                   capacity_plan_claim=capacity_plan_claim)
+    return try_persist_claim_batch(service_name=service_name,
+                                   service_hash=service_hash,
+                                   controller_owner=controller_owner,
+                                   candidates=(candidate,),
+                                   budget=budget).members[0].claim_result
 
 
 def adopt_existing_claims(
