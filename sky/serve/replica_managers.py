@@ -3306,7 +3306,8 @@ class ReplicaManager:
                 unknown_replica_ids=frozenset(snapshot.unknown_replica_ids),
                 received_at=snapshot.received_at,
                 authority=snapshot.authority)
-            if not self._logical_snapshot_is_fresh(published_snapshot):
+            if not self._logical_snapshot_has_scale_up_authority(
+                    published_snapshot):
                 logger.warning(
                     'Discarding expired logical reconcile authority for '
                     f'generation {snapshot.generation}.')
@@ -3349,6 +3350,7 @@ class ReplicaManager:
         None = None,
             accelerator_shapes: LogicalAcceleratorState | None = None,
             require_exact_generation: bool = False,
+            require_fresh_occupancy: bool = True,
             logical_state: _LogicalReconcileState | None = None) -> bool:
         """Whether a logical target intent is still authorized.
 
@@ -3379,10 +3381,14 @@ class ReplicaManager:
                               (snapshot.generation == decision_generation
                                if require_exact_generation else
                                snapshot.generation >= decision_generation))
+        snapshot_is_fresh = bool(
+            snapshot is not None and
+            (self._logical_snapshot_is_fresh(snapshot)
+             if require_fresh_occupancy else
+             self._logical_snapshot_has_scale_up_authority(snapshot)))
         return (not self._update_recovery_required and snapshot is not None and
                 snapshot.version == version and generation_matches and
-                self._logical_snapshot_is_fresh(snapshot) and
-                self.latest_version == version and
+                snapshot_is_fresh and self.latest_version == version and
                 (pending_version is None or pending_version <= version) and
                 (target_version, target_generation, current_target)
                 == (version, decision_generation, target_capacity) and
@@ -3394,6 +3400,7 @@ class ReplicaManager:
         fence: LogicalTargetState,
         *,
         require_exact_generation: bool = False,
+        require_fresh_occupancy: bool = True,
         logical_state: _LogicalReconcileState | None = None,
     ) -> bool:
         components = _logical_target_state_components(fence)
@@ -3408,12 +3415,32 @@ class ReplicaManager:
             target_by_card if exact else None,
             shapes if exact else None,
             require_exact_generation=require_exact_generation,
+            require_fresh_occupancy=require_fresh_occupancy,
             logical_state=logical_state)
 
     @staticmethod
     def _logical_snapshot_is_fresh(snapshot: LogicalReconcileSnapshot) -> bool:
         if snapshot.authority is not None:
             return time.monotonic() < snapshot.authority.deadline_monotonic
+        return (time.monotonic() - snapshot.received_at
+                <= 3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
+
+    @staticmethod
+    def _logical_snapshot_has_scale_up_authority(
+            snapshot: LogicalReconcileSnapshot) -> bool:
+        """Return whether additive work retains fresh demand/route authority.
+
+        Occupancy freshness remains mandatory for every destructive consumer
+        through ``_logical_snapshot_is_fresh``. A selected backend occupancy
+        sample expiring must not revoke an independently fresh exact-card
+        scale-up decision. Older in-process authorities without the split
+        conservatively retain the stricter deadline.
+        """
+        if snapshot.authority is not None:
+            deadline = getattr(snapshot.authority,
+                               'scale_up_deadline_monotonic',
+                               snapshot.authority.deadline_monotonic)
+            return time.monotonic() < deadline
         return (time.monotonic() - snapshot.received_at
                 <= 3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
 
@@ -7785,7 +7812,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             if not self._logical_reconcile_fence_holds(
                     logical_reconcile_fence,
                     require_exact_generation=(
-                        logical_reconcile_fence_requires_exact_generation)):
+                        logical_reconcile_fence_requires_exact_generation),
+                    require_fresh_occupancy=False):
                 logger.info('Logical launch selection was superseded before '
                             'row persistence; dropping the unpersisted pin.')
                 return None
@@ -8306,7 +8334,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                             logical_reconcile_fence,
                                             require_exact_generation=
                                             (logical_reconcile_fence_requires_exact_generation
-                                            ))):
+                                            ),
+                                            require_fresh_occupancy=False)):
                                     logger.info(
                                         'Logical launch was superseded at its '
                                         'final row-persistence fence.')
@@ -8482,7 +8511,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if not self._logical_reconcile_fence_holds(
                         logical_reconcile_fence,
                         require_exact_generation=(
-                            logical_reconcile_fence_requires_exact_generation)):
+                            logical_reconcile_fence_requires_exact_generation),
+                        require_fresh_occupancy=False):
                     logger.info('Logical launch was superseded at its final '
                                 'row-persistence fence.')
                     return None
@@ -10552,6 +10582,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                 target_capacity,
                                                 target_by_accelerator_state,
                                                 accelerator_shape_state,
+                                                require_fresh_occupancy=False,
                                                 logical_state=logical_state):
             logger.info('Discarding stale logical scale-up intent for '
                         f'version {version}, generation '
@@ -10861,6 +10892,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     card_target_state,
                     shape_state,
                     require_exact_generation=bool(replace_unknown_replica_ids),
+                    require_fresh_occupancy=False,
                     logical_state=logical_state):
                 logger.info('Stopping logical scale-up batch after its '
                             'reconciliation fence advanced.')
@@ -13725,7 +13757,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                     reason='target-missing-or-malformed',
                     details=f'target={target_fence!r}')
             if not self._logical_reconcile_fence_holds(
-                    target_fence, logical_state=logical_state):
+                    target_fence,
+                    require_fresh_occupancy=False,
+                    logical_state=logical_state):
                 snapshot = logical_state.snapshot
                 snapshot_summary = (None if snapshot is None else
                                     (snapshot.version, snapshot.generation,
@@ -13823,7 +13857,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             current_state = self._logical_reconcile_state
             if (current_state.target != target_fence or
                     not self._logical_reconcile_fence_holds(
-                        target_fence, logical_state=current_state)):
+                        target_fence,
+                        require_fresh_occupancy=False,
+                        logical_state=current_state)):
                 return _LogicalPendingLaunchAdmission(
                     applicable=True,
                     target_fence=None,
@@ -14687,7 +14723,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                         # started, so this cannot preempt serving work.
                         with self._logical_state_lock:
                             if not self._logical_reconcile_fence_holds(
-                                    logical_target_fence):
+                                    logical_target_fence,
+                                    require_fresh_occupancy=False):
                                 continue
                             logger.info(
                                 f'Superseding queued logical launch for '
@@ -14994,7 +15031,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     if logical_fence is not None:
                         with self._logical_state_lock:
                             if not self._logical_reconcile_fence_holds(
-                                    logical_fence):
+                                    logical_fence,
+                                    require_fresh_occupancy=False):
                                 continue
                     launch_candidates.append((replica_id, t, info))
 

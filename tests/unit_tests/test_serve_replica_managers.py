@@ -10622,6 +10622,29 @@ class TestLogicalPendingLaunchAdmission:
                                return_value=[candidate, ready]):
             assert not mgr._queued_logical_launch_fence_holds(1)
 
+    def test_final_cloud_guard_ignores_expired_occupancy_deadline(
+            self, monkeypatch):
+        now = [100.0]
+        monkeypatch.setattr(replica_managers.time, 'monotonic', lambda: now[0])
+        mgr = self._manager({'A100': 1})
+        authority = types.SimpleNamespace(deadline_monotonic=99.0,
+                                          scale_up_deadline_monotonic=110.0)
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot, authority=authority)
+        candidate = self._info(
+            1, 'A100', replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        mgr._replica_to_logical_launch_fence[1] = mgr._logical_target
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[candidate]):
+            assert not mgr._logical_snapshot_is_fresh(
+                mgr._logical_reconcile_snapshot)
+            allowed, reason, _ = mgr._queued_logical_launch_fence_decision(1)
+
+        assert allowed
+        assert reason == 'authorized'
+
     def test_single_card_unpinned_candidate_is_authorized(self):
         mgr = self._manager({'L4': 1})
         shapes = (('L4', 1),)
@@ -10838,6 +10861,37 @@ class TestLogicalCapacityPlanning:
         replay = dataclasses.replace(snapshot, received_at=now[0])
         assert not mgr.publish_logical_reconcile_state((1, 5, 1), replay)
         assert mgr._logical_reconcile_snapshot is published
+
+    def test_expired_occupancy_only_blocks_destructive_logical_work(
+            self, monkeypatch):
+        now = [100.0]
+        monkeypatch.setattr(replica_managers.time, 'monotonic', lambda: now[0])
+        mgr = _make_manager()
+        mgr._update_recovery_required = False
+        authority = types.SimpleNamespace(deadline_monotonic=99.0,
+                                          scale_up_deadline_monotonic=110.0)
+        snapshot = replica_managers.LogicalReconcileSnapshot(
+            version=1,
+            generation=5,
+            observed_slots_by_replica_id={},
+            in_flight_by_replica_id={},
+            unknown_replica_ids=frozenset({10}),
+            received_at=1.0,
+            authority=authority)
+        target = (1, 5, 1, (('L4', 1),), (('L4', 1),))
+
+        assert mgr.publish_logical_reconcile_state(target, snapshot)
+        assert not mgr._logical_snapshot_is_fresh(snapshot)
+        assert mgr._logical_snapshot_has_scale_up_authority(snapshot)
+        assert mgr._logical_target_fence_holds(1,
+                                               5,
+                                               1, (('L4', 1),), (('L4', 1),),
+                                               require_fresh_occupancy=False)
+        # The default remains the destructive fence. In particular, an
+        # explicitly unknown backend cannot become teardown evidence merely
+        # because additive demand/route authority is still fresh.
+        assert not mgr._logical_target_fence_holds(1, 5, 1, (('L4', 1),),
+                                                   (('L4', 1),))
 
     def test_legacy_half_publishers_reject_nonadvancing_evidence(self):
         mgr = _make_manager()
@@ -14056,6 +14110,38 @@ class TestLogicalCapacityPlanning:
         defer.assert_called_once_with(1,
                                       logical_retirement=(1, 3, 0),
                                       replica_info=l4)
+
+    def test_expired_occupancy_blocks_actual_logical_retirement(
+            self, monkeypatch):
+        now = [100.0]
+        monkeypatch.setattr(replica_managers.time, 'monotonic', lambda: now[0])
+        mgr = _make_manager()
+        mgr._uses_logical_replicas = True
+        mgr._update_recovery_required = False
+        l4 = self._ready_backend(1, 1)
+        l4.resources_override = {'accelerators': {'L4': 1}}
+        authority = types.SimpleNamespace(deadline_monotonic=99.0,
+                                          scale_up_deadline_monotonic=110.0)
+        snapshot = replica_managers.LogicalReconcileSnapshot(
+            version=1,
+            generation=3,
+            observed_slots_by_replica_id={1: 1},
+            in_flight_by_replica_id={1: 0},
+            unknown_replica_ids=frozenset(),
+            received_at=1.0,
+            authority=authority)
+        shapes = (('L4', 1),)
+        assert mgr.publish_logical_reconcile_state((1, 3, 0, (), shapes),
+                                                   snapshot)
+        defer = mock.Mock()
+        mgr._defer_scale_down_until_idle = defer
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[l4]):
+            mgr.scale_down_logically(1, 0, 1, 3, (), shapes)
+
+        defer.assert_not_called()
 
     def test_manager_retires_old_card_removed_from_exact_catalog(self):
         mgr = _make_manager()

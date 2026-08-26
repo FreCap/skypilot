@@ -63,8 +63,10 @@ class DemandReportReceipt:
 class DurableReconcileAuthority:
     """Exact PostgreSQL evidence that can authorize logical reconciliation.
 
-    ``deadline_monotonic`` is derived once from PostgreSQL's remaining
-    validity at the start of the read.  Consumers must carry it unchanged;
+    ``scale_up_deadline_monotonic`` is derived from the route and demand-report
+    validity remaining at the start of the read.  ``deadline_monotonic`` is
+    additionally bounded by the oldest selected occupancy sample and is the
+    authority for destructive work.  Consumers must carry both unchanged;
     receiving or publishing the object locally can never grant a fresh TTL.
     ``valid_until`` is the matching database-clock boundary rechecked by the
     destructive commit transaction.
@@ -91,6 +93,7 @@ class DurableReconcileAuthority:
     occupancy_sampled_urls: tuple[str, ...]
     valid_until: datetime.datetime
     read_started_monotonic: float
+    scale_up_deadline_monotonic: float
     deadline_monotonic: float
 
 
@@ -1191,20 +1194,24 @@ def get_autoscaling_snapshot(
         queue_depth == 0 and rejected == 0 and recent_rejected == 0)
     if not compatibility_complete and not fresh_aggregate_zero:
         return None
-    remaining_validity_seconds = min(
+    scale_up_remaining_validity_seconds = min(
         [(head['valid_until'] - now).total_seconds()] +
         [(row['valid_until'] - now).total_seconds() for row in rows])
-    for age_seconds in aggregate.occupancy_sample_ages_seconds.values():
-        remaining_validity_seconds = min(
-            remaining_validity_seconds,
-            constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS - age_seconds)
-    authority_deadline = (read_started_monotonic +
-                          max(0.0, remaining_validity_seconds))
+    scale_up_authority_deadline = (
+        read_started_monotonic + max(0.0, scale_up_remaining_validity_seconds))
     # Query and translation time consumes the original PostgreSQL allowance.
     # It must never be replaced with a fresh process-local receive timestamp.
-    if remaining_validity_seconds <= 0 or time.monotonic(
-    ) >= authority_deadline:
+    if (scale_up_remaining_validity_seconds <= 0 or
+            time.monotonic() >= scale_up_authority_deadline):
         return None
+    destructive_remaining_validity_seconds = (
+        scale_up_remaining_validity_seconds)
+    for age_seconds in aggregate.occupancy_sample_ages_seconds.values():
+        destructive_remaining_validity_seconds = min(
+            destructive_remaining_validity_seconds,
+            constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS - age_seconds)
+    authority_deadline = (read_started_monotonic +
+                          max(0.0, destructive_remaining_validity_seconds))
     controller_pid = service['controller_pid']
     controller_ip = service['controller_ip']
     controller_owner_epoch = service['controller_owner_epoch']
@@ -1216,7 +1223,7 @@ def get_autoscaling_snapshot(
             controller_owner_epoch < 1):
         return None
     authority_valid_until = now + datetime.timedelta(
-        seconds=remaining_validity_seconds)
+        seconds=max(0.0, destructive_remaining_validity_seconds))
 
     def _replica_id(url: str) -> int | None:
         identity = identities.get(url)
@@ -1339,6 +1346,7 @@ def get_autoscaling_snapshot(
         occupancy_sampled_urls=tuple(aggregate.occupancy_sampled_urls),
         valid_until=authority_valid_until,
         read_started_monotonic=read_started_monotonic,
+        scale_up_deadline_monotonic=scale_up_authority_deadline,
         deadline_monotonic=authority_deadline)
     return DurableAutoscalingSnapshot(service_name=service_name,
                                       service_hash=service_hash,

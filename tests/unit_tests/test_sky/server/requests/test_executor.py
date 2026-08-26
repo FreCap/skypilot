@@ -3505,6 +3505,11 @@ def _worker_pid():
     return os.getpid()
 
 
+def _wait_for_exact_cancel():
+    while True:
+        time.sleep(1)
+
+
 def _install_executor_process_title():
     import setproctitle
 
@@ -3519,6 +3524,27 @@ def test_pid_owner_check_accepts_real_thread_dispatcher_topology():
             max_workers=1, initializer=_install_executor_process_title) as pool:
         pid = pool.submit(_worker_pid).result(timeout=10)
         assert request_postgres._is_owned_executor_process(pid)
+
+
+def test_cancel_accepts_disposable_guardian_topology():
+    """The real outer guardian is attestable and drains on cancellation."""
+    from sky.server.requests import postgres as request_postgres
+
+    boundary = process.DisposableExecutor(max_workers=1)
+    future = boundary.submit(_wait_for_exact_cancel, receipt_required=True)
+    guardian = future.guardian_identity
+    try:
+        assert request_postgres._is_owned_executor_process(guardian.pid)
+        future.request_cancel()
+        with pytest.raises(concurrent.futures.CancelledError):
+            future.result(timeout=20)
+        future.acknowledge_receipt()
+        assert future.wait_for_boundary_release(timeout=20)
+    finally:
+        future.request_cancel()
+        if future.done() and future.boundary_result is not None:
+            future.acknowledge_receipt()
+        boundary.shutdown()
 
 
 # ---- Workspace resolution info log -------------------------------------

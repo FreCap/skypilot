@@ -927,6 +927,10 @@ def _outer_guardian_main(
     if capability_fd is not None:
         os.close(capability_fd)
         capability_fd = None
+    # Publish the title only after the raw controller capability is closed.
+    # The parent cannot persist this guardian's identity until READY below, so
+    # cancellation ownership attestation is race-free from that point onward.
+    setproctitle.setproctitle(f'SkyPilot:executor:guardian:{os.getpid()}')
     inner_connection.close()
     inner = ProcessIdentity(inner_pid,
                             _read_process_start_time_ticks(inner_pid))
