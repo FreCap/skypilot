@@ -2191,11 +2191,15 @@ def replace_claim_set(
                 separators=(',', ':'),
                 allow_nan=False).encode('utf-8')).hexdigest()
 
-    claim_scope = None
-    claim_authorization = None
-    service_version = None
-    semantic_hash = _semantic_hash(service_version)
-    try:
+    def _authorize_current_claim(
+    ) -> tuple[reserved_fill_reclaim_attestation.ReclaimClaimSetScope | None,
+               reserved_fill_reclaim_attestation.ReclaimClaimAuthorization |
+               None, int | None, str]:
+        """Mint sequenced authority after broker-lock admission."""
+        claim_scope = None
+        claim_authorization = None
+        service_version = None
+        semantic_hash = _semantic_hash(service_version)
         gate = (pool_capacity_observation.PoolCapacityObservationRepository().
                 read_reconciliation_gate())
         if gate.sequenced_active:
@@ -2278,20 +2282,8 @@ def replace_claim_set(
                 if owned_executor is not None:
                     owned_executor.shutdown(
                         timeout=(_RECLAIM_CLAIM_BOUNDARY_DRAIN_TIMEOUT_SECONDS))
-    except (request_process.AmbiguousBoundaryError,
-            request_process.BoundaryShutdownPendingError):
-        _clear_service_cache(service_name)
-        # The persistent production lane is now poisoned. Propagate through
-        # the poller so its supervisor cannot begin another claim read while
-        # the controller's fail-stop callback fences this process.
-        raise
-    except Exception as error:  # pylint: disable=broad-except
-        _clear_service_cache(service_name)
-        logger.error(
-            'Reserved-fill broker: reclaim policy refused the '
-            'complete claim set for %r: %s', service_name,
-            common_utils.format_exception(error))
-        return None
+        return (claim_scope, claim_authorization, service_version,
+                semantic_hash)
 
     lock = locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID)
     with lock.acquire(blocking=True):
@@ -2299,6 +2291,24 @@ def replace_claim_set(
             _clear_service_cache(service_name)
             logger.error('Reserved-fill protocol v2 is not active; refusing '
                          f'the complete claim set of {service_name!r}.')
+            return None
+        try:
+            (claim_scope, claim_authorization, service_version,
+             semantic_hash) = _authorize_current_claim()
+        except (request_process.AmbiguousBoundaryError,
+                request_process.BoundaryShutdownPendingError):
+            _clear_service_cache(service_name)
+            # The persistent production lane is now poisoned. Propagate
+            # through the poller so its supervisor cannot begin another claim
+            # read while the controller's fail-stop callback fences this
+            # process.
+            raise
+        except Exception as error:  # pylint: disable=broad-except
+            _clear_service_cache(service_name)
+            logger.error(
+                'Reserved-fill broker: reclaim policy refused the '
+                'complete claim set for %r: %s', service_name,
+                common_utils.format_exception(error))
             return None
         heartbeat_ts = time.time()
         _prune_claims(PROTOCOL_V2, heartbeat_ts - claim_ttl_seconds())

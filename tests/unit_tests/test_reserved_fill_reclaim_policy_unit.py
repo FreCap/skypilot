@@ -1052,7 +1052,7 @@ def _replace_claim_set(claim_authorization_executor=None,) -> int | None:
 
 
 @pytest.mark.parametrize('failure_kind', ['missing-identity', 'missing-policy'])
-def test_sequenced_claim_without_complete_policy_fails_before_broker_lock(
+def test_sequenced_claim_without_complete_policy_releases_broker_lock(
         monkeypatch, failure_kind):
     if failure_kind == 'missing-identity':
         gate = types.SimpleNamespace(sequenced_active=True,
@@ -1066,36 +1066,77 @@ def test_sequenced_claim_without_complete_policy_fails_before_broker_lock(
     _install_gate(monkeypatch, gate)
     monkeypatch.setattr(broker, '_authorize_reclaim_claim_set_in_boundary',
                         authorize)
-    get_lock = mock.Mock()
+    events = []
+
+    class _RecordingLock:
+
+        def acquire(self, *, blocking):
+            assert blocking
+
+            @contextlib.contextmanager
+            def _acquired():
+                events.append('broker-lock-enter')
+                try:
+                    yield
+                finally:
+                    events.append('broker-lock-exit')
+
+            return _acquired()
+
+    get_lock = mock.Mock(return_value=_RecordingLock())
     monkeypatch.setattr(broker.locks, 'get_lock', get_lock)
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        lambda: broker.PROTOCOL_V2)
 
     assert _replace_claim_set(mock.Mock()) is None
-    get_lock.assert_not_called()
+    get_lock.assert_called_once_with(constants.RESERVED_FILL_BROKER_LOCK_ID)
+    assert events == ['broker-lock-enter', 'broker-lock-exit']
     if failure_kind == 'missing-identity':
         authorize.assert_not_called()
     else:
         authorize.assert_called_once()
 
 
-def test_sequenced_claim_policy_identity_mismatch_precedes_ticket_and_lock(
+def test_sequenced_claim_policy_identity_mismatch_releases_broker_lock(
         monkeypatch):
     _install_gate(monkeypatch, _gate(sequenced=True))
     authorize = mock.Mock(
         side_effect=reclaim.ReclaimAttestationError('identity mismatch'))
     monkeypatch.setattr(broker, '_authorize_reclaim_claim_set_in_boundary',
                         authorize)
-    get_lock = mock.Mock()
+    events = []
+
+    class _RecordingLock:
+
+        def acquire(self, *, blocking):
+            assert blocking
+
+            @contextlib.contextmanager
+            def _acquired():
+                events.append('broker-lock-enter')
+                yield
+                events.append('broker-lock-exit')
+
+            return _acquired()
+
+    get_lock = mock.Mock(return_value=_RecordingLock())
     monkeypatch.setattr(broker.locks, 'get_lock', get_lock)
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        lambda: broker.PROTOCOL_V2)
 
     assert _replace_claim_set(mock.Mock()) is None
     authorize.assert_called_once()
-    get_lock.assert_not_called()
+    get_lock.assert_called_once_with(constants.RESERVED_FILL_BROKER_LOCK_ID)
+    assert events == ['broker-lock-enter', 'broker-lock-exit']
 
 
-def test_sequenced_claim_policy_callback_precedes_broker_lock(monkeypatch):
+def test_sequenced_claim_authorization_is_issued_after_broker_lock_admission(
+        monkeypatch):
     gate = _gate(sequenced=True)
     _install_gate(monkeypatch, gate)
     events = []
+    monotonic = [100.0]
+    monkeypatch.setattr(reclaim.time, 'monotonic', lambda: monotonic[0])
 
     def _authorize(_executor, scope, expected_identity,
                    expected_gate_generation):
@@ -1106,7 +1147,7 @@ def test_sequenced_claim_policy_callback_precedes_broker_lock(monkeypatch):
             identity=expected_identity,
             gate_generation=expected_gate_generation,
             scope=scope,
-            completed_monotonic=time.monotonic())
+            completed_monotonic=monotonic[0])
 
     class _RecordingLock:
         """Record the first instant at which broker authority is held."""
@@ -1117,6 +1158,9 @@ def test_sequenced_claim_policy_callback_precedes_broker_lock(monkeypatch):
             @contextlib.contextmanager
             def _acquired():
                 events.append('broker-lock-enter')
+                # Model production contention longer than one authorization
+                # lifetime.  The ticket must be minted after this wait.
+                monotonic[0] += reclaim.AUTHORIZATION_MAX_AGE_SECONDS + 1
                 yield
                 events.append('broker-lock-exit')
 
@@ -1133,6 +1177,12 @@ def test_sequenced_claim_policy_callback_precedes_broker_lock(monkeypatch):
         assert kwargs['reclaim_claim_scope'].service_name == 'svc'
         assert isinstance(kwargs['reclaim_claim_authorization'],
                           reclaim.ReclaimClaimAuthorization)
+        reclaim.require_exact_claim_authorization(
+            kwargs['reclaim_claim_authorization'],
+            expected_identity=_identity(),
+            expected_gate_generation=_GATE_GENERATION,
+            expected_scope=kwargs['reclaim_claim_scope'],
+            now_monotonic=monotonic[0])
         return 7
 
     monkeypatch.setattr(broker, '_authorize_reclaim_claim_set_in_boundary',
@@ -1147,7 +1197,7 @@ def test_sequenced_claim_policy_callback_precedes_broker_lock(monkeypatch):
 
     assert _replace_claim_set(mock.Mock()) == 7
     assert events == [
-        'policy', 'broker-lock-create', 'broker-lock-enter', 'persist',
+        'broker-lock-create', 'broker-lock-enter', 'policy', 'persist',
         'broker-lock-exit'
     ]
 
@@ -1230,16 +1280,37 @@ def test_claim_boundary_requires_one_finite_lane():
     executor.submit.assert_not_called()
 
 
-def test_claim_boundary_ambiguity_propagates_before_broker_lock(monkeypatch):
+def test_claim_boundary_ambiguity_propagates_and_releases_broker_lock(
+        monkeypatch):
     _install_gate(monkeypatch, _gate(sequenced=True))
     ambiguity = broker.request_process.AmbiguousBoundaryError(
         'unproven claim family')
     monkeypatch.setattr(broker, '_authorize_reclaim_claim_set_in_boundary',
                         mock.Mock(side_effect=ambiguity))
-    get_lock = mock.Mock()
+    events = []
+
+    class _RecordingLock:
+
+        def acquire(self, *, blocking):
+            assert blocking
+
+            @contextlib.contextmanager
+            def _acquired():
+                events.append('broker-lock-enter')
+                try:
+                    yield
+                finally:
+                    events.append('broker-lock-exit')
+
+            return _acquired()
+
+    get_lock = mock.Mock(return_value=_RecordingLock())
     monkeypatch.setattr(broker.locks, 'get_lock', get_lock)
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        lambda: broker.PROTOCOL_V2)
 
     with pytest.raises(broker.request_process.AmbiguousBoundaryError):
         _replace_claim_set(mock.Mock())
 
-    get_lock.assert_not_called()
+    get_lock.assert_called_once_with(constants.RESERVED_FILL_BROKER_LOCK_ID)
+    assert events == ['broker-lock-enter', 'broker-lock-exit']
