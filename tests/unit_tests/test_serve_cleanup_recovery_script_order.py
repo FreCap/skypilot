@@ -432,6 +432,10 @@ def test_teardown_keeps_pre_token_paid_ambiguity_fail_closed(monkeypatch):
     monkeypatch.setattr(service.request_postgres,
                         'inspect_bound_ordinary_launch',
                         mock.Mock(return_value=inspection))
+    monkeypatch.setattr(
+        service.request_postgres,
+        'bound_non_pool_provider_present_cleanup_is_authorized',
+        mock.Mock(return_value=False))
     monkeypatch.setattr(service.request_postgres,
                         'request_bound_ordinary_launch_cancel', cancel)
     monkeypatch.setattr(service.request_postgres,
@@ -442,6 +446,64 @@ def test_teardown_keeps_pre_token_paid_ambiguity_fail_closed(monkeypatch):
     with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
                        match='UNKNOWN for ORDINARY_PAID replica'):
         service._settle_bound_ordinary_launches_for_teardown(authority, [info])
+
+    cancel.assert_not_called()
+    reduce.assert_not_called()
+    reconcile.assert_called_once()
+
+
+def test_teardown_reconciles_paid_replacement_before_cancellation(monkeypatch):
+    """A terminal replacement uses exact GCP evidence, not cancellation."""
+    info = _replica(1)
+    profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.
+        UNKNOWN_CAPACITY_REPLACEMENT,
+        authorization_reference='replacement:test',
+        authorization_generation=1,
+        authorization_payload={'pool': 'gcp-spot'})
+    context = ordinary_launch_binding.BoundNonPoolLaunchContext(
+        association_id=uuid.UUID('11111111-1111-4111-8111-111111111111'),
+        request_id='request-1',
+        service_name='svc',
+        replica_id=1,
+        replica_record_id=uuid.UUID(info.replica_record_id),
+        launch_generation=1,
+        input_digest='a' * 64,
+        profile=profile,
+        capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+        capability_profile_set_digest=(
+            ordinary_launch_binding.supported_non_pool_profile_set_digest()),
+        receipt_protocol_version=1)
+    authority = types.SimpleNamespace(
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        service_name='svc')
+    target = types.SimpleNamespace(context=context, cancel_reason=None)
+    inspection = types.SimpleNamespace(context=context, disposition='AMBIGUOUS')
+    cancel = mock.Mock()
+    reduce = mock.Mock()
+    reconcile = mock.Mock(return_value=types.SimpleNamespace(
+        evidence=ordinary_launch_binding.ProviderEvidence.ABSENT))
+    monkeypatch.setattr(service.request_postgres,
+                        'lookup_bound_ordinary_launch_cancel_target',
+                        mock.Mock(return_value=target))
+    monkeypatch.setattr(service.request_postgres,
+                        'inspect_bound_ordinary_launch',
+                        mock.Mock(return_value=inspection))
+    monkeypatch.setattr(
+        service.request_postgres,
+        'bound_non_pool_provider_present_cleanup_is_authorized',
+        mock.Mock(return_value=False))
+    monkeypatch.setattr(service.request_postgres,
+                        'request_bound_ordinary_launch_cancel', cancel)
+    monkeypatch.setattr(service.request_postgres,
+                        'reduce_bound_ordinary_launch', reduce)
+    monkeypatch.setattr(service.non_pool_launch_reconciliation, 'reconcile',
+                        reconcile)
+
+    assert service._settle_bound_ordinary_launches_for_teardown(
+        authority, [info]) == {}
 
     cancel.assert_not_called()
     reduce.assert_not_called()
