@@ -1,6 +1,7 @@
 """PostgreSQL contracts for ordered SkyServe capacity admission."""
 # pylint: disable=not-callable,protected-access,redefined-outer-name,unused-import
 
+import copy
 import dataclasses
 import datetime
 import pickle
@@ -838,6 +839,21 @@ def _validate_prospective_claim(engine, claim) -> None:
             claim,
             prospective=True,
             protocol_and_service_prelocked=True)
+
+
+def _mock_prospective_snapshot_normalized_demand(monkeypatch, transform):
+    original = demand_state.get_autoscaling_snapshot
+    observed = []
+
+    def _read(*args, **kwargs):
+        snapshot = original(*args, **kwargs)
+        assert snapshot is not None
+        observed.append(snapshot)
+        normalized = transform(copy.deepcopy(snapshot.normalized_demand))
+        return dataclasses.replace(snapshot, normalized_demand=normalized)
+
+    monkeypatch.setattr(demand_state, 'get_autoscaling_snapshot', _read)
+    return observed
 
 
 def _mock_current_allocation(monkeypatch,
@@ -2010,6 +2026,75 @@ def test_plan_publication_rejects_advanced_demand_change(capacity_database):
 def test_demand_semantics_rejects_missing_and_extra_keys(expected, current):
     assert capacity_admission._changed_demand_semantics(
         expected, current) == ['queue_depth']
+
+
+def test_prospective_claim_accepts_later_clock_arrival_expiry(
+        capacity_database, monkeypatch):
+    engine, _, _ = capacity_database
+    planned_snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
+    assert planned_snapshot is not None
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+    claim = authority.claim_values('L4')
+    assert authority.remaining() == {'l4': 1}
+    assert claim['capacity_plan_accelerator'] == 'l4'
+    assert claim['capacity_plan_units'] == 1
+
+    def _expire_arrival(normalized):
+        normalized['recent_request_count'] = 0
+        normalized['compatibility_demand']['arrivals'] = []
+        return normalized
+
+    observed = _mock_prospective_snapshot_normalized_demand(
+        monkeypatch, _expire_arrival)
+
+    _validate_prospective_claim(engine, claim)
+    _insert_claim(engine, authority, 10)
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='exceed'):
+        _validate_prospective_claim(engine, claim)
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='no paid residual'):
+        authority.claim_values('H200')
+
+    assert len(observed) == 3
+    for snapshot in observed:
+        assert (snapshot.demand_feed_generation ==
+                planned_snapshot.demand_feed_generation)
+        assert snapshot.receipt_watermark == planned_snapshot.receipt_watermark
+        assert snapshot.route_generation == planned_snapshot.route_generation
+        assert snapshot.route_sha256 == planned_snapshot.route_sha256
+    assert authority.remaining() == {'l4': 1}
+
+
+@pytest.mark.parametrize('mutation',
+                         ['h200-redistribution', 'fresh-zero-change'])
+def test_prospective_claim_rejects_nonexpiry_snapshot_change(
+        capacity_database, monkeypatch, mutation):
+    engine, _, _ = capacity_database
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+    claim = authority.claim_values('L4')
+    assert authority.remaining() == {'l4': 1}
+    assert claim['capacity_plan_accelerator'] == 'l4'
+
+    def _mutate(normalized):
+        if mutation == 'h200-redistribution':
+            arrivals = normalized['compatibility_demand']['arrivals']
+            assert len(arrivals) == 1
+            arrivals[0]['compatible_accelerators'] = ['H200']
+        elif mutation == 'fresh-zero-change':
+            normalized['fresh_aggregate_zero'] = True
+        else:
+            raise AssertionError(f'Unhandled mutation {mutation!r}.')
+        return normalized
+
+    _mock_prospective_snapshot_normalized_demand(monkeypatch, _mutate)
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='demand semantics changed before admission'):
+        _validate_prospective_claim(engine, claim)
+    assert authority.remaining() == {'l4': 1}
 
 
 def test_committed_claim_survives_successor_plan_that_accounts_for_it(

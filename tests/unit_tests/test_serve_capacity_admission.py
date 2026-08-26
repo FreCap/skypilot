@@ -1,5 +1,7 @@
 """Pure contract tests for ordered SkyServe capacity admission."""
 
+import copy
+
 import pytest
 import sqlalchemy
 from sqlalchemy.dialects import postgresql
@@ -8,6 +10,42 @@ from sqlalchemy.dialects import sqlite
 from sky.serve import capacity_admission
 from sky.serve import reserved_fill_planner
 from sky.serve import serve_state_schema
+
+
+def _normalized_arrival_demand() -> dict:
+    return {
+        'configured_accelerators': ['L4', 'H200'],
+        'recent_request_count': 3,
+        'in_flight_by_replica_id': {
+            '7': 1,
+        },
+        'unknown_in_flight_replica_ids': [],
+        'queue_depth': 0,
+        'rejected_in_window': 0,
+        'recent_rejected_in_window': 0,
+        'fresh_aggregate_zero': False,
+        'compatibility_demand': {
+            'arrivals': [{
+                'priority': 50,
+                'compatible_accelerators': ['L4'],
+                'count': 2,
+                'recent_count': 1,
+            }, {
+                'priority': 20,
+                'compatible_accelerators': ['H200'],
+                'count': 1,
+                'recent_count': 1,
+            }],
+            'queued': [],
+            'rejected': [],
+        },
+        'autoscaler_target': 3,
+        'demand_target_by_accelerator': {
+            'L4': 2,
+            'H200': 1,
+        },
+        'replica_unit': 'logical',
+    }
 
 
 def _input(**overrides) -> capacity_admission.CapacityPlanInput:
@@ -268,3 +306,95 @@ def test_paid_launch_authority_debits_exact_or_aggregate_units():
             capacity_admission.ReservedFillPlanAuthority.not_applicable()))
     assert aggregate.claim_values('A100',
                                   units=1)['capacity_plan_accelerator'] == '*'
+
+
+def test_prospective_demand_accepts_only_monotonic_arrival_expiry():
+    planned = _normalized_arrival_demand()
+    current = copy.deepcopy(planned)
+    for field in ('autoscaler_target', 'demand_target_by_accelerator',
+                  'replica_unit'):
+        current.pop(field)
+    current['recent_request_count'] = 1
+    current['compatibility_demand']['arrivals'] = [{
+        'priority': 50,
+        'compatible_accelerators': ['L4'],
+        'count': 1,
+        'recent_count': 0,
+    }]
+
+    assert capacity_admission._changed_demand_semantics(
+        planned, current) == ['compatibility_demand', 'recent_request_count']
+    assert not capacity_admission._changed_prospective_demand_semantics(
+        planned, current)
+
+
+@pytest.mark.parametrize('mutation', [
+    'same-total-redistribution',
+    'new-card-set',
+    'new-priority',
+    'arrival-increase',
+    'duplicate-profile',
+    'aggregate-mismatch',
+    'other-field-churn',
+    'queued-churn',
+    'fresh-zero-change',
+    'missing-compatibility-field',
+    'extra-profile-field',
+    'identical-malformed-profile',
+    'current-unavailable',
+])
+def test_prospective_demand_rejects_nonexpiry_changes(mutation):
+    planned = _normalized_arrival_demand()
+    current = copy.deepcopy(planned)
+    if mutation == 'same-total-redistribution':
+        current['compatibility_demand']['arrivals'][0]['count'] = 1
+        current['compatibility_demand']['arrivals'][1]['count'] = 2
+        current['compatibility_demand']['arrivals'][1]['recent_count'] = 2
+    elif mutation == 'new-card-set':
+        current['compatibility_demand']['arrivals'][1][
+            'compatible_accelerators'] = ['A100']
+    elif mutation == 'new-priority':
+        current['compatibility_demand']['arrivals'][1]['priority'] = 10
+    elif mutation == 'arrival-increase':
+        current['recent_request_count'] = 4
+        current['compatibility_demand']['arrivals'][0]['count'] = 3
+    elif mutation == 'duplicate-profile':
+        current['compatibility_demand']['arrivals'] = [{
+            'priority': 50,
+            'compatible_accelerators': ['L4'],
+            'count': 1,
+            'recent_count': 0,
+        }, {
+            'priority': 50,
+            'compatible_accelerators': ['L4'],
+            'count': 1,
+            'recent_count': 0,
+        }]
+        current['recent_request_count'] = 2
+    elif mutation == 'aggregate-mismatch':
+        current['recent_request_count'] = 2
+    elif mutation == 'other-field-churn':
+        current['queue_depth'] = 1
+    elif mutation == 'queued-churn':
+        current['compatibility_demand']['queued'] = [{
+            'priority': 50,
+            'compatible_accelerators': ['L4'],
+            'count': 1,
+            'recent_count': 1,
+        }]
+    elif mutation == 'fresh-zero-change':
+        current['fresh_aggregate_zero'] = True
+    elif mutation == 'missing-compatibility-field':
+        current['compatibility_demand'].pop('rejected')
+    elif mutation == 'extra-profile-field':
+        current['compatibility_demand']['arrivals'][0]['future'] = True
+    elif mutation == 'identical-malformed-profile':
+        planned['compatibility_demand']['arrivals'][0]['count'] = True
+        current['compatibility_demand']['arrivals'][0]['count'] = True
+    elif mutation == 'current-unavailable':
+        current = None
+    else:
+        raise AssertionError(f'Unhandled mutation {mutation!r}.')
+
+    assert capacity_admission._changed_prospective_demand_semantics(
+        planned, current)
