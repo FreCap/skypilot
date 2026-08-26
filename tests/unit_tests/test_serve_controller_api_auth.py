@@ -131,28 +131,33 @@ def _run_middleware(monkeypatch,
                        authorization,
                        dedicated_auth=dedicated_auth)
     request.state.auth_user = None
-    downstream_users = []
+    request.state.serve_controller_api_authenticated = False
+    downstream_state = []
 
     async def call_next(inner_request):
-        downstream_users.append(inner_request.state.auth_user)
+        downstream_state.append(
+            (inner_request.state.auth_user,
+             inner_request.state.serve_controller_api_authenticated))
         return fastapi.responses.Response(status_code=204)
 
     response = asyncio.run(middleware.dispatch(request, call_next))
-    return response, reads, downstream_users
+    return response, reads, downstream_state
 
 
 @pytest.mark.parametrize('token', ['current', 'previous'])
 def test_middleware_accepts_admin_overlap_ring(monkeypatch, token):
-    response, reads, users = _run_middleware(monkeypatch, f'Bearer {token}',
-                                             ('current', 'previous'))
+    response, reads, states = _run_middleware(monkeypatch, f'Bearer {token}',
+                                              ('current', 'previous'))
 
     assert response.status_code == 204
     assert reads == [True]
-    assert len(users) == 1
-    assert users[0].id == constants.SKYPILOT_SERVE_CONTROLLER_SYSTEM_USER_ID
-    assert users[0].user_type == 'system'
+    assert len(states) == 1
+    user, serve_controller_authenticated = states[0]
+    assert user.id == constants.SKYPILOT_SERVE_CONTROLLER_SYSTEM_USER_ID
+    assert user.user_type == 'system'
+    assert serve_controller_authenticated is True
     cluster_name = common_utils.make_cluster_name_on_cloud_for_user(
-        'boltz-l4-fleet-54883-0698237f22', max_length=42, user_hash=users[0].id)
+        'boltz-l4-fleet-54883-0698237f22', max_length=42, user_hash=user.id)
     assert len(cluster_name) <= 42
     assert cluster_name.endswith('-skyserve')
 
@@ -160,23 +165,23 @@ def test_middleware_accepts_admin_overlap_ring(monkeypatch, token):
 @pytest.mark.parametrize('authorization',
                          [None, 'Bearer wrong', 'Bearer current extra'])
 def test_middleware_rejects_bad_token(monkeypatch, authorization):
-    response, reads, users = _run_middleware(monkeypatch, authorization,
-                                             ('current', 'previous'))
+    response, reads, states = _run_middleware(monkeypatch, authorization,
+                                              ('current', 'previous'))
 
     assert response.status_code == 401
     assert reads == [True]
-    assert not users
+    assert not states
 
 
 @pytest.mark.parametrize(
     'tokens', [(), (None,), RuntimeError('secret unavailable')])
 def test_middleware_fails_closed_without_ring(monkeypatch, tokens):
-    response, reads, users = _run_middleware(monkeypatch, 'Bearer current',
-                                             tokens)
+    response, reads, states = _run_middleware(monkeypatch, 'Bearer current',
+                                              tokens)
 
     assert response.status_code == 503
     assert reads == [True]
-    assert not users
+    assert not states
 
 
 @pytest.mark.parametrize(
@@ -184,18 +189,18 @@ def test_middleware_fails_closed_without_ring(monkeypatch, tokens):
                          ('/launch', 'POST')])
 def test_middleware_does_not_authenticate_outside_allowlist(
         monkeypatch, path, method):
-    response, reads, users = _run_middleware(monkeypatch,
-                                             'Bearer current', ('current',),
-                                             path=path,
-                                             method=method)
+    response, reads, states = _run_middleware(monkeypatch,
+                                              'Bearer current', ('current',),
+                                              path=path,
+                                              method=method)
 
     assert response.status_code == 204
     assert not reads
-    assert users == [None]
+    assert states == [(None, False)]
 
 
 def test_middleware_does_not_intercept_normal_api_auth(monkeypatch):
-    response, reads, users = _run_middleware(
+    response, reads, states = _run_middleware(
         monkeypatch,
         None,
         RuntimeError('ring must not be read'),
@@ -205,7 +210,7 @@ def test_middleware_does_not_intercept_normal_api_auth(monkeypatch):
 
     assert response.status_code == 204
     assert not reads
-    assert users == [None]
+    assert states == [(None, False)]
 
 
 def test_middleware_wraps_normal_authentication():

@@ -221,6 +221,7 @@ class InitializeRequestAuthUserMiddleware(
         request.state.anonymous_user = False
         request.state.controller_origin = None
         request.state.managed_job_origin = None
+        request.state.serve_controller_api_authenticated = False
         request.state.csp_nonce = None
         return await call_next(request)
 
@@ -591,6 +592,10 @@ class InternalServeControllerApiAuthMiddleware(
             id=constants.SKYPILOT_SERVE_CONTROLLER_SYSTEM_USER_ID,
             name='SkyServe controller',
             user_type=models.UserType.SYSTEM.value)
+        # Keep this capability separate from ``controller_origin``.  The
+        # split-role SkyServe controller owns the narrow controller-admin
+        # token, not the API server controller's generation capability.
+        request.state.serve_controller_api_authenticated = True
         return await call_next(request)
 
 

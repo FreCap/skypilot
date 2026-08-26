@@ -2605,10 +2605,13 @@ async def api_status_query(
     if internal_mode:
         controller_origin = request.state.controller_origin
         locally_trusted = auth_loopback.is_loopback_request(request)
-        if controller_origin is None and not locally_trusted:
+        serve_controller_authenticated = getattr(
+            request.state, 'serve_controller_api_authenticated', False) is True
+        if (controller_origin is None and not locally_trusted and
+                not serve_controller_authenticated):
             raise fastapi.HTTPException(
                 status_code=403,
-                detail=('Only the current controller can use internal '
+                detail=('Only an authenticated controller can use internal '
                         'request-status filters.'))
     return await _api_status(
         body.request_ids,

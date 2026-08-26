@@ -2253,6 +2253,35 @@ async def test_status_query_internal_filters_require_controller(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_status_query_accepts_split_serve_controller(monkeypatch):
+    from sky.server.requests import payloads
+
+    request = mock.Mock(spec=fastapi.Request)
+    request.state.auth_user = mock.Mock(id='skyserve')
+    request.state.controller_origin = None
+    request.state.serve_controller_api_authenticated = True
+    monkeypatch.setattr(server.auth_loopback, 'is_loopback_request',
+                        lambda _request: False)
+    captured = []
+
+    async def get_request_tasks(req_filter):
+        captured.append(req_filter)
+        return []
+
+    monkeypatch.setattr(server.requests_lib, 'get_request_tasks_async',
+                        get_request_tasks)
+    monkeypatch.setattr(server.requests_lib, 'encode_requests',
+                        lambda requests: requests)
+    body = payloads.RequestStatusBody(request_ids=['exact-request-id'],
+                                      exact_request_ids=True,
+                                      fields=['request_id', 'status'])
+
+    assert await server.api_status_query(request, body) == []
+    assert len(captured) == 1
+    assert captured[0].request_ids == ['exact-request-id']
+
+
+@pytest.mark.asyncio
 async def test_status_query_accepts_current_controller_and_owns_allowlist(
         monkeypatch):
     from sky.server.requests import payloads
