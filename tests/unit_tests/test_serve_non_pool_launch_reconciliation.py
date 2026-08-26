@@ -1,5 +1,6 @@
 """Tests for failure-isolated non-pool provider reconciliation."""
 
+import json
 import types
 import uuid
 
@@ -567,6 +568,66 @@ def test_gcp_exact_absence_preserves_typed_provider_failure(code, expected):
     assert result is not None
     assert result.paid_capacity_outcome is expected
     assert status_property.failed_spot_availability is True
+
+
+def test_cancelled_gcp_exact_absence_is_neutral_cleanup() -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    pool_key = json.dumps(
+        {
+            'accelerators': [['l4', 1]],
+            'cloud': 'gcp',
+            'instance_type': 'g2-standard-4',
+            'num_nodes': 1,
+            'region': 'us-east4',
+            'use_spot': True,
+            'version': 1,
+            'workspace': 'workspace-a',
+            'zone': 'us-east4-a',
+        },
+        sort_keys=True,
+        separators=(',', ':'))
+    status_property = types.SimpleNamespace(
+        sky_launch_status=reconciliation.common_utils.ProcessStatus.FAILED,
+        failed_spot_availability=True)
+    info = types.SimpleNamespace(paid_capacity_pool_key=pool_key,
+                                 is_spot=True,
+                                 is_zero_cost=False,
+                                 reserved_fill=False,
+                                 service_job_id=None,
+                                 status_property=status_property)
+    projection = types.SimpleNamespace(
+        provider_evidence=ordinary_launch_binding.ProviderEvidence.ABSENT,
+        provider_evidence_payload={
+            'probe_contract': 'gcp-vm-disk-operation-presence-v1',
+            'result': 'ABSENT',
+            'instance_ids': [],
+            'disk_ids': [],
+            'create_operation_targets': {
+                'failed': [],
+                'inflight': [],
+                'succeeded': [],
+            },
+        },
+        context=context,
+        pre_effect_terminal=False,
+        service_job_id=None,
+        locked_replica_info=info,
+        paid_capacity_pool_key=pool_key,
+        request=types.SimpleNamespace(error=None),
+        status=types.SimpleNamespace(value='CANCELLED'),
+        cause=types.SimpleNamespace(value='explicit_cancel'))
+
+    result = reconciliation.apply_exact_provider_absence_replica_projection(
+        projection)
+
+    assert result is not None
+    assert result.paid_capacity_outcome is paid_capacity.LaunchOutcome.OTHER_FAILURE
+    assert status_property.failed_spot_availability is False
+    assert (status_property.sky_launch_status is
+            reconciliation.common_utils.ProcessStatus.INTERRUPTED)
+    assert not ordinary_launch_binding.ordinary_paid_provider_terminal_shape_matches(
+        'CANCELLED', 'explicit_cancel', pool_key.replace('"gcp"', '"aws"'))
 
 
 def test_ordinary_paid_reconcile_prefers_exact_terminal_negative_ack(

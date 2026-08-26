@@ -99,14 +99,16 @@ def apply_exact_provider_absence_replica_projection(
             evidence_payload, Mapping) else None)
         status = getattr(getattr(projection, 'status', None), 'value', None)
         cause = getattr(getattr(projection, 'cause', None), 'value', None)
-        common_shape_matches = bool(
-            status == 'FAILED' and cause == 'handler_failed' and
+        replica_shape_matches = bool(
             isinstance(pool_key, str) and bool(pool_key) and
             info.paid_capacity_pool_key == pool_key and info.is_spot is True and
             info.is_zero_cost is False and info.reserved_fill is False and
             info.service_job_id is None)
+        handler_failed = status == 'FAILED' and cause == 'handler_failed'
         if probe_contract == 'gcp-vm-disk-operation-presence-v1':
-            if (not common_shape_matches or
+            if (not replica_shape_matches or not ordinary_launch_binding.
+                    ordinary_paid_provider_terminal_shape_matches(
+                        status, cause, pool_key) or
                     evidence_payload.get('result') != 'ABSENT' or
                     evidence_payload.get('instance_ids') != [] or
                     evidence_payload.get('disk_ids') != [] or not isinstance(
@@ -115,17 +117,26 @@ def apply_exact_provider_absence_replica_projection(
                     evidence_payload['create_operation_targets'].get('inflight')
                     != []):
                 return None
-            reason = None
-            if isinstance(decoded_error, exceptions.ResourcesUnavailableError):
-                reason = capacity_policy.classify_resources_unavailable_error(
-                    gcp_cloud.GCP(), decoded_error)
-            if reason == 'quota':
-                paid_outcome = paid_capacity.LaunchOutcome.QUOTA_FAILURE
-            elif reason == 'capacity':
-                paid_outcome = paid_capacity.LaunchOutcome.CAPACITY_FAILURE
+            if handler_failed:
+                reason = None
+                if isinstance(decoded_error,
+                              exceptions.ResourcesUnavailableError):
+                    reason = (
+                        capacity_policy.classify_resources_unavailable_error(
+                            gcp_cloud.GCP(), decoded_error))
+                if reason == 'quota':
+                    paid_outcome = paid_capacity.LaunchOutcome.QUOTA_FAILURE
+                elif reason == 'capacity':
+                    paid_outcome = paid_capacity.LaunchOutcome.CAPACITY_FAILURE
+                else:
+                    paid_outcome = paid_capacity.LaunchOutcome.OTHER_FAILURE
+                info.status_property.failed_spot_availability = True
             else:
+                # Explicit teardown cancellation is not negative GCP capacity
+                # feedback. The exact provider census still owns cleanup and
+                # OTHER_FAILURE leaves the adaptive pool unchanged.
                 paid_outcome = paid_capacity.LaunchOutcome.OTHER_FAILURE
-            info.status_property.failed_spot_availability = True
+                info.status_property.failed_spot_availability = False
         else:
             expected_receipt = (evidence_payload.get('receipt') if isinstance(
                 evidence_payload, Mapping) else None)
@@ -155,7 +166,7 @@ def apply_exact_provider_absence_replica_projection(
                 else None)
             if (provider_negative_ack is None or
                     provider_negative_ack != expected_receipt or
-                    not common_shape_matches):
+                    not replica_shape_matches or not handler_failed):
                 return None
             reason = provider_negative_ack['reason']
             if reason == 'quota':
@@ -168,8 +179,11 @@ def apply_exact_provider_absence_replica_projection(
     else:
         return None
 
-    if (info.status_property.sky_launch_status !=
-            common_utils.ProcessStatus.INTERRUPTED):
+    if status == 'CANCELLED' and cause == 'explicit_cancel':
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.INTERRUPTED)
+    elif (info.status_property.sky_launch_status !=
+          common_utils.ProcessStatus.INTERRUPTED):
         info.status_property.sky_launch_status = common_utils.ProcessStatus.FAILED
     return ProviderAbsenceReplicaProjection(paid_capacity_pool_key=pool_key,
                                             paid_capacity_outcome=paid_outcome)

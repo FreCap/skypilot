@@ -52,7 +52,7 @@ SPOT_JOBS_VERSION = '028'  # runtime-owned managed-job controller slots
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '059'  # exact ordinary-paid provider-absence projection
+SERVE_VERSION = '060'  # exact cancelled GCP paid-provider cleanup
 SERVE_NON_POSTGRES_VERSION = '037'  # retained local/controller SQLite head
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 SERVE_MIGRATION_CEILING_ENV_VAR = (

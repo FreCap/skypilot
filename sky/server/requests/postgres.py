@@ -4334,9 +4334,10 @@ def _ordinary_paid_gcp_provider_identity_from_locked_request(
             association['reconciliation_outcome'] !=
             expected_reconciliation_outcome or
             association['service_job_id'] is not None or
-            facts.status is not requests_lib.RequestStatus.FAILED or
-            facts.terminal_cause
-            is not event_api_models.EventCause.HANDLER_FAILED or
+            not ordinary_launch_binding.
+            ordinary_paid_provider_terminal_shape_matches(
+                facts.status, facts.terminal_cause,
+                association.get('paid_capacity_pool_key')) or
             facts.execution_generation is None or
             facts.execution_generation < 1 or
             facts.execution_quiescence_required is not True or

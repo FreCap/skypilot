@@ -405,6 +405,34 @@ class TerminalStatus(str, enum.Enum):
     CANCELLED = 'CANCELLED'
 
 
+def ordinary_paid_provider_terminal_shape_matches(
+    status: TerminalStatus | str | Any,
+    cause: str | Any,
+    paid_capacity_pool_key: str | None,
+) -> bool:
+    """Whether terminal evidence can safely enter paid-provider cleanup.
+
+    Provider failures retain the original cross-cloud contract.  An explicit
+    cancellation is additionally actionable only for the exact GCP Spot pool:
+    GCP VM, disk, and retained-operation reads can prove PRESENT/ABSENT after
+    an executor is cancelled during provider I/O.
+    """
+    status_value = getattr(status, 'value', status)
+    cause_value = getattr(cause, 'value', cause)
+    if (status_value == TerminalStatus.FAILED.value and
+            cause_value == 'handler_failed'):
+        return True
+    if (status_value != TerminalStatus.CANCELLED.value or
+            cause_value != 'explicit_cancel' or
+            not isinstance(paid_capacity_pool_key, str) or
+            not paid_capacity_pool_key):
+        return False
+    identity = paid_capacity.pool_key_payload(paid_capacity_pool_key)
+    return bool(
+        isinstance(identity, Mapping) and identity.get('cloud') == 'gcp' and
+        identity.get('version') == 1 and identity.get('use_spot') is True)
+
+
 UNSETTLED_RESOLUTIONS = frozenset({
     Resolution.BOUND,
     Resolution.CANCEL_REQUESTED,
@@ -439,6 +467,12 @@ _PROVIDER_EVIDENCE_SQL = ', '.join(
     f"'{value.value}'" for value in ProviderEvidence)
 _LEGACY_RESOLUTION_SQL = ', '.join(
     f"'{value.value}'" for value in LegacyReconciliationResolution)
+_ORDINARY_PAID_PROVIDER_TERMINAL_SQL = (
+    "((terminal_status = 'FAILED' AND terminal_cause = 'handler_failed') OR "
+    "(terminal_status = 'CANCELLED' AND terminal_cause = 'explicit_cancel' "
+    "AND paid_capacity_pool_key::jsonb ->> 'cloud' = 'gcp' "
+    "AND paid_capacity_pool_key::jsonb ->> 'version' = '1' "
+    "AND paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true'))")
 
 metadata = sqlalchemy.MetaData()
 ordinary_launch_associations_table = sqlalchemy.Table(
@@ -734,7 +768,7 @@ ordinary_launch_associations_table = sqlalchemy.Table(
         "provider_evidence_observed_at >= execution_quiesced_at AND "
         "effect_phase = 'PROVIDER_IO' AND "
         "paid_capacity_pool_key IS NOT NULL AND service_job_id IS NULL AND "
-        "terminal_status = 'FAILED' AND terminal_cause = 'handler_failed')",
+        f'{_ORDINARY_PAID_PROVIDER_TERMINAL_SQL})',
         name='serve047_provider_absence_projection_ck'),
     sqlalchemy.CheckConstraint(
         "resolution NOT IN ('RESULT_RECORDED', 'PROJECTED', "
@@ -5795,8 +5829,8 @@ def _replica_free_association_is_inert(association: Mapping[str, Any],) -> bool:
         elif profile.kind is NonPoolLaunchProfileKind.ORDINARY_PAID:
             pool_key = association.get('paid_capacity_pool_key')
             if (effect_phase is not EffectPhase.PROVIDER_IO or
-                    terminal_status is not TerminalStatus.FAILED or
-                    terminal_cause != 'handler_failed' or
+                    not ordinary_paid_provider_terminal_shape_matches(
+                        terminal_status, terminal_cause, pool_key) or
                     not isinstance(pool_key, str) or not pool_key):
                 return False
         else:
@@ -6720,13 +6754,14 @@ def provider_absence_projection_authority_in_connection(
                 EffectPhase.SERVICE_JOB_IO.value) and
             association['paid_capacity_pool_key'] is None)
     elif profile_kind is NonPoolLaunchProfileKind.ORDINARY_PAID:
+        pool_key = association['paid_capacity_pool_key']
         shape_matches = bool(
             association['effect_phase'] == EffectPhase.PROVIDER_IO.value and
-            isinstance(association['paid_capacity_pool_key'], str) and
-            association['paid_capacity_pool_key'] and
+            isinstance(pool_key, str) and pool_key and
             association['service_job_id'] is None and
-            association['terminal_status'] == TerminalStatus.FAILED.value and
-            association['terminal_cause'] == 'handler_failed')
+            ordinary_paid_provider_terminal_shape_matches(
+                association['terminal_status'], association['terminal_cause'],
+                pool_key))
     else:
         shape_matches = False
     if not shape_matches:
@@ -7202,8 +7237,9 @@ def provider_presence_cleanup_authority_in_connection(
             isinstance(pool_identity, Mapping) and
             pool_identity.get('cloud') == 'gcp' and
             pool_identity.get('use_spot') is True and
-            association['terminal_status'] == TerminalStatus.FAILED.value and
-            association['terminal_cause'] == 'handler_failed')
+            ordinary_paid_provider_terminal_shape_matches(
+                association['terminal_status'], association['terminal_cause'],
+                pool_key))
     else:
         shape_matches = False
     if not shape_matches:
@@ -7324,8 +7360,9 @@ def _validate_projected_provider_absence_retirement_locked_rows(
         pool_key = association['paid_capacity_pool_key']
         if (association['effect_phase'] != EffectPhase.PROVIDER_IO.value or
                 not isinstance(pool_key, str) or not pool_key or
-                association['terminal_status'] != TerminalStatus.FAILED.value or
-                association['terminal_cause'] != 'handler_failed' or
+                not ordinary_paid_provider_terminal_shape_matches(
+                    association['terminal_status'],
+                    association['terminal_cause'], pool_key) or
                 info.paid_capacity_pool_key != pool_key or
                 not replica_has_projected_provider_absence_cleanup_marker(info)
            ):
