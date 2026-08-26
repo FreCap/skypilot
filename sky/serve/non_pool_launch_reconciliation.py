@@ -85,6 +85,7 @@ def apply_exact_provider_absence_replica_projection(
     info = projection.locked_replica_info
     pool_key = projection.paid_capacity_pool_key
     paid_outcome = None
+    explicit_paid_cancel = False
     if (context.profile.kind ==
             ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
         if pool_key is not None:
@@ -99,6 +100,8 @@ def apply_exact_provider_absence_replica_projection(
             evidence_payload, Mapping) else None)
         status = getattr(getattr(projection, 'status', None), 'value', None)
         cause = getattr(getattr(projection, 'cause', None), 'value', None)
+        explicit_paid_cancel = (status == 'CANCELLED' and
+                                cause == 'explicit_cancel')
         replica_shape_matches = bool(
             isinstance(pool_key, str) and bool(pool_key) and
             info.paid_capacity_pool_key == pool_key and info.is_spot is True and
@@ -192,7 +195,7 @@ def apply_exact_provider_absence_replica_projection(
     else:
         return None
 
-    if status == 'CANCELLED' and cause == 'explicit_cancel':
+    if explicit_paid_cancel:
         info.status_property.sky_launch_status = (
             common_utils.ProcessStatus.INTERRUPTED)
     elif (info.status_property.sky_launch_status !=
