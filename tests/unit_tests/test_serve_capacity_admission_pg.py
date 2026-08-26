@@ -2305,7 +2305,20 @@ def test_prospective_hundred_claim_batch_survives_heartbeat_churn(
 
 def test_atomic_hundred_claim_batch_rejects_fresh_zero_without_rows(
         capacity_database):
-    engine, _, route_receipt = capacity_database
+    engine, incarnation, route_receipt = capacity_database
+    # Fresh aggregate zero is an explicit projected-route protocol-2 proof.
+    # The shared fixture deliberately models a retained protocol-1 cohort, so
+    # promote only this test's exact route writer before constructing the plan.
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_snapshots_table).values(
+                    producer_protocol_version=2))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_projection_protocol_version=2,
+                    route_projection_controller_incarnation=incarnation))
     authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
         _plan(100))
     claim = authority.claim_values('L4')
