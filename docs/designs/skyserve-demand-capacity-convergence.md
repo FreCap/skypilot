@@ -1,21 +1,19 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Current status (2026-08-25): SkyPilot release `1.1.1484` is deployed as Helm
-revision 606. PR #1715's UNKNOWN-replacement claim binding and equivalent-zero
-retirement corrections are merged and deployed. The two Spot VMs retained by
-the prior `1.1.1483` canary are fully terminated at the provider. A clean
-`1.1.1484` target-100/10,000-request rerun was stopped after it exposed a third
-source defect: demand heartbeats advanced between atomic paid-claim commit and
-the deferred provider guard, so committed rows churned without any provider
-launch. The qualification provider resources are down, but the historical
-`boltz-l4-fleet` service row remains `SHUTTING_DOWN` behind two ambiguous,
-execution-quiesced ordinary-paid rows. The next gate is the source-only atomic-
-handoff and cold-LB drain-observation correction below plus evidence-backed
-teardown adjudication, followed by one homogeneous Helm rollout and a sustained
-512-concurrency rerun requiring target 100, 100 provider-backed ready GPU slots,
-10,000 successful requests, no On-Demand effects, and complete teardown. The
-older phase account below is historical chronology and is not an executable
-runbook.
+Current status (2026-08-26): SkyPilot release `1.1.1511` is deployed as Helm
+revision 632. A clean target-100 qualification atomically committed all 100
+ordinary-paid Spot claims with zero On-Demand claims, but only six GCP L4 Spot
+VMs reached RUNNING. Two redundant process-local logical-target gates treated
+fresh equivalent demand generations as supersession and, after the durable
+claim boundary, still let a short target lease revoke the claim's first
+provider effect. Normal SkyServe teardown subsequently reached three fresh
+samples of exact zero service/replica/claim state, GCP VMs, and managed disks;
+an independent PostgreSQL and GCP-native census agreed. This change restores
+semantic generation carry-forward before claim commit and makes the existing
+atomic paid claim authoritative afterward. The next gate is one homogeneous
+Helm rollout and a sustained rerun requiring 100 provider-backed Spot L4 VMs,
+zero On-Demand effects, and complete normal teardown. The older phase account
+below is historical chronology and is not an executable runbook.
 
 All PHX lane names in that historical chronology are audit facts, not current
 operator instructions. The current source contract is policy-bundle schema v7
@@ -24,11 +22,15 @@ existing LocalQueue `be` -> existing ClusterQueue `research-be`, existing
 WorkloadPriorityClass `be-lt` at 11, and the server-owned Pod PriorityClass at
 -1000/`Never`. SkyPilot neither owns nor mutates the external Kueue topology.
 
-Source addendum (2026-08-25; not deployed or production-proven): paid demand
-and supply remain exact through the atomic replica/claim/cap-debit commit. Once
-that commit succeeds, the claim's one provider effect is authorized by its
-immutable original plan and bounded debit ledger; later heartbeats, successor
-plans (including aggregate zero), or reserved-supply changes cannot strand it.
+Source addendum (2026-08-26; implemented, deployment proof pending): paid
+demand and supply remain exact through the atomic replica/claim/cap-debit
+commit. Once that commit succeeds, the claim's one provider effect is
+authorized by its immutable original plan and bounded debit ledger; later
+heartbeats, successor plans (including aggregate zero), or reserved-supply
+changes cannot strand it. The process-local handoff requires the exact
+`ACQUIRED` Phase-A member receipt matching the replica ID and record ID; a
+canonical pool key alone grants nothing. After restart, only an adopter built
+from the exact durable bound-request association uses the equivalent handoff.
 Lifecycle and source epochs, monotonic demand and route generations, fresh
 current route/LB ownership, and the exact persisted action graph still fail
 closed. A successor authorizes no replay or additional debit, and ordinary
