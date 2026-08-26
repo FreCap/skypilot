@@ -2284,13 +2284,78 @@ class TestBoundOrdinaryLaunchManagerIntegration:
 
         assert reduce_exact.call_args_list == [
             mock.call(None, None),
-            mock.call(None, transport_error),
+            mock.call(None, None),
             mock.call(None, None),
         ]
         sleep.assert_called_once_with(
             replica_managers._LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
         waiter.start.assert_called_once_with()
         waiter.join.assert_called_once_with()
+
+    def test_waiter_error_cannot_override_immediate_durable_success(self):
+        active = self._projection('ADOPT_ACTIVE',
+                                  status='RUNNING',
+                                  projected=False)
+        projected = self._projection('PROJECTED', status='SUCCEEDED')
+        reduce_exact = mock.Mock(side_effect=[active, projected])
+        waiter = mock.Mock()
+        waiter.is_alive.return_value = False
+        waiter.exception = RuntimeError('stream disconnected')
+
+        with mock.patch.object(replica_managers.thread_utils,
+                               'SafeThread',
+                               return_value=waiter), \
+             mock.patch.object(replica_managers.time, 'sleep') as sleep:
+            replica_managers._wait_for_bound_ordinary_launch(
+                replica_id=1,
+                cluster_name='svc-1',
+                request_id='request-id',
+                stream_logs=False,
+                launch_cloud=None,
+                reduce_exact=reduce_exact,
+                cancel_exact=mock.Mock(),
+                teardown_requested=threading.Event())
+
+        assert reduce_exact.call_args_list == [
+            mock.call(None, None),
+            mock.call(None, None),
+        ]
+        sleep.assert_not_called()
+
+    def test_waiter_error_cannot_override_success_after_quiescence(self):
+        active = self._projection('ADOPT_ACTIVE',
+                                  status='RUNNING',
+                                  projected=False)
+        quiescing = self._projection('WAIT_QUIESCENCE',
+                                     status='FAILED',
+                                     projected=False)
+        projected = self._projection('PROJECTED', status='SUCCEEDED')
+        reduce_exact = mock.Mock(side_effect=[active, quiescing, projected])
+        waiter = mock.Mock()
+        waiter.is_alive.return_value = False
+        waiter.exception = RuntimeError('stream disconnected')
+
+        with mock.patch.object(replica_managers.thread_utils,
+                               'SafeThread',
+                               return_value=waiter), \
+             mock.patch.object(replica_managers.time, 'sleep') as sleep:
+            replica_managers._wait_for_bound_ordinary_launch(
+                replica_id=1,
+                cluster_name='svc-1',
+                request_id='request-id',
+                stream_logs=False,
+                launch_cloud=None,
+                reduce_exact=reduce_exact,
+                cancel_exact=mock.Mock(),
+                teardown_requested=threading.Event())
+
+        assert reduce_exact.call_args_list == [
+            mock.call(None, None),
+            mock.call(None, None),
+            mock.call(None, None),
+        ]
+        sleep.assert_called_once_with(
+            replica_managers._LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
 
     def test_ambiguous_projection_never_falls_through_to_cleanup(self):
         reduce_exact = mock.Mock(return_value=self._projection(

@@ -1206,7 +1206,6 @@ def _wait_for_bound_ordinary_launch(
     launch_request_id = server_common.RequestId[tuple[int | None,
                                                       backends.ResourceHandle |
                                                       None]](request_id)
-    result_box: list[Any] = []
     parent_context = context.get()
 
     def _wait_exact_request() -> None:
@@ -1215,13 +1214,15 @@ def _wait_for_bound_ordinary_launch(
             api_auth_token_provider is not None else contextlib.nullcontext())
         with context.initialize(parent_context), api_auth_context:
             if stream_logs:
-                result_box.append(sdk.stream_and_get(launch_request_id))
+                sdk.stream_and_get(launch_request_id)
             else:
-                result_box.append(sdk.get(launch_request_id))
+                sdk.get(launch_request_id)
 
-    # The exact SDK wait preserves typed results/errors and the normal log
-    # stream. Keeping it in a daemon child lets controller replacement detach
-    # promptly without cancelling the durable request it just handed off.
+    # The exact SDK wait preserves the normal log stream.  Its process-local
+    # result is deliberately non-authoritative: the PostgreSQL reducer below
+    # owns terminal result/error interpretation.  Keeping the wait in a daemon
+    # child lets controller replacement detach promptly without cancelling the
+    # durable request it just handed off.
     exact_waiter = thread_utils.SafeThread(
         target=_wait_exact_request,
         name=f'replica-{replica_id}-bound-request-wait',
@@ -1237,32 +1238,14 @@ def _wait_for_bound_ordinary_launch(
             return
         exact_waiter.join(timeout=_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
     exact_waiter.join()
-    exact_error = exact_waiter.exception
-    launch_result = result_box[0] if result_box else None
-    if exact_error is None:
-        result_is_exact = False
-        if isinstance(launch_result, tuple) and len(launch_result) == 2:
-            service_job_id, handle = launch_result  # pylint: disable=unpacking-non-sequence
-            result_is_exact = bool(
-                not isinstance(service_job_id, bool) and
-                isinstance(service_job_id, int) and service_job_id > 0 and
-                isinstance(handle, backends.CloudVmRayResourceHandle) and
-                handle.cluster_name == cluster_name)
-        if not result_is_exact:
-            exact_error = _BoundOrdinaryLaunchUnresolvedError(
-                f'Bound request {request_id} returned a malformed or '
-                f'mismatched result for replica {replica_id}.')
-    if (_reduce_until_wait_or_terminal(launch_result,
-                                       exact_error) == 'TERMINAL'):
+    if _reduce_until_wait_or_terminal() == 'TERMINAL':
         return
 
-    # The SDK waiter is only a convenience for typed results and log streaming;
-    # PostgreSQL remains the launch lifecycle authority.  A transport failure
-    # or retry transition can end that waiter while the exact durable request is
-    # still active.  Keep owning and reducing the bound request instead of
-    # letting the caller mistake the finished local thread for a projected
-    # launch.  Do not carry the stale waiter error into a later successful
-    # durable result.
+    # The SDK waiter is only a convenience for log streaming; PostgreSQL
+    # remains the launch lifecycle authority.  A transport failure or retry
+    # transition can end that waiter while the exact durable request is still
+    # active.  Keep owning and reducing the bound request instead of letting
+    # the caller mistake the finished local thread for a projected launch.
     while True:
         time.sleep(_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
         if _reduce_until_wait_or_terminal() == 'TERMINAL':
