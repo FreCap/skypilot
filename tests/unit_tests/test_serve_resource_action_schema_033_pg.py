@@ -641,7 +641,7 @@ def test_serve_alembic_lineage_has_033_through_action_history_039() -> None:
     revisions = list(scripts.walk_revisions())
     revision_ids = [revision.revision for revision in revisions]
     assert len(revision_ids) == len(set(revision_ids))
-    assert scripts.get_heads() == ['060']
+    assert scripts.get_heads() == ['061']
     revision_032 = scripts.get_revision('032')
     revision_033 = scripts.get_revision('033')
     revision_034 = scripts.get_revision('034')
@@ -671,7 +671,7 @@ def test_serve_alembic_lineage_has_033_through_action_history_039() -> None:
     assert Path(revision_039.path).name == (
         '039_serve_resource_action_execution_history.py')
     assert revision_039.down_revision == '038'
-    assert migration_utils.SERVE_VERSION == '060'
+    assert migration_utils.SERVE_VERSION == '061'
     assert migration_utils.SERVE_NON_POSTGRES_VERSION == '037'
 
 

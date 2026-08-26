@@ -2502,8 +2502,8 @@ def terminate_bound_non_pool_provider_present_cluster(
     **terminate_kwargs: Any,
 ) -> None:
     """Down one exact PRESENT allocation, then project fresh ABSENT proof."""
-    if (binding_context.profile.kind ==
-            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+    if ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+            binding_context.profile.kind):
         expected_cluster_record_uuid = terminate_kwargs.get(
             'expected_cluster_record_uuid')
         if expected_cluster_record_uuid is None:
@@ -4366,8 +4366,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     projection.paid_capacity_pool_key is None and
                     info.paid_capacity_pool_key is None and
                     info.is_zero_cost is True)
-            elif (cleanup_context.profile.kind == ordinary_launch_binding.
-                  NonPoolLaunchProfileKind.ORDINARY_PAID):
+            elif ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+                    cleanup_context.profile.kind):
                 pool_key = projection.paid_capacity_pool_key
                 pool_identity = (paid_capacity.pool_key_payload(pool_key)
                                  if isinstance(pool_key, str) else None)
@@ -5056,9 +5056,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         binding_context = target.context
         if (not isinstance(binding_context,
                            ordinary_launch_binding.BoundNonPoolLaunchContext) or
-                binding_context.profile.kind not in
-            (ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
-             ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)):
+                binding_context.profile.kind != ordinary_launch_binding.
+                NonPoolLaunchProfileKind.RESERVED_FILL and
+                not ordinary_launch_binding.
+                is_paid_provider_reconciliation_profile(
+                    binding_context.profile.kind)):
             return None
         if not (request_postgres.
                 bound_non_pool_provider_present_cleanup_is_authorized(

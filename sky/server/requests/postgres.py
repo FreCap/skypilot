@@ -4322,8 +4322,8 @@ def _ordinary_paid_gcp_provider_identity_from_locked_request(
         str(association.get('paid_capacity_pool_key')))
     gcp_cohort_floor = (ordinary_launch_binding.
                         ORDINARY_PAID_GCP_OPERATION_EVIDENCE_COHORT_FLOOR)
-    if (context.profile.kind !=
-            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID or
+    if (not ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+            context.profile.kind) or
         (context.capability_cohort_epoch != gcp_cohort_floor - 1 and
          not (gcp_cohort_floor <= context.capability_cohort_epoch <=
               ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH)) or
@@ -4358,10 +4358,10 @@ def _ordinary_paid_gcp_provider_identity_from_locked_request(
         parsed_context = (
             ordinary_launch_binding.parse_bound_non_pool_launch_context(
                 request.request_body.extra_launch_context))
+        request_identity_matches = _ordinary_paid_request_identity_matches(
+            connection, association, request_row, request, context)
         if (parsed_context != context or
-                not _ordinary_paid_request_identity_matches(
-                    connection, association, request_row, request, context) or
-                _request_service_job_id(
+                not request_identity_matches or _request_service_job_id(
                     request_row, str(association['cluster_name'])) is not None):
             return None
         if (not _gcp_paid_pool_is_plain_compute(pool_identity) or
@@ -4616,8 +4616,8 @@ def record_bound_non_pool_provider_evidence(
     ) -> ordinary_launch_binding_lib.TerminalEvidence | None:
         facts, request_row, queue_row, _ = _lock_bound_request_evidence(
             connection, locked_context)
-        if (locked_context.profile.kind == ordinary_launch_binding.
-                NonPoolLaunchProfileKind.ORDINARY_PAID and
+        if (ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+                locked_context.profile.kind) and
                 evidence in (ordinary_launch_binding.ProviderEvidence.ABSENT,
                              ordinary_launch_binding.ProviderEvidence.PRESENT)):
             association = (
@@ -4699,8 +4699,8 @@ def _lock_bound_non_pool_provider_present_cleanup(
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Provider-present cleanup could not decode the exact bound '
             'request payload.') from error
-    if context.profile.kind == (
-            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+    if ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+            context.profile.kind):
         request_identity_matches = _ordinary_paid_request_identity_matches(
             connection, association, request_row, request, context)
     else:
@@ -4712,9 +4712,9 @@ def _lock_bound_non_pool_provider_present_cleanup(
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Provider-present cleanup request identity, profile, digest, or '
             'service-job result is inconsistent.')
-    if (context.profile.kind
-            == ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID
-            and _ordinary_paid_provider_payload_from_locked_request(
+    if (ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+            context.profile.kind) and
+            _ordinary_paid_provider_payload_from_locked_request(
                 connection,
                 context,
                 association,
@@ -4946,8 +4946,9 @@ def project_bound_non_pool_provider_absence(
                 'Provider absence projection requires exact terminal request '
                 'quiescence and its active retention pin.')
         terminal_evidence = _terminal_evidence(facts)
-        paid_provider_absence = (context.profile.kind == ordinary_launch_binding
-                                 .NonPoolLaunchProfileKind.ORDINARY_PAID)
+        paid_provider_absence = (
+            ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+                context.profile.kind))
         expected_payload = None
         if paid_provider_absence:
             expected_payload = _ordinary_paid_provider_payload_from_locked_request(
@@ -5042,8 +5043,9 @@ def bound_non_pool_projected_provider_absence_is_authorized(
                 return False
             facts, _, queue_row, pin_row = _lock_bound_request_evidence(
                 connection, context)
-            paid_profile = (context.profile.kind == ordinary_launch_binding.
-                            NonPoolLaunchProfileKind.ORDINARY_PAID)
+            paid_profile = (
+                ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+                    context.profile.kind))
             claim_state_is_closed = (_paid_capacity_claim_is_released(
                 connection, association) if paid_profile else
                                      _paid_capacity_claim_is_exact(
@@ -5097,8 +5099,9 @@ def retire_bound_non_pool_projected_paid_provider_absence(
                     connection, service_name, replica_id, replica_record_id))
             profile = ordinary_launch_binding.NonPoolLaunchProfileKind(
                 str(association['profile_kind']))
-            if (profile is not ordinary_launch_binding.NonPoolLaunchProfileKind.
-                    ORDINARY_PAID or not ordinary_launch_binding.
+            if (not ordinary_launch_binding.
+                    is_paid_provider_reconciliation_profile(profile) or
+                    not ordinary_launch_binding.
                     replica_has_projected_provider_absence_cleanup_marker(info)
                ):
                 return False

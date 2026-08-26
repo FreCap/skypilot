@@ -588,6 +588,8 @@ def _prepare_paid_provider_absence_graph(
     pool_key: str | None = None,
     production_http_normalization: bool = False,
     explicit_cancel: bool = False,
+    profile_kind: ordinary_launch_binding.NonPoolLaunchProfileKind = (
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID),
 ) -> _PaidProviderAbsenceGraph:
     engine, _ = bound_request_database
     if pool_key is None:
@@ -595,6 +597,33 @@ def _prepare_paid_provider_absence_graph(
     info = replica_managers.ReplicaInfo.from_storage_dict(_gc_replica_state())
     info.is_spot = True
     info.paid_capacity_pool_key = pool_key
+    replacement_authorization = None
+    if profile_kind is (ordinary_launch_binding.NonPoolLaunchProfileKind.
+                        UNKNOWN_CAPACITY_REPLACEMENT):
+        predecessor_record_id = uuid.UUID(
+            '55555555-5555-4555-8555-555555555555')
+        predecessor = replica_managers.ReplicaInfo(replica_id=2,
+                                                   cluster_name='gc-service-2',
+                                                   replica_port='8080',
+                                                   is_spot=True,
+                                                   location=None,
+                                                   version=2,
+                                                   resources_override=None)
+        predecessor.replica_record_id = str(predecessor_record_id)
+        info.unknown_capacity_replacement = True
+        replacement_authorization = (
+            ordinary_launch_binding.build_replacement_planner_authorization(
+                profile_kind,
+                dataclasses.replace(_gc_binding_authority(), binding_epoch=6),
+                predecessor_replica_id=2,
+                predecessor_record_id=str(predecessor_record_id),
+                predecessor_service_version=2,
+                observation_generation=1,
+                observation_service_version=2,
+                target_capacity=1))
+    elif profile_kind is not (
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+        raise ValueError('Test graph supports only paid reconciled profiles.')
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.replicas_table).where(
@@ -610,6 +639,35 @@ def _prepare_paid_provider_absence_graph(
             expected_binding_epoch=5,
             participant_barrier_passed=lambda _connection: True,
             legacy_requests_drained=lambda _connection: True) == 6
+        if replacement_authorization is not None:
+            connection.execute(
+                sqlalchemy.delete(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    'gc-service',
+                    serve_state_schema.replicas_table.c.replica_id == 3))
+            connection.execute(
+                sqlalchemy.insert(serve_state_schema.replicas_table), [{
+                    'service_name': 'gc-service',
+                    'replica_id': 2,
+                    'replica_state_version': 1,
+                    'status': 'READY',
+                    'version': 2,
+                    'cluster_name': 'gc-service-2',
+                    'is_spot': True,
+                    'replica_state': predecessor.to_storage_dict(),
+                    'non_pool_launch_authorization': None,
+                }, {
+                    'service_name': 'gc-service',
+                    'replica_id': 3,
+                    'replica_state_version': 1,
+                    'status': 'READY',
+                    'version': 2,
+                    'cluster_name': 'gc-service-3',
+                    'is_spot': True,
+                    'paid_capacity_pool_key': pool_key,
+                    'replica_state': info.to_storage_dict(),
+                    'non_pool_launch_authorization': replacement_authorization,
+                }])
         connection.execute(
             sqlalchemy.insert(global_user_state_schema.user_table).values(
                 id='tenant-a', name='Tenant A', created_at=int(time.time())))
@@ -646,8 +704,7 @@ def _prepare_paid_provider_absence_graph(
 
     profile = ordinary_launch_binding.resolve_non_pool_launch_profile(
         'gc-service', 3, _GC_REPLICA_RECORD_ID)
-    assert profile.kind is (
-        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    assert profile.kind is profile_kind
     launch_body = _gc_unbound_non_pool_launch_body()
     launch_body.override_skypilot_config = {
         'active_workspace': 'workspace-a',
@@ -711,21 +768,24 @@ def _prepare_paid_provider_absence_graph(
         capability_profile_set_digest=(
             built.identity.capability_profile_set_digest),
         receipt_protocol_version=built.identity.receipt_protocol_version)
-    client_token = ordinary_launch_binding.ordinary_paid_aws_client_token(
-        context)
-    if receipt is None:
-        receipt = _gc_provider_negative_ack(client_token=client_token)
-    else:
-        receipt['client_token'] = client_token
-        invocations = receipt.get('invocations')
-        assert isinstance(invocations, list)
-        for invocation in invocations:
-            assert isinstance(invocation, dict)
-            attempts = invocation.get('attempts')
-            assert isinstance(attempts, list)
-            for attempt in attempts:
-                assert isinstance(attempt, dict)
-                attempt['client_token'] = client_token
+    if profile_kind is ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID:
+        client_token = ordinary_launch_binding.ordinary_paid_aws_client_token(
+            context)
+        if receipt is None:
+            receipt = _gc_provider_negative_ack(client_token=client_token)
+        else:
+            receipt['client_token'] = client_token
+            invocations = receipt.get('invocations')
+            assert isinstance(invocations, list)
+            for invocation in invocations:
+                assert isinstance(invocation, dict)
+                attempts = invocation.get('attempts')
+                assert isinstance(attempts, list)
+                for attempt in attempts:
+                    assert isinstance(attempt, dict)
+                    attempt['client_token'] = client_token
+    elif receipt is None:
+        receipt = _gc_provider_negative_ack()
     authority = dataclasses.replace(
         _gc_binding_authority(),
         binding_epoch=6,
@@ -2893,6 +2953,156 @@ def test_gcp_paid_exact_label_absence_projects_and_releases_debits_atomically(
     assert association['resolution'] == 'PROJECTED'
     assert association['provider_evidence_payload'] == payload
     assert claim_count == pin_count == 0
+
+
+def test_gcp_paid_unknown_replacement_absence_uses_frozen_cleanup_graph(
+        bound_request_database, monkeypatch) -> None:
+    """Replacement cleanup survives predecessor/planner state advancing."""
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database,
+        monkeypatch,
+        pool_key=_gc_gcp_paid_pool_key(),
+        profile_kind=(ordinary_launch_binding.NonPoolLaunchProfileKind.
+                      UNKNOWN_CAPACITY_REPLACEMENT))
+    identity = request_postgres.bound_non_pool_gcp_provider_identity(
+        graph.context, graph.authority)
+    assert identity is not None
+
+    # Provider I/O has already happened.  The mutable predecessor is no longer
+    # launch authority and must not strand the immutable retained cleanup graph.
+    with graph.engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                'gc-service',
+                serve_state_schema.replicas_table.c.replica_id == 2))
+
+    payload = {
+        'association_id': str(graph.context.association_id),
+        'cluster_name': 'gc-service-3',
+        'create_operation_targets': {
+            'failed': [],
+            'inflight': [],
+            'succeeded': [],
+        },
+        'disk_ids': [],
+        'instance_ids': [],
+        'probe_contract': 'gcp-vm-disk-operation-presence-v1',
+        'profile_kind': 'UNKNOWN_CAPACITY_REPLACEMENT',
+        'provider_identity': identity,
+        'replica_record_id': str(_GC_REPLICA_RECORD_ID),
+        'result': 'ABSENT',
+    }
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        graph.context, graph.authority,
+        ordinary_launch_binding.ProviderEvidence.ABSENT, payload)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'gc-service'
+    manager._ordinary_launch_binding_authority = graph.authority
+    assert request_postgres.project_bound_non_pool_provider_absence(
+        graph.context,
+        graph.authority,
+        project_replica_result=lambda connection, projection: manager.
+        _project_bound_ordinary_launch(None, connection, projection))
+
+    with graph.engine.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id ==
+                  graph.context.association_id)).mappings().one()
+        claim_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table)).scalar_one()
+        pin_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.REQUEST_RETENTION_PINS)).scalar_one()
+    assert association['resolution'] == 'PROJECTED'
+    assert association['provider_evidence_payload'] == payload
+    assert claim_count == pin_count == 0
+    assert request_postgres.bound_non_pool_projected_provider_absence_is_authorized(
+        'gc-service', 3, str(_GC_REPLICA_RECORD_ID))
+    assert request_postgres.retire_bound_non_pool_projected_paid_provider_absence(
+        'gc-service', 3, str(_GC_REPLICA_RECORD_ID))
+
+
+@pytest.mark.parametrize('pool_override', [{
+    'cloud': 'aws'
+}, {
+    'use_spot': False
+}, {
+    'version': 2
+}])
+def test_paid_unknown_replacement_database_guards_reject_pool_near_misses(
+        bound_request_database, monkeypatch, pool_override) -> None:
+    """Pointer and association transitions require exact GCP v1 Spot."""
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database,
+        monkeypatch,
+        pool_key=_gc_gcp_paid_pool_key(),
+        profile_kind=(ordinary_launch_binding.NonPoolLaunchProfileKind.
+                      UNKNOWN_CAPACITY_REPLACEMENT))
+    identity = request_postgres.bound_non_pool_gcp_provider_identity(
+        graph.context, graph.authority)
+    assert identity is not None
+    payload = {
+        'association_id': str(graph.context.association_id),
+        'cluster_name': 'gc-service-3',
+        'create_operation_targets': {
+            'failed': [],
+            'inflight': [],
+            'succeeded': [],
+        },
+        'disk_ids': [],
+        'instance_ids': [],
+        'probe_contract': 'gcp-vm-disk-operation-presence-v1',
+        'profile_kind': 'UNKNOWN_CAPACITY_REPLACEMENT',
+        'provider_identity': identity,
+        'replica_record_id': str(_GC_REPLICA_RECORD_ID),
+        'result': 'ABSENT',
+    }
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        graph.context, graph.authority,
+        ordinary_launch_binding.ProviderEvidence.ABSENT, payload)
+
+    invalid_pool = json.loads(graph.pool_key)
+    invalid_pool.update(pool_override)
+    invalid_pool_key = json.dumps(invalid_pool,
+                                  sort_keys=True,
+                                  separators=(',', ':'))
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    with graph.engine.begin() as connection:
+        connection.exec_driver_sql(
+            f'ALTER TABLE {associations.name} DISABLE TRIGGER USER')
+        try:
+            connection.execute(
+                sqlalchemy.update(associations).where(
+                    associations.c.association_id ==
+                    graph.context.association_id).values(
+                        paid_capacity_pool_key=invalid_pool_key))
+        finally:
+            connection.exec_driver_sql(
+                f'ALTER TABLE {associations.name} ENABLE TRIGGER USER')
+
+    with pytest.raises(sqlalchemy.exc.DBAPIError):
+        with graph.engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name ==
+                    'gc-service',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        ordinary_launch_association_id=None))
+    with pytest.raises(sqlalchemy.exc.DBAPIError):
+        with graph.engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(associations).where(
+                    associations.c.association_id ==
+                    graph.context.association_id).values(
+                        resolution='PROJECTED',
+                        reconciliation_outcome='PROJECTED',
+                        ambiguity_code=None))
 
 
 def test_gcp_paid_identity_accepts_http_post_normalization_body(

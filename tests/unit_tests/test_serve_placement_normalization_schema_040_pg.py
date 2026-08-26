@@ -244,7 +244,7 @@ def _insert_manifest(connection: sqlalchemy.engine.Connection,
 
 
 def test_serve040_lineage_and_postgresql_only() -> None:
-    assert migration_utils.SERVE_VERSION == '060'
+    assert migration_utils.SERVE_VERSION == '061'
     assert placement_normalization_authority.RECOGNIZED_ADDITIVE_REVISIONS == (
         frozenset(f'{revision:03d}' for revision in range(40, 61)))
     sqlite = sqlalchemy.create_engine('sqlite://')

@@ -89,8 +89,8 @@ def apply_exact_provider_absence_replica_projection(
             ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
         if pool_key is not None:
             return None
-    elif (context.profile.kind ==
-          ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+    elif ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+            context.profile.kind):
         request = getattr(projection, 'request', None)
         decoded_error = decoded_request_error(getattr(request, 'error', None))
         evidence_payload = getattr(projection, 'provider_evidence_payload',
@@ -106,7 +106,17 @@ def apply_exact_provider_absence_replica_projection(
             info.service_job_id is None)
         handler_failed = status == 'FAILED' and cause == 'handler_failed'
         if probe_contract == 'gcp-vm-disk-operation-presence-v1':
-            if (not replica_shape_matches or not ordinary_launch_binding.
+            pool_identity = (paid_capacity.pool_key_payload(pool_key)
+                             if isinstance(pool_key, str) else None)
+            replacement_shape_matches = bool(
+                context.profile.kind is ordinary_launch_binding.
+                NonPoolLaunchProfileKind.ORDINARY_PAID or
+                (isinstance(pool_identity, Mapping) and
+                 pool_identity.get('cloud') == 'gcp' and
+                 pool_identity.get('version') == 1 and
+                 pool_identity.get('use_spot') is True))
+            if (not replacement_shape_matches or not replica_shape_matches or
+                    not ordinary_launch_binding.
                     ordinary_paid_provider_terminal_shape_matches(
                         status, cause, pool_key) or
                     evidence_payload.get('result') != 'ABSENT' or
@@ -137,7 +147,8 @@ def apply_exact_provider_absence_replica_projection(
                 # OTHER_FAILURE leaves the adaptive pool unchanged.
                 paid_outcome = paid_capacity.LaunchOutcome.OTHER_FAILURE
                 info.status_property.failed_spot_availability = False
-        else:
+        elif (context.profile.kind ==
+              ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
             expected_receipt = (evidence_payload.get('receipt') if isinstance(
                 evidence_payload, Mapping) else None)
             expected_cloud_name = (expected_receipt.get('cluster_name_on_cloud')
@@ -176,6 +187,8 @@ def apply_exact_provider_absence_replica_projection(
             else:
                 return None
             info.status_property.failed_spot_availability = True
+        else:
+            return None
     else:
         return None
 
@@ -367,9 +380,8 @@ def observe_provider(
         'profile_kind': context.profile.kind.value,
         'replica_record_id': str(context.replica_record_id),
     }
-    if (context.profile.kind
-            == ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID
-            and authority is not None):
+    if (ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+            context.profile.kind) and authority is not None):
         return _observe_gcp_paid_provider(context, replica_info, authority)
     if (context.profile.kind !=
             ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
@@ -497,9 +509,8 @@ def terminate_gcp_paid_provider_allocation(
     continue_guard: Callable[[], bool] | None = None,
 ) -> ProviderObservation:
     """Delete one exact GCP allocation and require fresh provider absence."""
-    if (context.profile.kind !=
-            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID or
-            not request_postgres.
+    if (not ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+            context.profile.kind) or not request_postgres.
             bound_non_pool_provider_present_cleanup_is_authorized(
                 context, authority)):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(

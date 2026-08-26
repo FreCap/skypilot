@@ -231,11 +231,16 @@ def test_profile_without_durable_provider_uid_remains_unknown(
      }, [], ordinary_launch_binding.ProviderEvidence.PRESENT),
      ({}, ['svc-3-abc-head-1234abcd-compute'
           ], ordinary_launch_binding.ProviderEvidence.PRESENT)])
+@pytest.mark.parametrize('profile_kind', [
+    ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+    ordinary_launch_binding.NonPoolLaunchProfileKind.
+    UNKNOWN_CAPACITY_REPLACEMENT
+])
 def test_gcp_paid_observation_uses_frozen_exact_label_scope(
         monkeypatch: pytest.MonkeyPatch, instances, disks,
-        expected: ordinary_launch_binding.ProviderEvidence) -> None:
-    context = _context(
-        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+        expected: ordinary_launch_binding.ProviderEvidence,
+        profile_kind: ordinary_launch_binding.NonPoolLaunchProfileKind) -> None:
+    context = _context(profile_kind)
     identity = {
         'cluster_name_on_cloud': 'svc-3-abc',
         'instance_type': 'g2-standard-4',
@@ -272,6 +277,7 @@ def test_gcp_paid_observation_uses_frozen_exact_label_scope(
         context, types.SimpleNamespace(cluster_name='svc-3'), 'authority')
 
     assert observed.evidence is expected
+    assert observed.payload['profile_kind'] == profile_kind.value
     assert observed.payload['provider_identity'] == identity
     assert observed.payload['instance_ids'] == sorted(instances)
     assert observed.payload['disk_ids'] == disks
@@ -394,10 +400,15 @@ def test_gcp_paid_observation_fails_closed_without_frozen_project(
         'reason'] == 'missing-immutable-gcp-provider-identity'
 
 
+@pytest.mark.parametrize('profile_kind', [
+    ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+    ordinary_launch_binding.NonPoolLaunchProfileKind.
+    UNKNOWN_CAPACITY_REPLACEMENT
+])
 def test_gcp_paid_present_cleanup_deletes_disks_and_waits_for_combined_absence(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    context = _context(
-        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+        monkeypatch: pytest.MonkeyPatch,
+        profile_kind: ordinary_launch_binding.NonPoolLaunchProfileKind) -> None:
+    context = _context(profile_kind)
     replica = types.SimpleNamespace(cluster_name='svc-3')
     identity = {
         'cluster_name_on_cloud': 'svc-3-abc',
@@ -567,6 +578,63 @@ def test_gcp_exact_absence_preserves_typed_provider_failure(code, expected):
 
     assert result is not None
     assert result.paid_capacity_outcome is expected
+    assert status_property.failed_spot_availability is True
+
+
+def test_gcp_paid_unknown_replacement_exact_absence_is_projectable() -> None:
+    context = _context(ordinary_launch_binding.NonPoolLaunchProfileKind.
+                       UNKNOWN_CAPACITY_REPLACEMENT)
+    pool_key = json.dumps(
+        {
+            'accelerators': [['l4', 1]],
+            'cloud': 'gcp',
+            'instance_type': 'g2-standard-4',
+            'num_nodes': 1,
+            'region': 'us-east4',
+            'use_spot': True,
+            'version': 1,
+            'workspace': 'workspace-a',
+            'zone': 'us-east4-a',
+        },
+        sort_keys=True,
+        separators=(',', ':'))
+    status_property = types.SimpleNamespace(
+        sky_launch_status=reconciliation.common_utils.ProcessStatus.FAILED,
+        failed_spot_availability=False)
+    info = types.SimpleNamespace(paid_capacity_pool_key=pool_key,
+                                 is_spot=True,
+                                 is_zero_cost=False,
+                                 reserved_fill=False,
+                                 service_job_id=None,
+                                 status_property=status_property)
+    projection = types.SimpleNamespace(
+        provider_evidence=ordinary_launch_binding.ProviderEvidence.ABSENT,
+        provider_evidence_payload={
+            'probe_contract': 'gcp-vm-disk-operation-presence-v1',
+            'result': 'ABSENT',
+            'instance_ids': [],
+            'disk_ids': [],
+            'create_operation_targets': {
+                'failed': [],
+                'inflight': [],
+                'succeeded': [],
+            },
+        },
+        context=context,
+        pre_effect_terminal=False,
+        service_job_id=None,
+        locked_replica_info=info,
+        paid_capacity_pool_key=pool_key,
+        request=types.SimpleNamespace(error=None),
+        status=types.SimpleNamespace(value='FAILED'),
+        cause=types.SimpleNamespace(value='handler_failed'))
+
+    result = reconciliation.apply_exact_provider_absence_replica_projection(
+        projection)
+
+    assert result is not None
+    assert result.paid_capacity_pool_key == pool_key
+    assert result.paid_capacity_outcome is paid_capacity.LaunchOutcome.OTHER_FAILURE
     assert status_property.failed_spot_availability is True
 
 

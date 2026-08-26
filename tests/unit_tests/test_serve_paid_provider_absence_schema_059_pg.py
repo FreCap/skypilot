@@ -239,10 +239,10 @@ def test_serve059_lineage_and_runtime_metadata() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['060']
+    assert scripts.get_heads() == ['061']
     assert scripts.get_revision('060').down_revision == '059'
     assert scripts.get_revision('059').down_revision == '058'
-    assert migration_utils.SERVE_VERSION == '060'
+    assert migration_utils.SERVE_VERSION == '061'
     assert migration_utils.serve_target_version(sqlite) == '037'
 
     constraint = next(
