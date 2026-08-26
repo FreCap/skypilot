@@ -4477,9 +4477,9 @@ def test_serve057_is_linear_postgresql_only_predecessor() -> None:
     config = migration_utils.get_alembic_config(sqlite,
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
-    assert scripts.get_heads() == ['060']
+    assert scripts.get_heads() == ['061']
     assert scripts.get_revision('057').down_revision == '056'
-    assert migration_utils.SERVE_VERSION == '060'
+    assert migration_utils.SERVE_VERSION == '061'
     assert migration_utils.serve_target_version(sqlite) == '037'
     with pytest.raises(RuntimeError, match='PostgreSQL-only'):
         alembic_command.upgrade(config, '057')

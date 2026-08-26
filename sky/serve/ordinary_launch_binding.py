@@ -153,6 +153,19 @@ class NonPoolLaunchProfileKind(str, enum.Enum):
     SYSTEM_OOM_RECOVERY = 'SYSTEM_OOM_RECOVERY'
 
 
+def is_paid_provider_reconciliation_profile(
+        kind: NonPoolLaunchProfileKind) -> bool:
+    """Whether a profile may use exact paid-provider reconciliation.
+
+    This is a capability classification, not authority by itself.  Every
+    caller must still prove the exact paid claim, request identity, terminal
+    executor quiescence, and provider-specific identity.  Replacement profiles
+    are supported only by the GCP VM/disk/operation evidence path.
+    """
+    return kind in (NonPoolLaunchProfileKind.ORDINARY_PAID,
+                    NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT)
+
+
 class NonPoolLaunchAuthorizationKind(str, enum.Enum):
     """Planner-owned authority referenced by a non-pool launch profile."""
 
@@ -761,7 +774,11 @@ ordinary_launch_associations_table = sqlalchemy.Table(
         "provider_evidence = 'ABSENT' AND "
         "provider_evidence_observed_at >= execution_quiesced_at) OR "
         "(binding_protocol_version = 2 AND "
-        "profile_kind = 'ORDINARY_PAID' AND "
+        "(profile_kind = 'ORDINARY_PAID' OR "
+        "(profile_kind = 'UNKNOWN_CAPACITY_REPLACEMENT' AND "
+        "paid_capacity_pool_key::jsonb ->> 'cloud' = 'gcp' AND "
+        "paid_capacity_pool_key::jsonb ->> 'version' = '1' AND "
+        "paid_capacity_pool_key::jsonb ->> 'use_spot' = 'true')) AND "
         "reconciliation_outcome = 'PROJECTED' AND "
         "provider_evidence = 'ABSENT' AND "
         "execution_quiesced_at IS NOT NULL AND "
@@ -5826,9 +5843,18 @@ def _replica_free_association_is_inert(association: Mapping[str, Any],) -> bool:
                             EffectPhase.SERVICE_JOB_IO) or
                     association.get('paid_capacity_pool_key') is not None):
                 return False
-        elif profile.kind is NonPoolLaunchProfileKind.ORDINARY_PAID:
+        elif is_paid_provider_reconciliation_profile(profile.kind):
             pool_key = association.get('paid_capacity_pool_key')
-            if (effect_phase is not EffectPhase.PROVIDER_IO or
+            pool_identity = (paid_capacity.pool_key_payload(pool_key)
+                             if isinstance(pool_key, str) else None)
+            replacement_shape_matches = bool(
+                profile.kind is NonPoolLaunchProfileKind.ORDINARY_PAID or
+                (isinstance(pool_identity, Mapping) and
+                 pool_identity.get('cloud') == 'gcp' and
+                 pool_identity.get('version') == 1 and
+                 pool_identity.get('use_spot') is True))
+            if (not replacement_shape_matches or
+                    effect_phase is not EffectPhase.PROVIDER_IO or
                     not ordinary_paid_provider_terminal_shape_matches(
                         terminal_status, terminal_cause, pool_key) or
                     not isinstance(pool_key, str) or not pool_key):
@@ -5881,7 +5907,7 @@ def _replica_free_association_is_inert(association: Mapping[str, Any],) -> bool:
             isinstance(evidence_digest, str) and
             _SHA256_RE.fullmatch(evidence_digest) is not None):
         return False
-    if (profile.kind is NonPoolLaunchProfileKind.ORDINARY_PAID and
+    if (is_paid_provider_reconciliation_profile(profile.kind) and
             provider_evidence is ProviderEvidence.ABSENT):
         try:
             expected_payload, expected_digest = (
@@ -6734,8 +6760,8 @@ def provider_absence_projection_authority_in_connection(
     lifecycle, service, replica, association = _lock_effect_rows(
         connection,
         context,
-        require_paid_claim=(profile_kind is
-                            NonPoolLaunchProfileKind.ORDINARY_PAID))
+        require_paid_claim=is_paid_provider_reconciliation_profile(
+            profile_kind))
     _validate_effect_rows(lifecycle,
                           service,
                           replica,
@@ -6753,9 +6779,18 @@ def provider_absence_projection_authority_in_connection(
             in (EffectPhase.NOT_STARTED.value, EffectPhase.PROVIDER_IO.value,
                 EffectPhase.SERVICE_JOB_IO.value) and
             association['paid_capacity_pool_key'] is None)
-    elif profile_kind is NonPoolLaunchProfileKind.ORDINARY_PAID:
+    elif is_paid_provider_reconciliation_profile(profile_kind):
         pool_key = association['paid_capacity_pool_key']
+        pool_identity = (paid_capacity.pool_key_payload(pool_key) if isinstance(
+            pool_key, str) else None)
+        replacement_shape_matches = bool(
+            profile_kind is NonPoolLaunchProfileKind.ORDINARY_PAID or
+            (isinstance(pool_identity, Mapping) and
+             pool_identity.get('cloud') == 'gcp' and
+             pool_identity.get('version') == 1 and
+             pool_identity.get('use_spot') is True))
         shape_matches = bool(
+            replacement_shape_matches and
             association['effect_phase'] == EffectPhase.PROVIDER_IO.value and
             isinstance(pool_key, str) and pool_key and
             association['service_job_id'] is None and
@@ -6788,17 +6823,24 @@ def provider_absence_projection_authority_in_connection(
                 info.reserved_fill is not False or info.paid_capacity_pool_key
                 != association['paid_capacity_pool_key']):
             raise OrdinaryLaunchBindingConflict(
-                'Ordinary-paid provider absence lost its exact Spot profile.')
+                'Paid-provider absence lost its exact Spot profile.')
         if expected_provider_evidence_payload is None:
             raise OrdinaryLaunchBindingConflict(
-                'Ordinary-paid provider absence requires a freshly extracted '
+                'Paid-provider absence requires a freshly extracted '
                 'locked-request receipt.')
-        _validate_profile_authority_in_connection(
-            connection,
-            service,
-            replica,
-            context.profile,
-            validate_paid_provider_start=False)
+        # A replacement's predecessor/observation is mutable planner state and
+        # may legitimately change after provider I/O.  Cleanup instead relies
+        # on the immutable admitted association/profile, exact replica snapshot,
+        # paid claim, retained request, pin, and quiescence receipt validated by
+        # this transaction.  Ordinary paid has no predecessor and retains its
+        # historical profile revalidation.
+        if profile_kind is NonPoolLaunchProfileKind.ORDINARY_PAID:
+            _validate_profile_authority_in_connection(
+                connection,
+                service,
+                replica,
+                context.profile,
+                validate_paid_provider_start=False)
         expected_payload, expected_digest = _ordinary_paid_provider_evidence(
             association,
             info.cluster_name,
@@ -6978,6 +7020,15 @@ def _ordinary_paid_provider_evidence(
     evidence_payload: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Validate one canonical exact paid-provider evidence envelope."""
+    try:
+        profile_kind = NonPoolLaunchProfileKind(
+            str(association.get('profile_kind')))
+    except ValueError as error:
+        raise OrdinaryLaunchBindingConflict(
+            'Paid-provider evidence has an unknown profile kind.') from error
+    if not is_paid_provider_reconciliation_profile(profile_kind):
+        raise OrdinaryLaunchBindingConflict(
+            'Profile does not authorize paid-provider evidence.')
     candidate_payload = (association.get('provider_evidence_payload')
                          if evidence_payload is None else evidence_payload)
     if not isinstance(candidate_payload, Mapping):
@@ -7044,7 +7095,7 @@ def _ordinary_paid_provider_evidence(
             'disk_ids': disk_ids,
             'instance_ids': instance_ids,
             'probe_contract': 'gcp-vm-disk-operation-presence-v1',
-            'profile_kind': NonPoolLaunchProfileKind.ORDINARY_PAID.value,
+            'profile_kind': profile_kind.value,
             'provider_identity': expected_identity,
             'replica_record_id': str(association['replica_record_id']),
             'result': evidence.value,
@@ -7060,7 +7111,8 @@ def _ordinary_paid_provider_evidence(
         })
         return payload, digest
 
-    if evidence is not ProviderEvidence.ABSENT:
+    if (profile_kind is not NonPoolLaunchProfileKind.ORDINARY_PAID or
+            evidence is not ProviderEvidence.ABSENT):
         raise OrdinaryLaunchBindingConflict(
             'Ordinary-paid negative acknowledgement must prove absence.')
     receipt = candidate_payload.get('receipt')
@@ -7208,8 +7260,8 @@ def provider_presence_cleanup_authority_in_connection(
     lifecycle, service, replica, association = _lock_effect_rows(
         connection,
         context,
-        require_paid_claim=(profile_kind is
-                            NonPoolLaunchProfileKind.ORDINARY_PAID))
+        require_paid_claim=is_paid_provider_reconciliation_profile(
+            profile_kind))
     _validate_effect_rows(lifecycle,
                           service,
                           replica,
@@ -7228,7 +7280,7 @@ def provider_presence_cleanup_authority_in_connection(
                              in (EffectPhase.PROVIDER_IO.value,
                                  EffectPhase.SERVICE_JOB_IO.value) and
                              association['paid_capacity_pool_key'] is None)
-    elif profile_kind is NonPoolLaunchProfileKind.ORDINARY_PAID:
+    elif is_paid_provider_reconciliation_profile(profile_kind):
         pool_key = association['paid_capacity_pool_key']
         pool_identity = (paid_capacity.pool_key_payload(pool_key) if isinstance(
             pool_key, str) else None)
@@ -7280,12 +7332,15 @@ def provider_presence_cleanup_authority_in_connection(
                 != association['paid_capacity_pool_key']):
             raise OrdinaryLaunchBindingConflict(
                 'Provider-present cleanup lost its exact paid GCP profile.')
-        _validate_profile_authority_in_connection(
-            connection,
-            service,
-            replica,
-            context.profile,
-            validate_paid_provider_start=False)
+        # Do not re-consult a replacement predecessor after provider I/O; the
+        # frozen cleanup graph above is the non-authorizing settlement proof.
+        if profile_kind is NonPoolLaunchProfileKind.ORDINARY_PAID:
+            _validate_profile_authority_in_connection(
+                connection,
+                service,
+                replica,
+                context.profile,
+                validate_paid_provider_start=False)
         expected_payload, expected_digest = _ordinary_paid_provider_evidence(
             association, info.cluster_name, ProviderEvidence.PRESENT)
     if association['provider_evidence_payload'] != expected_payload:
@@ -7356,9 +7411,18 @@ def _validate_projected_provider_absence_retirement_locked_rows(
             association, info, ProviderEvidence.ABSENT)
         _validate_reserved_fill_cleanup_profile_in_connection(
             connection, service, replica, profile)
-    elif profile.kind is NonPoolLaunchProfileKind.ORDINARY_PAID:
+    elif is_paid_provider_reconciliation_profile(profile.kind):
         pool_key = association['paid_capacity_pool_key']
-        if (association['effect_phase'] != EffectPhase.PROVIDER_IO.value or
+        pool_identity = (paid_capacity.pool_key_payload(pool_key) if isinstance(
+            pool_key, str) else None)
+        replacement_shape_matches = bool(
+            profile.kind is NonPoolLaunchProfileKind.ORDINARY_PAID or
+            (isinstance(pool_identity, Mapping) and
+             pool_identity.get('cloud') == 'gcp' and
+             pool_identity.get('version') == 1 and
+             pool_identity.get('use_spot') is True))
+        if (not replacement_shape_matches or
+                association['effect_phase'] != EffectPhase.PROVIDER_IO.value or
                 not isinstance(pool_key, str) or not pool_key or
                 not ordinary_paid_provider_terminal_shape_matches(
                     association['terminal_status'],
