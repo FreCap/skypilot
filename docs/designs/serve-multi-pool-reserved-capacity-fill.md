@@ -424,12 +424,17 @@ binding transaction to create its association, immutable API request, queue
 row, and retention pin. Queue visibility at that later commit is intentional
 executor activation. The provider guard still exact-matches the complete
 replica, claim, binding, request, and execution authority before its first
-effect. A crash or lost commit acknowledgement between the two phases leaves
-inert state, never provider authority. In-process recovery exact-matches only
-the ambiguous frozen identities after releasing the manager lock; startup
-recovery enumerates them after process death. Both atomically retire and replan
-association-less replica+claim pairs, adopt an exact association if binding
-won the race, and infer no historical batch manifest.
+effect. Fresh complete current load-balancer reports authorize the prospective
+paid debit, not a second post-commit lease: report expiry, ingestion blackout,
+or HA-role heartbeat advancement cannot revoke the exact committed graph's one
+provider effect. The guard still requires an unexpired current route head and
+matching lifecycle, source epochs, owner, plan integrity, and bounded debit. A
+crash or lost commit acknowledgement between the two phases leaves inert state,
+never provider authority. In-process recovery exact-matches only the ambiguous
+frozen identities after releasing the manager lock; startup recovery enumerates
+them after process death. Both atomically retire and replan association-less
+replica+claim pairs, adopt an exact association if binding won the race, and
+infer no historical batch manifest.
 
 The current `1.1.1510` deployment implements the atomic batch and accepts
 semantic-equivalent HA heartbeat advancement. Its first repeat exposed a later
@@ -642,11 +647,13 @@ missing telemetry.
    request generation, worker, and provider token fence every side effect.
 9. **Fresh authority:** stale, incomplete, malformed, unknown-version, or
    owner-mismatched evidence authorizes no effect that depends on that evidence
-   dimension. Stale occupancy authorizes no retirement, drain, teardown, or
-   capacity release, but does not revoke additive work backed by independently
-   fresh demand and route evidence while unknown supply remains protected. A
-   newer heartbeat receipt is fresh only when the current locked reporter set
-   and generation are self-consistent and its normalized demand is
+   dimension. Fresh load-balancer reports are required to create a prospective
+   paid debit; after that atomic commit they are no longer an evidence dimension
+   for its one provider effect. Stale occupancy authorizes no retirement, drain,
+   teardown, or capacity release, but does not revoke additive work backed by
+   independently fresh demand and route evidence while unknown supply remains
+   protected. A newer heartbeat receipt is fresh only when the current locked
+   reporter set and generation are self-consistent and its normalized demand is
    semantic-equivalent to the immutable plan; byte identity with the older
    receipt watermark is neither required nor sufficient.
 10. **No slow lock:** blocking provider, HTTP, URL-resolution, Kubernetes, SSH,
@@ -749,8 +756,11 @@ forward. Do not demote authority, restore old database rows, or roll back to a
 binary that cannot decode the current head.
 
 The safe failure mode is underfill: stale or unavailable authority suppresses
-new reserved and paid provider effects while already healthy coherent routes
-continue serving. It is never duplicate capacity or on-demand spill.
+new reserved admissions and prospective paid debits while already healthy
+coherent routes continue serving. An exact paid debit that already committed
+may perform only its one graph-fenced provider effect while its independently
+required current route head remains fresh. It is never duplicate capacity or
+on-demand spill.
 
 ## Verification plan
 
@@ -767,6 +777,11 @@ continue serving. It is never duplicate capacity or on-demand spill.
   Repeat with fresh-zero, queue, rejection, in-flight, compatibility, reporter,
   and route changes and prove the complete batch rolls back with zero rows,
   claims, waiters, or pool debits.
+- After an exact paid claim commits, expire or remove every demand report and
+  prove its bound request may enter provider I/O once while a prospective claim
+  still fails closed. Repeat with an ACTIVE-slot/cutover-generation mismatch.
+  In both cases an expired or owner-mismatched current route head must still
+  reject the committed request before provider I/O.
 - Prove no blocking provider/HTTP/URL/Kubernetes/SSH/join/cancel call occurs
   under the manager lock with deterministic race tests; allow only the short
   PostgreSQL reread/CAS critical sections the reducer requires.

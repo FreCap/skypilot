@@ -1206,7 +1206,6 @@ def _wait_for_bound_ordinary_launch(
     launch_request_id = server_common.RequestId[tuple[int | None,
                                                       backends.ResourceHandle |
                                                       None]](request_id)
-    result_box: list[Any] = []
     parent_context = context.get()
 
     def _wait_exact_request() -> None:
@@ -1215,13 +1214,15 @@ def _wait_for_bound_ordinary_launch(
             api_auth_token_provider is not None else contextlib.nullcontext())
         with context.initialize(parent_context), api_auth_context:
             if stream_logs:
-                result_box.append(sdk.stream_and_get(launch_request_id))
+                sdk.stream_and_get(launch_request_id)
             else:
-                result_box.append(sdk.get(launch_request_id))
+                sdk.get(launch_request_id)
 
-    # The exact SDK wait preserves typed results/errors and the normal log
-    # stream. Keeping it in a daemon child lets controller replacement detach
-    # promptly without cancelling the durable request it just handed off.
+    # The exact SDK wait preserves the normal log stream.  Its process-local
+    # result is deliberately non-authoritative: the PostgreSQL reducer below
+    # owns terminal result/error interpretation.  Keeping the wait in a daemon
+    # child lets controller replacement detach promptly without cancelling the
+    # durable request it just handed off.
     exact_waiter = thread_utils.SafeThread(
         target=_wait_exact_request,
         name=f'replica-{replica_id}-bound-request-wait',
@@ -1237,22 +1238,18 @@ def _wait_for_bound_ordinary_launch(
             return
         exact_waiter.join(timeout=_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
     exact_waiter.join()
-    exact_error = exact_waiter.exception
-    launch_result = result_box[0] if result_box else None
-    if exact_error is None:
-        result_is_exact = False
-        if isinstance(launch_result, tuple) and len(launch_result) == 2:
-            service_job_id, handle = launch_result  # pylint: disable=unpacking-non-sequence
-            result_is_exact = bool(
-                not isinstance(service_job_id, bool) and
-                isinstance(service_job_id, int) and service_job_id > 0 and
-                isinstance(handle, backends.CloudVmRayResourceHandle) and
-                handle.cluster_name == cluster_name)
-        if not result_is_exact:
-            exact_error = _BoundOrdinaryLaunchUnresolvedError(
-                f'Bound request {request_id} returned a malformed or '
-                f'mismatched result for replica {replica_id}.')
-    _reduce_until_wait_or_terminal(launch_result, exact_error)
+    if _reduce_until_wait_or_terminal() == 'TERMINAL':
+        return
+
+    # The SDK waiter is only a convenience for log streaming; PostgreSQL
+    # remains the launch lifecycle authority.  A transport failure or retry
+    # transition can end that waiter while the exact durable request is still
+    # active.  Keep owning and reducing the bound request instead of letting
+    # the caller mistake the finished local thread for a projected launch.
+    while True:
+        time.sleep(_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
+        if _reduce_until_wait_or_terminal() == 'TERMINAL':
+            return
 
 
 @context.contextual
@@ -14433,9 +14430,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                         replica_id)
                     continue
                 if unresolved:
-                    if (remaining is not None and
-                            _bound_projection_classification(remaining)
-                            == 'AMBIGUOUS'):
+                    remaining_classification = (
+                        None if remaining is None else
+                        _bound_projection_classification(remaining))
+                    if remaining_classification == 'AMBIGUOUS':
+                        assert remaining is not None
                         cleanup_context = (
                             self.
                             _bound_non_pool_provider_present_cleanup_context(
@@ -14464,6 +14463,40 @@ class SkyPilotReplicaManager(ReplicaManager):
                             'Retaining finished bound ordinary-launch worker '
                             'for replica %s: its exact association is durably '
                             'ambiguous (%s).', replica_id, t.exception)
+                        continue
+                    if remaining_classification in ('ADOPT_ACTIVE',
+                                                    'WAIT_QUIESCENCE'):
+                        assert remaining is not None
+                        # The local waiter is finished, but PostgreSQL still
+                        # owns one exact request generation.  Replace the dead
+                        # marker with an association-bound adopter.  Re-driving
+                        # admission here cannot retire an unsettled association
+                        # and re-inserting the dead worker would permanently
+                        # hide it from the unowned-launch reconciler below.
+                        legacy_runtime.launch_thread_pool.pop(replica_id)
+                        legacy_runtime.replica_to_request_id.pop(replica_id)
+                        legacy_runtime.replica_to_logical_launch_fence.pop(
+                            replica_id)
+                        try:
+                            adopted = self._install_bound_launch_adopter(
+                                info, remaining.context, start=True)
+                        except Exception as error:  # pylint: disable=broad-except
+                            logger.warning(
+                                'Could not replace finished bound launch '
+                                'worker for replica %s with its exact durable '
+                                'adopter: %s', replica_id,
+                                common_utils.format_exception(error))
+                        else:
+                            if adopted:
+                                logger.info(
+                                    'Replaced finished bound launch worker for '
+                                    'replica %s with its exact durable adopter '
+                                    '(%s).', replica_id,
+                                    remaining_classification)
+                        # If construction failed, leave the dead marker detached
+                        # so _reconcile_unowned_bound_non_pool_launches() can
+                        # retry from the same durable pointer in this refresh or
+                        # a later one.
                         continue
                     # A transport failure can happen before admission commits,
                     # or after a commit whose response was lost.  Replace the
