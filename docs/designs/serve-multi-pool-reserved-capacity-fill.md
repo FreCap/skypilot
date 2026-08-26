@@ -18,8 +18,16 @@ bounded provider-lifecycle stimulus, not model-serving or terminal-ledger
 evidence. The compact immutable record is in the
 [Spot lifecycle evidence bundle](evidence/skyserve-gcp-spot-lifecycle-2026-08-26/README.md).
 The PHX candidate, final mixed reserved-plus-paid load campaign, terminal
-request reconciliation, and UI proof remain open. PHX continues to use only
-its existing externally owned Kueue lane without changing scheduler policy.
+request reconciliation, and UI proof remain open. A clean lifecycle-116
+service now includes PHX and continues to use only its existing externally
+owned Kueue lane without changing scheduler policy. Its first production fill
+exposed a claim-heartbeat ordering defect: pruning and overlap reads ran after
+a five-second reclaim authorization was minted, so ordinary PostgreSQL delay
+could expire valid authority and force the next actuation wave to wait for a
+new claim generation. The steady-state lock order is therefore
+``broker fence -> prune/overlap -> mint exact authorization -> locked
+revalidation/write``. No nonessential work may run after the short-lived
+authorization is minted.
 
 This file is the canonical living design. It describes the current contract,
 the latest production evidence, and only the gates that remain. Historical
@@ -59,9 +67,10 @@ it has merged or been deployed.
 | Deployed control plane | SkyPilot `1.1.1513`, Helm revision 635 after qualification revision 634. API, controller, and executor roles all use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:837be5d44a58e167fd7aaa906d65c2681f6e5c6bbefd54d76cd0bf6ba24dfec1`; chart digest is `sha256:d84303e4eab868127949d068f45e93f87ea800c214af0be5445021b44f38d4bb`. Helm storage remains disabled and the namespace has no PVC. |
 | Writer protocol | Public API 93, worker projection 10, non-pool capability cohort 12, and async request-ledger protocol 1. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. |
-| Active service | Absent after normal teardown of qualification lifecycle 115. No executor restart, direct provider deletion, or database-row deletion was required. The Kubernetes load-balancer objects disappeared with the service. |
+| Active service | Clean lifecycle 116, version 1, incarnation `f241559a-8ca6-4951-931c-377b388267f6` is active with `DURABLE_FEED`/`DURABLE_INTENT`, East A100/A100-80GB plus PHX H200, and `max_live_paid_gpu_units: 0` for the reserved-only qualification. It was recreated from the canonical service definition rather than migrated. |
 | Reserved occupancy | The 2026-08-25 23:30 UTC East census found all 328 healthy compatible physical GPUs allocated: research requested 156 and `boltz-l4-fleet` requested the remaining 172. PostgreSQL independently had 172/172 reserved replicas `READY`; compatible free capacity was therefore zero. At 23:38 UTC Kubernetes then recorded exactly 128 distinct SkyPilot Pod preemptions by 16 higher-priority research Pods of eight GPUs each. SkyPilot correctly yielded from 172 to 44 rather than blocking research. As ten short-lived preemptors exited, authenticated observations and allocations advanced in bounded waves from 44 to the exact compatible remainder of 132 (77 A100-80GB and 55 A100), reaching 132/132 `READY` at 2026-08-26 00:01:55 UTC with zero paid capacity. Together with the 188 research GPU requests, that occupied all 320 GPUs on the 40 then-healthy GPU nodes. A later exact 00:29 UTC census found 41 healthy GPU nodes and 328 allocatable GPUs, with 188 requested by `hyperpod-ns-research`, 140 running SkyPilot workers, and no pending SkyPilot worker; PostgreSQL independently reported the same 140 reserved replicas `READY`. Thus newly exposed capacity refilled automatically and all 328 GPUs were again occupied with zero paid capacity. This proves reclaim correctness and 100% eventual refill, while exposing a roughly 24-minute worst observed refill horizon that the provider-phase and bounded-admission work must reduce. |
-| PHX | Excluded from the live service definition, so it currently contributes zero. The 2026-08-25 23:40 UTC physical census found 512 healthy schedulable H200 GPUs, 355 requested by research, and 157 physically free. The bounded SkyPilot identity deliberately cannot list other tenants' Kueue Workloads, so physical freedom is not treated as scheduler admission. Live server-mode readback of PostgreSQL config identity revision 4 resolved the exact `boltz-research/be` projection, priority and worker identity. A read-only cluster read at 2026-08-26 00:18 UTC confirmed the unchanged `research-be` ClusterQueue is active, has zero nominal H200 quota, may borrow at most 512 H200 GPUs from `shared-pool`, uses `BestEffortFIFO`, and permits only lower-priority reclaim/preemption; its current admission and reservation counts were zero. The existing `boltz-research/be -> research-be` lane is ready for service-only activation; each exact Kueue admission remains the final authority. Its unchanged reclaim policy is conditional, not a guarantee that every research class immediately reclaims every fill admission. |
+| PHX | Active only through the unchanged `boltz-research/be -> research-be` lane. At 19:27 UTC PHX had 512 healthy schedulable H200 GPUs, research used 450, and the unchanged Kueue configuration exposed 62 slots. All first 15 SkyPilot one-GPU Workloads were admitted and Running, `research-be` had zero pending GPU Workloads, and 47 GPUs remained admissible but unused. The durable allocation independently granted 62. The remaining gap was upstream SkyPilot actuation: of the first 39 H200 intents, 15 committed, 20 expired before materialization, and four were deferred by the broker persist fence. This is not a Kueue-policy or GPU-availability blocker. |
+| Claim-heartbeat convergence defect | Production logs show successful exact reclaim-policy proofs followed 7--15 seconds later by rejected claim-set heartbeats. The five-second ticket was minted before prune/overlap work, and the same global broker fence caused concurrent nonblocking materializations to return `replica_commit_deferred`; intents that exhausted their roughly three-minute authority window became `grant_expired` without a provider effect. The correction preserves the existing fence and five-second bound, performs prune/overlap first, mints authority last, and changes neither Kueue nor TTL/batch/quantum limits. Production requalification remains open. |
 | PHX access | The controller identity can exact-read the required namespace/queue and manage only worker Pod/Service lifecycle; it cannot list or patch ClusterQueues. The worker ServiceAccount is tokenless and cannot read Pods, queues, or secrets. A historical audit-only group still has an unused broad Kueue LIST grant from platform PR #8800; it is read-only, has no scheduling effect, and is not used or expanded by this rollout. |
 | Paid state at idle | At 18:35:39.315 UTC the service was absent with zero paid rows, claims, waiters, matching GCP VMs, and attributable managed disks. Guard samples at 18:35:39.315, 18:36:19.373, and 18:36:57.577 UTC remained exact zero; independent all-state PostgreSQL and GCP-native censuses agreed before and after the post-test Helm rollout. No current provider billing remains for this service. |
 | Routing and queue | The disposable load-balancer pair was removed with the service and no matching Kubernetes object remains. The lifecycle-115 run attempted all 10,000 stable synthetic IDs at concurrency 256, but used them only as bounded provider-scale stimulus; it is not the separate 10,000-terminal-request ledger proof. A fresh nonzero queued/processing/in-flight/completed UI proof remains part of the final heterogeneous load run. |
@@ -780,6 +789,10 @@ on-demand spill.
 - Prove no blocking provider/HTTP/URL/Kubernetes/SSH/join/cancel call occurs
   under the manager lock with deterministic race tests; allow only the short
   PostgreSQL reread/CAS critical sections the reducer requires.
+- Advance monotonic time by more than one complete claim-authorization
+  lifetime during broker-lock admission and again during prune/overlap work;
+  prove the policy ticket is minted only after both and is accepted by the
+  exact locked PostgreSQL replacement without weakening its five-second bound.
 - Prove a stale same-numeric-ID completion causes zero row, placement, paid,
   route, or cleanup side effects.
 - Let selected occupancy expire while demand and route reports remain fresh;

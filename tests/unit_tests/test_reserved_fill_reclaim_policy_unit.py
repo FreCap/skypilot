@@ -1051,6 +1051,11 @@ def _replace_claim_set(claim_authorization_executor=None,) -> int | None:
         claim_authorization_executor=(claim_authorization_executor))
 
 
+def _stub_claim_preflight(monkeypatch) -> None:
+    monkeypatch.setattr(broker, '_prune_claims', lambda *_args: [])
+    monkeypatch.setattr(broker, '_claim_rows', lambda *_args: [])
+
+
 @pytest.mark.parametrize('failure_kind', ['missing-identity', 'missing-policy'])
 def test_sequenced_claim_without_complete_policy_releases_broker_lock(
         monkeypatch, failure_kind):
@@ -1087,6 +1092,7 @@ def test_sequenced_claim_without_complete_policy_releases_broker_lock(
     monkeypatch.setattr(broker.locks, 'get_lock', get_lock)
     monkeypatch.setattr(broker, 'get_protocol_version',
                         lambda: broker.PROTOCOL_V2)
+    _stub_claim_preflight(monkeypatch)
 
     assert _replace_claim_set(mock.Mock()) is None
     get_lock.assert_called_once_with(constants.RESERVED_FILL_BROKER_LOCK_ID)
@@ -1123,6 +1129,7 @@ def test_sequenced_claim_policy_identity_mismatch_releases_broker_lock(
     monkeypatch.setattr(broker.locks, 'get_lock', get_lock)
     monkeypatch.setattr(broker, 'get_protocol_version',
                         lambda: broker.PROTOCOL_V2)
+    _stub_claim_preflight(monkeypatch)
 
     assert _replace_claim_set(mock.Mock()) is None
     authorize.assert_called_once()
@@ -1130,7 +1137,7 @@ def test_sequenced_claim_policy_identity_mismatch_releases_broker_lock(
     assert events == ['broker-lock-enter', 'broker-lock-exit']
 
 
-def test_sequenced_claim_authorization_is_issued_after_broker_lock_admission(
+def test_sequenced_claim_authorization_is_issued_after_broker_preflight(
         monkeypatch):
     gate = _gate(sequenced=True)
     _install_gate(monkeypatch, gate)
@@ -1185,20 +1192,31 @@ def test_sequenced_claim_authorization_is_issued_after_broker_lock_admission(
             now_monotonic=monotonic[0])
         return 7
 
+    def _prune(*_args):
+        events.append('prune')
+        # Model the production regression: database maintenance after ticket
+        # issuance consumed more than the complete ticket lifetime.
+        monotonic[0] += reclaim.AUTHORIZATION_MAX_AGE_SECONDS + 1
+        return []
+
+    def _claims(*_args):
+        events.append('claims')
+        return []
+
     monkeypatch.setattr(broker, '_authorize_reclaim_claim_set_in_boundary',
                         _authorize)
     monkeypatch.setattr(broker.locks, 'get_lock', _get_lock)
     monkeypatch.setattr(broker, 'get_protocol_version',
                         lambda: broker.PROTOCOL_V2)
-    monkeypatch.setattr(broker, '_prune_claims', lambda *_args: [])
-    monkeypatch.setattr(broker, '_claim_rows', lambda *_args: [])
+    monkeypatch.setattr(broker, '_prune_claims', _prune)
+    monkeypatch.setattr(broker, '_claim_rows', _claims)
     monkeypatch.setattr(serve_state, 'replace_reserved_fill_claim_set',
                         _persist)
 
     assert _replace_claim_set(mock.Mock()) == 7
     assert events == [
-        'broker-lock-create', 'broker-lock-enter', 'policy', 'persist',
-        'broker-lock-exit'
+        'broker-lock-create', 'broker-lock-enter', 'prune', 'claims', 'policy',
+        'persist', 'broker-lock-exit'
     ]
 
 
@@ -1308,6 +1326,7 @@ def test_claim_boundary_ambiguity_propagates_and_releases_broker_lock(
     monkeypatch.setattr(broker.locks, 'get_lock', get_lock)
     monkeypatch.setattr(broker, 'get_protocol_version',
                         lambda: broker.PROTOCOL_V2)
+    _stub_claim_preflight(monkeypatch)
 
     with pytest.raises(broker.request_process.AmbiguousBoundaryError):
         _replace_claim_set(mock.Mock())

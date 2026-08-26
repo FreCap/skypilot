@@ -2292,26 +2292,15 @@ def replace_claim_set(
             logger.error('Reserved-fill protocol v2 is not active; refusing '
                          f'the complete claim set of {service_name!r}.')
             return None
-        try:
-            (claim_scope, claim_authorization, service_version,
-             semantic_hash) = _authorize_current_claim()
-        except (request_process.AmbiguousBoundaryError,
-                request_process.BoundaryShutdownPendingError):
-            _clear_service_cache(service_name)
-            # The persistent production lane is now poisoned. Propagate
-            # through the poller so its supervisor cannot begin another claim
-            # read while the controller's fail-stop callback fences this
-            # process.
-            raise
-        except Exception as error:  # pylint: disable=broad-except
-            _clear_service_cache(service_name)
-            logger.error(
-                'Reserved-fill broker: reclaim policy refused the '
-                'complete claim set for %r: %s', service_name,
-                common_utils.format_exception(error))
-            return None
-        heartbeat_ts = time.time()
-        _prune_claims(PROTOCOL_V2, heartbeat_ts - claim_ttl_seconds())
+        # Complete every nonessential broker read before minting the
+        # five-second reclaim authorization.  The broker fence serializes the
+        # overlap decision, while the final PostgreSQL transaction reconstructs
+        # and revalidates its exact gate, owner, version, projection, and scope.
+        # Aging the ticket on pruning or an all-claim scan makes a healthy
+        # heartbeat fail closed under ordinary database latency and stalls all
+        # pools until the old claim expires.
+        prune_ts = time.time()
+        _prune_claims(PROTOCOL_V2, prune_ts - claim_ttl_seconds())
         for existing in _claim_rows(PROTOCOL_V2):
             if existing['service_name'] == service_name:
                 continue
@@ -2330,6 +2319,27 @@ def replace_claim_set(
                         expected_controller_owner=expected_controller_owner)
                     _clear_service_cache(service_name)
                     return None
+        try:
+            (claim_scope, claim_authorization, service_version,
+             semantic_hash) = _authorize_current_claim()
+        except (request_process.AmbiguousBoundaryError,
+                request_process.BoundaryShutdownPendingError):
+            _clear_service_cache(service_name)
+            # The persistent production lane is now poisoned. Propagate
+            # through the poller so its supervisor cannot begin another claim
+            # read while the controller's fail-stop callback fences this
+            # process.
+            raise
+        except Exception as error:  # pylint: disable=broad-except
+            _clear_service_cache(service_name)
+            logger.error(
+                'Reserved-fill broker: reclaim policy refused the '
+                'complete claim set for %r: %s', service_name,
+                common_utils.format_exception(error))
+            return None
+        # Heartbeat freshness starts after all pre-authorization maintenance,
+        # immediately beside the sole authoritative replacement.
+        heartbeat_ts = time.time()
         generation = serve_state.replace_reserved_fill_claim_set(
             service_name,
             semantic_hash=semantic_hash,
