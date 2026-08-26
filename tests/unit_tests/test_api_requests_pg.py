@@ -586,6 +586,7 @@ def _prepare_paid_provider_absence_graph(
     *,
     receipt: dict[str, object] | None = None,
     pool_key: str | None = None,
+    production_http_normalization: bool = False,
 ) -> _PaidProviderAbsenceGraph:
     engine, _ = bound_request_database
     if pool_key is None:
@@ -657,16 +658,27 @@ def _prepare_paid_provider_absence_graph(
             },
         },
     }
-    launch_body.env_vars[constants.USER_ID_ENV_VAR] = 'tenant-a'
-    launch_body.env_vars[constants.USER_ENV_VAR] = 'Tenant A'
-    launch_body.client_api_version = 77
+    if production_http_normalization:
+        # The controller submits a prepared body carrying the service owner;
+        # authenticated HTTP admission then normalizes it to the API actor
+        # after computing the immutable pre-normalization digest.
+        launch_body.env_vars[constants.USER_ID_ENV_VAR] = 'tenant-a'
+        launch_body.env_vars[constants.USER_ENV_VAR] = 'Tenant A'
+        admission_tenant = 'skyserve'
+        admission_creator = 'SkyServe API'
+    else:
+        launch_body.env_vars[constants.USER_ID_ENV_VAR] = 'tenant-a'
+        launch_body.env_vars[constants.USER_ENV_VAR] = 'Tenant A'
+        launch_body.client_api_version = 77
+        admission_tenant = 'tenant-a'
+        admission_creator = 'Tenant A'
     built = non_pool_admission.build(
         launch_body,
         uuid.UUID('44444444-4444-4444-8444-444444444444'),
         profile,
         non_pool_admission.AdmissionAuthority(
-            tenant_id='tenant-a',
-            creator_name='Tenant A',
+            tenant_id=admission_tenant,
+            creator_name=admission_creator,
             service_workspace='workspace-a',
             capability_cohort_epoch=(
                 ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
@@ -675,7 +687,7 @@ def _prepare_paid_provider_absence_graph(
             ),
             receipt_protocol_version=(
                 ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)),
-        auth_user=models.User(id='tenant-a', name='Tenant A'),
+        auth_user=models.User(id=admission_tenant, name=admission_creator),
         client_api_version=77)
     monkeypatch.setattr(request_postgres,
                         '_resolved_request_backend_capability', lambda:
@@ -2797,10 +2809,15 @@ def test_paid_provider_negative_ack_projects_and_releases_debits_atomically(
     assert pool['last_failure_at'] is not None
 
 
+@pytest.mark.parametrize('production_http_normalization', [False, True])
 def test_gcp_paid_exact_label_absence_projects_and_releases_debits_atomically(
-        bound_request_database, monkeypatch) -> None:
+        bound_request_database, monkeypatch,
+        production_http_normalization: bool) -> None:
     graph = _prepare_paid_provider_absence_graph(
-        bound_request_database, monkeypatch, pool_key=_gc_gcp_paid_pool_key())
+        bound_request_database,
+        monkeypatch,
+        pool_key=_gc_gcp_paid_pool_key(),
+        production_http_normalization=production_http_normalization)
     identity = request_postgres.bound_non_pool_gcp_provider_identity(
         graph.context, graph.authority)
     assert identity == {
@@ -2809,7 +2826,8 @@ def test_gcp_paid_exact_label_absence_projects_and_releases_debits_atomically(
                 'gc-service-3',
                 max_length=clouds.GCP.max_cluster_name_length(),
                 cluster_name_hash_length=clouds.GCP.cluster_name_hash_length(),
-                user_hash='tenant-a'),
+                user_hash=('skyserve'
+                           if production_http_normalization else 'tenant-a')),
         'instance_type': 'g2-standard-4',
         'num_nodes': 1,
         'project_id': 'boltz-498512',
@@ -2868,6 +2886,77 @@ def test_gcp_paid_exact_label_absence_projects_and_releases_debits_atomically(
     assert claim_count == pin_count == 0
 
 
+def test_gcp_paid_identity_accepts_http_post_normalization_body(
+        bound_request_database, monkeypatch) -> None:
+    """Paid recovery validates the durable HTTP shape, not a lost preimage."""
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database,
+        monkeypatch,
+        pool_key=_gc_gcp_paid_pool_key(),
+        production_http_normalization=True)
+
+    with graph.engine.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id ==
+                  graph.context.association_id)).mappings().one()
+        request_row = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                graph.context.request_id)).mappings().one()
+        request = request_postgres._request_from_mapping(request_row)
+
+        assert association['tenant_scope'] == 'skyserve'
+        assert request.user_id == 'skyserve'
+        assert request.request_body.env_vars[
+            constants.USER_ID_ENV_VAR] == 'skyserve'
+        assert request.request_body.env_vars[
+            constants.USER_ENV_VAR] == 'SkyServe API'
+        assert request.request_body.client_api_version == 77
+        assert ordinary_launch_binding.canonical_launch_digest(
+            request.request_body) != graph.context.input_digest
+        assert not request_postgres._provider_present_cleanup_input_digest_matches(
+            connection, association, request_row, request, graph.context)
+        assert request_postgres._ordinary_paid_request_identity_matches(
+            connection, association, request_row, request, graph.context)
+
+        tampered_bodies = []
+        tampered_task = request.request_body.model_copy(deep=True)
+        tampered_task.task += '\nrun: echo tampered\n'
+        tampered_bodies.append(tampered_task)
+        tampered_project = request.request_body.model_copy(deep=True)
+        tampered_project.override_skypilot_config['workspaces']['workspace-a'][
+            'gcp']['project_id'] = 'different-project'
+        tampered_bodies.append(tampered_project)
+        tampered_env = request.request_body.model_copy(deep=True)
+        tampered_env.env_vars['UNRELATED_ENV'] = 'tampered'
+        tampered_bodies.append(tampered_env)
+        wrong_tenant = request.request_body.model_copy(deep=True)
+        wrong_tenant.env_vars[constants.USER_ID_ENV_VAR] = 'different-tenant'
+        tampered_bodies.append(wrong_tenant)
+        empty_actor = request.request_body.model_copy(deep=True)
+        empty_actor.env_vars[constants.USER_ENV_VAR] = ''
+        tampered_bodies.append(empty_actor)
+        for tampered_body in tampered_bodies:
+            assert not request_postgres._ordinary_paid_request_identity_matches(
+                connection, association, request_row,
+                dataclasses.replace(request, request_body=tampered_body),
+                graph.context)
+
+    identity = request_postgres.bound_non_pool_gcp_provider_identity(
+        graph.context, graph.authority)
+    assert identity is not None
+    assert identity['project_id'] == 'boltz-498512'
+    assert identity['cluster_name_on_cloud'] == (
+        common_utils.make_cluster_name_on_cloud_for_user(
+            'gc-service-3',
+            max_length=clouds.GCP.max_cluster_name_length(),
+            cluster_name_hash_length=clouds.GCP.cluster_name_hash_length(),
+            user_hash='skyserve'))
+
+
 def test_gcp_paid_provider_identity_uses_frozen_region_for_project(
         bound_request_database, monkeypatch) -> None:
     graph = _prepare_paid_provider_absence_graph(
@@ -2898,10 +2987,15 @@ def test_gcp_paid_provider_identity_uses_frozen_region_for_project(
     }]
 
 
+@pytest.mark.parametrize('production_http_normalization', [False, True])
 def test_gcp_paid_exact_presence_authorizes_only_immediate_cleanup(
-        bound_request_database, monkeypatch) -> None:
+        bound_request_database, monkeypatch,
+        production_http_normalization: bool) -> None:
     graph = _prepare_paid_provider_absence_graph(
-        bound_request_database, monkeypatch, pool_key=_gc_gcp_paid_pool_key())
+        bound_request_database,
+        monkeypatch,
+        pool_key=_gc_gcp_paid_pool_key(),
+        production_http_normalization=production_http_normalization)
     identity = request_postgres.bound_non_pool_gcp_provider_identity(
         graph.context, graph.authority)
     assert identity is not None

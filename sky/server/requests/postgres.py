@@ -4358,7 +4358,7 @@ def _ordinary_paid_gcp_provider_identity_from_locked_request(
             ordinary_launch_binding.parse_bound_non_pool_launch_context(
                 request.request_body.extra_launch_context))
         if (parsed_context != context or
-                not _provider_present_cleanup_input_digest_matches(
+                not _ordinary_paid_request_identity_matches(
                     connection, association, request_row, request, context) or
                 _request_service_job_id(
                     request_row, str(association['cluster_name'])) is not None):
@@ -4698,9 +4698,14 @@ def _lock_bound_non_pool_provider_present_cleanup(
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Provider-present cleanup could not decode the exact bound '
             'request payload.') from error
-    if (parsed_context != context or
-            not _provider_present_cleanup_input_digest_matches(
-                connection, association, request_row, request, context) or
+    if context.profile.kind == (
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+        request_identity_matches = _ordinary_paid_request_identity_matches(
+            connection, association, request_row, request, context)
+    else:
+        request_identity_matches = _provider_present_cleanup_input_digest_matches(
+            connection, association, request_row, request, context)
+    if (parsed_context != context or not request_identity_matches or
             request_service_job_id is not None or
             association['service_job_id'] is not None):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
@@ -4772,6 +4777,69 @@ def _provider_present_cleanup_input_digest_matches(
     # Atomic fill stamps the immutable service-owner tuple before hashing.
     return bool(executable_exact and tenant_scope == owner_user_id and
                 env_vars.get(skylet_constants.USER_ENV_VAR) == owner_user_name)
+
+
+def _ordinary_paid_request_identity_matches(
+    connection: sqlalchemy.engine.Connection,
+    association: Mapping[str, Any],
+    request_row: sqlalchemy.engine.RowMapping,
+    request: requests_lib.Request,
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+) -> bool:
+    """Match the durable post-normalization ordinary-paid request identity.
+
+    HTTP non-pool admission hashes the prepared body before replacing its
+    submitted service-owner environment and client API metadata with the
+    authenticated request actor.  Reconstruct that exact pre-normalization
+    shape from the durable service-owner snapshot before checking the digest.
+    The immutable association/profile context is validated by the caller;
+    this check also retains the exact request, authenticated tenant, and
+    cluster relations written by admission.
+    """
+    body = request.request_body
+    env_vars = getattr(body, 'env_vars', None)
+    tenant_scope = association.get('tenant_scope')
+    cluster_name = association.get('cluster_name')
+    request_id = association.get('request_id')
+    normalized_identity_matches = bool(
+        isinstance(tenant_scope, str) and bool(tenant_scope) and
+        isinstance(cluster_name, str) and bool(cluster_name) and
+        isinstance(request_id, str) and bool(request_id) and
+        isinstance(env_vars, Mapping) and request.request_id == request_id and
+        request_row['request_id'] == request_id and
+        request_row['user_id'] == tenant_scope and
+        env_vars.get(skylet_constants.USER_ID_ENV_VAR) == tenant_scope and
+        isinstance(env_vars.get(skylet_constants.USER_ENV_VAR), str) and
+        bool(env_vars[skylet_constants.USER_ENV_VAR]) and
+        request_row['cluster_name'] == cluster_name and
+        getattr(body, 'cluster_name', None) == cluster_name)
+    if not normalized_identity_matches:
+        return False
+    service_owner = connection.execute(
+        sqlalchemy.select(
+            serve_state_schema.services_table.c.owner_user_id,
+            serve_state_schema.services_table.c.owner_user_name).where(
+                serve_state_schema.services_table.c.name ==
+                context.service_name)).mappings().one_or_none()
+    if service_owner is None:
+        return False
+    owner_user_id = service_owner['owner_user_id']
+    owner_user_name = service_owner['owner_user_name']
+    if (not isinstance(owner_user_id, str) or not owner_user_id or
+            not isinstance(owner_user_name, str) or not owner_user_name):
+        return False
+    try:
+        if (ordinary_launch_binding.canonical_launch_digest(body) ==
+                context.input_digest):
+            return True
+        prepared_body = body.model_copy(deep=True)
+        prepared_body.env_vars[skylet_constants.USER_ID_ENV_VAR] = owner_user_id
+        prepared_body.env_vars[skylet_constants.USER_ENV_VAR] = owner_user_name
+        prepared_body.client_api_version = None
+        return (ordinary_launch_binding.canonical_launch_digest(prepared_body)
+                == context.input_digest)
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def authorize_bound_non_pool_provider_present_cleanup(
