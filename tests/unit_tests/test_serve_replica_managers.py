@@ -2257,6 +2257,41 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         waiter.start.assert_called_once()
         waiter.join.assert_not_called()
 
+    def test_waiter_exit_while_active_keeps_durable_owner_until_terminal(self):
+        active = self._projection('ADOPT_ACTIVE',
+                                  status='RUNNING',
+                                  projected=False)
+        projected = self._projection('PROJECTED', status='SUCCEEDED')
+        reduce_exact = mock.Mock(side_effect=[active, active, projected])
+        transport_error = RuntimeError('stream disconnected')
+        waiter = mock.Mock()
+        waiter.is_alive.return_value = False
+        waiter.exception = transport_error
+
+        with mock.patch.object(replica_managers.thread_utils,
+                               'SafeThread',
+                               return_value=waiter), \
+             mock.patch.object(replica_managers.time, 'sleep') as sleep:
+            replica_managers._wait_for_bound_ordinary_launch(
+                replica_id=1,
+                cluster_name='svc-1',
+                request_id='request-id',
+                stream_logs=False,
+                launch_cloud=None,
+                reduce_exact=reduce_exact,
+                cancel_exact=mock.Mock(),
+                teardown_requested=threading.Event())
+
+        assert reduce_exact.call_args_list == [
+            mock.call(None, None),
+            mock.call(None, transport_error),
+            mock.call(None, None),
+        ]
+        sleep.assert_called_once_with(
+            replica_managers._LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
+        waiter.start.assert_called_once_with()
+        waiter.join.assert_called_once_with()
+
     def test_ambiguous_projection_never_falls_through_to_cleanup(self):
         reduce_exact = mock.Mock(return_value=self._projection(
             'AMBIGUOUS', status='FAILED', projected=False))
@@ -8872,6 +8907,75 @@ class TestLaunchOwnershipFence:
         assert mgr._launch_thread_pool[1] is successor
         assert 1 not in mgr._replica_to_request_id
         terminate.assert_not_called()
+
+    @pytest.mark.parametrize('disposition', ['ADOPT_ACTIVE', 'WAIT_QUIESCENCE'])
+    def test_finished_bound_worker_is_replaced_by_exact_adopter(
+            self, disposition):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._spot_placer = None
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        context = _bound_non_pool_context()
+        info = _fake_replica_info(
+            context.replica_id,
+            replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.replica_record_id = str(context.replica_record_id)
+        old_thread = replica_managers._ReplicaLaunchThread(
+            target=lambda: None,
+            replica_id=info.replica_id,
+            replica_record_id=info.replica_record_id,
+            service_hash=mgr._service_hash,
+            controller_owner=mgr._controller_owner,
+            teardown_requested=threading.Event(),
+            completion_queue=queue.SimpleQueue(),
+            completion_event=threading.Event(),
+            bound_ordinary_launch=True)
+        old_thread.start()
+        old_thread.join()
+        mgr._launch_thread_pool[info.replica_id] = old_thread
+        mgr._replica_to_request_id[info.replica_id] = context.request_id
+        remaining = types.SimpleNamespace(context=context,
+                                          disposition=disposition)
+        successor = mock.Mock(name='exact-durable-adopter')
+
+        def _install(adopter_info, adopter_context, *, start):
+            assert adopter_info is info
+            assert adopter_context is context
+            assert start is True
+            mgr._launch_thread_pool[info.replica_id] = successor
+            mgr._replica_to_request_id[info.replica_id] = context.request_id
+            return True
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                return_value={info.replica_id: info}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 return_value=remaining), \
+             mock.patch.object(
+                 mgr,
+                 '_install_bound_launch_adopter',
+                 side_effect=_install) as install, \
+             mock.patch.object(
+                 mgr,
+                 '_redrive_bound_ordinary_launch_after_pre_effect') as redrive, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate, \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_thread_pool()
+
+        install.assert_called_once_with(info, context, start=True)
+        redrive.assert_not_called()
+        terminate.assert_not_called()
+        assert mgr._launch_thread_pool[info.replica_id] is successor
+        assert (
+            mgr._replica_to_request_id[info.replica_id] == context.request_id)
 
     def test_finished_unresolved_bound_teardown_reenters_exact_cleanup(self):
         """A pointerless finished waiter cannot strand teardown intent."""
