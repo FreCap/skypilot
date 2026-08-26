@@ -2214,26 +2214,16 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
         request_postgres.project_bound_non_pool_provider_absence(
             context, authority, project_replica_result=lambda *_args: False)
 
-    def _project_replica(connection, projection):
+    def _project_teardown(connection, projection):
         assert projection.provider_evidence == (
             ordinary_launch_binding.ProviderEvidence.ABSENT)
-        projected_info = projection.locked_replica_info
-        projected_info.status_property.sky_launch_status = (
-            common_utils.ProcessStatus.FAILED)
-        return serve_state.update_replica_for_bound_ordinary_launch_in_transaction(
-            connection,
-            'gc-service',
-            'gc-service-hash',
-            3,
-            str(_GC_REPLICA_RECORD_ID),
-            identity.association_id,
-            projected_info,
-            provider_launch_succeeded=False,
-            paid_capacity_pool_key=None,
-            paid_capacity_outcome=None)
+        return service._project_bound_ordinary_launch_for_teardown(
+            authority, connection, projection)
 
     assert request_postgres.project_bound_non_pool_provider_absence(
-        context, authority, project_replica_result=_project_replica)
+        context,
+        authority,
+        project_replica_result=_project_teardown)
     with engine.connect() as connection:
         association = connection.execute(
             sqlalchemy.select(
@@ -2251,6 +2241,8 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
             ).select_from(request_postgres.REQUEST_RETENTION_PINS).where(
                 request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
                 identity.request_id)).scalar_one()
+    persisted = replica_managers.ReplicaInfo.from_storage_dict(
+        replica['replica_state'])
     assert association['resolution'] == (
         ordinary_launch_binding.Resolution.PROJECTED.value)
     assert association['reconciliation_outcome'] == (
@@ -2261,6 +2253,8 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
     assert association['pin_released_at'] is not None
     assert replica['ordinary_launch_association_id'] is None
     assert replica['status'] == 'FAILED_CLEANUP'
+    assert (persisted.status_property.sky_launch_status
+            is common_utils.ProcessStatus.FAILED)
     assert pin_count == 0
 
 

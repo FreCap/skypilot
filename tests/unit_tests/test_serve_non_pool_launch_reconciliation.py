@@ -99,6 +99,38 @@ def test_reserved_fill_provider_observation_is_closed(
         replica.reserved_fill_physical_cluster_uid)
 
 
+@pytest.mark.parametrize(('initial', 'expected'), [
+    (reconciliation.common_utils.ProcessStatus.INTERRUPTED,
+     reconciliation.common_utils.ProcessStatus.INTERRUPTED),
+    (reconciliation.common_utils.ProcessStatus.SCHEDULED,
+     reconciliation.common_utils.ProcessStatus.FAILED),
+])
+def test_reserved_fill_exact_absence_projects_terminal_status(
+        initial: reconciliation.common_utils.ProcessStatus,
+        expected: reconciliation.common_utils.ProcessStatus) -> None:
+    status_property = types.SimpleNamespace(sky_launch_status=initial)
+    projection = types.SimpleNamespace(
+        provider_evidence=ordinary_launch_binding.ProviderEvidence.ABSENT,
+        context=_context(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL),
+        pre_effect_terminal=False,
+        service_job_id=None,
+        locked_replica_info=types.SimpleNamespace(
+            status_property=status_property),
+        paid_capacity_pool_key=None,
+        # Reserved-fill cancellation retains the pre-existing reserved
+        # reducer semantics instead of acquiring the paid-only GCP mapping.
+        status=types.SimpleNamespace(value='CANCELLED'),
+        cause=types.SimpleNamespace(value='explicit_cancel'))
+
+    result = reconciliation.apply_exact_provider_absence_replica_projection(
+        projection)
+
+    assert result == reconciliation.ProviderAbsenceReplicaProjection(
+        paid_capacity_pool_key=None, paid_capacity_outcome=None)
+    assert status_property.sky_launch_status is expected
+
+
 def test_retargeted_reserved_fill_context_is_replaced(
         monkeypatch: pytest.MonkeyPatch) -> None:
     replica = _reserved_replica()
