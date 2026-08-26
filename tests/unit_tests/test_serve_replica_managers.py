@@ -8377,6 +8377,7 @@ class TestLaunchOwnershipFence:
         worker.bound_ordinary_launch = bound_ordinary_launch
         worker.adopts_existing_bound_request = adopts_existing_bound_request
         worker.ordinary_legacy_launch = False
+        worker.paid_claim_commit_receipt = None
         worker.ident = None
         worker.is_alive.return_value = False
         worker.exception = None
@@ -9000,6 +9001,215 @@ class TestLaunchOwnershipFence:
         assert mgr._legacy_mutation_runtime_state(
         ).never_started_launch_reservations == {}
 
+    @pytest.mark.parametrize('install_stale_fence', [False, True])
+    def test_claimed_bound_paid_launch_ignores_local_logical_lease(
+            self, install_stale_fence):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._spot_placer = None
+        mgr._uses_logical_replicas = True
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        info = _fake_replica_info(
+            1, replica_managers.serve_state.ReplicaStatus.PENDING)
+        info.paid_capacity_pool_key = _canonical_paid_pool_key()
+        worker = self._launch_worker(mgr, info, bound_ordinary_launch=True)
+        worker.paid_claim_commit_receipt = (
+            replica_managers.paid_capacity.PaidClaimBatchMemberResult(
+                replica_id=info.replica_id,
+                replica_record_id=info.replica_record_id,
+                claim_result=(
+                    replica_managers.paid_capacity.ClaimResult.ACQUIRED)))
+        mgr._launch_thread_pool[1] = worker
+        if install_stale_fence:
+            mgr._replica_to_logical_launch_fence[1] = (
+                mock.sentinel.stale_logical_fence)
+
+        def _reserve(_service_name, candidates, **_kwargs):
+            assert candidates == [(1, info.replica_record_id, False)]
+            info.status_property.sky_launch_status = (
+                common_utils.ProcessStatus.RUNNING)
+            return {1: info}
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                side_effect=lambda _service, ids: ({1: info} if ids else {})), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(mgr,
+                               '_service_launch_authorization',
+                               return_value=True), \
+             mock.patch.object(
+                 mgr,
+                 '_logical_pending_launch_admission',
+                 return_value=(True, None, set())), \
+             mock.patch.object(
+                 mgr,
+                 '_logical_reconcile_fence_holds',
+                 return_value=False) as logical_fence_holds, \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'reserve_replica_launches_running_if_capacity',
+                 side_effect=_reserve) as reserve, \
+             mock.patch.object(mgr,
+                               '_reconcile_unowned_bound_non_pool_launches'), \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_thread_pool()
+
+        reserve.assert_called_once()
+        worker.start.assert_called_once_with()
+        logical_fence_holds.assert_not_called()
+        assert 1 not in mgr._replica_to_logical_launch_fence
+
+    @pytest.mark.parametrize('profile',
+                             ['canonical-no-receipt', 'malformed', 'zero-cost'])
+    def test_nonclaimed_or_zero_cost_bound_launch_keeps_logical_gate(
+            self, profile):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._spot_placer = None
+        mgr._uses_logical_replicas = True
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        info = _fake_replica_info(
+            1, replica_managers.serve_state.ReplicaStatus.PENDING)
+        if profile == 'malformed':
+            info.paid_capacity_pool_key = 'not-a-canonical-pool-key'
+        else:
+            info.paid_capacity_pool_key = _canonical_paid_pool_key()
+        if profile == 'zero-cost':
+            info.is_zero_cost = True
+            info.zero_cost_admission_sequence = 1
+        worker = self._launch_worker(mgr, info, bound_ordinary_launch=True)
+        if profile != 'canonical-no-receipt':
+            worker.paid_claim_commit_receipt = (
+                replica_managers.paid_capacity.PaidClaimBatchMemberResult(
+                    replica_id=info.replica_id,
+                    replica_record_id=info.replica_record_id,
+                    claim_result=(
+                        replica_managers.paid_capacity.ClaimResult.ACQUIRED)))
+        mgr._launch_thread_pool[1] = worker
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                side_effect=lambda _service, ids: ({1: info} if ids else {})), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(mgr,
+                               '_service_launch_authorization',
+                               return_value=True), \
+             mock.patch.object(
+                 mgr,
+                 '_logical_pending_launch_admission',
+                 return_value=(True, None, set())), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'reserve_replica_launches_running_if_capacity') as reserve, \
+             mock.patch.object(mgr,
+                               '_reconcile_unowned_bound_non_pool_launches'), \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_thread_pool()
+
+        reserve.assert_not_called()
+        worker.start.assert_not_called()
+
+    @pytest.mark.parametrize('mismatch', ['replica-id', 'record-id', 'result'])
+    def test_mismatched_paid_claim_receipt_keeps_logical_gate(self, mismatch):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._spot_placer = None
+        mgr._uses_logical_replicas = True
+        mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
+        mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict()
+        info = _fake_replica_info(
+            1, replica_managers.serve_state.ReplicaStatus.PENDING)
+        info.paid_capacity_pool_key = _canonical_paid_pool_key()
+        worker = self._launch_worker(mgr, info, bound_ordinary_launch=True)
+        worker.paid_claim_commit_receipt = (
+            replica_managers.paid_capacity.PaidClaimBatchMemberResult(
+                replica_id=(2 if mismatch == 'replica-id' else info.replica_id),
+                replica_record_id=('00000000-0000-4000-8000-000000000002'
+                                   if mismatch == 'record-id' else
+                                   info.replica_record_id),
+                claim_result=(
+                    replica_managers.paid_capacity.ClaimResult.SATURATED
+                    if mismatch == 'result' else
+                    replica_managers.paid_capacity.ClaimResult.ACQUIRED)))
+        mgr._launch_thread_pool[1] = worker
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos_from_ids',
+                side_effect=lambda _service, ids: ({1: info} if ids else {})), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(mgr,
+                               '_service_launch_authorization',
+                               return_value=True), \
+             mock.patch.object(
+                 mgr,
+                 '_logical_pending_launch_admission',
+                 return_value=(True, None, set())), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'reserve_replica_launches_running_if_capacity') as reserve, \
+             mock.patch.object(mgr,
+                               '_reconcile_unowned_bound_non_pool_launches'), \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_thread_pool()
+
+        reserve.assert_not_called()
+        worker.start.assert_not_called()
+
+    def test_exact_bound_adopter_uses_association_as_handoff_receipt(self):
+        info = _fake_replica_info(
+            1, replica_managers.serve_state.ReplicaStatus.PENDING)
+        info.paid_capacity_pool_key = _canonical_paid_pool_key()
+        mgr = self._owned_manager()
+        worker = self._launch_worker(mgr,
+                                     info,
+                                     bound_ordinary_launch=True,
+                                     adopts_existing_bound_request=True)
+
+        assert replica_managers._bound_ordinary_paid_claim_owns_provider_effect(
+            info, launch_thread=worker)
+
+    def test_launch_worker_accepts_only_its_exact_acquired_receipt(self):
+        worker = replica_managers._ReplicaLaunchThread(
+            target=lambda: None,
+            replica_id=1,
+            replica_record_id='00000000-0000-4000-8000-000000000001',
+            service_hash='incarnation-a',
+            controller_owner=(101, '10.0.0.1'),
+            teardown_requested=threading.Event(),
+            completion_queue=queue.SimpleQueue(),
+            completion_event=threading.Event(),
+            bound_ordinary_launch=True)
+        exact = paid_capacity.PaidClaimBatchMemberResult(
+            replica_id=1,
+            replica_record_id='00000000-0000-4000-8000-000000000001',
+            claim_result=paid_capacity.ClaimResult.ACQUIRED)
+        worker.install_paid_claim_commit_receipt(exact)
+        worker.install_paid_claim_commit_receipt(exact)
+
+        for mismatch in (
+                dataclasses.replace(exact, replica_id=2),
+                dataclasses.replace(
+                    exact,
+                    replica_record_id='00000000-0000-4000-8000-000000000002'),
+                dataclasses.replace(
+                    exact, claim_result=paid_capacity.ClaimResult.SATURATED)):
+            with pytest.raises(ValueError, match='does not match'):
+                worker.install_paid_claim_commit_receipt(mismatch)
+
     @pytest.mark.parametrize('asynchronous', [False, True])
     def test_fresh_launch_start_failure_rolls_back_only_ordinary_exception(
             self, asynchronous):
@@ -9519,6 +9729,102 @@ class TestLaunchOwnershipFence:
                                           is_scale_down=True,
                                           in_flight_drain_cap_seconds=0)
         assert mgr._replica_to_logical_launch_fence[1] == fence
+
+    def test_resource_lock_carries_equivalent_newer_generation(self, tmp_path):
+        mgr, infos = self._queued_manager([1])
+        mgr._uses_logical_replicas = True
+        mgr._logical_exact_accelerator_shapes = {'L4': 1}
+        previous_target = (1, 7, 1, (('L4', 1),), (('L4', 1),))
+        current_target = (1, 8, 1, previous_target[3], previous_target[4])
+        mgr._logical_target = current_target
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=8,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        info = infos[1]
+        info.version = 1
+        info.reserved_fill = False
+        info.unknown_capacity_replacement = False
+        info.cost_rebalance_for_replica_id = None
+
+        with mock.patch.object(mgr,
+                               '_service_launch_authorization',
+                               return_value=True), \
+             mock.patch.object(mgr,
+                               '_logical_pending_launch_admission',
+                               return_value=(True, previous_target, {1})), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               side_effect=lambda _svc, ids:
+                               {rid: infos[rid] for rid in ids}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(controller_utils, 'get_resources_lock_path',
+                               return_value=str(tmp_path / 'resources.lock')), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'reserve_replica_launches_running_if_capacity',
+                 side_effect=_admit_launches_from(infos)) as reserve, \
+             mock.patch.object(mgr,
+                               '_reconcile_unowned_bound_non_pool_launches'), \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_thread_pool()
+
+        reserve.assert_called_once()
+        mgr._launch_thread_pool[1].start.assert_called_once_with()
+        assert mgr._replica_to_logical_launch_fence[1] == current_target
+
+    def test_resource_lock_rejects_changed_newer_target(self, tmp_path):
+        mgr, infos = self._queued_manager([1])
+        mgr._uses_logical_replicas = True
+        mgr._logical_exact_accelerator_shapes = {'L4': 1}
+        previous_target = (1, 7, 1, (('L4', 1),), (('L4', 1),))
+        changed_target = (1, 8, 0, (), previous_target[4])
+        mgr._logical_target = changed_target
+        mgr._logical_reconcile_snapshot = (
+            replica_managers.LogicalReconcileSnapshot(
+                version=1,
+                generation=8,
+                observed_slots_by_replica_id={},
+                in_flight_by_replica_id={},
+                unknown_replica_ids=frozenset(),
+                received_at=replica_managers.time.monotonic()))
+        info = infos[1]
+        info.version = 1
+        info.reserved_fill = False
+        info.unknown_capacity_replacement = False
+        info.cost_rebalance_for_replica_id = None
+
+        with mock.patch.object(mgr,
+                               '_service_launch_authorization',
+                               return_value=True), \
+             mock.patch.object(mgr,
+                               '_logical_pending_launch_admission',
+                               return_value=(True, previous_target, {1})), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               side_effect=lambda _svc, ids:
+                               {rid: infos[rid] for rid in ids}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(controller_utils, 'get_resources_lock_path',
+                               return_value=str(tmp_path / 'resources.lock')), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'reserve_replica_launches_running_if_capacity') as reserve, \
+             mock.patch.object(mgr,
+                               '_reconcile_unowned_bound_non_pool_launches'), \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'):
+            mgr._refresh_thread_pool()
+
+        reserve.assert_not_called()
+        mgr._launch_thread_pool[1].start.assert_not_called()
 
     def test_consumed_retry_is_admitted_once(self, tmp_path):
         mgr, infos = self._queued_manager([1])
@@ -10603,6 +10909,102 @@ class TestLogicalPendingLaunchAdmission:
         assert fence is None
         assert authorized == set()
         get_infos.assert_not_called()
+
+    def test_pending_scan_carries_equivalent_newer_generation(self):
+        mgr = self._manager({'A100': 1})
+        candidate = self._info(
+            1, 'A100', replica_managers.serve_state.ReplicaStatus.PENDING)
+        previous_target = mgr._logical_target
+        assert previous_target is not None
+        current_target = (1, 8, 1, previous_target[3], previous_target[4])
+        current_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot,
+            generation=8,
+            received_at=replica_managers.time.monotonic())
+
+        def _read_fleet(_service_name):
+            assert mgr.publish_logical_reconcile_state(current_target,
+                                                       current_snapshot)
+            return [candidate]
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               side_effect=_read_fleet):
+            decision = mgr._logical_pending_launch_admission_decision()
+
+        assert decision.reason == 'ready'
+        assert decision.target_fence == current_target
+        assert decision.authorized_ids == frozenset({1})
+
+    def test_pending_scan_rejects_changed_newer_target(self):
+        mgr = self._manager({'A100': 1})
+        candidate = self._info(
+            1, 'A100', replica_managers.serve_state.ReplicaStatus.PENDING)
+        previous_target = mgr._logical_target
+        assert previous_target is not None
+        changed_target = (1, 8, 2, (('A100', 2),), previous_target[4])
+        current_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot,
+            generation=8,
+            received_at=replica_managers.time.monotonic())
+
+        def _read_fleet(_service_name):
+            assert mgr.publish_logical_reconcile_state(changed_target,
+                                                       current_snapshot)
+            return [candidate]
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               side_effect=_read_fleet):
+            decision = mgr._logical_pending_launch_admission_decision()
+
+        assert decision.reason == 'target-changed-during-replica-read'
+        assert decision.target_fence is None
+        assert decision.authorized_ids == frozenset()
+
+    def test_pending_scan_rejects_expired_scale_up_authority(self):
+        mgr = self._manager({'A100': 1})
+        now = replica_managers.time.monotonic()
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot,
+            authority=types.SimpleNamespace(deadline_monotonic=now - 2,
+                                            scale_up_deadline_monotonic=now -
+                                            1))
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos') as get_infos:
+            decision = mgr._logical_pending_launch_admission_decision()
+
+        assert decision.reason == 'target-not-authoritative'
+        assert decision.target_fence is None
+        assert decision.authorized_ids == frozenset()
+        get_infos.assert_not_called()
+
+    def test_pending_scan_rejects_generation_regression_during_fleet_read(self):
+        mgr = self._manager({'A100': 1})
+        candidate = self._info(
+            1, 'A100', replica_managers.serve_state.ReplicaStatus.PENDING)
+        previous_target = mgr._logical_target
+        assert previous_target is not None
+        regressed_target = (1, 6, 1, previous_target[3], previous_target[4])
+        regressed_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot,
+            generation=6,
+            received_at=replica_managers.time.monotonic())
+
+        def _read_fleet(_service_name):
+            assert mgr.publish_logical_reconcile_state(regressed_target,
+                                                       regressed_snapshot)
+            return [candidate]
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               side_effect=_read_fleet):
+            decision = mgr._logical_pending_launch_admission_decision()
+
+        assert decision.reason == 'target-changed-during-replica-read'
+        assert decision.target_fence is None
+        assert decision.authorized_ids == frozenset()
 
     def test_final_cloud_guard_rechecks_newly_ready_capacity(self):
         mgr = self._manager({'A100': 1})
@@ -17519,6 +17921,13 @@ class TestPaidLocationLaunchBudget:
         assert manager._next_replica_id == 4
         assert len(workers) == 3
         assert all(worker.start.call_count == 0 for worker in workers)
+        # The side effect returns the authoritative members directly; only
+        # the two ACQUIRED workers receive their exact Phase-A handoff.
+        assert workers[0].install_paid_claim_commit_receipt.call_args.args[0] \
+            .claim_result is paid_capacity.ClaimResult.ACQUIRED
+        assert workers[1].install_paid_claim_commit_receipt.call_args.args[0] \
+            .claim_result is paid_capacity.ClaimResult.ACQUIRED
+        workers[2].install_paid_claim_commit_receipt.assert_not_called()
         candidates = admit_batch.call_args.kwargs['candidates']
         assert [
             candidate.capacity_plan_claim['capacity_plan_units']

@@ -394,6 +394,8 @@ class _ReplicaLaunchThread(thread_utils.SafeThread):
                  bound_ordinary_launch: bool = False,
                  adopts_existing_bound_request: bool = False,
                  ordinary_legacy_launch: bool = False,
+                 paid_claim_commit_receipt: (
+                     paid_capacity.PaidClaimBatchMemberResult | None) = None,
                  **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.replica_id = replica_id
@@ -406,6 +408,24 @@ class _ReplicaLaunchThread(thread_utils.SafeThread):
         self.bound_ordinary_launch = bound_ordinary_launch
         self.adopts_existing_bound_request = adopts_existing_bound_request
         self.ordinary_legacy_launch = ordinary_legacy_launch
+        self.paid_claim_commit_receipt: (
+            paid_capacity.PaidClaimBatchMemberResult | None) = None
+        if paid_claim_commit_receipt is not None:
+            self.install_paid_claim_commit_receipt(paid_claim_commit_receipt)
+
+    def install_paid_claim_commit_receipt(
+            self, receipt: paid_capacity.PaidClaimBatchMemberResult) -> None:
+        """Install the exact authoritative Phase-A result once."""
+        if (not isinstance(receipt, paid_capacity.PaidClaimBatchMemberResult) or
+                receipt.claim_result is not paid_capacity.ClaimResult.ACQUIRED
+                or receipt.replica_id != self.replica_id or
+                receipt.replica_record_id != self.replica_record_id):
+            raise ValueError('Paid-claim commit receipt does not match its '
+                             'launch worker.')
+        existing = self.paid_claim_commit_receipt
+        if existing is not None and existing != receipt:
+            raise ValueError('Paid-claim commit receipt cannot be replaced.')
+        self.paid_claim_commit_receipt = receipt
 
     def run(self) -> None:
         try:
@@ -416,6 +436,38 @@ class _ReplicaLaunchThread(thread_utils.SafeThread):
             # preserves completion across Event coalescing and clear races.
             self._completion_queue.put(self)
             self._completion_event.set()
+
+
+def _bound_ordinary_paid_claim_owns_provider_effect(
+        info: 'ReplicaInfo', *, launch_thread: _ReplicaLaunchThread) -> bool:
+    """Whether PostgreSQL, not a local target lease, owns first effect.
+
+    This identifies only a bound ordinary-paid row carrying a canonical exact
+    pool identity. It is not provider authority by itself: the bound request
+    executor still validates the exact replica, claim, association, route,
+    owner, and launch context transactionally before its first provider I/O.
+    """
+    if not launch_thread.bound_ordinary_launch:
+        return False
+    if (ordinary_launch_binding.classify_non_pool_launch_profile(info) is
+            not ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+        return False
+    pool_key = info.paid_capacity_pool_key
+    if (not isinstance(pool_key, str) or not pool_key or
+            paid_capacity.pool_key_payload(pool_key) is None):
+        return False
+    if launch_thread.adopts_existing_bound_request:
+        # Recovery built this worker only from an exact durable association.
+        # It submits no new request; the request executor still re-locks the
+        # claim before its first provider effect.
+        return True
+    receipt = launch_thread.paid_claim_commit_receipt
+    return bool(
+        isinstance(receipt, paid_capacity.PaidClaimBatchMemberResult) and
+        receipt.claim_result is paid_capacity.ClaimResult.ACQUIRED and
+        receipt.replica_id == launch_thread.replica_id == info.replica_id and
+        receipt.replica_record_id == launch_thread.replica_record_id ==
+        info.replica_record_id)
 
 
 class _ReplicaDownThread(thread_utils.SafeThread):
@@ -7827,6 +7879,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         # location's capacity, so they keep the default in-place retries.
         availability_max_retry = (1 if location is not None else None)
         cloud_launch_guard = fill_cloud_launch_guard
+        launch_thread_ref: list[_ReplicaLaunchThread | None] = [None]
+        paid_claim_commit_receipt: (paid_capacity.PaidClaimBatchMemberResult |
+                                    None) = None
         if (self._uses_logical_replicas and
                 bool(self._logical_exact_accelerator_shapes) and
                 not zero_cost_only and cost_rebalance_for_replica_id is None and
@@ -7841,6 +7896,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             generation_decision = self._queued_launch_generation_decision(
                 expected_manager_version)
             if not generation_decision[0]:
+                return generation_decision
+            launch_thread = launch_thread_ref[0]
+            if (launch_thread is not None and
+                    _bound_ordinary_paid_claim_owns_provider_effect(
+                        info, launch_thread=launch_thread)):
                 return generation_decision
             if existing_cloud_launch_guard is None:
                 return generation_decision
@@ -8227,7 +8287,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                             input_digest=input_digest,
                             allow_demoted_candidate=bool(
                                 recovery_launch_kwargs)))
-            return _ReplicaLaunchThread(
+            launch_thread = _ReplicaLaunchThread(
                 target=launch_cluster_with_frozen_controller_config,
                 replica_id=replica_id,
                 replica_record_id=info.replica_record_id,
@@ -8238,6 +8298,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 completion_event=completion_event,
                 bound_ordinary_launch=bound_ordinary_launch,
                 ordinary_legacy_launch=ordinary_legacy_launch,
+                paid_claim_commit_receipt=paid_claim_commit_receipt,
                 args=(replica_id, launch_yaml_content, cluster_name,
                       log_file_name, legacy_runtime.replica_to_request_id,
                       resources_override, retry_until_up),
@@ -8246,6 +8307,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'teardown_requested': teardown_requested,
                 },
             )
+            launch_thread_ref[0] = launch_thread
+            return launch_thread
 
         if fill_protocol_version == reserved_capacity_broker.PROTOCOL_V2:
             # Single-scale callers acquire blocking admission before self.lock.
@@ -8571,6 +8634,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 'ordered capacity authority changed: %s',
                                 common_utils.format_exception(error))
                             return None
+                        if claim_result is paid_capacity.ClaimResult.ACQUIRED:
+                            # The singleton helper is the one-member form of
+                            # the same committed Phase-A transaction. Preserve
+                            # its exact identity on the private worker instead
+                            # of inferring commitment from the pre-commit pool
+                            # key carried by ReplicaInfo.
+                            paid_claim_commit_receipt = (
+                                paid_capacity.PaidClaimBatchMemberResult(
+                                    replica_id=replica_id,
+                                    replica_record_id=info.replica_record_id,
+                                    claim_result=claim_result))
                         if claim_result not in (
                                 paid_capacity.ClaimResult.ACQUIRED,
                                 paid_capacity.ClaimResult.LEGACY_LOCAL):
@@ -10288,12 +10362,15 @@ class SkyPilotReplicaManager(ReplicaManager):
         rejected = False
         ownership_lost = False
         try:
-            for prepared, claim_result in zip(prepared_paid_launches,
-                                              claim_results,
-                                              strict=True):
+            for prepared, member, claim_result in zip(prepared_paid_launches,
+                                                      members,
+                                                      claim_results,
+                                                      strict=True):
                 location = prepared.candidate.location
                 if claim_result is paid_capacity.ClaimResult.ACQUIRED:
                     replica_id = prepared.candidate.replica_id
+                    prepared.launch_thread.install_paid_claim_commit_receipt(
+                        member)
                     legacy_runtime.launch_thread_pool[replica_id] = (
                         prepared.launch_thread)
                     committed.append(prepared.launch_result)
@@ -13852,12 +13929,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                 remaining -= planned
 
         # A newer autoscaler tick may publish while the fleet read above is in
-        # flight. Never let an authorization set cross that target boundary.
+        # flight. A newer generation with the exact same target intent is a
+        # freshness renewal, not a supersession. Carry the authorization set
+        # onto that fresh immutable pair; any semantic change still fails
+        # closed.
         with self._logical_state_lock:
             current_state = self._logical_reconcile_state
-            if (current_state.target != target_fence or
+            current_target = current_state.target
+            if (not _logical_target_intent_preserved(
+                    current_target, target_fence) or current_target is None or
                     not self._logical_reconcile_fence_holds(
-                        target_fence,
+                        current_target,
                         require_fresh_occupancy=False,
                         logical_state=current_state)):
                 return _LogicalPendingLaunchAdmission(
@@ -13867,6 +13949,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     reason='target-changed-during-replica-read',
                     details=(f'previous_target={target_fence!r}, '
                              f'current_target={current_state.target!r}'))
+            target_fence = current_target
         candidate_ids_first_16 = {
             card: [info.replica_id for info in card_candidates[:16]]
             for card, card_candidates in candidates.items()
@@ -14710,7 +14793,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                 special_logical_launch = bool(
                     info.reserved_fill or info.unknown_capacity_replacement or
                     type(info.cost_rebalance_for_replica_id) is int)
-                if logical_admission_applies and not special_logical_launch:
+                paid_claim_owns_effect = (
+                    _bound_ordinary_paid_claim_owns_provider_effect(
+                        info, launch_thread=t) if isinstance(
+                            t, _ReplicaLaunchThread) else False)
+                if (logical_admission_applies and not special_logical_launch and
+                        not paid_claim_owns_effect):
                     if logical_target_fence is None:
                         logger.info(
                             f'Deferring queued logical launch for replica '
@@ -14763,9 +14851,15 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # sky.launch not started yet; admitted below under the
                 # resources lock.
                 if (logical_target_fence is not None and
-                        not special_logical_launch):
+                        not special_logical_launch and
+                        not paid_claim_owns_effect):
                     legacy_runtime.replica_to_logical_launch_fence[
                         replica_id] = logical_target_fence
+                elif paid_claim_owns_effect:
+                    # A previous pre-claim tick may have installed this local
+                    # lease. It must not survive the durable claim boundary.
+                    legacy_runtime.replica_to_logical_launch_fence.pop(
+                        replica_id)
                 launch_to_admit.append((replica_id, t, info))
 
         # Snapshot AFTER the finished-launch pass so down threads it scheduled
@@ -15028,12 +15122,24 @@ class SkyPilotReplicaManager(ReplicaManager):
                         continue
                     logical_fence = self._replica_to_logical_launch_fence.get(
                         replica_id)
-                    if logical_fence is not None:
+                    paid_claim_owns_effect = (
+                        _bound_ordinary_paid_claim_owns_provider_effect(
+                            info, launch_thread=t))
+                    if (logical_fence is not None and
+                            not paid_claim_owns_effect):
                         with self._logical_state_lock:
-                            if not self._logical_reconcile_fence_holds(
-                                    logical_fence,
-                                    require_fresh_occupancy=False):
+                            current_state = self._logical_reconcile_state
+                            current_target = current_state.target
+                            if (not _logical_target_intent_preserved(
+                                    current_target, logical_fence) or
+                                    current_target is None or
+                                    not self._logical_reconcile_fence_holds(
+                                        current_target,
+                                        require_fresh_occupancy=False,
+                                        logical_state=current_state)):
                                 continue
+                            legacy_runtime.replica_to_logical_launch_fence[
+                                replica_id] = current_target
                     launch_candidates.append((replica_id, t, info))
 
                 reserved_launch_infos = {}
