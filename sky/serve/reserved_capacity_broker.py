@@ -2191,13 +2191,8 @@ def replace_claim_set(
                 separators=(',', ':'),
                 allow_nan=False).encode('utf-8')).hexdigest()
 
-    def _authorize_current_claim(
-    ) -> tuple[reserved_fill_reclaim_attestation.ReclaimClaimSetScope | None,
-               reserved_fill_reclaim_attestation.ReclaimClaimAuthorization |
-               None, int | None, str]:
-        """Mint sequenced authority after broker-lock admission."""
-        claim_scope = None
-        claim_authorization = None
+    def _prepare_current_claim() -> tuple[int | None, str, bool]:
+        """Prepare immutable inputs before locked authorization minting."""
         service_version = None
         semantic_hash = _semantic_hash(service_version)
         gate = (pool_capacity_observation.PoolCapacityObservationRepository().
@@ -2221,7 +2216,6 @@ def replace_claim_set(
             if not found:
                 raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
                     'Sequenced claim service version is not committed.')
-            claim_edges = []
             for edge in normalized_edges:
                 identity = parse_pool_identity(str(edge['pool_key']))
                 projected_admissions = (
@@ -2243,47 +2237,15 @@ def replace_claim_set(
                         f'pool accelerators for {edge["pool_key"]!r}.')
                 edge['worker_projection_sha256_by_accelerator'] = dict(
                     sorted(projection_map.items()))
-                claim_edges.append(
-                    reserved_fill_reclaim_attestation.ReclaimClaimEdge(
-                        pool_key=str(edge['pool_key']),
-                        access_context=str(edge['access_context']),
-                        physical_cluster_uid=str(edge['physical_cluster_uid']),
-                        accelerator_names=tuple(sorted(identity.gpu_names)),
-                        projected_admissions=projected_admissions))
             # The broker is the sole point that combines configured service
             # policy with exact immutable version/projection authority.  The
             # closed payload below deliberately excludes heartbeat-owned
             # allocation inputs.
             semantic_hash = _semantic_hash(service_version)
-            claim_scope = (
-                reserved_fill_reclaim_attestation.ReclaimClaimSetScope(
-                    service_name=service_name,
-                    service_incarnation=expected_service_hash,
-                    service_version=service_version,
-                    semantic_hash=semantic_hash,
-                    edges=tuple(sorted(claim_edges))))
-            reclaim_identity = gate.reclaim_policy_identity
-            if reclaim_identity is None:
+            if gate.reclaim_policy_identity is None:
                 raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
                     'Sequenced reconciliation has no reclaim-policy identity.')
-            executor = claim_authorization_executor
-            owned_executor = None
-            if executor is None:
-                owned_executor = request_process.DisposableExecutor(
-                    max_workers=1)
-                executor = owned_executor
-            try:
-                claim_authorization = (
-                    _authorize_reclaim_claim_set_in_boundary)(executor,
-                                                              claim_scope,
-                                                              reclaim_identity,
-                                                              gate.generation)
-            finally:
-                if owned_executor is not None:
-                    owned_executor.shutdown(
-                        timeout=(_RECLAIM_CLAIM_BOUNDARY_DRAIN_TIMEOUT_SECONDS))
-        return (claim_scope, claim_authorization, service_version,
-                semantic_hash)
+        return service_version, semantic_hash, gate.sequenced_active
 
     lock = locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID)
     with lock.acquire(blocking=True):
@@ -2292,13 +2254,11 @@ def replace_claim_set(
             logger.error('Reserved-fill protocol v2 is not active; refusing '
                          f'the complete claim set of {service_name!r}.')
             return None
-        # Complete every nonessential broker read before minting the
-        # five-second reclaim authorization.  The broker fence serializes the
-        # overlap decision, while the final PostgreSQL transaction reconstructs
-        # and revalidates its exact gate, owner, version, projection, and scope.
-        # Aging the ticket on pruning or an all-claim scan makes a healthy
-        # heartbeat fail closed under ordinary database latency and stalls all
-        # pools until the old claim expires.
+        # Complete every nonessential broker read before entering the final
+        # PostgreSQL transaction. That transaction acquires its protocol-first
+        # and owner/version/projection locks, reconstructs the exact scope, and
+        # only then invokes the short-lived authorization callback. Thus
+        # neither this preflight nor row-lock contention can age the ticket.
         prune_ts = time.time()
         _prune_claims(PROTOCOL_V2, prune_ts - claim_ttl_seconds())
         for existing in _claim_rows(PROTOCOL_V2):
@@ -2320,8 +2280,63 @@ def replace_claim_set(
                     _clear_service_cache(service_name)
                     return None
         try:
-            (claim_scope, claim_authorization, service_version,
-             semantic_hash) = _authorize_current_claim()
+            service_version, semantic_hash, sequenced_active = (
+                _prepare_current_claim())
+        except Exception as error:  # pylint: disable=broad-except
+            _clear_service_cache(service_name)
+            logger.error(
+                'Reserved-fill broker: reclaim policy refused the '
+                'complete claim set for %r: %s', service_name,
+                common_utils.format_exception(error))
+            return None
+        executor = claim_authorization_executor
+        owned_executor = None
+        if sequenced_active and executor is None:
+            # Construct the owned lane before the transaction starts. Its
+            # invocation below reads only proactively renewed PostgreSQL proof
+            # receipts; provider proof renewal remains outside these locks.
+            owned_executor = request_process.DisposableExecutor(max_workers=1)
+            executor = owned_executor
+
+        def _authorize_locked_claim(
+            scope: reserved_fill_reclaim_attestation.ReclaimClaimSetScope,
+            expected_identity: (
+                reserved_fill_reclaim_attestation.ReclaimPolicyIdentity),
+            expected_gate_generation: int,
+        ) -> reserved_fill_reclaim_attestation.ReclaimClaimAuthorization:
+            if executor is None:
+                raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
+                    'Sequenced claim authorization has no bounded executor.')
+            try:
+                return _authorize_reclaim_claim_set_in_boundary(
+                    executor, scope, expected_identity,
+                    expected_gate_generation)
+            except (request_process.AmbiguousBoundaryError,
+                    request_process.BoundaryShutdownPendingError):
+                raise
+            except Exception as error:  # pylint: disable=broad-except
+                logger.error(
+                    'Reserved-fill broker: reclaim policy refused the locked '
+                    'complete claim set for %r: %s', service_name,
+                    common_utils.format_exception(error))
+                raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
+                    'Locked reclaim claim authorization failed.') from error
+
+        heartbeat_ts = time.time()
+        try:
+            generation = serve_state.replace_reserved_fill_claim_set(
+                service_name,
+                semantic_hash=semantic_hash,
+                global_headroom=global_headroom,
+                utilization_ceiling=utilization_ceiling,
+                utilization_state=utilization_state,
+                edges=normalized_edges,
+                heartbeat_ts=heartbeat_ts,
+                expected_service_hash=expected_service_hash,
+                expected_controller_owner=expected_controller_owner,
+                service_version=service_version,
+                reclaim_claim_authorizer=(_authorize_locked_claim
+                                          if sequenced_active else None))
         except (request_process.AmbiguousBoundaryError,
                 request_process.BoundaryShutdownPendingError):
             _clear_service_cache(service_name)
@@ -2330,29 +2345,22 @@ def replace_claim_set(
             # read while the controller's fail-stop callback fences this
             # process.
             raise
-        except Exception as error:  # pylint: disable=broad-except
-            _clear_service_cache(service_name)
-            logger.error(
-                'Reserved-fill broker: reclaim policy refused the '
-                'complete claim set for %r: %s', service_name,
-                common_utils.format_exception(error))
-            return None
-        # Heartbeat freshness starts after all pre-authorization maintenance,
-        # immediately beside the sole authoritative replacement.
-        heartbeat_ts = time.time()
-        generation = serve_state.replace_reserved_fill_claim_set(
-            service_name,
-            semantic_hash=semantic_hash,
-            global_headroom=global_headroom,
-            utilization_ceiling=utilization_ceiling,
-            utilization_state=utilization_state,
-            edges=normalized_edges,
-            heartbeat_ts=heartbeat_ts,
-            expected_service_hash=expected_service_hash,
-            expected_controller_owner=expected_controller_owner,
-            service_version=service_version,
-            reclaim_claim_scope=claim_scope,
-            reclaim_claim_authorization=claim_authorization)
+        finally:
+            if owned_executor is not None:
+                try:
+                    owned_executor.shutdown(
+                        timeout=_RECLAIM_CLAIM_BOUNDARY_DRAIN_TIMEOUT_SECONDS)
+                except (request_process.AmbiguousBoundaryError,
+                        request_process.BoundaryShutdownPendingError):
+                    _clear_service_cache(service_name)
+                    raise
+                except Exception as error:  # pylint: disable=broad-except
+                    _clear_service_cache(service_name)
+                    logger.error(
+                        'Reserved-fill broker: claim boundary shutdown failed '
+                        'for %r: %s', service_name,
+                        common_utils.format_exception(error))
+                    generation = None
         if generation is None:
             _clear_service_cache(service_name)
             return None

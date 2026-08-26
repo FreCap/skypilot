@@ -1035,6 +1035,28 @@ def _claim_edge() -> dict[str, object]:
     }
 
 
+def _claim_set_scope(semantic_hash: str) -> reclaim.ReclaimClaimSetScope:
+    edge = _claim_edge()
+    return reclaim.ReclaimClaimSetScope(
+        service_name='svc',
+        service_incarnation='incarnation-a',
+        service_version=3,
+        semantic_hash=semantic_hash,
+        edges=(reclaim.ReclaimClaimEdge(
+            pool_key=str(edge['pool_key']),
+            access_context='phx-context',
+            physical_cluster_uid='physical-uid',
+            accelerator_names=('h200',),
+            projected_admissions=(_projected_admission(),)),))
+
+
+def _invoke_claim_authorizer(kwargs):
+    authorizer = kwargs['reclaim_claim_authorizer']
+    assert callable(authorizer)
+    return authorizer(_claim_set_scope(kwargs['semantic_hash']), _identity(),
+                      _GATE_GENERATION)
+
+
 def _replace_claim_set(claim_authorization_executor=None,) -> int | None:
     return broker.replace_claim_set(
         'svc',
@@ -1093,6 +1115,17 @@ def test_sequenced_claim_without_complete_policy_releases_broker_lock(
     monkeypatch.setattr(broker, 'get_protocol_version',
                         lambda: broker.PROTOCOL_V2)
     _stub_claim_preflight(monkeypatch)
+    if failure_kind == 'missing-policy':
+
+        def _persist(*_args, **kwargs):
+            try:
+                _invoke_claim_authorizer(kwargs)
+            except reclaim.ReclaimAttestationError:
+                return None
+            raise AssertionError('The refusing policy unexpectedly succeeded.')
+
+        monkeypatch.setattr(serve_state, 'replace_reserved_fill_claim_set',
+                            _persist)
 
     assert _replace_claim_set(mock.Mock()) is None
     get_lock.assert_called_once_with(constants.RESERVED_FILL_BROKER_LOCK_ID)
@@ -1131,13 +1164,71 @@ def test_sequenced_claim_policy_identity_mismatch_releases_broker_lock(
                         lambda: broker.PROTOCOL_V2)
     _stub_claim_preflight(monkeypatch)
 
+    def _persist(*_args, **kwargs):
+        try:
+            _invoke_claim_authorizer(kwargs)
+        except reclaim.ReclaimAttestationError:
+            return None
+        raise AssertionError('The mismatched identity unexpectedly succeeded.')
+
+    monkeypatch.setattr(serve_state, 'replace_reserved_fill_claim_set',
+                        _persist)
+
     assert _replace_claim_set(mock.Mock()) is None
     authorize.assert_called_once()
     get_lock.assert_called_once_with(constants.RESERVED_FILL_BROKER_LOCK_ID)
     assert events == ['broker-lock-enter', 'broker-lock-exit']
 
 
-def test_sequenced_claim_authorization_is_issued_after_broker_preflight(
+def test_sequenced_claim_ordinary_boundary_failure_clears_and_returns_none(
+        monkeypatch):
+    _install_gate(monkeypatch, _gate(sequenced=True))
+    authorize = mock.Mock(side_effect=broker.request_process.
+                          BoundaryExecutionError('drained boundary failure'))
+    monkeypatch.setattr(broker, '_authorize_reclaim_claim_set_in_boundary',
+                        authorize)
+    events = []
+
+    class _RecordingLock:
+
+        def acquire(self, *, blocking):
+            assert blocking
+
+            @contextlib.contextmanager
+            def _acquired():
+                events.append('broker-lock-enter')
+                try:
+                    yield
+                finally:
+                    events.append('broker-lock-exit')
+
+            return _acquired()
+
+    monkeypatch.setattr(broker.locks, 'get_lock',
+                        mock.Mock(return_value=_RecordingLock()))
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        lambda: broker.PROTOCOL_V2)
+    _stub_claim_preflight(monkeypatch)
+    clear_cache = mock.Mock()
+    monkeypatch.setattr(broker, '_clear_service_cache', clear_cache)
+
+    def _persist(*_args, **kwargs):
+        try:
+            _invoke_claim_authorizer(kwargs)
+        except reclaim.ReclaimAttestationError:
+            return None
+        raise AssertionError('The failed boundary unexpectedly succeeded.')
+
+    monkeypatch.setattr(serve_state, 'replace_reserved_fill_claim_set',
+                        _persist)
+
+    assert _replace_claim_set(mock.Mock()) is None
+    authorize.assert_called_once()
+    clear_cache.assert_called_with('svc')
+    assert events == ['broker-lock-enter', 'broker-lock-exit']
+
+
+def test_sequenced_claim_authorization_is_issued_inside_locked_persist(
         monkeypatch):
     gate = _gate(sequenced=True)
     _install_gate(monkeypatch, gate)
@@ -1180,16 +1271,21 @@ def test_sequenced_claim_authorization_is_issued_after_broker_preflight(
 
     def _persist(*args, **kwargs):
         del args
-        events.append('persist')
-        assert kwargs['reclaim_claim_scope'].service_name == 'svc'
-        assert isinstance(kwargs['reclaim_claim_authorization'],
-                          reclaim.ReclaimClaimAuthorization)
+        events.append('persist-enter')
+        assert callable(kwargs['reclaim_claim_authorizer'])
+        # Model a protocol/owner/version row-lock wait longer than one ticket
+        # lifetime. Authorization must not exist until the state transaction
+        # has reconstructed its exact scope after this wait.
+        monotonic[0] += reclaim.AUTHORIZATION_MAX_AGE_SECONDS + 1
+        authorization = _invoke_claim_authorizer(kwargs)
+        scope = _claim_set_scope(kwargs['semantic_hash'])
         reclaim.require_exact_claim_authorization(
-            kwargs['reclaim_claim_authorization'],
+            authorization,
             expected_identity=_identity(),
             expected_gate_generation=_GATE_GENERATION,
-            expected_scope=kwargs['reclaim_claim_scope'],
+            expected_scope=scope,
             now_monotonic=monotonic[0])
+        events.append('persist-write')
         return 7
 
     def _prune(*_args):
@@ -1215,8 +1311,8 @@ def test_sequenced_claim_authorization_is_issued_after_broker_preflight(
 
     assert _replace_claim_set(mock.Mock()) == 7
     assert events == [
-        'broker-lock-create', 'broker-lock-enter', 'prune', 'claims', 'policy',
-        'persist', 'broker-lock-exit'
+        'broker-lock-create', 'broker-lock-enter', 'prune', 'claims',
+        'persist-enter', 'policy', 'persist-write', 'broker-lock-exit'
     ]
 
 
@@ -1327,6 +1423,13 @@ def test_claim_boundary_ambiguity_propagates_and_releases_broker_lock(
     monkeypatch.setattr(broker, 'get_protocol_version',
                         lambda: broker.PROTOCOL_V2)
     _stub_claim_preflight(monkeypatch)
+
+    def _persist(*_args, **kwargs):
+        _invoke_claim_authorizer(kwargs)
+        raise AssertionError('The ambiguous boundary unexpectedly returned.')
+
+    monkeypatch.setattr(serve_state, 'replace_reserved_fill_claim_set',
+                        _persist)
 
     with pytest.raises(broker.request_process.AmbiguousBoundaryError):
         _replace_claim_set(mock.Mock())

@@ -8,6 +8,7 @@ import json
 import pickle
 import threading
 import time
+import typing
 import uuid
 
 from alembic import command as alembic_command
@@ -154,6 +155,35 @@ def _claim_policy_authority(
         gate_generation=1,
         scope=scope,
         completed_monotonic=time.monotonic())
+
+
+def _claim_policy_authorizer(
+    semantic_hash: str,
+    *,
+    on_authorize: typing.Callable[[], None] | None = None,
+) -> typing.Callable[[
+        reserved_fill_reclaim_attestation.ReclaimClaimSetScope,
+        reserved_fill_reclaim_attestation.ReclaimPolicyIdentity, int
+], reserved_fill_reclaim_attestation.ReclaimClaimAuthorization]:
+    expected_scope, template = _claim_policy_authority(semantic_hash)
+
+    def _authorize(
+        scope: reserved_fill_reclaim_attestation.ReclaimClaimSetScope,
+        identity: reserved_fill_reclaim_attestation.ReclaimPolicyIdentity,
+        gate_generation: int,
+    ) -> reserved_fill_reclaim_attestation.ReclaimClaimAuthorization:
+        assert scope == expected_scope
+        assert identity == template.identity
+        assert gate_generation == template.gate_generation
+        if on_authorize is not None:
+            on_authorize()
+        return reserved_fill_reclaim_attestation.ReclaimClaimAuthorization(
+            identity=identity,
+            gate_generation=gate_generation,
+            scope=scope,
+            completed_monotonic=time.monotonic())
+
+    return _authorize
 
 
 @pytest.fixture
@@ -2055,20 +2085,8 @@ def test_concurrent_fill_persists_serialize_one_physical_slot(
     assert _persisted_replica_count(allocation_engine) == 1
 
 
-def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
-        allocation_engine, monkeypatch) -> None:
-    monkeypatch.setattr(serve_state._db_manager, '_engine', allocation_engine)
-    _, snapshot = _commit_evidence(allocation_engine)
-    repository = _repository(allocation_engine)
-    published = repository.publish(_SERVICE,
-                                   expected_service_hash=_SERVICE_HASH,
-                                   expected_controller_owner=_OWNER,
-                                   expected_claim_generation=11,
-                                   expected_gate_generation=1,
-                                   pool_snapshots=(snapshot,))
-    assert published is not None
-
-    edge = {
+def _claim_set_edge() -> dict[str, object]:
+    return {
         'pool_key': _POOL_KEY,
         'legacy_pool_key': json.dumps([_CONTEXT, ['a100-80gb', 'h200']]),
         'pool_position': 0,
@@ -2083,7 +2101,23 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
         'effective_cap': 8,
         'launchable': True,
     }
-    same_scope, same_authorization = _claim_policy_authority('semantic-a')
+
+
+def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
+        allocation_engine, monkeypatch) -> None:
+    monkeypatch.setattr(serve_state._db_manager, '_engine', allocation_engine)
+    _, snapshot = _commit_evidence(allocation_engine)
+    repository = _repository(allocation_engine)
+    published = repository.publish(_SERVICE,
+                                   expected_service_hash=_SERVICE_HASH,
+                                   expected_controller_owner=_OWNER,
+                                   expected_claim_generation=11,
+                                   expected_gate_generation=1,
+                                   pool_snapshots=(snapshot,))
+    assert published is not None
+
+    edge = _claim_set_edge()
+    same_authorizer = _claim_policy_authorizer('semantic-a')
     same_generation = serve_state.replace_reserved_fill_claim_set(
         _SERVICE,
         semantic_hash='semantic-a',
@@ -2095,8 +2129,7 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
         expected_service_hash=_SERVICE_HASH,
         service_version=1,
         expected_controller_owner=_OWNER,
-        reclaim_claim_scope=same_scope,
-        reclaim_claim_authorization=same_authorization)
+        reclaim_claim_authorizer=same_authorizer)
     assert same_generation == 11
     with allocation_engine.connect() as connection:
         assert connection.execute(
@@ -2125,8 +2158,7 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
         expected_service_hash=_SERVICE_HASH,
         service_version=1,
         expected_controller_owner=_OWNER,
-        reclaim_claim_scope=same_scope,
-        reclaim_claim_authorization=same_authorization)
+        reclaim_claim_authorizer=same_authorizer)
     assert runtime_generation == 11
     assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) == published
 
@@ -2146,8 +2178,7 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
         expected_service_hash=_SERVICE_HASH,
         service_version=1,
         expected_controller_owner=_OWNER,
-        reclaim_claim_scope=same_scope,
-        reclaim_claim_authorization=same_authorization)
+        reclaim_claim_authorizer=same_authorizer)
     assert lower_cap_generation == 11
     # Same-generation cap changes do not clear the publication row, but the
     # schema-5 reader immediately rejects the stale edge-cap authority.
@@ -2162,7 +2193,7 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
             }).scalar_one() == 1
     assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) is None
 
-    next_scope, next_authorization = _claim_policy_authority('semantic-b')
+    next_authorizer = _claim_policy_authorizer('semantic-b')
     next_generation = serve_state.replace_reserved_fill_claim_set(
         _SERVICE,
         semantic_hash='semantic-b',
@@ -2174,8 +2205,7 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
         expected_service_hash=_SERVICE_HASH,
         service_version=1,
         expected_controller_owner=_OWNER,
-        reclaim_claim_scope=next_scope,
-        reclaim_claim_authorization=next_authorization)
+        reclaim_claim_authorizer=next_authorizer)
     assert next_generation == 12
     with allocation_engine.connect() as connection:
         cleared = connection.execute(
@@ -2188,3 +2218,173 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
                 'name': _SERVICE
             }).one()
     assert tuple(cleared) == (0, None, None, None)
+
+
+@pytest.mark.parametrize('lock_target', ['protocol', 'legacy-projection'])
+def test_claim_authorization_is_minted_after_all_write_set_locks(
+        allocation_engine, monkeypatch, lock_target) -> None:
+    """A pre-lock wait longer than the ticket lifetime cannot expire it."""
+    monkeypatch.setattr(serve_state._db_manager, '_engine', allocation_engine)
+    monotonic = [100.0]
+    monkeypatch.setattr(reserved_fill_reclaim_attestation.time, 'monotonic',
+                        lambda: monotonic[0])
+    lock_attempted = threading.Event()
+    blocker_ready = threading.Event()
+    release_blocker = threading.Event()
+    authorization_called = threading.Event()
+    events = []
+    if lock_target == 'protocol':
+        original_lock = serve_state._lock_zero_cost_protocol_sequence_for_update
+
+        def _record_lock_attempt(session):
+            events.append('lock-attempt')
+            lock_attempted.set()
+            return original_lock(session)
+
+        monkeypatch.setattr(serve_state,
+                            '_lock_zero_cost_protocol_sequence_for_update',
+                            _record_lock_attempt)
+        lock_sql = """
+            SELECT id
+            FROM reserved_fill_protocol_state
+            WHERE id = 1
+            FOR UPDATE
+        """
+        lock_params = {}
+    else:
+        with allocation_engine.begin() as connection:
+            connection.execute(
+                serve_state_schema.reserved_fill_claims_table.insert().values(
+                    service_name=_SERVICE,
+                    pool_key='legacy-pool',
+                    heartbeat_ts=1))
+        original_lock = (
+            serve_state._lock_reserved_fill_claim_write_set_for_update)
+
+        def _record_lock_attempt(session, service_name):
+            events.append('lock-attempt')
+            lock_attempted.set()
+            return original_lock(session, service_name)
+
+        monkeypatch.setattr(serve_state,
+                            '_lock_reserved_fill_claim_write_set_for_update',
+                            _record_lock_attempt)
+        lock_sql = """
+            SELECT service_name
+            FROM reserved_fill_claims
+            WHERE service_name = :service_name
+            FOR UPDATE
+        """
+        lock_params = {'service_name': _SERVICE}
+
+    def _record_authorization() -> None:
+        events.append('authorize')
+        authorization_called.set()
+
+    authorizer = _claim_policy_authorizer('semantic-b',
+                                          on_authorize=_record_authorization)
+
+    def _hold_protocol_lock() -> None:
+        with allocation_engine.connect() as connection:
+            transaction = connection.begin()
+            try:
+                connection.execute(sqlalchemy.text(lock_sql), lock_params).one()
+                blocker_ready.set()
+                assert release_blocker.wait(timeout=20)
+            finally:
+                transaction.rollback()
+
+    def _replace() -> int | None:
+        return serve_state.replace_reserved_fill_claim_set(
+            _SERVICE,
+            semantic_hash='semantic-b',
+            global_headroom=8,
+            utilization_ceiling=8,
+            utilization_state=None,
+            edges=(_claim_set_edge(),),
+            heartbeat_ts=2,
+            expected_service_hash=_SERVICE_HASH,
+            service_version=1,
+            expected_controller_owner=_OWNER,
+            reclaim_claim_authorizer=authorizer)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        blocker = executor.submit(_hold_protocol_lock)
+        try:
+            assert blocker_ready.wait(timeout=10)
+            replacement = executor.submit(_replace)
+            assert lock_attempted.wait(timeout=10)
+            assert not authorization_called.wait(timeout=0.1)
+            monotonic[0] += (
+                reserved_fill_reclaim_attestation.AUTHORIZATION_MAX_AGE_SECONDS
+                + 1)
+            release_blocker.set()
+            assert replacement.result(timeout=20) == 12
+            blocker.result(timeout=20)
+        finally:
+            release_blocker.set()
+
+    assert events == ['lock-attempt', 'authorize']
+
+
+def test_locked_claim_authorizer_can_read_fresh_proof_on_second_connection(
+        allocation_engine, monkeypatch) -> None:
+    """The receipt-only callback cannot self-deadlock on the gate lock."""
+    monkeypatch.setattr(serve_state._db_manager, '_engine', allocation_engine)
+    _, template = _claim_policy_authority('semantic-b')
+    repository = reserved_fill_reclaim_proofs.ReclaimProviderProofRepository(
+        allocation_engine)
+    try:
+        repository.renew(
+            identity=template.identity,
+            gate_generation=template.gate_generation,
+            kubernetes_context=_CONTEXT,
+            deadline_monotonic=(time.monotonic() +
+                                reserved_fill_reclaim_attestation.
+                                PROVIDER_PROOF_REFRESH_TIMEOUT_SECONDS),
+            prove=lambda: reserved_fill_reclaim_proofs.
+            ReclaimProviderProofCandidate(proof_payload={
+                'kubernetes': {
+                    'physical_cluster_uid': _UID,
+                },
+            },
+                                          oldest_completed_monotonic=time.
+                                          monotonic()),
+            validate=lambda _payload: True)
+
+        def _authorize(
+            scope: reserved_fill_reclaim_attestation.ReclaimClaimSetScope,
+            identity: reserved_fill_reclaim_attestation.ReclaimPolicyIdentity,
+            gate_generation: int,
+        ) -> reserved_fill_reclaim_attestation.ReclaimClaimAuthorization:
+            repository.get_fresh(
+                identity=identity,
+                gate_generation=gate_generation,
+                kubernetes_context=_CONTEXT,
+                deadline_monotonic=(time.monotonic() +
+                                    reserved_fill_reclaim_attestation.
+                                    PROVIDER_PROOF_READ_TIMEOUT_SECONDS),
+                validate=lambda _payload: True,
+                minimum_remaining_seconds=(
+                    reserved_fill_reclaim_attestation.
+                    PROVIDER_PROOF_CONSUMER_MIN_REMAINING_SECONDS))
+            return (reserved_fill_reclaim_attestation.ReclaimClaimAuthorization(
+                identity=identity,
+                gate_generation=gate_generation,
+                scope=scope,
+                completed_monotonic=time.monotonic()))
+
+        assert serve_state.replace_reserved_fill_claim_set(
+            _SERVICE,
+            semantic_hash='semantic-b',
+            global_headroom=8,
+            utilization_ceiling=8,
+            utilization_state=None,
+            edges=(_claim_set_edge(),),
+            heartbeat_ts=2,
+            expected_service_hash=_SERVICE_HASH,
+            service_version=1,
+            expected_controller_owner=_OWNER,
+            reclaim_claim_authorizer=_authorize) == 12
+    finally:
+        repository._proof_engine.dispose()

@@ -11520,6 +11520,29 @@ def _write_reserved_fill_legacy_projection_in_session(
     session.execute(insert_stmt)
 
 
+def _lock_reserved_fill_claim_write_set_for_update(
+    session: orm.Session,
+    service_name: str,
+) -> tuple[Any, list[Any]]:
+    """Lock every existing row written by one claim-set replacement."""
+    previous = session.execute(
+        sqlalchemy.select(reserved_fill_service_claim_sets_table).where(
+            reserved_fill_service_claim_sets_table.c.service_name ==
+            service_name).with_for_update()).fetchone()
+    previous_edges = session.execute(
+        sqlalchemy.select(reserved_fill_pool_claims_table).where(
+            reserved_fill_pool_claims_table.c.service_name ==
+            service_name).with_for_update()).fetchall()
+    # The allocation columns live on the already-locked claim-set row. This
+    # compatibility projection is the only other relation updated by every
+    # successful replacement.
+    session.execute(
+        sqlalchemy.select(reserved_fill_claims_table).where(
+            reserved_fill_claims_table.c.service_name ==
+            service_name).with_for_update()).fetchone()
+    return previous, previous_edges
+
+
 def replace_reserved_fill_claim_set(
     service_name: str,
     *,
@@ -11532,17 +11555,23 @@ def replace_reserved_fill_claim_set(
     expected_service_hash: str,
     service_version: int | None = None,
     expected_controller_owner: tuple[int | None, str | None] | None = None,
-    reclaim_claim_scope: (reserved_fill_reclaim_attestation.ReclaimClaimSetScope
-                          | None) = None,
-    reclaim_claim_authorization: (
-        reserved_fill_reclaim_attestation.ReclaimClaimAuthorization |
-        None) = None,
+    reclaim_claim_authorizer: (typing.Callable[[
+        reserved_fill_reclaim_attestation.ReclaimClaimSetScope,
+        reserved_fill_reclaim_attestation.ReclaimPolicyIdentity, int
+    ], reserved_fill_reclaim_attestation.ReclaimClaimAuthorization] |
+                               None) = None,
 ) -> int | None:
     """Owner-fenced atomic replacement of one complete protocol-v2 set.
 
     Callers acquire the global reserved-fill broker lock before entering.
     ``None`` means the protocol or service owner fence was lost; otherwise the
     returned monotonic generation names every row written by this transaction.
+
+    Sequenced reconciliation invokes ``reclaim_claim_authorizer`` only after
+    this transaction owns the protocol-first, lifecycle/service, immutable
+    version/projection, and current-claim locks and has reconstructed the exact
+    claim scope. The callback may consume only proactively renewed PostgreSQL
+    proof receipts in its bounded process; it must not perform provider I/O.
     """
     if not isinstance(semantic_hash, str) or not semantic_hash:
         raise ValueError('Reserved-fill semantic_hash must be non-empty.')
@@ -11582,13 +11611,11 @@ def replace_reserved_fill_claim_set(
             if (service_version is not None or any(
                     edge['worker_projection_sha256_by_accelerator'] is not None
                     for edge in normalized_edges) or
-                    reclaim_claim_scope is not None or
-                    reclaim_claim_authorization is not None):
+                    reclaim_claim_authorizer is not None):
                 session.rollback()
                 return None
         elif gate_state == pool_capacity_observation_schema.SEQUENCED_ACTIVE:
-            if (service_version is None or reclaim_claim_scope is None or
-                    reclaim_claim_authorization is None):
+            if service_version is None or reclaim_claim_authorizer is None:
                 session.rollback()
                 return None
         else:
@@ -11624,7 +11651,7 @@ def replace_reserved_fill_claim_set(
             return None
         if gate_state == pool_capacity_observation_schema.SEQUENCED_ACTIVE:
             assert service_version is not None
-            assert reclaim_claim_authorization is not None
+            assert reclaim_claim_authorizer is not None
             if owner.current_version != service_version:
                 session.rollback()
                 return None
@@ -11674,6 +11701,22 @@ def replace_reserved_fill_claim_set(
                         policy_revision=sequence_row['reclaim_policy_revision'],
                         provider_inventory_sha256=sequence_row[
                             'reclaim_provider_inventory_sha256']))
+            except (reserved_fill_reclaim_attestation.ReclaimAttestationError,
+                    TypeError, ValueError):
+                session.rollback()
+                return None
+        previous, previous_edges = (
+            _lock_reserved_fill_claim_write_set_for_update(
+                session, service_name))
+        if gate_state == pool_capacity_observation_schema.SEQUENCED_ACTIVE:
+            assert reclaim_claim_authorizer is not None
+            try:
+                # All SQL locks defining ``expected_scope`` and the complete
+                # current write set are now held. Mint and validate the
+                # five-second ticket immediately beside the write.
+                reclaim_claim_authorization = reclaim_claim_authorizer(
+                    expected_scope, identity,
+                    sequence_row['reconciliation_gate_generation'])
                 (reserved_fill_reclaim_attestation.
                  require_exact_claim_authorization)(
                      reclaim_claim_authorization,
@@ -11685,17 +11728,6 @@ def replace_reserved_fill_claim_set(
                     TypeError, ValueError):
                 session.rollback()
                 return None
-            if reclaim_claim_scope != expected_scope:
-                session.rollback()
-                return None
-        previous = session.execute(
-            sqlalchemy.select(reserved_fill_service_claim_sets_table).where(
-                reserved_fill_service_claim_sets_table.c.service_name ==
-                service_name).with_for_update()).fetchone()
-        previous_edges = session.execute(
-            sqlalchemy.select(reserved_fill_pool_claims_table).where(
-                reserved_fill_pool_claims_table.c.service_name ==
-                service_name).with_for_update()).fetchall()
         previous_generation = 0 if previous is None else int(
             previous.generation)
         if previous_generation > int(protocol.claim_generation):
