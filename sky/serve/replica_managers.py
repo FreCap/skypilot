@@ -4496,28 +4496,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 shape_matches = False
             if not shape_matches:
                 return False
-            status_property = info.status_property
-            status_property.sky_launch_status = (
-                common_utils.ProcessStatus.INTERRUPTED)
-            if (status_property.sky_down_status
-                    != common_utils.ProcessStatus.RUNNING):
-                status_property.sky_down_status = (
-                    common_utils.ProcessStatus.SCHEDULED)
-            status_property.service_ready_now = False
-            status_property.is_scale_down = True
-            status_property.preempted = False
-            status_property.purged = False
-            status_property.failed_spot_availability = False
-            status_property.drain_cap_seconds = 0
-            status_property.drain_started_at = None
-            status_property.wait_for_idle_before_termination = False
-            status_property.logical_retirement_version = None
-            status_property.logical_retirement_controller_epoch = None
-            status_property.logical_retirement_generation = None
-            status_property.logical_retirement_target_capacity = None
-            status_property.logical_retirement_confirmed_generation = None
-            status_property.logical_retirement_bounded_deadline = False
-            status_property.logical_retirement_committed = False
+            (non_pool_launch_reconciliation.
+             apply_immediate_provider_cleanup_replica_marker(info))
         paid_outcome: paid_capacity.LaunchOutcome | None
         if projection.pre_effect_terminal:
             # No provider or service-job effect occurred.  Leave this exact

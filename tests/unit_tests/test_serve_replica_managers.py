@@ -3045,6 +3045,94 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         manager._handle_sky_down_finish.assert_called_once_with(info,
                                                                 format_exc=None)
 
+    def test_projected_reserved_1516_absence_cleanup_is_database_only(self):
+        manager = _make_manager()
+        runtime = manager._legacy_mutation_runtime_state()
+        info = _fake_replica_info(
+            3, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.reserved_fill = True
+        info.is_zero_cost = True
+        status = info.status_property
+        status.sky_launch_status = common_utils.ProcessStatus.FAILED
+        status.sky_down_status = common_utils.ProcessStatus.FAILED
+        assert info.status == (
+            replica_managers.serve_state.ReplicaStatus.FAILED_CLEANUP)
+        assert not ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+            info)
+        assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+            info)
+        assert not runtime.launch_thread_pool
+        assert not runtime.down_thread_pool
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=info), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'bound_non_pool_projected_provider_absence_is_authorized',
+                 return_value=True) as authorize, \
+             mock.patch.object(manager, '_remove_replica') as remove, \
+             mock.patch.object(manager, '_persist_replica') as persist, \
+             mock.patch.object(replica_managers, 'terminate_cluster') \
+                 as provider_down:
+            assert manager._finalize_projected_provider_absence_cleanup(3)
+
+        authorize.assert_called_once_with('svc', 3, info.replica_record_id)
+        remove.assert_called_once_with(
+            3,
+            info.replica_record_id,
+            allow_active_provider_free_pre_job=True)
+        persist.assert_not_called()
+        provider_down.assert_not_called()
+
+    @pytest.mark.parametrize(('field', 'value'), [
+        ('sky_down_status', None),
+        ('user_app_failed', True),
+        ('first_ready_time', 1.0),
+        ('is_scale_down', True),
+        ('drain_cap_seconds', 0),
+    ])
+    def test_projected_reserved_1516_absence_candidate_is_exact(
+            self, field, value):
+        info = _fake_replica_info(
+            3, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.reserved_fill = True
+        info.is_zero_cost = True
+        status = info.status_property
+        status.sky_launch_status = common_utils.ProcessStatus.FAILED
+        status.sky_down_status = common_utils.ProcessStatus.FAILED
+        setattr(status, field, value)
+
+        assert not ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+            info)
+
+    def test_projected_reserved_1516_candidate_without_authority_is_retained(
+            self):
+        manager = _make_manager()
+        info = _fake_replica_info(
+            3, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.reserved_fill = True
+        info.is_zero_cost = True
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        info.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=info), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'bound_non_pool_projected_provider_absence_is_authorized',
+                 return_value=False) as authorize, \
+             mock.patch.object(manager, '_handle_sky_down_finish') as finish, \
+             mock.patch.object(replica_managers, 'terminate_cluster') \
+                 as provider_down:
+            assert not manager._finalize_projected_provider_absence_cleanup(3)
+
+        authorize.assert_called_once_with('svc', 3, info.replica_record_id)
+        finish.assert_not_called()
+        provider_down.assert_not_called()
+
     def test_projected_paid_absence_cleanup_is_database_only(self):
         manager = _make_manager()
         runtime = manager._legacy_mutation_runtime_state()
@@ -3348,8 +3436,18 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         assert info.system_recovery_revision == 2
         update.assert_called_once()
 
-    def test_reserved_fill_absence_projects_failed_without_materialization(
-            self):
+    @pytest.mark.parametrize(
+        ('launch_status', 'down_status', 'expected_down_status'), [
+            (common_utils.ProcessStatus.SCHEDULED, None,
+             common_utils.ProcessStatus.SCHEDULED),
+            (common_utils.ProcessStatus.RUNNING, None,
+             common_utils.ProcessStatus.SCHEDULED),
+            (common_utils.ProcessStatus.INTERRUPTED,
+             common_utils.ProcessStatus.RUNNING,
+             common_utils.ProcessStatus.RUNNING),
+        ])
+    def test_reserved_fill_absence_projects_one_immediate_cleanup_marker(
+            self, launch_status, down_status, expected_down_status):
         manager = _make_manager()
         manager._ordinary_launch_binding_authority = _binding_authority(
             ordinary_launch_binding.BindingMode.BOUND, generic=True)
@@ -3357,6 +3455,24 @@ class TestBoundOrdinaryLaunchManagerIntegration:
             1, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
         info.reserved_fill = True
         info.is_zero_cost = True
+        status = info.status_property
+        status.sky_launch_status = launch_status
+        status.sky_down_status = down_status
+        status.service_ready_now = True
+        status.is_scale_down = False
+        status.preempted = True
+        status.purged = True
+        status.failed_spot_availability = True
+        status.wait_for_idle_before_termination = True
+        status.drain_cap_seconds = 60
+        status.drain_started_at = 123.0
+        status.logical_retirement_version = 1
+        status.logical_retirement_controller_epoch = 'epoch'
+        status.logical_retirement_generation = 2
+        status.logical_retirement_target_capacity = 3
+        status.logical_retirement_confirmed_generation = 4
+        status.logical_retirement_bounded_deadline = True
+        status.logical_retirement_committed = True
         profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
             ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
             authorization_reference='reserved-fill:' + 'a' * 64,
@@ -3393,8 +3509,26 @@ class TestBoundOrdinaryLaunchManagerIntegration:
             assert manager._project_bound_ordinary_launch(
                 None, mock.sentinel.connection, projection)
 
-        assert (info.status_property.sky_launch_status ==
-                common_utils.ProcessStatus.FAILED)
+        assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+            info)
+        assert status.sky_launch_status == (
+            common_utils.ProcessStatus.INTERRUPTED)
+        assert status.sky_down_status == expected_down_status
+        assert status.service_ready_now is False
+        assert status.is_scale_down is True
+        assert status.preempted is False
+        assert status.purged is False
+        assert status.failed_spot_availability is False
+        assert status.wait_for_idle_before_termination is False
+        assert status.drain_cap_seconds == 0
+        assert status.drain_started_at is None
+        assert status.logical_retirement_version is None
+        assert status.logical_retirement_controller_epoch is None
+        assert status.logical_retirement_generation is None
+        assert status.logical_retirement_target_capacity is None
+        assert status.logical_retirement_confirmed_generation is None
+        assert status.logical_retirement_bounded_deadline is False
+        assert status.logical_retirement_committed is False
         assert update.call_args.kwargs['provider_launch_succeeded'] is False
         assert update.call_args.kwargs['paid_capacity_pool_key'] is None
         assert update.call_args.kwargs['paid_capacity_outcome'] is None

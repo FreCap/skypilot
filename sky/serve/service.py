@@ -471,10 +471,11 @@ def _prepare_provider_present_cleanup(
         _project_bound_ordinary_launch_for_teardown, authority))
     for key, info in info_by_key.items():
         context = contexts.get(key)
-        marker = (ordinary_launch_binding.
-                  replica_has_provider_present_cleanup_marker(info))
+        projected_absence_candidate = (
+            ordinary_launch_binding.
+            replica_has_projected_provider_absence_cleanup_marker(info))
         if context is None:
-            if not marker:
+            if not projected_absence_candidate:
                 continue
             if (request_postgres.
                     bound_non_pool_projected_provider_absence_is_authorized(
@@ -487,8 +488,8 @@ def _prepare_provider_present_cleanup(
                     projected_absence_keys.add(key)
             else:
                 failures[key] = (
-                    'provider-present cleanup marker lost its exact bound '
-                    'association authority')
+                    'projected provider-absence candidate lost its exact '
+                    'bound association authority')
             continue
         try:
             cleanup_context = _provider_present_cleanup_context(
@@ -611,14 +612,22 @@ def _cleanup(
                 f'Lost lifecycle epoch or replica {info.replica_id} was '
                 'removed while updating cleanup bookkeeping.')
 
-    def _remove_replica(info: replica_managers.ReplicaInfo) -> None:
+    def _remove_replica(
+        info: replica_managers.ReplicaInfo,
+        *,
+        allow_active_provider_free_pre_job: bool = False,
+    ) -> None:
+        provider_free_kwargs = ({
+            'allow_active_provider_free_pre_job': True
+        } if allow_active_provider_free_pre_job else {})
         removed = serve_state.remove_replica(
             service_name,
             info.replica_id,
             expected_service_hash=service_hash,
             expected_lifecycle_epoch=lifecycle_epoch,
             expected_controller_owner=expected_owner,
-            expected_replica_record_id=info.replica_record_id)
+            expected_replica_record_id=info.replica_record_id,
+            **provider_free_kwargs)
         if removed is False:
             raise ServiceOwnershipLostError(
                 'Lost lifecycle epoch or record identity while removing '
@@ -687,6 +696,7 @@ def _cleanup(
         suffix = '' if reason is None else f': {reason}'
         logger.error(f'Replica {info.replica_id} failed to terminate{suffix}.')
 
+    projected_absence_infos: list[replica_managers.ReplicaInfo] = []
     absent_legacy_infos: list[replica_managers.ReplicaInfo] = []
     cleanup_entries: list[
         tuple[replica_managers.ReplicaInfo,
@@ -705,7 +715,12 @@ def _cleanup(
             _set_to_failed_cleanup(info, preparation_failure)
             continue
         if cleanup_key in preparation.projected_absence_keys:
-            absent_legacy_infos.append(info)
+            if info.reserved_fill is True:
+                projected_absence_infos.append(info)
+            else:
+                # Preserve the existing paid projected-absence retirement;
+                # only reserved pre-job cleanup needs the active Kueue scope.
+                absent_legacy_infos.append(info)
             continue
         try:
             cleanup_fence = (
@@ -763,6 +778,13 @@ def _cleanup(
                         f'{presence.value.lower()}')
             continue
         cleanup_entries.append((info, cleanup_fence, cleanup_context))
+
+    for info in projected_absence_infos:
+        _assert_owner(
+            f'before retiring provider-absent replica {info.replica_id}')
+        _remove_replica(info, allow_active_provider_free_pre_job=True)
+        logger.info(f'Replica {info.replica_id} removed after exact provider '
+                    'absence projection.')
 
     if absent_legacy_infos:
         removed = serve_state.remove_replicas(
@@ -1786,25 +1808,8 @@ def _project_bound_ordinary_launch_for_teardown(
             shape_matches = False
         if not shape_matches:
             return False
-        status = info.status_property
-        status.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
-        if status.sky_down_status != common_utils.ProcessStatus.RUNNING:
-            status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
-        status.service_ready_now = False
-        status.is_scale_down = True
-        status.preempted = False
-        status.purged = False
-        status.failed_spot_availability = False
-        status.drain_cap_seconds = 0
-        status.drain_started_at = None
-        status.wait_for_idle_before_termination = False
-        status.logical_retirement_version = None
-        status.logical_retirement_controller_epoch = None
-        status.logical_retirement_generation = None
-        status.logical_retirement_target_capacity = None
-        status.logical_retirement_confirmed_generation = None
-        status.logical_retirement_bounded_deadline = False
-        status.logical_retirement_committed = False
+        (non_pool_launch_reconciliation.
+         apply_immediate_provider_cleanup_replica_marker(info))
     elif provider_absent:
         assert provider_absence_projection is not None
     elif (info.status_property.sky_launch_status !=
