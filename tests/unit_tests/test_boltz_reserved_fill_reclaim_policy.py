@@ -529,6 +529,33 @@ def test_two_arbitrary_services_share_one_canonical_claim_path(monkeypatch):
         assert authorization.identity == identity
 
 
+def test_claim_ticket_is_minted_after_proof_logging(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    clock = [100.0]
+    monkeypatch.setattr(policy_lib.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(policy, '_read_launch_context',
+                        _fake_receipt_read(policy))
+
+    def _slow_log(_payload):
+        clock[0] += reclaim.AUTHORIZATION_MAX_AGE_SECONDS + 1
+
+    monkeypatch.setattr(policy, '_emit_proof', _slow_log)
+    context = policy._bundle.fleet_context('phx_research_cluster_eks')
+    scope = reclaim.ReclaimClaimSetScope(service_name='svc',
+                                         service_incarnation='incarnation',
+                                         service_version=1,
+                                         semantic_hash='semantic',
+                                         edges=(_edge(context),))
+
+    authorization = policy.authorize_claim_set(
+        scope,
+        expected_identity=policy.policy_identity(),
+        expected_gate_generation=7,
+        deadline_monotonic=clock[0] + 10)
+
+    assert authorization.completed_monotonic == clock[0] == 106.0
+
+
 def test_unchanged_policy_authorizes_current_service_version_refresh(
         monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()

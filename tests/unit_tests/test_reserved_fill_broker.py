@@ -1178,7 +1178,7 @@ def _install_claim_identity_harness(monkeypatch):
             identity=expected_identity,
             gate_generation=expected_gate_generation,
             scope=scope,
-            completed_monotonic=1.0)
+            completed_monotonic=broker.time.monotonic())
 
     monkeypatch.setattr(broker, '_authorize_reclaim_claim_set_in_boundary',
                         _authorize)
@@ -1193,6 +1193,36 @@ def _install_claim_identity_harness(monkeypatch):
     generations: dict[str, int] = {}
 
     def _persist(_service_name, **kwargs):
+        claim_edges = []
+        for edge in kwargs['edges']:
+            identity = broker.parse_pool_identity(str(edge['pool_key']))
+            projected_admissions = _projected_admissions(
+                [object()],
+                access_context=str(edge['access_context']),
+                accelerator_names=identity.gpu_names,
+                accelerator_count=int(edge['gpus_per_replica']),
+                require_current_protocol=True)
+            claim_edges.append(
+                reclaim.ReclaimClaimEdge(
+                    pool_key=str(edge['pool_key']),
+                    access_context=str(edge['access_context']),
+                    physical_cluster_uid=str(edge['physical_cluster_uid']),
+                    accelerator_names=tuple(sorted(identity.gpu_names)),
+                    projected_admissions=projected_admissions))
+        scope = reclaim.ReclaimClaimSetScope(
+            service_name=_service_name,
+            service_incarnation=authority['service_hash'],
+            service_version=kwargs['service_version'],
+            semantic_hash=kwargs['semantic_hash'],
+            edges=tuple(sorted(claim_edges)))
+        authorizer = kwargs['reclaim_claim_authorizer']
+        assert callable(authorizer)
+        authorization = authorizer(scope, policy_identity, gate.generation)
+        reclaim.require_exact_claim_authorization(
+            authorization,
+            expected_identity=policy_identity,
+            expected_gate_generation=gate.generation,
+            expected_scope=scope)
         semantic_hash = kwargs['semantic_hash']
         if semantic_hash not in generations:
             generations[semantic_hash] = 7 + len(generations)

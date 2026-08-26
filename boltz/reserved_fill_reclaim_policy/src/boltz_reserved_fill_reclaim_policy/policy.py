@@ -729,22 +729,25 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                                                  expected_gate_generation,
                                                  deadline_monotonic)
             proofs[context_name] = proof
-        completed = time.monotonic()
+        proof_completed = time.monotonic()
         self._require_deadline(deadline_monotonic)
-        authorization = reclaim.ReclaimClaimAuthorization(
-            identity=self.policy_identity(),
-            gate_generation=expected_gate_generation,
-            scope=scope,
-            completed_monotonic=completed)
         payload = self._proof_payload('claim',
                                       proofs,
-                                      completed,
+                                      proof_completed,
                                       gate_generation=expected_gate_generation,
                                       service_name=scope.service_name,
                                       service_version=scope.service_version,
                                       semantic_hash=scope.semantic_hash)
         self._emit_proof(payload)
-        return authorization
+        # Proof logging is observability, not authorization. Mint the
+        # short-lived ticket only after it completes so logging latency cannot
+        # consume the ticket's five-second validity window.
+        self._require_deadline(deadline_monotonic)
+        return reclaim.ReclaimClaimAuthorization(
+            identity=self.policy_identity(),
+            gate_generation=expected_gate_generation,
+            scope=scope,
+            completed_monotonic=time.monotonic())
 
     def renew_provider_proofs(
         self,
