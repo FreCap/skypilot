@@ -11,6 +11,7 @@ from sky.provision import common as provision_common
 from sky.serve import non_pool_launch_reconciliation as reconciliation
 from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
+from sky.serve import replica_info
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 
@@ -99,16 +100,35 @@ def test_reserved_fill_provider_observation_is_closed(
         replica.reserved_fill_physical_cluster_uid)
 
 
-@pytest.mark.parametrize(('initial', 'expected'), [
+@pytest.mark.parametrize(('initial_launch', 'initial_down', 'expected_down'), [
     (reconciliation.common_utils.ProcessStatus.INTERRUPTED,
-     reconciliation.common_utils.ProcessStatus.INTERRUPTED),
-    (reconciliation.common_utils.ProcessStatus.SCHEDULED,
-     reconciliation.common_utils.ProcessStatus.FAILED),
+     reconciliation.common_utils.ProcessStatus.RUNNING,
+     reconciliation.common_utils.ProcessStatus.RUNNING),
+    (reconciliation.common_utils.ProcessStatus.SCHEDULED, None,
+     reconciliation.common_utils.ProcessStatus.SCHEDULED),
 ])
-def test_reserved_fill_exact_absence_projects_terminal_status(
-        initial: reconciliation.common_utils.ProcessStatus,
-        expected: reconciliation.common_utils.ProcessStatus) -> None:
-    status_property = types.SimpleNamespace(sky_launch_status=initial)
+def test_reserved_fill_exact_absence_projects_one_cleanup_marker(
+        initial_launch: reconciliation.common_utils.ProcessStatus,
+        initial_down: reconciliation.common_utils.ProcessStatus | None,
+        expected_down: reconciliation.common_utils.ProcessStatus) -> None:
+    status_property = replica_info.ReplicaStatusProperty(
+        sky_launch_status=initial_launch,
+        sky_down_status=initial_down,
+        service_ready_now=True,
+        is_scale_down=False,
+        preempted=True,
+        purged=True,
+        failed_spot_availability=True,
+        drain_cap_seconds=60,
+        drain_started_at=123.0,
+        wait_for_idle_before_termination=True,
+        logical_retirement_version=1,
+        logical_retirement_controller_epoch='epoch',
+        logical_retirement_generation=2,
+        logical_retirement_target_capacity=3,
+        logical_retirement_confirmed_generation=4,
+        logical_retirement_bounded_deadline=True,
+        logical_retirement_committed=True)
     projection = types.SimpleNamespace(
         provider_evidence=ordinary_launch_binding.ProviderEvidence.ABSENT,
         context=_context(
@@ -128,7 +148,24 @@ def test_reserved_fill_exact_absence_projects_terminal_status(
 
     assert result == reconciliation.ProviderAbsenceReplicaProjection(
         paid_capacity_pool_key=None, paid_capacity_outcome=None)
-    assert status_property.sky_launch_status is expected
+    assert status_property.sky_launch_status is (
+        reconciliation.common_utils.ProcessStatus.INTERRUPTED)
+    assert status_property.sky_down_status is expected_down
+    assert status_property.service_ready_now is False
+    assert status_property.is_scale_down is True
+    assert status_property.preempted is False
+    assert status_property.purged is False
+    assert status_property.failed_spot_availability is False
+    assert status_property.drain_cap_seconds == 0
+    assert status_property.drain_started_at is None
+    assert status_property.wait_for_idle_before_termination is False
+    assert status_property.logical_retirement_version is None
+    assert status_property.logical_retirement_controller_epoch is None
+    assert status_property.logical_retirement_generation is None
+    assert status_property.logical_retirement_target_capacity is None
+    assert status_property.logical_retirement_confirmed_generation is None
+    assert status_property.logical_retirement_bounded_deadline is False
+    assert status_property.logical_retirement_committed is False
 
 
 def test_retargeted_reserved_fill_context_is_replaced(

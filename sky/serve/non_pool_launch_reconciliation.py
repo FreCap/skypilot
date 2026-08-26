@@ -63,6 +63,34 @@ def decoded_request_error(error: Any) -> BaseException | None:
     return error_object
 
 
+def apply_immediate_provider_cleanup_replica_marker(info: Any) -> None:
+    """Write the one closed marker used by exact immediate cleanup.
+
+    The caller owns provider and database authority. This helper only
+    normalizes the locked replica copy and performs no provider or database
+    I/O.
+    """
+    status = info.status_property
+    status.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
+    if status.sky_down_status != common_utils.ProcessStatus.RUNNING:
+        status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+    status.service_ready_now = False
+    status.is_scale_down = True
+    status.preempted = False
+    status.purged = False
+    status.failed_spot_availability = False
+    status.drain_cap_seconds = 0
+    status.drain_started_at = None
+    status.wait_for_idle_before_termination = False
+    status.logical_retirement_version = None
+    status.logical_retirement_controller_epoch = None
+    status.logical_retirement_generation = None
+    status.logical_retirement_target_capacity = None
+    status.logical_retirement_confirmed_generation = None
+    status.logical_retirement_bounded_deadline = False
+    status.logical_retirement_committed = False
+
+
 def apply_exact_provider_absence_replica_projection(
         projection: Any) -> ProviderAbsenceReplicaProjection | None:
     """Validate exact ABSENT evidence and update its locked replica copy.
@@ -86,10 +114,12 @@ def apply_exact_provider_absence_replica_projection(
     pool_key = projection.paid_capacity_pool_key
     paid_outcome = None
     explicit_paid_cancel = False
+    reserved_absence = False
     if (context.profile.kind ==
             ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
         if pool_key is not None:
             return None
+        reserved_absence = True
     elif ordinary_launch_binding.is_paid_provider_reconciliation_profile(
             context.profile.kind):
         request = getattr(projection, 'request', None)
@@ -195,7 +225,12 @@ def apply_exact_provider_absence_replica_projection(
     else:
         return None
 
-    if explicit_paid_cancel:
+    if reserved_absence:
+        # Exact post-quiescence ABSENT evidence makes provider cleanup a
+        # database-only retirement. Normalize every current writer to the
+        # same closed marker used by the restart-safe finalizer.
+        apply_immediate_provider_cleanup_replica_marker(info)
+    elif explicit_paid_cancel:
         info.status_property.sky_launch_status = (
             common_utils.ProcessStatus.INTERRUPTED)
     elif (info.status_property.sky_launch_status !=

@@ -2122,6 +2122,17 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
                     status='PROVISIONING',
                     paid_capacity_pool_key=None,
                     replica_state=info.to_storage_dict()))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                'gc-service').values(
+                    reserved_fill_actuation_mode=(
+                        zero_cost_actuation.ActuationMode.DURABLE_INTENT.value),
+                    reserved_fill_actuation_epoch=1,
+                    reserved_fill_actuation_capable=True,
+                    reserved_fill_actuation_controller_incarnation=(
+                        _GC_CONTROLLER_ID),
+                    reserved_fill_actuation_protocol_version=1))
     profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
         ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
         authorization_reference='reserved-fill:' + 'e' * 64,
@@ -2130,6 +2141,13 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
     monkeypatch.setattr(ordinary_launch_binding,
                         'resolve_non_pool_launch_profile_in_connection',
                         lambda *_args, **_kwargs: profile)
+    monkeypatch.setattr(
+        ordinary_launch_binding,
+        '_resolve_non_pool_launch_profile_in_connection',
+        lambda *_args, **_kwargs: (profile, None))
+    monkeypatch.setattr(
+        ordinary_launch_binding, '_reserved_fill_cleanup_payload',
+        lambda *_args, **_kwargs: {'physical_cluster_uid': 'physical-uid-a'})
     identity = _gc_non_pool_binding_identity(profile)
     request = _bound_non_pool_request(identity.request_id)
     monkeypatch.setattr(request_postgres,
@@ -2187,8 +2205,9 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
                     status=requests.RequestStatus.CANCELLED.value,
                     terminal_cause=event_api_models.EventCause.
                     EXECUTION_LEASE_EXPIRED.value,
+                    execution_generation=1,
                     execution_quiescence_required=True,
-                    execution_quiesced_generation=0,
+                    execution_quiesced_generation=1,
                     execution_quiesced_at=now,
                     finished_at=now,
                     updated_at=now))
@@ -2252,10 +2271,57 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
         'terminal_status'] == requests.RequestStatus.CANCELLED.value
     assert association['pin_released_at'] is not None
     assert replica['ordinary_launch_association_id'] is None
-    assert replica['status'] == 'FAILED_CLEANUP'
+    assert replica['status'] == 'SHUTTING_DOWN'
     assert (persisted.status_property.sky_launch_status
-            is common_utils.ProcessStatus.FAILED)
+            is common_utils.ProcessStatus.INTERRUPTED)
+    assert (persisted.status_property.sky_down_status
+            is common_utils.ProcessStatus.SCHEDULED)
+    assert persisted.status_property.is_scale_down is True
+    assert persisted.status_property.drain_cap_seconds == 0
+    assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+        persisted)
     assert pin_count == 0
+    assert request_postgres.bound_non_pool_projected_provider_absence_is_authorized(
+        'gc-service', 3, str(_GC_REPLICA_RECORD_ID))
+
+    # Release 1.1.1516 projected this exact diagnostic shape. It remains an
+    # N-1 candidate only: full locked association/evidence authority is still
+    # required before the manager may retire it.
+    persisted.status_property.sky_launch_status = (
+        common_utils.ProcessStatus.FAILED)
+    persisted.status_property.sky_down_status = common_utils.ProcessStatus.FAILED
+    persisted.status_property.is_scale_down = False
+    persisted.status_property.drain_cap_seconds = None
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                'gc-service',
+                serve_state_schema.replicas_table.c.replica_id == 3).values(
+                    status='FAILED_CLEANUP',
+                    replica_state=persisted.to_storage_dict()))
+    assert not ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+        persisted)
+    assert ordinary_launch_binding.replica_has_projected_provider_absence_cleanup_marker(
+        persisted)
+    assert request_postgres.bound_non_pool_projected_provider_absence_is_authorized(
+        'gc-service', 3, str(_GC_REPLICA_RECORD_ID))
+
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'gc-service'
+    with mock.patch.object(manager, '_remove_replica') as remove, \
+         mock.patch.object(replica_managers, 'terminate_cluster') \
+             as provider_down:
+        assert manager._finalize_projected_provider_absence_cleanup(3)
+    remove.assert_called_once_with(
+        3,
+        str(_GC_REPLICA_RECORD_ID),
+        allow_active_provider_free_pre_job=True)
+    provider_down.assert_not_called()
+    # Full active provider-free retirement, including normalized intent and
+    # Kueue lineage deletion, is exercised by the dedicated Kueue PostgreSQL
+    # graph tests. This fixture owns only launch projection and request pins.
 
 
 def test_provider_present_cleanup_requires_exact_digest_and_owner_relations(

@@ -7220,6 +7220,37 @@ def replica_has_projected_provider_absence_cleanup_marker(
     pool_key = getattr(replica_info, 'paid_capacity_pool_key', None)
     if status is None:
         return False
+    reserved_1516_absence_candidate = bool(
+        getattr(replica_info, 'reserved_fill', None) is True and
+        getattr(replica_info, 'is_zero_cost', None) is True and
+        pool_key is None and
+        getattr(replica_info, 'service_job_id', None) is None and
+        getattr(replica_info, 'zero_cost_materialization_sequence',
+                None) is None and
+        status.sky_launch_status == common_utils.ProcessStatus.FAILED and
+        status.sky_down_status == common_utils.ProcessStatus.FAILED and
+        status.user_app_failed is False and
+        status.service_ready_now is False and
+        status.first_ready_time is None and status.is_scale_down is False and
+        status.preempted is False and status.purged is False and
+        status.failed_spot_availability is False and
+        status.wait_for_idle_before_termination is False and
+        status.drain_cap_seconds is None and status.drain_started_at is None and
+        status.logical_retirement_version is None and
+        status.logical_retirement_controller_epoch is None and
+        status.logical_retirement_generation is None and
+        status.logical_retirement_target_capacity is None and
+        status.logical_retirement_confirmed_generation is None and
+        status.logical_retirement_bounded_deadline is False and
+        status.logical_retirement_committed is False)
+    if reserved_1516_absence_candidate:
+        # Release 1.1.1516 preserved this exact FAILED/FAILED shape after
+        # projection. Current writers use the single marker above. This N-1
+        # candidate alone authorizes no deletion or provider action: every
+        # consumer must revalidate the settled exact association and
+        # post-quiescence ABSENT evidence before retirement. The removal path
+        # independently revalidates its owner, record, and Kueue fences.
+        return True
     return bool(
         getattr(replica_info, 'reserved_fill', None) is False and
         getattr(replica_info, 'is_zero_cost', None) is False and
