@@ -8,10 +8,14 @@ paid-provider lifecycle gate also reached 100 physical one-L4 GCP Spot VMs
 concurrently `RUNNING` with zero on-demand and then converged through normal
 SkyServe teardown to zero VMs, disks, live PostgreSQL rows, load-balancer
 objects, and cluster bookkeeping. That baseline took 27 minutes 53 seconds,
-which is functionally correct but not fast enough. The immediate source gate is
-therefore one bounded PostgreSQL-atomic replica+claim batch followed by the
-existing P reservation, generic request binding, and parallel executors, then
-a repeat of the 100-VM lifecycle qualification. The source contract for PHX
+which is functionally correct but not fast enough. The bounded
+PostgreSQL-atomic replica+claim batch is deployed, but its first repeat exposed
+one remaining starvation bug: semantically unchanged HA load-balancer
+heartbeats can advance the demand receipt generation while a large candidate
+wave is prepared. The immediate source gate is to admit that monotonic,
+semantic-equivalent heartbeat advancement inside the existing Phase-A
+transaction while retaining fail-closed cancellation for every real demand,
+route, supply, or ownership change. The source contract for PHX
 uses its existing externally owned Kueue lane without changing scheduler
 policy, but that candidate is not yet present in the live service definition.
 The later 10,000-terminal-request qualification remains a separate end-to-end
@@ -51,11 +55,11 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` at `8d25f70bd`, including PRs #1734-#1738 for fresh-zero retirement, natural claim-arrival expiry, exact GCP replacement reconciliation, complete teardown routing, and schema-061 placement authority. Atomic paid batch admission is the active source change and is not yet merged or deployed. |
-| Deployed control plane | SkyPilot `1.1.1507`, Helm revision 628. API, controller, and executor roles all use `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz:1.1.1507@sha256:d4d62d3e36e9c69256d5580a356f06babed5bb0d0c4d75662315704c26e50024`. Helm storage remains disabled and the namespace has no PVC. |
+| Source base | `origin/improvements` at `35050028a`, including merged PR #1739 for PostgreSQL-atomic paid-wave admission. Semantic-equivalent heartbeat admission is the active source correction and is not yet merged or deployed. |
+| Deployed control plane | SkyPilot `1.1.1508`, Helm revision 629. API, controller, and executor roles all use `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz:1.1.1508@sha256:6bf490a0a5d5fcfa8372c3ff90705d3a617d3eb556421431fdeb79bfe165bdbc`. Helm storage remains disabled and the namespace has no PVC. |
 | Writer protocol | Public API 93, worker projection 10, non-pool capability cohort 12, and async request-ledger protocol 1. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. |
-| Active service | None. The disposable lifecycle-109 service incarnation `017eb506-be4f-49b1-8dab-0f5899ccef5d` was removed through ordinary `sky serve down` after the 100-VM proof. `sky serve status boltz-l4-fleet` reports no service, and Kubernetes has no matching load-balancer workload or Service. The canonical heterogeneous service remains intentionally absent until the next explicit gate. |
+| Active service | The isolated GCP qualification lifecycle 110, incarnation `a2cced4e-1c64-4f33-823a-cc307549cdd7`, is active at service version 2 with an exact target and paid cap of 100 one-L4 Spot VMs. An authenticated 10,000-request burst opened cold-launch authority, but repeated atomic candidate waves committed zero replica rows and zero claims because harmless five-second HA demand heartbeats advanced between plan publication and Phase A. The provider guard independently reports zero Spot and zero on-demand resources, so the correction can be deployed before any billable provider effect. |
 | Reserved occupancy | The 2026-08-25 23:30 UTC East census found all 328 healthy compatible physical GPUs allocated: research requested 156 and `boltz-l4-fleet` requested the remaining 172. PostgreSQL independently had 172/172 reserved replicas `READY`; compatible free capacity was therefore zero. At 23:38 UTC Kubernetes then recorded exactly 128 distinct SkyPilot Pod preemptions by 16 higher-priority research Pods of eight GPUs each. SkyPilot correctly yielded from 172 to 44 rather than blocking research. As ten short-lived preemptors exited, authenticated observations and allocations advanced in bounded waves from 44 to the exact compatible remainder of 132 (77 A100-80GB and 55 A100), reaching 132/132 `READY` at 2026-08-26 00:01:55 UTC with zero paid capacity. Together with the 188 research GPU requests, that occupied all 320 GPUs on the 40 then-healthy GPU nodes. A later exact 00:29 UTC census found 41 healthy GPU nodes and 328 allocatable GPUs, with 188 requested by `hyperpod-ns-research`, 140 running SkyPilot workers, and no pending SkyPilot worker; PostgreSQL independently reported the same 140 reserved replicas `READY`. Thus newly exposed capacity refilled automatically and all 328 GPUs were again occupied with zero paid capacity. This proves reclaim correctness and 100% eventual refill, while exposing a roughly 24-minute worst observed refill horizon that the provider-phase and bounded-admission work must reduce. |
 | PHX | Excluded from the live service definition, so it currently contributes zero. The 2026-08-25 23:40 UTC physical census found 512 healthy schedulable H200 GPUs, 355 requested by research, and 157 physically free. The bounded SkyPilot identity deliberately cannot list other tenants' Kueue Workloads, so physical freedom is not treated as scheduler admission. Live server-mode readback of PostgreSQL config identity revision 4 resolved the exact `boltz-research/be` projection, priority and worker identity. A read-only cluster read at 2026-08-26 00:18 UTC confirmed the unchanged `research-be` ClusterQueue is active, has zero nominal H200 quota, may borrow at most 512 H200 GPUs from `shared-pool`, uses `BestEffortFIFO`, and permits only lower-priority reclaim/preemption; its current admission and reservation counts were zero. The existing `boltz-research/be -> research-be` lane is ready for service-only activation; each exact Kueue admission remains the final authority. Its unchanged reclaim policy is conditional, not a guarantee that every research class immediately reclaims every fill admission. |
 | PHX access | The controller identity can exact-read the required namespace/queue and manage only worker Pod/Service lifecycle; it cannot list or patch ClusterQueues. The worker ServiceAccount is tokenless and cannot read Pods, queues, or secrets. A historical audit-only group still has an unused broad Kueue LIST grant from platform PR #8800; it is read-only, has no scheduling effect, and is not used or expanded by this rollout. |
@@ -369,6 +373,22 @@ The result is clipped by the elected service cap and all cleanup-unproven paid
 rows. The plan carries exact demand, route, service, capacity-graph, reserved
 allocation, accelerator, and pool identity.
 
+A prospective Phase-A debit may cross newer demand receipt generations only
+when the semantic plan itself is unchanged. In the same PostgreSQL transaction
+that inserts the wave, the controller locks the current service, route, demand
+reports, capacity graph, and plan head; requires every current reporter to be
+fresh, complete, elected, and bound to the plan's exact route; reconstructs the
+normalized demand snapshot from those locked reports; and compares it with the
+plan. A monotonically newer generation or receipt watermark is not by itself a
+semantic change. New, increased, or redistributed queue, in-flight, rejected,
+arrival, priority, or accelerator demand; fresh aggregate zero; a reporter or
+route mismatch; unavailable evidence; or any supply, cap, ownership, or plan
+change aborts the whole transaction before the first row is inserted. Natural
+rolling-window arrival expiry remains the only accepted demand-semantic
+contraction. This lets a large provider-free candidate preparation wave survive
+HA heartbeat churn without weakening immediate zero-demand revocation or the
+commit-before-provider boundary.
+
 One bounded paid wave uses one PostgreSQL transaction to:
 
 1. acquire the protocol-observation, lifecycle, service-owner,
@@ -406,12 +426,14 @@ recovery enumerates them after process death. Both atomically retire and replan
 association-less replica+claim pairs, adopt an exact association if binding
 won the race, and infer no historical batch manifest.
 
-The current `1.1.1507` deployment still performs the replica/claim commit and
-the generic launch binding separately for one replica at a time. Its provider
-guard makes that path safe, but a committed provisioning row advances route
-authority and invalidates the remaining prospective claims from the same
-nominal wave. The atomic batch above is therefore an active implementation
-gate, not a description of the deployed baseline.
+The current `1.1.1508` deployment implements the atomic batch, but still treats
+every newer HA demand receipt generation and watermark as an independent
+prospective conflict before reaching its semantic comparator. A 100-candidate
+provider-free preparation takes roughly four seconds while the two elected
+load balancers publish every five seconds, so unchanged heartbeats can starve
+the entire batch indefinitely. Removing only those redundant byte-identity
+guards, while retaining the transactional semantic and authority checks above,
+is therefore the active implementation gate.
 
 Every AWS paid association uses a stable provider idempotency token bound to
 the immutable association and exact instance parameters. A lost provider
@@ -599,7 +621,11 @@ missing telemetry.
 8. **Exact identity:** lifecycle, incarnation, replica record, association,
    request generation, worker, and provider token fence every side effect.
 9. **Fresh authority:** stale, incomplete, malformed, unknown-version, or
-   owner-mismatched evidence authorizes zero new capacity.
+   owner-mismatched evidence authorizes zero new capacity. A newer heartbeat
+   receipt is fresh only when the current locked reporter set and generation
+   are self-consistent and its normalized demand is semantic-equivalent to the
+   immutable plan; byte identity with the older receipt watermark is neither
+   required nor sufficient.
 10. **No slow lock:** blocking provider, HTTP, URL-resolution, Kubernetes, SSH,
     join, or cancel I/O never runs while holding the fleet manager mutex or a
     PostgreSQL admission lock. Short PostgreSQL rereads and CAS operations are
@@ -713,6 +739,11 @@ continue serving. It is never duplicate capacity or on-demand spill.
 - Run real-PostgreSQL tests for transaction atomicity, lost acknowledgements,
   stale identity, owner takeover, provider rejection/ambiguity, and concurrent
   admission.
+- Advance one and both HA reporter generations while a 100-member paid wave is
+  frozen and prove one atomic commit when normalized demand is unchanged.
+  Repeat with fresh-zero, queue, rejection, in-flight, compatibility, reporter,
+  and route changes and prove the complete batch rolls back with zero rows,
+  claims, waiters, or pool debits.
 - Prove no blocking provider/HTTP/URL/Kubernetes/SSH/join/cancel call occurs
   under the manager lock with deterministic race tests; allow only the short
   PostgreSQL reread/CAS critical sections the reducer requires.
@@ -794,9 +825,11 @@ heterogeneous scale-to-zero YAML for an explicit later activation; this gate
 must not activate or modify Kueue. The isolated qualification overrides do not
 become production paid-policy defaults.
 
-This provider-only gate deliberately sends no application traffic and does not
-claim that reserved replicas served a request. It is a prerequisite for, not a
-substitute for, the end-to-end campaign below.
+This provider-only gate uses only bounded authenticated synthetic demand to
+open and continuously renew the intentional fresh-demand paid fence. It does
+not exercise the model, activate reserved capacity, or claim that reserved
+replicas served a request. It is a prerequisite for, not a substitute for, the
+end-to-end campaign below.
 
 ### Paid Spot and 10,000-request proof
 
