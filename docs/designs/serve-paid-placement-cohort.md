@@ -60,6 +60,20 @@ provider I/O with the same authority error. Retained report rows cannot identify
 which report-authority subpredicate failed for each request, but none of those
 mutable predicates should revoke an already committed bounded debit.
 
+PR #1744, merge `329f6f5a33bab85401fef59b023714b47fb1d5eb`, closed that
+provider-lifecycle gate in release `1.1.1513`. It also makes durable PostgreSQL
+request outcome authoritative after a process-local SDK waiter exits and
+replaces a finished local launch marker with an exact association-bound
+adopter. A fixed-120 qualification committed all 120 replica and claim debits
+atomically at 18:25:12.183 UTC, reached 100 provider-native `RUNNING` GCP Spot
+L4 VMs 3 minutes 41.9 seconds later, and peaked at 117. Every VM was
+`g2-standard-4` with exactly one L4 and on-demand remained zero. Normal
+`sky serve down` reached provider `RUNNING=0` 4 minutes 56.4 seconds after the
+down request completed and exact service, PostgreSQL, VM, and disk zero after
+5 minutes 35.2 seconds. Two later guard samples, for three exact-zero samples
+total, and independent PostgreSQL
+and GCP censuses remained zero.
+
 The steady-state contract distinguishes those boundaries. Prospective planning
 continues to require fresh complete reports from the exact current ACTIVE slot,
 validate their immutable route references, and reject a mixed HA generation
@@ -524,6 +538,20 @@ Claim acquisition uses this bounded-batch transaction protocol:
    against existing same-plan claims. A stale graph or insufficient residual
    rejects the transaction; it never preserves candidate identities across a
    refreshed semantic plan.
+
+   Release `1.1.1513` still compares raw queue, rejection, and in-flight churn
+   in this prospective transaction. That is conservative, but a fixed-floor
+   qualification showed it can roll back an otherwise unchanged 120-unit
+   target while a traffic writer is active. Investigate replacing raw telemetry
+   equality with a complete decision-output fingerprint containing the
+   effective target, exact-card allocation, compatibility, launch priority, and
+   waiter-fairness result. A telemetry change may be treated as equivalent only
+   when every output is unchanged; any priority or fairness change must reject.
+   Fresh complete reporter, route, supply, cap, ownership, and every transition
+   that changes a decision output remain mandatory and fail-closed. Until that
+   investigation is implemented and qualified, a fixed-floor provider-lifecycle
+   run commits the floor before starting the volatile traffic writer. This does
+   not weaken demand-driven zero-demand revocation.
 5. Insert the accepted policy-valid subset's replica rows and paid claims in
    deterministic order with `sky_launch_status=SCHEDULED`, then commit before
    registering or starting any launch worker. An insert error rolls back every
@@ -1043,17 +1071,22 @@ zero-cost placement for the deferred card.
 
 There are four distinct mixed-version transitions.
 
-The 2026-08-26 atomic-batch amendment adds no table, column, API payload, or
-executor request shape. Service-owner fencing permits only one current
-fresh-admission writer for a service, so a singleton and batch writer cannot
-interleave for that service. The exact deployed `1.1.1507` cohort can decode,
-adopt, bind, serve, and clean the unchanged rows; this is the required rollback
-target. Broader N-1/N-2 authority remains exactly as declared by the umbrella
-compatibility matrix: readable state is not permission for an N-2 writer to
-start a provider effect.
+The following two paragraphs are historical compatibility analysis for the
+2026-08-26 atomic-batch amendment, not a current rollback runbook. That
+amendment added no table, column, API payload, or executor request shape.
+Service-owner fencing permitted only one current fresh-admission writer for a
+service, so a singleton and batch writer could not interleave for that service.
+At that rollout boundary, the then-deployed `1.1.1507` cohort could decode,
+adopt, bind, serve, and clean the unchanged rows and was designated as that
+amendment's rollback target. It is not qualified or authorized as a rollback
+from current release `1.1.1513`; the current recovery contract later in this
+document controls. Broader N-1/N-2 authority remains exactly as declared by the
+umbrella compatibility matrix: readable state is not permission for an N-2
+writer to start a provider effect.
 
-Rollback is operational, not cleanup-only. A rollback may return new paid
-admission to the slower singleton transaction, while already-committed
+At that historical boundary, rollback was operational rather than
+cleanup-only. It could return new paid admission to the slower singleton
+transaction, while already-committed
 `SCHEDULED` replica+claim pairs continue through the same P reservation and
 generic binding paths. The batch transaction is all-or-nothing, but no durable
 manifest records its historical boundary. After a process death, a successor
@@ -1610,36 +1643,54 @@ placement spread, API request queue depth, provider capacity errors,
 typed-outcome-to-pool-close latency, pending teardown duration, and launch
 latency.
 
-Rollback is an image rollback. Existing pool, claim, waiter, success, and
-failure rows remain schema-compatible with revision 027. From current release
-1.1.791, first redeploy that same artifact through the current declarative
-values when the failure is rollout or configuration drift. If a binary
-rollback is required, the classifier-preserving fallback is 1.1.789, whose
-exact image and chart were proven at Helm revision 264. That release predates
-PR #945's managed-pool Spot-fallback contract, so operators must first confirm
-that no active or recovering pool depends on a per-worker `spot_placer`
-snapshot; the production audit at this rollout found no managed pools.
-Redeploy 1.1.789 through the current declarative values instead of blindly
-replaying the historical revision: current values keep the PVC at 200 GiB and
-keep the prototype image workers disabled. Helm revision 261 / 1.1.784 remains
-the conservative pre-recursive fallback. It retains adaptive depth, sticky
-cooldown, the service envelope, the card frontier, zero-cost liveness, and
-direct typed outcome-before-teardown behavior, but nested optimizer-exhaustion
-failures remain untyped until a newer image returns. Do not use revision 263 /
-1.1.786: it contains the affected non-recursive classifier. Rolling back
-farther to PR #915 removes frontier enforcement and reintroduces the zero-cost
-liveness regression while the paid envelope is full. Rolling back to
-v1.1.759/v1.1.760 also removes the service envelope; rolling back to the
-original revision-027 behavior may additionally clamp a `current_limit=1`
-probe marker and ignore the refined sticky failure meaning. Those binaries
-still never clear `last_failure_at`, so a later upgrade returns conservatively
-to the negative epoch and requires a new-code probe. No live replica is moved
-or terminated by rollout or rollback. Operators may temporarily restore a
-larger explicit launch window without rolling back if the four-wide cold start
-is too conservative, but doing so does not disable the service envelope or
-frontier.
+The current recovery baseline is release `1.1.1513` at Helm revision 635,
+PostgreSQL-only with `storage.enabled=false`. For rollout or configuration
+drift, first redeploy that exact chart and image digest through Helm while
+reusing the current values. Do not reintroduce a PVC, EFS, a Terragrunt runtime
+pin, or historical declarative values. For a code defect, prefer one
+homogeneous fix-forward image so every API, controller, and executor observes
+the same protocol.
+
+A binary rollback is permitted only to an explicitly qualified N-1 artifact
+after a read-only census proves its schema and protocol can consume every live
+service, replica, claim, waiter, association, and provider-effect row. No such
+rollback artifact has been qualified for the current protocol, so no older
+release is presently an authorized operational fallback. If emergency rollback
+qualification is needed, first stop new admission, prove no unresolved
+provider effect or active service remains, test the exact retained PostgreSQL
+state against the candidate, and record the immutable image/chart receipt.
+The old 1.1.791/1.1.789/PVC guidance below this design's Git history is
+historical evidence only, not a current runbook.
 
 ## Verification Evidence
+
+Production Spot-lifecycle qualification on 2026-08-26:
+
+The compact immutable record is the
+[Spot lifecycle evidence bundle](evidence/skyserve-gcp-spot-lifecycle-2026-08-26/README.md).
+
+- PR #1744 shipped as `1.1.1513`, using image digest
+  `sha256:837be5d44a58e167fd7aaa906d65c2681f6e5c6bbefd54d76cd0bf6ba24dfec1`;
+  Helm revision 634 ran the qualification and revision 635 restored the
+  temporary launch envelope afterward.
+- Guarded run `2ca8e9a0-4a59-4acf-a0cb-f9ea4291d6f3`, service incarnation
+  `d4ccc0a5-f2b4-4b72-bc01-079c979fd5d6`, allowed only GCP Spot
+  `g2-standard-4` with one L4 and imposed a hard 120-GPU/VM/disk cap.
+- The fixed update completed at 18:23:39.277 UTC. Five prospective
+  transactions rolled back safely while the synthetic writer changed demand
+  semantics; the sixth committed 120 exact debits at 18:25:12.183. Native
+  samples reached 100 `RUNNING` at 18:28:54.100 and then 107, 110, 114, and
+  117. At the peak, 80 VMs were in `asia-northeast3` and 37 in
+  `asia-south1`; every object had the exact approved market, shape, GPU, and
+  50-GiB disk, with zero non-Spot/on-demand capacity.
+- The run attempted 10,000 stable IDs at concurrency 256 only as bounded
+  provider-lifecycle stimulus. It is not model-serving, reserved-serving, or
+  terminal-ledger evidence.
+- Normal teardown reached provider `RUNNING=0` at 18:35:00.512 and exact
+  service, replica, claim, waiter, association, queue, pin, cluster, VM, and
+  disk zero at 18:35:39.315. Guard samples through 18:36:57.577 and
+  independent all-state censuses agreed. Storage remained PostgreSQL-only with
+  no EFS/PVC, and no Terraform, Kueue, or `boltz-platform` change was made.
 
 Pre-PR implementation evidence on 2026-07-23, integrated onto
 `0c8ef6be33889bba2adf53dd4073a42e552ba7c3`:
@@ -2084,3 +2135,12 @@ that deployment later the same day.
   private EKS path; confirm revision 269, exact image digests, API/controller
   and dual-load-balancer health, the 16-claim service envelope, the two-pool
   frontier under natural L4 demand, and a zero-diff Terragrunt plan.
+- Complete: merge PR #1744, deploy homogeneous release `1.1.1513`, and prove
+  at least 100 native one-L4 GCP Spot VMs concurrently `RUNNING` under a hard
+  120 cap with zero on-demand, followed by normal teardown to repeated exact
+  PostgreSQL and provider zero.
+- Open investigation: determine whether raw volatile telemetry equality can be
+  replaced by a complete decision-output fingerprint for a fixed-floor wave.
+  It must preserve effective target, exact-card allocation, compatibility,
+  launch priority, and waiter fairness, and must not relax fresh reporter,
+  route, supply, cap, ownership, or demand-driven zero-demand revocation.

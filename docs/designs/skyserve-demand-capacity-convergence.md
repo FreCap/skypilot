@@ -1,20 +1,21 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Current status (2026-08-26): SkyPilot release `1.1.1512` is deployed. Its first
-target-100 qualification atomically committed the bounded ordinary-paid Spot
-wave with zero On-Demand claims, but six exact bound `sky.launch` requests
-failed before provider I/O with `Committed paid claim lost current
-load-balancer authority`. Concurrent API PostgreSQL connection-pool starvation
-made the short-lived report lease brittle; retained report rows cannot identify
-which report-authority subpredicate failed for each request. This source
-candidate removes only that post-commit report lease: fresh complete current
-load-balancer reports remain mandatory to create a paid debit, while the
-debit's one provider effect subsequently depends on its immutable graph and a
-fresh current route head. The next gate is one homogeneous Helm rollout and a
-sustained rerun requiring at least 100
-provider-backed Spot L4 VMs, zero On-Demand effects, and complete normal
-teardown. The older phase account below is historical chronology and is not an
-executable runbook.
+Current status (2026-08-26): SkyPilot release `1.1.1513`, PR #1744, is deployed
+at Helm revision 635 and the independent paid Spot provider-lifecycle gate is
+complete. A bounded fixed-120 wave atomically committed all 120 PostgreSQL
+debits, reached 100 provider-native `RUNNING` GCP Spot L4 VMs 3 minutes 41.9
+seconds later, and peaked at 117. Every VM was the approved one-L4
+`g2-standard-4` shape and On-Demand remained zero. Normal teardown reached
+provider `RUNNING=0` 4 minutes 56.4 seconds after the down request completed
+and exact service, PostgreSQL, VM, and disk zero after 5 minutes 35.2 seconds;
+two later guard samples, for three exact-zero samples total, and independent
+censuses agreed. This qualifies paid
+provider scale-up/down, not reserved/Kueue placement, application inference,
+the separate 10,000-terminal-request ledger, or UI telemetry. Those broader
+demand and reserved-capacity gates remain open. The older phase account below
+is historical chronology and is not an executable runbook. The compact
+immutable record is the
+[Spot lifecycle evidence bundle](evidence/skyserve-gcp-spot-lifecycle-2026-08-26/README.md).
 
 All PHX lane names in that historical chronology are audit facts, not current
 operator instructions. The current source contract is policy-bundle schema v7
@@ -23,7 +24,8 @@ existing LocalQueue `be` -> existing ClusterQueue `research-be`, existing
 WorkloadPriorityClass `be-lt` at 11, and the server-owned Pod PriorityClass at
 -1000/`Never`. SkyPilot neither owns nor mutates the external Kueue topology.
 
-Source addendum (2026-08-26; implemented, deployment proof pending): paid
+Source addendum (2026-08-26; implemented and deployed; paid provider-lifecycle
+portion production-qualified): paid
 demand and supply remain exact through the atomic replica/claim/cap-debit
 commit. Once that commit succeeds, the claim's one provider effect is
 authorized by its immutable original plan and bounded debit ledger; later
@@ -57,8 +59,8 @@ Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
 executor-termination precursor stack through PR #1528, PR #1529's exact
 reserved-fill deployment-policy bundle, P2d PR #1537, and PR #1540's closure
 of the untyped protocol-v2 fill batch path are also merged. PR #1542's
-supply-aware paid-residual bound is merged and qualified. The newest exact
-artifact is deployed directly with Helm as production revision 418 / release
+supply-aware paid-residual bound is merged and qualified. The historical P2d
+artifact described here was deployed directly as Helm revision 418 / release
 `1.1.1325`, merge commit
 `f5cf1c74cfe2c417a3551f70951f0191e762bad4`, image digest
 `sha256:e330fb8d0cdff9e153291173c513eb6aca34b0556d51ce435906ce82cce7fc49`,
@@ -1732,6 +1734,15 @@ Manual production verification records:
 11. after the ready-snapshot fix-forward, bounded controller startup and
     `/autoscaler/info` latency with the retained 5,536-row history and 38
     simultaneous logical retirements, without deleting audit rows.
+12. release `1.1.1513` / PR #1744 provider-lifecycle closure: the fixed update
+    completed at 18:23:39.277 UTC, the atomic 120-debit wave committed at
+    18:25:12.183, provider-native GCP reached 100 `RUNNING` one-L4 Spot VMs at
+    18:28:54.100 and peaked at 117, and On-Demand remained zero. The 10,000
+    stable IDs at concurrency 256 were lifecycle stimulus rather than terminal
+    request evidence. Normal down reached native `RUNNING=0` at 18:35:00.512
+    and exact PostgreSQL/provider/disk zero at 18:35:39.315, followed by three
+    exact-zero guard samples and agreeing independent censuses. The rollout
+    changed no EFS/PVC, Kueue, Terraform, IAM, or `boltz-platform` object.
 
 ## Adversarial review decision
 
@@ -1952,18 +1963,26 @@ dark deployment gate.
   fence while cold paid authority and post-rollout `sky.launch` requests stay
   zero. Also prove a genuinely under-capacity held same-card target still
   retries within its existing wave budget.
+- [x] Merge PR #1744, deploy homogeneous release `1.1.1513`, and complete the
+  provider-lifecycle gate with at least 100 native one-L4 GCP Spot VMs
+  concurrently `RUNNING`, zero On-Demand, and normal teardown to repeated exact
+  PostgreSQL and provider zero. This closes only the paid provider lifecycle;
+  demand conservation, terminal 10,000-request, reserved/PHX, and UI gates
+  remain open.
 - [x] Historical revision-408 gate: replace the stale revision-407 PHX
   deployment-policy identities with
   LocalQueue `be`, ClusterQueue `skypilot-be`, WorkloadPriorityClass `be-ls`,
   and service account `skypilot-pool-sa`; deploy the correction dark in
   revision 408.
-- [ ] Create the exact east and PHX cross-account audit roles, EKS access/RBAC,
-  and hub source permission; deploy policy schema v4 and prove east's custom
-  scheduler plus PHX's Kueue TAS/default-scheduler topology contract without
-  weakening any check. The direct ServiceAccount read is already proven.
-- [ ] Apply the complete audited server-owned worker config, compile/elect a
-  clean service version, and prove an H200 reserved-fill Pod is admitted with
-  the exact queue, workload priority, and low preemptible Pod priority.
+- [x] Superseded historical gate: do not create the proposed cross-account
+  audit roles or deploy policy schema v4. Policy schema v7 and the bounded
+  exact PHX read are already available; no IAM, RBAC, Kueue, Terraform, or
+  other infrastructure mutation is required or authorized by this design.
+- [ ] Add only the PHX H200 service candidate using the current server-owned
+  schema-v7 projection, compile/elect a clean service version, and prove one
+  H200 reserved-fill Pod is admitted through the existing externally owned
+  LocalQueue `be` -> ClusterQueue `research-be`, with WorkloadPriorityClass
+  `be-lt` and the low preemptible Pod priority. Do not modify that topology.
 - [ ] Pass demand conservation, no-paid-spill, provider-free route publication,
   fresh-zero paid drain, grant-before-row pool isolation, controller stall
   isolation, and dashboard tests.
