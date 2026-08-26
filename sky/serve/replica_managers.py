@@ -1061,11 +1061,18 @@ def _wait_for_bound_ordinary_launch(
         nonlocal cancel_committed
         while True:
             _raise_if_owner_lost()
+            cancel_delivery_failed = False
             try:
                 _commit_cancel_if_needed()
             except Exception:  # pylint: disable=broad-except
-                time.sleep(_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
-                continue
+                # Cancellation deliberately rejects an already-ambiguous
+                # association. The reducer is still a safe, non-authorizing
+                # read/transition and must observe that durable ambiguity so
+                # this process-local launch owner can detach and let the
+                # provider-evidence reconciler take over. Transient failures
+                # remain retryable below if reduction is also unavailable or
+                # still reports an active request.
+                cancel_delivery_failed = True
             try:
                 if cancel_projection is not None:
                     projection = cancel_projection
@@ -1097,6 +1104,9 @@ def _wait_for_bound_ordinary_launch(
                 # after projection would target a deliberately settled row.
                 _finish_projection(projection, waiter_error)
                 return 'TERMINAL'
+            if cancel_delivery_failed:
+                time.sleep(_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
+                continue
             durable_cancel_reason = getattr(projection, 'cancel_reason', None)
             if durable_cancel_reason is not None:
                 if (not isinstance(durable_cancel_reason, str) or
@@ -14210,9 +14220,55 @@ class SkyPilotReplicaManager(ReplicaManager):
                 isinstance(t, _ReplicaLaunchThread) and t.bound_ordinary_launch)
             teardown_requested = (isinstance(t, _ReplicaLaunchThread) and
                                   t.teardown_requested.is_set())
-            if (info.status_property.sky_launch_status
-                    == common_utils.ProcessStatus.INTERRUPTED or
-                    teardown_requested):
+            interrupted = (info.status_property.sky_launch_status ==
+                           common_utils.ProcessStatus.INTERRUPTED)
+            if bound_ordinary_launch and (interrupted or teardown_requested):
+                # Teardown normally owns completion first, but an AMBIGUOUS
+                # association cannot authorize cancellation or provider
+                # cleanup. Inspect it before the generic teardown branch;
+                # otherwise _terminate_replica installs another adopter for
+                # the same rejected cancel and permanently excludes this row
+                # from provider reconciliation.
+                try:
+                    teardown_projection = (
+                        request_postgres.inspect_bound_ordinary_launch(
+                            self._service_name, replica_id,
+                            info.replica_record_id))
+                    teardown_is_ambiguous = bool(
+                        teardown_projection is not None and
+                        _bound_projection_classification(teardown_projection)
+                        == 'AMBIGUOUS')
+                    provider_reconcilable = bool(
+                        teardown_is_ambiguous and isinstance(
+                            teardown_projection.context,
+                            ordinary_launch_binding.BoundNonPoolLaunchContext))
+                    provider_present_context = (
+                        self._bound_non_pool_provider_present_cleanup_context(
+                            info, teardown_projection)
+                        if provider_reconcilable else None)
+                except Exception as error:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Unable to inspect finished bound teardown for '
+                        'replica %s; retaining its local owner: %s', replica_id,
+                        common_utils.format_exception(error))
+                    continue
+                if (provider_reconcilable and provider_present_context is None):
+                    # Durable association identity, not this finished thread,
+                    # is the retry source. Detach only process-local
+                    # bookkeeping and let the exact provider observer commit
+                    # PRESENT/ABSENT before any cleanup path can proceed.
+                    legacy_runtime.launch_thread_pool.pop(replica_id)
+                    legacy_runtime.replica_to_request_id.pop(replica_id)
+                    legacy_runtime.replica_to_logical_launch_fence.pop(
+                        replica_id)
+                    self._schedule_non_pool_provider_reconciliation(
+                        info, teardown_projection.context)
+                    logger.error(
+                        'Finished bound teardown for replica %s is durably '
+                        'ambiguous; detached its local launch owner and '
+                        'scheduled exact provider reconciliation.', replica_id)
+                    continue
+            if interrupted or teardown_requested:
                 if not self._service_is_cleanup_authorized():
                     continue
                 legacy_runtime.launch_thread_pool.pop(replica_id)

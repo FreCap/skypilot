@@ -183,6 +183,7 @@ def _demand_report(now: float,
                    lb_session_id: str = 'pod-a',
                    lb_slot: str = 'a',
                    applied_role: str = 'ACTIVE',
+                   applied_generation: int = 1,
                    routing_version: int = 1) -> dict:
     bucket_seconds = constants.LB_DEMAND_WINDOW_BUCKET_SECONDS
     profiles = ([{
@@ -200,7 +201,7 @@ def _demand_report(now: float,
         'routing_version': routing_version,
         'armed_generation': None,
         'applied_role': applied_role,
-        'applied_generation': 1,
+        'applied_generation': applied_generation,
         'local_in_flight': request_count,
         'http_in_flight': {
             _URL: request_count,
@@ -2434,6 +2435,60 @@ def test_committed_claim_accepts_mixed_monotonic_routes_only_postcommit(
     # The already committed bounded debit may perform its one provider effect
     # because both fresh LB sessions name persisted, valid monotonic routes.
     _validate_committed_claim(engine, claim)
+
+
+def test_committed_claim_ignores_noncurrent_ha_generation_only_after_commit(
+        capacity_database):
+    engine, _, admitted_route = capacity_database
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(1))
+    claim = _insert_claim(engine, authority, 10)
+
+    # Cut over to slot b while the old slot-a report remains fresh.  The stale
+    # generation cannot authorize provider I/O by itself.
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    lb_ha_enabled=1,
+                    lb_active_slot='b',
+                    lb_cutover_generation=2))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    spec=pickle.dumps(_capacity_service_spec(
+                        False, lb_high_availability=True),
+                                      protocol=4)))
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict):
+        _validate_committed_claim(engine, claim)
+
+    # Once the exact current ACTIVE slot reports, previous and speculative
+    # future-generation rows are display-only. They neither authorize nor
+    # revoke the bounded debit, but the mixed set remains invalid for a new
+    # prospective debit.
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(),
+                       admitted_route,
+                       sequence=2,
+                       reporter_session_id='process-b',
+                       lb_session_id='pod-b',
+                       lb_slot='b',
+                       applied_generation=2))
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(),
+                       admitted_route,
+                       sequence=3,
+                       reporter_session_id='process-future',
+                       lb_session_id='pod-future',
+                       lb_slot='a',
+                       applied_role='DRAINING',
+                       applied_generation=3))
+    _validate_committed_claim(engine, claim)
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict):
+        _validate_prospective_claim(engine, authority.claim_values('L4'))
 
 
 def test_committed_claim_accepts_normalized_report_json(capacity_database):

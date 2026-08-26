@@ -735,9 +735,11 @@ def reports_match_current_lb_authority(
     """Prove that fresh demand includes the currently selected ACTIVE LB.
 
     HA cutover advances the service generation before a new role becomes
-    authoritative.  A still-fresh report from the previous generation must
-    therefore be display-only: it cannot promote durable demand, publish a
-    capacity plan, or keep a paid claim alive.
+    authoritative. A still-fresh report from a non-current generation must
+    therefore be display-only: it cannot promote durable demand or publish a
+    capacity plan. Post-commit callers filter out non-current generations
+    before calling this predicate so extraneous display evidence also cannot
+    revoke an already committed claim's one provider effect.
     """
     ha_enabled = service.get('lb_ha_enabled') == 1
     active_slot = service.get('lb_active_slot')

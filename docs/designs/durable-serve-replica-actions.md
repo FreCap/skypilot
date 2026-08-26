@@ -1,6 +1,6 @@
 # Durable SkyServe Replica Actions
 
-Last updated: 2026-08-20
+Last updated: 2026-08-26
 
 Status: the dedicated resource-action authority proposal is retired before
 activation. PRs #1112, #1239, #1240, #1336, #1338, and #1343 are closed. PR
@@ -291,6 +291,28 @@ cancellation and provider cleanup. The lifecycle epoch stored on the
 association remains immutable controller identity; both phases require exact
 equality with the current service operation fence and require the current
 lifecycle and service fence rows to agree.
+
+A 2026-08-26 paid-Spot qualification exposed one process-local liveness hole
+in that fail-closed boundary. A launch waiter whose teardown signal arrived
+after its association had already become `AMBIGUOUS` retried the deliberately
+rejected cancel transaction forever. Its retained launch-thread registration
+then excluded the exact replica from the provider-evidence reconciler that is
+the only component authorized to adjudicate that ambiguity. The steady-state
+contract is therefore explicit: after any cancel-delivery failure, the waiter
+still executes the non-authorizing exact reducer. If that reducer observes
+durable ambiguity, the waiter terminates and relinquishes only its
+process-local ownership. The completion manager classifies that exact
+association before its generic interrupted-launch branch, removes the finished
+worker's local maps, and hands the immutable association to the existing
+provider-evidence reconciler. It must not recreate a teardown adopter for the
+same rejected cancel. Only a complete protocol-v2
+`BoundNonPoolLaunchContext` may make that handoff; retained protocol-v1 bound
+launches keep their prior fail-closed owner because they do not carry the
+provider identity required by this reconciler. This path neither commits
+cancellation nor authorizes provider cleanup;
+`PRESENT`, `ABSENT`, `UNKNOWN`, and `REPLACED` retain their existing evidence
+and projection requirements. A transient cancel or reducer failure continues
+to retry without releasing durable authority.
 
 Authored verification covers the real PostgreSQL transaction from terminal
 generation-one quiescence through `PRESENT` authorization, idempotent replay,
