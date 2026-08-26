@@ -419,9 +419,7 @@ def _provider_present_cleanup_context(
             authority.binding_mode != ordinary_launch_binding.BindingMode.BOUND
             or not marker or not isinstance(
                 context, ordinary_launch_binding.BoundNonPoolLaunchContext) or
-            context.profile.kind not in
-        (ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
-         ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID) or
+            not _supports_bound_provider_reconciliation(context) or
             context.service_name != authority.service_name or
             context.replica_id != info.replica_id or
             str(context.replica_record_id) != info.replica_record_id or
@@ -513,8 +511,9 @@ def _prepare_provider_present_cleanup(
                 continue
             if (observation.evidence
                     == ordinary_launch_binding.ProviderEvidence.PRESENT and
-                    cleanup_context.profile.kind == ordinary_launch_binding.
-                    NonPoolLaunchProfileKind.ORDINARY_PAID):
+                    ordinary_launch_binding.
+                    is_paid_provider_reconciliation_profile(
+                        cleanup_context.profile.kind)):
                 # Unlike Kubernetes UID-fenced fill, GCP's immutable project,
                 # zone, and exact cluster label support provider-native cleanup
                 # even when the local cluster row was never committed.
@@ -1771,8 +1770,8 @@ def _project_bound_ordinary_launch_for_teardown(
             shape_matches = bool(projection.paid_capacity_pool_key is None and
                                  info.paid_capacity_pool_key is None and
                                  info.is_zero_cost is True)
-        elif (context.profile.kind ==
-              ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+        elif ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+                context.profile.kind):
             pool_key = projection.paid_capacity_pool_key
             pool_identity = (paid_capacity.pool_key_payload(pool_key)
                              if isinstance(pool_key, str) else None)
@@ -1856,9 +1855,7 @@ def _reconcile_bound_provider_ambiguity_for_teardown(
             'Provider reconciliation cannot authorize a protocol-v1 '
             'ambiguous launch.')
     profile_kind = context.profile.kind
-    if profile_kind not in (
-            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
-            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID):
+    if not _supports_bound_provider_reconciliation(context):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Provider reconciliation cannot authorize an ambiguous '
             f'{profile_kind.value} launch.')
@@ -1882,11 +1879,13 @@ def _reconcile_bound_provider_ambiguity_for_teardown(
 
 def _supports_bound_provider_reconciliation(context: Any) -> bool:
     """Whether an exact bound profile has a closed provider evidence path."""
-    return (isinstance(context,
-                       ordinary_launch_binding.BoundNonPoolLaunchContext) and
-            context.profile.kind
-            in (ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
-                ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID))
+    if not isinstance(context,
+                      ordinary_launch_binding.BoundNonPoolLaunchContext):
+        return False
+    return (context.profile.kind
+            is ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL or
+            ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+                context.profile.kind))
 
 
 def _settle_bound_ordinary_launches_for_teardown(
