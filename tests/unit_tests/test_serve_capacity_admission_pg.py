@@ -28,6 +28,7 @@ from sky.serve import kubernetes_identity
 from sky.serve import kueue_lane_lineage
 from sky.serve import kueue_lane_lineage_schema
 from sky.serve import ordinary_launch_binding
+from sky.serve import paid_capacity
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
@@ -2245,8 +2246,7 @@ def test_committed_claim_survives_successor_plan_that_accounts_for_it(
                                                              prospective=False)
 
 
-def test_committed_claim_survives_unpublished_semantic_heartbeats(
-        capacity_database):
+def test_paid_claims_survive_unpublished_semantic_heartbeats(capacity_database):
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
     first = repository.publish(_plan(2))
@@ -2259,9 +2259,9 @@ def test_committed_claim_survives_unpublished_semantic_heartbeats(
     assert successor.generation == first.generation + 1
     assert successor.remaining() == {'l4': 1}
 
-    # Two HA heartbeats can advance the live feed again before the deferred
-    # provider handler starts.  The committed debit remains authorized by the
-    # fresh semantic successor; a prospective debit is still exact-feed only.
+    # A heartbeat can advance the live feed again while a large provider-free
+    # candidate wave is being prepared. Both the committed debit and a new
+    # prospective debit remain authorized by unchanged demand semantics.
     demand_state.ingest_report(
         'svc', 'svc-hash',
         _demand_report(time.time(), route_receipt, sequence=3, request_count=2))
@@ -2274,15 +2274,109 @@ def test_committed_claim_survives_unpublished_semantic_heartbeats(
                                                              service,
                                                              first_claim,
                                                              prospective=False)
-        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                           match='fresh capacity-plan authority'):
-            capacity_admission.validate_paid_claim_in_connection(
-                connection, {
-                    **service, 'name': 'svc'
-                }, {
-                    **successor.claim_values('L4'), 'replica_id': 11
-                },
-                prospective=True)
+        capacity_admission.validate_paid_claim_in_connection(connection, {
+            **service, 'name': 'svc'
+        }, {
+            **successor.claim_values('L4'), 'replica_id': 11
+        },
+                                                             prospective=True)
+
+
+def test_prospective_hundred_claim_batch_survives_heartbeat_churn(
+        capacity_database):
+    engine, _, route_receipt = capacity_database
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(100))
+    claim = authority.claim_values('L4')
+
+    # Model the four-second candidate-freeze interval from the production
+    # 100-VM wave with multiple equivalent five-second reporter publications.
+    for sequence in (2, 3):
+        demand_state.ingest_report(
+            'svc', 'svc-hash',
+            _demand_report(time.time(), route_receipt, sequence=sequence))
+
+    fresh_until = _validate_prospective_claim_batch(engine, [{
+        **claim, 'replica_id': replica_id
+    } for replica_id in range(1, 101)])
+
+    assert fresh_until > datetime.datetime.now(datetime.timezone.utc)
+
+
+def test_atomic_hundred_claim_batch_rejects_fresh_zero_without_rows(
+        capacity_database):
+    engine, incarnation, route_receipt = capacity_database
+    # Fresh aggregate zero is an explicit projected-route protocol-2 proof.
+    # The shared fixture deliberately models a retained protocol-1 cohort, so
+    # promote only this test's exact route writer before constructing the plan.
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_snapshots_table).values(
+                    producer_protocol_version=2))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_projection_protocol_version=2,
+                    route_projection_controller_incarnation=incarnation))
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        _plan(100))
+    claim = authority.claim_values('L4')
+    specs = []
+    for replica_id in range(1, 101):
+        info = replica_managers.ReplicaInfo(
+            replica_id=replica_id,
+            cluster_name=f'svc-{replica_id}',
+            replica_port='8000',
+            is_spot=True,
+            location=None,
+            version=1,
+            resources_override={'accelerators': {
+                'L4': 1,
+            }})
+        specs.append(
+            paid_capacity.PaidClaimPersistenceSpec(
+                candidate=paid_capacity.PaidClaimCandidate(
+                    replica_id=replica_id,
+                    replica_info=info,
+                    location=None,  # type: ignore[arg-type]
+                    priority=50,
+                    capacity_plan_claim=claim),
+                pool_key='gcp:L4',
+                frontier_key=('l4',),
+                frontier_limit=100))
+
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=0))
+    snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
+    assert snapshot is not None
+    assert snapshot.fresh_aggregate_zero
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='demand semantics changed before admission'):
+        serve_state.try_add_replicas_with_paid_capacity_claims(
+            'svc',
+            'svc-hash',
+            specs,
+            base_limit=100,
+            max_limit=100,
+            service_limit=100,
+            now=time.time(),
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=60,
+            waiter_ttl_seconds=30,
+            frontier_default_limit=100,
+            expected_controller_owner=(123, '10.0.0.5'))
+
+    with engine.connect() as connection:
+        for table in (serve_state_schema.replicas_table,
+                      serve_state_schema.paid_capacity_claims_table,
+                      serve_state_schema.paid_capacity_waiters_table,
+                      serve_state_schema.paid_capacity_pools_table):
+            assert connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    table)).scalar_one() == 0
 
 
 def test_committed_claim_accepts_mixed_monotonic_routes_only_postcommit(

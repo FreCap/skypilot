@@ -2278,8 +2278,8 @@ def validate_paid_claim_in_connection(
             plan['content_sha256'] != claim_sha256 or
             plan['protocol_version'] != PROTOCOL_VERSION or
             current_demand_generation is None or
+            plan['demand_feed_generation'] > claim_demand_generation or
             head['demand_feed_generation'] > current_demand_generation or
-            head['demand_feed_generation'] != current_demand_generation or
             head['demand_feed_generation'] < claim_demand_generation or
             plan['demand_source_epoch'] != claim_source_epoch or
             plan['service_lifecycle_epoch'] != service['lifecycle_epoch'] or
@@ -2330,35 +2330,17 @@ def validate_paid_claim_in_connection(
         'sequence': int(row['sequence']),
         'payload_sha256': row['payload_sha256'],
     } for row in fresh_reports]
+    current_watermark_sha256 = (_sha256(current_watermark)
+                                if current_watermark else None)
     if (not current_watermark or
-            _sha256(current_watermark) != head['receipt_watermark_sha256'] or
+        (head['demand_feed_generation'] == current_demand_generation and
+         current_watermark_sha256 != head['receipt_watermark_sha256']) or
             any(row['complete'] is not True or row['protocol_version'] != 2
                 for row in fresh_reports) or
             not demand_state.reports_match_current_lb_authority(
                 fresh_reports, service)):
         raise CapacityAdmissionConflict(
             'Paid claim lost its fresh demand receipt watermark.')
-    # This is the prospective boundary: demand, supply, inventory, and the
-    # current plan remain exact until the replica+claim debit commits.  The
-    # earlier committed branch deliberately validates a smaller immutable
-    # handoff contract so heartbeat churn cannot strand a provider effect.
-    current_snapshot = demand_state.get_autoscaling_snapshot(
-        str(service['name']), str(service['hash']), connection=connection)
-    plan_normalized_demand = payload.get('normalized_demand')
-    changed_demand_fields = ([
-        'unavailable'
-    ] if current_snapshot is None else _changed_prospective_demand_semantics(
-        plan_normalized_demand, current_snapshot.normalized_demand))
-    if changed_demand_fields:
-        raise CapacityAdmissionConflict(
-            'Paid claim demand semantics changed before admission: '
-            f'{changed_demand_fields}.')
-    # Reporter heartbeats advance the mutable receipt sequence even when
-    # their canonical demand semantics do not change.  The same fail-closed
-    # normalizer used by the controller above proves semantic equivalence
-    # inside this lock transaction; requiring byte-identical watermarks would
-    # otherwise make provider start race both HA reporters forever.
-    # Prospective claims remain exact-watermark above.
     for row in fresh_reports:
         report = row['payload']
         if (not isinstance(report, Mapping) or
@@ -2368,6 +2350,43 @@ def validate_paid_claim_in_connection(
                 report.get('route_source_epoch') != plan['route_source_epoch']):
             raise CapacityAdmissionConflict(
                 'Paid claim demand receipts no longer name its exact route.')
+    # This is the prospective boundary: the current demand semantics, supply,
+    # inventory, and immutable plan remain exact until the replica+claim debit
+    # commits.  Ingest serializes on the already-locked service row, so this
+    # reconstruction is the same current report set locked above.  A heartbeat
+    # may advance its generation and watermark without changing demand; byte
+    # identity with an older plan head must not starve a large provider-free
+    # candidate wave.
+    current_snapshot = demand_state.get_autoscaling_snapshot(
+        str(service['name']), str(service['hash']), connection=connection)
+    plan_normalized_demand = payload.get('normalized_demand')
+    snapshot_inconsistent = bool(
+        current_snapshot is None or
+        current_snapshot.service_name != service['name'] or
+        current_snapshot.service_hash != service['hash'] or
+        current_snapshot.demand_source_epoch != claim_source_epoch or
+        current_snapshot.demand_feed_generation != current_demand_generation or
+        current_snapshot.receipt_watermark != current_watermark or
+        current_snapshot.route_generation != plan['route_generation'] or
+        current_snapshot.route_sha256 != plan['route_sha256'] or
+        current_snapshot.route_source_epoch != plan['route_source_epoch'])
+    plan_is_fresh_zero = (isinstance(plan_normalized_demand, Mapping) and
+                          plan_normalized_demand.get('fresh_aggregate_zero')
+                          is True)
+    current_is_fresh_zero = (current_snapshot is not None and
+                             current_snapshot.fresh_aggregate_zero)
+    if snapshot_inconsistent:
+        changed_demand_fields = ['unavailable']
+    elif plan_is_fresh_zero or current_is_fresh_zero:
+        changed_demand_fields = ['fresh_aggregate_zero']
+    else:
+        assert current_snapshot is not None
+        changed_demand_fields = _changed_prospective_demand_semantics(
+            plan_normalized_demand, current_snapshot.normalized_demand)
+    if changed_demand_fields:
+        raise CapacityAdmissionConflict(
+            'Paid claim demand semantics changed before admission: '
+            f'{changed_demand_fields}.')
     try:
         capacity_target = _canonical_counts(
             payload.get('capacity_target_by_accelerator', {}),
