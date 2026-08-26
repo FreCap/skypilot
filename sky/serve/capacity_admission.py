@@ -1898,129 +1898,6 @@ class CapacityAdmissionRepository:
                           demand_feed_generation=plan.demand_feed_generation)
 
 
-def _validate_committed_paid_report_routes_in_connection(
-    connection: sqlalchemy.engine.Connection,
-    service: Mapping[str, Any],
-    claim_plan: Mapping[str, Any],
-    route_head: Mapping[str, Any],
-    fresh_reports: list[Mapping[str, Any]],
-) -> None:
-    """Validate each current LB report's post-admission route reference.
-
-    This is deliberately narrower than prospective admission.  Once a paid
-    debit commits, a fresh current LB session may still name a valid route
-    snapshot between the admitted plan generation and the current head while
-    normal route publication advances.  Every referenced immutable snapshot is
-    locked and validated independently; it never becomes demand or economic
-    planning authority.
-    """
-    plan_payload = claim_plan.get('payload')
-    plan_source = (plan_payload.get('source') if isinstance(
-        plan_payload, Mapping) else None)
-    if (not isinstance(plan_source, Mapping) or
-            plan_source.get('route_generation')
-            != claim_plan.get('route_generation') or
-            plan_source.get('route_sha256') != claim_plan.get('route_sha256') or
-            plan_source.get('route_source_epoch')
-            != claim_plan.get('route_source_epoch')):
-        raise CapacityAdmissionConflict(
-            'Committed paid claim has an inconsistent admitted route.')
-    try:
-        plan_generation = _positive_int(claim_plan['route_generation'],
-                                        'route_generation')
-        head_generation = _positive_int(route_head['generation'],
-                                        'route_head_generation')
-        route_source_epoch = _positive_int(service['route_source_epoch'],
-                                           'route_source_epoch')
-        current_version = _positive_int(service['current_version'],
-                                        'current_version')
-    except (KeyError, TypeError, ValueError) as error:
-        raise CapacityAdmissionConflict(
-            'Committed paid claim has malformed route authority.') from error
-
-    references: dict[int, tuple[str, int]] = {}
-    for row in fresh_reports:
-        report = row.get('payload')
-        if not isinstance(report, Mapping):
-            raise CapacityAdmissionConflict(
-                'Committed paid claim report payload is malformed.')
-        try:
-            report_generation = _positive_int(
-                report.get('route_projection_generation'),
-                'route_projection_generation')
-            routing_version = _positive_int(report.get('routing_version'),
-                                            'routing_version')
-        except ValueError as error:
-            raise CapacityAdmissionConflict(
-                'Committed paid claim report route is malformed.') from error
-        report_sha256 = report.get('route_projection_sha256')
-        if (row.get('protocol_version') != 2 or
-                report.get('protocol_version') != 2 or
-                row.get('complete') is not True or
-                report.get('reporter_session_id')
-                != row.get('reporter_session_id') or
-                report.get('lb_session_id') != row.get('lb_session_id') or
-                report.get('lb_slot') != row.get('lb_slot') or
-                report.get('sequence') != row.get('sequence') or
-                report.get('routing_version') != row.get('routing_version') or
-                not isinstance(report_sha256, str) or
-                _SHA256_RE.fullmatch(report_sha256) is None or
-                report.get('route_source_epoch') != route_source_epoch or
-                routing_version != current_version or
-                report_generation < plan_generation or
-                report_generation > head_generation):
-            raise CapacityAdmissionConflict(
-                'Committed paid claim reports no longer name a valid '
-                'admitted route.')
-        reference = (report_sha256, routing_version)
-        previous = references.setdefault(report_generation, reference)
-        if previous != reference:
-            raise CapacityAdmissionConflict(
-                'Committed paid claim reports disagree about one route '
-                'generation.')
-
-    generations = sorted(references)
-    snapshots = connection.execute(
-        sqlalchemy.select(_ROUTE_SNAPSHOTS).where(
-            _ROUTE_SNAPSHOTS.c.service_name == service['name'],
-            _ROUTE_SNAPSHOTS.c.generation.in_(generations)).order_by(
-                _ROUTE_SNAPSHOTS.c.generation).with_for_update()).mappings(
-                ).all()
-    snapshots_by_generation = {
-        int(snapshot['generation']): snapshot for snapshot in snapshots
-    }
-    if len(snapshots_by_generation) != len(generations):
-        raise CapacityAdmissionConflict(
-            'Committed paid claim report route snapshot is unavailable.')
-
-    producer_protocol = service.get('route_projection_protocol_version')
-    for generation in generations:
-        snapshot = snapshots_by_generation[generation]
-        report_sha256, routing_version = references[generation]
-        if (snapshot['content_sha256'] != report_sha256 or
-                snapshot['service_hash'] != service['hash'] or
-                snapshot['service_lifecycle_epoch']
-                != service['lifecycle_epoch'] or
-                snapshot['service_version'] != routing_version or
-                snapshot['controller_incarnation']
-                != service['controller_incarnation'] or
-                snapshot['protocol_version'] != PROTOCOL_VERSION or
-                snapshot['producer_protocol_version'] != producer_protocol):
-            raise CapacityAdmissionConflict(
-                'Committed paid claim report route snapshot is invalid.')
-        try:
-            route_projection.RouteProjectionRepository.validate_snapshot_row(
-                snapshot)
-        except route_projection.RouteProjectionError as error:
-            raise CapacityAdmissionConflict(
-                'Committed paid claim report route snapshot is corrupt.'
-            ) from error
-        if not route_projection.snapshot_owner_matches(snapshot, service):
-            raise CapacityAdmissionConflict(
-                'Committed paid claim report route belongs to a different '
-                'owner.')
-
-
 def _validate_committed_paid_claim_in_connection(
     connection: sqlalchemy.engine.Connection,
     service: Mapping[str, Any],
@@ -2035,9 +1912,10 @@ def _validate_committed_paid_claim_in_connection(
     """Validate immutable post-admission authority against current routing.
 
     Replica, claim, paid-pool debit, association, and execution-claim identity
-    are locked by the provider-effect caller.  Demand and economic planning are
-    intentionally absent here: they authorized that atomic commit and may
-    change afterwards, but cannot revoke its one first provider effect.
+    are locked by the provider-effect caller.  Demand reports, load-balancer
+    role heartbeats, and economic planning are intentionally absent here: they
+    authorized that atomic commit and may change or become temporarily
+    unavailable afterwards, but cannot revoke its one first provider effect.
     """
     current_demand_generation = connection.execute(
         sqlalchemy.select(_DEMAND_GENERATIONS.c.generation).where(
@@ -2094,6 +1972,15 @@ def _validate_committed_paid_claim_in_connection(
             'Paid claim route projection belongs to a different owner.')
 
     claim_plan_payload = claim_plan['payload']
+    plan_source = claim_plan_payload.get('source')
+    if (not isinstance(plan_source, Mapping) or
+            plan_source.get('route_generation')
+            != claim_plan.get('route_generation') or
+            plan_source.get('route_sha256') != claim_plan.get('route_sha256') or
+            plan_source.get('route_source_epoch')
+            != claim_plan.get('route_source_epoch')):
+        raise CapacityAdmissionConflict(
+            'Committed paid claim has an inconsistent admitted route.')
     try:
         authorized_paid = _canonical_counts(
             claim_plan_payload.get('paid_residual_by_accelerator', {}),
@@ -2118,38 +2005,9 @@ def _validate_committed_paid_claim_in_connection(
         raise CapacityAdmissionConflict(
             'Committed paid claims exceed their immutable plan debit.')
 
-    fresh_reports = connection.execute(
-        sqlalchemy.select(_DEMAND_REPORTS).where(
-            _DEMAND_REPORTS.c.service_name == service['name'],
-            _DEMAND_REPORTS.c.service_hash == service['hash'],
-            _DEMAND_REPORTS.c.valid_until
-            > now).order_by(_DEMAND_REPORTS.c.reporter_session_id).
-        with_for_update()).mappings().all()
-    if service.get('lb_ha_enabled') == 1:
-        # A report from a non-current HA cutover generation is display-only.
-        # Prospective planning must reject that mixed set before a debit
-        # commits, but it must not revoke an already committed claim's one
-        # provider effect.  Retain only the current generation here; the
-        # predicate below still requires the exact selected ACTIVE slot.
-        cutover_generation = service.get('lb_cutover_generation')
-        fresh_reports = [
-            row for row in fresh_reports
-            if isinstance(row.get('payload'), Mapping) and
-            row['payload'].get('applied_generation') == cutover_generation
-        ]
-    if (not fresh_reports or
-            any(row['complete'] is not True or row['protocol_version'] != 2
-                for row in fresh_reports) or
-            not demand_state.reports_match_current_lb_authority(
-                fresh_reports, service)):
-        raise CapacityAdmissionConflict(
-            'Committed paid claim lost current load-balancer authority.')
-    _validate_committed_paid_report_routes_in_connection(
-        connection, service, claim_plan, route_head, fresh_reports)
     final_now = connection.execute(
         sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
-    paid_fresh_until = min([route_head['valid_until']] +
-                           [row['valid_until'] for row in fresh_reports])
+    paid_fresh_until = route_head['valid_until']
     if paid_fresh_until <= final_now:
         raise CapacityAdmissionConflict(
             'Paid claim freshness expired while validation waited.')

@@ -1,19 +1,20 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Current status (2026-08-26): SkyPilot release `1.1.1511` is deployed as Helm
-revision 632. A clean target-100 qualification atomically committed all 100
-ordinary-paid Spot claims with zero On-Demand claims, but only six GCP L4 Spot
-VMs reached RUNNING. Two redundant process-local logical-target gates treated
-fresh equivalent demand generations as supersession and, after the durable
-claim boundary, still let a short target lease revoke the claim's first
-provider effect. Normal SkyServe teardown subsequently reached three fresh
-samples of exact zero service/replica/claim state, GCP VMs, and managed disks;
-an independent PostgreSQL and GCP-native census agreed. This change restores
-semantic generation carry-forward before claim commit and makes the existing
-atomic paid claim authoritative afterward. The next gate is one homogeneous
-Helm rollout and a sustained rerun requiring 100 provider-backed Spot L4 VMs,
-zero On-Demand effects, and complete normal teardown. The older phase account
-below is historical chronology and is not an executable runbook.
+Current status (2026-08-26): SkyPilot release `1.1.1512` is deployed. Its first
+target-100 qualification atomically committed the bounded ordinary-paid Spot
+wave with zero On-Demand claims, but six exact bound `sky.launch` requests
+failed before provider I/O with `Committed paid claim lost current
+load-balancer authority`. Concurrent API PostgreSQL connection-pool starvation
+made the short-lived report lease brittle; retained report rows cannot identify
+which report-authority subpredicate failed for each request. This source
+candidate removes only that post-commit report lease: fresh complete current
+load-balancer reports remain mandatory to create a paid debit, while the
+debit's one provider effect subsequently depends on its immutable graph and a
+fresh current route head. The next gate is one homogeneous Helm rollout and a
+sustained rerun requiring at least 100
+provider-backed Spot L4 VMs, zero On-Demand effects, and complete normal
+teardown. The older phase account below is historical chronology and is not an
+executable runbook.
 
 All PHX lane names in that historical chronology are audit facts, not current
 operator instructions. The current source contract is policy-bundle schema v7
@@ -32,10 +33,13 @@ changes cannot strand it. The process-local handoff requires the exact
 canonical pool key alone grants nothing. After restart, only an adopter built
 from the exact durable bound-request association uses the equivalent handoff.
 Lifecycle and source epochs, monotonic demand and route generations, fresh
-current route/LB ownership, and the exact persisted action graph still fail
-closed. A successor authorizes no replay or additional debit, and ordinary
-desired-state retirement removes any capacity that became excess. This split
-replaces the older text below that described mutable demand/allocation as a
+current route ownership, and the exact persisted action graph still fail
+closed. Fresh complete current load-balancer ownership remains a prospective
+admission requirement, but report expiry or HA-role heartbeat advancement
+after the atomic debit cannot revoke that debit's one effect. A successor
+authorizes no replay or additional debit, and ordinary desired-state retirement
+removes any capacity that became excess. This split replaces the older text
+below that described mutable demand, load-balancer reports, or allocation as a
 post-commit provider-start revocation mechanism.
 
 The same fix-forward projects exact revoked async leases for scheduled
@@ -823,7 +827,7 @@ accounts for or retires the committed row. The provider guard does not
 recompute mutable allocation supply. It locks the exact persisted effect graph
 and original generation's claims, proves those debits remain within the
 original paid residual, requires monotonic demand and route generations with
-unchanged source epochs, validates the fresh current route/LB owner, and then
+unchanged source epochs, validates the fresh current route owner, and then
 resamples the PostgreSQL clock. The controller publishes an unbound zero
 revocation and returns before optimistic planning whenever a sequenced durable
 observation has no current allocation, preventing a planning early-return from
@@ -835,11 +839,13 @@ capacity units. Its existing generic association/request authorization copies
 that immutable claim tuple. Admission revalidates the current plan head,
 receipt watermark, recomputed locked inventory, reserved allocation, and
 content-addressed route payload before committing the paid admission. The
-generic executor then validates the exact committed graph, immutable plan/debit ledger,
-monotonic source sequence, and fresh current route/LB owner immediately before
-provider I/O. A missing graph, over-debit, regressed sequence, expired route,
-or owner/source-epoch mismatch terminates the request at `NOT_STARTED`; mutable
-demand or supply advancement alone does not. Once provider I/O may have
+generic executor then validates the exact committed graph, immutable
+plan/debit ledger, monotonic source sequence, and fresh current route owner
+immediately before provider I/O. It deliberately does not reacquire ephemeral
+demand-report or load-balancer-role authority after commit. A missing graph,
+over-debit, regressed sequence, expired route, or owner/source-epoch mismatch
+terminates the request at `NOT_STARTED`; mutable demand, report availability,
+HA heartbeat role, or supply advancement alone does not. Once provider I/O may have
 started, the durable action reconciliation contract owns the result and no
 telemetry change can pretend the effect did not happen.
 
