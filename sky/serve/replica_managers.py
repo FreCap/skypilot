@@ -12637,7 +12637,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 expected_service_hash=self._service_hash,
                 expected_controller_owner=self._controller_owner)
             if record is None:
-                continue
+                # Every item in this wave shares one fresh-zero authority.
+                # Contention or a stale authority on any item should yield to
+                # provider progress and a newer demand reconcile, rather than
+                # repeatedly attempting the same service-wide writer guard.
+                return changed
             changed = True
             if requires_idle_proof:
                 self._wait_for_idle_trackers.pop(info.replica_id, None)

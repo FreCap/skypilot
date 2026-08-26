@@ -428,6 +428,48 @@ def test_admission_atomically_revokes_route_and_persists_exact_intent(
     assert replica == 'SHUTTING_DOWN'
 
 
+def test_admission_defers_while_provider_holds_shared_authority(
+        retirement_database):
+    engine, info, authority = retirement_database
+    _mark_retiring(info)
+
+    with serve_state.service_replica_launch_authority_guard('svc'):
+        started = time.monotonic()
+        record = serve_state.admit_paid_retirement(
+            'svc',
+            1,
+            info,
+            authority,
+            requires_idle_proof=True,
+            expected_service_hash='svc-hash',
+            expected_controller_owner=_OWNER)
+        elapsed = time.monotonic() - started
+        second_reader_started = time.monotonic()
+        with serve_state.service_replica_launch_authority_guard('svc'):
+            pass
+        second_reader_elapsed = time.monotonic() - second_reader_started
+
+    assert record is None
+    assert elapsed < 2
+    assert second_reader_elapsed < 2
+    with engine.connect() as connection:
+        intent_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                paid_retirement.serve_paid_replica_retirements_table)
+        ).scalar_one()
+        lease = connection.execute(
+            sqlalchemy.select(
+                route_projection_schema.serve_route_replica_leases_table)
+        ).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.status)).scalar_one()
+    assert intent_count == 0
+    assert lease['revoked_at'] is None
+    assert lease['revocation_reason'] is None
+    assert replica == 'READY'
+
+
 def test_admission_accepts_current_duplicate_plan_head(retirement_database):
     engine, info, original_authority = retirement_database
     snapshot = _refresh_duplicate_zero_plan_head(engine)

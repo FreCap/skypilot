@@ -6428,8 +6428,20 @@ def _transition_paid_retirement(
     """Atomically pair paid-retirement authority with replica off-route state."""
     if action not in ('admit', 'commit', 'cancel'):
         raise ValueError(f'Unsupported paid-retirement action: {action!r}.')
-    with _replica_launch_authority_write_session(service_name) as (engine,
-                                                                   session):
+    # Fresh-zero admission is a periodic, fully revalidated reconciliation
+    # decision.  It must not queue an exclusive writer behind an in-flight
+    # provider call: PostgreSQL writer preference would then convoy every
+    # later shared provider guard behind the stale zero-demand decision.  A
+    # missed admission is safe to retry from the next fresh demand snapshot.
+    # Commit and positive-demand cancellation remain blocking because they
+    # finish already-durable retirement state.
+    write_session = (try_service_replica_launch_authority_write_session
+                     if action == 'admit' else
+                     _replica_launch_authority_write_session)
+    with write_session(service_name) as locked_session:
+        if locked_session is None:
+            return False
+        engine, session = locked_session
         if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
             raise RuntimeError('Paid retirement requires PostgreSQL.')
         owner = session.execute(
