@@ -20,23 +20,16 @@ from sky.utils import common_utils
 
 
 def _replica_info(replica_id):
-    info = mock.Mock()
-    info.replica_id = replica_id
-    info.cluster_name = f'svc-replica-{replica_id}'
-    info.version = 1
-    info.url = f'http://10.0.0.{replica_id}:8080'
-    info.is_spot = False
-    info.status_property.should_track_service_status.return_value = True
+    info = replica_managers.ReplicaInfo(
+        replica_id=replica_id,
+        cluster_name=f'svc-replica-{replica_id}',
+        replica_port='8080',
+        is_spot=False,
+        location=None,
+        version=1,
+        resources_override=None)
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
     info.status_property.first_ready_time = 1.0
-    info.first_consecutive_failure_time = None
-    info.first_not_ready_time = None
-    # This fixture models an ordinary replica.  Leaving newly added recovery
-    # fields as implicit Mock children makes ``quarantine is not None`` true and
-    # correctly drives the production probe loop into fail-closed teardown.
-    info.system_recovery_quarantine = None
-    info.system_recovery_disposition = (
-        system_recovery_state.SystemRecoveryDisposition.ORDINARY)
-    info.system_recovery = None
     return info
 
 
@@ -55,15 +48,17 @@ def _make_manager(failure_threshold):
     manager._get_initial_delay_seconds = mock.Mock(return_value=1200)
     manager._consecutive_failure_threshold_timeout = mock.Mock(
         return_value=failure_threshold)
-    manager._handle_preemption = mock.Mock(return_value=False)
     manager._cloud_instance_looks_alive = mock.Mock(
         return_value=(replica_managers._PreemptionPrefilterResult(
             replica_managers._PreemptionPrefilterDisposition.LIVE_OR_UNPROVEN)))
     manager._terminate_replica = mock.Mock()
     manager._db_fence_kwargs = mock.Mock(return_value={})
     manager._resolve_probe_urls = mock.Mock(
-        side_effect=lambda infos, **_kwargs:
-        {info.replica_id: info.url for info in infos})
+        side_effect=lambda infos, **_kwargs: {
+            info.replica_id: f'http://10.0.0.{info.replica_id}:8080'
+            for info in infos
+        })
+    manager._system_recovery_route_registry = mock.Mock()
     return manager
 
 
@@ -78,7 +73,7 @@ class TestConsecutiveFailureWindow(unittest.TestCase):
                                return_value={1: mock.Mock()}), \
              mock.patch.object(serve_state, 'add_or_update_replicas'), \
              mock.patch.object(serve_state, 'get_replica_infos_from_ids',
-                               return_value={}), \
+                               return_value={info.replica_id: info}), \
              mock.patch.object(serve_state, 'set_service_uptime'):
             manager._probe_all_replicas()
 
@@ -99,8 +94,9 @@ class TestConsecutiveFailureWindow(unittest.TestCase):
         self._run_round(manager, info, False, probe_time=159.9)
         manager._terminate_replica.assert_not_called()
         self._run_round(manager, info, False, probe_time=160.0)
-        manager._terminate_replica.assert_called_once_with(
-            1, sync_down_logs=True, replica_drain_delay_seconds=0)
+        manager._terminate_replica.assert_not_called()
+        self.assertEqual(info.status_property.sky_down_status,
+                         common_utils.ProcessStatus.SCHEDULED)
 
     def test_successful_probe_resets_window(self):
         manager = _make_manager(failure_threshold=60)
@@ -149,6 +145,9 @@ class TestFailureBookkeepingIsConstantSize(unittest.TestCase):
                                        return_value={1: mock.Mock()}), \
                      mock.patch.object(serve_state,
                                        'add_or_update_replicas'), \
+                     mock.patch.object(serve_state,
+                                       'get_replica_infos_from_ids',
+                                       return_value={1: info}), \
                      mock.patch.object(replica_managers.ReplicaInfo, 'probe',
                                        probe):
                     manager._probe_all_replicas()

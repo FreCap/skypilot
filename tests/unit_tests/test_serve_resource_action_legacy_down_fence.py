@@ -70,6 +70,7 @@ def _protocol_v2_cluster_record():
     handle = mock.Mock(
         spec=replica_managers.cloud_vm_ray_backend.CloudVmRayResourceHandle)
     handle.cluster_name = 'svc-1'
+    handle.cluster_name_on_cloud = 'svc-1-cloud'
     handle.launched_resources = mock.Mock(
         cloud=replica_managers.clouds.Kubernetes(), region='phx-context')
     return {
@@ -104,9 +105,7 @@ def test_terminate_cluster_forwards_exact_resource_action_uuid(tmp_path):
          mock.patch.object(replica_managers.time, 'sleep'):
         workspace_ctx.return_value.__enter__.return_value = None
         replica_managers.terminate_cluster(
-            'svc-1',
-            str(tmp_path / 'down.log'),
-            expected_cluster_record_uuid=expected_uuid)
+            'svc-1', expected_cluster_record_uuid=expected_uuid)
 
     down.assert_called_once_with('svc-1',
                                  _expected_cluster_record_uuid=expected_uuid,
@@ -130,7 +129,6 @@ def test_terminate_cluster_does_not_retry_identity_conflict(tmp_path):
              ClusterRecordIdentityConflictError):
         replica_managers.terminate_cluster(
             'svc-1',
-            str(tmp_path / 'down.log'),
             expected_cluster_record_uuid=(
                 '33333333-3333-4333-8333-333333333333'))
 
@@ -176,9 +174,7 @@ def test_action_aware_ordinary_cleanup_bypasses_only_exact_non_kubernetes(
          mock.patch('sky.core.down') as down, \
          mock.patch.object(replica_managers.time, 'sleep'):
         replica_managers.terminate_cluster.__wrapped__(
-            'svc-1',
-            str(tmp_path / 'down.log'),
-            expected_cluster_record_uuid=expected_uuid)
+            'svc-1', expected_cluster_record_uuid=expected_uuid)
 
     assert modes == expected_modes
     expected_handle = (b'ordinary-handle' if isinstance(
@@ -224,9 +220,7 @@ def test_ordinary_cleanup_retries_handle_change_and_reclassifies_provider(
          mock.patch('sky.core.down', side_effect=[changed, None]) as down, \
          mock.patch.object(replica_managers.time, 'sleep'):
         replica_managers.terminate_cluster.__wrapped__(
-            'svc-1',
-            str(tmp_path / 'down.log'),
-            expected_cluster_record_uuid=expected_uuid)
+            'svc-1', expected_cluster_record_uuid=expected_uuid)
 
     assert modes == [
         replica_managers.provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
@@ -254,13 +248,15 @@ def test_protocol_v2_legacy_cleanup_forwards_hash_and_owner_guard(tmp_path):
          mock.patch.object(replica_managers.kubernetes_adaptor,
                            'physical_cluster_uid_fence',
                            return_value=contextlib.nullcontext()), \
+         mock.patch.object(
+             replica_managers.reserved_capacity,
+             'probe_physical_replica_presence',
+             return_value=replica_managers.reserved_capacity.
+             PhysicalReplicaPresence.ABSENT), \
          mock.patch('sky.core.down') as down, \
          mock.patch.object(replica_managers.time, 'sleep'):
         replica_managers.terminate_cluster.__wrapped__(
-            'svc-1',
-            str(tmp_path / 'down.log'),
-            cleanup_fence=cleanup_fence,
-            continue_guard=guard)
+            'svc-1', cleanup_fence=cleanup_fence, continue_guard=guard)
 
     down.assert_called_once_with('svc-1',
                                  _expected_cluster_hash='generation-a',
@@ -285,11 +281,15 @@ def test_protocol_v2_action_cleanup_keeps_uuid_authoritative(tmp_path):
          mock.patch.object(replica_managers.kubernetes_adaptor,
                            'physical_cluster_uid_fence',
                            return_value=contextlib.nullcontext()), \
+         mock.patch.object(
+             replica_managers.reserved_capacity,
+             'probe_physical_replica_presence',
+             return_value=replica_managers.reserved_capacity.
+             PhysicalReplicaPresence.ABSENT), \
          mock.patch('sky.core.down') as down, \
          mock.patch.object(replica_managers.time, 'sleep'):
         replica_managers.terminate_cluster.__wrapped__(
             'svc-1',
-            str(tmp_path / 'down.log'),
             cleanup_fence=cleanup_fence,
             expected_cluster_record_uuid=expected_uuid,
             continue_guard=guard)
@@ -306,7 +306,7 @@ def test_protocol_v2_cleanup_reacquires_phase_workspace_and_uid_per_retry(
     events = []
 
     @contextlib.contextmanager
-    def phase(mode):
+    def phase(mode, **_kwargs):
         events.append(('phase-enter', mode))
         try:
             yield mock.sentinel.admission
@@ -360,16 +360,18 @@ def test_protocol_v2_cleanup_reacquires_phase_workspace_and_uid_per_retry(
          mock.patch.object(replica_managers.kubernetes_adaptor,
                            'physical_cluster_uid_fence',
                            side_effect=physical_fence), \
+         mock.patch.object(
+             replica_managers.reserved_capacity,
+             'probe_physical_replica_presence',
+             return_value=replica_managers.reserved_capacity.
+             PhysicalReplicaPresence.ABSENT), \
          mock.patch('sky.core.down', side_effect=down), \
          mock.patch.object(replica_managers.common_utils.Backoff,
                            'current_backoff',
                            return_value=0), \
          mock.patch.object(replica_managers.time, 'sleep'):
         replica_managers.terminate_cluster.__wrapped__(
-            'svc-1',
-            str(tmp_path / 'down.log'),
-            cleanup_fence=cleanup_fence,
-            max_retry=2)
+            'svc-1', cleanup_fence=cleanup_fence, max_retry=2)
 
     mode = replica_managers.provider_phase.ProviderPhaseMode.V2_FENCED
     assert events == [('phase-enter', mode), ('record-read', 'workspace-a'),
@@ -379,7 +381,8 @@ def test_protocol_v2_cleanup_reacquires_phase_workspace_and_uid_per_retry(
                       ('phase-enter', mode), ('record-read', 'workspace-b'),
                       ('workspace-enter', 'workspace-b'), ('fence-enter', None),
                       ('down', 'generation-b'), ('fence-exit', None),
-                      ('workspace-exit', 'workspace-b'), ('phase-exit', mode)]
+                      ('workspace-exit', 'workspace-b'), ('phase-exit', mode),
+                      ('phase-enter', mode), ('phase-exit', mode)]
     assert get_record.call_count == 2
 
 
@@ -409,7 +412,6 @@ def test_protocol_v2_rotated_uuid_rejects_before_provider_capture(tmp_path):
              match='rotated'):
         replica_managers.terminate_cluster.__wrapped__(
             'svc-1',
-            str(tmp_path / 'down.log'),
             cleanup_fence=cleanup_fence,
             expected_cluster_record_uuid=expected_uuid)
 
@@ -435,31 +437,21 @@ def test_action_aware_replica_worker_carries_persisted_uuid(tmp_path):
         desired_generation=1,
         sky_cluster_record_uuid=expected_uuid)
     manager._persist_replica = mock.Mock()
-    down_thread = mock.Mock()
-
     with mock.patch.object(
             replica_managers.serve_state,
             'get_replica_info_with_resource_action_identity',
             return_value=(info, identity)), \
-         mock.patch.object(replica_managers.serve_utils,
-                           'generate_replica_log_file_name',
-                           return_value=str(tmp_path / 'replica.log')), \
          mock.patch.object(replica_managers.global_user_state,
                            'cluster_with_name_exists',
-                           return_value=True), \
-         mock.patch.object(replica_managers.thread_utils,
-                           'SafeThread',
-                           return_value=down_thread) as safe_thread:
+                           return_value=True):
         manager._terminate_replica(1,
-                                   sync_down_logs=False,
                                    replica_drain_delay_seconds=0,
                                    is_scale_down=True)
 
-    assert manager._down_thread_pool[1] is down_thread
-    assert safe_thread.call_args.kwargs['target'] is (
-        replica_managers.terminate_cluster)
-    assert safe_thread.call_args.kwargs['kwargs'][
-        'expected_cluster_record_uuid'] == str(expected_uuid)
+    down_thread = manager._down_thread_pool[1]
+    assert isinstance(down_thread, replica_managers._ReplicaDownThread)
+    assert down_thread._kwargs['expected_cluster_record_uuid'] == str(
+        expected_uuid)
 
 
 def test_legacy_replica_worker_remains_name_only(tmp_path):
@@ -478,25 +470,20 @@ def test_legacy_replica_worker_remains_name_only(tmp_path):
             replica_managers.serve_state,
             'get_replica_info_with_resource_action_identity',
             return_value=(info, None)), \
-         mock.patch.object(replica_managers.serve_utils,
-                           'generate_replica_log_file_name',
-                           return_value=str(tmp_path / 'replica.log')), \
          mock.patch.object(replica_managers.global_user_state,
                            'cluster_with_name_exists',
-                           return_value=True), \
-         mock.patch.object(replica_managers.thread_utils,
-                           'SafeThread',
-                           return_value=mock.Mock()) as safe_thread:
+                           return_value=True):
         manager._terminate_replica(1,
-                                   sync_down_logs=False,
                                    replica_drain_delay_seconds=0,
                                    is_scale_down=True)
 
-    assert safe_thread.call_args.kwargs['kwargs'][
-        'expected_cluster_record_uuid'] is None
+    down_thread = manager._down_thread_pool[1]
+    assert isinstance(down_thread, replica_managers._ReplicaDownThread)
+    assert down_thread._kwargs['expected_cluster_record_uuid'] is None
 
 
-def test_protocol_v2_absent_cluster_record_is_retained_for_retry(tmp_path):
+def test_protocol_v2_absent_cluster_record_still_runs_provider_cleanup(
+        tmp_path):
     manager = _manager_for_down_test()
     info = _protocol_v2_replica()
 
@@ -504,23 +491,22 @@ def test_protocol_v2_absent_cluster_record_is_retained_for_retry(tmp_path):
             replica_managers.serve_state,
             'get_replica_info_with_resource_action_identity',
             return_value=(info, None)), \
-         mock.patch.object(replica_managers.serve_utils,
-                           'generate_replica_log_file_name',
-                           return_value=str(tmp_path / 'replica.log')), \
          mock.patch.object(replica_managers.global_user_state,
                            'cluster_with_name_exists',
                            return_value=False):
         manager._terminate_replica(1,
-                                   sync_down_logs=False,
                                    replica_drain_delay_seconds=0,
                                    is_scale_down=True)
 
-    assert info.status_property.sky_down_status == common_utils.ProcessStatus.FAILED
-    assert info.status_property.sky_launch_status == common_utils.ProcessStatus.FAILED
-    assert info.status == serve_state.ReplicaStatus.FAILED_CLEANUP
+    assert (info.status_property.sky_down_status ==
+            common_utils.ProcessStatus.SCHEDULED)
+    assert (info.status_property.sky_launch_status ==
+            common_utils.ProcessStatus.SCHEDULED)
     manager._persist_replica.assert_called_once_with(1, info)
-    manager._schedule_failed_cleanup_retry.assert_called_once_with(1)
-    assert 1 not in manager._down_thread_pool
+    manager._schedule_failed_cleanup_retry.assert_not_called()
+    down_thread = manager._down_thread_pool[1]
+    assert isinstance(down_thread, replica_managers._ReplicaDownThread)
+    assert down_thread._kwargs['cleanup_fence'] is not None
 
 
 def test_malformed_protocol_v2_cleanup_authority_is_retained(tmp_path):
@@ -532,13 +518,9 @@ def test_malformed_protocol_v2_cleanup_authority_is_retained(tmp_path):
             replica_managers.serve_state,
             'get_replica_info_with_resource_action_identity',
             return_value=(info, None)), \
-         mock.patch.object(replica_managers.serve_utils,
-                           'generate_replica_log_file_name',
-                           return_value=str(tmp_path / 'replica.log')), \
          mock.patch.object(replica_managers.global_user_state,
                            'cluster_with_name_exists') as cluster_exists:
         manager._terminate_replica(1,
-                                   sync_down_logs=False,
                                    replica_drain_delay_seconds=0,
                                    is_scale_down=True)
 

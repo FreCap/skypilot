@@ -136,8 +136,8 @@ class _TruncatingLogFile:
         self._bytes_since_disk_check %= self._disk_check_interval_bytes
         # Include this pending write in the decision so a single large output
         # chunk cannot cross the reserve after observing a healthy snapshot.
-        return (shutil.disk_usage(self._path.parent).free - incoming_bytes
-                < self._min_free_bytes)
+        return (shutil.disk_usage(self._path.parent).free - incoming_bytes <
+                self._min_free_bytes)
 
     def _replace_with_disk_pressure_marker(self, fd: int) -> None:
         """Release this spool's payload and leave a follower-visible marker."""
@@ -418,7 +418,7 @@ class SkyPilotContext:
         del exc_type, exc_val, exc_tb
         self.cleanup()
 
-    def copy(self) -> 'SkyPilotContext':
+    def copy(self, *, inherit_log: bool = True) -> 'SkyPilotContext':
         """Create a copy of the context.
 
         Changes to the current context after this call will not affect the copy.
@@ -428,8 +428,9 @@ class SkyPilotContext:
         Cancellation of the current context will not be propagated to the copy.
         """
         new_context = SkyPilotContext()
-        new_context.redirect_log(self._log_file, self._log_file_max_bytes,
-                                 self._log_file_min_free_bytes)
+        if inherit_log:
+            new_context.redirect_log(self._log_file, self._log_file_max_bytes,
+                                     self._log_file_min_free_bytes)
         new_context.env_overrides = self.env_overrides.copy()
         new_context.config_context = copy.deepcopy(self.config_context)
         return new_context
@@ -663,6 +664,22 @@ def contextual(func: Callable[P, T]) -> Callable[P, T]:
     return wrapper
 
 
+def contextual_without_log(func: Callable[P, T]) -> Callable[P, T]:
+    """Run with inherited config/environment but no diagnostic log sink."""
+
+    def run_in_context(*args: P.args, **kwargs: P.kwargs) -> T:
+        original_ctx = get()
+        with initialize(original_ctx, inherit_log=False):
+            return func(*args, **kwargs)
+
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        copied_context = contextvars.copy_context()
+        return copied_context.run(run_in_context, *args, **kwargs)
+
+    return wrapper
+
+
 def contextual_async(
     func: Callable[P, Coroutine[Any, Any, T]]
 ) -> Callable[P, Coroutine[Any, Any, T]]:
@@ -689,10 +706,12 @@ def contextual_async(
     return wrapper
 
 
-def initialize(base_context: SkyPilotContext | None = None) -> SkyPilotContext:
+def initialize(base_context: SkyPilotContext | None = None,
+               *,
+               inherit_log: bool = True) -> SkyPilotContext:
     """Initialize the current SkyPilot context."""
-    new_context = base_context.copy(
-    ) if base_context is not None else SkyPilotContext()
+    new_context = (base_context.copy(inherit_log=inherit_log)
+                   if base_context is not None else SkyPilotContext())
     _CONTEXT.set(new_context)
     return new_context
 

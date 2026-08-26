@@ -1,4 +1,4 @@
-"""Tests for the removable legacy SkyServe replica-mutation runtime."""
+"""Tests for SkyServe's process-local replica-mutation runtime."""
 # pylint: disable=protected-access
 
 import concurrent.futures
@@ -10,16 +10,14 @@ from sky.serve import replica_managers
 from sky.utils import thread_utils
 
 
-def test_legacy_runtime_owns_process_local_mutation_state() -> None:
-    runtime = replica_managers._LegacyReplicaMutationRuntime()
-    other_runtime = replica_managers._LegacyReplicaMutationRuntime()
+def test_runtime_owns_process_local_mutation_state() -> None:
+    runtime = replica_managers._ReplicaMutationRuntime()
+    other_runtime = replica_managers._ReplicaMutationRuntime()
 
     assert isinstance(runtime.launch_completion_queue, queue.SimpleQueue)
     assert isinstance(runtime.launch_completion_event, threading.Event)
     assert isinstance(runtime.launch_thread_pool, thread_utils.ThreadSafeDict)
     assert isinstance(runtime.replica_to_request_id,
-                      thread_utils.ThreadSafeDict)
-    assert isinstance(runtime.replica_to_launch_cancelled,
                       thread_utils.ThreadSafeDict)
     assert isinstance(runtime.replica_to_logical_launch_fence,
                       thread_utils.ThreadSafeDict)
@@ -28,7 +26,6 @@ def test_legacy_runtime_owns_process_local_mutation_state() -> None:
     assert not runtime.failed_cleanup_retry_at
     for field_name in ('launch_completion_queue', 'launch_completion_event',
                        'launch_thread_pool', 'replica_to_request_id',
-                       'replica_to_launch_cancelled',
                        'replica_to_logical_launch_fence', 'down_thread_pool',
                        'failed_cleanup_retry_attempts',
                        'failed_cleanup_retry_at'):
@@ -60,7 +57,6 @@ def test_legacy_runtime_adopts_pre_refactor_manager_fields() -> None:
     old_completion_event = threading.Event()
     old_launch_pool = thread_utils.ThreadSafeDict()
     old_request_ids = thread_utils.ThreadSafeDict()
-    old_launch_cancelled = thread_utils.ThreadSafeDict()
     old_logical_fences = thread_utils.ThreadSafeDict()
     old_down_pool = thread_utils.ThreadSafeDict()
     old_retry_attempts = {1: 3}
@@ -70,7 +66,6 @@ def test_legacy_runtime_adopts_pre_refactor_manager_fields() -> None:
         '_launch_completion_event': old_completion_event,
         '_launch_thread_pool': old_launch_pool,
         '_replica_to_request_id': old_request_ids,
-        '_replica_to_launch_cancelled': old_launch_cancelled,
         '_replica_to_logical_launch_fence': old_logical_fences,
         '_down_thread_pool': old_down_pool,
         '_failed_cleanup_retry_attempts': old_retry_attempts,
@@ -83,7 +78,6 @@ def test_legacy_runtime_adopts_pre_refactor_manager_fields() -> None:
     assert runtime.launch_completion_event is old_completion_event
     assert runtime.launch_thread_pool is old_launch_pool
     assert runtime.replica_to_request_id is old_request_ids
-    assert runtime.replica_to_launch_cancelled is old_launch_cancelled
     assert runtime.replica_to_logical_launch_fence is old_logical_fences
     assert runtime.down_thread_pool is old_down_pool
     assert runtime.failed_cleanup_retry_attempts is old_retry_attempts
@@ -186,7 +180,7 @@ def test_recovery_and_refresh_route_through_legacy_runtime() -> None:
         replica_managers.SkyPilotReplicaManager)
     manager.lock = threading.Lock()
     manager._superseded_prune_pending = False
-    runtime = replica_managers._LegacyReplicaMutationRuntime()
+    runtime = replica_managers._ReplicaMutationRuntime()
     runtime.recover = mock.Mock()
     runtime.refresh = mock.Mock()
     manager._publish_legacy_mutation_runtime_state(runtime)

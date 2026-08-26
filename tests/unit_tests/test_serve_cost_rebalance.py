@@ -48,6 +48,7 @@ def _spec(**overrides):
         'cost_rebalance_min_savings_fraction': 0.3,
         'cost_rebalance_max_parallel_replacements': 1,
         'cost_rebalance_stabilization_seconds': 0.0,
+        'max_live_paid_gpu_units': None,
     }
     values.update(overrides)
     return types.SimpleNamespace(**values)
@@ -133,6 +134,18 @@ def _status_property(
     status_property = replica_managers.ReplicaStatusProperty()
     status_property.wait_for_idle_before_termination = wait_for_idle
     return status_property
+
+
+def _replica_record_id(replica_id: int) -> str:
+    return f'00000000-0000-4000-8000-{replica_id:012d}'
+
+
+def _idle_state(replica_id: int, tracker, deadline: float):
+    return replica_managers._WaitForIdleState(
+        replica_record_id=_replica_record_id(replica_id),
+        deadline=deadline,
+        tracker=tracker,
+        needs_url_resolution=False)
 
 
 class TestCostRebalanceSpec:
@@ -621,9 +634,7 @@ class TestEconomicDecisions:
                   cost_rebalance_max_parallel_replacements=1))
         placer = make_placer({
             paid: 1.0,
-            **{
-                location: 0.0 for location in cheap_locations
-            },
+            **{location: 0.0 for location in cheap_locations},
         })
         scaler.set_spot_placer(placer)
         replicas = [
@@ -703,7 +714,6 @@ class TestPinnedReplacementLaunch:
         manager._version_specs = {1: _spec()}
         manager._launch_thread_pool = {}
         manager._replica_to_request_id = {}
-        manager._replica_to_launch_cancelled = {}
         manager._persist_new_replica = mock.Mock()
         override = cheap.to_dict()
         override[constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY] = 7
@@ -733,6 +743,10 @@ class TestPinnedReplacementLaunch:
         assert set(construction.kwargs) == {
             'target',
             'replica_id',
+            'replica_record_id',
+            'service_hash',
+            'controller_owner',
+            'teardown_requested',
             'completion_queue',
             'completion_event',
             'bound_ordinary_launch',
@@ -741,14 +755,19 @@ class TestPinnedReplacementLaunch:
             'kwargs',
         }
         runtime = manager._legacy_mutation_runtime_state()
-        assert (
-            construction.kwargs['target']
-            is replica_managers.launch_cluster_with_frozen_controller_config)
+        assert (construction.kwargs['target'] is
+                replica_managers.launch_cluster_with_frozen_controller_config)
         assert construction.kwargs['replica_id'] == 8
-        assert (construction.kwargs['completion_queue']
-                is runtime.launch_completion_queue)
-        assert (construction.kwargs['completion_event']
-                is runtime.launch_completion_event)
+        assert construction.kwargs[
+            'replica_record_id'] == info.replica_record_id
+        assert construction.kwargs['service_hash'] is None
+        assert construction.kwargs['controller_owner'] is None
+        teardown_requested = construction.kwargs['teardown_requested']
+        assert isinstance(teardown_requested, threading.Event)
+        assert (construction.kwargs['completion_queue'] is
+                runtime.launch_completion_queue)
+        assert (construction.kwargs['completion_event'] is
+                runtime.launch_completion_event)
         assert construction.kwargs['bound_ordinary_launch'] is False
         assert construction.kwargs['ordinary_legacy_launch'] is False
         assert construction.kwargs['args'] == (
@@ -757,7 +776,6 @@ class TestPinnedReplacementLaunch:
             info.cluster_name,
             mock.ANY,
             runtime.replica_to_request_id,
-            runtime.replica_to_launch_cancelled,
             info.resources_override,
             False,
         )
@@ -778,23 +796,25 @@ class TestPinnedReplacementLaunch:
             'ordinary_launch_event',
             'frozen_controller_config',
             'frozen_controller_config_path',
+            'task_template',
+            'teardown_requested',
         }
         assert launch_kwargs['availability_max_retry'] == 1
         assert launch_kwargs['exact_resources_override'] is True
         pre_launch_guard = launch_kwargs['pre_launch_guard']
         assert pre_launch_guard.__self__ is manager
-        assert (pre_launch_guard.__func__
-                is type(manager)._service_is_launch_authorized)
+        assert (pre_launch_guard.__func__ is
+                type(manager)._service_is_launch_authorized)
         assert launch_kwargs['cloud_launch_guard']() == (True, 'authorized')
         assert launch_kwargs['supersession_guard']() == (True, 'authorized')
         continue_guard = launch_kwargs['continue_guard']
         assert continue_guard.__self__ is manager
-        assert (continue_guard.__func__
-                is type(manager)._launch_owner_watchdog_allows_continue)
+        assert (continue_guard.__func__ is
+                type(manager)._launch_owner_watchdog_allows_continue)
         cleanup_continue_guard = launch_kwargs['cleanup_continue_guard']
         assert cleanup_continue_guard.__self__ is manager
-        assert (cleanup_continue_guard.__func__
-                is type(manager)._service_is_cleanup_authorized)
+        assert (cleanup_continue_guard.__func__ is
+                type(manager)._service_is_cleanup_authorized)
         assert launch_kwargs['launch_fence'] is None
         assert launch_kwargs['service_spec'] is manager._version_specs[1]
         assert launch_kwargs['service_name'] == 'svc'
@@ -808,6 +828,8 @@ class TestPinnedReplacementLaunch:
         assert handoff['controller_route_epoch']
         assert len(handoff['input_digest']) == 64
         assert launch_kwargs['frozen_controller_config'] is not None
+        assert launch_kwargs['task_template'] is not None
+        assert launch_kwargs['teardown_requested'] is teardown_requested
         launch_thread = launch_thread_cls.return_value
         assert manager._launch_thread_pool[8] is launch_thread
         launch_thread.start.assert_not_called()
@@ -834,7 +856,6 @@ class TestPinnedReplacementLaunch:
         manager._version_specs = {1: _spec()}
         manager._launch_thread_pool = {}
         manager._replica_to_request_id = {}
-        manager._replica_to_launch_cancelled = {}
         manager._persist_replica = mock.Mock()
         budget = replica_managers.paid_capacity.LaunchBudget(
             remaining_by_location={cheap: 1},
@@ -889,7 +910,6 @@ class TestPinnedReplacementLaunch:
         manager._version_specs = {1: _spec()}
         manager._launch_thread_pool = {}
         manager._replica_to_request_id = {}
-        manager._replica_to_launch_cancelled = {}
         manager._persist_replica = mock.Mock()
 
         with mock.patch.object(replica_managers, '_should_use_spot'), \
@@ -945,7 +965,6 @@ class TestPinnedReplacementLaunch:
 
         manager._terminate_replica.assert_called_once_with(
             8,
-            sync_down_logs=False,
             replica_drain_delay_seconds=0,
             is_scale_down=True,
             in_flight_drain_cap_seconds=0)
@@ -1004,7 +1023,7 @@ _ABSENT = object()
 
 
 class TestRecoveryRedrive:
-    """Recovery re-drives keep (or safely drop) the persisted pairing."""
+    """Pointerless legacy launches remain fail closed across recovery."""
 
     def _recover(self, row):
         manager = _recovery_manager()
@@ -1017,24 +1036,24 @@ class TestRecoveryRedrive:
             manager._recover_replica_operations()
         return manager
 
-    def test_pairing_is_forwarded_to_the_redriven_launch(self):
+    def test_pairing_row_is_retained_without_duplicate_redrive(self):
         row = _pending_row(3, replacement_for=7)
         manager = self._recover(row)
-        kwargs = manager._launch_replica.call_args.kwargs
-        assert kwargs['prior_cost_rebalance_for_replica_id'] == 7
-        assert kwargs['resources_override'] == {'region': 'research'}
+        manager._launch_replica.assert_not_called()
+        assert row.cost_rebalance_for_replica_id == 7
+        manager._terminate_replica.assert_not_called()
 
-    def test_normalized_pre_field_row_redrives_without_pairing_kwarg(self):
+    def test_normalized_pre_field_row_is_retained_without_redrive(self):
         row = _pending_row(3, replacement_for=_ABSENT)
         manager = self._recover(row)
-        kwargs = manager._launch_replica.call_args.kwargs
-        assert 'prior_cost_rebalance_for_replica_id' not in kwargs
+        manager._launch_replica.assert_not_called()
+        manager._terminate_replica.assert_not_called()
 
-    def test_ordinary_row_redrives_without_pairing_kwarg(self):
+    def test_ordinary_pointerless_row_is_retained_without_redrive(self):
         row = _pending_row(3, replacement_for=None)
         manager = self._recover(row)
-        kwargs = manager._launch_replica.call_args.kwargs
-        assert 'prior_cost_rebalance_for_replica_id' not in kwargs
+        manager._launch_replica.assert_not_called()
+        manager._terminate_replica.assert_not_called()
 
 
 class TestPinnedLaunchFailClosed:
@@ -1051,7 +1070,6 @@ class TestPinnedLaunchFailClosed:
         manager._version_specs = {1: _spec()}
         manager._launch_thread_pool = {}
         manager._replica_to_request_id = {}
-        manager._replica_to_launch_cancelled = {}
         manager._persist_replica = mock.Mock()
         return manager
 
@@ -1140,9 +1158,20 @@ class TestWaitForIdleRecovery:
             manager._recover_replica_operations()
 
         # Not re-driven into a bounded drain: recovery only re-registers
-        # the zero-occupancy wait.
+        # the zero-occupancy wait. Provider-backed URL lookup is deliberately
+        # left to the lock-free resolver.
         manager._terminate_replica.assert_not_called()
-        assert manager._wait_for_idle_trackers[1] is not None
+        unresolved = manager._wait_for_idle_trackers[1]
+        assert unresolved.tracker is None
+        assert unresolved.needs_url_resolution
+        manager._wait_for_idle_trackers[1] = (
+            replica_managers._WaitForIdleState(
+                replica_record_id=unresolved.replica_record_id,
+                deadline=unresolved.deadline,
+                tracker=replica_managers._ReplicaDrainTracker(
+                    manager, 'http://replica',
+                    replica_managers.time.monotonic()),
+                needs_url_resolution=False))
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos_from_ids',
@@ -1170,7 +1199,6 @@ class TestWaitForIdleRecovery:
         assert not status_property.wait_for_idle_before_termination
         manager._terminate_replica.assert_called_once_with(
             1,
-            sync_down_logs=False,
             replica_drain_delay_seconds=0,
             is_scale_down=True,
             in_flight_drain_cap_seconds=0)
@@ -1216,10 +1244,6 @@ class TestStrictDrain:
         manager = replica_managers.SkyPilotReplicaManager.__new__(
             replica_managers.SkyPilotReplicaManager)
         manager._service_name = 'svc'
-        manager._wait_for_idle_trackers = {
-            replica_id: (mock.Mock(return_value=False), float('inf'))
-            for replica_id in range(52)
-        }
         manager._persist_replica = mock.Mock()
         manager._terminate_replica = mock.Mock()
         infos = {
@@ -1227,6 +1251,7 @@ class TestStrictDrain:
                 replica_id=replica_id,
                 cluster_name=f'cluster-{replica_id}',
                 version=1,
+                replica_record_id=_replica_record_id(replica_id),
                 status_property=_status_property(True))
             for replica_id in range(51)
         }
@@ -1237,7 +1262,12 @@ class TestStrictDrain:
             replica_id=51,
             cluster_name='cluster-51',
             version=1,
+            replica_record_id=_replica_record_id(51),
             status_property=_status_property(False))
+        manager._wait_for_idle_trackers = {
+            replica_id: _idle_state(replica_id, mock.Mock(return_value=False),
+                                    float('inf')) for replica_id in range(52)
+        }
         live_clusters = {
             f'cluster-{replica_id}': ('UP', 1)
             for replica_id in range(50)
@@ -1269,7 +1299,6 @@ class TestStrictDrain:
         manager._persist_replica.assert_called_once_with(1, infos[1])
         manager._terminate_replica.assert_called_once_with(
             1,
-            sync_down_logs=False,
             replica_drain_delay_seconds=0,
             is_scale_down=True,
             in_flight_drain_cap_seconds=0)
@@ -1278,13 +1307,14 @@ class TestStrictDrain:
         manager = replica_managers.SkyPilotReplicaManager.__new__(
             replica_managers.SkyPilotReplicaManager)
         manager._service_name = 'svc'
-        tracked = (mock.Mock(return_value=False), float('inf'))
+        tracked = _idle_state(1, mock.Mock(return_value=False), float('inf'))
         manager._wait_for_idle_trackers = {1: tracked}
         manager._persist_replica = mock.Mock()
         manager._terminate_replica = mock.Mock()
         info = types.SimpleNamespace(replica_id=1,
                                      cluster_name='cluster-1',
                                      version=1,
+                                     replica_record_id=_replica_record_id(1),
                                      status_property=_status_property(True))
 
         with mock.patch.object(
@@ -1319,7 +1349,7 @@ class TestStrictDrain:
         manager._logical_reconcile_snapshot = None
         manager._logical_target = None
         manager._wait_for_idle_trackers = {
-            1: (mock.Mock(return_value=False), 99.0)
+            1: _idle_state(1, mock.Mock(return_value=False), 99.0)
         }
         manager._persist_replica = mock.Mock()
         manager._terminate_replica = mock.Mock()
@@ -1335,6 +1365,7 @@ class TestStrictDrain:
         info = types.SimpleNamespace(replica_id=1,
                                      cluster_name='cluster-1',
                                      version=1,
+                                     replica_record_id=_replica_record_id(1),
                                      status_property=status)
 
         with mock.patch.object(replica_managers.serve_state,
@@ -1362,7 +1393,7 @@ class TestStrictDrain:
         manager._logical_reconcile_snapshot = None
         manager._logical_target = None
         manager._wait_for_idle_trackers = {
-            1: (mock.Mock(return_value=False), 200.0)
+            1: _idle_state(1, mock.Mock(return_value=False), 200.0)
         }
         manager._persist_replica = mock.Mock()
         manager._terminate_replica = mock.Mock()
@@ -1378,6 +1409,7 @@ class TestStrictDrain:
         info = types.SimpleNamespace(replica_id=1,
                                      cluster_name='cluster-1',
                                      version=1,
+                                     replica_record_id=_replica_record_id(1),
                                      status_property=status)
 
         with mock.patch.object(replica_managers.serve_state,
@@ -1410,6 +1442,7 @@ class TestStrictDrain:
             replica_id=1,
             cluster_name='cluster-1',
             version=1,
+            replica_record_id=_replica_record_id(1),
             url='http://replica',
             status_property=replica_managers.ReplicaStatusProperty(
                 sky_launch_status=common_utils.ProcessStatus.SUCCEEDED))
@@ -1430,6 +1463,15 @@ class TestStrictDrain:
             assert info.status_property.wait_for_idle_before_termination
             assert info.status_property.sky_down_status == common_utils.ProcessStatus.SCHEDULED
             manager._terminate_replica.assert_not_called()
+            unresolved = manager._wait_for_idle_trackers[1]
+            manager._wait_for_idle_trackers[1] = (
+                replica_managers._WaitForIdleState(
+                    replica_record_id=unresolved.replica_record_id,
+                    deadline=unresolved.deadline,
+                    tracker=replica_managers._ReplicaDrainTracker(
+                        manager, 'http://replica',
+                        replica_managers.time.monotonic()),
+                    needs_url_resolution=False))
 
             received = replica_managers.time.monotonic()
             manager._lb_in_flight_report = (received, {
@@ -1452,7 +1494,6 @@ class TestStrictDrain:
         assert not info.status_property.wait_for_idle_before_termination
         manager._terminate_replica.assert_called_once_with(
             1,
-            sync_down_logs=False,
             replica_drain_delay_seconds=0,
             is_scale_down=True,
             in_flight_drain_cap_seconds=0)
@@ -1474,6 +1515,7 @@ class TestStrictDrain:
             replica_id=1,
             cluster_name='cluster-1',
             version=1,
+            replica_record_id=_replica_record_id(1),
             url='http://replica',
             status_property=replica_managers.ReplicaStatusProperty(
                 sky_launch_status=common_utils.ProcessStatus.SUCCEEDED))
@@ -1508,7 +1550,6 @@ class TestStrictDrain:
         assert not info.status_property.wait_for_idle_before_termination
         manager._terminate_replica.assert_called_once_with(
             1,
-            sync_down_logs=False,
             replica_drain_delay_seconds=0,
             is_scale_down=True,
             in_flight_drain_cap_seconds=600)

@@ -272,7 +272,7 @@ docker run --rm --platform "$PLATFORM" \
   -e "EXPECTED_SKYPILOT_COMMIT_TIMESTAMP=${overlay_commit_timestamp}" \
   -e "EXPECTED_SKYPILOT_BUILD=${overlay_build}" \
   "$TAG" python -c "
-import importlib.metadata, inspect, os
+import importlib.metadata, os
 import skypilot_serve_system_oom_recovery_authorization
 import boltz_reserved_fill_reclaim_policy
 import sky
@@ -283,8 +283,8 @@ from sky.server import constants as server_constants
 assert sky.__commit__ == os.environ['EXPECTED_SKYPILOT_COMMIT']
 assert sky.__commit_timestamp__ == os.environ['EXPECTED_SKYPILOT_COMMIT_TIMESTAMP']
 assert sky.__build__ == os.environ['EXPECTED_SKYPILOT_BUILD']
-assert hasattr(controller_utils, 'in_flight_launch_count')
-assert 'in_flight' in inspect.signature(controller_utils.can_provision).parameters
+assert callable(controller_utils.get_serve_launch_limit)
+assert callable(controller_utils.get_serve_termination_limit)
 assert sky.__version__ == '${SKYPILOT_VERSION}', sky.__version__
 assert importlib.metadata.version('skypilot-nightly') == sky.__version__
 assert importlib.metadata.version(

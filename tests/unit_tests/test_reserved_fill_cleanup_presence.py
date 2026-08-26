@@ -17,7 +17,6 @@ from unittest import mock
 import pytest
 
 from sky import exceptions
-from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 
 _CONTEXT = 'prod_research_cluster_eks'
@@ -48,9 +47,6 @@ def _pod(*, annotation: str | None, label: str | None):
 def _clear_snapshot_cache(monkeypatch):
     reserved_capacity._physical_presence_snapshots.clear()
     reserved_capacity._physical_presence_reads.clear()
-    monkeypatch.setattr(replica_managers.kueue_lane_observer,
-                        'project_exact_pod_absence_after_teardown',
-                        lambda *_args: False)
     yield
     reserved_capacity._physical_presence_snapshots.clear()
     reserved_capacity._physical_presence_reads.clear()
@@ -477,71 +473,3 @@ def test_post_teardown_caller_never_joins_a_pre_teardown_read(monkeypatch):
         assert older.result(timeout=5) is Presence.ABSENT
         assert causal.result(timeout=5) is Presence.PRESENT
     assert calls == 2
-
-
-class _Recorder:
-    """Minimal stand-in exposing only what the cleanup funnel touches."""
-
-    def __init__(self):
-        self._service_name = 'svc'
-        self.finished = []
-
-    def _handle_sky_down_finish(self, info, format_exc):
-        self.finished.append((info, format_exc))
-
-
-def _info():
-    return types.SimpleNamespace(
-        replica_id=39149,
-        replica_record_id=('00000000-0000-0000-0000-000000000001'),
-        cluster_name=_CLUSTER)
-
-
-def _prove(recorder, info):
-    return replica_managers.SkyPilotReplicaManager._prove_cleanup_complete(
-        recorder, info, 'the durable cluster record is absent')
-
-
-def test_proven_absent_cleanup_finishes_instead_of_being_retained(monkeypatch):
-    """The 368-row pileup drains: absence settles the row as cleaned up."""
-    monkeypatch.setattr(reserved_capacity, 'parse_protocol_v2_cleanup_fence',
-                        lambda info: _fence())
-    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
-                        lambda fence, name: Presence.ABSENT)
-    recorder = _Recorder()
-    assert _prove(recorder, _info()) is True
-    assert recorder.finished == [(mock.ANY, None)]
-
-
-@pytest.mark.parametrize('presence', [Presence.PRESENT, Presence.UNPROVEN])
-def test_unsettled_cleanup_is_still_retained(monkeypatch, presence):
-    """A live or unreadable Pod keeps the durable row and its retry."""
-    monkeypatch.setattr(reserved_capacity, 'parse_protocol_v2_cleanup_fence',
-                        lambda info: _fence())
-    monkeypatch.setattr(reserved_capacity, 'probe_physical_replica_presence',
-                        lambda fence, name: presence)
-    recorder = _Recorder()
-    assert _prove(recorder, _info()) is False
-    assert not recorder.finished
-
-
-def test_non_fenced_replica_keeps_legacy_handling(monkeypatch):
-    """Ordinary (non reserved-fill) rows never consult the physical prover."""
-    monkeypatch.setattr(reserved_capacity, 'parse_protocol_v2_cleanup_fence',
-                        lambda info: None)
-    recorder = _Recorder()
-    assert _prove(recorder, _info()) is False
-    assert not recorder.finished
-
-
-def test_malformed_identity_is_never_settled(monkeypatch):
-    """The row the fence exists to protect must stay retained."""
-
-    def _raise(info):
-        raise exceptions.KubernetesPhysicalClusterIdentityError('malformed')
-
-    monkeypatch.setattr(reserved_capacity, 'parse_protocol_v2_cleanup_fence',
-                        _raise)
-    recorder = _Recorder()
-    assert _prove(recorder, _info()) is False
-    assert not recorder.finished

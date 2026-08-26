@@ -69,6 +69,21 @@ def _free_port():
     return port
 
 
+def _admit_cleanup_from(infos):
+    infos_by_id = {info.replica_id: info for info in infos}
+
+    def _reserve(_service_name, candidates, **_kwargs):
+        admitted = {}
+        for replica_id, _replica_record_id in candidates:
+            info = infos_by_id[replica_id]
+            info.status_property.sky_down_status = (
+                service.common_utils.ProcessStatus.RUNNING)
+            admitted[replica_id] = info
+        return admitted
+
+    return _reserve
+
+
 def _binding_authority(
     mode=service.ordinary_launch_binding.BindingMode.LEGACY,
     binding_epoch=0,
@@ -1649,8 +1664,10 @@ def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
                           ) as persist, \
          mock.patch.object(serve_state,
                            'remove_replica', return_value=True) as remove_one, \
-         mock.patch.object(service.controller_utils,
-                           'can_terminate', return_value=True), \
+         mock.patch.object(
+             serve_state,
+             'reserve_replica_teardowns_running_if_capacity',
+             side_effect=_admit_cleanup_from([present])), \
          mock.patch.object(service,
                            'cleanup_storage_intents', return_value=True), \
          mock.patch.object(service.replica_managers,
@@ -1676,7 +1693,9 @@ def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
     assert terminate.call_args.kwargs['expected_cluster_record_uuid'] == str(
         cluster_record_uuid)
     identity_snapshot.assert_called_once_with('svc', [2])
-    assert persist.call_count == 2
+    # The SCHEDULED write is explicit; the RUNNING transition is owned by the
+    # atomic reservation helper rather than a second blind replica upsert.
+    persist.assert_called_once()
     for call in persist.call_args_list:
         assert call.args == ('svc', 2, present)
         assert call.kwargs == {
@@ -1705,12 +1724,14 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination():
             self._kwargs = kwargs
             self.format_exc = None
             self.started = False
+            self.ident = None
 
         def is_alive(self):
             return False
 
         def start(self):
             self.started = True
+            self.ident = 1
             self._target(*self._args, **self._kwargs)
 
         def join(self):
@@ -1797,8 +1818,10 @@ def test_cleanup_routes_provider_present_marker_through_exact_termination():
                            'add_or_update_replica', return_value=True), \
          mock.patch.object(serve_state,
                            'remove_replica', return_value=True) as remove, \
-         mock.patch.object(service.controller_utils,
-                           'can_terminate', return_value=True), \
+         mock.patch.object(
+             serve_state,
+             'reserve_replica_teardowns_running_if_capacity',
+             side_effect=_admit_cleanup_from([info])), \
          mock.patch.object(service.thread_utils,
                            'SafeThread', SynchronousThread), \
          mock.patch.object(service.replica_managers,
@@ -2062,6 +2085,7 @@ def test_cleanup_skips_tail_sleep_after_final_success():
             self._kwargs = kwargs
             self.format_exc = None
             self.started = False
+            self.ident = None
 
         def is_alive(self):
             return False
@@ -2069,6 +2093,7 @@ def test_cleanup_skips_tail_sleep_after_final_success():
         def start(self):
             events.append('start')
             self.started = True
+            self.ident = 1
             self._target(*self._args, **self._kwargs)
 
         def join(self):
@@ -2102,8 +2127,10 @@ def test_cleanup_skips_tail_sleep_after_final_success():
                            'add_or_update_replica', return_value=True), \
          mock.patch.object(serve_state,
                            'remove_replica', return_value=True) as remove, \
-         mock.patch.object(service.controller_utils,
-                           'can_terminate', return_value=True), \
+         mock.patch.object(
+             serve_state,
+             'reserve_replica_teardowns_running_if_capacity',
+             side_effect=_admit_cleanup_from([replica])), \
          mock.patch.object(service.thread_utils,
                            'SafeThread', SynchronousThread), \
          mock.patch.object(service.replica_managers,
@@ -2139,14 +2166,19 @@ def test_cleanup_skips_tail_sleep_after_final_start_failure():
     class FailingThread:
 
         def __init__(self, **_):
-            self.format_exc = None
+            self.format_exc = 'RuntimeError: thread unavailable'
+            self.ident = None
 
         def is_alive(self):
             return False
 
         def start(self):
             events.append('start')
+            self.ident = 1
             raise RuntimeError('thread unavailable')
+
+        def join(self):
+            events.append('join')
 
     replica = mock.Mock(replica_id=1,
                         cluster_name='svc-a-r1',
@@ -2172,8 +2204,10 @@ def test_cleanup_skips_tail_sleep_after_final_start_failure():
          mock.patch.object(serve_state,
                            'add_or_update_replica', return_value=True), \
          mock.patch.object(serve_state, 'remove_replica') as remove, \
-         mock.patch.object(service.controller_utils,
-                           'can_terminate', return_value=True), \
+         mock.patch.object(
+             serve_state,
+             'reserve_replica_teardowns_running_if_capacity',
+             side_effect=_admit_cleanup_from([replica])), \
          mock.patch.object(service.thread_utils, 'SafeThread', FailingThread), \
          mock.patch.object(service.time,
                            'sleep', side_effect=lambda _: events.append(
@@ -2186,7 +2220,7 @@ def test_cleanup_skips_tail_sleep_after_final_start_failure():
                                   '10.4.7.7', lifecycle_lock)
 
     assert failed
-    assert events == ['start', 'storage']
+    assert events == ['start', 'sleep', 'join', 'storage']
     remove.assert_not_called()
 
 
@@ -2199,12 +2233,14 @@ def test_cleanup_logs_captured_teardown_failure_before_retaining_replica():
                 'KubernetesPhysicalClusterIdentityError: provider remained '
                 'present')
             self.started = False
+            self.ident = None
 
         def is_alive(self):
             return False
 
         def start(self):
             self.started = True
+            self.ident = 1
 
         def join(self):
             assert self.started
@@ -2237,8 +2273,10 @@ def test_cleanup_logs_captured_teardown_failure_before_retaining_replica():
          mock.patch.object(serve_state,
                            'add_or_update_replica', return_value=True), \
          mock.patch.object(serve_state, 'remove_replica') as remove, \
-         mock.patch.object(service.controller_utils,
-                           'can_terminate', return_value=True), \
+         mock.patch.object(
+             serve_state,
+             'reserve_replica_teardowns_running_if_capacity',
+             side_effect=_admit_cleanup_from([replica])), \
          mock.patch.object(service.thread_utils,
                            'SafeThread', CompletedFailedThread), \
          mock.patch.object(service.time, 'sleep'), \

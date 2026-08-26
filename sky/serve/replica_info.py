@@ -897,8 +897,8 @@ def validate_reserved_fill_allocation_attribution(
                 'Policy-bound reserved-fill launch requires a current '
                 f'ReplicaInfo v{_REPLICA_INFO_VERSION} row.')
         if (admission_sequence is None or
-                values['reserved_fill_allocation_claim_generation']
-                != service_generation):
+                values['reserved_fill_allocation_claim_generation'] !=
+                service_generation):
             raise exceptions.KubernetesPhysicalClusterIdentityError(
                 'Policy-bound reserved-fill launch requires complete admitted '
                 'allocation provenance.')
@@ -1099,15 +1099,13 @@ def is_recoverable_uncommitted_logical_retirement(info: Any) -> bool:
          confirmed_generation >= typing.cast(int, selection_generation)))
     strict_idle_wait = (status.wait_for_idle_before_termination is True and
                         confirmation_valid)
-    bounded_precommit = (status.wait_for_idle_before_termination is False and
-                         bounded_deadline is True and
-                         type(confirmed_generation) is int and
-                         generation_valid and
-                         confirmed_generation >= typing.cast(
-                             int, selection_generation) and
-                         type(info.version) is int and
-                         type(retirement_version) is int and
-                         info.version <= retirement_version)
+    bounded_precommit = (
+        status.wait_for_idle_before_termination is False and
+        bounded_deadline is True and type(confirmed_generation) is int and
+        generation_valid and
+        confirmed_generation >= typing.cast(int, selection_generation) and
+        type(info.version) is int and type(retirement_version) is int and
+        info.version <= retirement_version)
     return bool(
         status.sky_launch_status == common_utils.ProcessStatus.SUCCEEDED and
         status.sky_down_status == common_utils.ProcessStatus.SCHEDULED and
@@ -1451,8 +1449,8 @@ class ReplicaInfo:
                 'logical_retirement_confirmed_generation':
                     status_property.logical_retirement_confirmed_generation,
                 'logical_retirement_bounded_deadline':
-                    (status_property.logical_retirement_bounded_deadline
-                     is True),
+                    (status_property.logical_retirement_bounded_deadline is True
+                    ),
                 'logical_retirement_committed': logical_retirement_committed,
             },
         }
@@ -1635,9 +1633,9 @@ class ReplicaInfo:
                 'logical_retirement_confirmed_generation'),
             logical_retirement_bounded_deadline=(
                 _status_value('logical_retirement_bounded_deadline') is True),
-            logical_retirement_committed=(logical_retirement_committed
-                                          if type(logical_retirement_committed)
-                                          is bool else None),
+            logical_retirement_committed=(
+                logical_retirement_committed
+                if type(logical_retirement_committed) is bool else None),
         )
         quarantine = replica.system_recovery_quarantine
         if quarantine is not None:
@@ -1770,8 +1768,8 @@ class ReplicaInfo:
         # scheme. The LB reaches replicas over public IPs across clouds and
         # regions, so this hop is https whenever replica TLS is enabled.
         if not endpoint.startswith('http'):
-            scheme = ('https' if serve_utils.replica_tls_mode()
-                      != serve_constants.REPLICA_TLS_MODE_OFF else 'http')
+            scheme = ('https' if serve_utils.replica_tls_mode() !=
+                      serve_constants.REPLICA_TLS_MODE_OFF else 'http')
             endpoint = f'{scheme}://{endpoint}'
         return endpoint
 
@@ -1982,7 +1980,12 @@ class ReplicaInfo:
             if statuses[1] == job_lib.JobStatus.SUCCEEDED:
                 return self, True, probe_time
             return self, False, probe_time
-        except exceptions.KubernetesPhysicalClusterIdentityError:
+        except (exceptions.KubernetesPhysicalClusterIdentityError,
+                exceptions.ProviderPhaseError):
+            # Provider-phase admission failure is no readiness observation.
+            # The replica manager defers this exact row and keeps healthy
+            # peers progressing instead of converting contention into a
+            # negative probe sample.
             raise
         except Exception as e:  # pylint: disable=broad-except
             logger.error(f'Error when probing pool of {self.cluster_name}: '

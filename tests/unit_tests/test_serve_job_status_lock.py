@@ -15,6 +15,7 @@ deterministic (uses Events, not sleeps).
 """
 # pylint: disable=protected-access,unnecessary-lambda,unused-argument
 # pylint: disable=use-implicit-booleaness-not-comparison
+import copy
 import threading
 
 import pytest
@@ -86,14 +87,14 @@ def test_backend_liveness_source_fails_closed_for_malformed_handle():
     # Missing launched_resources, a malformed resource object, and a missing
     # cloud must all preserve exact remote status polling instead of raising or
     # silently selecting the endpoint-only path.
-    assert (backend.serve_replica_job_status_source(handle)
-            is backends.ServeReplicaJobStatusSource.REMOTE_JOB)
+    assert (backend.serve_replica_job_status_source(handle) is
+            backends.ServeReplicaJobStatusSource.REMOTE_JOB)
     handle.launched_resources = object()
-    assert (backend.serve_replica_job_status_source(handle)
-            is backends.ServeReplicaJobStatusSource.REMOTE_JOB)
+    assert (backend.serve_replica_job_status_source(handle) is
+            backends.ServeReplicaJobStatusSource.REMOTE_JOB)
     handle.launched_resources = type('LaunchedResources', (), {'cloud': None})()
-    assert (backend.serve_replica_job_status_source(handle)
-            is backends.ServeReplicaJobStatusSource.REMOTE_JOB)
+    assert (backend.serve_replica_job_status_source(handle) is
+            backends.ServeReplicaJobStatusSource.REMOTE_JOB)
 
 
 def test_fetch_job_status_samples_latest_version_first(monkeypatch):
@@ -131,8 +132,7 @@ def test_fetch_job_status_samples_latest_version_first(monkeypatch):
     mgr.latest_version = 2
     mgr._persist_replica = lambda rid, info: None
     mgr._terminate_replica = (
-        lambda rid, sync_down_logs, replica_drain_delay_seconds: terminated.
-        append(rid))
+        lambda rid, replica_drain_delay_seconds: terminated.append(rid))
     mgr._fetch_job_status()
 
     assert sorted(probed) == [1, 2, 3]
@@ -229,7 +229,7 @@ def test_preemption_path_acts_on_fresh_replica_not_stale_snapshot(monkeypatch):
     lock and act on the FRESH state, not the pre-SSH snapshot (which another
     thread may have mutated while we SSHed lock-free)."""
     stale = _tracked_replica(7)
-    fresh = _tracked_replica(7)  # distinct object, same id
+    fresh = copy.deepcopy(stale)
     monkeypatch.setattr(serve_state, 'get_replica_infos', lambda svc: [stale])
     monkeypatch.setattr(replica_managers.ReplicaInfo,
                         'handle',
@@ -239,12 +239,19 @@ def test_preemption_path_acts_on_fresh_replica_not_stale_snapshot(monkeypatch):
     monkeypatch.setattr(serve_state, 'get_replica_info_from_id',
                         lambda svc, rid: fresh)
 
-    seen = []
+    persisted = []
+    terminated = []
     mgr = _build_manager()
-    mgr._handle_preemption = lambda info: (seen.append(info) or True)
+    mgr._cloud_instance_looks_alive = lambda *_args, **_kwargs: (
+        replica_managers._PreemptionPrefilterResult(
+            replica_managers._PreemptionPrefilterDisposition.INTERRUPTED))
+    mgr._persist_replica = lambda rid, info: persisted.append((rid, info))
+    mgr._terminate_replica = lambda rid, **kwargs: terminated.append(rid)
     mgr._fetch_job_status()
 
-    assert seen == [fresh], 'preemption must act on the re-read fresh replica'
+    assert persisted == [(7, fresh)]
+    assert terminated == [7]
+    assert fresh.status_property.preempted
 
 
 def test_preemption_path_skips_vanished_replica(monkeypatch):
@@ -262,7 +269,12 @@ def test_preemption_path_skips_vanished_replica(monkeypatch):
 
     called = []
     mgr = _build_manager()
-    mgr._handle_preemption = lambda info: called.append(info)
+    mgr._cloud_instance_looks_alive = lambda *_args, **_kwargs: (
+        replica_managers._PreemptionPrefilterResult(
+            replica_managers._PreemptionPrefilterDisposition.INTERRUPTED))
+    mgr._persist_replica = lambda *_args, **_kwargs: called.append('persist')
+    mgr._terminate_replica = lambda *_args, **_kwargs: called.append('terminate'
+                                                                    )
     mgr._fetch_job_status()  # must not raise
 
     assert called == [], 'vanished replica must be skipped, not handled'
@@ -362,8 +374,11 @@ def test_command_error_on_one_replica_does_not_starve_the_rest(monkeypatch):
 
     terminated = []
     mgr = _build_manager()
-    # Not preempted: the error is a persistent command failure.
-    mgr._handle_preemption = lambda info: False
+    # Provider still reports the backend live: this is a command failure, not
+    # interruption evidence.
+    mgr._cloud_instance_looks_alive = lambda *_args, **_kwargs: (
+        replica_managers._PreemptionPrefilterResult(
+            replica_managers._PreemptionPrefilterDisposition.LIVE_OR_UNPROVEN))
     mgr._terminate_replica = lambda rid, **kwargs: terminated.append(rid)
     mgr._fetch_job_status()  # must not raise
 

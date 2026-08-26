@@ -3265,9 +3265,12 @@ def _sync_full(ctrl: controller.SkyServeController,
              }), \
          mock.patch.object(
              controller.global_user_state,
-             'get_cluster_yaml_dict_multiple',
-             side_effect=lambda paths: [{'provider': {'path': path}}
-                                        for path in paths]):
+             'get_cluster_yaml_str_multiple',
+             side_effect=lambda paths: [
+                 json.dumps({'provider': {
+                     'path': path
+                 }}) for path in paths
+             ]):
         return ctrl._get_lb_replica_info(  # pylint: disable=protected-access
             infos, async_occupancy_by_version)
 
@@ -3303,6 +3306,96 @@ class TestGetLbReplicaInfo:
                 'gpu_count': '8'
             },
         }
+
+    def test_bad_provider_yaml_withholds_only_bad_replica(self):
+        ctrl = _make_controller()
+        bad = _FakeReplicaInfo(1,
+                               serve_state.ReplicaStatus.READY,
+                               url='http://1.1.1.1:8080',
+                               accelerators={'L4': 1})
+        healthy = _FakeReplicaInfo(2,
+                                   serve_state.ReplicaStatus.READY,
+                                   url='http://2.2.2.2:8080',
+                                   accelerators={'A100': 8})
+        with mock.patch.object(
+                controller.serve_state,
+                'get_service_runtime_snapshot',
+                return_value={'active_versions': [1]}), \
+             mock.patch.object(
+                 controller.global_user_state,
+                 'get_clusters_from_names',
+                 side_effect=lambda names: {
+                     name: {
+                         'handle': _FakeHandle(None, f'{name}.yaml')
+                     } for name in names
+                 }), \
+             mock.patch.object(
+                 controller.global_user_state,
+                 'get_cluster_yaml_str_multiple',
+                 return_value=['provider: [',
+                               json.dumps({'provider': {'healthy': True}})]):
+            replica_info, verified = ctrl._get_lb_replica_info(  # pylint: disable=protected-access
+                [bad, healthy], None)
+
+        assert replica_info == {
+            'http://2.2.2.2:8080': {
+                'gpu_type': 'A100',
+                'gpu_count': '8'
+            }
+        }
+        assert verified == 1
+        assert bad.url_resolutions == 0
+        assert healthy.last_provider_config == {'healthy': True}
+
+    def test_bad_handle_metadata_withholds_only_bad_replica(self):
+        ctrl = _make_controller()
+        bad = _FakeReplicaInfo(1,
+                               serve_state.ReplicaStatus.READY,
+                               url='http://1.1.1.1:8080',
+                               accelerators={'L4': 1})
+        healthy = _FakeReplicaInfo(2,
+                                   serve_state.ReplicaStatus.READY,
+                                   url='http://2.2.2.2:8080',
+                                   accelerators={'H200': 8})
+
+        class _BadLaunchedResources:
+
+            @property
+            def accelerators(self):
+                raise ValueError('corrupt accelerator metadata')
+
+        bad_handle = _FakeHandle(None, 'replica-1.yaml')
+        bad_handle.launched_resources = _BadLaunchedResources()
+        bad.handle = mock.Mock(
+            return_value=bad_handle)  # type: ignore[method-assign]
+        with mock.patch.object(
+                controller.serve_state,
+                'get_service_runtime_snapshot',
+                return_value={'active_versions': [1]}), \
+             mock.patch.object(
+                 controller.global_user_state,
+                 'get_clusters_from_names',
+                 side_effect=lambda names: {
+                     name: {
+                         'handle': mock.sentinel.handle
+                     } for name in names
+                 }), \
+             mock.patch.object(
+                 controller.global_user_state,
+                 'get_cluster_yaml_str_multiple',
+                 side_effect=lambda paths: [
+                     json.dumps({'provider': {}}) for _ in paths
+                 ]):
+            replica_info, verified = ctrl._get_lb_replica_info(  # pylint: disable=protected-access
+                [bad, healthy], None)
+
+        assert replica_info == {
+            'http://2.2.2.2:8080': {
+                'gpu_type': 'H200',
+                'gpu_count': '8'
+            }
+        }
+        assert verified == 1
 
     def test_capable_route_requires_and_emits_exact_marker(self):
         ctrl = _make_controller()
@@ -3583,12 +3676,13 @@ class TestGetLbReplicaInfo:
                         } for info in infos
                     }) as get_clusters, mock.patch.object(
                         controller.global_user_state,
-                        'get_cluster_yaml_dict_multiple',
-                        return_value=[{
-                            'provider': {
-                                'replica': info.replica_id
-                            }
-                        } for info in infos]) as get_yamls:
+                        'get_cluster_yaml_str_multiple',
+                        return_value=[
+                            json.dumps(
+                                {'provider': {
+                                    'replica': info.replica_id
+                                }}) for info in infos
+                        ]) as get_yamls:
             first = ctrl._get_lb_replica_info(  # pylint: disable=protected-access
                 infos, None)
             second = ctrl._get_lb_replica_info(  # pylint: disable=protected-access
@@ -3629,9 +3723,10 @@ class TestGetLbReplicaInfo:
                             'handle': mock.sentinel.handle
                         } for info in infos
                     }), mock.patch.object(controller.global_user_state,
-                                          'get_cluster_yaml_dict_multiple',
-                                          return_value=[shared_provider
-                                                       ]) as get_yamls:
+                                          'get_cluster_yaml_str_multiple',
+                                          return_value=[
+                                              json.dumps(shared_provider)
+                                          ]) as get_yamls:
             ctrl._get_lb_replica_info(  # pylint: disable=protected-access
                 infos, None)
 
@@ -3964,9 +4059,10 @@ class TestGetLbReplicaInfo:
                      }), \
                  mock.patch.object(
                      controller.global_user_state,
-                     'get_cluster_yaml_dict_multiple',
-                     side_effect=lambda paths: [{'provider': {}}
-                                                for _ in paths]):
+                     'get_cluster_yaml_str_multiple',
+                     side_effect=lambda paths: [
+                         json.dumps({'provider': {}}) for _ in paths
+                     ]):
                 return ctrl._get_lb_replica_info(  # pylint: disable=protected-access
                     [info], None)
 

@@ -39,6 +39,7 @@ from sky.server.requests import payloads
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import reserved_fill_admission
 from sky.skylet import constants as skylet_constants
+from sky.utils import common_utils
 from sky.utils.db import migration_utils
 
 _SERVICE = 'svc'
@@ -105,7 +106,7 @@ _WORKER_PROJECTIONS = [
 ]
 _PROJECTION_MAP = {
     projection['accelerator_name'].casefold():
-        kubernetes_identity.worker_projection_sha256(projection)
+    kubernetes_identity.worker_projection_sha256(projection)
     for projection in _WORKER_PROJECTIONS
 }
 
@@ -378,7 +379,7 @@ def _commit_evidence(
     ]
     projection_map = {
         projection['accelerator_name'].casefold():
-            kubernetes_identity.worker_projection_sha256(projection)
+        kubernetes_identity.worker_projection_sha256(projection)
         for projection in worker_projections
     }
     repository = pool_capacity_observation.PoolCapacityObservationRepository(
@@ -877,6 +878,7 @@ def _stage_durable_fill(
         },
         override_skypilot_config={'active_workspace': _WORKSPACE})
     prepared = sdk.PreparedLaunchRequest(sdk._canonical_launch_body_bytes(body))
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.RUNNING
     spec = reserved_fill_admission.AdmissionSpec(
         prepared_request=prepared,
         submission_id=uuid.uuid5(
@@ -884,7 +886,8 @@ def _stage_durable_fill(
             f'{service_name}:{replica_id}:{info.replica_record_id}'),
         authority=authority,
         replica_info=info,
-        actuation_lease=lease)
+        actuation_lease=lease,
+        launch_limit=32)
     with engine.connect() as connection:
         transaction = connection.begin()
         try:
@@ -1663,8 +1666,8 @@ def test_durable_intent_handoff_survives_successor_pool_epoch(
         expected_gate_generation=1,
         pool_snapshots=(successor_snapshot,))
     assert successor_allocation is not None
-    assert (successor_allocation.allocation_generation
-            > allocation.allocation_generation)
+    assert (successor_allocation.allocation_generation >
+            allocation.allocation_generation)
 
     assert _stage_durable_fill(allocation_engine, _SERVICE, 1, info, lease)
     with allocation_engine.connect() as connection:

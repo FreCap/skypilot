@@ -20,8 +20,9 @@ deploy).
   release for every `improvements` merge and publishes the image as that exact version
   (for example, `1.1.1`). The chart publisher follows the successful image run and publishes the
   same version before marking it with a Git tag. Commit identity stays in artifact metadata.
-- **Consume:** the platform repo pins one release version and derives both the chart and image from
-  it in the skypilot-control-plane terragrunt.
+- **Consume:** deploy the matching chart and immutable image digest directly with the existing
+  SkyPilot Helm release. Pin the same digest on the API, controller, and executor roles; no
+  `boltz-platform` runtime pin is part of this release path.
 
 The upstream nightly tag is only a runtime dependency. `boltz/release_version.py` derives the
 release patch from every first-parent commit after the recorded `1.1.19` epoch. The publisher
@@ -40,8 +41,10 @@ python -m boltz_reserved_fill_reclaim_policy
 ```
 
 Success prints one schema-1 JSON object and exits zero. Failure prints one redacted schema-1 JSON
-object and exits nonzero. The preflight is expected to fail until both Kubernetes contexts match the
-code-owned queue, priority, admission, scheduler, Kueue, accelerator, and Pod Identity inventory.
+object and exits nonzero. The preflight verifies East's direct Kubernetes contract and PHX's
+externally owned `boltz-research/be -> research-be` Kueue lane, `be-lt` workload priority, low Pod
+priority, scheduler, accelerator, and Pod Identity inventory. SkyPilot observes that contract; it
+does not own or mutate Kueue queues, cohorts, quotas, priorities, borrowing, or preemption policy.
 The exact contract and fix-forward deployment sequence are maintained in
 `docs/designs/serve-multi-pool-reserved-capacity-fill.md`.
 

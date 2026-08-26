@@ -775,12 +775,13 @@ bs = controller_mount_translation.bs
 # estimation but we keep it here for now.
 # TODO(tian): Remeasure this.
 SERVE_MONITORING_MEMORY_MB = 512
-# The resource consumption ratio of service launch to serve down.
-SERVE_LAUNCH_RATIO = 2.0
+# Preserve the historical pure-teardown peak while giving provider deletion
+# an admission budget independent of launch saturation.
+SERVE_TERMINATIONS_PER_LAUNCH_SLOT = 2
 
-# The _RESOURCES_LOCK should be held whenever we are checking the parallelism
-# control or updating the schedule_state of any job or service. Any code that
-# takes this lock must conclude by calling maybe_schedule_next_jobs.
+# This legacy local lock protects only service-count admission/registration.
+# Replica provider mutation uses the PostgreSQL transaction gate in
+# sky.serve.serve_state and must never use this path.
 _RESOURCES_LOCK = '~/.sky/locks/controller_resources.lock'
 
 # keep 2GB reserved after the controllers
@@ -1099,24 +1100,14 @@ def _get_request_parallelism(pool: bool) -> int:
     return min(derived_parallelism, guaranteed_parallelism)
 
 
-def in_flight_launch_count() -> float:
-    """Launch-budget occupancy: provisioning + terminating / SERVE_LAUNCH_RATIO.
-
-    NOTE: this scans the whole replica table once and unpickles every row
-    (O(N)). Callers that evaluate the launch budget for many replicas in a
-    single pass (e.g. ``ReplicaManager._refresh_thread_pool``) MUST compute this
-    once and track the delta locally -- passing it as ``in_flight`` to
-    ``can_provision``/``can_terminate`` -- rather than calling those per
-    replica, otherwise the cost is O(K*N) pickle.loads per refresh tick.
-    """
-    provisioning, terminating = serve_state.get_replica_launch_budget_counts()
-    return provisioning + terminating / SERVE_LAUNCH_RATIO
+def get_serve_launch_limit(pool: bool) -> int:
+    """Return the global concurrent launch limit for this controller mode."""
+    return _get_request_parallelism(pool)
 
 
-def can_provision(pool: bool, in_flight: float | None = None) -> bool:
-    # TODO(tian): probe API server to see if there is any pending provision
-    # requests.
-    return can_terminate(pool, in_flight=in_flight)
+def get_serve_termination_limit(pool: bool) -> int:
+    """Return the independent global concurrent provider-teardown limit."""
+    return (_get_request_parallelism(pool) * SERVE_TERMINATIONS_PER_LAUNCH_SLOT)
 
 
 def can_start_new_process(pool: bool) -> bool:
@@ -1153,11 +1144,3 @@ def get_max_services_error_message(pool: bool) -> str:
                 f'{docs_link}')
 
     return msg
-
-
-def can_terminate(pool: bool, in_flight: float | None = None) -> bool:
-    # TODO(tian): probe API server to see if there is any pending terminate
-    # requests.
-    if in_flight is None:
-        in_flight = in_flight_launch_count()
-    return in_flight < _get_request_parallelism(pool)

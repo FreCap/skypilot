@@ -38,9 +38,10 @@ class _FakeClock:
 
 
 def _protocol_v2_cluster_record(workspace='mt_hybrid'):
-    handle = mock.Mock(
-        spec=replica_managers.cloud_vm_ray_backend.CloudVmRayResourceHandle)
+    handle = replica_managers.cloud_vm_ray_backend.CloudVmRayResourceHandle.__new__(
+        replica_managers.cloud_vm_ray_backend.CloudVmRayResourceHandle)
     handle.cluster_name = 'svc-1'
+    handle.cluster_name_on_cloud = 'svc-1-cloud'
     handle.launched_resources = mock.Mock(
         cloud=replica_managers.clouds.Kubernetes(), region='phx-context')
     return {
@@ -120,9 +121,7 @@ class TestWaitForDrain:
              mock.patch.object(replica_managers.time, 'sleep'):
             with pytest.raises(RuntimeError, match='ownership was lost'):
                 replica_managers.terminate_cluster.__wrapped__(
-                    'svc-1',
-                    '/tmp/replica.log',
-                    continue_guard=lambda: next(ownership))
+                    'svc-1', 0, continue_guard=lambda: next(ownership))
 
         down.assert_called_once_with('svc-1',
                                      _expected_cluster_record_uuid=None,
@@ -160,8 +159,9 @@ class TestWaitForDrain:
                                return_value=0), \
              mock.patch.object(replica_managers.time, 'sleep'):
             with skypilot_config.local_active_workspace_ctx('default'):
-                replica_managers.terminate_cluster.__wrapped__(
-                    'svc-1', '/tmp/replica.log', max_retry=2)
+                replica_managers.terminate_cluster.__wrapped__('svc-1',
+                                                               0,
+                                                               max_retry=2)
 
         assert observed_workspaces == ['mt_hybrid', 'mt_hybrid']
 
@@ -192,14 +192,17 @@ class TestWaitForDrain:
                 # No cluster record: teardown must not enter a workspace
                 # context, and ClusterDoesNotExist must return cleanly
                 # without retries.
-                replica_managers.terminate_cluster.__wrapped__(
-                    'svc-1', '/tmp/replica.log', max_retry=1)
+                replica_managers.terminate_cluster.__wrapped__('svc-1',
+                                                               0,
+                                                               max_retry=1)
 
         assert observed_workspaces == ['default']
 
     def test_protocol_v2_missing_record_is_cleanup_uncertainty(self):
         context = mock.MagicMock()
         down = mock.MagicMock()
+        absence_error = exceptions.KubernetesPhysicalClusterIdentityError(
+            'post-teardown physical absence is unproven')
         cleanup_fence = reserved_capacity.ProtocolV2CleanupFence(
             kubernetes_context='phx-context', physical_cluster_uid='physical-a')
         with mock.patch.object(replica_managers.context,
@@ -209,14 +212,18 @@ class TestWaitForDrain:
                                'get_cluster_from_name',
                                return_value=None), \
              mock.patch('sky.core.down', down), \
-             mock.patch.object(replica_managers.time, 'sleep'), \
+             mock.patch.object(
+                 replica_managers,
+                 '_wait_for_post_teardown_physical_absence',
+                 side_effect=absence_error) as wait_for_absence, \
              pytest.raises(
                  exceptions.KubernetesPhysicalClusterIdentityError,
-                 match='cluster record is absent'):
+                 match='physical absence is unproven'):
             replica_managers.terminate_cluster.__wrapped__(
-                'svc-1', '/tmp/replica.log', cleanup_fence=cleanup_fence)
+                'svc-1', 0, cleanup_fence=cleanup_fence)
 
         down.assert_not_called()
+        wait_for_absence.assert_called_once()
 
     def test_protocol_v2_capture_runs_inside_recorded_workspace(self):
         context = mock.MagicMock()
@@ -242,12 +249,15 @@ class TestWaitForDrain:
              mock.patch.object(replica_managers.usage_lib.messages.usage,
                                'set_internal'), \
              mock.patch('sky.core.down'), \
-             mock.patch.object(replica_managers.time, 'sleep'):
+             mock.patch.object(
+                 replica_managers,
+                 '_wait_for_post_teardown_physical_absence') as wait_for_absence:
             with skypilot_config.local_active_workspace_ctx('default'):
                 replica_managers.terminate_cluster.__wrapped__(
-                    'svc-1', '/tmp/replica.log', cleanup_fence=cleanup_fence)
+                    'svc-1', 0, cleanup_fence=cleanup_fence)
 
         assert observed_workspaces == ['mt_hybrid']
+        wait_for_absence.assert_called_once()
 
     def test_protocol_v2_rejects_mismatched_durable_handle_before_capture(self):
         context = mock.MagicMock()
@@ -270,7 +280,7 @@ class TestWaitForDrain:
                  exceptions.KubernetesPhysicalClusterIdentityError,
                  match='handle does not match'):
             replica_managers.terminate_cluster.__wrapped__(
-                'svc-1', '/tmp/replica.log', cleanup_fence=cleanup_fence)
+                'svc-1', 0, cleanup_fence=cleanup_fence)
 
         provider_fence.assert_not_called()
         down.assert_not_called()
@@ -295,7 +305,7 @@ class TestWaitForDrain:
                  exceptions.KubernetesPhysicalClusterIdentityError,
                  match='handle does not match'):
             replica_managers.terminate_cluster.__wrapped__(
-                'svc-1', '/tmp/replica.log', cleanup_fence=cleanup_fence)
+                'svc-1', 0, cleanup_fence=cleanup_fence)
 
         provider_fence.assert_not_called()
         down.assert_not_called()
@@ -306,6 +316,8 @@ class TestWaitForDrain:
             side_effect=exceptions.ClusterDoesNotExist('svc-1'))
         cleanup_fence = reserved_capacity.ProtocolV2CleanupFence(
             kubernetes_context='phx-context', physical_cluster_uid='physical-a')
+        absence_error = exceptions.KubernetesPhysicalClusterIdentityError(
+            'post-teardown physical absence is unproven')
         with mock.patch.object(replica_managers.context,
                                'get',
                                return_value=context), \
@@ -319,14 +331,18 @@ class TestWaitForDrain:
              mock.patch.object(replica_managers.usage_lib.messages.usage,
                                'set_internal'), \
              mock.patch('sky.core.down', down), \
-             mock.patch.object(replica_managers.time, 'sleep'), \
+             mock.patch.object(
+                 replica_managers,
+                 '_wait_for_post_teardown_physical_absence',
+                 side_effect=absence_error) as wait_for_absence, \
              pytest.raises(
                  exceptions.KubernetesPhysicalClusterIdentityError,
-                 match='disappeared during teardown'):
+                 match='physical absence is unproven'):
             replica_managers.terminate_cluster.__wrapped__(
-                'svc-1', '/tmp/replica.log', cleanup_fence=cleanup_fence)
+                'svc-1', 0, cleanup_fence=cleanup_fence)
 
         down.assert_called_once()
+        wait_for_absence.assert_called_once()
 
     def test_terminate_plain_value_error_retries_then_raises(self):
         # ValueErrors other than ClusterDoesNotExist must NOT be treated
@@ -351,8 +367,9 @@ class TestWaitForDrain:
                                return_value=0), \
              mock.patch.object(replica_managers.time, 'sleep'):
             with pytest.raises(RuntimeError, match='Failed to terminate'):
-                replica_managers.terminate_cluster.__wrapped__(
-                    'svc-1', '/tmp/replica.log', max_retry=2)
+                replica_managers.terminate_cluster.__wrapped__('svc-1',
+                                                               0,
+                                                               max_retry=2)
 
         assert down.call_count == 2
 
@@ -774,15 +791,6 @@ class TestRecoveryRedrive:
     def test_failure_teardown_redrive_keeps_immediate_teardown(self):
         kwargs = self._redrive(is_scale_down=False)
         assert kwargs['in_flight_drain_cap_seconds'] is None
-        # Failure teardowns are left in the record; _terminate_replica
-        # asserts such rows sync logs down. A False here would trip that
-        # assert into the recovery catch and strand the replica in
-        # SHUTTING_DOWN forever.
-        assert kwargs['sync_down_logs'] is True
-
-    def test_scale_down_redrive_skips_log_sync(self):
-        kwargs = self._redrive(is_scale_down=True)
-        assert kwargs['sync_down_logs'] is False
 
     @pytest.mark.parametrize(
         'derived_status',
@@ -799,7 +807,6 @@ class TestRecoveryRedrive:
                                preempted=True,
                                derived_status=derived_status)
         assert kwargs['is_scale_down'] is True
-        assert kwargs['sync_down_logs'] is False
         assert kwargs['in_flight_drain_cap_seconds'] is None
 
     def test_persisted_preemption_rebuilds_spot_bench(self):
@@ -870,7 +877,6 @@ class TestRecoveryRedrive:
         rm._spot_placer.set_preemptive.assert_called_once_with(location)
         kwargs = rm._terminate_replica.call_args.kwargs
         assert kwargs['is_scale_down'] is True
-        assert kwargs['sync_down_logs'] is False
         assert kwargs['in_flight_drain_cap_seconds'] is None
 
     def test_active_spot_with_cluster_row_is_not_misclassified(self):
@@ -915,8 +921,8 @@ class TestRecoveryRedrive:
 class TestTerminateReplicaDrainAssembly:
     """Exercise the REAL _terminate_replica drain assembly (no mock of
     the method itself): deadline anchored after the SCHEDULED persist,
-    tracker built only for non-pool replicas with a resolvable url, and
-    the kwargs actually reaching the terminate thread."""
+    no provider-backed probe lookup under the manager lock, and the kwargs
+    actually reaching the terminate thread."""
 
     def _assemble(self, is_pool=False, url='http://r1:8080', url_error=None):
         return self._assemble_impl(is_pool=is_pool,
@@ -942,21 +948,24 @@ class TestTerminateReplicaDrainAssembly:
         rm._launch_thread_pool = {}
         rm._down_thread_pool = {}
         rm._replica_to_request_id = {}
-        rm._replica_to_launch_cancelled = {}
         if url_error is not None:
             rm._resolve_probe_urls = mock.Mock(side_effect=url_error)
         else:
             rm._resolve_probe_urls = mock.Mock(return_value={7: url})
-        if interrupted_launch:
-            finished_launch = mock.Mock()
-            finished_launch.is_alive.return_value = False
-            rm._launch_thread_pool = {7: finished_launch}
-            rm._replica_to_request_id = {7: 'req-7'}
         info = mock.Mock()
         info.cluster_name = 'svc-7-abc'
         info.replica_record_id = '00000000-0000-4000-8000-000000000007'
         info.status_property = replica_managers.ReplicaStatusProperty()
         info.status_property.drain_started_at = started_at
+        if interrupted_launch:
+            finished_launch = replica_managers._ReplicaLaunchThread.__new__(
+                replica_managers._ReplicaLaunchThread)
+            finished_launch.replica_record_id = info.replica_record_id
+            finished_launch.service_hash = rm._service_hash
+            finished_launch.controller_owner = rm._controller_owner
+            finished_launch.teardown_requested = mock.Mock()
+            rm._launch_thread_pool = {7: finished_launch}
+            rm._replica_to_request_id = {7: 'req-7'}
         if url_error is not None:
             type(info).url = mock.PropertyMock(side_effect=url_error)
         else:
@@ -965,10 +974,12 @@ class TestTerminateReplicaDrainAssembly:
 
         class _FakeThread:
 
-            def __init__(self, target, args=(), kwargs=None):
-                captured['target'] = target
-                captured['args'] = args
-                captured['kwargs'] = kwargs or {}
+            def __init__(self, *args, **kwargs):
+                captured['thread_args'] = args
+                captured['thread_kwargs'] = kwargs
+                captured['target'] = kwargs['target']
+                captured['args'] = kwargs.get('args', ())
+                captured['kwargs'] = kwargs.get('kwargs', {})
 
         writes = []
 
@@ -994,18 +1005,18 @@ class TestTerminateReplicaDrainAssembly:
              mock.patch.object(replica_managers.global_user_state,
                                'cluster_with_name_exists',
                                return_value=True), \
-             mock.patch.object(replica_managers.thread_utils, 'SafeThread',
+             mock.patch.object(replica_managers, '_ReplicaDownThread',
                                _FakeThread), \
              mock.patch.object(replica_managers.time,
                                'time', return_value=wall_now), \
              mock.patch.object(replica_managers.time,
                                'monotonic', return_value=monotonic_now):
             rm._terminate_replica(7,
-                                  sync_down_logs=False,
                                   replica_drain_delay_seconds=0,
                                   is_scale_down=True,
                                   in_flight_drain_cap_seconds=cap)
         captured['writes'] = writes
+        captured['resolve_probe_urls'] = rm._resolve_probe_urls
         return captured
 
     def test_scheduled_write_persists_the_cap(self):
@@ -1027,12 +1038,12 @@ class TestTerminateReplicaDrainAssembly:
             replica_managers.common_utils.ProcessStatus.INTERRUPTED, None, 450,
             1000.0)
 
-    def test_deadline_and_tracker_reach_the_thread(self):
+    def test_deadline_reaches_thread_without_probe_tracker(self):
         captured = self._assemble()
         kwargs = captured['kwargs']
-        assert isinstance(kwargs['drain_complete'],
-                          replica_managers._ReplicaDrainTracker)
+        assert kwargs['drain_complete'] is None
         assert kwargs['drain_deadline'] == 2300.0
+        captured['resolve_probe_urls'].assert_not_called()
 
     def test_recovery_consumes_only_remaining_cap(self):
         first = self._assemble_impl(cap=600,
@@ -1081,10 +1092,12 @@ class TestTerminateReplicaDrainAssembly:
         assert kwargs['drain_complete'] is None
         assert kwargs['drain_deadline'] is not None
 
-    def test_unresolvable_url_falls_back_to_bounded_sleep(self):
-        kwargs = self._assemble(url_error=RuntimeError('no handle'))['kwargs']
+    def test_provider_cleanup_does_not_resolve_probe_url(self):
+        captured = self._assemble(url_error=RuntimeError('no handle'))
+        kwargs = captured['kwargs']
         assert kwargs['drain_complete'] is None
         assert kwargs['drain_deadline'] is not None
+        captured['resolve_probe_urls'].assert_not_called()
 
     def test_url_none_falls_back_to_bounded_sleep(self):
         kwargs = self._assemble(url=None)['kwargs']
@@ -1109,7 +1122,7 @@ class TestRecoveredStrictDrainDeadline:
         type(info).url = mock.PropertyMock(return_value='http://r7:8080')
         return rm, info
 
-    def test_recovery_reuses_durable_start_and_requires_fresh_lb_report(self):
+    def test_recovery_reuses_durable_start_and_defers_url_resolution(self):
         rm, info = self._manager_and_info(700.0)
         with mock.patch.object(replica_managers.time,
                                'time', return_value=1000.0), \
@@ -1117,23 +1130,13 @@ class TestRecoveredStrictDrainDeadline:
                                'monotonic', return_value=2000.0):
             rm._register_wait_for_idle(info)
 
-        tracker, deadline = rm._wait_for_idle_trackers[7]
-        assert deadline == 2300.0
+        state = rm._wait_for_idle_trackers[7]
+        assert state.deadline == 2300.0
         assert info.status_property.drain_started_at == 700.0
         rm._persist_replica.assert_not_called()
-        assert tracker is not None
-
-        rm._lb_in_flight_report = (1999.0, {
-            'http://r7:8080': 0
-        }, set(), set(), set(), 'lb-a')
-        with mock.patch.object(replica_managers.time,
-                               'monotonic',
-                               return_value=2001.0):
-            assert tracker() is False
-            rm._lb_in_flight_report = (2001.0, {
-                'http://r7:8080': 0
-            }, set(), set(), set(), 'lb-a')
-            assert tracker() is True
+        assert state.tracker is None
+        assert state.needs_url_resolution
+        rm._resolve_probe_urls.assert_not_called()
 
     def test_recovery_uses_pre_resolved_url_without_property_lookup(self):
         rm, info = self._manager_and_info(700.0)
@@ -1146,9 +1149,11 @@ class TestRecoveredStrictDrainDeadline:
             rm._register_wait_for_idle(info,
                                        replica_url='http://batched-r7:8080')
 
-        tracker, deadline = rm._wait_for_idle_trackers[7]
+        state = rm._wait_for_idle_trackers[7]
+        tracker = state.tracker
         assert tracker is not None
-        assert deadline == 2300.0
+        assert state.deadline == 2300.0
+        assert not state.needs_url_resolution
         rm._lb_in_flight_report = (2001.0, {
             'http://batched-r7:8080': 0
         }, set(), set(), set(), 'lb-a')
@@ -1167,7 +1172,7 @@ class TestRecoveredStrictDrainDeadline:
 
         assert info.status_property.drain_started_at == 1000.0
         rm._persist_replica.assert_called_once_with(7, info)
-        assert rm._wait_for_idle_trackers[7][1] == 2600.0
+        assert rm._wait_for_idle_trackers[7].deadline == 2600.0
 
     def test_backfill_failure_does_not_admit_in_memory_drain(self):
         rm, info = self._manager_and_info(None)

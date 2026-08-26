@@ -36,6 +36,8 @@ from sky.serve import serve_utils
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import requests as api_requests
 from sky.skylet import constants as skylet_constants
+from sky.utils import common_utils
+from sky.utils import thread_utils
 
 # String path for mock.patch — can't use the constant directly because
 # mock.patch needs the dotted path to the attribute being patched.
@@ -2133,21 +2135,19 @@ def test_get_provider_configs_for_handles_fans_out_distinct_and_shared():
     }
     provider_a = {'context': 'a'}
     provider_b = {'context': 'b'}
-    configs_by_path = {
-        '/p/a.yaml': {
-            'provider': provider_a
-        },
-        '/p/b.yaml': {
-            'provider': provider_b
-        },
+    yamls_by_path = {
+        '/p/a.yaml': 'provider:\n  context: a\n',
+        '/p/b.yaml': 'provider:\n  context: b\n',
     }
+    failed_keys = set()
 
     with mock.patch.object(
             serve_utils.global_user_state,
-            'get_cluster_yaml_dict_multiple',
-            side_effect=lambda paths: [configs_by_path[path] for path in paths],
+            'get_cluster_yaml_str_multiple',
+            side_effect=lambda paths: [yamls_by_path[path] for path in paths],
     ) as get_yamls:
-        result = serve_utils.get_provider_configs_for_handles(handles_by_key)
+        result = serve_utils.get_provider_configs_for_handles(
+            handles_by_key, failed_keys=failed_keys)
 
     # One batched read over the unique paths, in first-occurrence order.
     get_yamls.assert_called_once_with(['/p/a.yaml', '/p/b.yaml'])
@@ -2155,8 +2155,42 @@ def test_get_provider_configs_for_handles_fans_out_distinct_and_shared():
     # (None / non-str cluster_yaml) are absent from the result.
     assert result == {1: provider_a, 2: provider_b, 3: provider_a}
     # The fan-out shares the exact parsed provider object across shared keys.
-    assert result[1] is provider_a
-    assert result[3] is provider_a
+    assert result[1] is result[3]
+    assert failed_keys == {4, 5}
+
+
+def test_bounded_teardown_empty_admission_fails_closed_without_hanging():
+    info = types.SimpleNamespace(
+        replica_id=1,
+        replica_record_id='00000000-0000-4000-8000-000000000001',
+        status_property=types.SimpleNamespace(
+            sky_down_status=common_utils.ProcessStatus.SCHEDULED))
+    worker = mock.Mock(spec=thread_utils.SafeThread)
+    worker.is_alive.return_value = False
+    worker.ident = None
+    reserve = mock.Mock(return_value={})
+    restore = mock.Mock()
+    succeeded = mock.Mock()
+    failed = mock.Mock()
+
+    with pytest.raises(RuntimeError, match='made no progress'):
+        serve_utils.run_bounded_serve_teardown_threads(
+            [(info, worker)],
+            pool=False,
+            reserve_running=reserve,
+            restore_never_started=restore,
+            handle_success=succeeded,
+            handle_failure=failed,
+            continue_guard=lambda: True,
+            max_concurrent_per_service=1,
+            poll_interval_seconds=0,
+            max_no_progress_polls=2)
+
+    assert reserve.call_count == 2
+    worker.start.assert_not_called()
+    restore.assert_not_called()
+    succeeded.assert_not_called()
+    failed.assert_not_called()
 
 
 class TestIsConsolidationMode:
@@ -2903,13 +2937,30 @@ def test_orphaned_service_cluster_fields_use_exact_replica_ownership():
 def test_child_only_purge_termination_failure_retains_inventory():
     lifecycle_lock = mock.MagicMock(epoch=9)
     replica_infos = [
-        mock.Mock(replica_id=1, cluster_name='orphan-r1'),
-        mock.Mock(replica_id=2, cluster_name='orphan-r2'),
+        mock.Mock(replica_id=1,
+                  replica_record_id='00000000-0000-4000-8000-000000000001',
+                  cluster_name='orphan-r1',
+                  status_property=types.SimpleNamespace(sky_down_status=None)),
+        mock.Mock(replica_id=2,
+                  replica_record_id='00000000-0000-4000-8000-000000000002',
+                  cluster_name='orphan-r2',
+                  status_property=types.SimpleNamespace(sky_down_status=None)),
     ]
 
-    def _terminate(cluster_name, _log_file, **_kwargs):
+    def _terminate(cluster_name, **_kwargs):
         if cluster_name == 'orphan-r2':
             raise RuntimeError('down failed')
+
+    def _reserve(_service_name, candidates, **_kwargs):
+        candidate_ids = {replica_id for replica_id, _ in candidates}
+        reserved = {}
+        for info in replica_infos:
+            if info.replica_id not in candidate_ids:
+                continue
+            info.status_property.sky_down_status = (
+                common_utils.ProcessStatus.RUNNING)
+            reserved[info.replica_id] = info
+        return reserved
 
     with mock.patch.object(serve_utils,
                            'get_service_lifecycle_lock',
@@ -2939,6 +2990,15 @@ def test_child_only_purge_termination_failure_retains_inventory():
              serve_state,
              'get_replica_resource_action_identities',
              return_value={info.replica_id: None for info in replica_infos}), \
+         mock.patch.object(serve_state,
+                           'add_or_update_replica', return_value=True), \
+         mock.patch.object(
+             serve_state,
+             'reserve_replica_teardowns_running_if_capacity',
+             side_effect=_reserve), \
+         mock.patch.object(
+             serve_state,
+             'restore_never_started_replica_teardown_to_scheduled'), \
          mock.patch('sky.serve.replica_managers.terminate_cluster',
                     side_effect=_terminate) as terminate, \
          mock.patch.object(serve_state,
@@ -3551,7 +3611,8 @@ class TestServiceStatusEndpointSnapshot:
             info.cluster_name: {
                 'launched_at': idx,
                 'handle': handle,
-            } for idx, (info, handle) in enumerate(replicas_and_handles, start=1)
+            }
+            for idx, (info, handle) in enumerate(replicas_and_handles, start=1)
         }
         endpoint_calls = []
 
@@ -3661,7 +3722,7 @@ class TestServiceStatusEndpointSnapshot:
                 'launched_at': index,
                 'handle': handle,
             } for index, (info,
-                         handle) in enumerate(replicas_and_handles, start=1)
+                          handle) in enumerate(replicas_and_handles, start=1)
         }
         depth = 0
         uid_reads = 0
@@ -3716,7 +3777,7 @@ class TestServiceStatusEndpointSnapshot:
                 'launched_at': index,
                 'handle': handle,
             } for index, (info,
-                         handle) in enumerate(replicas_and_handles, start=1)
+                          handle) in enumerate(replicas_and_handles, start=1)
         }
         depth = 0
         uid_reads = 0
@@ -3893,99 +3954,6 @@ class TestServiceReplicaSummary:
         }) == '1/2'
 
 
-class TestStreamReplicaLogsZeroByteFallback:
-    """`replica_<id>.log` is the teardown archive (only written by
-    terminate_cluster's redirect_log or _download_and_stream_logs). Once
-    the teardown path runs and crashes mid-flight (or terminate_cluster is
-    invoked on a replica that never provisioned a cluster), a 0-byte
-    `replica_<id>.log` is left on disk.
-
-    Before the fix, `stream_replica_logs` checked `os.path.exists`
-    only — so it would commit to the (empty) main log, print "", and
-    return without ever consulting the launch log. Result: `sky jobs
-    pool logs` returns blank for a perfectly alive replica whose real
-    output is in `replica_<id>_launch.log`.
-
-    Fix: also gate on `os.path.getsize > 0`. These tests pin that
-    invariant.
-    """
-
-    def _patch_healthy(self):
-        # Provide the slim owner snapshot expected by the log-stream entrypoint.
-        return mock.patch(
-            'sky.serve.serve_utils._get_healthy_service_log_owner_record',
-            return_value=({
-                'pool': True,
-                'resource_scope': None,
-                'status': serve_state.ServiceStatus.READY,
-            }, None))
-
-    def test_zero_byte_main_log_falls_through_to_launch_log(
-            self, tmp_path, capsys):
-        # Set up: 0-byte replica_1.log + 100-byte replica_1_launch.log
-        # under a fake service dir. Patch the path generators to return
-        # them. The function should print the launch log content, not "".
-        main_log = tmp_path / 'replica_1.log'
-        launch_log = tmp_path / 'replica_1_launch.log'
-        main_log.touch()
-        launch_log.write_text('LAUNCH-CONTENT\n')
-        with self._patch_healthy(), \
-             mock.patch(
-                 'sky.serve.serve_utils.generate_replica_log_file_name',
-                 return_value=str(main_log)), \
-             mock.patch(
-                 'sky.serve.serve_utils.generate_replica_launch_log_file_name',
-                 return_value=str(launch_log)), \
-             mock.patch(
-                 'sky.serve.serve_utils.serve_state.get_replica_info_from_id',
-                 return_value=mock.Mock(replica_id=1, status='READY')), \
-             mock.patch(
-                 'sky.serve.serve_utils._follow_logs_with_provision_expanding',
-                 return_value=iter(['LAUNCH-CONTENT\n'])), \
-             mock.patch(
-                 'sky.serve.serve_utils._get_service_status',
-                 return_value={'status': 'READY'}), \
-             mock.patch(
-                 'sky.serve.serve_utils.serve_state.get_service_from_name',
-                 return_value=None):
-            serve_utils.stream_replica_logs('svc',
-                                            replica_id=1,
-                                            follow=False,
-                                            tail=None,
-                                            pool=True)
-        captured = capsys.readouterr()
-        # The launch log content must have been emitted.
-        assert 'LAUNCH-CONTENT' in captured.out, (
-            f'launch log fallback failed; captured stdout: {captured.out!r}')
-
-    def test_nonempty_main_log_still_used(self, tmp_path, capsys):
-        """Sanity: when main log has content, we still use it (no
-        regression to the original happy path)."""
-        main_log = tmp_path / 'replica_1.log'
-        launch_log = tmp_path / 'replica_1_launch.log'
-        main_log.write_text('MAIN-CONTENT\n')
-        # Launch log should NOT be touched in this case.
-        launch_log.write_text('SHOULD-NOT-APPEAR\n')
-        with self._patch_healthy(), \
-             mock.patch(
-                 'sky.serve.serve_utils.generate_replica_log_file_name',
-                 return_value=str(main_log)), \
-             mock.patch(
-                 'sky.serve.serve_utils.generate_replica_launch_log_file_name',
-                 return_value=str(launch_log)), \
-             mock.patch(
-                 'sky.serve.serve_utils.serve_state.get_service_from_name',
-                 return_value=None):
-            serve_utils.stream_replica_logs('svc',
-                                            replica_id=1,
-                                            follow=False,
-                                            tail=None,
-                                            pool=True)
-        captured = capsys.readouterr()
-        assert 'MAIN-CONTENT' in captured.out
-        assert 'SHOULD-NOT-APPEAR' not in captured.out
-
-
 class TestStreamReplicaLogsPhysicalIdentityFence:
 
     def test_remote_tail_runs_inside_exact_replica_fence(self, tmp_path):
@@ -3993,7 +3961,6 @@ class TestStreamReplicaLogsPhysicalIdentityFence:
         class _FakeHandle:
             pass
 
-        main_log = tmp_path / 'replica_1.log'
         launch_log = tmp_path / 'replica_1_launch.log'
         launch_log.write_text('launch complete\n')
         info = types.SimpleNamespace(replica_id=1,
@@ -4037,9 +4004,6 @@ class TestStreamReplicaLogsPhysicalIdentityFence:
                     'resource_scope': None,
                     'status': serve_state.ServiceStatus.READY,
                 }, None)), \
-             mock.patch(
-                 'sky.serve.serve_utils.generate_replica_log_file_name',
-                 return_value=str(main_log)), \
              mock.patch(
                  'sky.serve.serve_utils.generate_replica_launch_log_file_name',
                  return_value=str(launch_log)), \
@@ -4088,7 +4052,6 @@ class TestStreamReplicaLogsPhysicalIdentityFence:
         class _FakeHandle:
             pass
 
-        main_log = tmp_path / 'replica_1.log'
         launch_log = tmp_path / 'replica_1_launch.log'
         launch_log.write_text('launch complete\n')
         info = types.SimpleNamespace(replica_id=1,
@@ -4120,9 +4083,6 @@ class TestStreamReplicaLogsPhysicalIdentityFence:
                     'resource_scope': None,
                     'status': serve_state.ServiceStatus.READY,
                 }, None)), \
-             mock.patch(
-                 'sky.serve.serve_utils.generate_replica_log_file_name',
-                 return_value=str(main_log)), \
              mock.patch(
                  'sky.serve.serve_utils.generate_replica_launch_log_file_name',
                  return_value=str(launch_log)), \
@@ -5047,11 +5007,22 @@ class TestTerminateFailedServices:
         terminated = []
         self.termination_kwargs = []
 
-        def _terminate(cluster_name, _log_file, **kwargs):
+        def _terminate(cluster_name, **kwargs):
             terminated.append(cluster_name)
             self.termination_kwargs.append(kwargs)
             if terminate_side_effect is not None:
                 terminate_side_effect(cluster_name)
+
+        def _reserve_cleanup(_service_name, candidates, **_kwargs):
+            candidate_ids = {replica_id for replica_id, _ in candidates}
+            reserved = {}
+            for info in replica_infos:
+                if info.replica_id not in candidate_ids:
+                    continue
+                info.status_property.sky_down_status = (
+                    common_utils.ProcessStatus.RUNNING)
+                reserved[info.replica_id] = info
+            return reserved
 
         self.exact_terminations = []
 
@@ -5075,78 +5046,115 @@ class TestTerminateFailedServices:
              if bound_authority is not None else
              ordinary_launch_binding.ServiceTeardownDisposition.UNSUPPORTED),
             bound_authority)
-        with mock.patch(
-                'sky.serve.serve_utils.serve_state.get_replica_infos',
-                return_value=replica_infos), \
-             mock.patch(
-                 'sky.serve.serve_utils.'
-                 'quiesce_service_replica_launch_requests',
-                 return_value=True,
-                 side_effect=quiesce_side_effect) as quiesce, \
-             mock.patch(
-                 'sky.serve.ordinary_launch_binding.'
-                 'begin_service_teardown_if_owner',
-                 return_value=teardown_result), \
-             mock.patch(
-                 'sky.serve.service.'
-                 '_settle_bound_ordinary_launches_for_teardown',
-                 side_effect=bound_settle_side_effect,
-                 return_value={}) as settle_bound, \
-             mock.patch(
-                 'sky.serve.serve_utils.global_user_state.'
-                 'get_cluster_status_fields',
-                 side_effect=_cluster_snapshot), \
-             mock.patch(
-                 'sky.serve.serve_utils.serve_state.'
-                 'get_replica_resource_action_identities',
-                 side_effect=lambda _service_name, replica_ids:
-                 ({replica_id: None for replica_id in replica_ids}
-                  if teardown_identities is None else teardown_identities)), \
-             mock.patch('sky.serve.replica_managers.terminate_cluster',
-                        side_effect=_terminate), \
-             mock.patch(
-                 'sky.serve.replica_managers.'
-                 'terminate_bound_non_pool_provider_present_cluster',
-                 side_effect=_terminate_exact), \
-             mock.patch('sky.serve.serve_utils.get_service_lifecycle_lock',
-                        return_value=lifecycle_lock), \
-             mock.patch('sky.serve.serve_utils.lifecycle_lock_is_valid',
-                        return_value=True), \
-             mock.patch('sky.serve.serve_utils.serve_state.'
-                        'service_owner_matches', return_value=True), \
-             mock.patch('sky.serve.serve_utils.serve_state.'
-                        'add_or_update_replica', return_value=True) as persist, \
-             mock.patch(
-                 'sky.serve.kueue_lane_observer.'
-                 'project_exact_pod_absence_after_teardown',
-                 return_value=exact_absence) as exact_probe, \
-             mock.patch('sky.serve.serve_utils.serve_state.'
-                        'set_service_status_and_active_versions_if_hash',
-                        return_value=True), \
-             mock.patch('sky.serve.serve_utils.serve_state.'
-                        'set_service_status_and_active_versions_if_owner',
-                        return_value=True) as set_owner_status, \
-             mock.patch('sky.serve.serve_utils.serve_state.'
-                        'get_service_controller_owner',
-                        return_value={
-                            'hash': 'incarnation-a',
-                            'resource_scope': resource_scope,
-                            'controller_pid': 101,
-                            'controller_ip': '10.0.0.1',
-                            'controller_port':
-                                constants.CONTROLLER_TEARDOWN_ACK_PORT,
-                        }), \
-             mock.patch(
-                 'sky.serve.serve_utils.serve_state.'
-                 'remove_service_completely', return_value=True
-             ) as remove_service, \
-             mock.patch('sky.serve.serve_utils.'
-                        'remove_service_directory') as remove_directory, \
-             mock.patch(
-                 'sky.serve.lb_k8s.get_api_deployment_owner_uid',
-                 return_value='api-deployment-uid'), \
-             mock.patch('sky.serve.lb_k8s.delete_lb_objects',
-                        side_effect=lb_side_effect) as delete_lb:
+        # CPython lowers a multi-item ``with`` into nested blocks and rejects
+        # this safety harness once it exceeds the static nesting limit. Keep
+        # the teardown boundary explicit without weakening any mock.
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch(
+                    'sky.serve.serve_utils.serve_state.get_replica_infos',
+                    return_value=replica_infos))
+            quiesce = stack.enter_context(
+                mock.patch(
+                    'sky.serve.serve_utils.'
+                    'quiesce_service_replica_launch_requests',
+                    return_value=True,
+                    side_effect=quiesce_side_effect))
+            stack.enter_context(
+                mock.patch(
+                    'sky.serve.ordinary_launch_binding.'
+                    'begin_service_teardown_if_owner',
+                    return_value=teardown_result))
+            settle_bound = stack.enter_context(
+                mock.patch(
+                    'sky.serve.service.'
+                    '_settle_bound_ordinary_launches_for_teardown',
+                    side_effect=bound_settle_side_effect,
+                    return_value={}))
+            stack.enter_context(
+                mock.patch(
+                    'sky.serve.serve_utils.global_user_state.'
+                    'get_cluster_status_fields',
+                    side_effect=_cluster_snapshot))
+            stack.enter_context(
+                mock.patch(
+                    'sky.serve.serve_utils.serve_state.'
+                    'get_replica_resource_action_identities',
+                    side_effect=lambda _service_name, replica_ids:
+                    ({replica_id: None for replica_id in replica_ids}
+                     if teardown_identities is None else teardown_identities)))
+            stack.enter_context(
+                mock.patch('sky.serve.replica_managers.terminate_cluster',
+                           side_effect=_terminate))
+            stack.enter_context(
+                mock.patch(
+                    'sky.serve.replica_managers.'
+                    'terminate_bound_non_pool_provider_present_cluster',
+                    side_effect=_terminate_exact))
+            stack.enter_context(
+                mock.patch('sky.serve.serve_utils.get_service_lifecycle_lock',
+                           return_value=lifecycle_lock))
+            stack.enter_context(
+                mock.patch('sky.serve.serve_utils.lifecycle_lock_is_valid',
+                           return_value=True))
+            stack.enter_context(
+                mock.patch(
+                    'sky.serve.serve_utils.serve_state.service_owner_matches',
+                    return_value=True))
+            persist = stack.enter_context(
+                mock.patch(
+                    'sky.serve.serve_utils.serve_state.'
+                    'add_or_update_replica',
+                    return_value=True))
+            stack.enter_context(
+                mock.patch(
+                    'sky.serve.serve_utils.serve_state.'
+                    'reserve_replica_teardowns_running_if_capacity',
+                    side_effect=_reserve_cleanup))
+            stack.enter_context(
+                mock.patch(
+                    'sky.serve.serve_utils.serve_state.'
+                    'restore_never_started_replica_teardown_to_scheduled'))
+            exact_probe = stack.enter_context(
+                mock.patch(
+                    'sky.serve.kueue_lane_observer.'
+                    'project_exact_pod_absence_after_teardown',
+                    return_value=exact_absence))
+            stack.enter_context(
+                mock.patch(
+                    'sky.serve.serve_utils.serve_state.'
+                    'set_service_status_and_active_versions_if_hash',
+                    return_value=True))
+            set_owner_status = stack.enter_context(
+                mock.patch(
+                    'sky.serve.serve_utils.serve_state.'
+                    'set_service_status_and_active_versions_if_owner',
+                    return_value=True))
+            stack.enter_context(
+                mock.patch(
+                    'sky.serve.serve_utils.serve_state.'
+                    'get_service_controller_owner',
+                    return_value={
+                        'hash': 'incarnation-a',
+                        'resource_scope': resource_scope,
+                        'controller_pid': 101,
+                        'controller_ip': '10.0.0.1',
+                        'controller_port':
+                            constants.CONTROLLER_TEARDOWN_ACK_PORT,
+                    }))
+            remove_service = stack.enter_context(
+                mock.patch(
+                    'sky.serve.serve_utils.serve_state.'
+                    'remove_service_completely',
+                    return_value=True))
+            remove_directory = stack.enter_context(
+                mock.patch('sky.serve.serve_utils.remove_service_directory'))
+            stack.enter_context(
+                mock.patch('sky.serve.lb_k8s.get_api_deployment_owner_uid',
+                           return_value='api-deployment-uid'))
+            delete_lb = stack.enter_context(
+                mock.patch('sky.serve.lb_k8s.delete_lb_objects',
+                           side_effect=lb_side_effect))
             result = serve_utils._terminate_failed_services(
                 'svc', 'incarnation-a', None)
         self.quiesce = quiesce
@@ -5160,6 +5168,7 @@ class TestTerminateFailedServices:
     def _replica(replica_id, cluster_name):
         info = mock.Mock()
         info.replica_id = replica_id
+        info.replica_record_id = str(uuid.UUID(int=replica_id))
         info.cluster_name = cluster_name
         return info
 

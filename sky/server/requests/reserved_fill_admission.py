@@ -22,6 +22,7 @@ from sky.server import constants as server_constants
 from sky.server.requests import non_pool_admission
 from sky.server.requests import postgres as request_postgres
 from sky.skylet import constants as skylet_constants
+from sky.utils import common_utils
 
 
 class AdmissionDisposition(enum.Enum):
@@ -37,6 +38,7 @@ class AdmissionSpec:
     authority: ordinary_launch_binding.ControllerBindingAuthority
     replica_info: Any
     actuation_lease: zero_cost_actuation.IntentLease
+    launch_limit: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -71,8 +73,14 @@ def _frozen_identity(
             not isinstance(spec.authority,
                            ordinary_launch_binding.ControllerBindingAuthority)
             or not isinstance(spec.actuation_lease,
-                              zero_cost_actuation.IntentLease)):
+                              zero_cost_actuation.IntentLease) or
+            type(spec.launch_limit) is not int or spec.launch_limit < 1):
         raise ValueError('Reserved-fill admission input is malformed.')
+    if (spec.replica_info.status_property.sky_launch_status !=
+            common_utils.ProcessStatus.RUNNING or
+            spec.replica_info.status_property.sky_down_status is not None):
+        raise ValueError('Reserved-fill admission must reserve a RUNNING '
+                         'launch without teardown intent.')
     authority = spec.authority
     if (authority.capable is not True or authority.binding_mode
             is not ordinary_launch_binding.BindingMode.BOUND or
@@ -100,8 +108,8 @@ def _frozen_identity(
             intent.controller_pid != authority.controller_pid or
             intent.controller_ip != authority.controller_ip or
             intent.replica_id != spec.replica_info.replica_id or
-            str(intent.replica_record_id)
-            != spec.replica_info.replica_record_id):
+            str(intent.replica_record_id) !=
+            spec.replica_info.replica_record_id):
         raise ValueError('Frozen launch does not match controller authority.')
     return body, intent
 
@@ -337,6 +345,24 @@ def _transaction(
     try:
         transaction = connection.begin()
         try:
+            # This must be the transaction's first SQL statement.  The same
+            # transaction counts P, persists the RUNNING replica, binds its
+            # executable request, and commits the full graph before any
+            # adopter can observe/start it.
+            if not serve_state.try_acquire_serve_mutation_admission_in_transaction(
+                    connection):
+                raise _Rejected('Serve launch admission is busy.')
+            if not (serve_state.
+                    try_acquire_replica_launch_authority_in_transaction(
+                        connection, connection.engine,
+                        spec.authority.service_name)):
+                raise _Rejected('Replica launch authority is busy.')
+            if not require_existing:
+                provisioning, _ = (
+                    serve_state.get_replica_mutation_counts_in_transaction(
+                        connection))
+                if provisioning >= spec.launch_limit:
+                    raise _Rejected('Serve launch capacity is saturated.')
             staged_receipt = _stage_and_bind(connection,
                                              spec,
                                              lease_token,

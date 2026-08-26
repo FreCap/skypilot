@@ -133,6 +133,48 @@ def _decode(payload):
 
 class TestStatusProviderPhaseFanout:
 
+    def test_bad_replica_serializer_does_not_black_out_healthy_peer(self):
+        harness = _PhaseHarness()
+        serialized = []
+        bad = _replica(1, 'bad', _AMBIENT, harness, serialized)
+        bad.replica_record_id = 'record-bad'
+        bad.version = 1
+        bad.is_spot = False
+        bad.to_info_dict.side_effect = RuntimeError('corrupt presentation row')
+        healthy = _replica(2, 'healthy', _AMBIENT, harness, serialized)
+        prepared = _prepared('svc', [], [bad, healthy])
+
+        with harness.phase(_AMBIENT) as admission, mock.patch.object(
+                provider_phase, 'join_provider_phase',
+                side_effect=harness.join):
+            results = serve_utils._serialize_ordinary_status_partition(
+                [(prepared, bad), (prepared, healthy)], admission=admission)
+        records = {record['name']: record for _, _, record in results}
+
+        assert records['bad']['status'] is serve_state.ReplicaStatus.UNKNOWN
+        assert records['bad']['provider_identity_uncertain'] is True
+        assert records['bad']['endpoint'] is None
+        assert records['healthy']['status'] is serve_state.ReplicaStatus.READY
+        assert records['healthy']['endpoint'] == 'http://healthy:8080'
+
+    def test_bad_service_preparation_does_not_black_out_healthy_service(self):
+        prepared = _prepared('healthy', [], [])
+
+        def _prepare(name, **_kwargs):
+            if name == 'bad':
+                raise RuntimeError('corrupt service snapshot')
+            return prepared
+
+        with mock.patch.object(serve_utils,
+                               '_prepare_service_status',
+                               side_effect=_prepare):
+            statuses = _decode(
+                serve_utils.get_service_status_pickled(['bad', 'healthy'],
+                                                       pool=False))
+
+        assert [status['name'] for status in statuses] == ['healthy']
+        assert statuses[0]['replica_info'] == []
+
     def test_global_v2_then_ambient_fanout_joins_and_proves_pool_once(self):
         harness = _PhaseHarness()
         serialized = []

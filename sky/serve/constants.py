@@ -888,6 +888,12 @@ RESERVED_FILL_BROKER_LOCK_ID = '~/.sky/serve_reserved_fill_broker_lock'
 # round-trips; generous so a slow cluster query makes peers wait for the
 # fresh round instead of timing out into a no-fill cycle.
 RESERVED_FILL_BROKER_LOCK_TIMEOUT_SECONDS = 120
+# All Serve launch and provider-teardown admission uses this stable lock.  On
+# PostgreSQL it is a transaction-scoped advisory lock on the exact transaction
+# that counts capacity and commits the durable RUNNING reservation; rollback
+# releases both the reservation and authority atomically.  Local file locking
+# is retained only for the supported single-process local server.
+SERVE_MUTATION_ADMISSION_LOCK_ID = '~/.sky/serve_mutation_admission_lock'
 # Shared demand-placement observations and reservations use a separate lock
 # from fill arbitration. The refresh path never holds it while a planner is
 # waiting on the fill broker, avoiding lock-order coupling between features.

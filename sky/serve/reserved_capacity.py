@@ -228,8 +228,8 @@ class FillPoolSpec:
     def __post_init__(self) -> None:
         contexts = self.observation_contexts or (self.context,)
         if (self.context not in contexts or
-                len(set(contexts)) != len(contexts) or len(contexts)
-                > pool_capacity_observer.MAX_OBSERVATION_ROUTES_PER_POOL):
+                len(set(contexts)) != len(contexts) or len(contexts) >
+                pool_capacity_observer.MAX_OBSERVATION_ROUTES_PER_POOL):
             raise ValueError('A fill pool needs unique observation routes '
                              'including its placement context.')
         object.__setattr__(self, 'observation_contexts', contexts)
@@ -833,8 +833,8 @@ def protocol_v2_provider_fence(
                     'A physical-only provider fence cannot consume a phase '
                     'admission.')
             return contextlib.nullcontext()
-        if (phase_admission is not None and phase_admission.mode
-                != provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
+        if (phase_admission is not None and phase_admission.mode !=
+                provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
             raise exceptions.ProviderPhaseMisuseError(
                 'An ordinary provider operation requires ambient admission.')
         if phase_admission is None:
@@ -896,8 +896,9 @@ def protocol_v2_provider_batch_fences(
     instead of racing to initialize one proof per fast worker.
 
     Entry failures are returned by group so callers can isolate only the rows
-    whose provider identity is uncertain. Unexpected failures remain typed in
-    the result and must be re-raised by callers.
+    whose provider evidence is unavailable. The typed result lets callers
+    distinguish durable identity uncertainty from an exact zero-evidence
+    deferral while independently healthy groups continue.
     """
     if phase_admission is None:
         phase_context = provider_phase.provider_phase(
@@ -1176,9 +1177,9 @@ def parse_protocol_v2_launch_fence(
         raise ValueError('Reserved-fill accelerator count is invalid.')
     if policy_bound and (
             type(gate_generation) is not int or gate_generation < 1 or
-            type(reclaim_fleet_bundle_sha256) is not str or re.fullmatch(
-                r'[0-9a-f]{64}', reclaim_fleet_bundle_sha256) is None or
-            type(reclaim_policy_revision) is not str or
+            type(reclaim_fleet_bundle_sha256) is not str or
+            re.fullmatch(r'[0-9a-f]{64}', reclaim_fleet_bundle_sha256) is None
+            or type(reclaim_policy_revision) is not str or
             not reclaim_policy_revision or
             type(reclaim_provider_inventory_sha256) is not str or re.fullmatch(
                 r'[0-9a-f]{64}', reclaim_provider_inventory_sha256) is None or
@@ -1304,8 +1305,8 @@ def validate_protocol_v2_launch_fence_against_replica(
                            isinstance(resource_cloud, str) and
                            resource_cloud.casefold() == 'kubernetes')
     accelerators = resources_override.get('accelerators')
-    if (not is_kubernetes_cloud or resources_override.get('region')
-            != persisted.get('reserved_fill_kubernetes_context') or
+    if (not is_kubernetes_cloud or resources_override.get('region') !=
+            persisted.get('reserved_fill_kubernetes_context') or
             not isinstance(accelerators, Mapping) or len(accelerators) != 1):
         raise ValueError('Reserved-fill launch row resource pin is malformed.')
     accelerator, raw_count = next(iter(accelerators.items()))
@@ -1655,8 +1656,8 @@ def group_zero_cost_fill_pools(
                                   for name, _ in shapes)))
     exact_card_pool_count = sum(
         len(candidate.shapes) for candidate in candidates)
-    if (exact_card_pool_count
-            > pool_capacity_observation.MAX_OBSERVATION_COHORT_POOLS):
+    if (exact_card_pool_count >
+            pool_capacity_observation.MAX_OBSERVATION_COHORT_POOLS):
         raise ValueError(
             'Reserved-fill capacity exceeds the bounded '
             'Kubernetes pool count '
@@ -1937,8 +1938,8 @@ def _sequenced_fill_pool_specs_from_current_claim_authority(
                 return ()
             _, configured_width, locations = configured
             if (configured_width != width or
-                    expected_position_by_location[(context, card)]
-                    != pool_position or
+                    expected_position_by_location[(context, card)] !=
+                    pool_position or
                     legacy_pool_key != reserved_capacity_broker.make_pool_key(
                         context, card)):
                 return ()
@@ -3512,9 +3513,9 @@ def _broker_cycle_v2(
         return
 
     location_keys = {
-        spec.pool_key: [
-            location.to_pickleable() for location in spec.locations
-        ] for spec in specs
+        spec.pool_key:
+        [location.to_pickleable() for location in spec.locations]
+        for spec in specs
     }
     autoscaler.seed_zero_cost_pools(location_keys)
     previous_set = serve_state.get_reserved_fill_service_claim_set(service_name)
@@ -3823,8 +3824,8 @@ def _observation_targets(
                     pool_key)
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-            if (identity.protocol_version
-                    != reserved_capacity_broker.PROTOCOL_V2 or
+            if (identity.protocol_version !=
+                    reserved_capacity_broker.PROTOCOL_V2 or
                     identity.physical_cluster_uid != physical_uid):
                 continue
             claim_routes.setdefault(pool_key, set()).add(context)
@@ -3839,8 +3840,8 @@ def _observation_targets(
         contexts = list(spec.observation_contexts)
         contexts.extend(
             sorted(claim_routes.get(spec.pool_key, set()).difference(contexts)))
-        if (len(contexts)
-                > pool_capacity_observer.MAX_OBSERVATION_ROUTES_PER_POOL):
+        if (len(contexts) >
+                pool_capacity_observer.MAX_OBSERVATION_ROUTES_PER_POOL):
             logger.warning(
                 'Reserved-fill physical pool has more authenticated '
                 'aliases than one bounded observation can query; '
@@ -4062,9 +4063,8 @@ def poller_loop(
     behavior; the stacked cleanup removes that compatibility branch after all
     controller images use generation fencing.
     """
-    callbacks_are_paired = ((get_actuation_generation
-                             is None) == (actuation_generation_is_current
-                                          is None))
+    callbacks_are_paired = ((get_actuation_generation is
+                             None) == (actuation_generation_is_current is None))
     if not callbacks_are_paired:
         raise ValueError('Actuation generation capture and validation must be '
                          'configured together.')
@@ -4235,8 +4235,9 @@ def poller_loop(
                                         PoolCapacityObserver(
                                             observation_repository,
                                             query_target,
-                                            publish=(None if notify_reconcile
-                                                     is None else lambda _row:
+                                            publish=(None
+                                                     if notify_reconcile is None
+                                                     else lambda _row:
                                                      notify_reconcile()),
                                             interval_seconds=(
                                                 poll_interval_seconds()),

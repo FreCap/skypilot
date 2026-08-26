@@ -5852,6 +5852,17 @@ def _replica_free_association_is_inert(association: Mapping[str, Any],) -> bool:
     return True
 
 
+def settled_association_proves_execution_quiescence(
+        association: Mapping[str, Any]) -> bool:
+    """Return whether retained association history is safe for teardown.
+
+    This is the shared read-side authority for both replica-free history and a
+    pointerless current replica whose exact cancellation projection has
+    already released its association pointer.
+    """
+    return _replica_free_association_is_inert(association)
+
+
 def _retained_graphs_have_terminal_absence_authority(
     connection: sqlalchemy.engine.Connection,
     lifecycle: Mapping[str, Any],

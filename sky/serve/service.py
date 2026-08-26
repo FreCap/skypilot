@@ -419,8 +419,8 @@ def _provider_present_cleanup_context(
             authority.binding_mode != ordinary_launch_binding.BindingMode.BOUND
             or not marker or not isinstance(
                 context, ordinary_launch_binding.BoundNonPoolLaunchContext) or
-            context.profile.kind
-            != ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL or
+            context.profile.kind !=
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL or
             context.service_name != authority.service_name or
             context.replica_id != info.replica_id or
             str(context.replica_record_id) != info.replica_record_id or
@@ -461,10 +461,8 @@ def _prepare_provider_present_cleanup(
     contexts = dict(cleanup_contexts)
     projected_absence_keys: set[tuple[int, str]] = set()
     failures: dict[tuple[int, str], str] = {}
-    info_by_key = {
-        (info.replica_id, info.replica_record_id): info
-        for info in replica_infos
-    }
+    info_by_key = {(info.replica_id, info.replica_record_id): info
+                   for info in replica_infos}
     extra_keys = contexts.keys() - info_by_key.keys()
     if extra_keys:
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
@@ -507,8 +505,8 @@ def _prepare_provider_present_cleanup(
                 authority,
                 projector,
                 force_provider_read=True)
-            if (observation.evidence
-                    != ordinary_launch_binding.ProviderEvidence.ABSENT):
+            if (observation.evidence !=
+                    ordinary_launch_binding.ProviderEvidence.ABSENT):
                 raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                     'A provider-present cleanup marker lost its SkyPilot '
                     'cluster record, but fresh exact provider evidence is '
@@ -530,14 +528,13 @@ def _terminate_replica_cluster_for_service_cleanup(
     cleanup_context: ordinary_launch_binding.BoundNonPoolLaunchContext | None,
     authority: ordinary_launch_binding.ControllerBindingAuthority | None,
     cluster_name: str,
-    log_file_name: str,
     **terminate_kwargs: Any,
 ) -> None:
     """Dispatch generic or exact PRESENT cleanup through one bulk path."""
     if cleanup_context is None:
         replica_managers.terminate_cluster_with_kueue_absence_receipt(
             service_name, info.replica_id, info.replica_record_id, cluster_name,
-            log_file_name, **terminate_kwargs)
+            **terminate_kwargs)
         return
     if authority is None:
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
@@ -545,8 +542,7 @@ def _terminate_replica_cluster_for_service_cleanup(
     replica_managers.terminate_bound_non_pool_provider_present_cluster(
         cleanup_context, info, authority,
         functools.partial(_project_bound_ordinary_launch_for_teardown,
-                          authority), cluster_name, log_file_name,
-        **terminate_kwargs)
+                          authority), cluster_name, **terminate_kwargs)
 
 
 # NOTE(dev): We don't need to acquire the `with_lock` in replica manager here
@@ -719,8 +715,10 @@ def _cleanup(
             if cleanup_fence is None:
                 absent_legacy_infos.append(info)
             else:
-                info.status_property.sky_down_status = (
-                    common_utils.ProcessStatus.SCHEDULED)
+                if (info.status_property.sky_down_status !=
+                        common_utils.ProcessStatus.RUNNING):
+                    info.status_property.sky_down_status = (
+                        common_utils.ProcessStatus.SCHEDULED)
                 _persist_replica(info)
                 try:
                     exact_absence = (kueue_lane_observer.
@@ -741,8 +739,8 @@ def _cleanup(
                     continue
                 presence = reserved_capacity.probe_physical_replica_presence(
                     cleanup_fence, info.cluster_name)
-                if (presence
-                        is reserved_capacity.PhysicalReplicaPresence.ABSENT):
+                if (presence is
+                        reserved_capacity.PhysicalReplicaPresence.ABSENT):
                     logger.info(
                         f'Replica {info.replica_id} owns no Pod on its fenced '
                         'physical cluster; provider cleanup is complete.')
@@ -810,8 +808,6 @@ def _cleanup(
         # incarnation-scoped names truncate long service prefixes to stay
         # within the 63-character cloud/Kubernetes ceiling, so a prefix query
         # with the full service name can miss a live, billable cluster.
-        log_file_name = serve_utils.generate_replica_log_file_name(
-            service_name, info.replica_id, resource_scope)
         teardown_identity = teardown_identities[info.replica_id]
         terminate_kwargs: dict[str, Any] = {
             'continue_guard': _still_owns,
@@ -824,7 +820,7 @@ def _cleanup(
         t = thread_utils.SafeThread(
             target=_terminate_replica_cluster_for_service_cleanup,
             args=(service_name, info, cleanup_context, binding_authority,
-                  info.cluster_name, log_file_name),
+                  info.cluster_name),
             kwargs=terminate_kwargs)
         info2thr[info] = t
         # Set replica status to `SHUTTING_DOWN`
@@ -837,46 +833,54 @@ def _cleanup(
             # never be rewritten to synthetic success.
             info.status_property.sky_launch_status = (
                 replica_managers.common_utils.ProcessStatus.SUCCEEDED)
-        info.status_property.sky_down_status = (
-            replica_managers.common_utils.ProcessStatus.SCHEDULED)
+        # A restart may reconstruct this cleanup after the prior process
+        # committed RUNNING but before its provider worker completed.  That
+        # row already consumes D and must stay RUNNING for idempotent adoption;
+        # only fresh cleanup intent enters SCHEDULED admission.
+        if (info.status_property.sky_down_status !=
+                replica_managers.common_utils.ProcessStatus.RUNNING):
+            info.status_property.sky_down_status = (
+                replica_managers.common_utils.ProcessStatus.SCHEDULED)
         _persist_replica(info)
         logger.info(f'Scheduling to terminate replica {info.replica_id} ...')
 
-    # Please reference to sky/serve/replica_managers.py::_refresh_process_pool.
-    # TODO(tian): Refactor to use the same logic and code.
-    while info2thr:
-        _assert_owner('while waiting for replica cleanup')
-        snapshot = list(info2thr.items())
-        for info, t in snapshot:
-            if t.is_alive():
-                continue
-            if (info.status_property.sky_down_status ==
-                    replica_managers.common_utils.ProcessStatus.SCHEDULED):
-                if controller_utils.can_terminate(pool):
-                    try:
-                        t.start()
-                    except Exception as e:  # pylint: disable=broad-except
-                        _set_to_failed_cleanup(info)
-                        logger.error(f'Failed to start thread for replica '
-                                     f'{info.replica_id}: {e}')
-                        del info2thr[info]
-                    else:
-                        info.status_property.sky_down_status = (
-                            common_utils.ProcessStatus.RUNNING)
-                        _persist_replica(info)
-            else:
-                logger.info('Terminate thread for replica '
-                            f'{info.replica_id} finished.')
-                t.join()
-                del info2thr[info]
-                if t.format_exc is None:
-                    _remove_replica(info)
-                    logger.info(
-                        f'Replica {info.replica_id} terminated successfully.')
-                else:
-                    _set_to_failed_cleanup(info, t.format_exc)
-        if info2thr:
-            time.sleep(3)
+    def _handle_cleanup_success(info: replica_managers.ReplicaInfo) -> None:
+        _remove_replica(info)
+        logger.info(f'Replica {info.replica_id} terminated successfully.')
+
+    def _reserve_cleanup(
+        infos: list[replica_managers.ReplicaInfo],
+        termination_limit: int,
+    ) -> dict[int, replica_managers.ReplicaInfo]:
+        return serve_state.reserve_replica_teardowns_running_if_capacity(
+            service_name,
+            [(info.replica_id, info.replica_record_id) for info in infos],
+            termination_limit=termination_limit,
+            expected_service_hash=service_hash,
+            expected_lifecycle_epoch=lifecycle_epoch,
+            expected_controller_owner=expected_owner)
+
+    def _restore_cleanup(
+        info: replica_managers.ReplicaInfo,
+    ) -> replica_managers.ReplicaInfo | None:
+        return (serve_state.restore_never_started_replica_teardown_to_scheduled(
+            service_name,
+            info.replica_id,
+            info.replica_record_id,
+            expected_service_hash=service_hash,
+            expected_lifecycle_epoch=lifecycle_epoch,
+            expected_controller_owner=expected_owner))
+
+    serve_utils.run_bounded_serve_teardown_threads(
+        list(info2thr.items()),
+        pool=pool,
+        reserve_running=_reserve_cleanup,
+        restore_never_started=_restore_cleanup,
+        handle_success=_handle_cleanup_success,
+        handle_failure=_set_to_failed_cleanup,
+        continue_guard=_still_owns,
+        max_concurrent_per_service=(
+            replica_managers.MAX_CONCURRENT_DOWNS_PER_SERVICE))
 
     _assert_owner('before scoped storage cleanup')
 
@@ -1745,9 +1749,9 @@ def _project_bound_ordinary_launch_for_teardown(
         context = projection.context
         if (not isinstance(context,
                            ordinary_launch_binding.BoundNonPoolLaunchContext) or
-                context.profile.kind != ordinary_launch_binding.
-                NonPoolLaunchProfileKind.RESERVED_FILL or
-                projection.pre_effect_terminal or
+                context.profile.kind !=
+                ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL
+                or projection.pre_effect_terminal or
                 projection.service_job_id is not None or
                 projection.paid_capacity_pool_key is not None or
                 info.service_job_id is not None or
@@ -1757,7 +1761,8 @@ def _project_bound_ordinary_launch_for_teardown(
             return False
         status = info.status_property
         status.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
-        status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+        if status.sky_down_status != common_utils.ProcessStatus.RUNNING:
+            status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
         status.service_ready_now = False
         status.is_scale_down = True
         status.preempted = False
@@ -1775,8 +1780,8 @@ def _project_bound_ordinary_launch_for_teardown(
         status.logical_retirement_committed = False
     elif provider_absent:
         assert provider_absence_projection is not None
-    elif (info.status_property.sky_launch_status
-          != common_utils.ProcessStatus.INTERRUPTED):
+    elif (info.status_property.sky_launch_status !=
+          common_utils.ProcessStatus.INTERRUPTED):
         if projection.status.value == 'SUCCEEDED':
             info.status_property.sky_launch_status = (
                 common_utils.ProcessStatus.SUCCEEDED)
@@ -1868,8 +1873,8 @@ def _settle_bound_ordinary_launches_for_teardown(
 ) -> dict[tuple[int, str], ordinary_launch_binding.BoundNonPoolLaunchContext]:
     """Cancel and project every exact association before generic cleanup."""
     if (authority is None or authority.capable is not True or
-            authority.binding_mode
-            != ordinary_launch_binding.BindingMode.BOUND):
+            authority.binding_mode !=
+            ordinary_launch_binding.BindingMode.BOUND):
         return {}
     projector = functools.partial(_project_bound_ordinary_launch_for_teardown,
                                   authority)
@@ -2383,8 +2388,8 @@ def _start(service_name: str,
                 raise RuntimeError(
                     f'Refusing stale HA recovery ownership for '
                     f'{service_name!r}: its service incarnation changed.')
-            if (recovery_owner_fence['lifecycle_epoch']
-                    != service.get('lifecycle_epoch')):
+            if (recovery_owner_fence['lifecycle_epoch'] !=
+                    service.get('lifecycle_epoch')):
                 raise RuntimeError(
                     f'Refusing stale HA recovery ownership for '
                     f'{service_name!r}: its lifecycle epoch changed.')

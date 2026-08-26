@@ -29,7 +29,6 @@ from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import service
 from sky.utils import common_utils
-from sky.utils import controller_utils
 
 
 def _replica(replica_id: int) -> replica_managers.ReplicaInfo:
@@ -64,9 +63,23 @@ def _patch_common(monkeypatch, events, replicas):
                         lambda *a, **k: None)
     monkeypatch.setattr(serve_state, 'remove_replica', lambda *a, **k: None)
     monkeypatch.setattr(serve_state, 'get_service_versions', lambda svc: [])
-    monkeypatch.setattr(controller_utils,
-                        'can_terminate',
-                        lambda pool, in_flight=None: True)
+
+    def _reserve(_service_name, candidates, **_kwargs):
+        replicas_by_id = {replica.replica_id: replica for replica in replicas}
+        admitted = {}
+        for replica_id, _replica_record_id in candidates:
+            replica = replicas_by_id[replica_id]
+            replica.status_property.sky_down_status = (
+                common_utils.ProcessStatus.RUNNING)
+            admitted[replica_id] = replica
+        return admitted
+
+    monkeypatch.setattr(serve_state,
+                        'reserve_replica_teardowns_running_if_capacity',
+                        _reserve)
+    monkeypatch.setattr(replica_managers.kueue_lane_observer,
+                        'project_exact_pod_absence_after_teardown',
+                        lambda *_args, **_kwargs: False)
     monkeypatch.setattr(serve_state, 'remove_ha_recovery_script',
                         lambda svc: events.append('remove_recovery_script'))
 
@@ -77,7 +90,6 @@ def test_cleanup_preserves_recovery_script_through_replica_teardown(
     events = []
 
     def _terminate(cluster_name,
-                   unused_log_file_name,
                    continue_guard=None,
                    expected_cluster_record_uuid=None):
         assert continue_guard is not None
@@ -105,7 +117,6 @@ def test_cleanup_uses_exact_scoped_cluster_identity_for_long_name(monkeypatch):
     assert not info.cluster_name.startswith(service_name)
 
     def _terminate(cluster_name,
-                   unused_log_file_name,
                    continue_guard=None,
                    expected_cluster_record_uuid=None):
         assert continue_guard is not None and continue_guard()
@@ -158,7 +169,7 @@ def _patch_finalize(monkeypatch, calls):
         serve_state, 'acknowledge_service_controller_teardown_if_owner',
         lambda *a, **k: calls.append(('begin_teardown', a[0])) or True)
     monkeypatch.setattr(service.serve_utils, 'get_service_lifecycle_lock',
-                        lambda name: mock.MagicMock())
+                        lambda name, **_kwargs: mock.MagicMock())
     monkeypatch.setattr(service.serve_utils, 'lifecycle_lock_is_valid',
                         lambda lock: True)
     monkeypatch.setattr(serve_state, 'service_owner_matches',

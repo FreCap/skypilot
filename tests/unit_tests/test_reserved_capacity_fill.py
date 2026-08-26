@@ -151,7 +151,8 @@ def _spec(min_replicas=1, max_replicas=10, fill=True):
                                  cost_rebalance=False,
                                  cost_rebalance_min_savings_fraction=0.3,
                                  cost_rebalance_max_parallel_replacements=1,
-                                 cost_rebalance_stabilization_seconds=300.0)
+                                 cost_rebalance_stabilization_seconds=300.0,
+                                 max_live_paid_gpu_units=None)
 
 
 def _make_autoscaler(**spec_kwargs):
@@ -4586,7 +4587,6 @@ def _make_manager(placer):
     manager._spot_placer = placer
     manager._launch_thread_pool = {}
     manager._replica_to_request_id = {}
-    manager._replica_to_launch_cancelled = {}
     manager._fill_skip_last_log_time = 0.0
     manager._next_replica_id = 7
     manager.latest_version = 1
@@ -4651,7 +4651,7 @@ class TestZeroCostSelection(unittest.TestCase):
         self.placer.location2cost.pop(self.paid)
         self.placer.location2status.update({
             _make_location(f'paid-region-{index}', 'paid', use_spot=True):
-                spot_placer.LocationStatus.ACTIVE for index in range(1058)
+            spot_placer.LocationStatus.ACTIVE for index in range(1058)
         })
         self.assertEqual(self.placer.zero_cost_locations(), [self.k8s])
 
@@ -5413,7 +5413,15 @@ class TestFillLaunchPath(unittest.TestCase):
         admit.assert_called_once()
         admission_spec = admitted_specs[0]
         info = admission_spec.replica_info
-        classify.assert_called_once_with(info, protocol_version=2)
+        classify.assert_called_once()
+        classified_info = classify.call_args.args[0]
+        self.assertEqual(classify.call_args.kwargs, {'protocol_version': 2})
+        self.assertIsNot(classified_info, info)
+        self.assertEqual(classified_info.replica_record_id,
+                         info.replica_record_id)
+        self.assertEqual(classified_info.status,
+                         serve_state.ReplicaStatus.PENDING)
+        self.assertEqual(info.status, serve_state.ReplicaStatus.PROVISIONING)
         self.assertEqual(info.reserved_fill_pool_key, override[_POOL_KEY])
         self.assertEqual(info.reserved_fill_service_generation, 7)
         self.assertEqual(info.reserved_fill_physical_cluster_uid,
@@ -5736,7 +5744,15 @@ class TestFillLaunchPath(unittest.TestCase):
         self.assertEqual(request_ids.pop_calls, 0)
         self.assertIs(launch_threads[7], worker)
         self.assertEqual(request_ids[7], 'request-id')
-        self.assertEqual(existing, admitted_infos)
+        self.assertEqual(len(existing), 1)
+        self.assertEqual(len(admitted_infos), 1)
+        self.assertIsNot(existing[0], admitted_infos[0])
+        self.assertEqual(existing[0].replica_record_id,
+                         admitted_infos[0].replica_record_id)
+        self.assertEqual(existing[0].status,
+                         serve_state.ReplicaStatus.PROVISIONING)
+        self.assertEqual(admitted_infos[0].status,
+                         serve_state.ReplicaStatus.PROVISIONING)
         release_retry.assert_not_called()
         cleanup.assert_not_called()
         placer.release_retry.assert_not_called()
@@ -6186,14 +6202,6 @@ class TestFillLaunchPath(unittest.TestCase):
             placer.reset_mock()
             placer.is_launch_admissible.return_value = False
             with mock.patch.object(
-                    replica_managers.controller_utils,
-                    'can_provision',
-                    return_value=False) as can_provision, \
-                 mock.patch.object(
-                     replica_managers.serve_state,
-                     'mark_bound_replica_launch_running_if_active'
-                 ) as mark_running, \
-                 mock.patch.object(
                      replica_managers.context.SkyPilotContext,
                      'redirect_log',
                      side_effect=AssertionError(
@@ -6210,8 +6218,6 @@ class TestFillLaunchPath(unittest.TestCase):
             self.assertEqual(manager._replica_to_request_id[7], 'request-id')
             reduce_bound.assert_called_once_with(None, None)
             redirect_log.assert_not_called()
-            can_provision.assert_not_called()
-            mark_running.assert_not_called()
             remove.assert_not_called()
             placer.is_launch_admissible.assert_not_called()
             placer.set_preemptive.assert_not_called()

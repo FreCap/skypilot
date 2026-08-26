@@ -925,17 +925,29 @@ class SkyServeController:
         # records above to collect the YAML paths, then fetch all YAMLs in one
         # query before resolving endpoints.
         handles: dict[int, Any] = {}
+        provider_config_failed_ids: set[int] = set()
         for info in cluster_lookup_infos:
             cluster_record = cluster_records.get(info.cluster_name)
             if cluster_record is None:
                 continue
-            if cleanup_fences[id(info)] is None:
-                handle = info.handle(cluster_record)
-            else:
-                # A v2 row must validate the exact durable handle instead of
-                # letting a convenience accessor assert or fetch by name.
-                handle = (cluster_record.get('handle') if isinstance(
-                    cluster_record, dict) else None)
+            try:
+                if cleanup_fences[id(info)] is None:
+                    handle = info.handle(cluster_record)
+                else:
+                    # A v2 row must validate the exact durable handle instead
+                    # of letting a convenience accessor assert or fetch by
+                    # name.
+                    handle = (cluster_record.get('handle') if isinstance(
+                        cluster_record, dict) else None)
+            except Exception as error:  # pylint: disable=broad-except
+                provider_config_failed_ids.add(info.replica_id)
+                if _is_recovery_capable(info):
+                    self._replica_manager.retire_system_recovery_route(info)
+                logger.warning(
+                    'Replica %s has an invalid cluster handle; withholding '
+                    'only this route: %s', info.replica_id,
+                    common_utils.format_exception(error))
+                continue
             handles[id(info)] = handle
         uncached_handles = {
             info.replica_id: handles[id(info)]
@@ -943,7 +955,7 @@ class SkyServeController:
             if _cached_route(info) is None and id(info) in handles
         }
         provider_configs = serve_utils.get_provider_configs_for_handles(
-            uncached_handles)
+            uncached_handles, failed_keys=provider_config_failed_ids)
 
         # First resolve/cache candidates under their physical-cluster fence.
         # The emission pass below retains the caller's original row order so
@@ -952,10 +964,18 @@ class SkyServeController:
         route_candidates: dict[int, tuple[str, str, int]] = {}
 
         def _resolve_route_candidate(
-                info: 'replica_managers.ReplicaInfo') -> None:
+                info: 'replica_managers.ReplicaInfo') -> bool:
             is_capable = _is_recovery_capable(info)
             cached = _cached_route(info)
             if cached is None:
+                if info.replica_id in provider_config_failed_ids:
+                    if is_capable:
+                        self._replica_manager.retire_system_recovery_route(info)
+                    logger.warning(
+                        'Replica %s has invalid cluster provider '
+                        'configuration; withholding only this route.',
+                        info.replica_id)
+                    return False
                 cluster_record = cluster_records.get(info.cluster_name)
                 if cluster_record is None:
                     if is_capable:
@@ -963,12 +983,25 @@ class SkyServeController:
                     logger.warning(f'Replica {info.replica_id} is READY but '
                                    'its cluster record is not available yet; '
                                    'skipping for this sync.')
-                    return
+                    # Missing cluster metadata is a transient endpoint
+                    # resolution failure, not proof that a READY replica has
+                    # disappeared. Preserve the non-zero READY signal so the
+                    # LB retains its last coherent routes for this sync.
+                    return True
                 handle = handles.get(id(info))
-                url = info._resolve_url(  # pylint: disable=protected-access
-                    cluster_record=cluster_record,
-                    handle=handle,
-                    provider_config=provider_configs.get(info.replica_id))
+                try:
+                    url = info._resolve_url(  # pylint: disable=protected-access
+                        cluster_record=cluster_record,
+                        handle=handle,
+                        provider_config=provider_configs.get(info.replica_id))
+                except Exception as error:  # pylint: disable=broad-except
+                    if is_capable:
+                        self._replica_manager.retire_system_recovery_route(info)
+                    logger.warning(
+                        'Replica %s endpoint resolution failed; withholding '
+                        'only this route: %s', info.replica_id,
+                        common_utils.format_exception(error))
+                    return False
                 if url is None:
                     # A replica can be READY while its endpoint is briefly
                     # unresolvable (e.g. the cluster record has no head IP
@@ -981,7 +1014,7 @@ class SkyServeController:
                     logger.warning(f'Replica {info.replica_id} is READY but '
                                    'its endpoint is not resolvable yet; '
                                    'skipping for this sync.')
-                    return
+                    return True
                 # gpu_type/gpu_count are used by instance-aware load
                 # balancing policies. They derive from the replica's
                 # launched accelerators, which are fixed for the replica's
@@ -989,15 +1022,24 @@ class SkyServeController:
                 gpu_type = 'unknown'
                 gpu_count = 1
                 if handle is not None:
-                    accelerators = handle.launched_resources.accelerators
-                    if accelerators:
-                        gpu_type = list(accelerators.keys())[0]
-                        try:
+                    try:
+                        accelerators = handle.launched_resources.accelerators
+                        if accelerators:
+                            gpu_type = list(accelerators.keys())[0]
                             gpu_count = max(1, int(accelerators[gpu_type]))
-                        except (TypeError, ValueError):
-                            gpu_count = 1
+                    except Exception as error:  # pylint: disable=broad-except
+                        if is_capable:
+                            (self._replica_manager.retire_system_recovery_route(
+                                info))
+                        logger.warning(
+                            'Replica %s has malformed launched-resource '
+                            'metadata; withholding only this route: %s',
+                            info.replica_id,
+                            common_utils.format_exception(error))
+                        return False
                 cached = (url, gpu_type, gpu_count)
             route_candidates[id(info)] = cached
+            return True
 
         verified_ready_count = 0
         v2_groups: dict[tuple[str, str], list[tuple[
@@ -1038,8 +1080,10 @@ class SkyServeController:
                         # open makes all endpoint reads use the same captured
                         # physical target.
                         with grouped_infos[0][1]:
+                            verified_count = 0
                             for info, _ in grouped_infos:
-                                _resolve_route_candidate(info)
+                                if _resolve_route_candidate(info):
+                                    verified_count += 1
                     except exceptions.KubernetesPhysicalClusterIdentityError as e:
                         # Treat the group as one coherent snapshot: a provider
                         # fence failure invalidates candidates resolved earlier
@@ -1049,14 +1093,14 @@ class SkyServeController:
                             identity_rejected_ids.add(id(info))
                             _retire_unverified_route(info, e)
                         continue
-                    verified_ready_count += len(grouped_infos)
+                    verified_ready_count += verified_count
 
         if legacy_infos:
             with provider_phase.provider_phase(
                     provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
                 for info in legacy_infos:
-                    verified_ready_count += 1
-                    _resolve_route_candidate(info)
+                    if _resolve_route_candidate(info):
+                        verified_ready_count += 1
 
         for info in ready_infos:
             cached = route_candidates.get(id(info))

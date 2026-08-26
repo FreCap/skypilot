@@ -222,7 +222,7 @@ def _authority():
 def _atomic_specs(engine, count=1, *, image_id=None, authority=None):
     if authority is None:
         authority = _authority()
-    serve_state.verify_service_owner_user_id(authority, _CREATOR_ID,
+    serve_state.attest_service_owner_user_id(authority, _CREATOR_ID,
                                              _CREATOR_NAME)
     _publish_fresh_provider_proof(engine)
     _, snapshot = _commit_evidence(engine)
@@ -270,6 +270,8 @@ def _atomic_specs(engine, count=1, *, image_id=None, authority=None):
         selected_location = intent.allowed_locations[0].to_location()
         info.location = selected_location.to_pickleable()
         info.resources_override = selected_location.to_dict()
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.RUNNING)
         launch_context = {
             serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: _SERVICE,
             serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: _SERVICE_HASH,
@@ -307,7 +309,8 @@ def _atomic_specs(engine, count=1, *, image_id=None, authority=None):
                     str(replica_id)),
                 authority=authority,
                 replica_info=info,
-                actuation_lease=lease))
+                actuation_lease=lease,
+                launch_limit=max(1, count)))
     return tuple(specs)
 
 
@@ -637,10 +640,10 @@ def test_failed_teardown_present_ambiguity_authorizes_cleanup_marker(
     replica_managers.terminate_bound_non_pool_provider_present_cluster(
         context, persisted, authority,
         functools.partial(service._project_bound_ordinary_launch_for_teardown,
-                          authority), persisted.cluster_name, 'cleanup.log')
+                          authority), persisted.cluster_name)
 
     assert len(terminated) == 1
-    assert terminated[0][0][:2] == (persisted.cluster_name, 'cleanup.log')
+    assert terminated[0][0] == (persisted.cluster_name,)
     assert cleanup_reads == ['physical-cluster-uid', 'replica-presence']
     with atomic_database.connect() as connection:
         association = connection.execute(
@@ -1030,22 +1033,23 @@ def test_serve056_retains_json_only_rows_but_rejects_new_old_writer_rows(
                     replica_state=new_state))
 
 
-def test_serve058_removes_owner_transition_symbols(atomic_database) -> None:
+def test_serve059_exposes_only_owner_attestation_symbol(
+        atomic_database) -> None:
     del atomic_database
-    assert not hasattr(serve_state, 'attest_service_owner_user_id')
+    assert hasattr(serve_state, 'attest_service_owner_user_id')
     assert not hasattr(serve_state,
                        'service_owner_attestation_transition_active')
-    assert hasattr(serve_state, 'verify_service_owner_user_id')
+    assert not hasattr(serve_state, 'verify_service_owner_user_id')
 
 
-def test_service_owner_verification_is_read_only_and_restart_safe(
+def test_service_owner_attestation_is_idempotent_and_restart_safe(
         atomic_database) -> None:
     authority = _authority()
     before = _owner_tuple(atomic_database)
     assert before == (_CREATOR_ID, _CREATOR_NAME)
-    serve_state.verify_service_owner_user_id(authority, _CREATOR_ID,
+    serve_state.attest_service_owner_user_id(authority, _CREATOR_ID,
                                              _CREATOR_NAME)
-    serve_state.verify_service_owner_user_id(authority, _CREATOR_ID,
+    serve_state.attest_service_owner_user_id(authority, _CREATOR_ID,
                                              _CREATOR_NAME)
     assert _owner_tuple(atomic_database) == before
     assert serve_state.get_service_names_owned_by_user_id(_CREATOR_ID) == [
@@ -1171,12 +1175,13 @@ def test_service_owner_verification_fails_closed(atomic_database,
                 sqlalchemy.delete(global_user_state_schema.user_table).where(
                     global_user_state_schema.user_table.c.id == _CREATOR_ID))
     with pytest.raises(serve_state.ServiceOwnerAuthorityError):
-        serve_state.verify_service_owner_user_id(authority, owner_id,
+        serve_state.attest_service_owner_user_id(authority, owner_id,
                                                  owner_name)
     assert _owner_tuple(atomic_database) == expected_owner
 
 
-def test_missing_owner_tuple_is_never_auto_repaired(atomic_database) -> None:
+def test_missing_owner_tuple_is_attested_under_controller_fence(
+        atomic_database) -> None:
     with atomic_database.begin() as connection:
         connection.execute(
             sqlalchemy.text('DROP TRIGGER skyserve055_service_owner_guard '
@@ -1195,11 +1200,9 @@ def test_missing_owner_tuple_is_never_auto_repaired(atomic_database) -> None:
                 serve_state_schema.services_table.c.name == _SERVICE).values(
                     owner_user_id=None, owner_user_name=None))
 
-    with pytest.raises(serve_state.ServiceOwnerAuthorityError,
-                       match='does not match'):
-        serve_state.verify_service_owner_user_id(_authority(), _CREATOR_ID,
-                                                 _CREATOR_NAME)
-    assert _owner_tuple(atomic_database) == (None, None)
+    serve_state.attest_service_owner_user_id(_authority(), _CREATOR_ID,
+                                             _CREATOR_NAME)
+    assert _owner_tuple(atomic_database) == (_CREATOR_ID, _CREATOR_NAME)
 
 
 @pytest.mark.parametrize('rejection', [
@@ -1961,7 +1964,7 @@ def test_remove_service_completely_removes_intent_linked_replica_graph(
     replica_managers.terminate_bound_non_pool_provider_present_cluster(
         context, persisted, authority,
         functools.partial(service._project_bound_ordinary_launch_for_teardown,
-                          authority), persisted.cluster_name, 'cleanup.log')
+                          authority), persisted.cluster_name)
 
     assert serve_state.remove_service_completely(
         _SERVICE,
@@ -2730,16 +2733,32 @@ def test_competing_distinct_lineages_finish_without_deadlock(
     specs = _atomic_specs(atomic_database, 2)
 
     def transact(spec):
-        return reserved_fill_admission._transaction(spec,
-                                                    7,
-                                                    require_existing=False)
+        try:
+            return reserved_fill_admission._transaction(spec,
+                                                        7,
+                                                        require_existing=False)
+        except reserved_fill_admission._Rejected:
+            # The transaction-scoped global mutation gate is deliberately
+            # nonblocking. A simultaneous distinct lineage may defer, then
+            # succeed on the next controller tick/retry.
+            return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(transact, spec) for spec in specs]
         outcomes = [future.result(timeout=15) for future in futures]
 
-    assert len(outcomes) == 2
-    assert {receipt.replica_id for _, receipt in outcomes} == {1, 2}
+    committed = {
+        receipt.replica_id for outcome in outcomes if outcome is not None
+        for _, receipt in [outcome]
+    }
+    assert committed
+    for spec in specs:
+        if spec.replica_info.replica_id in committed:
+            continue
+        _, receipt = reserved_fill_admission._transaction(
+            spec, 7, require_existing=False)
+        committed.add(receipt.replica_id)
+    assert committed == {1, 2}
     with atomic_database.connect() as connection:
         assert _suffix_counts(connection) == (2, 2, 2, 2, 2)
 

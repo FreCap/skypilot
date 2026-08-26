@@ -3,6 +3,7 @@ import base64
 import collections
 from collections.abc import Callable
 from collections.abc import Iterator
+from collections.abc import Mapping
 import concurrent.futures
 import contextlib
 import contextvars
@@ -68,7 +69,7 @@ from sky.utils import log_utils
 from sky.utils import message_utils
 from sky.utils import resources_utils
 from sky.utils import status_lib
-from sky.utils import subprocess_utils
+from sky.utils import thread_utils
 from sky.utils import ux_utils
 from sky.utils import yaml_utils
 from sky.utils.db import db_utils
@@ -301,10 +302,9 @@ def _find_ha_recovery_controller_launch_index(lines: list[str]) -> int:
             continue
         if not tokens:
             continue
-        module_pair_count = sum(
-            token == '-m' and index +
-            1 < len(tokens) and tokens[index + 1] == 'sky.serve.service'
-            for index, token in enumerate(tokens))
+        module_pair_count = sum(token == '-m' and index + 1 < len(tokens) and
+                                tokens[index + 1] == 'sky.serve.service'
+                                for index, token in enumerate(tokens))
         if module_pair_count != 1:
             continue
         direct_python = (_HA_RECOVERY_PYTHON_EXECUTABLE_RE.fullmatch(
@@ -554,7 +554,9 @@ class _ClusterYamlHandle(typing.Protocol):
 
 
 def get_provider_configs_for_handles(
-    handles_by_key: 'typing.Mapping[Any, _ClusterYamlHandle | None]'
+    handles_by_key: 'typing.Mapping[Any, _ClusterYamlHandle | None]',
+    *,
+    failed_keys: set[Any] | None = None,
 ) -> dict[Any, dict[str, Any]]:
     """Fetch provider configs once per unique cluster YAML path.
 
@@ -568,8 +570,18 @@ def get_provider_configs_for_handles(
     for key, handle in handles_by_key.items():
         if handle is None:
             continue
-        cluster_yaml = handle.cluster_yaml
+        try:
+            cluster_yaml = handle.cluster_yaml
+        except Exception as error:  # pylint: disable=broad-except
+            if failed_keys is not None:
+                failed_keys.add(key)
+            logger.warning(
+                'Deferring Serve provider operations for handle %r: %s', key,
+                common_utils.format_exception(error))
+            continue
         if not isinstance(cluster_yaml, str):
+            if failed_keys is not None:
+                failed_keys.add(key)
             continue
         if cluster_yaml not in keys_by_yaml:
             yaml_paths.append(cluster_yaml)
@@ -578,14 +590,51 @@ def get_provider_configs_for_handles(
     if not yaml_paths:
         return {}
 
-    yaml_configs = global_user_state.get_cluster_yaml_dict_multiple(yaml_paths)
-    provider_configs_by_yaml = {
-        yaml_path: config['provider']
-        for yaml_path, config in zip(yaml_paths, yaml_configs, strict=True)
-    }
+    try:
+        yaml_strings = list(
+            global_user_state.get_cluster_yaml_str_multiple(yaml_paths))
+        if len(yaml_strings) != len(yaml_paths):
+            raise ValueError('batched cluster YAML result length mismatch')
+    except Exception as batch_error:  # pylint: disable=broad-except
+        # Preserve one-query behavior in the healthy path.  Only a failed
+        # batch falls back to isolated reads so one missing/file-migration
+        # error cannot black out unrelated YAML partitions.
+        logger.warning(
+            'Batched Serve provider-config read failed; retrying '
+            'each unique YAML independently: %s',
+            common_utils.format_exception(batch_error))
+        yaml_strings = []
+        for yaml_path in yaml_paths:
+            try:
+                yaml_strings.append(
+                    global_user_state.get_cluster_yaml_str(yaml_path))
+            except Exception:  # pylint: disable=broad-except
+                yaml_strings.append(None)
+
+    provider_configs_by_yaml: dict[str, dict[str, Any]] = {}
+    for yaml_path, yaml_string in zip(yaml_paths, yaml_strings, strict=True):
+        try:
+            if not isinstance(yaml_string, str):
+                raise ValueError('cluster YAML is unavailable')
+            config = yaml_utils.safe_load(yaml_string)
+            if not isinstance(config, dict):
+                raise ValueError('cluster YAML root is not a mapping')
+            provider_config = config.get('provider')
+            if not isinstance(provider_config, dict):
+                raise ValueError('cluster YAML provider is not a mapping')
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                'Deferring Serve provider operations for cluster '
+                'YAML %r: %s', yaml_path, common_utils.format_exception(error))
+            continue
+        provider_configs_by_yaml[yaml_path] = provider_config
     provider_configs: dict[Any, dict[str, Any]] = {}
     for yaml_path, keys in keys_by_yaml.items():
-        provider_config = provider_configs_by_yaml[yaml_path]
+        provider_config = provider_configs_by_yaml.get(yaml_path)
+        if provider_config is None:
+            if failed_keys is not None:
+                failed_keys.update(keys)
+            continue
         for key in keys:
             provider_configs[key] = provider_config
     return provider_configs
@@ -704,8 +753,8 @@ class ServiceComponentTarget:
 
     def __post_init__(self):
         """Validate that replica_id is only provided for REPLICA component."""
-        if (self.component == ServiceComponent.REPLICA) != (self.replica_id
-                                                            is None):
+        if (self.component
+                == ServiceComponent.REPLICA) != (self.replica_id is None):
             raise ValueError(
                 'replica_id must be specified if and only if component is '
                 'REPLICA.')
@@ -1264,8 +1313,8 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                 recovery_snapshot = current_snapshot
                 if (runtime_profile.guarded_ha_ephemeral_artifacts_enabled() and
                     (not current_snapshot.get('config_protocol_active') or
-                     current_snapshot.get('controller_config_snapshot')
-                     is None)):
+                     current_snapshot.get('controller_config_snapshot') is None)
+                   ):
                     f.write(f'{capnoun} {service_name} has no complete '
                             'PostgreSQL controller recovery snapshot; guarded '
                             'HA will not use a predecessor-local or embedded '
@@ -2002,8 +2051,8 @@ def secure_staged_controller_config(config_path: str,
             raise RuntimeError('Staged controller config snapshot is not a '
                                'regular file.')
         if (pre_open_stat is not None and
-            (pre_open_stat.st_dev, pre_open_stat.st_ino)
-                != (staged_stat.st_dev, staged_stat.st_ino)):
+            (pre_open_stat.st_dev, pre_open_stat.st_ino) !=
+            (staged_stat.st_dev, staged_stat.st_ino)):
             raise RuntimeError('Staged controller config snapshot changed '
                                'while it was being opened.')
         if staged_stat.st_size > 1024 * 1024:
@@ -2521,14 +2570,6 @@ def generate_replica_launch_log_file_name(
     dir_name = generate_remote_service_dir_name(service_name, resource_scope)
     dir_name = os.path.expanduser(dir_name)
     return os.path.join(dir_name, f'replica_{replica_id}_launch.log')
-
-
-def generate_replica_log_file_name(service_name: str,
-                                   replica_id: int,
-                                   resource_scope: str | None = None) -> str:
-    dir_name = generate_remote_service_dir_name(service_name, resource_scope)
-    dir_name = os.path.expanduser(dir_name)
-    return os.path.join(dir_name, f'replica_{replica_id}.log')
 
 
 def generate_replica_cluster_name(service_name: str,
@@ -3387,10 +3428,28 @@ def _provider_uncertain_replica_status(info: Any,
                                        strip_placement_metadata: bool = False
                                       ) -> dict[str, Any]:
     """Serialize durable fields only; no provider or replacement metadata."""
-    replica_record = info.to_info_dict(with_handle=True,
-                                       with_url=False,
-                                       cluster_record=None,
-                                       rate_cache=None)
+    try:
+        replica_record = info.to_info_dict(with_handle=True,
+                                           with_url=False,
+                                           cluster_record=None,
+                                           rate_cache=None)
+    except Exception as error:  # pylint: disable=broad-except
+        # Corrupt presentation data must not make the fail-closed fallback
+        # call the same failing serializer again and black out every peer.
+        # These are direct durable fields; provider-derived fields are
+        # deliberately absent/unknown.
+        logger.warning(
+            'Using minimal durable status for replica %s after serialization '
+            'failed: %s', getattr(info, 'replica_id', '<unknown>'),
+            common_utils.format_exception(error))
+        replica_record = {
+            'replica_id': getattr(info, 'replica_id', None),
+            'replica_record_id': getattr(info, 'replica_record_id', None),
+            'name': getattr(info, 'cluster_name', '<unknown>'),
+            'version': getattr(info, 'version', None),
+            'is_spot': getattr(info, 'is_spot', None),
+            'status': serve_state.ReplicaStatus.UNKNOWN,
+        }
     return _sanitize_provider_uncertain_status(
         replica_record, strip_placement_metadata=strip_placement_metadata)
 
@@ -3430,6 +3489,31 @@ def _uncertain_results(
             for prepared, info in entries]
 
 
+def _serialize_status_entries_with_row_isolation(
+    entries: list[_PreparedReplicaStatus],
+) -> list[tuple[_PreparedServiceStatus, int, dict[str, Any]]]:
+    """Serialize rows independently while preserving phase/fence failures."""
+    results = []
+    for prepared, info in entries:
+        try:
+            replica_record = _serialize_prepared_replica(prepared, info)
+        # pylint: disable-next=try-except-raise
+        except (exceptions.KubernetesPhysicalClusterIdentityError,
+                exceptions.ProviderPhaseError):
+            # These are authority/phase facts shared by the surrounding
+            # partition and must retain its coherent fail-closed handling.
+            raise
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                'Service status could not serialize replica %s; withholding '
+                'only that row: %s', info.replica_id,
+                common_utils.format_exception(error))
+            replica_record = _provider_uncertain_replica_status(
+                info, strip_placement_metadata=True)
+        results.append((prepared, info.replica_id, replica_record))
+    return results
+
+
 def _serialize_v2_status_group(
     entries: list[_PreparedReplicaStatus],
     admission: provider_phase.ProviderPhaseAdmission | None = None,
@@ -3449,9 +3533,7 @@ def _serialize_v2_status_group(
             with reserved_capacity.protocol_v2_provider_fence(
                     representative, representative_prepared.validated_handles[
                         representative.replica_id]):
-                return [(prepared, info.replica_id,
-                         _serialize_prepared_replica(prepared, info))
-                        for prepared, info in entries]
+                return _serialize_status_entries_with_row_isolation(entries)
     except exceptions.KubernetesPhysicalClusterIdentityError as error:
         logger.warning(
             'Service status fenced off a protocol-v2 provider partition: %s',
@@ -3461,6 +3543,12 @@ def _serialize_v2_status_group(
         logger.warning(
             'Service status timed out joining a protocol-v2 provider phase: '
             '%s', common_utils.format_exception(error))
+        return _uncertain_results(entries, strip_placement_metadata=True)
+    except Exception as error:  # pylint: disable=broad-except
+        logger.warning(
+            'Service status could not serialize one protocol-v2 provider '
+            'partition; withholding only that partition: %s',
+            common_utils.format_exception(error))
         return _uncertain_results(entries, strip_placement_metadata=True)
 
 
@@ -3475,12 +3563,16 @@ def _serialize_ordinary_status_partition(
         if admission is None else provider_phase.join_provider_phase(admission))
     try:
         with join_context:
-            return [(prepared, info.replica_id,
-                     _serialize_prepared_replica(prepared, info))
-                    for prepared, info in entries]
+            return _serialize_status_entries_with_row_isolation(entries)
     except exceptions.ProviderPhaseTimeoutError as error:
         logger.warning(
             'Service status fenced off an ambient provider partition: %s',
+            common_utils.format_exception(error))
+        return _uncertain_results(entries, strip_placement_metadata=True)
+    except Exception as error:  # pylint: disable=broad-except
+        logger.warning(
+            'Service status could not serialize one ambient provider '
+            'partition; withholding only that partition: %s',
             common_utils.format_exception(error))
         return _uncertain_results(entries, strip_placement_metadata=True)
 
@@ -3559,6 +3651,13 @@ def _serialize_prepared_statuses_synchronously(
             _mark_phase_timeout(v2_groups.values(),
                                 provider_phase.ProviderPhaseMode.V2_FENCED,
                                 error)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                'Service status could not enter the v2 provider '
+                'phase: %s', common_utils.format_exception(error))
+            for entries in v2_groups.values():
+                _store_serialized_results(
+                    _uncertain_results(entries, strip_placement_metadata=True))
 
     ordinary_partitions = _ordinary_status_partitions(prepared_statuses)
     if ordinary_partitions:
@@ -3572,26 +3671,39 @@ def _serialize_prepared_statuses_synchronously(
             _mark_phase_timeout(ordinary_partitions,
                                 provider_phase.ProviderPhaseMode.AMBIENT_LEGACY,
                                 error)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                'Service status could not enter the ambient '
+                'provider phase: %s', common_utils.format_exception(error))
+            for entries in ordinary_partitions:
+                _store_serialized_results(
+                    _uncertain_results(entries, strip_placement_metadata=True))
 
 
 def _run_status_phase_fanout(
     work: list[list[_PreparedReplicaStatus]],
     worker: Callable[
         [list[_PreparedReplicaStatus], provider_phase.ProviderPhaseAdmission],
-        list[tuple[_PreparedServiceStatus, int, dict[str, Any]]],
-    ],
+        list[tuple[_PreparedServiceStatus, int, dict[str, Any]]],],
     admission: provider_phase.ProviderPhaseAdmission,
     parent_ctx: contextvars.Context,
 ) -> None:
     """Run and fully join one admitted status-provider fanout."""
     max_workers = min(len(work), _STATUS_FANOUT_MAX_WORKERS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [
-            ex.submit(parent_ctx.copy().run, worker, entries, admission)
-            for entries in work
-        ]
-        for future in futures:
-            _store_serialized_results(future.result())
+        futures = [(ex.submit(parent_ctx.copy().run, worker, entries,
+                              admission), entries) for entries in work]
+        for future, entries in futures:
+            try:
+                results = future.result()
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning(
+                    'Service status provider fanout failed for one partition; '
+                    'withholding only that partition: %s',
+                    common_utils.format_exception(error))
+                results = _uncertain_results(entries,
+                                             strip_placement_metadata=True)
+            _store_serialized_results(results)
 
 
 def _serialize_prepared_statuses_with_fanout(
@@ -3612,6 +3724,13 @@ def _serialize_prepared_statuses_with_fanout(
             _mark_phase_timeout(v2_work,
                                 provider_phase.ProviderPhaseMode.V2_FENCED,
                                 error)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                'Service status could not enter the v2 provider '
+                'phase: %s', common_utils.format_exception(error))
+            for entries in v2_work:
+                _store_serialized_results(
+                    _uncertain_results(entries, strip_placement_metadata=True))
 
     ordinary_work = _ordinary_status_partitions(prepared_statuses)
     if ordinary_work:
@@ -3625,6 +3744,13 @@ def _serialize_prepared_statuses_with_fanout(
             _mark_phase_timeout(ordinary_work,
                                 provider_phase.ProviderPhaseMode.AMBIENT_LEGACY,
                                 error)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                'Service status could not enter the ambient '
+                'provider phase: %s', common_utils.format_exception(error))
+            for entries in ordinary_work:
+                _store_serialized_results(
+                    _uncertain_results(entries, strip_placement_metadata=True))
 
 
 def _finalize_prepared_service_status(
@@ -3769,8 +3895,6 @@ def get_service_status_pickled(
     # can't be entered from multiple threads (Context.run raises
     # RuntimeError otherwise) — but the values (request_id / user_id)
     # are inherited so log redirection still works inside workers.
-    # `ex.map` preserves the existing failure contract (first failure
-    # aborts the whole call).
     parent_ctx = contextvars.copy_context()
 
     def _run_in_context(name: str) -> _PreparedServiceStatus | None:
@@ -3796,7 +3920,22 @@ def get_service_status_pickled(
 
     max_workers = min(len(service_names), _STATUS_FANOUT_MAX_WORKERS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        prepared_statuses = list(ex.map(_run_in_context, service_names))
+        futures = [
+            (name, ex.submit(_run_in_context, name)) for name in service_names
+        ]
+        prepared_statuses = []
+        for name, future in futures:
+            try:
+                prepared_statuses.append(future.result())
+            except Exception as error:  # pylint: disable=broad-except
+                # A malformed service/replica snapshot is not evidence about
+                # any peer service. Keep the dashboard/status batch available
+                # for healthy services; the failed service is retried on the
+                # next poll.
+                logger.warning(
+                    'Service status preparation failed for %r; omitting only '
+                    'that service from this snapshot: %s', name,
+                    common_utils.format_exception(error))
     live_prepared = [
         prepared for prepared in prepared_statuses if prepared is not None
     ]
@@ -4186,6 +4325,188 @@ def _purge_ownership_failure(service_name: str, detail: str) -> str:
             f'{colorama.Style.RESET_ALL}')
 
 
+def run_bounded_serve_teardown_threads(
+    work: list[tuple[Any, thread_utils.SafeThread]],
+    *,
+    pool: bool,
+    reserve_running: Callable[[list[Any], int], Mapping[int, Any]],
+    restore_never_started: Callable[[Any], Any | None],
+    handle_success: Callable[[Any], None],
+    handle_failure: Callable[[Any, str | None], None],
+    continue_guard: Callable[[], bool],
+    max_concurrent_per_service: int,
+    poll_interval_seconds: float = 3,
+    max_no_progress_polls: int = 20,
+) -> None:
+    """Run provider teardown with one durable cross-pod admission budget.
+
+    Every candidate must already carry durable ``SCHEDULED`` or ``RUNNING``
+    teardown intent. ``reserve_running`` atomically counts and changes an
+    exact bounded SCHEDULED batch to RUNNING on the transaction owning mutation
+    authority.  A RUNNING row reconstructed after process loss is already
+    charged to D and is adopted without another reservation.  Only a row this
+    invocation received from ``reserve_running`` may be restored after a
+    provably identity-less ``Thread.start()`` failure.  Launch saturation is
+    deliberately irrelevant to this cost-cleanup budget.
+    """
+    if type(max_no_progress_polls) is not int or max_no_progress_polls < 1:
+        raise ValueError('Serve teardown no-progress bound must be positive.')
+
+    def _replica_identity(info: Any) -> tuple[int, str]:
+        replica_id = getattr(info, 'replica_id', None)
+        if (isinstance(replica_id, bool) or not isinstance(replica_id, int) or
+                replica_id < 0):
+            raise ValueError('Serve teardown requires a nonnegative integer '
+                             'replica ID.')
+        replica_record_id = getattr(info, 'replica_record_id', None)
+        if not isinstance(replica_record_id, str):
+            raise ValueError('Serve teardown requires a canonical replica '
+                             'record UUID.')
+        try:
+            parsed_record_id = uuid.UUID(replica_record_id)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError('Serve teardown requires a canonical replica '
+                             'record UUID.') from error
+        if str(parsed_record_id) != replica_record_id:
+            raise ValueError('Serve teardown requires a canonical replica '
+                             'record UUID.')
+        return replica_id, replica_record_id
+
+    pending: dict[tuple[int, str], tuple[Any, thread_utils.SafeThread]] = {}
+    for info, worker in work:
+        identity = _replica_identity(info)
+        if identity in pending:
+            raise ValueError('Serve teardown work contains duplicate replica '
+                             f'identity {identity!r}.')
+        pending[identity] = (info, worker)
+    effective_infos: dict[tuple[int, str], Any] = {}
+    no_progress_polls = 0
+    while pending:
+        made_progress = False
+        if not continue_guard():
+            raise RuntimeError('Serve teardown ownership was lost.')
+        scheduled: list[tuple[tuple[int, str], Any,
+                              thread_utils.SafeThread]] = []
+        running_to_adopt: list[tuple[tuple[int, str], Any,
+                                     thread_utils.SafeThread]] = []
+        concurrent_workers = 0
+        for identity, (info, worker) in list(pending.items()):
+            effective_info = effective_infos.get(identity)
+            if effective_info is None:
+                effective_info = info
+            if worker.is_alive():
+                concurrent_workers += 1
+                continue
+            if (effective_info.status_property.sky_down_status ==
+                    common_utils.ProcessStatus.SCHEDULED):
+                scheduled.append((identity, effective_info, worker))
+                continue
+            if (worker.ident is None and
+                    effective_info.status_property.sky_down_status
+                    == common_utils.ProcessStatus.RUNNING):
+                # This is durable work inherited from a lost process or an
+                # ambiguous commit acknowledgement.  Teardown is idempotent;
+                # RUNNING already consumes D and must be adopted, never
+                # rewritten to SCHEDULED merely because this new SafeThread
+                # has no native identity yet.
+                running_to_adopt.append((identity, effective_info, worker))
+                continue
+            worker.join()
+            del pending[identity]
+            effective_infos.pop(identity, None)
+            made_progress = True
+            if worker.format_exc is None:
+                handle_success(effective_info)
+            else:
+                handle_failure(effective_info, worker.format_exc)
+        available = max(0, max_concurrent_per_service - concurrent_workers)
+        for _, effective_info, worker in running_to_adopt[:available]:
+            if not continue_guard():
+                raise RuntimeError('Serve teardown ownership was lost '
+                                   'during RUNNING adoption.')
+            try:
+                worker.start()
+            except BaseException as error:  # pylint: disable=broad-except
+                # Inherited RUNNING is not proof that this process created the
+                # reservation.  Retain it on every identity-less failure; the
+                # next retry adopts the same idempotent teardown again.
+                if not isinstance(error, Exception):
+                    raise
+                logger.warning(
+                    'Could not adopt durable RUNNING teardown for replica '
+                    '%s; retaining its charged reservation: %s',
+                    effective_info.replica_id,
+                    common_utils.format_exception(error))
+            else:
+                concurrent_workers += 1
+                made_progress = True
+        if scheduled:
+            available = max(0, max_concurrent_per_service - concurrent_workers)
+            selected = scheduled[:available]
+            if selected:
+                if not continue_guard():
+                    raise RuntimeError('Serve teardown ownership was lost '
+                                       'during admission.')
+                reserved = reserve_running(
+                    [info for _, info, _ in selected],
+                    controller_utils.get_serve_termination_limit(pool))
+                for identity, info, worker in selected:
+                    reserved_info = reserved.get(info.replica_id)
+                    if reserved_info is None:
+                        continue
+                    if _replica_identity(reserved_info) != identity:
+                        raise RuntimeError(
+                            'Serve teardown reservation changed exact replica '
+                            f'identity {identity!r}.')
+                    effective_infos[identity] = reserved_info
+                    try:
+                        worker.start()
+                    except BaseException as error:  # pylint: disable=broad-except
+                        # An asynchronous BaseException can land after the OS
+                        # thread starts but before ``ident`` is observable.
+                        # It is never proof that provider work did not begin.
+                        if not isinstance(error, Exception):
+                            raise
+                        # ``reserved_info`` is the exact commit receipt from
+                        # this invocation.  It is the only proof permitting a
+                        # RUNNING -> SCHEDULED rollback when start never
+                        # obtained a native identity.
+                        if worker.ident is None:
+                            restored = restore_never_started(reserved_info)
+                            if restored is not None:
+                                if _replica_identity(restored) != identity:
+                                    raise RuntimeError(
+                                        'Serve teardown restoration changed '
+                                        'exact replica identity '
+                                        f'{identity!r}.')
+                                effective_infos[identity] = restored
+                        if worker.ident is not None:
+                            logger.warning(
+                                'Serve teardown worker returned a start '
+                                'error after obtaining a native identity; '
+                                'retaining durable RUNNING evidence: %s',
+                                common_utils.format_exception(error))
+                    else:
+                        concurrent_workers += 1
+                        made_progress = True
+        if pending:
+            # A global/service guard may be transiently busy, but an empty
+            # admission result (or an inherited RUNNING worker that cannot be
+            # adopted) must not hold a purge/controller caller forever.  Live
+            # local workers are observable progress and may legitimately run
+            # longer than this retry horizon.  Otherwise fail closed and leave
+            # every durable row for the caller's normal cleanup retry.
+            if concurrent_workers == 0 and not made_progress:
+                no_progress_polls += 1
+                if no_progress_polls >= max_no_progress_polls:
+                    raise RuntimeError(
+                        'Serve teardown admission made no progress; durable '
+                        'cleanup rows were retained for retry.')
+            else:
+                no_progress_polls = 0
+            time.sleep(poll_interval_seconds)
+
+
 def _begin_service_teardown_if_owner(
     service_name: str,
     expected_service_hash: str,
@@ -4335,8 +4656,8 @@ def quiesce_service_replica_launch_requests(
                     # contract. Protocol v2 cannot create those rows, and
                     # replica creation time excludes reused cluster names.
                     continue
-                if (request.execution_quiesced_generation
-                        != execution_generation or
+                if (request.execution_quiesced_generation !=
+                        execution_generation or
                         request.execution_quiesced_at is None):
                     terminal_unproven[request.request_id] = (
                         execution_generation)
@@ -4406,8 +4727,8 @@ def quiesce_service_replica_launch_requests(
                         f'({request.status})')
                     return False
                 if (request.execution_quiescence_required is not True or
-                        request.execution_quiesced_generation
-                        != expected_generation or
+                        request.execution_quiesced_generation !=
+                        expected_generation or
                         request.execution_quiesced_at is None):
                     waiting.append(request_id)
 
@@ -4744,9 +5065,9 @@ def _terminate_failed_services_locked(
     high_availability = bool(owner.get('lb_ha_enabled'))
     if owner.get('controller_port') != constants.CONTROLLER_TEARDOWN_ACK_PORT:
         recovery_script = serve_state.get_ha_recovery_script(service_name)
-        unrecoverable = (recovery_script is not None and
-                         serve_state.get_latest_committed_version(service_name)
-                         is None)
+        unrecoverable = (
+            recovery_script is not None and
+            serve_state.get_latest_committed_version(service_name) is None)
         if (bound_authority is not None and
             (recovery_script is None or unrecoverable)):
             # The old PID/IP cannot be rewritten in place for a bound service:
@@ -5048,39 +5369,115 @@ def _terminate_failed_services_locked(
         def _terminate_replica_cluster(
             cleanup_target: tuple['replica_managers.ReplicaInfo', Any,
                                   Any | None]
-        ) -> str | None:
-            # Reuse the normal replica down path (sdk.down with retries);
-            # logs go to the replica's log file like a regular teardown.
+        ) -> None:
+            # Reuse the canonical direct core.down path with retries.
             info, cleanup_fence, cleanup_context = cleanup_target
-            log_file_name = generate_replica_log_file_name(
-                service_name, info.replica_id, resource_scope)
-            try:
-                identity = teardown_identities[info.replica_id]
-                terminate_kwargs: dict[str, Any] = {
-                    'continue_guard': _worker_still_owns,
-                    'expected_cluster_record_uuid':
-                        (str(identity.sky_cluster_record_uuid)
-                         if identity is not None else None),
-                }
-                if cleanup_fence is not None:
-                    terminate_kwargs['cleanup_fence'] = cleanup_fence
-                # pylint: disable=protected-access
-                service_lib._terminate_replica_cluster_for_service_cleanup(
-                    service_name, info, cleanup_context, bound_authority,
-                    info.cluster_name, log_file_name, **terminate_kwargs)
-                # pylint: enable=protected-access
-                return None
-            except Exception as e:  # pylint: disable=broad-except
-                logger.error(f'Failed to terminate replica cluster '
-                             f'{info.cluster_name} of failed service '
-                             f'{service_name!r}: '
-                             f'{common_utils.format_exception(e)}')
-                return info.cluster_name
+            identity = teardown_identities[info.replica_id]
+            terminate_kwargs: dict[str, Any] = {
+                'continue_guard': _worker_still_owns,
+                'expected_cluster_record_uuid':
+                    (str(identity.sky_cluster_record_uuid)
+                     if identity is not None else None),
+            }
+            if cleanup_fence is not None:
+                terminate_kwargs['cleanup_fence'] = cleanup_fence
+            # pylint: disable=protected-access
+            service_lib._terminate_replica_cluster_for_service_cleanup(
+                service_name, info, cleanup_context, bound_authority,
+                info.cluster_name, **terminate_kwargs)
+            # pylint: enable=protected-access
 
-        termination_failures = subprocess_utils.run_in_parallel(
-            _terminate_replica_cluster, cleanup_targets)
-        remaining_replica_clusters.extend(
-            name for name in termination_failures if name is not None)
+        cleanup_owner = (owner.get('controller_pid'),
+                         owner.get('controller_ip'))
+
+        def _persist_cleanup(info: 'replica_managers.ReplicaInfo') -> None:
+            persisted = serve_state.add_or_update_replica(
+                service_name,
+                info.replica_id,
+                info,
+                expected_service_hash=expected_service_hash,
+                expected_lifecycle_epoch=lifecycle_epoch,
+                expected_controller_owner=cleanup_owner,
+                expected_replica_exists=True,
+                guard_launch_exclusion=(
+                    serve_state.replica_info_has_binding_excluded_profile(info)
+                ))
+            if not persisted:
+                raise RuntimeError('Failed service cleanup lost exact replica '
+                                   f'{info.replica_id} ownership.')
+
+        def _cleanup_succeeded(info: 'replica_managers.ReplicaInfo') -> None:
+            info.status_property.sky_down_status = (
+                common_utils.ProcessStatus.SUCCEEDED)
+            _persist_cleanup(info)
+
+        def _cleanup_failed(info: 'replica_managers.ReplicaInfo',
+                            reason: str | None) -> None:
+            info.status_property.sky_down_status = (
+                common_utils.ProcessStatus.FAILED)
+            _persist_cleanup(info)
+            remaining_replica_clusters.append(info.cluster_name)
+            suffix = '' if reason is None else f': {reason}'
+            logger.error(
+                'Failed to terminate replica cluster %s of failed '
+                'service %r%s', info.cluster_name, service_name, suffix)
+
+        def _reserve_failed_cleanup(
+            infos: list['replica_managers.ReplicaInfo'],
+            termination_limit: int,
+        ) -> Mapping[int, 'replica_managers.ReplicaInfo']:
+            return serve_state.reserve_replica_teardowns_running_if_capacity(
+                service_name,
+                [(info.replica_id, info.replica_record_id) for info in infos],
+                termination_limit=termination_limit,
+                expected_service_hash=expected_service_hash,
+                expected_lifecycle_epoch=lifecycle_epoch,
+                expected_controller_owner=cleanup_owner)
+
+        def _restore_failed_cleanup(
+            info: 'replica_managers.ReplicaInfo',
+        ) -> 'replica_managers.ReplicaInfo | None':
+            return (
+                serve_state.restore_never_started_replica_teardown_to_scheduled(
+                    service_name,
+                    info.replica_id,
+                    info.replica_record_id,
+                    expected_service_hash=expected_service_hash,
+                    expected_lifecycle_epoch=lifecycle_epoch,
+                    expected_controller_owner=cleanup_owner))
+
+        cleanup_work: list[tuple[Any, thread_utils.SafeThread]] = []
+        for target in cleanup_targets:
+            info = target[0]
+            if (info.status_property.sky_down_status !=
+                    common_utils.ProcessStatus.RUNNING):
+                info.status_property.sky_down_status = (
+                    common_utils.ProcessStatus.SCHEDULED)
+            _persist_cleanup(info)
+            cleanup_work.append(
+                (info,
+                 thread_utils.SafeThread(target=_terminate_replica_cluster,
+                                         args=(target,))))
+        try:
+            run_bounded_serve_teardown_threads(
+                cleanup_work,
+                pool=pool,
+                reserve_running=_reserve_failed_cleanup,
+                restore_never_started=_restore_failed_cleanup,
+                handle_success=_cleanup_succeeded,
+                handle_failure=_cleanup_failed,
+                continue_guard=_still_owns,
+                max_concurrent_per_service=(
+                    replica_managers.MAX_CONCURRENT_DOWNS_PER_SERVICE))
+        except Exception as error:  # pylint: disable=broad-except
+            logger.error(
+                'Failed-service replica teardown admission failed '
+                'closed for %r: %s', service_name,
+                common_utils.format_exception(error))
+            return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
+                    'could not be purged because bounded provider cleanup '
+                    'admission failed; durable cleanup inventory was retained '
+                    f'for retry.{colorama.Style.RESET_ALL}')
 
     if not _still_owns():
         return _purge_ownership_failure(service_name,
@@ -5272,31 +5669,102 @@ def _terminate_orphaned_service_children_impl(
                     f'{common_utils.format_exception(e)}.'
                     f'{colorama.Style.RESET_ALL}')
         termination_failures = list(unresolved_cluster_names)
-        for info, cleanup_fence in to_terminate:
-            if not _still_orphaned():
-                return _purge_ownership_failure(
+
+        def _persist_orphan_cleanup(
+                info: 'replica_managers.ReplicaInfo') -> None:
+            persisted = serve_state.add_or_update_replica(
+                service_name,
+                info.replica_id,
+                info,
+                expected_lifecycle_epoch=lifecycle_epoch,
+                expected_replica_exists=True,
+                guard_launch_exclusion=(
+                    serve_state.replica_info_has_binding_excluded_profile(info)
+                ))
+            if not persisted:
+                raise RuntimeError('Orphan cleanup lost exact replica '
+                                   f'{info.replica_id} ownership.')
+
+        def _terminate_orphan(info: 'replica_managers.ReplicaInfo',
+                              cleanup_fence: Any) -> None:
+            identity = teardown_identities[info.replica_id]
+            terminate_kwargs: dict[str, Any] = {
+                'continue_guard': _still_orphaned,
+                'expected_cluster_record_uuid':
+                    (str(identity.sky_cluster_record_uuid)
+                     if identity is not None else None),
+            }
+            if cleanup_fence is not None:
+                terminate_kwargs['cleanup_fence'] = cleanup_fence
+            replica_managers.terminate_cluster(info.cluster_name,
+                                               **terminate_kwargs)
+
+        def _orphan_cleanup_succeeded(
+                info: 'replica_managers.ReplicaInfo') -> None:
+            info.status_property.sky_down_status = (
+                common_utils.ProcessStatus.SUCCEEDED)
+            _persist_orphan_cleanup(info)
+
+        def _orphan_cleanup_failed(info: 'replica_managers.ReplicaInfo',
+                                   reason: str | None) -> None:
+            info.status_property.sky_down_status = (
+                common_utils.ProcessStatus.FAILED)
+            _persist_orphan_cleanup(info)
+            termination_failures.append(info.cluster_name)
+            suffix = '' if reason is None else f': {reason}'
+            logger.error('Failed to terminate orphan replica cluster %r%s',
+                         info.cluster_name, suffix)
+
+        def _reserve_orphan_cleanup(
+            infos: list['replica_managers.ReplicaInfo'],
+            termination_limit: int,
+        ) -> Mapping[int, 'replica_managers.ReplicaInfo']:
+            return serve_state.reserve_replica_teardowns_running_if_capacity(
+                service_name,
+                [(info.replica_id, info.replica_record_id) for info in infos],
+                termination_limit=termination_limit,
+                expected_lifecycle_epoch=lifecycle_epoch)
+
+        def _restore_orphan_cleanup(
+            info: 'replica_managers.ReplicaInfo',
+        ) -> 'replica_managers.ReplicaInfo | None':
+            return (
+                serve_state.restore_never_started_replica_teardown_to_scheduled(
                     service_name,
-                    'ownership lost before orphan replica cleanup')
-            try:
-                identity = teardown_identities[info.replica_id]
-                terminate_kwargs: dict[str, Any] = {
-                    'continue_guard': _still_orphaned,
-                    'expected_cluster_record_uuid':
-                        (str(identity.sky_cluster_record_uuid)
-                         if identity is not None else None),
-                }
-                if cleanup_fence is not None:
-                    terminate_kwargs['cleanup_fence'] = cleanup_fence
-                replica_managers.terminate_cluster(
-                    info.cluster_name,
-                    generate_replica_log_file_name(service_name,
-                                                   info.replica_id),
-                    **terminate_kwargs)
-            except Exception as e:  # pylint: disable=broad-except
-                logger.error(f'Failed to terminate orphan replica cluster '
-                             f'{info.cluster_name!r}: '
-                             f'{common_utils.format_exception(e)}')
-                termination_failures.append(info.cluster_name)
+                    info.replica_id,
+                    info.replica_record_id,
+                    expected_lifecycle_epoch=lifecycle_epoch))
+
+        orphan_cleanup_work: list[tuple[Any, thread_utils.SafeThread]] = []
+        for info, cleanup_fence in to_terminate:
+            if (info.status_property.sky_down_status !=
+                    common_utils.ProcessStatus.RUNNING):
+                info.status_property.sky_down_status = (
+                    common_utils.ProcessStatus.SCHEDULED)
+            _persist_orphan_cleanup(info)
+            orphan_cleanup_work.append(
+                (info,
+                 thread_utils.SafeThread(target=_terminate_orphan,
+                                         args=(info, cleanup_fence))))
+        try:
+            run_bounded_serve_teardown_threads(
+                orphan_cleanup_work,
+                pool=expected_pool,
+                reserve_running=_reserve_orphan_cleanup,
+                restore_never_started=_restore_orphan_cleanup,
+                handle_success=_orphan_cleanup_succeeded,
+                handle_failure=_orphan_cleanup_failed,
+                continue_guard=_still_orphaned,
+                max_concurrent_per_service=(
+                    replica_managers.MAX_CONCURRENT_DOWNS_PER_SERVICE))
+        except Exception as error:  # pylint: disable=broad-except
+            logger.error(
+                'Orphan replica teardown admission failed closed for '
+                '%r: %s', service_name, common_utils.format_exception(error))
+            return (f'{colorama.Fore.YELLOW}orphaned service '
+                    f'{service_name!r} could not be purged because bounded '
+                    'provider cleanup admission failed; durable child '
+                    f'inventory was retained.{colorama.Style.RESET_ALL}')
         if termination_failures:
             return (f'{colorama.Fore.YELLOW}orphaned service '
                     f'{service_name!r} could not be purged because replica '
@@ -5498,8 +5966,8 @@ def terminate_services(service_names: list[str] | None, purge: bool,
         if (service_status is None or
             (service_status['status']
              not in serve_state.ServiceStatus.failed_statuses() and
-             service_status['status']
-             != serve_state.ServiceStatus.SHUTTING_DOWN) or not purge):
+             service_status['status'] != serve_state.ServiceStatus.SHUTTING_DOWN
+            ) or not purge):
             terminated_service_names.append(f'{service_name!r}')
     if not terminated_service_names:
         messages.append(f'No {noun} to terminate.')
@@ -5854,30 +6322,6 @@ def stream_replica_logs(service_name: str, replica_id: int, follow: bool,
     print(f'{colorama.Fore.YELLOW}Start streaming logs for launching process '
           f'of {repnoun} {replica_id}.{colorama.Style.RESET_ALL}')
     resource_scope = record.get('resource_scope')
-    log_file_name = generate_replica_log_file_name(service_name, replica_id,
-                                                   resource_scope)
-    # The replica_<id>.log file is the post-mortem archive: it's only
-    # populated on the teardown path (terminate_cluster's redirect_log,
-    # or _download_and_stream_logs writing launch_log + ssh'd job logs
-    # into it). A 0-byte file on disk is a teardown-race remnant — e.g.
-    # `terminate_cluster` was invoked on a replica that never came up, so
-    # `ctx.redirect_log` created the file but no log lines were written;
-    # or `_download_and_stream_logs` opened with mode='w' and crashed
-    # before writing. If we trust `os.path.exists` alone, we commit to
-    # the (empty) main log and silently drop the launch log fallback,
-    # making `sky jobs pool logs` return empty for an alive replica.
-    if (os.path.exists(log_file_name) and os.path.getsize(log_file_name) > 0):
-        if tail is not None:
-            lines = common_utils.read_last_n_lines(log_file_name, tail)
-            for line in lines:
-                if not line.endswith('\n'):
-                    line += '\n'
-                print(line, end='', flush=True)
-        else:
-            with open(log_file_name, encoding='utf-8') as f:
-                print(f.read(), flush=True)
-        return ''
-
     launch_log_file_name = generate_replica_launch_log_file_name(
         service_name, replica_id, resource_scope)
     if not os.path.exists(launch_log_file_name):
