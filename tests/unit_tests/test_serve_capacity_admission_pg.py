@@ -1514,7 +1514,7 @@ def test_autoscaling_snapshot_is_one_repeatable_read_generation(
     assert current.receipt_watermark[0]['sequence'] == 2
 
 
-def test_authority_deadline_includes_selected_occupancy_age(capacity_database):
+def test_authority_splits_scale_up_from_occupancy_deadline(capacity_database):
     _, _, route_receipt = capacity_database
     max_age = constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS
     demand_state.ingest_report(
@@ -1529,8 +1529,14 @@ def test_authority_deadline_includes_selected_occupancy_age(capacity_database):
 
     assert snapshot is not None
     authority = snapshot.reconcile_authority
-    assert 0 < (authority.deadline_monotonic -
-                authority.read_started_monotonic) <= 1
+    destructive_window = (authority.deadline_monotonic -
+                          authority.read_started_monotonic)
+    scale_up_window = (authority.scale_up_deadline_monotonic -
+                       authority.read_started_monotonic)
+    assert 0 < destructive_window <= 1
+    assert 1 < scale_up_window <= constants.LB_DEMAND_REPORT_TTL_SECONDS
+    assert authority.deadline_monotonic < (
+        authority.scale_up_deadline_monotonic)
 
 
 def test_logical_retirement_preserves_global_sql_lock_order(capacity_database):
