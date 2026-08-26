@@ -3,8 +3,9 @@
 Last updated: 2026-08-26
 
 Status: **in progress**. The single PostgreSQL-authoritative reserved-capacity
-path has already proved full East occupancy and reclaim. The independent paid
-provider-lifecycle gate is now complete on release `1.1.1513`, PR #1744, merge
+path has proved full East occupancy, reclaim, and synchronized post-fix
+East/PHX convergence. The independent paid provider-lifecycle gate is complete
+on release `1.1.1513`, PR #1744, merge
 `329f6f5a33bab85401fef59b023714b47fb1d5eb`. One atomic PostgreSQL wave
 committed 120 exact Spot debits; provider-native GCP observations then reached
 100 concurrently `RUNNING` one-L4 `g2-standard-4` Spot VMs 3 minutes 41.9
@@ -17,11 +18,13 @@ and GCP censuses agreed. The run's 10,000 stable IDs at concurrency 256 were
 bounded provider-lifecycle stimulus, not model-serving or terminal-ledger
 evidence. The compact immutable record is in the
 [Spot lifecycle evidence bundle](evidence/skyserve-gcp-spot-lifecycle-2026-08-26/README.md).
-Synchronized post-fix East/PHX convergence, the final mixed reserved-plus-paid
-load campaign, terminal request reconciliation, and UI proof remain open under
-the broader
-heterogeneous objective; none is part of the clarified paid Spot lifecycle
-gate. Lifecycle 116 used only PHX's existing externally owned Kueue lane
+The accepted provider-lifecycle gate is specifically at least 100 physical paid
+Spot L4 VMs concurrently provider-`RUNNING`, followed by normal provider and
+PostgreSQL exact-zero teardown; reserved request execution is neither stimulus
+nor evidence for that gate. The final mixed reserved-plus-paid load campaign,
+terminal request reconciliation, UI proof, and takeover proof remain open under
+the broader heterogeneous objective. Lifecycle 116 used only PHX's existing
+externally owned Kueue lane
 without changing scheduler policy, and is now intentionally absent after
 cleanup. Its first production fill exposed a claim-heartbeat ordering defect.
 PR #1746 moved pruning and overlap reads before the five-second reclaim
@@ -34,7 +37,10 @@ protocol-first, owner, version/projection, and complete current-write-set locks
 emit proof observability -> mint exact authorization -> validate/write/commit``.
 Provider proof renewal and all provider I/O remain outside the transaction. No
 nonessential work or contended lock acquisition may run after the short-lived
-authorization is minted.
+authorization is minted. PR #1750 merged this correction as
+`f22c459d53749e0d3a707d45621b633f6528073e`; release `1.1.1519` deployed it as
+Helm revision 639. Eight consecutive observed post-rollout claim/publish rounds
+succeeded without a rejected claim-set heartbeat.
 
 The normal lifecycle-116 teardown then exposed two independent reducer defects.
 First, exact reserved-fill absence reached the common replica projection, but
@@ -115,18 +121,18 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` at merge `9cda37b33c70d6857640537b42db30a71a43f6ac`, including PR #1749's cleanup evidence, PR #1748's exact post-ABSENT retirement, PR #1747's reserved-absence reducer correction, and PR #1746's first claim-heartbeat ordering correction in addition to PRs #1739--#1744. The remaining post-mint PostgreSQL lock-wait correction is implemented and locally qualified in the current change; it is not yet merged or deployed. |
-| Deployed control plane | SkyPilot `1.1.1517`, Helm revision 638. API, controller, and executor roles all use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:26d6de7e77fd85915ca342c32850e2c66fc70d20022af1df1d7ae490195801cd`. Helm storage remains disabled and the namespace has no PVC. |
+| Source base | `origin/improvements` at merge `f22c459d53749e0d3a707d45621b633f6528073e`, including PR #1750's after-lock claim authorization, PR #1749's cleanup evidence, PR #1748's exact post-ABSENT retirement, PR #1747's reserved-absence reducer correction, PR #1746's first claim-heartbeat ordering correction, and PRs #1739--#1744. |
+| Deployed control plane | SkyPilot `1.1.1519`, Helm revision 639. Two API, two controller, and three executor Pods are Ready with zero restarts and all use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:afef5d1ec58af318dc262e2b21bbcb246581e4872d30e94c3077a7646a6e1186`. Helm storage remains disabled and the namespace has no PVC. |
 | Writer protocol | Public API 93, worker projection 10, non-pool capability cohort 12, and async request-ledger protocol 1. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. |
-| Active service | Lifecycle 116 and all of its child authority were removed by the supported fenced purge after PR #1748 deployed. Lifecycle 117, incarnation `3bc2c88b-2c28-40fa-a9d5-482880767b3e`, was then recreated from the canonical PostgreSQL-only spec with paid residual cap 100 to continue heterogeneous qualification. Its first broker allocation observed 345 compatible free GPUs. It is test-only and not yet production-qualified. |
-| Reserved occupancy | The 2026-08-25 23:30 UTC East census found all 328 healthy compatible physical GPUs allocated: research requested 156 and `boltz-l4-fleet` requested the remaining 172. PostgreSQL independently had 172/172 reserved replicas `READY`; compatible free capacity was therefore zero. At 23:38 UTC Kubernetes then recorded exactly 128 distinct SkyPilot Pod preemptions by 16 higher-priority research Pods of eight GPUs each. SkyPilot correctly yielded from 172 to 44 rather than blocking research. As ten short-lived preemptors exited, authenticated observations and allocations advanced in bounded waves from 44 to the exact compatible remainder of 132 (77 A100-80GB and 55 A100), reaching 132/132 `READY` at 2026-08-26 00:01:55 UTC with zero paid capacity. Together with the 188 research GPU requests, that occupied all 320 GPUs on the 40 then-healthy GPU nodes. A later exact 00:29 UTC census found 41 healthy GPU nodes and 328 allocatable GPUs, with 188 requested by `hyperpod-ns-research`, 140 running SkyPilot workers, and no pending SkyPilot worker; PostgreSQL independently reported the same 140 reserved replicas `READY`. Thus newly exposed capacity refilled automatically and all 328 GPUs were again occupied with zero paid capacity. This proves reclaim correctness and 100% eventual refill, while exposing a roughly 24-minute worst observed refill horizon that the provider-phase and bounded-admission work must reduce. |
-| PHX | Lifecycle 117 uses only the unchanged `boltz-research/be -> research-be` lane. At 22:35 UTC PHX had 512 healthy schedulable H200 GPUs, research held 482, and the unchanged Kueue policy exposed exactly 30 slots. SkyPilot first had 29 admitted/Ready workers and one committed pre-provider intent. For that final replica, PostgreSQL committed the intent at 22:43:32, the Pod appeared at 22:43:55, Kueue admitted it at 22:43:56, and the Pod became Ready at 22:44:32. PHX therefore reached exactly 30/30 SkyPilot plus 482 research = 512/512 GPUs, with zero pending research GPU Workloads and no scheduler-policy change. PostgreSQL projected the final replica `READY` only between 22:52:25 and 22:52:40, exposing a separate roughly eight-minute status-freshness lag rather than a capacity/admission failure. |
-| Claim-heartbeat convergence defect | Lifecycle 117 logs show successful exact reclaim-policy proofs followed 7--15 seconds later by rejected claim-set heartbeats. PR #1746 had already moved prune/overlap before ticket mint; the remaining defect is that the broker minted the five-second ticket before entering the PostgreSQL replacement, where protocol-first and lifecycle/service row-lock waits expired it. The current correction passes an authorization callback into the state transaction, locks protocol, owner, immutable version/projection, claim-set/edge rows and the legacy projection, reconstructs exact scope, and only then reads already-renewed PostgreSQL proof receipts. Proof logging completes before the ticket timestamp; the ticket is then immediately validated and written. Ordinary drained boundary failures remain fail-closed and boundary ambiguity remains controller-terminal. The correction changes neither Kueue nor TTL/batch/quantum limits. Focused local tests pass; production requalification remains open. |
+| Active service | Lifecycle 116 and all of its child authority were removed by the supported fenced purge after PR #1748 deployed. Lifecycle 117, incarnation `3bc2c88b-2c28-40fa-a9d5-482880767b3e`, was then recreated from the canonical PostgreSQL-only spec with paid residual cap 100 to continue heterogeneous qualification. Helm revision 639 preserved lifecycle 117 and service version 1 while replacing the control plane. The service is test-only and not yet production-qualified. |
+| Reserved occupancy | At 2026-08-26 23:09--23:13 UTC, East had 328 healthy compatible GPUs on 41 nodes: research requested 45 and 283 `boltz-l4-fleet` Pods requested the exact remainder; all 283 were Running and Ready, with zero free compatible GPU and zero pending research or fleet GPU Pod. PHX had 512 healthy H200 GPUs: research held 482 and the unchanged Kueue policy admitted 30/30 fleet Workloads; all 30 Pods were Running/Ready and PostgreSQL `READY`, with zero pending research GPU Workload. PostgreSQL independently reported exactly 63 A100, 220 A100-80GB, and 30 H200 reserved replicas `READY`, with zero durable intent pending. Thus the same lifecycle occupied East 328/328 and PHX 512/512 without changing scheduler policy. |
+| Reserved readiness projection | For the final PHX replica, PostgreSQL committed the intent at 22:43:32, the Pod appeared at 22:43:55, Kueue admitted it at 22:43:56, and the Pod became Ready at 22:44:32. PostgreSQL projected it `READY` only between 22:52:25 and 22:52:40, exposing a separate roughly eight-minute status-freshness lag rather than a capacity/admission failure. The post-Helm 23:13 UTC census retained the exact 30/30 admission and readiness with no churn. |
+| Claim-heartbeat convergence defect | Resolved in source, deployed, and dark-verified in production. Lifecycle 117 had logged successful exact reclaim-policy proofs followed 7--15 seconds later by rejected claim-set heartbeats because the broker minted the five-second ticket before entering the PostgreSQL replacement and its protocol/lifecycle locks. PR #1750 passes an authorization callback into the state transaction, locks protocol, owner, immutable version/projection, claim-set/edge rows and the legacy projection, reconstructs exact scope, and only then reads already-renewed PostgreSQL proof receipts. Proof logging completes before the ticket timestamp; the ticket is then immediately validated and written. Ordinary drained boundary failures remain fail-closed and boundary ambiguity remains controller-terminal. The correction changes neither Kueue nor TTL/batch/quantum limits. Real-PostgreSQL tests cover waits beyond the ticket lifetime on the affected lock paths. Release `1.1.1519` then produced eight consecutive observed successful claim/publish rounds after controller takeover with no rejected heartbeat. |
 | Reserved teardown projection | Complete. PR #1747 projected all formerly blocked associations and retired 194 rows. PR #1748 normalized current writers to the existing immediate-removal marker and accepted only the exact `1.1.1516` `FAILED/FAILED` shape as an N-1 DB-retirement candidate. Release `1.1.1517` plus the supported orphan purge retired the final two rows through exact PostgreSQL authority and independent owner, record, cluster, and Kueue fences. No provider, Kueue, schema, migration, or manual-cleanup behavior changed. Exact service/control-plane/Kubernetes/GCP zero is production-proven. |
 | PHX access | The controller identity can exact-read the required namespace/queue and manage only worker Pod/Service lifecycle; it cannot list or patch ClusterQueues. The worker ServiceAccount is tokenless and cannot read Pods, queues, or secrets. A historical audit-only group still has an unused broad Kueue LIST grant from platform PR #8800; it is read-only, has no scheduling effect, and is not used or expanded by this rollout. |
-| Paid state at idle | At 18:35:39.315 UTC the service was absent with zero paid rows, claims, waiters, matching GCP VMs, and attributable managed disks. Guard samples at 18:35:39.315, 18:36:19.373, and 18:36:57.577 UTC remained exact zero; independent all-state PostgreSQL and GCP-native censuses agreed before and after the post-test Helm rollout. No current provider billing remains for this service. |
-| Routing and queue | The disposable load-balancer pair was removed with the service and no matching Kubernetes object remains. The lifecycle-115 run attempted all 10,000 stable synthetic IDs at concurrency 256, but used them only as bounded provider-scale stimulus; it is not the separate 10,000-terminal-request ledger proof. A fresh nonzero queued/processing/in-flight/completed UI proof remains part of the final heterogeneous load run. |
+| Paid state at idle | The 23:11--23:12 UTC post-fix census found PostgreSQL paid claims 0, waiters 0, Spot replicas 0, paid-attributed replicas 0, and native provider inventories at zero: AWS across 18 regions had no service instance, open/active Spot request, or tagged volume; GCP had no service instance or disk. No scan errors occurred. Earlier lifecycle-gate exact-zero samples remain in the linked evidence bundle. |
+| Routing and queue | The recreated lifecycle-117 endpoint is Ready with 313/313 reserved replicas. The lifecycle-115 run attempted all 10,000 stable synthetic IDs at concurrency 256, but used them only as bounded provider-scale stimulus; it is not the separate 10,000-terminal-request ledger proof. A fresh nonzero queued/processing/in-flight/completed UI proof remains part of the final heterogeneous load run. |
 | Partial mixed proof | Provider/DB censuses at 2026-08-25 19:45:47.538 and 19:45:56.281 UTC bracketed a 72-request completion wave and both had 44 reserved plus 28 paid replicas all `READY`, the same 28 AWS Spot instances—27 `g6.2xlarge` and one `g6.4xlarge`—and zero on-demand. The wave completed from 19:45:48.956 through 19:45:51.187; every request performed 9.533–12.451 seconds of concurrency-one GPU work, so at least 28 necessarily executed on Spot beside the 44 reserved workers. The Spot instances later fully drained at the provider. |
 | GCP Spot lifecycle proof | Complete on `1.1.1513`. The fixed-120 update completed at 18:23:39.277 UTC. After five fail-closed prospective conflicts while the traffic writer changed telemetry, the sixth attempt atomically committed all 120 debits at 18:25:12.183. Provider-native observations first reached 100 `RUNNING` at 18:28:54.100, then 107, 110, 114, and 117. Every object was GCP Spot `g2-standard-4` with exactly one NVIDIA L4; zero on-demand or non-Spot capacity appeared. The peak 117 VMs were in `asia-northeast3` and `asia-south1`. Normal teardown reached native `RUNNING=0` at 18:35:00.512 and exact all-state zero at 18:35:39.315. |
 | Final load proof | Not complete. The prior run accepted 4,640 requests and observed 4,568 completion markers, but ended with 802 ambiguous submissions. Those identities must not be replayed as a substitute for a fresh exact-ledger run. |
@@ -998,25 +1004,21 @@ and keep only the latest result in the current-state table.
 
 ## Remaining gates
 
-1. If the broader reserved-capacity campaign resumes, recreate the PHX H200
-   service candidate only, then prove the clean current
-   lifecycle reaches 100% of the fresh East denominator and 100% of the PHX
-   capacity actually admitted by the unchanged external Kueue policy. Make no
-   Kueue, Terraform, IAM, or application change. This is deliberately outside
-   the clarified paid Spot lifecycle acceptance run.
-2. Reconcile exactly 10,000 terminal logical requests with no ambiguous,
+The current lifecycle has completed the synchronized reserved-capacity gate:
+East is 328/328 occupied and PHX is 512/512 occupied, with the latter limited
+to the 30 fleet GPUs admitted by unchanged Kueue policy. The independent paid
+Spot lifecycle gate is also complete. Neither gate requires reserved workers to
+execute the Spot lifecycle stimulus. Re-run the paid lifecycle gate only if a
+later source change affects paid launch admission or teardown behavior.
+
+1. Reconcile exactly 10,000 terminal logical requests with no ambiguous,
    missing, failed, or unsettled tail.
-3. Keep a positive Spot-only paid cap in any final recreated service. The
-   independent provider lifecycle gate is already complete: one atomic
-   120-debit wave reached at least 100 provider-running instances and normal
-   down returned the provider census to exact zero. Re-run it only if a later
-   source change invalidates launch admission or teardown behavior.
-4. Capture a nonzero service-UI sample for queued, processing, in-flight, and
+2. Capture a nonzero service-UI sample for queued, processing, in-flight, and
    completed requests, then a fresh idle-zero sample after drain.
-5. Restart/take over the service controller and one controller Pod during the
+3. Restart/take over the service controller and one controller Pod during the
    final load campaign; prove the same service incarnation, no duplicate
    provider effect, renewed receipts, and uninterrupted telemetry.
-6. Re-audit transitional cleanup PRs against current source. PRs #1619 and
+4. Re-audit transitional cleanup PRs against current source. PRs #1619 and
    #1633 are still stacked on historical feature branches; PRs #1660 and #1556
    are currently dirty against `improvements`. Rebase or replace only the
    still-required deletion changes after the exact retained-row and
@@ -1025,11 +1027,11 @@ and keep only the latest result in the current-state table.
    with the complete decision-output fingerprint investigation described
    above.
 
-The clarified paid provider-lifecycle objective is complete. The broader
-heterogeneous production objective remains open until gates 1–5 pass. Gate 6
-is separately required before declaring transition-code and architecture
-cleanup complete; it does not authorize expanding the Kueue or infrastructure
-scope.
+The clarified paid provider-lifecycle objective and synchronized reserved-fill
+objective are complete. The broader heterogeneous production objective remains
+open until gates 1–3 pass. Gate 4 is separately required before declaring
+transition-code and architecture cleanup complete; it does not authorize
+expanding the Kueue or infrastructure scope.
 
 ## Rejected alternatives
 
