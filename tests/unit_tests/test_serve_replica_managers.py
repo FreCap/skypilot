@@ -6141,8 +6141,8 @@ class TestLaunchClusterRetry:
         launch.assert_not_called()
         assert request_ids[1] == 'request-id'
         wait.assert_called_once()
-        assert (wait.call_args.kwargs['api_auth_token_provider'] is
-                replica_managers._required_controller_admin_auth_tokens)
+        assert (wait.call_args.kwargs['api_auth_token_provider']
+                is replica_managers._required_controller_admin_auth_tokens)
 
     def test_reserved_fill_profile_rejects_post_admission_worker_submission(
             self, tmp_path):
@@ -7254,14 +7254,13 @@ class TestUpdateVersionBatchesPriorVersionYamls:
 
         def _get_specs(_service_name, versions):
             return {
-                version:
-                service_spec.SkyServiceSpec(readiness_path='/',
-                                            initial_delay_seconds=0,
-                                            readiness_timeout_seconds=15,
-                                            endpoint_probe_interval_seconds=10,
-                                            lb_stream_timeout_seconds=30,
-                                            min_replicas=1)
-                for version in versions
+                version: service_spec.SkyServiceSpec(
+                    readiness_path='/',
+                    initial_delay_seconds=0,
+                    readiness_timeout_seconds=15,
+                    endpoint_probe_interval_seconds=10,
+                    lb_stream_timeout_seconds=30,
+                    min_replicas=1) for version in versions
             }
 
         with mock.patch.object(replica_managers.serve_state,
@@ -12263,10 +12262,9 @@ class TestLogicalCapacityPlanning:
         mgr._logical_retirement_recovery_deadline = (
             replica_managers.time.monotonic() + 120)
         mgr._wait_for_idle_trackers = {
-            info.replica_id:
-            _wait_for_idle_state(info, mock.Mock(return_value=False),
-                                 replica_managers.time.monotonic() + 300)
-            for info in candidates
+            info.replica_id: _wait_for_idle_state(
+                info, mock.Mock(return_value=False),
+                replica_managers.time.monotonic() + 300) for info in candidates
         }
         mgr._logical_reconcile_snapshot = (
             replica_managers.LogicalReconcileSnapshot(
@@ -12276,7 +12274,9 @@ class TestLogicalCapacityPlanning:
                     survivor.replica_id: survivor.planned_capacity
                 },
                 in_flight_by_replica_id={
-                    **{info.replica_id: 0 for info in candidates},
+                    **{
+                        info.replica_id: 0 for info in candidates
+                    },
                     survivor.replica_id: 0,
                 },
                 unknown_replica_ids=frozenset(),
@@ -12447,10 +12447,10 @@ class TestLogicalCapacityPlanning:
         survivor.version = 2
         mgr._recovering_logical_retirement_ids = {1, 2, 3}
         mgr._wait_for_idle_trackers = {
-            info.replica_id:
-            _wait_for_idle_state(info, mock.Mock(return_value=False),
-                                 replica_managers.time.monotonic() + 300)
-            for info in (outdated, relabelled_a, relabelled_b)
+            info.replica_id: _wait_for_idle_state(
+                info, mock.Mock(return_value=False),
+                replica_managers.time.monotonic() +
+                300) for info in (outdated, relabelled_a, relabelled_b)
         }
         mgr._logical_reconcile_snapshot = (
             replica_managers.LogicalReconcileSnapshot(
@@ -13228,11 +13228,9 @@ class TestLogicalCapacityPlanning:
         mgr._terminate_replica = mock.Mock()
         deadline = replica_managers.time.monotonic() + 300
         mgr._wait_for_idle_trackers = {
-            info.replica_id: _wait_for_idle_state(info,
-                                                  None,
-                                                  deadline,
-                                                  needs_url_resolution=True)
-            for info in retiring
+            info.replica_id: _wait_for_idle_state(
+                info, None, deadline,
+                needs_url_resolution=True) for info in retiring
         }
         provider_fence = mock.MagicMock()
         provider_fence.return_value.__enter__.side_effect = (
@@ -13653,7 +13651,9 @@ class TestLogicalCapacityPlanning:
             version=2,
             observed_slots_by_replica_id={100: 1},
             in_flight_by_replica_id={
-                **{info.replica_id: 0 for info in candidates},
+                **{
+                    info.replica_id: 0 for info in candidates
+                },
                 100: 0,
             })
         mgr._logical_target = (2, 5, 25)
@@ -13681,7 +13681,9 @@ class TestLogicalCapacityPlanning:
             version=2,
             observed_slots_by_replica_id={100: 1},
             in_flight_by_replica_id={
-                **{info.replica_id: 0 for info in candidates}, 100: 0
+                **{
+                    info.replica_id: 0 for info in candidates
+                }, 100: 0
             })
         mgr._logical_target = (2, 5, 25)
         mgr._persist_replica.side_effect = [None] * 19 + [
@@ -14806,8 +14808,8 @@ class TestLogicalCapacityPlanning:
                        replica_url=replica_managers._REPLICA_URL_NOT_PROVIDED):
                 assert logical_retirement == (1, 4, 4)
                 assert replica_info is backends[replica_id]
-                assert (replica_url is
-                        replica_managers._REPLICA_URL_NOT_PROVIDED)
+                assert (replica_url
+                        is replica_managers._REPLICA_URL_NOT_PROVIDED)
                 accepted.append(replica_id)
                 backends[replica_id].status_property.is_scale_down = True
 
@@ -15020,8 +15022,8 @@ class TestLogicalCapacityPlanning:
         else:
             mgr._terminate_replica.assert_not_called()
             assert not retiring.status_property.is_scale_down
-        assert (retiring.status_property.logical_retirement_bounded_deadline is
-                should_terminate)
+        assert (retiring.status_property.logical_retirement_bounded_deadline
+                is should_terminate)
         assert 9 not in mgr._wait_for_idle_trackers
 
     @pytest.mark.parametrize('guard', [
@@ -15525,11 +15527,11 @@ class TestLogicalCapacityPlanning:
         assert (retiring.status_property.sky_down_status ==
                 common_utils.ProcessStatus.RUNNING)
         assert retiring.status_property.logical_retirement_version is None
-        assert (retiring.status_property.logical_retirement_controller_epoch is
-                None)
+        assert (retiring.status_property.logical_retirement_controller_epoch
+                is None)
         assert (retiring.status_property.logical_retirement_generation is None)
-        assert (retiring.status_property.logical_retirement_target_capacity is
-                None)
+        assert (retiring.status_property.logical_retirement_target_capacity
+                is None)
         assert (retiring.status_property.logical_retirement_confirmed_generation
                 is None)
         assert not retiring.status_property.logical_retirement_bounded_deadline
@@ -16746,8 +16748,8 @@ class TestFailedCleanupReconciliation:
                                          common_utils.ProcessStatus.SCHEDULED)
             assert (durable[9].status_property.sky_down_status ==
                     expected_recovered_status)
-            assert (durable[9].status_property.logical_retirement_version is
-                    None)
+            assert (durable[9].status_property.logical_retirement_version
+                    is None)
             assert not durable[9].is_ready
             assert fresh_thread._kwargs['drain_deadline'] == 610
             fresh_thread.is_alive = mock.Mock(return_value=False)
@@ -16943,6 +16945,57 @@ class TestPaidLocationLaunchBudget:
         assert info.status == status
         return info
 
+    def _prepared_paid_wave(self, count=2):
+        paid = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        manager = self._manager({paid: 1.0})
+        manager._service_hash = 'svc-hash'
+        manager._controller_owner = (1, '10.0.0.1')
+        pool_key = paid_capacity.pool_key(paid,
+                                          workspace='default',
+                                          num_nodes=1)
+        budget = paid_capacity.LaunchBudget(
+            remaining_by_location={paid: count},
+            pool_key_by_location={paid: pool_key},
+            states_by_pool_key={},
+            globally_managed=True,
+            service_remaining=count)
+        existing = []
+        prepared = []
+        workers = []
+        for replica_id in range(1, count + 1):
+            info = self._info(
+                replica_id, paid,
+                replica_managers.serve_state.ReplicaStatus.PENDING)
+            info.paid_capacity_pool_key = pool_key
+            worker = mock.Mock()
+            existing.append(info)
+            workers.append(worker)
+            prepared.append(
+                replica_managers._PreparedPaidLaunch(
+                    candidate=paid_capacity.PaidClaimCandidate(
+                        replica_id=replica_id,
+                        replica_info=info,
+                        location=paid,
+                        priority=1),
+                    launch_result=_accepted_launch_result(
+                        replica_id, 1,
+                        replica_managers._ReplicaLaunchFunding.PAID),
+                    launch_thread=worker))
+        return manager, paid, budget, existing, prepared, workers
+
+    @staticmethod
+    def _ambiguous_paid_manager():
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._service_name = 'svc'
+        manager._ordinary_launch_binding_authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=2,
+            generic=True)
+        manager._notify_scale_reconciliation = mock.Mock()
+        manager._install_bound_launch_adopter = mock.Mock(return_value=True)
+        return manager
+
     @pytest.mark.parametrize('is_zero_cost', [False, True])
     def test_accepted_launch_reports_explicit_funding(self, is_zero_cost):
         location = make_location(
@@ -17112,6 +17165,487 @@ class TestPaidLocationLaunchBudget:
         persist.assert_not_called()
         manager._persist_new_replica.assert_not_called()
 
+    def test_paid_authority_physical_wave_commits_once_before_worker_publish(
+            self):
+        paid = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        manager = self._manager({paid: 1.0})
+        manager._service_hash = 'svc-hash'
+        manager._controller_owner = (1, '10.0.0.1')
+        manager._next_replica_id = 1
+        manager._pending_version = None
+        manager._uses_shared_zero_cost_demand_budget = mock.Mock(
+            return_value=False)
+        manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
+        manager._demand_should_skip_saturated_zero_cost = mock.Mock(
+            return_value=False)
+        manager._persist_new_replica = mock.Mock()
+        existing = []
+        pool_key = paid_capacity.pool_key(paid,
+                                          workspace='default',
+                                          num_nodes=1)
+        budget = paid_capacity.LaunchBudget(
+            remaining_by_location={paid: 3},
+            pool_key_by_location={paid: pool_key},
+            states_by_pool_key={},
+            globally_managed=True,
+            service_remaining=3)
+        authority = capacity_admission.PaidLaunchAuthority(
+            service_name='svc',
+            service_hash='svc-hash',
+            generation=8,
+            content_sha256='a' * 64,
+            demand_feed_generation=9,
+            demand_source_epoch=3,
+            paid_residual_by_accelerator=(('l4', 3),),
+            reserved_fill_authority=(
+                capacity_admission.ReservedFillPlanAuthority.not_applicable()))
+        workers = []
+
+        def _make_worker(*_args, **_kwargs):
+            worker = mock.Mock()
+            workers.append(worker)
+            return worker
+
+        def _admit_batch(**kwargs):
+            candidates = kwargs['candidates']
+            assert len(candidates) == 3
+            assert not manager._launch_thread_pool
+            manager._persist_new_replica.assert_not_called()
+            results = [
+                paid_capacity.ClaimResult.ACQUIRED,
+                paid_capacity.ClaimResult.ACQUIRED,
+                paid_capacity.ClaimResult.SATURATED,
+            ]
+            return paid_capacity.PaidClaimBatchResult(
+                tuple(
+                    paid_capacity.PaidClaimBatchMemberResult(
+                        candidate.replica_id,
+                        candidate.replica_info.replica_record_id, claim_result)
+                    for candidate, claim_result in zip(
+                        candidates, results, strict=True)))
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=existing), \
+             mock.patch.object(paid_capacity,
+                               'build_launch_budget',
+                               return_value=budget), \
+             mock.patch.object(paid_capacity,
+                               'try_persist_claim_batch',
+                               side_effect=_admit_batch) as admit_batch, \
+             mock.patch.object(paid_capacity,
+                               'try_persist_claim') as singleton, \
+             mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True), \
+             mock.patch('sky.serve.replica_managers._get_resources_ports',
+                        return_value='8080'), \
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread',
+                        side_effect=_make_worker):
+            accepted = manager._scale_up_batch_locked(
+                [{
+                    'use_spot': True
+                }] * 3, paid_launch_authority=authority)
+
+        admit_batch.assert_called_once()
+        singleton.assert_not_called()
+        manager._persist_new_replica.assert_not_called()
+        assert [result.replica_id for result in accepted] == [1, 2]
+        assert {
+            replica_id for replica_id, _ in manager._launch_thread_pool.items()
+        } == {1, 2}
+        assert [info.replica_id for info in existing] == [1, 2]
+        assert manager._next_replica_id == 4
+        assert len(workers) == 3
+        assert all(worker.start.call_count == 0 for worker in workers)
+        candidates = admit_batch.call_args.kwargs['candidates']
+        assert [
+            candidate.capacity_plan_claim['capacity_plan_units']
+            for candidate in candidates
+        ] == [1, 1, 1]
+        assert all(candidate.replica_info.paid_capacity_pool_key == pool_key
+                   for candidate in candidates)
+
+    def test_paid_wave_exception_drops_staged_rows_and_workers(self):
+        paid = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+        manager = self._manager({paid: 1.0})
+        manager._service_hash = 'svc-hash'
+        manager._controller_owner = (1, '10.0.0.1')
+        manager._next_replica_id = 1
+        manager._pending_version = None
+        manager._uses_shared_zero_cost_demand_budget = mock.Mock(
+            return_value=False)
+        manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
+        manager._demand_should_skip_saturated_zero_cost = mock.Mock(
+            return_value=False)
+        existing = []
+        pool_key = paid_capacity.pool_key(paid,
+                                          workspace='default',
+                                          num_nodes=1)
+        budget = paid_capacity.LaunchBudget(
+            remaining_by_location={paid: 2},
+            pool_key_by_location={paid: pool_key},
+            states_by_pool_key={},
+            globally_managed=True,
+            service_remaining=2)
+        authority = capacity_admission.PaidLaunchAuthority(
+            service_name='svc',
+            service_hash='svc-hash',
+            generation=8,
+            content_sha256='a' * 64,
+            demand_feed_generation=9,
+            demand_source_epoch=3,
+            paid_residual_by_accelerator=(('l4', 2),),
+            reserved_fill_authority=(
+                capacity_admission.ReservedFillPlanAuthority.not_applicable()))
+
+        workers = []
+
+        def _make_worker(*_args, **_kwargs):
+            worker = mock.Mock()
+            workers.append(worker)
+            return worker
+
+        def _release_after_enqueue(location):
+            assert location == paid
+            with manager._ambiguous_paid_phase_a_lock:
+                assert len(manager._ambiguous_paid_phase_a_recoveries) == 2
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=existing), \
+             mock.patch.object(paid_capacity,
+                               'build_launch_budget',
+                               return_value=budget), \
+             mock.patch.object(paid_capacity,
+                               'try_persist_claim_batch',
+                               side_effect=RuntimeError('transaction failed')) \
+                 as admit_batch, \
+             mock.patch.object(manager._spot_placer,
+                               'release_retry',
+                               side_effect=_release_after_enqueue) as release, \
+             mock.patch.object(
+                 manager, '_persist_spot_placement_state_if_dirty'), \
+             mock.patch.object(
+                 ordinary_launch_binding,
+                 'retire_pre_admission_non_pool_launch_intent') as retire, \
+             mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True), \
+             mock.patch('sky.serve.replica_managers._get_resources_ports',
+                        return_value='8080'), \
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread',
+                        side_effect=_make_worker), \
+             pytest.raises(RuntimeError, match='transaction failed'):
+            manager._scale_up_batch_locked([{
+                'use_spot': True
+            }] * 2,
+                                           paid_launch_authority=authority)
+
+        assert not existing
+        assert not manager._launch_thread_pool
+        assert manager._next_replica_id == 3
+        assert release.call_args_list == [mock.call(paid), mock.call(paid)]
+        assert len(workers) == 2
+        assert all(worker.start.call_count == 0 for worker in workers)
+        candidates = admit_batch.call_args.kwargs['candidates']
+        with manager._ambiguous_paid_phase_a_lock:
+            queued = set(manager._ambiguous_paid_phase_a_recoveries)
+        assert queued == {
+            replica_managers._AmbiguousPaidPhaseAIdentity(
+                candidate.replica_id, candidate.replica_info.replica_record_id)
+            for candidate in candidates
+        }
+        retire.assert_not_called()
+
+    @pytest.mark.parametrize('disposition', [
+        ordinary_launch_binding.PreAdmissionRetirementDisposition.RETIRED,
+        ordinary_launch_binding.PreAdmissionRetirementDisposition.ABSENT,
+    ])
+    def test_ambiguous_paid_phase_a_exact_retirement_notifies_and_leaves_unrelated(
+            self, disposition):
+        manager = self._ambiguous_paid_manager()
+        exact = replica_managers._AmbiguousPaidPhaseAIdentity(
+            3, '22222222-2222-4222-8222-222222222222')
+        unrelated = replica_managers._AmbiguousPaidPhaseAIdentity(
+            4, '33333333-3333-4333-8333-333333333333')
+        with manager._ambiguous_paid_phase_a_lock:
+            manager._ambiguous_paid_phase_a_recoveries[exact] = (
+                replica_managers._AmbiguousPaidPhaseARecovery())
+            manager._ambiguous_paid_phase_a_recoveries[unrelated] = (
+                replica_managers._AmbiguousPaidPhaseARecovery(
+                    retry_at=time.monotonic() + 3600))
+        retirement = ordinary_launch_binding.PreAdmissionRetirement(disposition)
+
+        def _retire(authority, replica_id, replica_record_id):
+            assert not manager.lock.locked()
+            assert authority is manager._ordinary_launch_binding_authority
+            assert (replica_id, replica_record_id) == (exact.replica_id,
+                                                       exact.replica_record_id)
+            return retirement
+
+        with mock.patch.object(
+                ordinary_launch_binding,
+                'retire_pre_admission_non_pool_launch_intent',
+                side_effect=_retire) as retire, \
+             mock.patch.object(replica_managers.request_postgres,
+                               'inspect_bound_ordinary_launch') as inspect:
+            manager._reconcile_ambiguous_paid_phase_a_outcomes()
+
+        retire.assert_called_once()
+        inspect.assert_not_called()
+        manager._notify_scale_reconciliation.assert_called_once_with()
+        with manager._ambiguous_paid_phase_a_lock:
+            assert set(
+                manager._ambiguous_paid_phase_a_recoveries) == {unrelated}
+
+    def test_ambiguous_paid_phase_a_recovery_coalesces_and_retries(self):
+        manager, _, _, _, prepared, _ = self._prepared_paid_wave(count=1)
+        manager._ordinary_launch_binding_authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=2,
+            generic=True)
+        manager._notify_scale_reconciliation = mock.Mock()
+        manager._enqueue_ambiguous_paid_phase_a_recovery(prepared)
+        manager._enqueue_ambiguous_paid_phase_a_recovery(prepared)
+        with manager._ambiguous_paid_phase_a_lock:
+            assert len(manager._ambiguous_paid_phase_a_recoveries) == 1
+        retirement = ordinary_launch_binding.PreAdmissionRetirement(
+            ordinary_launch_binding.PreAdmissionRetirementDisposition.RETIRED)
+
+        with mock.patch.object(
+                ordinary_launch_binding,
+                'retire_pre_admission_non_pool_launch_intent',
+                side_effect=[RuntimeError('postgres unavailable'), retirement
+                ]) as retire, \
+             mock.patch.object(replica_managers.time,
+                               'monotonic',
+                               return_value=100.0):
+            manager._reconcile_ambiguous_paid_phase_a_outcomes()
+            manager._reconcile_ambiguous_paid_phase_a_outcomes()
+
+        retire.assert_called_once()
+        manager._notify_scale_reconciliation.assert_not_called()
+        with manager._ambiguous_paid_phase_a_lock:
+            recovery = next(
+                iter(manager._ambiguous_paid_phase_a_recoveries.values()))
+            assert recovery.attempts == 1
+            assert recovery.retry_at > 100.0
+
+        with mock.patch.object(
+                ordinary_launch_binding,
+                'retire_pre_admission_non_pool_launch_intent',
+                return_value=retirement) as retry, \
+             mock.patch.object(replica_managers.time,
+                               'monotonic',
+                               return_value=recovery.retry_at):
+            manager._reconcile_ambiguous_paid_phase_a_outcomes()
+
+        retry.assert_called_once()
+        manager._notify_scale_reconciliation.assert_called_once_with()
+        with manager._ambiguous_paid_phase_a_lock:
+            assert not manager._ambiguous_paid_phase_a_recoveries
+
+    def test_ambiguous_paid_phase_a_association_is_adopted_exactly(self):
+        manager = self._ambiguous_paid_manager()
+        context = _bound_non_pool_context()
+        identity = replica_managers._AmbiguousPaidPhaseAIdentity(
+            context.replica_id, str(context.replica_record_id))
+        info = _fake_replica_info(
+            identity.replica_id,
+            replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.replica_record_id = identity.replica_record_id
+        reduction = types.SimpleNamespace(context=context,
+                                          disposition='ADOPT_ACTIVE')
+        with manager._ambiguous_paid_phase_a_lock:
+            manager._ambiguous_paid_phase_a_recoveries[identity] = (
+                replica_managers._AmbiguousPaidPhaseARecovery())
+        retirement = ordinary_launch_binding.PreAdmissionRetirement(
+            ordinary_launch_binding.PreAdmissionRetirementDisposition.ASSOCIATED
+        )
+
+        def _retire(*_args):
+            assert not manager.lock.locked()
+            return retirement
+
+        with mock.patch.object(
+                ordinary_launch_binding,
+                'retire_pre_admission_non_pool_launch_intent',
+                side_effect=_retire) as retire, \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 return_value=reduction) as inspect, \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_info_from_id',
+                               return_value=info) as get_info:
+            manager._reconcile_ambiguous_paid_phase_a_outcomes()
+
+        retire.assert_called_once_with(
+            manager._ordinary_launch_binding_authority, identity.replica_id,
+            identity.replica_record_id)
+        inspect.assert_called_once_with('svc', identity.replica_id,
+                                        identity.replica_record_id)
+        get_info.assert_called_once_with('svc', identity.replica_id)
+        manager._install_bound_launch_adopter.assert_called_once_with(
+            info, context, start=False)
+        manager._notify_scale_reconciliation.assert_not_called()
+        with manager._ambiguous_paid_phase_a_lock:
+            assert not manager._ambiguous_paid_phase_a_recoveries
+
+    @pytest.mark.parametrize('receipt_kind',
+                             ['sequence', 'enum', 'mixed_ownership'])
+    def test_paid_batch_invalid_receipt_publishes_no_workers(
+            self, receipt_kind):
+        manager, paid, budget, existing, prepared, workers = (
+            self._prepared_paid_wave())
+        candidates = [item.candidate for item in prepared]
+        if receipt_kind == 'sequence':
+            ordered = reversed(candidates)
+            results = [paid_capacity.ClaimResult.ACQUIRED] * 2
+        else:
+            ordered = candidates
+            results = ([object(), paid_capacity.ClaimResult.ACQUIRED]
+                       if receipt_kind == 'enum' else [
+                           paid_capacity.ClaimResult.ACQUIRED,
+                           paid_capacity.ClaimResult.OWNERSHIP_LOST
+                       ])
+        receipt = paid_capacity.PaidClaimBatchResult(
+            tuple(
+                paid_capacity.PaidClaimBatchMemberResult(
+                    candidate.replica_id,
+                    candidate.replica_info.replica_record_id, claim_result) for
+                candidate, claim_result in zip(ordered, results, strict=True)))
+
+        with mock.patch.object(paid_capacity,
+                               'try_persist_claim_batch',
+                               return_value=receipt), \
+             mock.patch.object(manager._spot_placer,
+                               'release_retry') as release, \
+             mock.patch.object(
+                 manager, '_persist_spot_placement_state_if_dirty'), \
+             pytest.raises(RuntimeError):
+            manager._finalize_prepared_paid_launches(prepared, budget, existing)
+
+        assert not existing
+        assert not manager._launch_thread_pool
+        assert all(worker.start.call_count == 0 for worker in workers)
+        assert release.call_args_list == [mock.call(paid), mock.call(paid)]
+        with manager._ambiguous_paid_phase_a_lock:
+            assert set(manager._ambiguous_paid_phase_a_recoveries) == {
+                replica_managers._AmbiguousPaidPhaseAIdentity(
+                    candidate.replica_id,
+                    candidate.replica_info.replica_record_id)
+                for candidate in candidates
+            }
+
+    def test_paid_batch_collision_preflight_publishes_no_partial_wave(self):
+        manager, paid, budget, existing, prepared, workers = (
+            self._prepared_paid_wave())
+        candidates = [item.candidate for item in prepared]
+        receipt = paid_capacity.PaidClaimBatchResult(
+            tuple(
+                paid_capacity.PaidClaimBatchMemberResult(
+                    candidate.replica_id, candidate.replica_info.
+                    replica_record_id, paid_capacity.ClaimResult.ACQUIRED)
+                for candidate in candidates))
+        collision = mock.Mock()
+        manager._launch_thread_pool[candidates[1].replica_id] = collision
+
+        with mock.patch.object(paid_capacity,
+                               'try_persist_claim_batch',
+                               return_value=receipt), \
+             mock.patch.object(manager._spot_placer,
+                               'release_retry') as release, \
+             mock.patch.object(
+                 manager, '_persist_spot_placement_state_if_dirty'), \
+             pytest.raises(RuntimeError, match='collided'):
+            manager._finalize_prepared_paid_launches(prepared, budget, existing)
+
+        assert not existing
+        assert {
+            replica_id for replica_id, _ in manager._launch_thread_pool.items()
+        } == {candidates[1].replica_id}
+        assert manager._launch_thread_pool[
+            candidates[1].replica_id] is collision
+        assert all(worker.start.call_count == 0 for worker in workers)
+        assert release.call_args_list == [mock.call(paid), mock.call(paid)]
+        with manager._ambiguous_paid_phase_a_lock:
+            assert set(manager._ambiguous_paid_phase_a_recoveries) == {
+                replica_managers._AmbiguousPaidPhaseAIdentity(
+                    candidate.replica_id,
+                    candidate.replica_info.replica_record_id)
+                for candidate in candidates
+            }
+
+    def test_paid_batch_member_extraction_interrupt_queues_exact_recovery(self):
+        manager, paid, budget, existing, prepared, workers = (
+            self._prepared_paid_wave())
+
+        class _InterruptedReceipt:
+
+            @property
+            def members(self):
+                raise KeyboardInterrupt()
+
+        with mock.patch.object(paid_capacity,
+                               'try_persist_claim_batch',
+                               return_value=_InterruptedReceipt()), \
+             mock.patch.object(manager._spot_placer,
+                               'release_retry') as release, \
+             mock.patch.object(
+                 manager, '_persist_spot_placement_state_if_dirty'), \
+             pytest.raises(KeyboardInterrupt):
+            manager._finalize_prepared_paid_launches(prepared, budget, existing)
+
+        assert not existing
+        assert not manager._launch_thread_pool
+        assert all(worker.start.call_count == 0 for worker in workers)
+        assert release.call_args_list == [mock.call(paid), mock.call(paid)]
+        with manager._ambiguous_paid_phase_a_lock:
+            assert set(manager._ambiguous_paid_phase_a_recoveries) == {
+                replica_managers._AmbiguousPaidPhaseAIdentity(
+                    item.candidate.replica_id,
+                    item.candidate.replica_info.replica_record_id)
+                for item in prepared
+            }
+
+    def test_paid_batch_postcommit_publication_interrupt_wakes_exact_adoption(
+            self):
+        manager, _, budget, existing, prepared, workers = (
+            self._prepared_paid_wave())
+        candidates = [item.candidate for item in prepared]
+        receipt = paid_capacity.PaidClaimBatchResult(
+            tuple(
+                paid_capacity.PaidClaimBatchMemberResult(
+                    candidate.replica_id, candidate.replica_info.
+                    replica_record_id, paid_capacity.ClaimResult.ACQUIRED)
+                for candidate in candidates))
+
+        class _InterruptedPublication(dict):
+
+            def __setitem__(self, key, value):
+                if key == candidates[1].replica_id:
+                    raise KeyboardInterrupt()
+                super().__setitem__(key, value)
+
+        interrupted_pool = _InterruptedPublication()
+        manager._launch_thread_pool = interrupted_pool
+        manager._launch_completion_event.clear()
+
+        with mock.patch.object(paid_capacity,
+                               'try_persist_claim_batch',
+                               return_value=receipt), \
+             pytest.raises(KeyboardInterrupt):
+            manager._finalize_prepared_paid_launches(prepared, budget, existing)
+
+        # Phase A is proven committed, so never retire either row as
+        # ambiguous. The periodic/startup exact adopter sees the second durable
+        # row after this wake while preserving the first exact worker.
+        assert set(interrupted_pool) == {candidates[0].replica_id}
+        assert manager._launch_completion_event.is_set()
+        assert all(worker.start.call_count == 0 for worker in workers)
+        with manager._ambiguous_paid_phase_a_lock:
+            assert not manager._ambiguous_paid_phase_a_recoveries
+
     def test_env_override_and_invalid_fallback(self, monkeypatch):
         paid_capacity._parse_positive_int.cache_clear()
         monkeypatch.delenv(paid_capacity._BASE_LIMIT_ENV_VAR, raising=False)
@@ -17245,10 +17779,9 @@ class TestPaidLocationLaunchBudget:
         manager._demand_should_skip_saturated_zero_cost = mock.Mock(
             return_value=False)
         keys = {
-            location: paid_capacity.pool_key(location,
-                                             workspace='default',
-                                             num_nodes=1)
-            for location in (primary, hedge, third)
+            location: paid_capacity.pool_key(
+                location, workspace='default',
+                num_nodes=1) for location in (primary, hedge, third)
         }
         budget = paid_capacity.LaunchBudget(
             remaining_by_location={
@@ -17307,10 +17840,9 @@ class TestPaidLocationLaunchBudget:
             return_value=False)
         locations = (primary, hedge, third)
         keys = {
-            location: paid_capacity.pool_key(location,
-                                             workspace='default',
-                                             num_nodes=1)
-            for location in locations
+            location: paid_capacity.pool_key(
+                location, workspace='default',
+                num_nodes=1) for location in locations
         }
         budget = paid_capacity.LaunchBudget(
             remaining_by_location={
@@ -19257,16 +19789,16 @@ class TestRecoveryRetryAndIsolation:
         runtime = mgr._legacy_mutation_runtime_state()
         launch_thread.assert_called_once()
         launch_kwargs = launch_thread.call_args.kwargs
-        assert (launch_kwargs['target'] is
-                replica_managers.adopt_system_recovery_launch)
+        assert (launch_kwargs['target']
+                is replica_managers.adopt_system_recovery_launch)
         assert launch_kwargs['replica_id'] == 1
         assert launch_kwargs['replica_record_id'] == candidate.replica_record_id
         assert launch_kwargs['service_hash'] == mgr._service_hash
         assert launch_kwargs['controller_owner'] == mgr._controller_owner
-        assert (launch_kwargs['completion_queue'] is
-                runtime.launch_completion_queue)
-        assert (launch_kwargs['completion_event'] is
-                runtime.launch_completion_event)
+        assert (launch_kwargs['completion_queue']
+                is runtime.launch_completion_queue)
+        assert (launch_kwargs['completion_event']
+                is runtime.launch_completion_event)
         launch_args = launch_kwargs['args']
         assert launch_args[:4] == (1, 'svc-1', '/tmp/launch.log', 'request-1')
         assert callable(launch_args[4])

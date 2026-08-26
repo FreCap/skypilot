@@ -47,6 +47,7 @@ from sky import clouds
 from sky import estimated_spend
 from sky import global_user_state
 from sky import global_user_state_schema
+from sky.serve import capacity_admission_schema
 from sky.serve import constants
 from sky.serve import lb_ha
 from sky.serve import paid_capacity
@@ -492,6 +493,432 @@ class TestPaidCapacityAuthorityPG:
         return location, paid_capacity.pool_key(location,
                                                 workspace='workspace',
                                                 num_nodes=1)
+
+    @classmethod
+    def _paid_batch_spec(
+        cls,
+        replica_id: int,
+        pool_key: str,
+        *,
+        frontier_key: paid_capacity.FrontierKey = ('l4',),
+        planner_bound: bool = False,
+    ) -> paid_capacity.PaidClaimPersistenceSpec:
+        info = cls._info('svc', replica_id)
+        capacity_plan_claim = None
+        if planner_bound:
+            capacity_plan_claim = {
+                'capacity_plan_generation': 1,
+                'capacity_plan_sha256': 'a' * 64,
+                'demand_feed_generation': 1,
+                'demand_source_epoch': 1,
+                'capacity_plan_accelerator': 'l4',
+                'capacity_plan_units': 1,
+            }
+        candidate = paid_capacity.PaidClaimCandidate(
+            replica_id=replica_id,
+            replica_info=info,
+            location=None,  # type: ignore[arg-type]
+            priority=20,
+            capacity_plan_claim=capacity_plan_claim)
+        return paid_capacity.PaidClaimPersistenceSpec(candidate=candidate,
+                                                      pool_key=pool_key,
+                                                      frontier_key=frontier_key,
+                                                      frontier_limit=100)
+
+    def test_atomic_paid_batch_commits_large_wave_once(self, broker_engine,
+                                                       monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            session.execute(
+                capacity_admission_schema.serve_capacity_plans_table.insert().
+                values(service_name='svc',
+                       generation=1,
+                       service_hash='hash',
+                       service_lifecycle_epoch=1,
+                       service_version=1,
+                       demand_source_epoch=1,
+                       demand_feed_generation=1,
+                       route_generation=1,
+                       route_sha256='b' * 64,
+                       route_source_epoch=1,
+                       protocol_version=1,
+                       content_sha256='a' * 64,
+                       payload={},
+                       created_at=datetime.datetime.now(datetime.timezone.utc)))
+            session.commit()
+        specs = [
+            self._paid_batch_spec(replica_id, 'pool', planner_bound=True)
+            for replica_id in range(1, 101)
+        ]
+        validate = mock.Mock(
+            return_value=datetime.datetime.now(datetime.timezone.utc) +
+            datetime.timedelta(minutes=1))
+        monkeypatch.setattr(
+            serve_state.capacity_admission,
+            'validate_prospective_paid_claim_batch_in_connection', validate)
+        results = serve_state.try_add_replicas_with_paid_capacity_claims(
+            'svc',
+            'hash',
+            specs,
+            base_limit=100,
+            max_limit=100,
+            service_limit=100,
+            now=100,
+            success_ttl_seconds=60,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1'),
+            frontier_default_limit=100)
+
+        assert results == ['acquired'] * 100
+        validate.assert_called_once()
+        assert len(validate.call_args.args[2]) == 100
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            replica_count = session.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(serve_state.replicas_table).where(
+                    serve_state.replicas_table.c.service_name ==
+                    'svc')).scalar_one()
+            claim_count = session.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(serve_state.paid_capacity_claims_table).where(
+                    serve_state.paid_capacity_claims_table.c.service_name ==
+                    'svc')).scalar_one()
+        assert replica_count == 100
+        assert claim_count == 100
+
+    def test_atomic_paid_batch_saturation_continues_and_waiter_wins(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        specs = [
+            self._paid_batch_spec(1, 'pool-b'),
+            self._paid_batch_spec(2, 'pool-b'),
+            self._paid_batch_spec(3, 'pool-a'),
+        ]
+        lock_order = []
+        lock_pool = serve_state._paid_capacity_pool_row_for_update
+
+        def _record_lock(session, pool_key):
+            lock_order.append(pool_key)
+            return lock_pool(session, pool_key)
+
+        monkeypatch.setattr(serve_state, '_paid_capacity_pool_row_for_update',
+                            _record_lock)
+
+        results = serve_state.try_add_replicas_with_paid_capacity_claims(
+            'svc',
+            'hash',
+            specs,
+            base_limit=1,
+            max_limit=1,
+            service_limit=10,
+            now=100,
+            success_ttl_seconds=60,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1'),
+            frontier_default_limit=100)
+
+        assert results == ['acquired', 'saturated', 'acquired']
+        assert lock_order == ['pool-a', 'pool-b']
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            claims = session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_claims_table.c.replica_id).where(
+                        serve_state.paid_capacity_claims_table.c.service_name ==
+                        'svc').order_by(serve_state.paid_capacity_claims_table.
+                                        c.replica_id)).scalars().all()
+            waiters = session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_waiters_table.c.pool_key).where(
+                        serve_state.paid_capacity_waiters_table.c.service_name
+                        == 'svc')).scalars().all()
+        assert claims == [1, 3]
+        assert waiters == ['pool-b']
+
+    def test_atomic_paid_batch_locks_all_pools_before_stale_claim_cleanup(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            session.execute(
+                serve_state.paid_capacity_pools_table.insert().values(
+                    pool_key='pool-z',
+                    current_limit=1,
+                    successes_since_resize=0,
+                    updated_at=1))
+            session.execute(
+                serve_state.paid_capacity_claims_table.insert().values(
+                    service_name='svc',
+                    service_hash='hash',
+                    replica_id=999,
+                    pool_key='pool-z',
+                    priority=20,
+                    claimed_at=1))
+            session.commit()
+
+        events = []
+        lock_pool = serve_state._paid_capacity_pool_row_for_update
+        delete_claims = serve_state._delete_paid_capacity_claims_in_session
+
+        def _record_lock(session, pool_key):
+            events.append(f'lock:{pool_key}')
+            return lock_pool(session, pool_key)
+
+        def _record_delete(session, identities):
+            if identities:
+                events.append('delete')
+            return delete_claims(session, identities)
+
+        monkeypatch.setattr(serve_state, '_paid_capacity_pool_row_for_update',
+                            _record_lock)
+        monkeypatch.setattr(serve_state,
+                            '_delete_paid_capacity_claims_in_session',
+                            _record_delete)
+
+        results = serve_state.try_add_replicas_with_paid_capacity_claims(
+            'svc',
+            'hash', [self._paid_batch_spec(1, 'pool-a')],
+            base_limit=1,
+            max_limit=1,
+            service_limit=10,
+            now=100,
+            success_ttl_seconds=60,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1'),
+            frontier_default_limit=100)
+
+        assert results == ['acquired']
+        assert events[:3] == ['lock:pool-a', 'lock:pool-z', 'delete']
+
+    def test_atomic_paid_batch_plan_conflict_rolls_back_phase_a(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        specs = [
+            self._paid_batch_spec(1, 'pool-b', planner_bound=True),
+            self._paid_batch_spec(2, 'pool-a', planner_bound=True),
+        ]
+        monkeypatch.setattr(
+            serve_state.capacity_admission,
+            'validate_prospective_paid_claim_batch_in_connection',
+            mock.Mock(side_effect=serve_state.capacity_admission.
+                      CapacityAdmissionConflict('stale plan')))
+
+        with pytest.raises(
+                serve_state.capacity_admission.CapacityAdmissionConflict,
+                match='stale plan'):
+            serve_state.try_add_replicas_with_paid_capacity_claims(
+                'svc',
+                'hash',
+                specs,
+                base_limit=2,
+                max_limit=2,
+                service_limit=10,
+                now=100,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1'),
+                frontier_default_limit=100)
+
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            assert session.execute(
+                sqlalchemy.select(serve_state.replicas_table).where(
+                    serve_state.replicas_table.c.service_name ==
+                    'svc')).first() is None
+            assert session.execute(
+                sqlalchemy.select(serve_state.paid_capacity_claims_table).where(
+                    serve_state.paid_capacity_claims_table.c.service_name ==
+                    'svc')).first() is None
+            assert session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_waiters_table).where(
+                        serve_state.paid_capacity_waiters_table.c.service_name
+                        == 'svc')).first() is None
+            assert session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_pools_table)).first() is None
+
+    def test_atomic_paid_batch_replay_rejects_reserved_row_and_rolls_back(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        existing = self._paid_batch_spec(1, 'pool-z')
+        assert serve_state.try_add_replicas_with_paid_capacity_claims(
+            'svc',
+            'hash', [existing],
+            base_limit=2,
+            max_limit=2,
+            service_limit=10,
+            now=100,
+            success_ttl_seconds=60,
+            waiter_ttl_seconds=30,
+            expected_controller_owner=(11, '10.0.0.1'),
+            frontier_default_limit=100) == ['acquired']
+
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            stored_state = session.execute(
+                sqlalchemy.select(
+                    serve_state.replicas_table.c.replica_state).where(
+                        serve_state.replicas_table.c.service_name == 'svc',
+                        serve_state.replicas_table.c.replica_id ==
+                        1)).scalar_one()
+            reserved_state = dict(stored_state)
+            reserved_state['reserved_fill'] = True
+            reserved_state['is_zero_cost'] = False
+            decoded = serve_state.decode_replica_state_for_authority(
+                serve_state._REPLICA_STATE_VERSION, reserved_state)
+            assert decoded.reserved_fill is True
+            assert decoded.is_zero_cost is False
+            session.execute(
+                sqlalchemy.update(serve_state.replicas_table).where(
+                    serve_state.replicas_table.c.service_name == 'svc',
+                    serve_state.replicas_table.c.replica_id == 1).values(
+                        replica_state=reserved_state))
+            session.commit()
+
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            replica_before = dict(
+                session.execute(
+                    sqlalchemy.select(serve_state.replicas_table).where(
+                        serve_state.replicas_table.c.service_name == 'svc',
+                        serve_state.replicas_table.c.replica_id ==
+                        1)).mappings().one())
+            claim_before = dict(
+                session.execute(
+                    sqlalchemy.select(
+                        serve_state.paid_capacity_claims_table).where(
+                            serve_state.paid_capacity_claims_table.c.
+                            service_name == 'svc',
+                            serve_state.paid_capacity_claims_table.c.replica_id
+                            == 1)).mappings().one())
+            pools_before = session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_pools_table.c.pool_key).order_by(
+                        serve_state.paid_capacity_pools_table.c.pool_key)
+            ).scalars().all()
+            waiters_before = session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_waiters_table.c.pool_key).
+                order_by(serve_state.paid_capacity_waiters_table.c.pool_key
+                        )).scalars().all()
+
+        fresh = self._paid_batch_spec(2, 'pool-a')
+        with pytest.raises(ValueError, match='zero-cost or reserved-fill row'):
+            serve_state.try_add_replicas_with_paid_capacity_claims(
+                'svc',
+                'hash', [existing, fresh],
+                base_limit=2,
+                max_limit=2,
+                service_limit=10,
+                now=101,
+                success_ttl_seconds=60,
+                waiter_ttl_seconds=30,
+                expected_controller_owner=(11, '10.0.0.1'),
+                frontier_default_limit=100)
+
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            replica_after = dict(
+                session.execute(
+                    sqlalchemy.select(serve_state.replicas_table).where(
+                        serve_state.replicas_table.c.service_name == 'svc',
+                        serve_state.replicas_table.c.replica_id ==
+                        1)).mappings().one())
+            claim_after = dict(
+                session.execute(
+                    sqlalchemy.select(
+                        serve_state.paid_capacity_claims_table).where(
+                            serve_state.paid_capacity_claims_table.c.
+                            service_name == 'svc',
+                            serve_state.paid_capacity_claims_table.c.replica_id
+                            == 1)).mappings().one())
+            assert replica_after == replica_before
+            assert claim_after == claim_before
+            assert session.execute(
+                sqlalchemy.select(serve_state.replicas_table).where(
+                    serve_state.replicas_table.c.service_name == 'svc',
+                    serve_state.replicas_table.c.replica_id ==
+                    2)).first() is None
+            assert session.execute(
+                sqlalchemy.select(serve_state.paid_capacity_claims_table).where(
+                    serve_state.paid_capacity_claims_table.c.service_name ==
+                    'svc', serve_state.paid_capacity_claims_table.c.replica_id
+                    == 2)).first() is None
+            assert session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_pools_table.c.pool_key).order_by(
+                        serve_state.paid_capacity_pools_table.c.pool_key)
+            ).scalars().all() == pools_before
+            assert session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_waiters_table.c.pool_key).
+                order_by(serve_state.paid_capacity_waiters_table.c.pool_key
+                        )).scalars().all() == waiters_before
+
+    def test_atomic_paid_batch_member_insert_fault_rolls_back_phase_a(
+            self, broker_engine, monkeypatch):
+        monkeypatch.setattr(serve_state._db_manager, '_engine', broker_engine)
+        serve_state.Base.metadata.create_all(broker_engine)
+        self._add_service('svc', 'hash', 11)
+        replica_inserts = 0
+
+        def _fail_second_replica_insert(conn, cursor, statement, parameters,
+                                        context, executemany):
+            del conn, cursor, parameters, context, executemany
+            nonlocal replica_inserts
+            if statement.lstrip().startswith('INSERT INTO replicas'):
+                replica_inserts += 1
+                if replica_inserts == 2:
+                    raise RuntimeError('injected second member insert fault')
+
+        sqlalchemy.event.listen(broker_engine, 'before_cursor_execute',
+                                _fail_second_replica_insert)
+        try:
+            with pytest.raises(RuntimeError,
+                               match='injected second member insert fault'):
+                serve_state.try_add_replicas_with_paid_capacity_claims(
+                    'svc',
+                    'hash', [
+                        self._paid_batch_spec(1, 'pool-b'),
+                        self._paid_batch_spec(2, 'pool-a'),
+                    ],
+                    base_limit=2,
+                    max_limit=2,
+                    service_limit=10,
+                    now=100,
+                    success_ttl_seconds=60,
+                    waiter_ttl_seconds=30,
+                    expected_controller_owner=(11, '10.0.0.1'),
+                    frontier_default_limit=100)
+        finally:
+            sqlalchemy.event.remove(broker_engine, 'before_cursor_execute',
+                                    _fail_second_replica_insert)
+
+        assert replica_inserts == 2
+        with sqlalchemy.orm.Session(broker_engine) as session:
+            assert session.execute(
+                sqlalchemy.select(serve_state.replicas_table).where(
+                    serve_state.replicas_table.c.service_name ==
+                    'svc')).first() is None
+            assert session.execute(
+                sqlalchemy.select(serve_state.paid_capacity_claims_table).where(
+                    serve_state.paid_capacity_claims_table.c.service_name ==
+                    'svc')).first() is None
+            assert session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_waiters_table).where(
+                        serve_state.paid_capacity_waiters_table.c.service_name
+                        == 'svc')).first() is None
+            assert session.execute(
+                sqlalchemy.select(
+                    serve_state.paid_capacity_pools_table)).first() is None
 
     def test_outcome_persistence_reports_only_committed_claim_pools(
             self, broker_engine, monkeypatch):

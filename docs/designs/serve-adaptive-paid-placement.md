@@ -1,6 +1,7 @@
 # SkyServe Adaptive Paid Placement
 
 _Created: 2026-08-02_
+_Last updated: 2026-08-26_
 
 ## Status
 
@@ -8,6 +9,21 @@ Proposed. This design extends the deployed global paid-capacity authority in
 `serve-paid-placement-cohort.md`. The existing exact-pool depth ladder,
 per-service envelope, per-card exploration frontier, request-priority protocol,
 and PostgreSQL outcome transaction remain authoritative.
+
+The atomic paid-batch amendment in the parent design changes transaction
+cardinality, not adaptive policy. One transaction may commit several accepted
+members, but it evaluates the same cold/effective service limit, per-card
+frontier, exact-pool depth, price order, and request priority once under the
+service and sorted pool locks. The default maximum remains 16. A larger
+qualification batch requires an explicit isolated operator profile, effective
+service limit, summed pool headroom, frontier, process/global launch cap, and
+aggregate long-worker capacity of at least the requested width; batching alone
+never widens a service or pool.
+
+The process/global launch cap in that qualification is enforced only by the
+existing later P-reservation transaction. Phase A may use its current snapshot
+to bound preparation, but it does not reserve P and may commit more
+`SCHEDULED` rows than Phase B can start immediately.
 
 The rollout is intentionally ordered. Milestone 1 makes genuine target-backed
 launches react to durable provider feedback faster and lets proven pools widen
@@ -128,11 +144,13 @@ recognized by the existing pool authority, and a large catalog cannot widen the
 service merely by containing many old successful regions.
 
 The launch budget records the effective limit and passes that exact value into
-the atomic claim transaction. The advisory snapshot is not authority. The
-service-row lock recounts valid claims and rejects a stale concurrent claim at
-the effective limit. If a controller restarts, it recomputes the same bound from
-durable claims and pool evidence. Existing over-limit claims are retained and
-new claims stop until they drain below the recomputed limit.
+the atomic batch transaction. The advisory snapshot is not authority. The
+service-row lock recounts valid claims, adds the accepted policy-valid subset,
+and clips or rejects members at the effective limit. It never admits every
+prepared member merely because the caller requested a large wave. If a
+controller restarts, it recomputes the same bound from durable claims and pool
+evidence. Existing over-limit claims are retained and new claims stop until
+they drain below the recomputed limit.
 
 The autoscaler and logical target fence remain the source of demand. Raising
 the envelope creates no additional scaling decision; it only lets more already
@@ -277,8 +295,12 @@ convenient during design.
 The adaptive target-backed window and feedback events require no schema change.
 Old controllers continue enforcing 16. A current service has one fenced owner,
 so a rolling binary transition cannot concurrently widen one service from an
-old and new controller. PostgreSQL service-row and exact-pool locks remain the
-authority across services.
+old and new controller. The same service-owner fence prevents a singleton and
+batch writer from interleaving fresh admission for that service. The batch adds
+no row or request shape, so an image rollback is operational and may return
+fresh admission to singleton speed while existing replica+claim pairs continue
+through ordinary reservation, binding, serving, and cleanup. PostgreSQL
+service-row and sorted exact-pool locks remain the authority across services.
 
 Local SQLite retains the legacy local paid window and does not use adaptive
 service limits or speculative accounting. This follows the central database
@@ -365,12 +387,18 @@ Automated coverage must include:
    effective cap.
 3. Real-PostgreSQL races in which two stale snapshots contend for the last
    dynamic service slot and exactly one claim commits.
-4. Launch completion waking the manager, typed outcome commit waking the
+4. A multi-member real-PostgreSQL batch whose prepared size exceeds the
+   effective adaptive window, proving that the committed policy-valid subset
+   plus existing claims stops exactly at the recomputed service limit, remains
+   `SCHEDULED`, and creates no association/request/queue/pin before ordinary
+   binding. Include a saturated middle member followed by an accepted member
+   for a distinct logical slot and eligible pool.
+5. Launch completion waking the manager, typed outcome commit waking the
    autoscaler only after persistence, generic failure not waking it, coalesced
    waves, restart fallback, and ownership-loss behavior.
-5. Existing frontier, zero-cost, request-priority, rollout, recovery, and paid
+6. Existing frontier, zero-cost, request-priority, rollout, recovery, and paid
    capacity suites unchanged.
-6. For speculation, migration upgrade/downgrade ownership, winner races, late
+7. For speculation, migration upgrade/downgrade ownership, winner races, late
    success, cancellation ambiguity, crash failpoints around winner commit,
    cleanup recovery, price staleness, reservation exhaustion, rejected-request
    exclusion, invoice reconciliation, and fail-closed mixed-version rollback.
