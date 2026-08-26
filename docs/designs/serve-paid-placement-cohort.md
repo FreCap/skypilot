@@ -41,6 +41,28 @@ call. No provider effect occurred during the failed `1.1.1508` qualification;
 the guarded production census remained at zero replicas, claims, Spot VMs, and
 on-demand VMs.
 
+Release `1.1.1509` proved the corrected Phase-A boundary in production: one
+100-member Spot-only batch committed its replica and claim rows in 4.2 seconds.
+The same run exposed an independent Phase-B handoff defect because it overlapped
+the Helm load-balancer rollout.  A fresh report from the previous HA cutover
+generation remained beside the newly selected ACTIVE reporter. Prospective
+demand correctly rejected that mixed set, but committed-claim validation reused
+the same predicate and returned `Committed paid claim lost current load-balancer
+authority` for already debited rows.  Their transport retries then backed off
+while the finite synthetic demand window expired; the guarded provider peak was
+12 GCP Spot L4 VMs and zero on-demand VMs, so this is not the required lifecycle
+qualification.
+
+The steady-state contract distinguishes those boundaries.  Prospective
+planning continues to reject a mixed HA generation before any debit commits.
+After a debit commits, a non-current-generation report is display-only: it may
+neither authorize nor revoke the claim's one provider effect. Phase B filters
+to fresh reports for the service's current HA cutover generation, requires the
+exact currently selected ACTIVE slot, and validates every retained current
+report's immutable route snapshot and freshness.  No current ACTIVE report,
+wrong ownership, lifecycle/version drift, corrupt or expired route evidence, or
+an overdrawn immutable debit still fails closed.
+
 The PostgreSQL global paid-capacity authority shipped with database migration
 027. PR #909 reduced its exact-pool bootstrap from 60 to four, added a sticky
 failure cooldown and one-probe recovery, bounded controller submission by API
@@ -1330,7 +1352,7 @@ capacity without deriving either durable claim envelope from it.
 | One nominal paid wave validates one immutable plan and atomically commits its ordered policy-valid `SCHEDULED` replica+claim subset before any worker is registered | Real-PostgreSQL 100-member claim test plus replica-manager no-worker-before-commit test |
 | A member insert fault rolls back every new replica and claim; transaction-acknowledgement loss fails closed, scopes recovery to exact frozen identities, retires and replans association-less pairs, adopts bound pairs, and never infers a batch manifest | Real-PostgreSQL failpoint, lost-ack, exact-scope in-process recovery, and restart tests |
 | A multi-pool batch acquires the service row then exact-pool rows in canonical sorted order and never exceeds the service envelope, card frontier, adaptive pool depth, plan residual, or global paid cap; later P admission independently prevents started workers from exceeding process capacity | Real-PostgreSQL sorted-lock instrumentation and saturation tests, aggregate summed-debit tests, plus retained cross-pool concurrency and P-reservation regressions |
-| A route, allocation, capacity-graph, or demand-semantic change before the transaction rejects every member; monotonic semantic-equivalent reporter heartbeats do not starve a prepared wave; route publication after commit does not revoke an already committed batch | Capacity-plan conflict/rollback tests, 100-member equivalent-heartbeat admission, 100-member fresh-zero rollback, plus retained capacity-plan CAS tests |
+| A route, allocation, capacity-graph, or demand-semantic change before the transaction rejects every member; monotonic semantic-equivalent reporter heartbeats do not starve a prepared wave; route publication and non-current-generation HA reports after commit do not revoke an already committed batch, while the exact current ACTIVE reporter remains mandatory | Capacity-plan conflict/rollback tests, 100-member equivalent-heartbeat admission, 100-member fresh-zero rollback, current-ACTIVE/non-current-HA-generation committed-claim tests, plus retained capacity-plan CAS tests |
 | A default cold batch remains clipped to pool depth 4, service envelope 16, and card frontier 2; an explicit isolated qualification requires effective service limit, summed locked pool headroom, accelerator frontier, process/global cap, and aggregate long-worker capacity all at least 100 | Pure configuration, manager integration, rendered-Helm, and real-PostgreSQL qualification-profile tests |
 | Default and invalid fallback are 4; maximum is at least bootstrap | Pure configuration tests |
 | Failure cooldown defaults to ten minutes and rejects invalid overrides | Pure configuration tests |

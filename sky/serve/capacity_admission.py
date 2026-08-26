@@ -2125,6 +2125,18 @@ def _validate_committed_paid_claim_in_connection(
             _DEMAND_REPORTS.c.valid_until
             > now).order_by(_DEMAND_REPORTS.c.reporter_session_id).
         with_for_update()).mappings().all()
+    if service.get('lb_ha_enabled') == 1:
+        # A report from a non-current HA cutover generation is display-only.
+        # Prospective planning must reject that mixed set before a debit
+        # commits, but it must not revoke an already committed claim's one
+        # provider effect.  Retain only the current generation here; the
+        # predicate below still requires the exact selected ACTIVE slot.
+        cutover_generation = service.get('lb_cutover_generation')
+        fresh_reports = [
+            row for row in fresh_reports
+            if isinstance(row.get('payload'), Mapping) and
+            row['payload'].get('applied_generation') == cutover_generation
+        ]
     if (not fresh_reports or
             any(row['complete'] is not True or row['protocol_version'] != 2
                 for row in fresh_reports) or

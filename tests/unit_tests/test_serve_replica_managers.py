@@ -2272,6 +2272,68 @@ class TestBoundOrdinaryLaunchManagerIntegration:
                 cancel_exact=mock.Mock(),
                 teardown_requested=threading.Event())
 
+    def test_ambiguous_cancel_rejection_relinquishes_launch_owner(self):
+        teardown_requested = threading.Event()
+        teardown_requested.set()
+        reduce_exact = mock.Mock(return_value=self._projection(
+            'AMBIGUOUS', status='FAILED', projected=False))
+        cancel_exact = mock.Mock(
+            side_effect=ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'An ambiguous association cannot authorize cancellation.'))
+
+        with mock.patch.object(replica_managers.sdk, 'get') as get, \
+             pytest.raises(
+                 replica_managers._BoundOrdinaryLaunchUnresolvedError,
+                 match='durably ambiguous'):
+            replica_managers._wait_for_bound_ordinary_launch(
+                replica_id=1,
+                cluster_name='svc-1',
+                request_id='request-id',
+                stream_logs=False,
+                launch_cloud=None,
+                reduce_exact=reduce_exact,
+                cancel_exact=cancel_exact,
+                teardown_requested=teardown_requested)
+
+        cancel_exact.assert_called_once_with('replica-teardown')
+        reduce_exact.assert_called_once_with(None, None)
+        get.assert_not_called()
+
+    def test_transient_cancel_failure_retries_without_forging_commit(self):
+        teardown_requested = threading.Event()
+        teardown_requested.set()
+        active = self._projection('ADOPT_ACTIVE',
+                                  status='RUNNING',
+                                  projected=False)
+        projected = self._projection('PROJECTED',
+                                     status='CANCELLED',
+                                     cancel_reason='replica-teardown')
+        reduce_exact = mock.Mock(return_value=active)
+        cancel_exact = mock.Mock(
+            side_effect=[RuntimeError('temporarily unavailable'), projected])
+
+        with mock.patch.object(replica_managers.time, 'sleep') as sleep, \
+             mock.patch.object(replica_managers.sdk,
+                               'stream_and_get') as stream_and_get:
+            replica_managers._wait_for_bound_ordinary_launch(
+                replica_id=1,
+                cluster_name='svc-1',
+                request_id='request-id',
+                stream_logs=True,
+                launch_cloud=None,
+                reduce_exact=reduce_exact,
+                cancel_exact=cancel_exact,
+                teardown_requested=teardown_requested)
+
+        assert cancel_exact.call_args_list == [
+            mock.call('replica-teardown'),
+            mock.call('replica-teardown'),
+        ]
+        reduce_exact.assert_called_once_with(None, None)
+        sleep.assert_called_once_with(
+            replica_managers._LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
+        stream_and_get.assert_not_called()
+
     @pytest.mark.parametrize('reason', ['capacity', 'quota'])
     def test_waiter_raises_typed_durable_capacity_error(self, reason):
         error = (_capacity_error() if reason == 'capacity' else _quota_error())
@@ -2445,6 +2507,120 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         persist.assert_called_once_with(context.replica_id, info)
         settle.assert_not_called()
         reconcile.assert_not_called()
+
+    @pytest.mark.parametrize('provider_reconcilable', [True, False])
+    def test_interrupted_ambiguous_worker_handoff_is_protocol_fenced(
+            self, provider_reconcilable):
+        manager = _make_manager()
+        manager._ordinary_launch_binding_authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=2,
+            generic=True)
+        runtime = manager._legacy_mutation_runtime_state()
+        non_pool_context = _bound_non_pool_context(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+        context = non_pool_context
+        if not provider_reconcilable:
+            context = ordinary_launch_binding.BoundLaunchContext(
+                association_id=non_pool_context.association_id,
+                request_id=non_pool_context.request_id,
+                service_name=non_pool_context.service_name,
+                replica_id=non_pool_context.replica_id,
+                replica_record_id=non_pool_context.replica_record_id,
+                launch_generation=non_pool_context.launch_generation,
+                input_digest=non_pool_context.input_digest)
+        info = _fake_replica_info(
+            context.replica_id,
+            replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.replica_record_id = str(context.replica_record_id)
+        status = info.status_property
+        status.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
+        status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+        status.is_scale_down = True
+        status.drain_cap_seconds = 0
+        error = replica_managers._BoundOrdinaryLaunchUnresolvedError(
+            'durably ambiguous')
+
+        def _fail():
+            raise error
+
+        launch_thread = replica_managers._ReplicaLaunchThread(
+            target=_fail,
+            replica_id=context.replica_id,
+            replica_record_id=info.replica_record_id,
+            service_hash=manager._service_hash,
+            controller_owner=manager._controller_owner,
+            teardown_requested=threading.Event(),
+            completion_queue=queue.SimpleQueue(),
+            completion_event=threading.Event(),
+            bound_ordinary_launch=True)
+        launch_thread.start()
+        launch_thread.join()
+        runtime.launch_thread_pool[context.replica_id] = launch_thread
+        runtime.replica_to_request_id[context.replica_id] = context.request_id
+        runtime.replica_to_logical_launch_fence[
+            context.replica_id] = mock.sentinel.logical_fence
+        projection = types.SimpleNamespace(context=context)
+
+        with mock.patch.object(
+                manager, '_reconcile_ambiguous_logical_retirement_commits'), \
+             mock.patch.object(
+                 manager, '_reconcile_legacy_uncertain_logical_retirements'), \
+             mock.patch.object(
+                 manager, '_reconcile_recovering_logical_retirements'), \
+             mock.patch.object(manager, '_refresh_wait_for_idle'), \
+             mock.patch.object(
+                 manager, '_clear_known_unknown_capacity_replacements'), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos_from_ids',
+                 return_value={context.replica_id: info}), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 return_value=projection) as inspect, \
+             mock.patch.object(
+                 replica_managers,
+                 '_bound_projection_classification',
+                 return_value='AMBIGUOUS'), \
+             mock.patch.object(
+                 manager,
+                 '_bound_non_pool_provider_present_cleanup_context',
+                 return_value=None), \
+             mock.patch.object(
+                 manager,
+                 '_schedule_non_pool_provider_reconciliation',
+                 side_effect=RuntimeError('stop after handoff')) as reconcile, \
+             mock.patch.object(
+                 manager,
+                 '_service_is_cleanup_authorized',
+                 side_effect=RuntimeError('retained legacy owner')) as cleanup, \
+             mock.patch.object(manager, '_terminate_replica') as terminate, \
+             pytest.raises(
+                 RuntimeError,
+                 match=('stop after handoff' if provider_reconcilable else
+                        'retained legacy owner')):
+            manager._refresh_legacy_mutation_runtime()
+
+        inspect.assert_called_once_with('svc', context.replica_id,
+                                        info.replica_record_id)
+        terminate.assert_not_called()
+        if provider_reconcilable:
+            reconcile.assert_called_once_with(info, context)
+            cleanup.assert_not_called()
+            assert context.replica_id not in runtime.launch_thread_pool
+            assert context.replica_id not in runtime.replica_to_request_id
+            assert (context.replica_id
+                    not in runtime.replica_to_logical_launch_fence)
+        else:
+            reconcile.assert_not_called()
+            cleanup.assert_called_once_with()
+            assert runtime.launch_thread_pool[
+                context.replica_id] is launch_thread
+            assert (runtime.replica_to_request_id[context.replica_id] ==
+                    context.request_id)
+            assert (runtime.replica_to_logical_launch_fence[context.replica_id]
+                    is mock.sentinel.logical_fence)
 
     def test_provider_present_cleanup_does_not_cancel_live_bound_worker(self):
         manager = _make_manager()
