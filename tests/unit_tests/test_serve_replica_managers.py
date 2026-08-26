@@ -12794,6 +12794,43 @@ class TestLogicalCapacityPlanning:
         mgr._register_wait_for_idle.assert_called_once_with(
             ready, deadline=math.inf, replica_url='http://replica-2:8000')
 
+    def test_fresh_zero_paid_retirement_defers_remaining_wave(self):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._service_hash = 'svc-hash'
+        mgr._controller_owner = (123, '10.0.0.5')
+        mgr._update_recovery_required = False
+        replicas = [self._ready_backend(replica_id, 1) for replica_id in (1, 2)]
+        for info in replicas:
+            info.is_zero_cost = False
+        infos = {info.replica_id: info for info in replicas}
+        authority = replica_managers.paid_retirement.FreshZeroAuthority(
+            service_hash='svc-hash',
+            demand_source_epoch=2,
+            demand_feed_generation=7,
+            capacity_plan_generation=9,
+            capacity_plan_sha256='a' * 64,
+            route_generation=11)
+        mgr._register_wait_for_idle = mock.Mock()
+        mgr._terminate_replica = mock.Mock()
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_info_from_id',
+                side_effect=lambda _service_name, replica_id: infos[
+                    replica_id]), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'admit_paid_retirement',
+                 return_value=None) as admit:
+            changed = mgr.reconcile_fresh_zero_paid_retirements(
+                authority, replicas)
+
+        assert not changed
+        admit.assert_called_once()
+        mgr._terminate_replica.assert_not_called()
+        mgr._register_wait_for_idle.assert_not_called()
+
     @pytest.mark.parametrize('error_type', [
         replica_managers._ReplicaLaunchOwnershipLostError,
         RuntimeError,
