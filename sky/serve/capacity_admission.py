@@ -1275,6 +1275,144 @@ def _changed_demand_semantics(expected: Any,
     ]
 
 
+_NORMALIZED_COMPATIBILITY_DEMAND_FIELDS = frozenset(
+    {'arrivals', 'queued', 'rejected'})
+_NORMALIZED_COMPATIBILITY_PROFILE_FIELDS = frozenset(
+    {'priority', 'compatible_accelerators', 'count', 'recent_count'})
+
+
+def _canonical_normalized_compatibility_profiles(
+    value: Any,) -> dict[tuple[int, tuple[str, ...]], tuple[int, int]] | None:
+    """Parse the exact normalized profile shape without merging duplicates."""
+    if not isinstance(value, list):
+        return None
+    result: dict[tuple[int, tuple[str, ...]], tuple[int, int]] = {}
+    for raw_profile in value:
+        if (not isinstance(raw_profile, Mapping) or
+                set(raw_profile) != _NORMALIZED_COMPATIBILITY_PROFILE_FIELDS):
+            return None
+        priority = raw_profile['priority']
+        raw_accelerators = raw_profile['compatible_accelerators']
+        count = raw_profile['count']
+        recent_count = raw_profile['recent_count']
+        if (not isinstance(priority, int) or isinstance(priority, bool) or
+                not 0 <= priority <= 100 or
+                not isinstance(raw_accelerators, list) or
+                not raw_accelerators or len(raw_accelerators) >
+                constants.LB_REQUEST_ACCELERATORS_MAX_ITEMS or not all(
+                    isinstance(card, str) and card for card in raw_accelerators)
+                or len(set(raw_accelerators)) != len(raw_accelerators) or
+                not isinstance(count, int) or isinstance(count, bool) or
+                count <= 0 or not isinstance(recent_count, int) or
+                isinstance(recent_count, bool) or recent_count < 0 or
+                recent_count > count):
+            return None
+        key = (priority, tuple(raw_accelerators))
+        if key in result:
+            return None
+        result[key] = (count, recent_count)
+    return result
+
+
+def _changed_prospective_demand_semantics(expected: Any,
+                                          current: Any) -> list[str]:
+    """Compare prospective demand while allowing only natural arrival expiry.
+
+    A prospective claim first locks the exact current plan head, demand
+    generation, receipt watermark, reports, and route. Reconstructing the
+    normalized snapshot after those locks takes a later PostgreSQL clock
+    sample, so an old rolling-window arrival may expire even though none of
+    the locked authority changed. This comparator accepts only that monotonic
+    projection: an existing arrival class may shrink or disappear. It cannot
+    appear, grow, or move between priorities or exact accelerator tuples.
+
+    All non-arrival reporter semantics remain byte-exact. In particular this
+    exception does not apply during plan publication and does not relax route,
+    watermark, supply, inventory, paid-cap, or exact-card validation.
+    """
+    if not isinstance(expected, Mapping) or not isinstance(current, Mapping):
+        return ['unavailable']
+    try:
+        changed = _changed_demand_semantics(expected, current)
+    except ValueError:
+        return ['unavailable']
+    expected = {
+        key: value
+        for key, value in expected.items()
+        if key not in _PLAN_DERIVED_DEMAND_FIELDS
+    }
+    current = {
+        key: value
+        for key, value in current.items()
+        if key not in _PLAN_DERIVED_DEMAND_FIELDS
+    }
+    if (set(expected) != set(current) or
+            'recent_request_count' not in expected or
+            'compatibility_demand' not in expected):
+        return changed or ['unavailable']
+
+    expected_recent = expected['recent_request_count']
+    current_recent = current['recent_request_count']
+    if (not isinstance(expected_recent, int) or
+            isinstance(expected_recent, bool) or expected_recent < 0 or
+            not isinstance(current_recent, int) or
+            isinstance(current_recent, bool) or current_recent < 0 or
+            current_recent > expected_recent):
+        return changed or ['recent_request_count']
+    expected_compatibility = expected['compatibility_demand']
+    current_compatibility = current['compatibility_demand']
+    if (not isinstance(expected_compatibility, Mapping) or
+            not isinstance(current_compatibility, Mapping) or
+            set(expected_compatibility) !=
+            _NORMALIZED_COMPATIBILITY_DEMAND_FIELDS or
+            set(current_compatibility) !=
+            _NORMALIZED_COMPATIBILITY_DEMAND_FIELDS):
+        return changed or ['compatibility_demand']
+
+    expected_profiles = {
+        field: _canonical_normalized_compatibility_profiles(
+            expected_compatibility[field])
+        for field in _NORMALIZED_COMPATIBILITY_DEMAND_FIELDS
+    }
+    current_profiles = {
+        field: _canonical_normalized_compatibility_profiles(
+            current_compatibility[field])
+        for field in _NORMALIZED_COMPATIBILITY_DEMAND_FIELDS
+    }
+    if (any(profiles is None for profiles in expected_profiles.values()) or
+            any(profiles is None for profiles in current_profiles.values())):
+        return changed or ['compatibility_demand']
+    expected_arrivals = expected_profiles['arrivals']
+    current_arrivals = current_profiles['arrivals']
+    assert expected_arrivals is not None
+    assert current_arrivals is not None
+    if (expected_recent != sum(count for count, _ in expected_arrivals.values())
+            or current_recent != sum(
+                count for count, _ in current_arrivals.values())):
+        return changed or ['compatibility_demand', 'recent_request_count']
+    if not changed:
+        return []
+    expiry_fields = {'recent_request_count', 'compatibility_demand'}
+    try:
+        other_field_changed = any(
+            _sha256({'value': expected[key]}) != _sha256(
+                {'value': current[key]})
+            for key in set(expected) - expiry_fields)
+        queued_or_rejected_changed = any(
+            _sha256(expected_compatibility[field]) != _sha256(
+                current_compatibility[field])
+            for field in ('queued', 'rejected'))
+    except ValueError:
+        return changed
+    if other_field_changed or queued_or_rejected_changed:
+        return changed
+    for key, (count, recent_count) in current_arrivals.items():
+        planned = expected_arrivals.get(key)
+        if (planned is None or count > planned[0] or recent_count > planned[1]):
+            return changed
+    return []
+
+
 def get_service_source_mode(
         service_name: str) -> tuple[DemandSourceMode, int] | None:
     """Read the current per-service demand owner without provider access."""
@@ -2208,7 +2346,7 @@ def validate_paid_claim_in_connection(
     plan_normalized_demand = payload.get('normalized_demand')
     changed_demand_fields = ([
         'unavailable'
-    ] if current_snapshot is None else _changed_demand_semantics(
+    ] if current_snapshot is None else _changed_prospective_demand_semantics(
         plan_normalized_demand, current_snapshot.normalized_demand))
     if changed_demand_fields:
         raise CapacityAdmissionConflict(
