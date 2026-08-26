@@ -21,6 +21,8 @@ pytestmark = pytest.mark.xdist_group(
 
 _MIGRATION = importlib.import_module(
     'sky.schemas.db.serve_state.059_ordinary_paid_provider_absence')
+_CURRENT_MIGRATION = importlib.import_module(
+    'sky.schemas.db.serve_state.060_cancelled_gcp_paid_cleanup')
 
 
 def _function_definition(engine: sqlalchemy.engine.Engine,
@@ -237,9 +239,10 @@ def test_serve059_lineage_and_runtime_metadata() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['059']
+    assert scripts.get_heads() == ['060']
+    assert scripts.get_revision('060').down_revision == '059'
     assert scripts.get_revision('059').down_revision == '058'
-    assert migration_utils.SERVE_VERSION == '059'
+    assert migration_utils.SERVE_VERSION == '060'
     assert migration_utils.serve_target_version(sqlite) == '037'
 
     constraint = next(
@@ -247,7 +250,7 @@ def test_serve059_lineage_and_runtime_metadata() -> None:
         ordinary_launch_binding.ordinary_launch_associations_table.constraints
         if item.name == _MIGRATION._PROJECTION_CONSTRAINT)
     assert _compact(str(constraint.sqltext)) == _compact(
-        _MIGRATION._PROJECTION_CHECK)
+        _CURRENT_MIGRATION._PROJECTION_CHECK)
     paid_pool_constraint = next(
         item for item in
         ordinary_launch_binding.ordinary_launch_associations_table.constraints

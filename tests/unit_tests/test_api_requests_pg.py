@@ -587,6 +587,7 @@ def _prepare_paid_provider_absence_graph(
     receipt: dict[str, object] | None = None,
     pool_key: str | None = None,
     production_http_normalization: bool = False,
+    explicit_cancel: bool = False,
 ) -> _PaidProviderAbsenceGraph:
     engine, _ = bound_request_database
     if pool_key is None:
@@ -747,6 +748,9 @@ def _prepare_paid_provider_absence_graph(
                     effect_phase_changed_at=(sqlalchemy.func.clock_timestamp()),
                     owner_revision=association.c.owner_revision + 1,
                     updated_at=sqlalchemy.func.clock_timestamp()))
+        if explicit_cancel:
+            ordinary_launch_binding.request_cancel_in_connection(
+                connection, context, 'service-teardown')
         assert ordinary_launch_binding.mark_ambiguous_in_connection(
             connection, context, 'provider-result-uncertain')
         connection.execute(
@@ -761,14 +765,19 @@ def _prepare_paid_provider_absence_graph(
             sqlalchemy.update(request_postgres.REQUESTS).where(
                 request_postgres.REQUESTS.c.request_id ==
                 context.request_id).values(
-                    status=requests.RequestStatus.FAILED.value,
+                    status=(requests.RequestStatus.CANCELLED.value
+                            if explicit_cancel else
+                            requests.RequestStatus.FAILED.value),
                     terminal_cause=(
+                        event_api_models.EventCause.EXPLICIT_CANCEL.value
+                        if explicit_cancel else
                         event_api_models.EventCause.HANDLER_FAILED.value),
                     execution_generation=1,
                     execution_quiescence_required=True,
                     execution_quiesced_generation=1,
                     execution_quiesced_at=quiesced_at,
-                    error=_gc_provider_negative_ack_error(receipt),
+                    error=(None if explicit_cancel else
+                           _gc_provider_negative_ack_error(receipt)),
                     finished_at=now,
                     updated_at=now))
     return _PaidProviderAbsenceGraph(engine=engine,
@@ -3036,6 +3045,107 @@ def test_gcp_paid_exact_presence_authorizes_only_immediate_cleanup(
     assert info.paid_capacity_pool_key == graph.pool_key
     assert request_postgres.bound_non_pool_provider_present_cleanup_is_authorized(
         graph.context, graph.authority)
+
+
+def test_cancelled_gcp_paid_present_cleanup_then_absence_retires_atomically(
+        bound_request_database, monkeypatch) -> None:
+    """Explicit teardown keeps debits until exact GCP cleanup is absent."""
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database,
+        monkeypatch,
+        pool_key=_gc_gcp_paid_pool_key(),
+        production_http_normalization=True,
+        explicit_cancel=True)
+    identity = request_postgres.bound_non_pool_gcp_provider_identity(
+        graph.context, graph.authority)
+    assert identity is not None
+    resource_name = (f'{identity["cluster_name_on_cloud"]}'
+                     '-head-1234abcd-compute')
+    base_payload = {
+        'association_id': str(graph.context.association_id),
+        'cluster_name': 'gc-service-3',
+        'probe_contract': 'gcp-vm-disk-operation-presence-v1',
+        'profile_kind': 'ORDINARY_PAID',
+        'provider_identity': identity,
+        'replica_record_id': str(_GC_REPLICA_RECORD_ID),
+    }
+    present_payload = {
+        **base_payload,
+        'create_operation_targets': {
+            'failed': [],
+            'inflight': [],
+            'succeeded': [resource_name],
+        },
+        'disk_ids': [resource_name],
+        'instance_ids': [resource_name],
+        'result': 'PRESENT',
+    }
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        graph.context, graph.authority,
+        ordinary_launch_binding.ProviderEvidence.PRESENT, present_payload)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'gc-service'
+    manager._ordinary_launch_binding_authority = graph.authority
+    assert request_postgres.authorize_bound_non_pool_provider_present_cleanup(
+        graph.context,
+        graph.authority,
+        project_replica_result=lambda connection, projection: manager.
+        _project_bound_ordinary_launch(None, connection, projection))
+
+    with graph.engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table)).scalar_one(
+                ) == 1
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.REQUEST_RETENTION_PINS)).scalar_one() == 1
+
+    absent_payload = {
+        **base_payload,
+        'create_operation_targets': {
+            'failed': [],
+            'inflight': [],
+            'succeeded': [],
+        },
+        'disk_ids': [],
+        'instance_ids': [],
+        'result': 'ABSENT',
+    }
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        graph.context, graph.authority,
+        ordinary_launch_binding.ProviderEvidence.ABSENT, absent_payload)
+    assert request_postgres.project_bound_non_pool_provider_absence(
+        graph.context,
+        graph.authority,
+        project_replica_result=lambda connection, projection: manager.
+        _project_bound_ordinary_launch(None, connection, projection))
+
+    with graph.engine.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id ==
+                  graph.context.association_id)).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                'gc-service', serve_state_schema.replicas_table.c.replica_id ==
+                3)).mappings().one()
+        claim_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table)).scalar_one()
+        pin_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.REQUEST_RETENTION_PINS)).scalar_one()
+    assert association['resolution'] == 'PROJECTED'
+    assert association['terminal_status'] == 'CANCELLED'
+    assert association['terminal_cause'] == 'explicit_cancel'
+    assert association['provider_evidence_payload'] == absent_payload
+    assert replica['ordinary_launch_association_id'] is None
+    assert claim_count == pin_count == 0
 
 
 def test_service_teardown_settles_exact_paid_provider_negative_ack(
