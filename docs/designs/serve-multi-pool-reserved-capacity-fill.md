@@ -208,17 +208,18 @@ residual is authorized. Opportunistic fill is utilization-gated with a zero
 floor, so idle fill returns without changing East scheduling or Simone's PHX
 Kueue policy.
 
-The existing implementation has one calculation defect relative to this
-contract. Aggregate queued work applies priority timeout weights, while the
-exact-card compatibility allocator consumes raw queued profile counts. A
-complete compatibility report can therefore raise the aggregate target back
+Before PR #1758, aggregate queued work applied priority timeout weights while
+the exact-card compatibility allocator consumed raw queued profile counts. A
+complete compatibility report could therefore raise the aggregate target back
 to one logical slot per queued request and erase the timeout weighting. The
-steady state has one queue-work representation: every queued compatibility
-profile is converted to work with the same priority timeout, expected request
-duration, launch lead, and utilization policy used by the aggregate target.
-That exact work is then allocated once across compatible cards. Raw counts
-remain only the conservative mixed-version fallback when the priority or
-compatibility report is incomplete; they are not a second current happy path.
+deployed implementation now has one queue-work representation: every queued
+compatibility profile is converted to work with the same priority timeout,
+expected request duration, launch lead, and utilization policy used by the
+aggregate target. That exact work is then allocated once across compatible
+cards. Raw counts remain only the conservative mixed-version fallback when the
+priority or compatibility report is incomplete; they are not a second current
+happy path. The separate capacity-time refinement below addresses ready versus
+cold supply; it does not reopen this fixed aggregate/exact-card split.
 
 A fresh positive snapshot can follow a committed zero-demand retirement while
 the pre-transaction replica snapshot still marks paid capacity as scaling
