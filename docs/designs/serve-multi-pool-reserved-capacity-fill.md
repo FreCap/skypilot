@@ -492,7 +492,7 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` at merge `574b78d0f`, including PR #1769's accelerator-scoped reserved authority, both paid reconciliation profiles, and per-association teardown isolation; PR #1770's Serve063 trigger correction; and PR #1771's Serve063 placement authority. The Serve064 paid-`SERVICE_JOB_IO` reconciliation boundary described above is the current source change and is not yet deployed. |
+| Source base | `origin/improvements` at merge `574b78d0f`, including PR #1769's accelerator-scoped reserved authority, both paid reconciliation profiles, and per-association teardown isolation; PR #1770's Serve063 trigger correction; and PR #1771's Serve063 placement authority. PR #1772 at `d83861586` contains the qualified Serve064 paid-`SERVICE_JOB_IO` reconciliation boundary described above; it is not yet merged or deployed. |
 | Deployed control plane | SkyPilot `1.1.1540`, Helm revision 657. API, controller, and executor roles use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:82264e9df1791457f1460b02ccab5fd3d163b9df8b3926e38df7d29df5125a2c`. Helm storage remains disabled and PostgreSQL remains the sole central store. |
 | Writer protocol | Public API 93, worker projection 10, deployed and source non-pool capability cohort 13, and async request-ledger protocol 1. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. |
@@ -1663,9 +1663,10 @@ no-on-demand halves, but its final retained ``SERVICE_JOB_IO`` association left
 one exact Spot VM after otherwise normal parallel teardown. The remaining
 gates are:
 
-1. Merge and deploy Serve064. Prove the retained association reconstructs its
-   exact GCP identity, observes ``PRESENT``, terminates only the matching VM,
-   later observes ``ABSENT``, and retires the service, replica, association,
+1. Merge and deploy PR #1772 / Serve064. Prove the retained association
+   reconstructs its exact GCP identity, observes ``PRESENT``, terminates only
+   the matching VM, later observes ``ABSENT``, and retires the service,
+   replica, association,
    claim, waiter, pin, VM, disk, operation, and cluster bookkeeping through the
    supported reducers. No direct provider or database deletion is allowed.
 2. Hold provider and PostgreSQL zero through repeated observations and one
