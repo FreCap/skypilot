@@ -5503,8 +5503,12 @@ class TestAutoscalerRuntimeSnapshot:
                     1, 3, 28, request_target, shapes),
                 retirement_shelter=None,
                 invalidate_logical_target=False),
-            capacity_target_by_accelerator=(('a100', 19), ('a100-80gb', 9),
-                                            ('h200', 0), ('l4', 0)),
+            committed_demand_target_by_accelerator=(('a100', 19), ('a100-80gb',
+                                                                   9),
+                                                    ('h200', 0), ('l4', 0)),
+            actuation_target_capacity=28,
+            actuation_target_by_accelerator=(('a100', 19), ('a100-80gb', 9),
+                                             ('h200', 0), ('l4', 0)),
             accelerator_shapes=shapes,
             logical_snapshot=None,
             notification_generation=4,
@@ -5565,7 +5569,9 @@ class TestAutoscalerRuntimeSnapshot:
                     1, 3, 28, (('L4', 28),), shapes),
                 retirement_shelter=None,
                 invalidate_logical_target=False),
-            capacity_target_by_accelerator=(('a100', 20), ('l4', 8)),
+            committed_demand_target_by_accelerator=(('a100', 20), ('l4', 8)),
+            actuation_target_capacity=28,
+            actuation_target_by_accelerator=(('a100', 20), ('l4', 8)),
             accelerator_shapes=shapes,
             logical_snapshot=None,
             notification_generation=4,
@@ -5582,6 +5588,58 @@ class TestAutoscalerRuntimeSnapshot:
                                                                    ('L4', 8))
         assert installed_target.cold_launch_authority_by_accelerator == (('L4',
                                                                           8),)
+
+    def test_fresh_zero_installs_existing_capacity_retention_target(self):
+        shapes = (('A100', 1), ('L4', 1))
+        demand_target = (('A100', 5), ('L4', 1))
+        scale_down = autoscalers.AutoscalerDecision(
+            autoscalers.AutoscalerDecisionOperator.SCALE_DOWN,
+            autoscalers.LogicalScaleDownTarget(
+                version=1,
+                reconcile_generation=3,
+                target_capacity=6,
+                replica_id=17,
+                target_capacity_by_accelerator=demand_target,
+                accelerator_shapes=shapes))
+        planned = controller._LinearizedScalePlan(  # pylint: disable=protected-access
+            snapshot=self._durable_snapshot(fresh_aggregate_zero=True),
+            scaling_plan=controller._ScaleReconciliationPlan(  # pylint: disable=protected-access
+                scaling_options=(scale_down,),
+                target_num_replicas=5,
+                rollout_failure=None,
+                logical_target=autoscalers.LogicalCapacityTarget(
+                    1, 3, 6, demand_target, shapes),
+                logical_retirement_floor=autoscalers.LogicalCapacityTarget(
+                    1, 3, 6, demand_target, shapes),
+                retirement_shelter=None,
+                invalidate_logical_target=False),
+            committed_demand_target_by_accelerator=(('a100', 0), ('l4', 0)),
+            actuation_target_capacity=5,
+            actuation_target_by_accelerator=(('a100', 5), ('l4', 0)),
+            accelerator_shapes=shapes,
+            logical_snapshot=None,
+            notification_generation=4,
+            demand_generation=5)
+        authority = types.SimpleNamespace(remaining=lambda: {})
+
+        installed = (
+            controller.SkyServeController.
+            _install_committed_logical_capacity_target(  # pylint: disable=protected-access
+                planned, authority, 1000))
+
+        retained = autoscalers.LogicalCapacityTarget(1, 3, 5, (('A100', 5),),
+                                                     shapes)
+        assert installed.scaling_plan.target_num_replicas == 5
+        assert installed.scaling_plan.logical_target == retained
+        assert installed.scaling_plan.logical_retirement_floor == retained
+        assert installed.scaling_plan.scaling_options[0].target == (
+            autoscalers.LogicalScaleDownTarget(
+                version=1,
+                reconcile_generation=3,
+                target_capacity=5,
+                replica_id=17,
+                target_capacity_by_accelerator=(('A100', 5),),
+                accelerator_shapes=shapes))
 
     def test_exact_paid_target_does_not_depend_on_unrelated_reserved_authority(
             self):
@@ -5791,6 +5849,8 @@ class TestAutoscalerRuntimeSnapshot:
         scaler.clear_paid_launch_authority_for_fresh_zero.assert_called_once_with(
         )
         repository.plan_and_publish_current.assert_called_once()
+        ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(
+            0, expected_version=1)
         retirement_authority = (
             ctrl._replica_manager.reconcile_fresh_zero_paid_retirements.
             call_args.args[0])
@@ -5802,6 +5862,68 @@ class TestAutoscalerRuntimeSnapshot:
             capacity_plan_sha256='c' * 64,
             route_generation=4)
         ctrl._replica_manager.scale_up_batch.assert_not_called()
+
+    def test_fresh_aggregate_zero_executes_bounded_retirement_wave(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        scaler = self._logical_durable_autoscaler(target=5)
+        scaler.configured_accelerator_shapes = {'A100': 1, 'L4': 1}
+        scaler.capacity_target_by_accelerator = {'A100': 4, 'L4': 1}
+        scaler.existing_capacity_retention_target_by_accelerator.return_value = {
+            'A100': 5
+        }
+        shapes = (('A100', 1), ('L4', 1))
+        request_target = (('A100', 4), ('L4', 1))
+
+        def _generate(_replica_infos, _active_versions):
+            scaler.logical_target_state = autoscalers.LogicalCapacityTarget(
+                version=1,
+                generation=scaler.reconcile_generation,
+                target_capacity=5,
+                target_capacity_by_accelerator=request_target,
+                accelerator_shapes=shapes)
+            return [
+                autoscalers.AutoscalerDecision(
+                    autoscalers.AutoscalerDecisionOperator.SCALE_DOWN,
+                    autoscalers.LogicalScaleDownTarget(
+                        version=1,
+                        reconcile_generation=scaler.reconcile_generation,
+                        target_capacity=5,
+                        replica_id=17,
+                        target_capacity_by_accelerator=request_target,
+                        accelerator_shapes=shapes))
+            ]
+
+        scaler.generate_scaling_decisions.side_effect = _generate
+        ctrl._autoscaler = scaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        ctrl._replica_manager.publish_logical_reconcile_state.return_value = True
+        ctrl._replica_manager.reconcile_fresh_zero_paid_retirements.return_value = (  # pylint: disable=line-too-long
+            False)
+        snapshot = self._durable_snapshot(observed_slots={17: 1},
+                                          in_flight={17: 0},
+                                          fresh_aggregate_zero=True)
+
+        repository = self._run_promoted_reconciles(ctrl, [snapshot])
+
+        repository.plan_and_publish_current.assert_called_once()
+        scaler.existing_capacity_retention_target_by_accelerator.assert_called_once_with(
+            [], 5, kueue_capacity_by_replica_id=None)
+        ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(
+            5, expected_version=1)
+        published_target = (ctrl._replica_manager.
+                            publish_logical_reconcile_state.call_args.args[0])
+        assert published_target == autoscalers.LogicalCapacityTarget(
+            1, 3, 5, (('A100', 5),), shapes)
+        ctrl._replica_manager.scale_down_logically_batch.assert_called_once_with(
+            [17],
+            5,
+            1,
+            3,
+            target_capacity_by_accelerator=(('A100', 5),),
+            accelerator_shapes=shapes)
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()
 
     def test_newer_positive_demand_cancels_uncommitted_paid_retirement(self):
         ctrl = _make_controller()

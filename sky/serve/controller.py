@@ -138,7 +138,9 @@ class _LinearizedScalePlan:
 
     snapshot: demand_state.DurableAutoscalingSnapshot
     scaling_plan: _ScaleReconciliationPlan
-    capacity_target_by_accelerator: tuple[tuple[str, int], ...]
+    committed_demand_target_by_accelerator: tuple[tuple[str, int], ...]
+    actuation_target_capacity: int
+    actuation_target_by_accelerator: tuple[tuple[str, int], ...]
     accelerator_shapes: tuple[tuple[str, int], ...]
     logical_snapshot: replica_managers.LogicalReconcileSnapshot | None
     notification_generation: int
@@ -2130,10 +2132,9 @@ class SkyServeController:
                            owner: dict[str, Any]) -> _LbPromotionGate:
         """Resolve current route authority and evaluate one target report."""
         raw_mode_hint = owner.get('route_source_mode')
-        mode_hint = (raw_mode_hint if isinstance(raw_mode_hint, str) and
-                     raw_mode_hint in tuple(
-                         mode.value
-                         for mode in route_projection.RouteSourceMode) else
+        mode_hint = (raw_mode_hint if isinstance(
+            raw_mode_hint, str) and raw_mode_hint in tuple(
+                mode.value for mode in route_projection.RouteSourceMode) else
                      'UNKNOWN')
         routing_version = request_data.get('routing_version')
         normalized_version = (routing_version
@@ -6287,7 +6288,17 @@ class SkyServeController:
             return planned
         if not isinstance(logical_target, autoscalers.LogicalCapacityTarget):
             raise ValueError('Logical target has no canonical capacity state.')
-        target_capacity = logical_target.target_capacity
+        original_target_capacity = logical_target.target_capacity
+        target_capacity = planned.actuation_target_capacity
+        if type(target_capacity) is not int or target_capacity < 0:
+            raise ValueError('Logical actuation target is malformed.')
+        fresh_zero_retention = planned.snapshot.fresh_aggregate_zero
+        if ((not fresh_zero_retention and
+             target_capacity != original_target_capacity) or
+            (fresh_zero_retention and
+             target_capacity > original_target_capacity)):
+            raise ValueError('Logical actuation target changed aggregate '
+                             'demand without fresh-zero retention authority.')
         raw_shapes = (logical_target.accelerator_shapes or
                       planned.accelerator_shapes)
         if type(raw_shapes) is not tuple:
@@ -6305,22 +6316,41 @@ class SkyServeController:
             display_cards[card] = raw_card
             shapes.append((raw_card, width))
 
-        committed: dict[str, int] = {}
-        for raw_card, count in planned.capacity_target_by_accelerator:
+        committed_demand: dict[str, int] = {}
+        for raw_card, count in planned.committed_demand_target_by_accelerator:
             if not isinstance(raw_card, str) or not raw_card:
-                raise ValueError('Committed capacity target is malformed.')
+                raise ValueError('Committed demand target is malformed.')
             card = raw_card.casefold()
-            if (card in committed or card not in display_cards or
+            if (card in committed_demand or card not in display_cards or
                     type(count) is not int or count < 0):
-                raise ValueError('Committed capacity target is malformed.')
-            committed[card] = count
-        committed = {card: committed.get(card, 0) for card in display_cards}
-        if sum(committed.values()) != target_capacity:
-            raise ValueError('Committed capacity target changed aggregate '
-                             'logical demand.')
-        target_by_accelerator = tuple((display_cards[card], committed[card])
-                                      for card in display_cards
-                                      if committed[card] > 0)
+                raise ValueError('Committed demand target is malformed.')
+            committed_demand[card] = count
+        committed_demand = {
+            card: committed_demand.get(card, 0) for card in display_cards
+        }
+        if ((fresh_zero_retention and any(committed_demand.values())) or
+            (not fresh_zero_retention and
+             sum(committed_demand.values()) != target_capacity)):
+            raise ValueError('Committed demand target is incompatible with '
+                             'local actuation.')
+
+        actuation: dict[str, int] = {}
+        for raw_card, count in planned.actuation_target_by_accelerator:
+            if not isinstance(raw_card, str) or not raw_card:
+                raise ValueError('Actuation capacity target is malformed.')
+            card = raw_card.casefold()
+            if (card in actuation or card not in display_cards or
+                    type(count) is not int or count < 0):
+                raise ValueError('Actuation capacity target is malformed.')
+            actuation[card] = count
+        actuation = {card: actuation.get(card, 0) for card in display_cards}
+        if sum(actuation.values()) != target_capacity:
+            raise ValueError('Actuation capacity target changed aggregate '
+                             'logical capacity.')
+        target_by_accelerator = tuple(
+            (display_card, actuation[card])
+            for card, display_card in display_cards.items()
+            if actuation[card] > 0)
 
         remaining = authority.remaining()
         if not isinstance(remaining, dict):
@@ -6333,21 +6363,25 @@ class SkyServeController:
             card = raw_card.casefold()
             if (card in paid or card not in display_cards or
                     type(count) is not int or count < 0 or
-                    count > committed[card]):
+                    count > committed_demand[card]):
                 raise ValueError('Paid launch residual is incompatible with '
-                                 'the committed capacity target.')
+                                 'the committed demand target.')
             paid[card] = count
-        paid_by_accelerator = tuple((display_cards[card], paid.get(card, 0))
-                                    for card in display_cards
-                                    if paid.get(card, 0) > 0)
+        paid_by_accelerator = tuple(
+            (display_card, paid.get(card, 0))
+            for card, display_card in display_cards.items()
+            if paid.get(card, 0) > 0)
 
         retargeted_options: list[autoscalers.AutoscalerDecision] = []
         for option in scaling_plan.scaling_options:
             target = option.target
             if isinstance(target, autoscalers.LogicalScaleTarget):
+                if fresh_zero_retention:
+                    raise ValueError('Fresh aggregate zero retained a logical '
+                                     'scale-up option.')
                 if target.target_capacity != target_capacity:
                     raise ValueError('Logical scale-up aggregate differs from '
-                                     'the committed capacity target.')
+                                     'the actuation capacity target.')
                 target = dataclasses.replace(
                     target,
                     target_capacity_by_accelerator=target_by_accelerator,
@@ -6357,12 +6391,16 @@ class SkyServeController:
                         for card, _ in target_by_accelerator),
                     cold_launch_authority_by_accelerator=(paid_by_accelerator))
             elif isinstance(target, autoscalers.LogicalScaleDownTarget):
-                if target.target_capacity != target_capacity:
+                expected_option_capacity = (original_target_capacity
+                                            if fresh_zero_retention else
+                                            target_capacity)
+                if target.target_capacity != expected_option_capacity:
                     raise ValueError(
                         'Logical scale-down aggregate differs from '
-                        'the committed capacity target.')
+                        'the actuation capacity target.')
                 target = dataclasses.replace(
                     target,
+                    target_capacity=target_capacity,
                     target_capacity_by_accelerator=target_by_accelerator,
                     accelerator_shapes=tuple(shapes))
             retargeted_options.append(
@@ -6399,6 +6437,7 @@ class SkyServeController:
             scaling_plan=dataclasses.replace(
                 scaling_plan,
                 scaling_options=tuple(retargeted_options),
+                target_num_replicas=target_capacity,
                 logical_target=committed_logical_target,
                 logical_retirement_floor=retirement_floor,
                 invalidate_logical_target=False))
@@ -6532,7 +6571,14 @@ class SkyServeController:
                 scaling_plan = dataclasses.replace(
                     scaling_plan,
                     scaling_options=scaling_options,
-                    target_num_replicas=0)
+                    # Logical services publish a bounded, existing-capacity
+                    # retention target below so autoscaler hysteresis can
+                    # retire in waves.  Physical services have no such
+                    # committed-target protocol and retain the established
+                    # immediate-zero behavior.
+                    target_num_replicas=(scaling_plan.target_num_replicas
+                                         if scaling_plan.logical_target
+                                         is not None else 0))
 
             capacity_target = self._ordered_capacity_target(
                 decision_autoscaler, force_zero=snapshot.fresh_aggregate_zero)
@@ -6601,10 +6647,55 @@ class SkyServeController:
                     raise capacity_admission.CapacityAdmissionConflict(
                         'Compatible reserved supply is unavailable.')
 
+            actuation_target = dict(capacity_target)
+            actuation_target_capacity = sum(actuation_target.values())
+            logical_target = scaling_plan.logical_target
+            if snapshot.fresh_aggregate_zero and logical_target is not None:
+                retention_infos = (list(supply.economic_replica_infos)
+                                   if supply is not None else replica_infos)
+                retention_kueue = (supply.economic_kueue_capacity_by_replica_id
+                                   if supply is not None else None)
+                try:
+                    retained = (
+                        decision_autoscaler.
+                        existing_capacity_retention_target_by_accelerator(
+                            retention_infos,
+                            logical_target.target_capacity,
+                            kueue_capacity_by_replica_id=(retention_kueue)))
+                except (capacity_admission.CapacityAdmissionError,
+                        ValueError) as error:
+                    raise capacity_admission.CapacityAdmissionConflict(
+                        'Existing capacity could not produce a fresh-zero '
+                        'retention target.') from error
+                if not isinstance(retained, dict):
+                    raise capacity_admission.CapacityAdmissionConflict(
+                        'Fresh-zero retention has no exact-card target.')
+                canonical_retained: dict[str, int] = {}
+                for raw_card, count in retained.items():
+                    card = str(raw_card).casefold()
+                    if (card in canonical_retained or
+                            card not in capacity_target or
+                            not isinstance(count, int) or
+                            isinstance(count, bool) or count < 0):
+                        raise ValueError(
+                            'Fresh-zero retention target is malformed.')
+                    canonical_retained[card] = count
+                actuation_target = {
+                    card: canonical_retained.get(card, 0)
+                    for card in capacity_target
+                }
+                actuation_target_capacity = sum(actuation_target.values())
+                if (actuation_target_capacity > logical_target.target_capacity):
+                    raise ValueError('Fresh-zero retention increased the '
+                                     'autoscaler target.')
+
             planned = _LinearizedScalePlan(
                 snapshot=snapshot,
                 scaling_plan=scaling_plan,
-                capacity_target_by_accelerator=tuple(capacity_target.items()),
+                committed_demand_target_by_accelerator=tuple(
+                    capacity_target.items()),
+                actuation_target_capacity=actuation_target_capacity,
+                actuation_target_by_accelerator=tuple(actuation_target.items()),
                 accelerator_shapes=(tuple(
                     decision_autoscaler.configured_accelerator_shapes.items())
                                     if decision_autoscaler.replica_unit

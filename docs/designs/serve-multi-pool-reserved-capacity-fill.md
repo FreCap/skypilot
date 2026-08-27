@@ -321,6 +321,38 @@ boundary and must produce the same canonical object before core logic runs;
 this test-only deployment has no retained logical-target representation that
 requires such a decoder.
 
+Release ``1.1.1544`` deployed that typed target and the economic-target
+actuation correction on Helm revision 663. A fresh 200-request exact-ledger
+calibration committed an 18-unit A100 economic target with zero paid residual,
+and the controller launched additional reserved A100 replicas instead of the
+pre-economic L4 request-class target. All 200 identities were admitted; the
+deliberately failing application payloads drained in 234.9 seconds, so this was
+an actuation-boundary calibration rather than the final terminal model proof.
+
+The natural drain then exposed one remaining conflation. PostgreSQL correctly
+committed fresh aggregate zero while eleven A100 replicas were ready. The
+autoscaler separately retained a temporary five-unit local target under the
+configured 300-second downscale hysteresis and 50-percent retirement-wave
+limit. Requiring the zero demand target and the retained actuation target to
+have the same aggregate suppressed the entire local publication and retirement
+wave. It also left the prior positive logical launch fence installed, allowing
+already-scheduled replacement launches to appear after demand had drained.
+
+Committed demand and bounded retained actuation are distinct domain concepts,
+not schema versions or competing authorities. Under positive demand they are
+identical after economic placement. Under authenticated fresh aggregate zero,
+the PostgreSQL demand target and paid residual remain exactly zero, every
+scale-up option is removed, and local retained actuation is clamped to the
+smaller of the autoscaler's hysteresis target and already-committed logical
+capacity. Its exact-card map may select only that existing committed supply;
+unmaterialized reserved grants and every paid location are excluded. Publishing
+the new retained target revokes every prior positive launch fence immediately,
+while same-generation scale-down decisions may retire the excess down to that
+target. Each later bounded wave recomputes from the smaller committed fleet
+until both retained actuation and physical capacity reach zero. A target
+divergence is valid only for this typed fresh-zero retention state; any positive
+committed demand mismatch remains fail-closed.
+
 The first deadline-planner production campaign on lifecycle 121 exposed a
 remaining violation of that demand-driven contract. Two hundred explicitly
 L4-only, priority-zero queue entries correctly produced an L4-only deadline
