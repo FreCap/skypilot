@@ -37,6 +37,7 @@ logger = sky_logging.init_logger(__name__)
 
 AutoscalerDecisionOperator = (autoscaler_decisions.AutoscalerDecisionOperator)
 AutoscalerDecisionReason = autoscaler_decisions.AutoscalerDecisionReason
+LogicalCapacityTarget = autoscaler_decisions.LogicalCapacityTarget
 LogicalScaleTarget = autoscaler_decisions.LogicalScaleTarget
 LogicalScaleDownTarget = autoscaler_decisions.LogicalScaleDownTarget
 UnrecoverableRolloutFailure = (autoscaler_decisions.UnrecoverableRolloutFailure)
@@ -5843,10 +5844,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         # one-wave replacement incident state.
         self._degraded_capacity_since_by_replica_id: dict[int, float] = {}
         self._logical_state_lock = threading.RLock()
-        self._last_logical_target_state: (
-            tuple[int, int, int] |
-            tuple[int, int, int, tuple[tuple[str, int], ...],
-                  tuple[tuple[str, int], ...]] | None) = None
+        self._last_logical_target_state: LogicalCapacityTarget | None = None
         self._gpu_shape_cache: dict[int, tuple[str, int]] = {}
         # Backs the cost-descending victim tiebreak (shed paid spot
         # before zero-cost reserved capacity); pruned with the shape
@@ -6112,8 +6110,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
     @property
     def logical_target_state(
         self,
-    ) -> (tuple[int, int, int] | tuple[int, int, int, tuple[tuple[
-            str, int], ...], tuple[tuple[str, int], ...]] | None):
+    ) -> LogicalCapacityTarget | None:
         """Version, report generation, and demand actuation target."""
         with self._logical_state_lock:
             return self._last_logical_target_state
@@ -9001,14 +8998,17 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 # published by an earlier complete generation.
                 self._last_logical_target_state = None
             elif use_card_targets:
-                self._last_logical_target_state = (self.latest_version,
-                                                   self._reconcile_generation,
-                                                   target, target_by_card_state,
-                                                   shape_state)
+                self._last_logical_target_state = LogicalCapacityTarget(
+                    version=self.latest_version,
+                    generation=self._reconcile_generation,
+                    target_capacity=target,
+                    target_capacity_by_accelerator=target_by_card_state,
+                    accelerator_shapes=shape_state)
             else:
-                self._last_logical_target_state = (self.latest_version,
-                                                   self._reconcile_generation,
-                                                   target)
+                self._last_logical_target_state = LogicalCapacityTarget(
+                    version=self.latest_version,
+                    generation=self._reconcile_generation,
+                    target_capacity=target)
             for decision in decisions:
                 if (decision.operator == AutoscalerDecisionOperator.SCALE_DOWN
                         and isinstance(decision.target, int)):

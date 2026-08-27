@@ -284,6 +284,43 @@ target, settled grants debit that supply and only the genuine remainder may
 become Spot. No allocation schema, database migration, Kueue object, or
 provider contract changes for this correction.
 
+Release ``1.1.1543`` deployed that shared witness on Helm revision 661. Its
+fresh 200-request calibration reached a schema-6 allocation with demonstrated
+need 28, ceiling 35, settled grants 35, and zero paid claims while the same
+round observed 240 compatible spendable GPUs. The transaction then selected
+the correct compatibility-aware economic target: eight existing A100 replicas,
+eleven additional A100 slots, and nine A100-80GB slots covered all 28 logical
+replicas with a zero paid residual. Local logical actuation nevertheless kept
+the pre-economic request-class target of eight A100 plus twenty L4. It launched
+and served on the eight A100s, but could neither launch the remaining exact-L4
+target on reserved A100-80GB/H200 nor spend paid authority, because PostgreSQL
+correctly authorized no Spot residual. This is the remaining utilization gap:
+the transaction commits one economic target while the replica manager actuates
+a different pre-transaction target.
+
+The committed economic target is therefore also the sole local actuation and
+retirement target for that demand generation. After PostgreSQL returns the
+exact capacity-plan authority, the controller carries the transaction-selected
+card counts and exact paid residual into the same-generation logical scale-up,
+published logical target, and scale-down fences. Configured accelerator shape
+names are preserved; compatible reserved cards receive the priority selected
+from the same locked request snapshot. The pre-economic target remains only
+diagnostic input in ``normalized_demand``. No second compatibility allocator,
+table, migration, provider path, scheduler policy, or service-version path is
+introduced.
+
+That target is one frozen ``LogicalCapacityTarget`` domain object everywhere
+after autoscaler planning. There is no three-field/five-field tuple union,
+length-based dispatch, magic positional indexing, or controller-local legacy
+variant. The object validates exact accelerator counts and shapes at
+construction, so an invalid state cannot enter the manager. The controller's
+seven-field reconciliation result is likewise one frozen named plan rather
+than an ``Any``-typed positional tuple. Compatibility decoding, when an actual
+external or persisted old representation must be supported, belongs at that
+boundary and must produce the same canonical object before core logic runs;
+this test-only deployment has no retained logical-target representation that
+requires such a decoder.
+
 The first deadline-planner production campaign on lifecycle 121 exposed a
 remaining violation of that demand-driven contract. Two hundred explicitly
 L4-only, priority-zero queue entries correctly produced an L4-only deadline
@@ -573,8 +610,8 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` at merge `5a40b6f47`, including PR #1773's schema-6 utilization/allocation causality boundary and PR #1772's Serve064 paid-`SERVICE_JOB_IO` reconciliation boundary. |
-| Deployed control plane | SkyPilot `1.1.1542`, Helm revision 660. Two API, two controller, and three executor Pods use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:16b37652804a0f848fa2568249959574aafe5649b2e36f9b2be06cc462bdc179`. PostgreSQL is at Serve revision 064, Helm storage remains disabled, and PostgreSQL remains the sole central store. |
+| Source base | `origin/improvements` at merge `8f953634d`, including PR #1774's shared SLA/utilization demand witness, PR #1773's schema-6 utilization/allocation causality boundary, and PR #1772's Serve064 paid-`SERVICE_JOB_IO` reconciliation boundary. |
+| Deployed control plane | SkyPilot `1.1.1543`, Helm revision 661. Two API, two controller, and three executor Pods use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:880f353bedeb5582b60965b900a30af219ce4931ce6e3b833ce4eda7cf8b6395`. PostgreSQL is at Serve revision 064, Helm storage remains disabled, and PostgreSQL remains the sole central store. |
 | Writer protocol | Public API 93, worker projection 10, deployed and source non-pool capability cohort 13, and async request-ledger protocol 1. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. |
 | Active service | Lifecycle 124 is a clean recreation on release `1.1.1541`, service incarnation `c1b25022-4257-44c8-bb95-4d1ae087fd6f`, version 1, with two healthy HA load-balancer slots. It has `min_replicas: 0`, fill floor 0, `utilization_gate: true`, a 120 paid-GPU cap, only Spot L4 paid candidates, and reserved East A100/A100-80GB plus PHX H200 candidates. It has no task-owned scheduler override, file mount, EFS, PVC, or on-demand candidate. |
@@ -589,7 +626,7 @@ it has merged or been deployed.
 | GCP Spot lifecycle proof | Complete for the current writer. Release `1.1.1540` reached 105 concurrently `RUNNING` and peaked at 109 exact one-L4 Spot `g2-standard-4` VMs, with zero on-demand and zero wrong-shape instances. A fresh 256-request wave moved the native census 71 -> 105 in roughly two minutes. Normal down reduced 109 running VMs to one in 4 minutes 43 seconds; release `1.1.1541` / Serve064 deleted the final exact VM, projected `ABSENT`, and held provider/database active authority at zero through the full horizon. |
 | Final load proof | Not complete. Run `final10k-1524-20260827-0246` retains one immutable 10,000-ID manifest. It accepted 2,125 identities, classified 29 exact transport outcomes as ambiguous for durable reconciliation, and retained 7,846 pending identities before stopping on the publication defect. Live telemetry proved nonzero queued/in-flight demand and computed targets of 414 and 494. The exact 503 body `No replica has confirmed free async capacity. Use "sky serve status [SERVICE_NAME]" to check the replica status.` is a definitive retryable pre-dispatch rejection only when the PostgreSQL request receipt is exactly `REJECTED_PRE_DISPATCH`; the harness may classify that exact pair without relaxing any other 5xx outcome. The run identity must be resumed, not replaced. |
 | Demand/publication ordering | The PostgreSQL-linearized planner, semantic fingerprint, weighted exact-card target, current-generation cancellation, whole-wave drain seed, restored-route fence, capacity-time SLA target, demand-gated fill, and accelerator-scoped reserved authority are merged and deployed. The clean `1.1.1540` lifecycle published and actuated a 120-unit exact-L4 Spot target; provider availability converged to 105 running and later 109 without on-demand spill. |
-| Utilization/allocation causality | Schema 6 is merged, deployed, and proved to reject both the stale idle allocation and unsettled first-upward allocation on lifecycle 124. The follow-up calibration found that the gate authenticated four concurrency-derived slots while the locked SLA target was 28, allowing a later false Spot residual despite 185 observed compatible spendable GPUs. Source work now makes the existing fill sample and paid guard use the same SLA-selected target; production proof remains open. |
+| Utilization/allocation causality | Schema 6 and the shared SLA-selected utilization witness are merged, deployed, and proved to reject the stale idle, concurrency-only, and unsettled first-upward allocations on lifecycle 124. Release `1.1.1543` settled need 28 / ceiling 35 with zero paid claims. Its PostgreSQL plan correctly remapped the 28-unit demand to existing and additional reserved A100/A100-80GB capacity, but local logical actuation retained the pre-economic A100/L4 target and stalled at eight ready A100 replicas. Source work now makes the committed economic target the same-generation actuation and retirement target; production proof remains open. |
 
 The completed paid-gate post-rollout census was green after Helm revision 635:
 the service, replicas, claims, waiters, request associations, queue rows,
@@ -1427,6 +1464,10 @@ missing telemetry.
     and whose raw upward grants have all reached their damped grants. An older
     idle, concurrency-only, or upward-in-flight allocation is retryable
     unavailable authority, never paid residual evidence.
+20. **One compatibility target:** the exact-card economic target committed in
+    the PostgreSQL capacity-plan transaction is the target actuated and used by
+    same-generation retirement fences. The pre-economic request-class target
+    is diagnostic input only; it cannot independently select provider shape.
 
 ## Compatibility contract
 

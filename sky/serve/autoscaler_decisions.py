@@ -7,6 +7,79 @@ from typing import Any
 
 from sky.serve import constants
 
+LogicalAcceleratorState = tuple[tuple[str, int], ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class LogicalCapacityTarget:
+    """One canonical logical-capacity intent and exact accelerator catalog."""
+
+    version: int
+    generation: int
+    target_capacity: int
+    target_capacity_by_accelerator: LogicalAcceleratorState = ()
+    accelerator_shapes: LogicalAcceleratorState = ()
+
+    def __post_init__(self) -> None:
+        if (type(self.version) is not int or self.version < 1 or
+                type(self.generation) is not int or self.generation < 0 or
+                type(self.target_capacity) is not int or
+                self.target_capacity < 0):
+            raise ValueError('Logical capacity target identity is malformed.')
+
+        def _normalize(
+            raw: LogicalAcceleratorState,
+            *,
+            allow_zero: bool,
+        ) -> LogicalAcceleratorState:
+            if type(raw) is not tuple:
+                raise ValueError('Logical accelerator state must be immutable.')
+            normalized: list[tuple[str, int]] = []
+            seen: set[str] = set()
+            for item in raw:
+                if (type(item) is not tuple or len(item) != 2 or
+                        not isinstance(item[0], str) or not item[0] or
+                        type(item[1]) is not int or
+                        item[1] < (0 if allow_zero else 1)):
+                    raise ValueError('Logical accelerator state is malformed.')
+                card = item[0].casefold()
+                if card in seen:
+                    raise ValueError('Logical accelerator state repeats a '
+                                     'card.')
+                seen.add(card)
+                if item[1] > 0 or not allow_zero:
+                    normalized.append(item)
+            return tuple(normalized)
+
+        target = _normalize(self.target_capacity_by_accelerator,
+                            allow_zero=True)
+        shapes = _normalize(self.accelerator_shapes, allow_zero=False)
+        target_cards = {card.casefold() for card, _ in target}
+        shape_cards = {card.casefold() for card, _ in shapes}
+        if ((target or shapes) and
+            (sum(value for _, value in target) != self.target_capacity or
+             target_cards - shape_cards or
+             (self.target_capacity > 0 and not target))):
+            raise ValueError('Logical exact-card target does not match its '
+                             'aggregate capacity and shapes.')
+        object.__setattr__(self, 'target_capacity_by_accelerator', target)
+        object.__setattr__(self, 'accelerator_shapes', shapes)
+
+    @property
+    def is_exact(self) -> bool:
+        return bool(self.target_capacity_by_accelerator or
+                    self.accelerator_shapes)
+
+    def intent_is_preserved_by(self, current: 'LogicalCapacityTarget') -> bool:
+        """Whether ``current`` is a freshness renewal of this same intent."""
+        return (
+            isinstance(current, LogicalCapacityTarget) and
+            current.generation >= self.generation and
+            (current.version, current.target_capacity,
+             current.target_capacity_by_accelerator, current.accelerator_shapes)
+            == (self.version, self.target_capacity,
+                self.target_capacity_by_accelerator, self.accelerator_shapes))
+
 
 class AutoscalerDecisionOperator(enum.Enum):
     SCALE_UP = 'scale_up'
@@ -143,6 +216,7 @@ class AutoscalerDecision:
 
 # The historical facade remains the serialized and introspection identity.
 for _contract_type in (
+        LogicalCapacityTarget,
         AutoscalerDecisionOperator,
         AutoscalerDecisionReason,
         LogicalScaleTarget,

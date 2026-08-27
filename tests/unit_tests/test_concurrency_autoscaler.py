@@ -2329,7 +2329,9 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                          {'L4': 1})
         self.assertIsNotNone(autoscaler.logical_target_state)
         assert autoscaler.logical_target_state is not None
-        self.assertEqual(autoscaler.logical_target_state[3], (('L4', 1),))
+        self.assertEqual(
+            autoscaler.logical_target_state.target_capacity_by_accelerator,
+            (('L4', 1),))
         for decision in _scale_ups(decisions):
             target = decision.target
             self.assertIsInstance(target, autoscalers.LogicalScaleTarget)
@@ -6403,6 +6405,45 @@ class TestLogicalScalingWaves(unittest.TestCase):
 class TestLogicalReplicaSemantics(unittest.TestCase):
     """Logical targets are GPU slots; physical shapes remain indivisible."""
 
+    def test_logical_capacity_target_rejects_noncanonical_state(self):
+        malformed_states = ({
+            'version': 0,
+            'generation': 4,
+            'target_capacity': 1,
+        }, {
+            'version': 1,
+            'generation': 4,
+            'target_capacity': 2,
+            'target_capacity_by_accelerator': (('L4', 1),),
+            'accelerator_shapes': (('L4', 1),),
+        }, {
+            'version': 1,
+            'generation': 4,
+            'target_capacity': 1,
+            'target_capacity_by_accelerator': (('L4', 1), ('l4', 0)),
+            'accelerator_shapes': (('L4', 1),),
+        }, {
+            'version': 1,
+            'generation': 4,
+            'target_capacity': 1,
+            'target_capacity_by_accelerator': (('A100', 1),),
+            'accelerator_shapes': (('L4', 1),),
+        })
+        for state in malformed_states:
+            with self.subTest(state=state), self.assertRaises(ValueError):
+                autoscalers.LogicalCapacityTarget(**state)
+
+    def test_logical_capacity_target_normalizes_zero_card_entries(self):
+        target = autoscalers.LogicalCapacityTarget(
+            version=1,
+            generation=4,
+            target_capacity=1,
+            target_capacity_by_accelerator=(('L4', 1), ('A100', 0)),
+            accelerator_shapes=(('L4', 1), ('A100', 8)))
+
+        self.assertEqual(target.target_capacity_by_accelerator, (('L4', 1),))
+        self.assertTrue(target.is_exact)
+
     def test_cost_rebalance_location_capacity_stays_in_gpu_slots(self):
         autoscaler = _make_autoscaler(knob=2, replica_unit='logical')
         location = mock.Mock()
@@ -6433,14 +6474,26 @@ class TestLogicalReplicaSemantics(unittest.TestCase):
                                       replica_unit='logical')
         _report(autoscaler, in_flight={}, queue_depth=5, generation=4)
         _decisions(autoscaler, [])
-        self.assertEqual(autoscaler.logical_target_state, (1, 4, 5))
+        self.assertEqual(
+            autoscaler.logical_target_state,
+            autoscalers.LogicalCapacityTarget(version=1,
+                                              generation=4,
+                                              target_capacity=5))
 
         # A newer sync must not relabel the already computed target. The next
         # decision tick will publish a new target for generation 5.
         _report(autoscaler, in_flight={}, queue_depth=9, generation=5)
-        self.assertEqual(autoscaler.logical_target_state, (1, 4, 5))
+        self.assertEqual(
+            autoscaler.logical_target_state,
+            autoscalers.LogicalCapacityTarget(version=1,
+                                              generation=4,
+                                              target_capacity=5))
         _decisions(autoscaler, [])
-        self.assertEqual(autoscaler.logical_target_state, (1, 5, 9))
+        self.assertEqual(
+            autoscaler.logical_target_state,
+            autoscalers.LogicalCapacityTarget(version=1,
+                                              generation=5,
+                                              target_capacity=9))
 
     def test_incomplete_exact_report_revokes_logical_target(self):
         autoscaler = _make_autoscaler(knob=1,

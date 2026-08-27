@@ -119,13 +119,27 @@ class _LbRoleDatabaseSnapshot(NamedTuple):
 
 
 @dataclasses.dataclass(frozen=True)
+class _ScaleReconciliationPlan:
+    """One named, immutable result from a fenced autoscaler decision."""
+
+    scaling_options: tuple[autoscalers.AutoscalerDecision, ...]
+    target_num_replicas: int | None
+    rollout_failure: autoscalers.UnrecoverableRolloutFailure | None
+    logical_target: autoscalers.LogicalCapacityTarget | None
+    logical_retirement_floor: autoscalers.LogicalCapacityTarget | None
+    retirement_shelter: (reserved_fill_planner.SequencedRetirementShelter |
+                         None)
+    invalidate_logical_target: bool
+
+
+@dataclasses.dataclass(frozen=True)
 class _LinearizedScalePlan:
     """Post-commit local actuation candidate for one exact demand snapshot."""
 
     snapshot: demand_state.DurableAutoscalingSnapshot
-    scaling_plan: tuple[list[autoscalers.AutoscalerDecision], int | None,
-                        autoscalers.UnrecoverableRolloutFailure | None, Any,
-                        Any, Any, bool]
+    scaling_plan: _ScaleReconciliationPlan
+    capacity_target_by_accelerator: tuple[tuple[str, int], ...]
+    accelerator_shapes: tuple[tuple[str, int], ...]
     logical_snapshot: replica_managers.LogicalReconcileSnapshot | None
     notification_generation: int
     demand_generation: int
@@ -2115,10 +2129,12 @@ class SkyServeController:
     def _lb_promotion_gate(self, request_data: dict[str, Any],
                            owner: dict[str, Any]) -> _LbPromotionGate:
         """Resolve current route authority and evaluate one target report."""
-        mode_hint = owner.get('route_source_mode')
-        if mode_hint not in tuple(
-                mode.value for mode in route_projection.RouteSourceMode):
-            mode_hint = 'UNKNOWN'
+        raw_mode_hint = owner.get('route_source_mode')
+        mode_hint = (raw_mode_hint if isinstance(raw_mode_hint, str) and
+                     raw_mode_hint in tuple(
+                         mode.value
+                         for mode in route_projection.RouteSourceMode) else
+                     'UNKNOWN')
         routing_version = request_data.get('routing_version')
         normalized_version = (routing_version
                               if type(routing_version) is int else None)
@@ -5843,9 +5859,7 @@ class SkyServeController:
         prepared_decision_inputs: (autoscalers.ScalingDecisionInputs |
                                    None) = None,
         planning_fingerprint_already_validated: bool = False,
-    ) -> tuple[list[autoscalers.AutoscalerDecision], int | None,
-               autoscalers.UnrecoverableRolloutFailure | None, Any, Any, Any,
-               bool] | None:
+    ) -> _ScaleReconciliationPlan | None:
         """Mutate one exact autoscaler while update/LB publication is fenced.
 
         Durable handle resolution can block on PostgreSQL connection setup.
@@ -5963,31 +5977,30 @@ class SkyServeController:
                 if logical_target is not None:
                     logical_retirement_floor = logical_target
                     if retirement_shelter is not None:
-                        target_by_card = (() if len(logical_target) == 3 else
-                                          logical_target[3])
-                        shapes = (() if len(logical_target) == 3 else
-                                  logical_target[4])
                         floor = (reserved_fill_planner.
                                  compose_retirement_capacity_floor(
-                                     demand_capacity=logical_target[2],
+                                     demand_capacity=(
+                                         logical_target.target_capacity),
                                      demand_capacity_by_accelerator=(
-                                         target_by_card),
-                                     accelerator_shapes=shapes,
+                                         logical_target.
+                                         target_capacity_by_accelerator),
+                                     accelerator_shapes=(
+                                         logical_target.accelerator_shapes),
                                      shelter=retirement_shelter,
                                      max_capacity=(
                                          decision_autoscaler.max_replicas)))
                         if floor is None:
                             logical_retirement_floor = None
-                        elif (floor.capacity_by_accelerator or
-                              floor.accelerator_shapes):
-                            logical_retirement_floor = (
-                                logical_target[0], logical_target[1],
-                                floor.capacity, floor.capacity_by_accelerator,
-                                floor.accelerator_shapes)
                         else:
-                            logical_retirement_floor = (logical_target[0],
-                                                        logical_target[1],
-                                                        floor.capacity)
+                            logical_retirement_floor = (
+                                autoscalers.LogicalCapacityTarget(
+                                    version=logical_target.version,
+                                    generation=logical_target.generation,
+                                    target_capacity=floor.capacity,
+                                    target_capacity_by_accelerator=(
+                                        floor.capacity_by_accelerator),
+                                    accelerator_shapes=(
+                                        floor.accelerator_shapes)))
                 invalidate_logical_target = (
                     (logical_target is None or logical_retirement_floor is None)
                     and bool(decision_autoscaler.configured_accelerator_shapes))
@@ -6009,9 +6022,14 @@ class SkyServeController:
                     option for option in scaling_options if option.operator !=
                     autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
                 ]
-            return (scaling_options, target_num_replicas, rollout_failure,
-                    logical_target, logical_retirement_floor,
-                    retirement_shelter, invalidate_logical_target)
+            return _ScaleReconciliationPlan(
+                scaling_options=tuple(scaling_options),
+                target_num_replicas=target_num_replicas,
+                rollout_failure=rollout_failure,
+                logical_target=logical_target,
+                logical_retirement_floor=logical_retirement_floor,
+                retirement_shelter=retirement_shelter,
+                invalidate_logical_target=invalidate_logical_target)
 
     @staticmethod
     def _committed_reserved_fill_debits(
@@ -6248,6 +6266,143 @@ class SkyServeController:
         return (allocation.utilization_demonstrated_need >= current_need and
                 allocation.utilization_ceiling >= current_need)
 
+    @staticmethod
+    def _install_committed_logical_capacity_target(
+        planned: _LinearizedScalePlan,
+        authority: capacity_admission.PaidLaunchAuthority,
+        max_capacity: int,
+    ) -> _LinearizedScalePlan:
+        """Make one committed economic target the only logical target.
+
+        The autoscaler initially assigns demand to request accelerator classes.
+        The PostgreSQL capacity-plan transaction may assign that same aggregate
+        demand to compatible reserved accelerators before calculating a paid
+        residual.  Local launch and retirement decisions must use the latter
+        assignment; mixing the two makes reserved supply unspendable while the
+        database correctly refuses to authorize paid capacity.
+        """
+        scaling_plan = planned.scaling_plan
+        logical_target = scaling_plan.logical_target
+        if logical_target is None:
+            return planned
+        if not isinstance(logical_target, autoscalers.LogicalCapacityTarget):
+            raise ValueError('Logical target has no canonical capacity state.')
+        target_capacity = logical_target.target_capacity
+        raw_shapes = (logical_target.accelerator_shapes or
+                      planned.accelerator_shapes)
+        if type(raw_shapes) is not tuple:
+            raise ValueError('Logical accelerator shapes are not immutable.')
+
+        display_cards: dict[str, str] = {}
+        shapes: list[tuple[str, int]] = []
+        for raw_card, width in raw_shapes:
+            if (not isinstance(raw_card, str) or not raw_card or
+                    type(width) is not int or width <= 0):
+                raise ValueError('Logical accelerator shapes are malformed.')
+            card = raw_card.casefold()
+            if card in display_cards:
+                raise ValueError('Logical accelerator shapes repeat a card.')
+            display_cards[card] = raw_card
+            shapes.append((raw_card, width))
+
+        committed: dict[str, int] = {}
+        for raw_card, count in planned.capacity_target_by_accelerator:
+            if not isinstance(raw_card, str) or not raw_card:
+                raise ValueError('Committed capacity target is malformed.')
+            card = raw_card.casefold()
+            if (card in committed or card not in display_cards or
+                    type(count) is not int or count < 0):
+                raise ValueError('Committed capacity target is malformed.')
+            committed[card] = count
+        committed = {card: committed.get(card, 0) for card in display_cards}
+        if sum(committed.values()) != target_capacity:
+            raise ValueError('Committed capacity target changed aggregate '
+                             'logical demand.')
+        target_by_accelerator = tuple((display_cards[card], committed[card])
+                                      for card in display_cards
+                                      if committed[card] > 0)
+
+        remaining = authority.remaining()
+        if not isinstance(remaining, dict):
+            raise ValueError('Paid launch authority has no exact residual.')
+        paid: dict[str, int] = {}
+        for raw_card, count in remaining.items():
+            if not isinstance(raw_card, str) or not raw_card:
+                raise ValueError('Paid launch residual is incompatible with '
+                                 'the committed capacity target.')
+            card = raw_card.casefold()
+            if (card in paid or card not in display_cards or
+                    type(count) is not int or count < 0 or
+                    count > committed[card]):
+                raise ValueError('Paid launch residual is incompatible with '
+                                 'the committed capacity target.')
+            paid[card] = count
+        paid_by_accelerator = tuple((display_cards[card], paid.get(card, 0))
+                                    for card in display_cards
+                                    if paid.get(card, 0) > 0)
+
+        retargeted_options: list[autoscalers.AutoscalerDecision] = []
+        for option in scaling_plan.scaling_options:
+            target = option.target
+            if isinstance(target, autoscalers.LogicalScaleTarget):
+                if target.target_capacity != target_capacity:
+                    raise ValueError('Logical scale-up aggregate differs from '
+                                     'the committed capacity target.')
+                target = dataclasses.replace(
+                    target,
+                    target_capacity_by_accelerator=target_by_accelerator,
+                    accelerator_shapes=tuple(shapes),
+                    launch_priority_by_accelerator=tuple(
+                        (card, target.launch_priority)
+                        for card, _ in target_by_accelerator),
+                    cold_launch_authority_by_accelerator=(paid_by_accelerator))
+            elif isinstance(target, autoscalers.LogicalScaleDownTarget):
+                if target.target_capacity != target_capacity:
+                    raise ValueError(
+                        'Logical scale-down aggregate differs from '
+                        'the committed capacity target.')
+                target = dataclasses.replace(
+                    target,
+                    target_capacity_by_accelerator=target_by_accelerator,
+                    accelerator_shapes=tuple(shapes))
+            retargeted_options.append(
+                autoscalers.AutoscalerDecision(option.operator, target,
+                                               option.reason))
+
+        committed_logical_target = autoscalers.LogicalCapacityTarget(
+            version=logical_target.version,
+            generation=logical_target.generation,
+            target_capacity=target_capacity,
+            target_capacity_by_accelerator=target_by_accelerator,
+            accelerator_shapes=tuple(shapes))
+        retirement_shelter = scaling_plan.retirement_shelter
+        if retirement_shelter is None:
+            retirement_floor = committed_logical_target
+        else:
+            floor = reserved_fill_planner.compose_retirement_capacity_floor(
+                demand_capacity=target_capacity,
+                demand_capacity_by_accelerator=target_by_accelerator,
+                accelerator_shapes=tuple(shapes),
+                shelter=retirement_shelter,
+                max_capacity=max_capacity)
+            if floor is None:
+                raise ValueError('Committed capacity target cannot compose an '
+                                 'exact retirement floor.')
+            retirement_floor = autoscalers.LogicalCapacityTarget(
+                version=logical_target.version,
+                generation=logical_target.generation,
+                target_capacity=floor.capacity,
+                target_capacity_by_accelerator=floor.capacity_by_accelerator,
+                accelerator_shapes=floor.accelerator_shapes)
+        return dataclasses.replace(
+            planned,
+            scaling_plan=dataclasses.replace(
+                scaling_plan,
+                scaling_options=tuple(retargeted_options),
+                logical_target=committed_logical_target,
+                logical_retirement_floor=retirement_floor,
+                invalidate_logical_target=False))
+
     def _plan_and_publish_current_capacity(
         self,
         decision_autoscaler: autoscalers.Autoscaler,
@@ -6369,19 +6524,15 @@ class SkyServeController:
             if scaling_plan is None:
                 raise capacity_admission.CapacityAdmissionConflict(
                     'Controller state changed during current planning.')
-            (scaling_options, target_num_replicas, rollout_failure,
-             logical_target, logical_retirement_floor, retirement_shelter,
-             invalidate_logical_target) = scaling_plan
             if snapshot.fresh_aggregate_zero:
-                target_num_replicas = 0
-                scaling_options = [
-                    option for option in scaling_options if option.operator !=
-                    autoscalers.AutoscalerDecisionOperator.SCALE_UP
-                ]
-                scaling_plan = (scaling_options, target_num_replicas,
-                                rollout_failure, logical_target,
-                                logical_retirement_floor, retirement_shelter,
-                                invalidate_logical_target)
+                scaling_options = tuple(
+                    option for option in scaling_plan.scaling_options
+                    if option.operator !=
+                    autoscalers.AutoscalerDecisionOperator.SCALE_UP)
+                scaling_plan = dataclasses.replace(
+                    scaling_plan,
+                    scaling_options=scaling_options,
+                    target_num_replicas=0)
 
             capacity_target = self._ordered_capacity_target(
                 decision_autoscaler, force_zero=snapshot.fresh_aggregate_zero)
@@ -6453,6 +6604,11 @@ class SkyServeController:
             planned = _LinearizedScalePlan(
                 snapshot=snapshot,
                 scaling_plan=scaling_plan,
+                capacity_target_by_accelerator=tuple(capacity_target.items()),
+                accelerator_shapes=(tuple(
+                    decision_autoscaler.configured_accelerator_shapes.items())
+                                    if decision_autoscaler.replica_unit
+                                    == 'logical' else ()),
                 logical_snapshot=logical_snapshot,
                 notification_generation=notification_generation,
                 demand_generation=demand_generation)
@@ -6502,9 +6658,19 @@ class SkyServeController:
                     f'{common_utils.format_exception(error)}')
                 return None
         if planned is None or planned.snapshot != snapshot:
-            logger.warning('Suppressing paid launch because current planning '
-                           'returned no exact local candidate.')
+            logger.warning('Suppressing local capacity actuation because '
+                           'current planning returned no exact candidate.')
             return None
+        if planned.scaling_plan.logical_target is not None:
+            try:
+                planned = self._install_committed_logical_capacity_target(
+                    planned, authority, decision_autoscaler.max_replicas)
+            except ValueError as error:
+                logger.warning(
+                    'Suppressing local capacity actuation because the '
+                    'committed capacity target could not be installed: '
+                    f'{common_utils.format_exception(error)}')
+                return None
         return authority, planned
 
     def _reconcile_scale_once(self, reconcile_generation: int) -> None:
@@ -6727,9 +6893,13 @@ class SkyServeController:
                     if legacy_plan is None:
                         return
                     plan = legacy_plan
-                (scaling_options, target_num_replicas, rollout_failure,
-                 logical_target, logical_retirement_floor, retirement_shelter,
-                 invalidate_logical_target) = plan
+                scaling_options = list(plan.scaling_options)
+                target_num_replicas = plan.target_num_replicas
+                rollout_failure = plan.rollout_failure
+                logical_target = plan.logical_target
+                logical_retirement_floor = plan.logical_retirement_floor
+                retirement_shelter = plan.retirement_shelter
+                invalidate_logical_target = plan.invalidate_logical_target
                 ordinary_physical_overrides: list[dict[str, Any] | None] = []
                 ordinary_logical_targets: list[
                     autoscalers.LogicalScaleTarget] = []
@@ -6796,7 +6966,7 @@ class SkyServeController:
                 if logical_target is not None:
                     if durable_logical_snapshot is None:
                         self._replica_manager.publish_logical_target(
-                            *logical_target,
+                            logical_target,
                             retirement_floor=logical_retirement_floor,
                             retirement_shelter=retirement_shelter)
                     else:
@@ -6991,48 +7161,50 @@ class SkyServeController:
                         if isinstance(scaling_option.target,
                                       autoscalers.LogicalScaleTarget):
                             _flush_scale_up()
-                            logical_target = scaling_option.target
+                            logical_scale_target = scaling_option.target
                             replacement_kwargs: dict[str, Any] = {}
-                            if logical_target.replace_unknown_replica_ids:
+                            if logical_scale_target.replace_unknown_replica_ids:
                                 replacement_kwargs[
                                     'replace_unknown_replica_ids'] = (
-                                        logical_target.
+                                        logical_scale_target.
                                         replace_unknown_replica_ids)
-                            if logical_target.launch_budget is not None:
+                            if logical_scale_target.launch_budget is not None:
                                 replacement_kwargs['launch_budget'] = (
-                                    logical_target.launch_budget)
+                                    logical_scale_target.launch_budget)
                             replacement_kwargs['launch_priority'] = (
-                                logical_target.launch_priority)
-                            if (logical_target.launch_priority_by_accelerator):
+                                logical_scale_target.launch_priority)
+                            if (logical_scale_target.
+                                    launch_priority_by_accelerator):
                                 replacement_kwargs[
                                     'launch_priority_by_accelerator'] = dict(
-                                        logical_target.
+                                        logical_scale_target.
                                         launch_priority_by_accelerator)
-                            if (logical_target.
+                            if (logical_scale_target.
                                     cold_launch_authority_by_accelerator
                                     is not None):
                                 replacement_kwargs[
                                     'cold_launch_authority_by_accelerator'] = (
                                         dict(
-                                            logical_target.
+                                            logical_scale_target.
                                             cold_launch_authority_by_accelerator
                                         ))
-                            if logical_target.target_capacity_by_accelerator:
+                            if (logical_scale_target.
+                                    target_capacity_by_accelerator):
                                 replacement_kwargs[
                                     'target_capacity_by_accelerator'] = dict(
-                                        logical_target.
+                                        logical_scale_target.
                                         target_capacity_by_accelerator)
                                 replacement_kwargs['accelerator_shapes'] = dict(
-                                    logical_target.accelerator_shapes)
+                                    logical_scale_target.accelerator_shapes)
                             if (scaling_option.reason != autoscalers.
                                     AutoscalerDecisionReason.COST_REBALANCE and
                                     ordered_paid_authority is not None):
                                 replacement_kwargs['paid_launch_authority'] = (
                                     ordered_paid_authority)
                             self._replica_manager.scale_up_to_logical_capacity(
-                                logical_target.target_capacity,
-                                logical_target.version,
-                                logical_target.reconcile_generation,
+                                logical_scale_target.target_capacity,
+                                logical_scale_target.version,
+                                logical_scale_target.reconcile_generation,
                                 **replacement_kwargs)
                         else:
                             assert (scaling_option.target is None or isinstance(

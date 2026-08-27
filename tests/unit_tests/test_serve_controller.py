@@ -11,6 +11,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import hashlib
+import inspect
 import json
 import os
 import pathlib
@@ -39,6 +40,22 @@ from sky.serve import serve_utils
 from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state
 from sky.utils import yaml_utils
+
+
+def test_logical_capacity_target_has_one_internal_representation():
+    forbidden_markers = (
+        'LogicalTargetState =',
+        'def _logical_target_state_components',
+        'len(logical_target)',
+        'logical_target[',
+        'logical_target_state[',
+        'scaling_plan[',
+    )
+    for module in (autoscalers, controller, replica_managers):
+        source = inspect.getsource(module)
+        for marker in forbidden_markers:
+            assert marker not in source, (f'{module.__name__} reintroduced '
+                                          f'positional state: {marker!r}')
 
 
 @pytest.fixture(autouse=True)
@@ -4303,6 +4320,7 @@ class TestAutoscalerRuntimeSnapshot:
                 'L4': target
             }
         }
+        scaler.generate_scaling_decisions.return_value = []
         return scaler
 
     @staticmethod
@@ -4322,6 +4340,7 @@ class TestAutoscalerRuntimeSnapshot:
         scaler.target_num_replicas_by_accelerator = {'L4': target}
         scaler.warm_retention_target_by_accelerator = {}
         scaler.cold_launch_authority_by_accelerator = {}
+        scaler.max_replicas = 1000
         scaler.reconcile_generation = 0
         scaler.logical_target_state = None
         scaler.info.return_value = {
@@ -4335,16 +4354,19 @@ class TestAutoscalerRuntimeSnapshot:
 
         def _generate(_replica_infos, _active_versions):
             if not emit_scale_up:
-                scaler.logical_target_state = (scaler.latest_version,
-                                               scaler.reconcile_generation,
-                                               target)
+                scaler.logical_target_state = autoscalers.LogicalCapacityTarget(
+                    version=scaler.latest_version,
+                    generation=scaler.reconcile_generation,
+                    target_capacity=target)
                 return []
             target_by_accelerator = (('L4', target),)
             accelerator_shapes = (('L4', 1),)
-            scaler.logical_target_state = (scaler.latest_version,
-                                           scaler.reconcile_generation, target,
-                                           target_by_accelerator,
-                                           accelerator_shapes)
+            scaler.logical_target_state = autoscalers.LogicalCapacityTarget(
+                version=scaler.latest_version,
+                generation=scaler.reconcile_generation,
+                target_capacity=target,
+                target_capacity_by_accelerator=target_by_accelerator,
+                accelerator_shapes=accelerator_shapes)
             return [
                 autoscalers.AutoscalerDecision(
                     autoscalers.AutoscalerDecisionOperator.SCALE_UP,
@@ -4372,15 +4394,20 @@ class TestAutoscalerRuntimeSnapshot:
             service_lifecycle_epoch=3)
         if repository is None:
             repository = mock.Mock()
-        if authority is None:
-            authority = types.SimpleNamespace(generation=1,
-                                              content_sha256='c' * 64)
+        use_planner_authority = authority is None
         snapshot_iterator = iter(snapshots)
 
         def _plan_current(**kwargs):
             snapshot = next(snapshot_iterator)
-            kwargs['planner'](snapshot, supply)
-            return authority, snapshot
+            decision = kwargs['planner'](snapshot, supply)
+            current_authority = authority
+            if use_planner_authority:
+                residual = dict(decision.capacity_target_by_accelerator)
+                current_authority = types.SimpleNamespace(
+                    generation=1,
+                    content_sha256='c' * 64,
+                    remaining=lambda: dict(residual))
+            return current_authority, snapshot
 
         repository.plan_and_publish_current.side_effect = _plan_current
         with mock.patch.object(
@@ -4786,7 +4813,12 @@ class TestAutoscalerRuntimeSnapshot:
         assert scaler.reconcile_generation == 68023
         assert len(published) == 1
         target, manager_snapshot = published[0]
-        assert target == (1, 68023, 2)
+        assert target == autoscalers.LogicalCapacityTarget(
+            version=1,
+            generation=68023,
+            target_capacity=2,
+            target_capacity_by_accelerator=(('L4', 2),),
+            accelerator_shapes=(('L4', 1),))
         assert manager_snapshot.version == 1
         assert manager_snapshot.generation == 68023
         assert manager_snapshot.observed_slots_by_replica_id == {
@@ -4817,7 +4849,7 @@ class TestAutoscalerRuntimeSnapshot:
 
         state_calls = ctrl._replica_manager.publish_logical_reconcile_state.call_args_list  # pylint: disable=line-too-long
         snapshot_generations = [call.args[1].generation for call in state_calls]
-        target_generations = [call.args[0][1] for call in state_calls]
+        target_generations = [call.args[0].generation for call in state_calls]
         assert snapshot_generations == [68023, 68023, 68024]
         assert target_generations == [68023, 68023, 68024]
         assert ctrl._reconcile_generation == 3  # pylint: disable=protected-access
@@ -5414,8 +5446,14 @@ class TestAutoscalerRuntimeSnapshot:
                                return_value=False), \
              mock.patch.object(ctrl,
                                '_plan_scale_reconciliation',
-                               return_value=([], 2, None, None, None, None,
-                                             False)), \
+                               return_value=controller._ScaleReconciliationPlan(  # pylint: disable=protected-access
+                                   scaling_options=(),
+                                   target_num_replicas=2,
+                                   rollout_failure=None,
+                                   logical_target=None,
+                                   logical_retirement_floor=None,
+                                   retirement_shelter=None,
+                                   invalidate_logical_target=False)), \
              mock.patch.object(ctrl,
                                '_persist_cost_rebalance_state',
                                return_value=True), \
@@ -5427,6 +5465,123 @@ class TestAutoscalerRuntimeSnapshot:
         assert call_order == ['planning-inputs', 'transaction', 'local-target']
         repository.plan_and_publish_current.assert_called_once()
         repository.project_reserved_supply.assert_not_called()
+
+    def test_committed_economic_target_replaces_every_local_logical_target(
+            self):
+        shapes = (('A100', 1), ('A100-80GB', 1), ('H200', 1), ('L4', 1))
+        request_target = (('A100', 8), ('L4', 20))
+        scale_up = autoscalers.AutoscalerDecision(
+            autoscalers.AutoscalerDecisionOperator.SCALE_UP,
+            autoscalers.LogicalScaleTarget(
+                version=1,
+                reconcile_generation=3,
+                target_capacity=28,
+                target_capacity_by_accelerator=request_target,
+                accelerator_shapes=shapes,
+                launch_budget=40,
+                launch_priority=50,
+                launch_priority_by_accelerator=(('A100', 50), ('L4', 10)),
+                cold_launch_authority_by_accelerator=(('L4', 20),)))
+        scale_down = autoscalers.AutoscalerDecision(
+            autoscalers.AutoscalerDecisionOperator.SCALE_DOWN,
+            autoscalers.LogicalScaleDownTarget(
+                version=1,
+                reconcile_generation=3,
+                target_capacity=28,
+                replica_id=17,
+                target_capacity_by_accelerator=request_target,
+                accelerator_shapes=shapes))
+        planned = controller._LinearizedScalePlan(  # pylint: disable=protected-access
+            snapshot=self._durable_snapshot(),
+            scaling_plan=controller._ScaleReconciliationPlan(  # pylint: disable=protected-access
+                scaling_options=(scale_up, scale_down),
+                target_num_replicas=28,
+                rollout_failure=None,
+                logical_target=autoscalers.LogicalCapacityTarget(
+                    1, 3, 28, request_target, shapes),
+                logical_retirement_floor=autoscalers.LogicalCapacityTarget(
+                    1, 3, 28, request_target, shapes),
+                retirement_shelter=None,
+                invalidate_logical_target=False),
+            capacity_target_by_accelerator=(('a100', 19), ('a100-80gb', 9),
+                                            ('h200', 0), ('l4', 0)),
+            accelerator_shapes=shapes,
+            logical_snapshot=None,
+            notification_generation=4,
+            demand_generation=5)
+        authority = types.SimpleNamespace(remaining=lambda: {})
+
+        installed = (
+            controller.SkyServeController.
+            _install_committed_logical_capacity_target(  # pylint: disable=protected-access
+                planned, authority, 1000))
+
+        installed_plan = installed.scaling_plan
+        options = installed_plan.scaling_options
+        logical_target = installed_plan.logical_target
+        retirement_floor = installed_plan.logical_retirement_floor
+        economic_target = (('A100', 19), ('A100-80GB', 9))
+        assert logical_target == autoscalers.LogicalCapacityTarget(
+            1, 3, 28, economic_target, shapes)
+        assert retirement_floor == logical_target
+        assert installed_plan.invalidate_logical_target is False
+        assert options[0].target == autoscalers.LogicalScaleTarget(
+            version=1,
+            reconcile_generation=3,
+            target_capacity=28,
+            target_capacity_by_accelerator=economic_target,
+            accelerator_shapes=shapes,
+            launch_budget=40,
+            launch_priority=50,
+            launch_priority_by_accelerator=(('A100', 50), ('A100-80GB', 50)),
+            cold_launch_authority_by_accelerator=())
+        assert options[1].target == autoscalers.LogicalScaleDownTarget(
+            version=1,
+            reconcile_generation=3,
+            target_capacity=28,
+            replica_id=17,
+            target_capacity_by_accelerator=economic_target,
+            accelerator_shapes=shapes)
+
+    def test_committed_target_maps_paid_residual_to_configured_card_names(self):
+        shapes = (('A100', 1), ('L4', 1))
+        target = autoscalers.LogicalScaleTarget(
+            version=1,
+            reconcile_generation=3,
+            target_capacity=28,
+            target_capacity_by_accelerator=(('L4', 28),),
+            accelerator_shapes=shapes,
+            cold_launch_authority_by_accelerator=(('L4', 28),))
+        planned = controller._LinearizedScalePlan(  # pylint: disable=protected-access
+            snapshot=self._durable_snapshot(),
+            scaling_plan=controller._ScaleReconciliationPlan(  # pylint: disable=protected-access
+                scaling_options=(autoscalers.AutoscalerDecision(
+                    autoscalers.AutoscalerDecisionOperator.SCALE_UP, target),),
+                target_num_replicas=28,
+                rollout_failure=None,
+                logical_target=autoscalers.LogicalCapacityTarget(
+                    1, 3, 28, (('L4', 28),), shapes),
+                logical_retirement_floor=autoscalers.LogicalCapacityTarget(
+                    1, 3, 28, (('L4', 28),), shapes),
+                retirement_shelter=None,
+                invalidate_logical_target=False),
+            capacity_target_by_accelerator=(('a100', 20), ('l4', 8)),
+            accelerator_shapes=shapes,
+            logical_snapshot=None,
+            notification_generation=4,
+            demand_generation=5)
+        authority = types.SimpleNamespace(remaining=lambda: {'l4': 8})
+
+        installed = (
+            controller.SkyServeController.
+            _install_committed_logical_capacity_target(  # pylint: disable=protected-access
+                planned, authority, 1000))
+
+        installed_target = installed.scaling_plan.scaling_options[0].target
+        assert installed_target.target_capacity_by_accelerator == (('A100', 20),
+                                                                   ('L4', 8))
+        assert installed_target.cold_launch_authority_by_accelerator == (('L4',
+                                                                          8),)
 
     def test_exact_paid_target_does_not_depend_on_unrelated_reserved_authority(
             self):
@@ -5492,7 +5647,14 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(
                  ctrl,
                  '_plan_scale_reconciliation',
-                 return_value=([], 2, None, None, None, None, False)), \
+                 return_value=controller._ScaleReconciliationPlan(  # pylint: disable=protected-access
+                     scaling_options=(),
+                     target_num_replicas=2,
+                     rollout_failure=None,
+                     logical_target=None,
+                     logical_retirement_floor=None,
+                     retirement_shelter=None,
+                     invalidate_logical_target=False)), \
              mock.patch.object(ctrl,
                                '_persist_cost_rebalance_state',
                                return_value=True):
@@ -5545,11 +5707,13 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
         scaler = self._logical_durable_autoscaler(target=3)
-        scaler.logical_target_state = (1, 3, 3, (('L4', 3),), (('L4', 1),))
+        scaler.logical_target_state = autoscalers.LogicalCapacityTarget(
+            1, 3, 3, (('L4', 3),), (('L4', 1),))
         ctrl._autoscaler = scaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._replica_manager.spot_placer = None
         authority = mock.Mock()
+        authority.remaining.return_value = {'l4': 3}
         target = autoscalers.LogicalScaleTarget(
             version=1,
             reconcile_generation=3,
@@ -5803,7 +5967,7 @@ class TestAutoscalerRuntimeSnapshot:
         sequenced_context.__enter__.assert_called_once_with()
         sequenced_context.__exit__.assert_called_once()
         assert plan is not None
-        assert plan[0] == []
+        assert plan.scaling_options == ()
 
     def test_run_autoscaler_uses_runtime_snapshot_for_active_versions(self):
         ctrl = _make_controller()
@@ -6324,8 +6488,14 @@ class TestAutoscalerRuntimeSnapshot:
                                return_value=repository), \
              mock.patch.object(ctrl,
                                '_plan_scale_reconciliation',
-                               return_value=([], 0, None, None, None, None,
-                                             False)):
+                               return_value=controller._ScaleReconciliationPlan(  # pylint: disable=protected-access
+                                   scaling_options=(),
+                                   target_num_replicas=0,
+                                   rollout_failure=None,
+                                   logical_target=None,
+                                   logical_retirement_floor=None,
+                                   retirement_shelter=None,
+                                   invalidate_logical_target=False)):
             publisher = threading.Thread(target=_publish)
             publisher.start()
             assert transaction_entered.wait(timeout=5)

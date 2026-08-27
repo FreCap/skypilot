@@ -7,6 +7,19 @@ from sky.serve import replica_managers
 from sky.utils import common_utils
 
 
+def _logical_target(version,
+                    generation,
+                    target_capacity,
+                    target_capacity_by_accelerator=(),
+                    accelerator_shapes=()):
+    return replica_managers.LogicalCapacityTarget(
+        version=version,
+        generation=generation,
+        target_capacity=target_capacity,
+        target_capacity_by_accelerator=target_capacity_by_accelerator,
+        accelerator_shapes=accelerator_shapes)
+
+
 def _make_manager(service_name='svc', next_replica_id=1):
     """Bare SkyPilotReplicaManager skipping the heavy __init__ (mirrors the
     helper in test_serve_replica_managers.py, which CI cannot import across
@@ -119,7 +132,8 @@ def test_probe2_full_restart_lifecycle_strands_teardown():
                 in_flight_by_replica_id={1: 0},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (2, gen, 0)  # target 0: no shortfall
+        mgr._logical_target = _logical_target(2, gen,
+                                              0)  # target 0: no shortfall
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[info]):
@@ -158,7 +172,7 @@ def test_probe3_shortfall_reactivation_still_works():
             in_flight_by_replica_id={1: 0},
             unknown_replica_ids=frozenset(),
             received_at=replica_managers.time.monotonic()))
-    mgr._logical_target = (2, 5, 3)  # shortfall of 3
+    mgr._logical_target = _logical_target(2, 5, 3)  # shortfall of 3
     with mock.patch.object(replica_managers.serve_state,
                            'get_replica_infos',
                            return_value=[info]):
@@ -199,7 +213,8 @@ def test_same_total_exact_card_shift_reactivates_required_card():
             },
             unknown_replica_ids=frozenset(),
             received_at=replica_managers.time.monotonic()))
-    mgr._logical_target = (2, 5, 1, (('L4', 1),), (('L4', 1), ('A100', 1)))
+    mgr._logical_target = _logical_target(2, 5, 1, (('L4', 1),),
+                                          (('L4', 1), ('A100', 1)))
 
     with mock.patch.object(replica_managers.serve_state,
                            'get_replica_infos',
