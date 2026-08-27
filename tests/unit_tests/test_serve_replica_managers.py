@@ -13635,6 +13635,9 @@ class TestLogicalCapacityPlanning:
             'replica_record_id': retiring.replica_record_id,
             'route_url': 'http://replica:8000',
         }
+        wave_report = (1000.0, {}, {'http://replica:8000'}, set(), set(),
+                       'ha-generation-11')
+        mgr._lb_in_flight_report = wave_report
         mgr._register_wait_for_idle = mock.Mock()
 
         with mock.patch.object(
@@ -13664,7 +13667,11 @@ class TestLogicalCapacityPlanning:
                                       expected_controller_owner=(123,
                                                                  '10.0.0.5'))
         mgr._register_wait_for_idle.assert_called_once_with(
-            retiring, deadline=math.inf, replica_url='http://replica:8000')
+            retiring,
+            deadline=math.inf,
+            replica_url='http://replica:8000',
+            seed_report=wave_report,
+            seed_report_captured_at=mock.ANY)
 
     def test_fresh_zero_paid_retirement_isolates_ambiguous_bound_launch(self):
         mgr = _make_manager()
@@ -13727,7 +13734,11 @@ class TestLogicalCapacityPlanning:
             is_scale_down=True,
             in_flight_drain_cap_seconds=0)
         mgr._register_wait_for_idle.assert_called_once_with(
-            ready, deadline=math.inf, replica_url='http://replica-2:8000')
+            ready,
+            deadline=math.inf,
+            replica_url='http://replica-2:8000',
+            seed_report=None,
+            seed_report_captured_at=mock.ANY)
 
     def test_fresh_zero_paid_retirement_defers_remaining_wave(self):
         mgr = _make_manager()
