@@ -405,6 +405,7 @@ def test_admission_atomically_revokes_route_and_persists_exact_intent(
                                                info,
                                                authority,
                                                requires_idle_proof=True,
+                                               expected_route_url=_ROUTE_URL,
                                                expected_service_hash='svc-hash',
                                                expected_controller_owner=_OWNER)
 
@@ -428,6 +429,42 @@ def test_admission_atomically_revokes_route_and_persists_exact_intent(
     assert replica == 'SHUTTING_DOWN'
 
 
+def test_admission_rejects_route_not_acknowledged_by_load_balancer(
+        retirement_database):
+    engine, info, authority = retirement_database
+    route_urls = paid_retirement.list_active_route_urls(
+        'svc', 'svc-hash', {1: info.replica_record_id})
+    assert route_urls == {1: _ROUTE_URL}
+    _mark_retiring(info)
+
+    record = serve_state.admit_paid_retirement(
+        'svc',
+        1,
+        info,
+        authority,
+        requires_idle_proof=True,
+        expected_route_url='http://stale-route:8000',
+        expected_service_hash='svc-hash',
+        expected_controller_owner=_OWNER)
+
+    assert record is None
+    with engine.connect() as connection:
+        intent_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                paid_retirement.serve_paid_replica_retirements_table)
+        ).scalar_one()
+        lease = connection.execute(
+            sqlalchemy.select(
+                route_projection_schema.serve_route_replica_leases_table)
+        ).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.status)).scalar_one()
+    assert intent_count == 0
+    assert lease['revoked_at'] is None
+    assert replica == 'READY'
+
+
 def test_admission_defers_while_provider_holds_shared_authority(
         retirement_database):
     engine, info, authority = retirement_database
@@ -441,6 +478,7 @@ def test_admission_defers_while_provider_holds_shared_authority(
             info,
             authority,
             requires_idle_proof=True,
+            expected_route_url=_ROUTE_URL,
             expected_service_hash='svc-hash',
             expected_controller_owner=_OWNER)
         elapsed = time.monotonic() - started
@@ -483,6 +521,7 @@ def test_admission_accepts_current_duplicate_plan_head(retirement_database):
                                                info,
                                                authority,
                                                requires_idle_proof=True,
+                                               expected_route_url=_ROUTE_URL,
                                                expected_service_hash='svc-hash',
                                                expected_controller_owner=_OWNER)
 
@@ -502,6 +541,7 @@ def test_idle_commit_is_generation_fenced_and_irreversible(retirement_database):
         info,
         authority,
         requires_idle_proof=True,
+        expected_route_url=_ROUTE_URL,
         expected_service_hash='svc-hash',
         expected_controller_owner=_OWNER) is not None
     with engine.begin() as connection:
@@ -536,6 +576,7 @@ def test_idle_commit_rebases_to_current_equivalent_zero_authority(
         info,
         original_authority,
         requires_idle_proof=True,
+        expected_route_url=_ROUTE_URL,
         expected_service_hash='svc-hash',
         expected_controller_owner=_OWNER) is not None
     successor, successor_digest = _publish_zero_successor(engine, info)
@@ -570,6 +611,7 @@ def test_idle_commit_rebases_to_current_duplicate_plan_head(
         info,
         original_authority,
         requires_idle_proof=True,
+        expected_route_url=_ROUTE_URL,
         expected_service_hash='svc-hash',
         expected_controller_owner=_OWNER) is not None
     snapshot = _refresh_duplicate_zero_plan_head(engine)
@@ -624,6 +666,7 @@ def test_idle_commit_rejects_non_equivalent_or_stale_successor(
         info,
         authority,
         requires_idle_proof=True,
+        expected_route_url=_ROUTE_URL,
         expected_service_hash='svc-hash',
         expected_controller_owner=_OWNER) is not None
     _publish_zero_successor(engine,
@@ -739,6 +782,7 @@ def test_immediate_retirement_rejects_expired_live_zero_reports(
         info,
         authority,
         requires_idle_proof=False,
+        expected_route_url=None,
         expected_service_hash='svc-hash',
         expected_controller_owner=_OWNER) is None
     with engine.connect() as connection:
@@ -761,6 +805,7 @@ def test_exact_idle_commit_cannot_be_cancelled(retirement_database):
         info,
         authority,
         requires_idle_proof=True,
+        expected_route_url=_ROUTE_URL,
         expected_service_hash='svc-hash',
         expected_controller_owner=_OWNER) is not None
     info.status_property.wait_for_idle_before_termination = False
@@ -803,6 +848,7 @@ def test_newer_positive_demand_cancels_only_uncommitted_intent(
         info,
         authority,
         requires_idle_proof=True,
+        expected_route_url=_ROUTE_URL,
         expected_service_hash='svc-hash',
         expected_controller_owner=_OWNER) is not None
     with engine.begin() as connection:
@@ -843,6 +889,7 @@ def test_positive_demand_batch_cancellation_accepts_newer_positive_generation(
         info,
         authority,
         requires_idle_proof=True,
+        expected_route_url=_ROUTE_URL,
         expected_service_hash='svc-hash',
         expected_controller_owner=_OWNER) is not None
 
@@ -935,6 +982,7 @@ def test_batch_cancellation_rejects_current_fresh_zero(retirement_database):
         info,
         authority,
         requires_idle_proof=True,
+        expected_route_url=_ROUTE_URL,
         expected_service_hash='svc-hash',
         expected_controller_owner=_OWNER) is not None
     info.status_property.is_scale_down = False

@@ -6625,6 +6625,7 @@ def _transition_paid_retirement(
     authority: 'paid_retirement.FreshZeroAuthority | None' = None,
     positive_demand_generation: int | None = None,
     requires_idle_proof: bool = True,
+    expected_route_url: str | None = None,
     expected_service_hash: str,
     expected_controller_owner: tuple[int | None, str | None],
 ) -> dict[str, Any] | bool:
@@ -6670,7 +6671,7 @@ def _transition_paid_retirement(
                     paid_retirement.admit_in_session(
                         session, service_name, replica_id,
                         replica_info.replica_record_id, replica_info.version,
-                        requires_idle_proof, authority,
+                        requires_idle_proof, expected_route_url, authority,
                         expected_controller_owner))
             elif action == 'commit':
                 assert authority is not None
@@ -6712,6 +6713,7 @@ def admit_paid_retirement(
     authority: 'paid_retirement.FreshZeroAuthority',
     *,
     requires_idle_proof: bool,
+    expected_route_url: str | None,
     expected_service_hash: str,
     expected_controller_owner: tuple[int | None, str | None],
 ) -> dict[str, Any] | None:
@@ -6723,6 +6725,7 @@ def admit_paid_retirement(
         action='admit',
         authority=authority,
         requires_idle_proof=requires_idle_proof,
+        expected_route_url=expected_route_url,
         expected_service_hash=expected_service_hash,
         expected_controller_owner=expected_controller_owner)
     return result if isinstance(result, dict) else None
