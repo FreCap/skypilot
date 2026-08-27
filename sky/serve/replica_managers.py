@@ -13222,7 +13222,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._controller_owner is None or
                 service_hash != self._service_hash):
             return False
-        changed = False
         records = paid_retirement.list_for_service(self._service_name)
         active_ids = [
             replica_id for replica_id, record in records.items() if
@@ -13230,6 +13229,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         ]
         infos = serve_state.get_replica_infos_from_ids(self._service_name,
                                                        active_ids)
+        cancellation_candidates = []
         for replica_id in sorted(active_ids):
             record = records[replica_id]
             info = infos.get(replica_id)
@@ -13243,17 +13243,16 @@ class SkyPilotReplicaManager(ReplicaManager):
             status.drain_cap_seconds = None
             status.drain_started_at = None
             status.wait_for_idle_before_termination = False
-            if not serve_state.cancel_paid_retirement(
-                    self._service_name,
-                    replica_id,
-                    info,
-                    positive_demand_generation,
-                    expected_service_hash=self._service_hash,
-                    expected_controller_owner=self._controller_owner):
-                continue
+            cancellation_candidates.append((replica_id, info))
+        cancelled_ids = serve_state.cancel_paid_retirements(
+            self._service_name,
+            cancellation_candidates,
+            positive_demand_generation,
+            expected_service_hash=self._service_hash,
+            expected_controller_owner=self._controller_owner)
+        for replica_id in cancelled_ids:
             self._wait_for_idle_trackers.pop(replica_id, None)
-            changed = True
-        return changed
+        return bool(cancelled_ids)
 
     @with_lock
     def scale_down(self,

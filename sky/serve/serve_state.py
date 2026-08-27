@@ -7170,6 +7170,103 @@ def cancel_paid_retirement(
         expected_controller_owner=expected_controller_owner) is True
 
 
+def cancel_paid_retirements(
+    service_name: str,
+    replica_infos: list[tuple[int, 'replica_managers.ReplicaInfo']],
+    minimum_positive_demand_generation: int,
+    *,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+) -> set[int]:
+    """Atomically cancel active retirements under current positive demand.
+
+    Load balancers publish demand every few seconds.  Cancelling one replica
+    per transaction against an exact previously observed generation lets that
+    normal heartbeat race every item in a large retirement wave.  Lock the
+    service once, reconstruct the current durable snapshot, and cancel the
+    whole still-active subset against that generation in one transaction.
+
+    A newer generation is accepted only when it independently remains fresh
+    and positive.  Newer zero, stale, or incomplete demand fails closed.
+    """
+    if not replica_infos:
+        return set()
+    if (type(minimum_positive_demand_generation) is not int or  # pylint: disable=unidiomatic-typecheck
+            minimum_positive_demand_generation < 1):
+        return set()
+    for replica_id, replica_info in replica_infos:
+        _validate_replica_row_identity(replica_id, replica_info)
+    with _replica_launch_authority_write_session(service_name) as (engine,
+                                                                   session):
+        if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            raise RuntimeError('Paid retirement requires PostgreSQL.')
+        owner = session.execute(
+            sqlalchemy.select(services_table.c.hash,
+                              services_table.c.controller_pid,
+                              services_table.c.controller_ip).where(
+                                  services_table.c.name ==
+                                  service_name).with_for_update()).fetchone()
+        if (owner is None or owner[0] != expected_service_hash or
+            (owner[1], owner[2]) != expected_controller_owner):
+            session.rollback()
+            return set()
+        snapshot = demand_state.get_autoscaling_snapshot(
+            service_name,
+            expected_service_hash,
+            connection=session.connection())
+        if (snapshot is None or snapshot.fresh_aggregate_zero or
+                snapshot.demand_feed_generation
+                < minimum_positive_demand_generation):
+            session.rollback()
+            return set()
+        normalized = snapshot.normalized_demand
+        aggregate_positive = any(
+            int(normalized.get(field, 0) or 0) > 0
+            for field in ('recent_request_count', 'queue_depth',
+                          'rejected_in_window', 'recent_rejected_in_window'))
+        if not aggregate_positive:
+            session.rollback()
+            return set()
+        infos_by_id = dict(replica_infos)
+        if len(infos_by_id) != len(replica_infos):
+            session.rollback()
+            return set()
+        locked_record_ids = _lock_replica_record_ids_in_session(
+            session, engine, service_name, sorted(infos_by_id))
+        if locked_record_ids is None:
+            session.rollback()
+            return set()
+        cancelled_infos: list[tuple[int, 'replica_managers.ReplicaInfo']] = []
+        try:
+            for replica_id in sorted(infos_by_id):
+                info = infos_by_id[replica_id]
+                if (locked_record_ids.get(replica_id)
+                        != info.replica_record_id):
+                    continue
+                if paid_retirement.cancel_in_session(
+                        session, service_name, replica_id,
+                        info.replica_record_id, snapshot.demand_feed_generation,
+                        expected_service_hash, expected_controller_owner):
+                    cancelled_infos.append((replica_id, info))
+        except paid_retirement.PaidRetirementError:
+            session.rollback()
+            return set()
+        if not cancelled_infos:
+            session.rollback()
+            return set()
+        persisted_infos = _upsert_replica_rows_in_session(
+            session,
+            engine,
+            service_name,
+            cancelled_infos,
+            expected_replica_exists=True)
+        if persisted_infos is None:
+            session.rollback()
+            return set()
+        session.commit()
+    return {replica_id for replica_id, _ in cancelled_infos}
+
+
 def add_or_update_replica_with_launch_shadow(
     service_name: str,
     replica_id: int,

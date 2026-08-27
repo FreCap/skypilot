@@ -14043,8 +14043,8 @@ class TestLogicalCapacityPlanning:
                  return_value={1: retiring}), \
              mock.patch.object(
                  replica_managers.serve_state,
-                 'cancel_paid_retirement',
-                 return_value=True) as cancel:
+                 'cancel_paid_retirements',
+                 return_value={1}) as cancel:
             changed = mgr.cancel_uncommitted_paid_retirements('svc-hash', 8)
 
         assert changed
@@ -14052,10 +14052,7 @@ class TestLogicalCapacityPlanning:
         assert retiring.status_property.sky_down_status is None
         assert not retiring.status_property.wait_for_idle_before_termination
         assert 1 not in mgr._wait_for_idle_trackers
-        cancel.assert_called_once_with('svc',
-                                       1,
-                                       retiring,
-                                       8,
+        cancel.assert_called_once_with('svc', [(1, retiring)], 8,
                                        expected_service_hash='svc-hash',
                                        expected_controller_owner=(123,
                                                                   '10.0.0.5'))
