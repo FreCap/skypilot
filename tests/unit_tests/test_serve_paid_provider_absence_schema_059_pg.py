@@ -22,7 +22,9 @@ pytestmark = pytest.mark.xdist_group(
 _MIGRATION = importlib.import_module(
     'sky.schemas.db.serve_state.059_ordinary_paid_provider_absence')
 _CURRENT_MIGRATION = importlib.import_module(
-    'sky.schemas.db.serve_state.060_cancelled_gcp_paid_cleanup')
+    'sky.schemas.db.serve_state.061_paid_replacement_gcp_reconciliation')
+_AWS_CENSUS_MIGRATION = importlib.import_module(
+    'sky.schemas.db.serve_state.062_aws_paid_provider_census')
 
 
 def _function_definition(engine: sqlalchemy.engine.Engine,
@@ -135,8 +137,8 @@ def _paid_receipt_scope_is_accepted(
     provider_evidence: str = 'ABSENT',
     paid_capacity_pool_key: str,
     provider_evidence_payload,
+    expression: str = _MIGRATION._PAID_RECEIPT_SCOPE_CHECK,
 ) -> bool:
-    expression = _MIGRATION._PAID_RECEIPT_SCOPE_CHECK
     return bool(
         connection.execute(
             sqlalchemy.text(f'''
@@ -239,10 +241,12 @@ def test_serve059_lineage_and_runtime_metadata() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['061']
+    assert scripts.get_heads() == ['062']
+    assert scripts.get_revision('062').down_revision == '061'
+    assert scripts.get_revision('061').down_revision == '060'
     assert scripts.get_revision('060').down_revision == '059'
     assert scripts.get_revision('059').down_revision == '058'
-    assert migration_utils.SERVE_VERSION == '061'
+    assert migration_utils.SERVE_VERSION == '062'
     assert migration_utils.serve_target_version(sqlite) == '037'
 
     constraint = next(
@@ -262,7 +266,7 @@ def test_serve059_lineage_and_runtime_metadata() -> None:
         ordinary_launch_binding.ordinary_launch_associations_table.constraints
         if item.name == _MIGRATION._PAID_RECEIPT_SCOPE_CONSTRAINT)
     assert _compact(str(paid_receipt_constraint.sqltext)) == _compact(
-        _MIGRATION._PAID_RECEIPT_SCOPE_CHECK)
+        _AWS_CENSUS_MIGRATION._PAID_RECEIPT_SCOPE_CHECK)
 
 
 def test_serve059_migrates_all_three_database_gates(empty_postgres) -> None:
@@ -459,3 +463,63 @@ def test_serve059_paid_receipt_scope_rejects_null_authority(
             capability_cohort_epoch=10,
             paid_capacity_pool_key='legacy|opaque|paid-pool',
             provider_evidence_payload={})
+
+
+def test_serve062_accepts_only_pool_bound_aws_census(empty_postgres) -> None:
+    config = migration_utils.get_alembic_config(empty_postgres,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '062')
+    pool_key = _paid_pool_key(
+        cloud='aws', provider_identity={'aws_account_id': '123456789012'})
+    identity = {
+        'aws_account_id': '123456789012',
+        'client_token': 'a' * 64,
+        'cluster_name_on_cloud': 'service-1-tenant',
+        'credential_profile': 'prod',
+        'instance_type': 'gpu.large',
+        'num_nodes': 1,
+        'region': 'region-a',
+        'use_spot': True,
+        'workspace': 'default',
+        'zone': 'zone-a',
+    }
+    payload = {
+        'association_id': '59100000-0000-4000-8000-000000000001',
+        'cluster_name': 'service-1',
+        'instances': [],
+        'probe_contract': 'aws-client-token-instance-presence-v1',
+        'profile_kind': 'ORDINARY_PAID',
+        'provider_identity': identity,
+        'replica_record_id': '59100000-0000-4000-8000-000000000003',
+        'result': 'ABSENT',
+    }
+    with empty_postgres.connect() as connection:
+        assert _paid_receipt_scope_is_accepted(
+            connection,
+            paid_capacity_pool_key=pool_key,
+            provider_evidence_payload=payload,
+            expression=_AWS_CENSUS_MIGRATION._PAID_RECEIPT_SCOPE_CHECK)
+        for key, invalid in (
+            ('aws_account_id', '999999999999'),
+            ('client_token', 'not-a-token'),
+            ('instance_type', 'other.large'),
+            ('num_nodes', 2),
+            ('region', 'other-region'),
+            ('use_spot', False),
+            ('workspace', 'other-workspace'),
+            ('zone', 'other-zone'),
+        ):
+            changed = json.loads(json.dumps(payload))
+            changed['provider_identity'][key] = invalid
+            assert not _paid_receipt_scope_is_accepted(
+                connection,
+                paid_capacity_pool_key=pool_key,
+                provider_evidence_payload=changed,
+                expression=_AWS_CENSUS_MIGRATION._PAID_RECEIPT_SCOPE_CHECK)
+        changed = json.loads(json.dumps(payload))
+        changed['probe_contract'] = 'other-contract'
+        assert not _paid_receipt_scope_is_accepted(
+            connection,
+            paid_capacity_pool_key=pool_key,
+            provider_evidence_payload=changed,
+            expression=_AWS_CENSUS_MIGRATION._PAID_RECEIPT_SCOPE_CHECK)
