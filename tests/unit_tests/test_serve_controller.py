@@ -5396,7 +5396,7 @@ class TestAutoscalerRuntimeSnapshot:
         assert call_order == ['supply', 'demand']
         repository.project_reserved_supply.assert_called_once()
 
-    def test_promoted_reconcile_reuses_projected_allocation_for_publication(
+    def test_promoted_reconcile_publishes_projected_allocation_before_local_state(
             self):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
@@ -5421,6 +5421,18 @@ class TestAutoscalerRuntimeSnapshot:
         authority = mock.Mock()
         retirement_shelter = types.SimpleNamespace(authority_current=True)
         plan = ([], 2, None, None, None, retirement_shelter, False)
+        call_order = []
+
+        def _read_fill():
+            call_order.append('allocation')
+            return True, allocation
+
+        def _publish(*_args, **_kwargs):
+            call_order.append('publish')
+            return authority
+
+        ctrl._replica_manager.publish_target_num_replicas.side_effect = (
+            lambda *_args, **_kwargs: call_order.append('local-target'))
 
         with mock.patch.object(
                 controller.capacity_admission,
@@ -5442,7 +5454,7 @@ class TestAutoscalerRuntimeSnapshot:
                  return_value={'active_versions': [1]}), \
              mock.patch.object(ctrl,
                                '_read_sequenced_reserved_fill_allocation',
-                               return_value=(True, allocation)) as read_fill, \
+                               side_effect=_read_fill) as read_fill, \
              mock.patch.object(ctrl,
                                '_accept_sequenced_reserved_fill',
                                return_value=False), \
@@ -5454,10 +5466,13 @@ class TestAutoscalerRuntimeSnapshot:
                                return_value=True), \
              mock.patch.object(ctrl,
                                '_publish_ordered_paid_authority',
-                               return_value=authority) as publish:
+                               side_effect=_publish) as publish:
             ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
 
         assert read_fill.call_args_list == [mock.call(), mock.call()]
+        assert call_order == [
+            'allocation', 'publish', 'allocation', 'local-target'
+        ]
         repository.project_reserved_supply.assert_called_once()
         publish.assert_called_once_with(  # pylint: disable=protected-access
             scaler,

@@ -70,6 +70,28 @@ transaction remains the authority: it locks and reconstructs the captured
 allocation and supply graph with demand and rejects either if stale. This
 removes an optimistic identity race; it does not accept stale supply.
 
+Release ``1.1.1522`` deployed that allocation reuse in Helm revision 641.
+The same immutable 10,000-request run then reached 5,962 accepted identities
+and exposed the final ordering gap: after computing the supply-aware target,
+the controller still published local target/retirement state and attempted a
+zero-cost demand launch before beginning the paid-plan transaction. Those
+operations can wait on the large-fleet replica-manager lock long enough for a
+new demand receipt or allocation heartbeat to arrive. PostgreSQL correctly
+rejected the old inputs, but repeated rejection left paid residual starved.
+
+The canonical promoted, allocation-bound order is therefore stricter:
+``prepare/project supply -> capture demand -> compute target -> publish the
+atomic PostgreSQL paid plan -> publish local target/retirement state ->
+actuate``. The sequenced allocation has already committed every current and
+pending reserved holding plus its unmaterialized tail before demand is read,
+so a second demand-owned zero-cost probe is not a prerequisite for the paid
+residual. It may still materialize reserved supply after publication; if it
+does, no paid provider effect occurs in that branch and the controller replans.
+Any allocation, supply-graph, route, demand, cap, version, or owner change at
+publication still rejects atomically, and every later paid claim revalidates
+the current plan and graph. This is an ordering correction, not permission to
+accept changed demand or stale reserved capacity.
+
 The normal lifecycle-116 teardown then exposed two independent reducer defects.
 First, exact reserved-fill absence reached the common replica projection, but
 terminal request status and cause were read only in the paid-provider branch.
