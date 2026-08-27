@@ -537,15 +537,15 @@ provider-policy ceilings.  This preserves recovery for a cold burst whose SLA
 is shorter than its measured provisioning lead while making the inevitable
 miss visible instead of representing that launch as SLA-compliant.
 
-This is a replacement of the uniform cold-lead queue path, not an optional
-parallel scaler.  During an N-1/N-2 rollout, old reports take only the bounded
-raw-target compatibility path; after all elected load balancers publish
-complete deadline buckets, only the capacity-time path sizes queued demand.
-The transition-only fallback and its tests are removed after the documented
-mixed-version horizon.  Request-age buckets, exact-card service-time reads,
-ready-time observations, autoscaler/UI projection, and bounded load tests are
-therefore one implementation phase and are not part of the already-deployed
-proof recorded above.
+This replaces the uniform cold-lead queue calculation whenever the elected
+load balancers provide a complete current deadline gauge; it is not an
+operator-selectable second scaler.  Standard N-1/N-2 compatibility is
+permanent: an adjacent-version report that lacks the additive deadline field
+takes only the existing bounded raw-target calculation, while a complete
+current report has exactly one capacity-time result.  Request-age buckets,
+exact-card service-time reads, ready-time observations, autoscaler/UI
+projection, and bounded load tests are therefore one implementation phase and
+are not part of the already-deployed proof recorded above.
 
 ### Paid residual
 
