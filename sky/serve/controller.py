@@ -6689,6 +6689,55 @@ class SkyServeController:
                         option for option in scaling_options if option.operator
                         != autoscalers.AutoscalerDecisionOperator.SCALE_UP
                     ]
+                ordinary_physical_overrides: list[dict[str, Any] | None] = []
+                ordinary_logical_targets: list[
+                    autoscalers.LogicalScaleTarget] = []
+                if durable_demand_promoted:
+                    ordinary_physical_overrides = [
+                        option.target
+                        for option in scaling_options
+                        if option.operator == autoscalers.
+                        AutoscalerDecisionOperator.SCALE_UP and option.reason !=
+                        autoscalers.AutoscalerDecisionReason.COST_REBALANCE and
+                        (option.target is None or
+                         isinstance(option.target, dict))
+                    ]
+                    ordinary_logical_targets = [
+                        option.target
+                        for option in scaling_options
+                        if option.operator ==
+                        autoscalers.AutoscalerDecisionOperator.SCALE_UP and
+                        option.reason != autoscalers.AutoscalerDecisionReason.
+                        COST_REBALANCE and isinstance(
+                            option.target, autoscalers.LogicalScaleTarget) and
+                        not option.target.replace_unknown_replica_ids
+                    ]
+                    for target in ordinary_logical_targets:
+                        if target.cold_launch_authority_by_accelerator is None:
+                            logger.warning(
+                                'Suppressing promoted logical paid launch '
+                                'without exact-card residual authority.')
+                            return
+                    if (ordered_paid_authority is None and
+                            sequenced_reserved_fill):
+                        # The allocation-bound plan is the first side effect
+                        # after target computation. Publishing local target
+                        # state or probing ordinary zero-cost placement can
+                        # wait on the large-fleet manager lock and race the
+                        # next demand/allocation heartbeat. The sequenced
+                        # allocation already accounts for committed, pending,
+                        # and unmaterialized reserved supply; publication
+                        # locks and revalidates that exact graph with demand.
+                        ordered_paid_authority = (
+                            self._publish_ordered_paid_authority(
+                                decision_autoscaler,
+                                decision_version,
+                                sequenced_reserved_fill=True,
+                                reserved_fill_allocation_map=allocation,
+                                reserved_supply_projection=(
+                                    reserved_supply_projection)))
+                        if ordered_paid_authority is None:
+                            return
                 if (sequenced_reserved_fill and
                         retirement_shelter is not None and
                         retirement_shelter.authority_current):
@@ -6769,25 +6818,6 @@ class SkyServeController:
                     # aggregate-only intent.
                     self._replica_manager.invalidate_logical_target()
                 if durable_demand_promoted:
-                    ordinary_physical_overrides: list[dict[str, Any] | None] = [
-                        option.target
-                        for option in scaling_options
-                        if option.operator == autoscalers.
-                        AutoscalerDecisionOperator.SCALE_UP and option.reason !=
-                        autoscalers.AutoscalerDecisionReason.COST_REBALANCE and
-                        (option.target is None or
-                         isinstance(option.target, dict))
-                    ]
-                    ordinary_logical_targets = [
-                        option.target
-                        for option in scaling_options
-                        if option.operator ==
-                        autoscalers.AutoscalerDecisionOperator.SCALE_UP and
-                        option.reason != autoscalers.AutoscalerDecisionReason.
-                        COST_REBALANCE and isinstance(
-                            option.target, autoscalers.LogicalScaleTarget) and
-                        not option.target.replace_unknown_replica_ids
-                    ]
                     zero_cost_progress = False
                     if ordinary_physical_overrides:
                         accepted = self._replica_manager.scale_up_batch(
@@ -6826,12 +6856,6 @@ class SkyServeController:
                         # snapshot.
                         self._notify_scale_reconcile()
                         return
-                    for target in ordinary_logical_targets:
-                        if target.cold_launch_authority_by_accelerator is None:
-                            logger.warning(
-                                'Suppressing promoted logical paid launch '
-                                'without exact-card residual authority.')
-                            return
                     # Publish on every fresh promoted reconcile, including a
                     # zero target.  Duplicate semantic content refreshes the
                     # current head for queued claims; a demand drop mints a
