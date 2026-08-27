@@ -5172,11 +5172,14 @@ class TestAutoscalerRuntimeSnapshot:
 
         ctrl._replica_manager.accept_reserved_fill.assert_not_called()
 
-    def test_unknown_demand_after_empty_prefill_blocks_other_actuation(self):
+    @pytest.mark.parametrize('utilization_gate', [False, True])
+    def test_unknown_demand_after_empty_prefill_blocks_other_actuation(
+            self, utilization_gate):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
         scaler = self._logical_durable_autoscaler(target=2, emit_scale_up=True)
         scaler.reserved_capacity_fill = True
+        scaler.reserved_fill_utilization_gate = utilization_gate
         scaler.max_replicas = 20
         ctrl._autoscaler = scaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
@@ -5226,13 +5229,18 @@ class TestAutoscalerRuntimeSnapshot:
                                return_value=False) as accept:
             ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
 
-        accept.assert_called_once_with(allocation, scaler, 1, 0)
+        if utilization_gate:
+            accept.assert_not_called()
+        else:
+            accept.assert_called_once_with(allocation, scaler, 1, 0)
         read_demand.assert_not_called()
         assert get_replicas.call_args_list == [
             mock.call('svc'), mock.call('svc')
         ]
         get_runtime.assert_called_once_with('svc', require_version=True)
         repository.plan_and_publish_current.assert_called_once()
+        assert (repository.plan_and_publish_current.call_args.
+                kwargs['reserved_fill_allocation_map'] is allocation)
         ctrl._replica_manager.publish_target_num_replicas.assert_not_called()
         ctrl._replica_manager.publish_logical_reconcile_state.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.scale_up_batch.assert_not_called()
@@ -5240,7 +5248,8 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._replica_manager.scale_down_logically_batch.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.reconcile_fresh_zero_paid_retirements.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.cancel_uncommitted_paid_retirements.assert_not_called()  # pylint: disable=line-too-long
-        assert ctrl._replica_manager.invalidate_logical_reconcile_state.call_count == 2  # pylint: disable=line-too-long
+        expected_invalidations = 1 if utilization_gate else 2
+        assert ctrl._replica_manager.invalidate_logical_reconcile_state.call_count == expected_invalidations  # pylint: disable=line-too-long
 
     def test_current_repository_linearizes_supply_and_demand_before_local_state(
             self):

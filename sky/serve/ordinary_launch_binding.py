@@ -100,6 +100,7 @@ NON_POOL_CAPABILITY_COHORT_EPOCH = (
 # without a ClientToken and can never acquire provider-absence authority from
 # a later tokenized retry.
 ORDINARY_PAID_AWS_CLIENT_TOKEN_COHORT_FLOOR = 11
+ORDINARY_PAID_AWS_ABSENCE_SETTLE_SECONDS = 60
 # Cohort 12 is the first cohort whose GCP create timeout preserves the zone
 # operation record and whose provider reconciliation reads VM, disk, and
 # in-flight create-operation state.  A cohort-12 binary may conservatively
@@ -7012,6 +7013,62 @@ def ordinary_paid_aws_account_id(context: BoundNonPoolLaunchContext) -> str:
     return ordinary_paid_aws_account_id_from_pool_key(parts[2])
 
 
+def ordinary_paid_aws_provider_identity(
+    association: Mapping[str, Any],
+    *,
+    credential_profile: str | None,
+) -> dict[str, Any]:
+    """Build the exact AWS census identity retained by a paid request."""
+    if credential_profile is not None and (
+            not isinstance(credential_profile, str) or not credential_profile):
+        raise OrdinaryLaunchBindingConflict(
+            'Ordinary-paid AWS launch has an invalid credential profile.')
+    pool_key = association.get('paid_capacity_pool_key')
+    if not isinstance(pool_key, str) or not pool_key:
+        raise OrdinaryLaunchBindingConflict(
+            'Ordinary-paid AWS launch has no exact paid pool identity.')
+    pool_identity = paid_capacity.pool_key_payload(pool_key)
+    provider_identity = (pool_identity.get('provider_identity') if isinstance(
+        pool_identity, Mapping) else None)
+    aws_account_id = (provider_identity.get('aws_account_id') if isinstance(
+        provider_identity, Mapping) else None)
+    if (not isinstance(pool_identity, Mapping) or
+            pool_identity.get('version') != 2 or
+            pool_identity.get('cloud') != 'aws' or
+            pool_identity.get('use_spot') is not True or
+            not isinstance(pool_identity.get('workspace'), str) or
+            not pool_identity['workspace'] or
+            not isinstance(pool_identity.get('region'), str) or
+            not pool_identity['region'] or
+            not isinstance(pool_identity.get('zone'), str) or
+            not pool_identity['zone'] or
+            not isinstance(pool_identity.get('instance_type'), str) or
+            not pool_identity['instance_type'] or
+            type(pool_identity.get('num_nodes')) is not int or  # pylint: disable=unidiomatic-typecheck
+            pool_identity['num_nodes'] < 1
+            or not isinstance(aws_account_id, str)
+            or re.fullmatch(r'[0-9]{12}', aws_account_id) is None):
+        raise OrdinaryLaunchBindingConflict(
+            'Ordinary-paid AWS launch has no exact Spot placement.')
+    context = bound_context_from_association(association)
+    if not isinstance(context, BoundNonPoolLaunchContext):
+        raise OrdinaryLaunchBindingConflict(
+            'Ordinary-paid AWS launch lost its typed association.')
+    return {
+        'aws_account_id': aws_account_id,
+        'client_token': ordinary_paid_aws_client_token(context),
+        'cluster_name_on_cloud':
+            ordinary_paid_cluster_name_on_cloud(association),
+        'credential_profile': credential_profile,
+        'instance_type': pool_identity['instance_type'],
+        'num_nodes': pool_identity['num_nodes'],
+        'region': pool_identity['region'],
+        'use_spot': True,
+        'workspace': pool_identity['workspace'],
+        'zone': pool_identity['zone'],
+    }
+
+
 def _ordinary_paid_provider_evidence(
     association: Mapping[str, Any],
     cluster_name: str,
@@ -7035,6 +7092,85 @@ def _ordinary_paid_provider_evidence(
         raise OrdinaryLaunchBindingConflict(
             'Ordinary-paid provider absence has no typed evidence envelope.')
     probe_contract = candidate_payload.get('probe_contract')
+    if probe_contract == 'aws-client-token-instance-presence-v1':
+        if evidence not in (ProviderEvidence.ABSENT, ProviderEvidence.PRESENT):
+            raise OrdinaryLaunchBindingConflict(
+                'Ordinary-paid AWS evidence must prove presence or absence.')
+        expected_keys = {
+            'association_id', 'cluster_name', 'instances', 'probe_contract',
+            'profile_kind', 'provider_identity', 'replica_record_id', 'result'
+        }
+        provider_identity = candidate_payload.get('provider_identity')
+        credential_profile = (provider_identity.get('credential_profile') if
+                              isinstance(provider_identity, Mapping) else None)
+        expected_identity = ordinary_paid_aws_provider_identity(
+            association, credential_profile=credential_profile)
+        instances = candidate_payload.get('instances')
+        if not isinstance(instances, list):
+            raise OrdinaryLaunchBindingConflict(
+                'Ordinary-paid AWS provider evidence has no instance list.')
+        allowed_states = {
+            'pending', 'running', 'shutting-down', 'terminated', 'stopping',
+            'stopped'
+        }
+        instance_keys = {
+            'availability_zone', 'client_token', 'cluster_name_on_cloud',
+            'instance_id', 'instance_type', 'market', 'state'
+        }
+        canonical_instances = True
+        for instance in instances:
+            if (not isinstance(instance, Mapping) or
+                    set(instance) != instance_keys or
+                    instance.get('availability_zone') !=
+                    expected_identity['zone'] or instance.get('client_token') !=
+                    expected_identity['client_token'] or
+                    instance.get('cluster_name_on_cloud') !=
+                    expected_identity['cluster_name_on_cloud'] or
+                    not isinstance(instance.get('instance_id'), str) or
+                    not instance['instance_id'] or instance.get('instance_type')
+                    != expected_identity['instance_type'] or
+                    instance.get('market') != 'spot' or
+                    instance.get('state') not in allowed_states):
+                canonical_instances = False
+                break
+        live_instances = ([
+            instance for instance in instances
+            if instance['state'] != 'terminated'
+        ] if canonical_instances else [])
+        if (set(candidate_payload) != expected_keys or
+                not isinstance(provider_identity, Mapping) or
+                dict(provider_identity) != expected_identity or
+                not canonical_instances or
+                len(instances) > expected_identity['num_nodes'] or
+                instances != sorted(instances,
+                                    key=lambda item: item['instance_id']) or
+                len({instance['instance_id']
+                     for instance in instances}) != len(instances) or
+            (evidence is ProviderEvidence.ABSENT and live_instances) or
+            (evidence is ProviderEvidence.PRESENT and not live_instances)):
+            raise OrdinaryLaunchBindingConflict(
+                'Ordinary-paid AWS provider evidence is not canonical.')
+        payload = {
+            'association_id': str(association['association_id']),
+            'cluster_name': cluster_name,
+            'instances': [dict(instance) for instance in instances],
+            'probe_contract': 'aws-client-token-instance-presence-v1',
+            'profile_kind': profile_kind.value,
+            'provider_identity': expected_identity,
+            'replica_record_id': str(association['replica_record_id']),
+            'result': evidence.value,
+        }
+        if dict(candidate_payload) != payload:
+            raise OrdinaryLaunchBindingConflict(
+                'Ordinary-paid AWS provider evidence changed its allocation.')
+        digest = _canonical_sha256({
+            'association_id': str(association['association_id']),
+            'evidence': evidence.value,
+            'payload': payload,
+            'profile_digest': association['profile_digest'],
+        })
+        return payload, digest
+
     if probe_contract == 'gcp-vm-disk-operation-presence-v1':
         if evidence not in (ProviderEvidence.ABSENT, ProviderEvidence.PRESENT):
             raise OrdinaryLaunchBindingConflict(
@@ -7182,14 +7318,15 @@ def replica_has_provider_present_cleanup_marker(
         getattr(replica_info, 'is_zero_cost', None) is True and
         getattr(replica_info, 'paid_capacity_pool_key', None) is None)
     pool_key = getattr(replica_info, 'paid_capacity_pool_key', None)
-    paid_gcp_shape = bool(
+    paid_provider_shape = bool(
         getattr(replica_info, 'reserved_fill', None) is False and
         getattr(replica_info, 'is_zero_cost', None) is False and
         getattr(replica_info, 'is_spot', None) is True and
         isinstance(pool_key, str) and bool(pool_key) and
-        (paid_capacity.pool_key_payload(pool_key) or {}).get('cloud') == 'gcp')
+        (paid_capacity.pool_key_payload(pool_key) or
+         {}).get('cloud') in ('aws', 'gcp'))
     return bool(
-        (reserved_shape or paid_gcp_shape) and
+        (reserved_shape or paid_provider_shape) and
         getattr(replica_info, 'service_job_id', None) is None and
         getattr(replica_info, 'zero_cost_materialization_sequence',
                 None) is None and

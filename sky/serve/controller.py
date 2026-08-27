@@ -6506,7 +6506,18 @@ class SkyServeController:
                     (pre_demand_sequenced_fill, pre_demand_allocation) = (
                         self._read_sequenced_reserved_fill_allocation())
                     if (pre_demand_sequenced_fill and
-                            pre_demand_allocation is not None):
+                            pre_demand_allocation is not None and
+                            getattr(decision_autoscaler,
+                                    'reserved_fill_utilization_gate',
+                                    False) is not True):
+                        # Static fill is intentionally independent of demand,
+                        # so it may consume its authenticated allocation
+                        # before a demand snapshot exists.  A utilization-
+                        # gated service has the opposite contract: admit only
+                        # the exact-card reserved capacity selected by the
+                        # ordinary demand planner below.  Letting its scalar
+                        # activity cap reach this pre-demand planner can turn
+                        # L4-only queue work into unrelated A100/H200 fill.
                         if not self._scale_actuation_is_current(
                                 actuation_generation, decision_autoscaler,
                                 decision_version):
