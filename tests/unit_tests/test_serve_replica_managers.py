@@ -73,6 +73,19 @@ _LOGICAL_PLACEMENT_CONTRACT = placement_policy.resolve_fresh_contract(
     placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False)
 
 
+def _logical_target(version,
+                    generation,
+                    target_capacity,
+                    target_capacity_by_accelerator=(),
+                    accelerator_shapes=()):
+    return replica_managers.LogicalCapacityTarget(
+        version=version,
+        generation=generation,
+        target_capacity=target_capacity,
+        target_capacity_by_accelerator=target_capacity_by_accelerator,
+        accelerator_shapes=accelerator_shapes)
+
+
 def _admit_launches_from(replicas):
 
     def _reserve(_service_name, candidates, **_kwargs):
@@ -3078,10 +3091,9 @@ class TestBoundOrdinaryLaunchManagerIntegration:
             assert manager._finalize_projected_provider_absence_cleanup(3)
 
         authorize.assert_called_once_with('svc', 3, info.replica_record_id)
-        remove.assert_called_once_with(
-            3,
-            info.replica_record_id,
-            allow_active_provider_free_pre_job=True)
+        remove.assert_called_once_with(3,
+                                       info.replica_record_id,
+                                       allow_active_provider_free_pre_job=True)
         persist.assert_not_called()
         provider_down.assert_not_called()
 
@@ -8264,7 +8276,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (2, 5, 1)
+        mgr._logical_target = _logical_target(2, 5, 1)
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[retiring, survivor]):
@@ -8280,7 +8292,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
 
         mgr._logical_reconcile_snapshot = dataclasses.replace(
             mgr._logical_reconcile_snapshot, generation=6)
-        mgr._logical_target = (2, 6, 1)
+        mgr._logical_target = _logical_target(2, 6, 1)
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[retiring, survivor]):
@@ -8358,7 +8370,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (3, 5, 1)
+        mgr._logical_target = _logical_target(3, 5, 1)
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[retiring, survivor]):
@@ -8378,7 +8390,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
 
         mgr._logical_reconcile_snapshot = dataclasses.replace(
             mgr._logical_reconcile_snapshot, generation=6)
-        mgr._logical_target = (3, 6, 1)
+        mgr._logical_target = _logical_target(3, 6, 1)
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[retiring, survivor]):
@@ -8510,7 +8522,7 @@ class TestUpdateVersionBatchesPriorVersionYamls:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (2, 5, 1)
+        mgr._logical_target = _logical_target(2, 5, 1)
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos_from_ids',
                                return_value={1: queued}), \
@@ -9985,7 +9997,7 @@ class TestLaunchOwnershipFence:
         mgr, infos = self._queued_manager([1, 2])
         mgr._uses_logical_replicas = True
         mgr._logical_exact_accelerator_shapes = {'L4': 1}
-        fence = (1, 7, 1, (('L4', 1),), (('L4', 1),))
+        fence = _logical_target(1, 7, 1, (('L4', 1),), (('L4', 1),))
         mgr._logical_target = fence
         mgr._logical_reconcile_snapshot = (
             replica_managers.LogicalReconcileSnapshot(
@@ -10037,8 +10049,8 @@ class TestLaunchOwnershipFence:
         mgr, infos = self._queued_manager([1])
         mgr._uses_logical_replicas = True
         mgr._logical_exact_accelerator_shapes = {'L4': 1}
-        previous_target = (1, 7, 1, (('L4', 1),), (('L4', 1),))
-        current_target = (1, 8, 1, previous_target[3], previous_target[4])
+        previous_target = _logical_target(1, 7, 1, (('L4', 1),), (('L4', 1),))
+        current_target = dataclasses.replace(previous_target, generation=8)
         mgr._logical_target = current_target
         mgr._logical_reconcile_snapshot = (
             replica_managers.LogicalReconcileSnapshot(
@@ -10086,8 +10098,9 @@ class TestLaunchOwnershipFence:
         mgr, infos = self._queued_manager([1])
         mgr._uses_logical_replicas = True
         mgr._logical_exact_accelerator_shapes = {'L4': 1}
-        previous_target = (1, 7, 1, (('L4', 1),), (('L4', 1),))
-        changed_target = (1, 8, 0, (), previous_target[4])
+        previous_target = _logical_target(1, 7, 1, (('L4', 1),), (('L4', 1),))
+        changed_target = _logical_target(1, 8, 0, (),
+                                         previous_target.accelerator_shapes)
         mgr._logical_target = changed_target
         mgr._logical_reconcile_snapshot = (
             replica_managers.LogicalReconcileSnapshot(
@@ -11099,8 +11112,9 @@ class TestLogicalPendingLaunchAdmission:
                 received_at=replica_managers.time.monotonic()))
         shapes = (('L4', 1), ('A100', 1), ('A100-80GB', 1))
         target = sum(target_by_card.values())
-        mgr._logical_target = (1, generation, target,
-                               tuple(target_by_card.items()), shapes)
+        mgr._logical_target = _logical_target(1, generation, target,
+                                              tuple(target_by_card.items()),
+                                              shapes)
         return mgr
 
     def test_recovered_paid_a100_wave_is_excluded_when_ready_covers_target(
@@ -11219,7 +11233,7 @@ class TestLogicalPendingLaunchAdmission:
             1, 'A100', replica_managers.serve_state.ReplicaStatus.PENDING)
         previous_target = mgr._logical_target
         assert previous_target is not None
-        current_target = (1, 8, 1, previous_target[3], previous_target[4])
+        current_target = dataclasses.replace(previous_target, generation=8)
         current_snapshot = dataclasses.replace(
             mgr._logical_reconcile_snapshot,
             generation=8,
@@ -11245,7 +11259,8 @@ class TestLogicalPendingLaunchAdmission:
             1, 'A100', replica_managers.serve_state.ReplicaStatus.PENDING)
         previous_target = mgr._logical_target
         assert previous_target is not None
-        changed_target = (1, 8, 2, (('A100', 2),), previous_target[4])
+        changed_target = _logical_target(1, 8, 2, (('A100', 2),),
+                                         previous_target.accelerator_shapes)
         current_snapshot = dataclasses.replace(
             mgr._logical_reconcile_snapshot,
             generation=8,
@@ -11289,7 +11304,7 @@ class TestLogicalPendingLaunchAdmission:
             1, 'A100', replica_managers.serve_state.ReplicaStatus.PENDING)
         previous_target = mgr._logical_target
         assert previous_target is not None
-        regressed_target = (1, 6, 1, previous_target[3], previous_target[4])
+        regressed_target = dataclasses.replace(previous_target, generation=6)
         regressed_snapshot = dataclasses.replace(
             mgr._logical_reconcile_snapshot,
             generation=6,
@@ -11354,7 +11369,7 @@ class TestLogicalPendingLaunchAdmission:
         mgr = self._manager({'L4': 1})
         shapes = (('L4', 1),)
         mgr._logical_exact_accelerator_shapes = dict(shapes)
-        mgr._logical_target = (1, 7, 1, shapes, shapes)
+        mgr._logical_target = _logical_target(1, 7, 1, shapes, shapes)
         candidate = self._info(
             1, 'L4', replica_managers.serve_state.ReplicaStatus.PROVISIONING)
         candidate.resources_override = None
@@ -11375,7 +11390,7 @@ class TestLogicalPendingLaunchAdmission:
         mgr = self._manager({'L4': 1})
         shapes = (('L4', 1),)
         mgr._logical_exact_accelerator_shapes = dict(shapes)
-        mgr._logical_target = (1, 7, 1, shapes, shapes)
+        mgr._logical_target = _logical_target(1, 7, 1, shapes, shapes)
         ready = self._info(1, 'L4',
                            replica_managers.serve_state.ReplicaStatus.READY)
         ready.resources_override = None
@@ -11416,7 +11431,8 @@ class TestLogicalPendingLaunchAdmission:
         mgr._replica_to_logical_launch_fence[1] = stored_fence
         mgr._logical_reconcile_snapshot = dataclasses.replace(
             mgr._logical_reconcile_snapshot, generation=8)
-        mgr._logical_target = (1, 8, 1, (('A100', 1),), stored_fence[4])
+        mgr._logical_target = _logical_target(1, 8, 1, (('A100', 1),),
+                                              stored_fence.accelerator_shapes)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -11434,7 +11450,8 @@ class TestLogicalPendingLaunchAdmission:
         mgr._replica_to_logical_launch_fence[1] = stored_fence
         mgr._logical_reconcile_snapshot = dataclasses.replace(
             mgr._logical_reconcile_snapshot, generation=8)
-        mgr._logical_target = (1, 8, 2, (('A100', 2),), stored_fence[4])
+        mgr._logical_target = _logical_target(1, 8, 2, (('A100', 2),),
+                                              stored_fence.accelerator_shapes)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -11447,8 +11464,9 @@ class TestLogicalPendingLaunchAdmission:
             1, 'A100', replica_managers.serve_state.ReplicaStatus.PROVISIONING)
         current_fence = mgr._logical_target
         assert current_fence is not None
-        stored_fence = (current_fence[0], current_fence[1] + 1,
-                        current_fence[2], current_fence[3], current_fence[4])
+        stored_fence = dataclasses.replace(current_fence,
+                                           generation=current_fence.generation +
+                                           1)
         mgr._replica_to_logical_launch_fence[1] = stored_fence
 
         with mock.patch.object(replica_managers.serve_state,
@@ -11523,18 +11541,20 @@ class TestLogicalCapacityPlanning:
             in_flight_by_replica_id={10: 0},
             unknown_replica_ids=frozenset(),
             received_at=replica_managers.time.monotonic())
-        mgr._logical_target = (1, 5, 1)
+        mgr._logical_target = _logical_target(1, 5, 1)
         mgr._logical_reconcile_snapshot = old_snapshot
         new_snapshot = dataclasses.replace(old_snapshot,
                                            generation=6,
                                            observed_slots_by_replica_id={10: 2})
 
-        assert not mgr.publish_logical_reconcile_state((1, 5, 1), new_snapshot)
-        assert mgr._logical_target == (1, 5, 1)
+        assert not mgr.publish_logical_reconcile_state(_logical_target(1, 5, 1),
+                                                       new_snapshot)
+        assert mgr._logical_target == _logical_target(1, 5, 1)
         assert mgr._logical_reconcile_snapshot is old_snapshot
 
-        assert mgr.publish_logical_reconcile_state((1, 6, 2), new_snapshot)
-        assert mgr._logical_target == (1, 6, 2)
+        assert mgr.publish_logical_reconcile_state(_logical_target(1, 6, 2),
+                                                   new_snapshot)
+        assert mgr._logical_target == _logical_target(1, 6, 2)
         assert mgr._logical_reconcile_snapshot.generation == 6
         assert mgr._logical_reconcile_snapshot.observed_slots_by_replica_id == {
             10: 2
@@ -11556,7 +11576,8 @@ class TestLogicalCapacityPlanning:
             received_at=1.0,
             authority=authority)
 
-        assert mgr.publish_logical_reconcile_state((1, 5, 1), snapshot)
+        assert mgr.publish_logical_reconcile_state(_logical_target(1, 5, 1),
+                                                   snapshot)
         published = mgr._logical_reconcile_snapshot
         assert published is not None
         assert published.authority is authority
@@ -11564,7 +11585,8 @@ class TestLogicalCapacityPlanning:
         assert not mgr._logical_snapshot_is_fresh(published)
 
         replay = dataclasses.replace(snapshot, received_at=now[0])
-        assert not mgr.publish_logical_reconcile_state((1, 5, 1), replay)
+        assert not mgr.publish_logical_reconcile_state(_logical_target(1, 5, 1),
+                                                       replay)
         assert mgr._logical_reconcile_snapshot is published
 
     def test_expired_occupancy_only_blocks_destructive_logical_work(
@@ -11583,20 +11605,17 @@ class TestLogicalCapacityPlanning:
             unknown_replica_ids=frozenset({10}),
             received_at=1.0,
             authority=authority)
-        target = (1, 5, 1, (('L4', 1),), (('L4', 1),))
+        target = _logical_target(1, 5, 1, (('L4', 1),), (('L4', 1),))
 
         assert mgr.publish_logical_reconcile_state(target, snapshot)
         assert not mgr._logical_snapshot_is_fresh(snapshot)
         assert mgr._logical_snapshot_has_scale_up_authority(snapshot)
-        assert mgr._logical_target_fence_holds(1,
-                                               5,
-                                               1, (('L4', 1),), (('L4', 1),),
+        assert mgr._logical_target_fence_holds(target,
                                                require_fresh_occupancy=False)
         # The default remains the destructive fence. In particular, an
         # explicitly unknown backend cannot become teardown evidence merely
         # because additive demand/route authority is still fresh.
-        assert not mgr._logical_target_fence_holds(1, 5, 1, (('L4', 1),),
-                                                   (('L4', 1),))
+        assert not mgr._logical_target_fence_holds(target)
 
     def test_legacy_half_publishers_reject_nonadvancing_evidence(self):
         mgr = _make_manager()
@@ -11608,7 +11627,7 @@ class TestLogicalCapacityPlanning:
             in_flight_by_replica_id={10: 0},
             unknown_replica_ids=frozenset(),
             received_at=replica_managers.time.monotonic())
-        mgr._logical_target = (1, 7, 1)
+        mgr._logical_target = _logical_target(1, 7, 1)
         mgr._logical_reconcile_snapshot = old_snapshot
         old_state = mgr._logical_reconcile_state
 
@@ -11628,7 +11647,7 @@ class TestLogicalCapacityPlanning:
             unknown_replica_ids=set())
         assert mgr._logical_reconcile_state is old_state
 
-        mgr.publish_logical_target(1, 6, 0)
+        mgr.publish_logical_target(_logical_target(1, 6, 0))
         assert mgr._logical_reconcile_state is old_state
 
         mgr.update_logical_reconcile_snapshot(
@@ -11639,7 +11658,7 @@ class TestLogicalCapacityPlanning:
             unknown_replica_ids=set())
         advanced_state = mgr._logical_reconcile_state
         assert advanced_state is not old_state
-        assert advanced_state.target == (1, 7, 1)
+        assert advanced_state.target == _logical_target(1, 7, 1)
         assert advanced_state.snapshot is not None
         assert advanced_state.snapshot.generation == 8
 
@@ -11673,7 +11692,7 @@ class TestLogicalCapacityPlanning:
             in_flight_by_replica_id={10: 0},
             unknown_replica_ids=frozenset(),
             received_at=replica_managers.time.monotonic())
-        mgr._logical_target = (1, 7, 1)
+        mgr._logical_target = _logical_target(1, 7, 1)
         mgr._logical_reconcile_snapshot = old_snapshot
         old_state = mgr._logical_reconcile_state
         copy_started = threading.Event()
@@ -11686,18 +11705,19 @@ class TestLogicalCapacityPlanning:
         results = []
 
         publisher = threading.Thread(target=lambda: results.append(
-            mgr.publish_logical_reconcile_state((1, 7, 2), replay_snapshot)))
+            mgr.publish_logical_reconcile_state(_logical_target(1, 7, 2),
+                                                replay_snapshot)))
         publisher.start()
         assert copy_started.wait(timeout=5)
         try:
             observed_during_publish = mgr._logical_reconcile_state
             assert observed_during_publish is old_state
-            assert observed_during_publish.target == (1, 7, 1)
+            assert observed_during_publish.target == _logical_target(1, 7, 1)
             assert observed_during_publish.snapshot is old_snapshot
             assert mgr._logical_target_fence_holds(
-                1, 7, 1, logical_state=observed_during_publish)
+                _logical_target(1, 7, 1), logical_state=observed_during_publish)
             assert not mgr._logical_target_fence_holds(
-                1, 7, 2, logical_state=observed_during_publish)
+                _logical_target(1, 7, 2), logical_state=observed_during_publish)
         finally:
             release_copy.set()
             publisher.join(timeout=5)
@@ -11706,12 +11726,10 @@ class TestLogicalCapacityPlanning:
         assert results == [True]
         replay_state = mgr._logical_reconcile_state
         assert replay_state is not old_state
-        assert replay_state.target == (1, 7, 2)
+        assert replay_state.target == _logical_target(1, 7, 2)
         assert replay_state.snapshot is not None
         assert replay_state.snapshot.observed_slots_by_replica_id == {10: 2}
-        assert mgr._logical_target_fence_holds(1,
-                                               7,
-                                               2,
+        assert mgr._logical_target_fence_holds(_logical_target(1, 7, 2),
                                                logical_state=replay_state)
 
     def test_plans_complete_shapes_until_target_is_covered(self):
@@ -11725,14 +11743,14 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 7, 9)
+        mgr._logical_target = _logical_target(1, 7, 9)
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=True)
         widths = iter([8, 4])
         planned = []
 
         def _append_shape(_override, _used_ids, existing, _budget,
                           logical_reconcile_fence):
-            assert logical_reconcile_fence == (1, 7, 9)
+            assert logical_reconcile_fence == _logical_target(1, 7, 9)
             width = next(widths)
             info = mock.Mock(replica_id=len(existing) + 1,
                              is_terminal=False,
@@ -11781,7 +11799,8 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr.publish_logical_target(1, 7, 30, (('L4', 30),), (('L4', 1),))
+        mgr.publish_logical_target(
+            _logical_target(1, 7, 30, (('L4', 30),), (('L4', 1),)))
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
         key = paid_capacity.pool_key(location, workspace='w', num_nodes=1)
         monkeypatch.setenv(
@@ -11862,7 +11881,7 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 3, 8)
+        mgr._logical_target = _logical_target(1, 3, 8)
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
 
         with mock.patch.object(replica_managers.locks,
@@ -11874,7 +11893,7 @@ class TestLogicalCapacityPlanning:
                                              reconcile_generation=3)
 
         get_lock.assert_not_called()
-        scale_locked.assert_called_once_with(8, 1, 3,
+        scale_locked.assert_called_once_with(_logical_target(1, 3, 8),
                                              mgr._logical_reconcile_snapshot,
                                              ())
 
@@ -11895,8 +11914,9 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr.publish_logical_target(1, 3, 9, (('L4', 1), ('A100', 8)),
-                                   (('L4', 1), ('A100', 8)))
+        mgr.publish_logical_target(
+            _logical_target(1, 3, 9, (('L4', 1), ('A100', 8)),
+                            (('L4', 1), ('A100', 8))))
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
         budget = paid_capacity.LaunchBudget(
             remaining_by_location={paid_l4: 4},
@@ -11959,7 +11979,7 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 3, 1)
+        mgr._logical_target = _logical_target(1, 3, 1)
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
         budget = paid_capacity.LaunchBudget(remaining_by_location={},
                                             pool_key_by_location={},
@@ -11971,7 +11991,7 @@ class TestLogicalCapacityPlanning:
         def _append_zero_cost(_override, _used_ids, existing, _zero_cost_budget,
                               *, logical_reconcile_fence,
                               paid_location_launch_budget):
-            assert logical_reconcile_fence == (1, 3, 1)
+            assert logical_reconcile_fence == _logical_target(1, 3, 1)
             assert paid_location_launch_budget is budget
             info = mock.Mock(replica_id=1,
                              is_terminal=False,
@@ -12014,8 +12034,9 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr.publish_logical_target(1, 7, 9, (('L4', 1), ('A100', 8)),
-                                   (('L4', 1), ('A100', 8)))
+        mgr.publish_logical_target(
+            _logical_target(1, 7, 9, (('L4', 1), ('A100', 8)),
+                            (('L4', 1), ('A100', 8))))
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
         overrides = []
         priorities = []
@@ -12086,8 +12107,9 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr.publish_logical_target(2, 7, 2, (('L4', 1), ('A100', 1)),
-                                   (('L4', 1), ('A100', 1)))
+        mgr.publish_logical_target(
+            _logical_target(2, 7, 2, (('L4', 1), ('A100', 1)),
+                            (('L4', 1), ('A100', 1))))
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
         attempts = []
 
@@ -12169,7 +12191,8 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr.publish_logical_target(1, 7, 3, (('L4', 3),), (('L4', 1),))
+        mgr.publish_logical_target(
+            _logical_target(1, 7, 3, (('L4', 3),), (('L4', 1),)))
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
         fundings = iter([
             replica_managers._ReplicaLaunchFunding.ZERO_COST,
@@ -12234,7 +12257,8 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr.publish_logical_target(1, 7, 1, (('L4', 1),), (('L4', 1),))
+        mgr.publish_logical_target(
+            _logical_target(1, 7, 1, (('L4', 1),), (('L4', 1),)))
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
 
         with mock.patch.object(replica_managers.serve_state,
@@ -12262,15 +12286,16 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr.publish_logical_target(1, 7, 50, (('L4', 50),), (('L4', 1),))
+        mgr.publish_logical_target(
+            _logical_target(1, 7, 50, (('L4', 50),), (('L4', 1),)))
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=True)
         launched_ids = []
         reservation_lock = mock.MagicMock()
 
         def _append_shape(resources_override, _used_ids, existing, _budget,
                           logical_reconcile_fence):
-            assert logical_reconcile_fence == (1, 7, 50, (('L4', 50),), (('L4',
-                                                                          1),))
+            assert logical_reconcile_fence == _logical_target(
+                1, 7, 50, (('L4', 50),), (('L4', 1),))
             launched_ids.append(len(existing) + 1)
             info = mock.Mock(replica_id=len(existing) + 1,
                              is_terminal=False,
@@ -12318,7 +12343,8 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr.publish_logical_target(1, 7, 50, (('L4', 50),), (('L4', 1),))
+        mgr.publish_logical_target(
+            _logical_target(1, 7, 50, (('L4', 50),), (('L4', 1),)))
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=True)
 
         with mock.patch.object(replica_managers.locks,
@@ -12359,12 +12385,12 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr.publish_logical_target(1, 7, 5)
+        mgr.publish_logical_target(_logical_target(1, 7, 5))
         launched_ids = []
 
         def _append_one(_resources_override, _used_ids, infos, _budget,
                         logical_reconcile_fence):
-            assert logical_reconcile_fence == (1, 7, 5)
+            assert logical_reconcile_fence == _logical_target(1, 7, 5)
             if not launched_ids:
                 # Concurrent LB publication makes an existing ready row gain
                 # one observed slot. That is not launch progress for this
@@ -12414,8 +12440,9 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr.publish_logical_target(1, 7, 2, (('L4', 1), ('A100', 1)),
-                                   (('L4', 1), ('A100', 1)))
+        mgr.publish_logical_target(
+            _logical_target(1, 7, 2, (('L4', 1), ('A100', 1)),
+                            (('L4', 1), ('A100', 1))))
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
         attempted_cards = []
 
@@ -12471,7 +12498,7 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={1: 0},
                 unknown_replica_ids=frozenset({1}),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 9, 8)
+        mgr._logical_target = _logical_target(1, 9, 8)
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=True)
         launches = []
         authorizations = []
@@ -12554,7 +12581,7 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={1: 0},
                 unknown_replica_ids=frozenset({1}),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 9, 3)
+        mgr._logical_target = _logical_target(1, 9, 3)
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
         authority = mock.sentinel.paid_authority
         seen = []
@@ -12617,7 +12644,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 9, 8)
+        mgr._logical_target = _logical_target(1, 9, 8)
         authorization = (
             ordinary_launch_binding.build_replacement_planner_authorization(
                 ordinary_launch_binding.NonPoolLaunchProfileKind.
@@ -12669,7 +12696,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset({1}),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 9, 2)
+        mgr._logical_target = _logical_target(1, 9, 2)
         authority = mock.sentinel.paid_authority
         authorization = (
             ordinary_launch_binding.build_replacement_planner_authorization(
@@ -12766,7 +12793,7 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 8, 9)
+        mgr._logical_target = _logical_target(1, 8, 9)
 
         with mock.patch.object(mgr, '_scale_up_one_locked') as launch:
             mgr.scale_up_to_logical_capacity(target_capacity=9,
@@ -12788,7 +12815,7 @@ class TestLogicalCapacityPlanning:
         mgr._logical_reconcile_snapshot = newer_snapshot
         # Generation 7 is still the current published autoscaler decision.
         # Only the independently arriving capacity snapshot advanced.
-        mgr._logical_target = (1, 7, 9)
+        mgr._logical_target = _logical_target(1, 7, 9)
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
 
         with mock.patch.object(
@@ -12797,7 +12824,8 @@ class TestLogicalCapacityPlanning:
                                              version=1,
                                              reconcile_generation=7)
 
-        scale_locked.assert_called_once_with(9, 1, 7, newer_snapshot, ())
+        scale_locked.assert_called_once_with(_logical_target(1, 7, 9),
+                                             newer_snapshot, ())
 
     def test_newer_snapshot_drops_recovered_unknown_replacement(self):
         mgr = _make_manager()
@@ -12810,7 +12838,7 @@ class TestLogicalCapacityPlanning:
             unknown_replica_ids=frozenset(),
             received_at=replica_managers.time.monotonic())
         mgr._logical_reconcile_snapshot = newer_snapshot
-        mgr._logical_target = (1, 7, 8)
+        mgr._logical_target = _logical_target(1, 7, 8)
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
 
         with mock.patch.object(
@@ -12820,7 +12848,8 @@ class TestLogicalCapacityPlanning:
                                              reconcile_generation=7,
                                              replace_unknown_replica_ids=(1,))
 
-        scale_locked.assert_called_once_with(8, 1, 7, newer_snapshot, ())
+        scale_locked.assert_called_once_with(_logical_target(1, 7, 8),
+                                             newer_snapshot, ())
 
     def test_newer_snapshot_capacity_stops_rest_of_scale_up_batch(self):
         mgr = _make_manager()
@@ -12834,7 +12863,7 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={1: 0},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 7, 16)
+        mgr._logical_target = _logical_target(1, 7, 16)
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=False)
         launches = []
 
@@ -12920,7 +12949,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (10, 5, 1)
+        mgr._logical_target = _logical_target(10, 5, 1)
         mgr._persist_replica = mock.Mock()
         mgr._terminate_replica = mock.Mock()
         return mgr, retiring, survivor
@@ -12940,7 +12969,7 @@ class TestLogicalCapacityPlanning:
                 10: 0,
                 11: 0,
             })
-        mgr._logical_target = (10, 5, 2)
+        mgr._logical_target = _logical_target(10, 5, 2)
 
         with mock.patch.object(
                 replica_managers.serve_state,
@@ -12975,7 +13004,7 @@ class TestLogicalCapacityPlanning:
         mgr, retiring, survivor = self._pending_logical_retirement()
         mgr._logical_reconcile_snapshot = dataclasses.replace(
             mgr._logical_reconcile_snapshot, generation=6)
-        mgr._logical_target = (10, 5, 2)
+        mgr._logical_target = _logical_target(10, 5, 2)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -12997,7 +13026,7 @@ class TestLogicalCapacityPlanning:
                                                     version=10,
                                                     resources_override=None,
                                                     planned_capacity=4)
-        mgr._logical_target = (10, 5, 5)
+        mgr._logical_target = _logical_target(10, 5, 5)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -13018,7 +13047,7 @@ class TestLogicalCapacityPlanning:
                 9: 3,
                 10: 0,
             })
-        mgr._logical_target = (10, 5, 2)
+        mgr._logical_target = _logical_target(10, 5, 2)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -13043,7 +13072,7 @@ class TestLogicalCapacityPlanning:
                                               planned_capacity=4)
         failed.status_property.sky_launch_status = (
             common_utils.ProcessStatus.FAILED)
-        mgr._logical_target = (10, 5, 5)
+        mgr._logical_target = _logical_target(10, 5, 5)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -13060,7 +13089,7 @@ class TestLogicalCapacityPlanning:
         degraded = self._ready_backend(11, 4)
         degraded.version = 10
         degraded.status_property.service_ready_now = False
-        mgr._logical_target = (10, 5, 5)
+        mgr._logical_target = _logical_target(10, 5, 5)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -13076,7 +13105,7 @@ class TestLogicalCapacityPlanning:
         mgr, retiring, survivor = self._pending_logical_retirement()
         unobservable = self._ready_backend(11, 4)
         unobservable.version = 10
-        mgr._logical_target = (10, 5, 5)
+        mgr._logical_target = _logical_target(10, 5, 5)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -13099,7 +13128,7 @@ class TestLogicalCapacityPlanning:
                 11: 4,
             },
             unknown_replica_ids=frozenset({11}))
-        mgr._logical_target = (10, 5, 5)
+        mgr._logical_target = _logical_target(10, 5, 5)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -13141,7 +13170,7 @@ class TestLogicalCapacityPlanning:
                 10: 0,
                 11: 0,
             })
-        mgr._logical_target = (10, 5, 3)
+        mgr._logical_target = _logical_target(10, 5, 3)
         fleet = [
             first_retiring, second_retiring, first_survivor, second_survivor
         ]
@@ -13216,7 +13245,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 5, target)
+        mgr._logical_target = _logical_target(1, 5, target)
         mgr._persist_replica = mock.Mock()
         mgr._terminate_replica = mock.Mock()
         return mgr
@@ -13402,7 +13431,7 @@ class TestLogicalCapacityPlanning:
                 received_at=replica_managers.time.monotonic()))
         # Fresh vNext evidence: target 2 while only the survivor (1 slot) is
         # routed, so the shortfall is exactly one slot.
-        mgr._logical_target = (2, 5, 2)
+        mgr._logical_target = _logical_target(2, 5, 2)
         fleet = [outdated, relabelled_a, relabelled_b, survivor]
 
         # Phase 1: another, newer update is still pending; recovery must not
@@ -13636,8 +13665,8 @@ class TestLogicalCapacityPlanning:
             'route_url': 'http://replica:8000',
         }
         wave_report = (replica_managers.time.monotonic(), {},
-                       {'http://replica:8000'}, set(), set(),
-                       'ha-generation-11')
+                       {'http://replica:8000'
+                       }, set(), set(), 'ha-generation-11')
         mgr._lb_in_flight_report = wave_report
         mgr._register_wait_for_idle = mock.Mock()
 
@@ -13663,16 +13692,15 @@ class TestLogicalCapacityPlanning:
         assert retiring.status_property.drain_cap_seconds is None
         assert retiring.status_property.drain_started_at is None
         assert retiring.status_property.wait_for_idle_before_termination
-        admit.assert_called_once_with('svc',
-                                      1,
-                                      retiring,
-                                      authority,
-                                      requires_idle_proof=True,
-                                      expected_route_url=(
-                                          'http://replica:8000'),
-                                      expected_service_hash='svc-hash',
-                                      expected_controller_owner=(123,
-                                                                 '10.0.0.5'))
+        admit.assert_called_once_with(
+            'svc',
+            1,
+            retiring,
+            authority,
+            requires_idle_proof=True,
+            expected_route_url=('http://replica:8000'),
+            expected_service_hash='svc-hash',
+            expected_controller_owner=(123, '10.0.0.5'))
         mgr._register_wait_for_idle.assert_called_once_with(
             retiring,
             deadline=math.inf,
@@ -13689,10 +13717,9 @@ class TestLogicalCapacityPlanning:
         mgr._update_recovery_required = False
         retiring = self._ready_backend(1, 1)
         route_url = 'http://replica:8000'
-        mgr._lb_in_flight_report = (
-            replica_managers.time.monotonic(), {},
-            {'http://different-replica:8000'}, set(), set(),
-            'ha-generation-11')
+        mgr._lb_in_flight_report = (replica_managers.time.monotonic(), {},
+                                    {'http://different-replica:8000'}, set(),
+                                    set(), 'ha-generation-11')
         authority = replica_managers.paid_retirement.FreshZeroAuthority(
             service_hash='svc-hash',
             demand_source_epoch=2,
@@ -13746,8 +13773,8 @@ class TestLogicalCapacityPlanning:
             capacity_plan_sha256='a' * 64,
             route_generation=11)
         wave_report = (replica_managers.time.monotonic(), {},
-                       {'http://replica-2:8000'}, set(), set(),
-                       'ha-generation-11')
+                       {'http://replica-2:8000'
+                       }, set(), set(), 'ha-generation-11')
         mgr._lb_in_flight_report = wave_report
         mgr._register_wait_for_idle = mock.Mock()
         unresolved = replica_managers._BoundOrdinaryLaunchUnresolvedError(
@@ -13816,9 +13843,9 @@ class TestLogicalCapacityPlanning:
             info.replica_id: f'http://replica-{info.replica_id}:8000'
             for info in replicas
         }
-        mgr._lb_in_flight_report = (
-            replica_managers.time.monotonic(), {}, set(route_urls.values()),
-            set(), set(), 'ha-generation-11')
+        mgr._lb_in_flight_report = (replica_managers.time.monotonic(), {},
+                                    set(route_urls.values()), set(), set(),
+                                    'ha-generation-11')
         mgr._register_wait_for_idle = mock.Mock()
         mgr._terminate_replica = mock.Mock()
 
@@ -14129,7 +14156,8 @@ class TestLogicalCapacityPlanning:
         assert retiring.status_property.sky_down_status is None
         assert not retiring.status_property.wait_for_idle_before_termination
         assert 1 not in mgr._wait_for_idle_trackers
-        cancel.assert_called_once_with('svc', [(1, retiring)], 8,
+        cancel.assert_called_once_with('svc', [(1, retiring)],
+                                       8,
                                        expected_service_hash='svc-hash',
                                        expected_controller_owner=(123,
                                                                   '10.0.0.5'))
@@ -14327,7 +14355,7 @@ class TestLogicalCapacityPlanning:
 
             mgr._logical_reconcile_snapshot = dataclasses.replace(
                 mgr._logical_reconcile_snapshot, generation=6)
-            mgr._logical_target = (1, 6, 1)
+            mgr._logical_target = _logical_target(1, 6, 1)
             mgr._reconcile_recovering_logical_retirements()
 
         assert not mgr._recovering_logical_retirement_ids
@@ -14481,7 +14509,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 6, 3)
+        mgr._logical_target = _logical_target(1, 6, 3)
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=candidates + [survivor]):
@@ -14494,7 +14522,7 @@ class TestLogicalCapacityPlanning:
 
         mgr._logical_reconcile_snapshot = dataclasses.replace(
             mgr._logical_reconcile_snapshot, generation=7)
-        mgr._logical_target = (1, 7, 3)
+        mgr._logical_target = _logical_target(1, 7, 3)
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=candidates + [survivor]):
@@ -14532,7 +14560,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 6, 2)
+        mgr._logical_target = _logical_target(1, 6, 2)
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=candidates + [survivor]):
@@ -14601,7 +14629,7 @@ class TestLogicalCapacityPlanning:
                 1: 0,
                 2: 0
             })
-        mgr._logical_target = (2, 5, 4)
+        mgr._logical_target = _logical_target(2, 5, 4)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -14634,7 +14662,8 @@ class TestLogicalCapacityPlanning:
                 1: 0,
                 2: 0,
             })
-        mgr._logical_target = (2, 5, 1, (('L4', 1),), (('L4', 1),))
+        mgr._logical_target = _logical_target(2, 5, 1, (('L4', 1),),
+                                              (('L4', 1),))
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -14665,7 +14694,7 @@ class TestLogicalCapacityPlanning:
                 },
                 100: 0,
             })
-        mgr._logical_target = (2, 5, 25)
+        mgr._logical_target = _logical_target(2, 5, 25)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -14694,7 +14723,7 @@ class TestLogicalCapacityPlanning:
                     info.replica_id: 0 for info in candidates
                 }, 100: 0
             })
-        mgr._logical_target = (2, 5, 25)
+        mgr._logical_target = _logical_target(2, 5, 25)
         mgr._persist_replica.side_effect = [None] * 19 + [
             RuntimeError('database unavailable')
         ]
@@ -14763,7 +14792,7 @@ class TestLogicalCapacityPlanning:
             mgr._reconcile_recovering_logical_retirements()
             mgr._logical_reconcile_snapshot = dataclasses.replace(
                 mgr._logical_reconcile_snapshot, generation=6)
-            mgr._logical_target = (1, 6, 1)
+            mgr._logical_target = _logical_target(1, 6, 1)
             mgr._reconcile_recovering_logical_retirements()
         mgr._wait_for_idle_trackers[1] = dataclasses.replace(
             mgr._wait_for_idle_trackers[1],
@@ -14818,11 +14847,11 @@ class TestLogicalCapacityPlanning:
              mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[eight, four]):
-            mgr._logical_target = (1, 3, 9)
+            mgr._logical_target = _logical_target(1, 3, 9)
             mgr.scale_down_logically(2, 9, 1, 3)
             defer.assert_not_called()
 
-            mgr._logical_target = (1, 3, 8)
+            mgr._logical_target = _logical_target(1, 3, 8)
             mgr.scale_down_logically(2, 8, 1, 3)
 
         defer.assert_called_once_with(2,
@@ -14852,7 +14881,7 @@ class TestLogicalCapacityPlanning:
                 received_at=replica_managers.time.monotonic()))
         target_by_card = (('L4', 1),)
         shapes = (('L4', 1), ('A100', 1))
-        mgr._logical_target = (1, 3, 1, target_by_card, shapes)
+        mgr._logical_target = _logical_target(1, 3, 1, target_by_card, shapes)
         defer = mock.Mock()
         mgr._defer_scale_down_until_idle = defer
 
@@ -14877,7 +14906,7 @@ class TestLogicalCapacityPlanning:
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
         shapes = (('L4', 1), ('A100', 1))
-        mgr._logical_target = (1, 3, 0, (), shapes)
+        mgr._logical_target = _logical_target(1, 3, 0, (), shapes)
         defer = mock.Mock()
         mgr._defer_scale_down_until_idle = defer
 
@@ -14910,8 +14939,8 @@ class TestLogicalCapacityPlanning:
             received_at=1.0,
             authority=authority)
         shapes = (('L4', 1),)
-        assert mgr.publish_logical_reconcile_state((1, 3, 0, (), shapes),
-                                                   snapshot)
+        assert mgr.publish_logical_reconcile_state(
+            _logical_target(1, 3, 0, (), shapes), snapshot)
         defer = mock.Mock()
         mgr._defer_scale_down_until_idle = defer
 
@@ -14946,7 +14975,7 @@ class TestLogicalCapacityPlanning:
                 received_at=replica_managers.time.monotonic()))
         target_by_card = (('H100', 1),)
         shapes = (('H100', 1),)
-        mgr._logical_target = (1, 3, 1, target_by_card, shapes)
+        mgr._logical_target = _logical_target(1, 3, 1, target_by_card, shapes)
         defer = mock.Mock()
         mgr._defer_scale_down_until_idle = defer
 
@@ -14965,7 +14994,8 @@ class TestLogicalCapacityPlanning:
         retiring.resources_override = {'accelerators': {'L4': 1}}
         survivor.resources_override = {'accelerators': {'A100': 1}}
         mgr = self._logical_recovery_manager([retiring], survivor)
-        mgr._logical_target = (1, 5, 1, (('L4', 1),), (('L4', 1), ('A100', 1)))
+        mgr._logical_target = _logical_target(1, 5, 1, (('L4', 1),),
+                                              (('L4', 1), ('A100', 1)))
 
         mgr.invalidate_logical_target()
         with mock.patch.object(replica_managers.serve_state,
@@ -15002,7 +15032,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 3, 4)
+        mgr._logical_target = _logical_target(1, 3, 4)
         defer = mock.Mock()
         mgr._defer_scale_down_until_idle = defer
 
@@ -15036,7 +15066,7 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={1: 0},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 3, 0)
+        mgr._logical_target = _logical_target(1, 3, 0)
 
         with mock.patch.object(
                 replica_managers.serve_state,
@@ -15061,7 +15091,7 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 4, 0)
+        mgr._logical_target = _logical_target(1, 4, 0)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos') as scan, \
@@ -15093,7 +15123,7 @@ class TestLogicalCapacityPlanning:
                 received_at=replica_managers.time.monotonic()))
         # Generation 4 is still the current published autoscaler decision.
         # Only the independently arriving capacity snapshot advanced.
-        mgr._logical_target = (1, 4, 4)
+        mgr._logical_target = _logical_target(1, 4, 4)
         defer = mock.Mock()
         mgr._defer_scale_down_until_idle = defer
 
@@ -15126,8 +15156,8 @@ class TestLogicalCapacityPlanning:
             },
             unknown_replica_ids=frozenset(),
             received_at=replica_managers.time.monotonic())
-        action = (1, 4, 0, (), (('H200', 1),))
-        floor = (1, 4, 45, (('H200', 45),), (('H200', 1),))
+        action = _logical_target(1, 4, 0, (), (('H200', 1),))
+        floor = _logical_target(1, 4, 45, (('H200', 45),), (('H200', 1),))
         mgr._logical_reconcile_state = (replica_managers._LogicalReconcileState(
             target=action, snapshot=snapshot, retirement_floor=floor))
 
@@ -15171,7 +15201,7 @@ class TestLogicalCapacityPlanning:
             target_capacity_by_accelerator=(('H200', 1),),
             accelerator_shapes=(('H200', 1),),
             allocation_identity=identity)
-        action = (1, 4, 0, (), (('H200', 1),))
+        action = _logical_target(1, 4, 0, (), (('H200', 1),))
 
         assert mgr.publish_logical_reconcile_state(action, snapshot, None,
                                                    shelter)
@@ -15215,8 +15245,8 @@ class TestLogicalCapacityPlanning:
                     reclaim_fleet_bundle_sha256='b' * 64,
                     reclaim_policy_revision='test-policy',
                     reclaim_provider_inventory_sha256='c' * 64)))
-        action = (1, 4, 0, (), (('H200', 1),))
-        floor = (1, 4, 0, (), (('H200', 1),))
+        action = _logical_target(1, 4, 0, (), (('H200', 1),))
+        floor = _logical_target(1, 4, 0, (), (('H200', 1),))
 
         assert mgr.publish_logical_reconcile_state(action, snapshot, floor,
                                                    shelter)
@@ -15249,7 +15279,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 4, 4)
+        mgr._logical_target = _logical_target(1, 4, 4)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -15273,7 +15303,7 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 4, 0)
+        mgr._logical_target = _logical_target(1, 4, 0)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos') as scan, \
@@ -15307,7 +15337,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 4, 4)
+        mgr._logical_target = _logical_target(1, 4, 4)
         defer = mock.Mock()
         mgr._defer_scale_down_until_idle = defer
 
@@ -15343,7 +15373,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 4, 8)
+        mgr._logical_target = _logical_target(1, 4, 8)
         defer = mock.Mock()
         mgr._defer_scale_down_until_idle = defer
 
@@ -15378,7 +15408,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 4, 3)
+        mgr._logical_target = _logical_target(1, 4, 3)
         defer = mock.Mock()
         mgr._defer_scale_down_until_idle = defer
 
@@ -15439,7 +15469,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 4, 1)
+        mgr._logical_target = _logical_target(1, 4, 1)
         defer = mock.Mock()
         mgr._defer_scale_down_until_idle = defer
 
@@ -15475,7 +15505,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 4, 0)
+        mgr._logical_target = _logical_target(1, 4, 0)
         defer = mock.Mock(side_effect=[None, RuntimeError('persist failed')])
         mgr._defer_scale_down_until_idle = defer
 
@@ -15517,7 +15547,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 4, 4)
+        mgr._logical_target = _logical_target(1, 4, 4)
         terminate = mock.Mock()
         mgr._terminate_replica = terminate
 
@@ -15553,7 +15583,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 4, 1)
+        mgr._logical_target = _logical_target(1, 4, 1)
         events = []
 
         def _defer(replica_id, **_kwargs):
@@ -15593,7 +15623,7 @@ class TestLogicalCapacityPlanning:
         finished_launch.is_alive.return_value = False
         mgr._launch_thread_pool[1] = finished_launch
         mgr._replica_to_request_id[1] = 'request-1'
-        mgr._replica_to_logical_launch_fence[1] = (1, 4)
+        mgr._replica_to_logical_launch_fence[1] = _logical_target(1, 4, 0)
         mgr._logical_reconcile_snapshot = (
             replica_managers.LogicalReconcileSnapshot(
                 version=1,
@@ -15602,7 +15632,7 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 4, 0)
+        mgr._logical_target = _logical_target(1, 4, 0)
         mgr._terminate_replica = mock.Mock()
 
         with mock.patch.object(
@@ -15671,7 +15701,7 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 4, 0)
+        mgr._logical_target = _logical_target(1, 4, 0)
         mgr._terminate_replica = mock.Mock()
 
         with mock.patch.object(
@@ -15721,7 +15751,7 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 4, 0)
+        mgr._logical_target = _logical_target(1, 4, 0)
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
@@ -15772,7 +15802,7 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={2: 0},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 4, 0)
+        mgr._logical_target = _logical_target(1, 4, 0)
         mgr._terminate_replica = mock.Mock()
         defer = mock.Mock()
         mgr._defer_scale_down_until_idle = defer
@@ -15839,7 +15869,7 @@ class TestLogicalCapacityPlanning:
                     },
                     unknown_replica_ids=frozenset({3}),
                     received_at=replica_managers.time.monotonic()))
-            mgr._logical_target = (1, 4, 4)
+            mgr._logical_target = _logical_target(1, 4, 4)
             accepted = []
 
             def _defer(replica_id,
@@ -15888,7 +15918,7 @@ class TestLogicalCapacityPlanning:
             unknown_replica_ids=frozenset(),
             received_at=replica_managers.time.monotonic())
         mgr._logical_reconcile_snapshot = snapshot
-        mgr._logical_target = (1, 3, 8)
+        mgr._logical_target = _logical_target(1, 3, 8)
         defer = mock.Mock()
         mgr._defer_scale_down_until_idle = defer
 
@@ -15947,7 +15977,7 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={2: 0},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 5, 8)
+        mgr._logical_target = _logical_target(1, 5, 8)
         mgr._wait_for_idle_trackers = {
             1: _wait_for_idle_state(retiring, mock.Mock(return_value=True),
                                     replica_managers.time.monotonic() + 60),
@@ -16085,7 +16115,7 @@ class TestLogicalCapacityPlanning:
         elif guard == 'pending_update':
             mgr._pending_version = 11
         elif guard == 'target_growth':
-            mgr._logical_target = (10, 5, 2)
+            mgr._logical_target = _logical_target(10, 5, 2)
         elif guard == 'unknown_replacement':
             snapshot = dataclasses.replace(snapshot,
                                            unknown_replica_ids=frozenset({10}))
@@ -16183,7 +16213,7 @@ class TestLogicalCapacityPlanning:
                 10: 0
             },
             received_at=now[0])
-        mgr._logical_target = (10, 6, 1)
+        mgr._logical_target = _logical_target(10, 6, 1)
         mgr._launch_thread_pool = thread_utils.ThreadSafeDict()
         mgr._down_thread_pool = thread_utils.ThreadSafeDict()
         mgr._replica_to_request_id = thread_utils.ThreadSafeDict()
@@ -16235,7 +16265,7 @@ class TestLogicalCapacityPlanning:
         authority = types.SimpleNamespace(deadline_monotonic=math.inf)
         mgr._logical_reconcile_snapshot = dataclasses.replace(
             mgr._logical_reconcile_snapshot, generation=6, authority=authority)
-        mgr._logical_target = (10, 6, 1)
+        mgr._logical_target = _logical_target(10, 6, 1)
         down_thread = _dormant_down_worker(mgr, retiring)
         mgr._down_thread_pool = thread_utils.ThreadSafeDict({9: down_thread})
         commit_effect = (commit_result if callable(commit_result) else
@@ -16452,7 +16482,7 @@ class TestLogicalCapacityPlanning:
                 'http://old-backend': 1
             }, set(), set(), {'http://old-backend'}, 'lb-session')
             if scenario == 'target_growth_abort':
-                mgr._logical_target = (10, 5, 2)
+                mgr._logical_target = _logical_target(10, 5, 2)
             mgr._refresh_thread_pool()
 
         if scenario in ('outdated_bounded_start', 'same_version_abort'):
@@ -16485,7 +16515,7 @@ class TestLogicalCapacityPlanning:
         mgr._terminate_replica = types.MethodType(
             replica_managers.SkyPilotReplicaManager._terminate_replica, mgr)
         mgr._logical_controller_epoch = 'new-controller-epoch'
-        mgr._logical_target = (10, 5, current_target)
+        mgr._logical_target = _logical_target(10, 5, current_target)
         mgr._resource_scope = None
         status = retiring.status_property
         status.logical_retirement_controller_epoch = 'old-controller-epoch'
@@ -16611,7 +16641,7 @@ class TestLogicalCapacityPlanning:
         survivor.version = 10
         mgr._logical_reconcile_snapshot = dataclasses.replace(
             mgr._logical_reconcile_snapshot, generation=6)
-        mgr._logical_target = (10, 6, 1)
+        mgr._logical_target = _logical_target(10, 6, 1)
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
                                return_value=[retiring, survivor]):
@@ -16885,7 +16915,7 @@ class TestLogicalCapacityPlanning:
                 },
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 5, 8)
+        mgr._logical_target = _logical_target(1, 5, 8)
         tracker = mock.Mock(return_value=True)
         mgr._wait_for_idle_trackers = {
             1: _wait_for_idle_state(retiring, tracker,
@@ -16976,7 +17006,7 @@ class TestLogicalCapacityPlanning:
                 in_flight_by_replica_id={},
                 unknown_replica_ids=frozenset(),
                 received_at=replica_managers.time.monotonic()))
-        mgr._logical_target = (1, 4, 4)
+        mgr._logical_target = _logical_target(1, 4, 4)
         terminated = []
 
         def _terminate(replica_id, **_kwargs):
@@ -21274,7 +21304,7 @@ class TestRecoveryRetryAndIsolation:
         ready.status_property.first_ready_time = 1.0
         assert ready.status == replica_managers.serve_state.ReplicaStatus.READY
 
-        fence = (1, 8, 1, (('A100', 1),), (('A100', 1),))
+        fence = _logical_target(1, 8, 1, (('A100', 1),), (('A100', 1),))
         mgr._logical_target = fence
         mgr._logical_reconcile_snapshot = (
             replica_managers.LogicalReconcileSnapshot(

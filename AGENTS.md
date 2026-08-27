@@ -246,6 +246,23 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
   fewer concepts and ownership boundaries, while supporting future variation
   through the canonical abstraction rather than additional special cases.
 
+### Typed Internal State and Compatibility Boundaries
+
+- Represent cross-module domain state that has multiple fields, invariants, or
+  an independent lifecycle with a frozen dataclass (or an equivalently typed
+  record with named fields). Do not use positional tuples plus magic indices
+  for such state.
+- Do not model internal schema evolution as a union of tuple lengths, optional
+  key sets, or branches on ``len()``. Decode an actually supported old API or
+  persisted representation once at its boundary, validate it, and immediately
+  return the single current domain type used by all core logic.
+- Make invalid states unrepresentable in the canonical type's constructor.
+  Avoid ``Any`` in internal domain contracts and aggregate return values; use a
+  named typed result instead.
+- Compatibility code requires a concrete external producer or retained state,
+  a removal gate, and boundary-focused tests. Test fixtures are not a reason to
+  preserve a second production representation.
+
 ### Design Documents and Implementation Plans
 
 For non-trivial changes, the repository must contain the canonical design at
