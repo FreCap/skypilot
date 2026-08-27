@@ -6208,6 +6208,8 @@ class SkyServeController:
         force_zero: bool = False,
         reserved_fill_allocation_map: (
             reserved_fill_planner.AuthenticatedAllocationMap | None) = None,
+        reserved_supply_projection: (
+            capacity_admission.ReservedSupplyProjection | None) = None,
     ) -> capacity_admission.PaidLaunchAuthority | None:
         """Bind a post-zero-cost residual to the current durable demand."""
         snapshot = self._durable_demand_snapshot
@@ -6245,7 +6247,7 @@ class SkyServeController:
             reserved_fill_authority = (
                 capacity_admission.ReservedFillPlanAuthority.bound(
                     reserved_fill_allocation_map.identity))
-        supply_projection = None
+        supply_projection = reserved_supply_projection
         repository = capacity_admission.CapacityAdmissionRepository()
         if (reserved_fill_authority.mode is capacity_admission.
                 ReservedFillPlanAuthorityMode.ALLOCATION_BOUND):
@@ -6255,14 +6257,12 @@ class SkyServeController:
                     'Suppressing paid launch because this autoscaler has no '
                     'work-conserving reserved-supply economic target.')
                 return None
+            if supply_projection is None:
+                logger.warning(
+                    'Suppressing paid launch because reserved supply was not '
+                    'projected before the durable demand boundary.')
+                return None
             try:
-                supply_projection = repository.project_reserved_supply(
-                    service_name=self._service_name,
-                    service_hash=snapshot.service_hash,
-                    service_lifecycle_epoch=binding.service_lifecycle_epoch,
-                    service_version=decision_version,
-                    accounting_cards=capacity_target,
-                    authority=reserved_fill_authority)
                 economic_target = (
                     decision_autoscaler.economic_capacity_target_by_accelerator(
                         list(supply_projection.economic_replica_infos),
@@ -6358,6 +6358,9 @@ class SkyServeController:
                     demand_source is not None and demand_source[0] is
                     capacity_admission.DemandSourceMode.DURABLE_FEED)
                 logical_reconcile_invalidated = False
+                pre_demand_allocation = None
+                reserved_supply_projection = None
+                previous_demand = self._durable_demand_snapshot
                 if (durable_demand_promoted and
                         decision_autoscaler.reserved_capacity_fill):
                     # Sequenced fill spends an independently authenticated
@@ -6396,6 +6399,46 @@ class SkyServeController:
                             # a lost wakeup or restart cannot duplicate them.
                             self._notify_scale_reconcile()
                             return
+                    previous_demand_may_be_positive = (
+                        previous_demand is None or
+                        not previous_demand.fresh_aggregate_zero)
+                    if (sequenced_fill and
+                            pre_demand_allocation is not None and
+                            previous_demand_may_be_positive):
+                        binding = self._ordinary_launch_binding_authority
+                        accounting_cards = self._ordered_capacity_target(
+                            decision_autoscaler, force_zero=True)
+                        if (binding is not None and
+                                self._service_hash is not None and
+                                accounting_cards is not None and
+                                decision_autoscaler.
+                                supports_reserved_supply_economic_target()):
+                            try:
+                                authority = (
+                                    capacity_admission.
+                                    ReservedFillPlanAuthority.bound(
+                                        pre_demand_allocation.identity))
+                                reserved_supply_projection = (
+                                    capacity_admission.
+                                    CapacityAdmissionRepository().
+                                    project_reserved_supply(
+                                        service_name=self._service_name,
+                                        service_hash=self._service_hash,
+                                        service_lifecycle_epoch=(
+                                            binding.service_lifecycle_epoch),
+                                        service_version=decision_version,
+                                        accounting_cards=accounting_cards,
+                                        authority=authority))
+                            except (capacity_admission.CapacityAdmissionError,
+                                    ValueError) as error:
+                                # Keep going so a fresh zero snapshot can
+                                # revoke older paid authority. A later positive
+                                # plan requires this exact pre-demand
+                                # projection and therefore remains fail closed.
+                                logger.warning(
+                                    'Reserved supply could not be projected '
+                                    'before the durable demand boundary: '
+                                    f'{common_utils.format_exception(error)}')
                 durable_snapshot = None
                 durable_logical_snapshot: (
                     replica_managers.LogicalReconcileSnapshot | None) = None
@@ -6780,13 +6823,21 @@ class SkyServeController:
                     # current head for queued claims; a demand drop mints a
                     # new zero-residual generation and revokes the old one.
                     if ordered_paid_authority is None:
+                        reserved_supply_kwargs: dict[str, Any] = {}
+                        if sequenced_reserved_fill:
+                            reserved_supply_kwargs[
+                                'reserved_supply_projection'] = (
+                                    reserved_supply_projection
+                                    if allocation == pre_demand_allocation else
+                                    None)
                         ordered_paid_authority = (
                             self._publish_ordered_paid_authority(
                                 decision_autoscaler,
                                 decision_version,
                                 sequenced_reserved_fill=(
                                     sequenced_reserved_fill),
-                                reserved_fill_allocation_map=allocation))
+                                reserved_fill_allocation_map=allocation,
+                                **reserved_supply_kwargs))
                     if ordered_paid_authority is None:
                         return
                 # Batch consecutive SCALE_UP decisions into ONE

@@ -4479,7 +4479,7 @@ class TestAutoscalerRuntimeSnapshot:
         repository = mock.Mock()
         expected = object()
         repository.publish.return_value = expected
-        repository.project_reserved_supply.return_value = (
+        supply_projection = (
             controller.capacity_admission.ReservedSupplyProjection(
                 pending_zero_cost_capacity_by_accelerator={'l4': 0},
                 allocation_reserved_capacity_by_accelerator={'l4': target},
@@ -4500,9 +4500,13 @@ class TestAutoscalerRuntimeSnapshot:
                 sequenced_reserved_fill=sequenced_reserved_fill,
                 force_zero=force_zero,
                 reserved_fill_allocation_map=(
-                    allocation if sequenced_reserved_fill else None))
+                    allocation if sequenced_reserved_fill else None),
+                reserved_supply_projection=(
+                    supply_projection
+                    if expected_mode == 'ALLOCATION_BOUND' else None))
 
         assert result is expected
+        repository.project_reserved_supply.assert_not_called()
         plan = repository.publish.call_args.args[0]
         assert plan.reserved_fill_authority.mode.value == expected_mode
         if expected_mode == 'ALLOCATION_BOUND':
@@ -4526,7 +4530,7 @@ class TestAutoscalerRuntimeSnapshot:
         }
         allocation, _ = self._reserved_fill_allocation(accelerator='H200')
         repository = mock.Mock()
-        repository.project_reserved_supply.return_value = (
+        supply_projection = (
             controller.capacity_admission.ReservedSupplyProjection(
                 pending_zero_cost_capacity_by_accelerator={
                     'l4': 0,
@@ -4549,9 +4553,11 @@ class TestAutoscalerRuntimeSnapshot:
                 scaler,
                 1,
                 sequenced_reserved_fill=True,
-                reserved_fill_allocation_map=allocation)
+                reserved_fill_allocation_map=allocation,
+                reserved_supply_projection=supply_projection)
 
         assert result is repository.publish.return_value
+        repository.project_reserved_supply.assert_not_called()
         plan = repository.publish.call_args.args[0]
         assert plan.capacity_target_by_accelerator == {
             'l4': 0,
@@ -4573,6 +4579,33 @@ class TestAutoscalerRuntimeSnapshot:
         scaler = self._durable_autoscaler(1)
         scaler.reserved_capacity_fill = True
         scaler.supports_reserved_supply_economic_target.return_value = False
+        allocation, _ = self._reserved_fill_allocation()
+        repository = mock.Mock()
+
+        with mock.patch.object(controller.capacity_admission,
+                               'CapacityAdmissionRepository',
+                               return_value=repository):
+            result = ctrl._publish_ordered_paid_authority(  # pylint: disable=protected-access
+                scaler,
+                1,
+                sequenced_reserved_fill=True,
+                reserved_fill_allocation_map=allocation)
+
+        assert result is None
+        repository.project_reserved_supply.assert_not_called()
+        repository.publish.assert_not_called()
+        scaler.economic_capacity_target_by_accelerator.assert_not_called()
+
+    def test_ordered_paid_publication_requires_pre_demand_supply_projection(
+            self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._durable_demand_snapshot = self._durable_snapshot()  # pylint: disable=protected-access
+        ctrl._ordinary_launch_binding_authority = types.SimpleNamespace(  # pylint: disable=protected-access
+            service_lifecycle_epoch=3)
+        scaler = self._durable_autoscaler(1)
+        scaler.reserved_capacity_fill = True
+        scaler.supports_reserved_supply_economic_target.return_value = True
         allocation, _ = self._reserved_fill_allocation()
         repository = mock.Mock()
 
@@ -5306,6 +5339,62 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._replica_manager.reconcile_fresh_zero_paid_retirements.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.cancel_uncommitted_paid_retirements.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.invalidate_logical_reconcile_state.assert_called_once_with()  # pylint: disable=line-too-long
+
+    def test_reserved_supply_projection_precedes_durable_demand_snapshot(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._ordinary_launch_binding_authority = types.SimpleNamespace(  # pylint: disable=protected-access
+            service_lifecycle_epoch=3)
+        scaler = self._logical_durable_autoscaler(target=2,
+                                                  emit_scale_up=True)
+        scaler.reserved_capacity_fill = True
+        scaler.supports_reserved_supply_economic_target.return_value = True
+        ctrl._autoscaler = scaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        allocation, _ = self._reserved_fill_allocation()
+        projection = controller.capacity_admission.ReservedSupplyProjection(
+            pending_zero_cost_capacity_by_accelerator={'l4': 0},
+            allocation_reserved_capacity_by_accelerator={'l4': 1},
+            economic_replica_infos=(),
+            economic_kueue_capacity_by_replica_id={},
+            economic_capacity_graph_sha256='f' * 64)
+        repository = mock.Mock()
+        call_order = []
+
+        def _project(**_kwargs):
+            call_order.append('supply')
+            return projection
+
+        def _read_demand(*_args, **_kwargs):
+            call_order.append('demand')
+            return None
+
+        repository.project_reserved_supply.side_effect = _project
+        with mock.patch.object(
+                controller.capacity_admission,
+                'get_service_source_mode',
+                return_value=(controller.capacity_admission.DemandSourceMode.
+                              DURABLE_FEED, 1)), \
+             mock.patch.object(controller.capacity_admission,
+                               'CapacityAdmissionRepository',
+                               return_value=repository), \
+             mock.patch.object(controller.demand_state,
+                               'get_autoscaling_snapshot',
+                               side_effect=_read_demand), \
+             mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(ctrl,
+                               '_read_sequenced_reserved_fill_allocation',
+                               return_value=(True, allocation)), \
+             mock.patch.object(ctrl,
+                               '_accept_sequenced_reserved_fill',
+                               return_value=False):
+            ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
+
+        assert call_order == ['supply', 'demand']
+        repository.project_reserved_supply.assert_called_once()
 
     def test_promoted_paid_launch_uses_post_zero_cost_plan_authority(self):
         ctrl = _make_controller()
