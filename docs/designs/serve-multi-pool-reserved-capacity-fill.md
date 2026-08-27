@@ -321,7 +321,7 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` at merge `fa97e7673`, release `1.1.1526`, including PR #1757's semantic prepared-state fingerprint, PR #1756's PostgreSQL-linearized planner, and the earlier ordering, claim, retained-row, and reducer corrections. The unified priority/deadline-weighted exact-card target described here is the active source change and is not yet deployed or proven. |
+| Source base | `origin/improvements` at merge `fa97e7673`, release `1.1.1526`, including PR #1757's semantic prepared-state fingerprint, PR #1756's PostgreSQL-linearized planner, and the earlier ordering, claim, retained-row, and reducer corrections. PR #1758 contains the unified priority/deadline-weighted exact-card target described here; it is not yet deployed or proven. |
 | Deployed control plane | SkyPilot `1.1.1526`, Helm revision 645. Two API, two controller, and three executor Pods are Ready and all use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:34e1ef5560dafd04612c5b415a395d4d0fedd1df86e7470511eb40ad12e9c59b`. Helm storage remains disabled and the namespace has no PVC. |
 | Writer protocol | Public API 93, worker projection 10, non-pool capability cohort 12, and async request-ledger protocol 1. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. |
