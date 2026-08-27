@@ -67,6 +67,7 @@ def _report() -> dict:
         'request_accelerator_compatibility_version': 1,
         'queue_depth': 0,
         'queued_requests_by_compatibility': [],
+        'queued_request_deadline_buckets': [],
         'rejected_requests_by_compatibility': [],
         'queue_depth_by_priority': {},
         'rejected_in_window': 0,
@@ -212,10 +213,55 @@ def test_validate_report_never_promotes_partial_queue_compatibility():
     report = copy.deepcopy(_report())
     report['queue_depth'] = 1
     report['queue_depth_by_priority'] = {'50': 1}
+    report['queued_request_deadline_buckets'] = None
 
     _, _, complete = demand_state._validate_report(report)
 
     assert complete is False
+
+
+def test_validate_report_accepts_exact_queue_deadline_buckets():
+    report = copy.deepcopy(_report())
+    report['queue_depth'] = 2
+    report['queue_depth_by_priority'] = {'50': 2}
+    report['queued_requests_by_compatibility'] = [{
+        'priority': 50,
+        'compatible_accelerators': ['L4'],
+        'count': 2,
+    }]
+    report['queued_request_deadline_buckets'] = [{
+        'priority': 50,
+        'compatible_accelerators': ['L4'],
+        'remaining_seconds': 55,
+        'count': 2,
+    }]
+
+    normalized, _, complete = demand_state._validate_report(report)
+
+    assert complete is True
+    assert normalized['queued_request_deadline_buckets'][0][
+        'remaining_seconds'] == 55
+
+
+def test_validate_report_rejects_partial_queue_deadline_buckets():
+    report = copy.deepcopy(_report())
+    report['queue_depth'] = 2
+    report['queue_depth_by_priority'] = {'50': 2}
+    report['queued_requests_by_compatibility'] = [{
+        'priority': 50,
+        'compatible_accelerators': ['L4'],
+        'count': 2,
+    }]
+    report['queued_request_deadline_buckets'] = [{
+        'priority': 50,
+        'compatible_accelerators': ['L4'],
+        'remaining_seconds': 55,
+        'count': 1,
+    }]
+
+    with pytest.raises(demand_state.DemandReportError,
+                       match='must exactly cover'):
+        demand_state._validate_report(report)
 
 
 def test_validate_report_never_promotes_saturated_offered_arrivals():

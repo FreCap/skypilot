@@ -239,6 +239,58 @@ def _validate_compatibility_profiles(
     return accelerators, counts_by_priority, recent_counts_by_priority
 
 
+def _validate_deadline_profiles(
+        value: Any, field: str
+) -> tuple[list[dict[str, Any]] | None, set[str], dict[str, int]]:
+    """Validate optional N+1 queue-deadline capability telemetry."""
+    if value is None:
+        return None, set(), {}
+    if (not isinstance(value, list) or
+            len(value) > constants.LB_REQUEST_TIMESTAMP_CAP):
+        raise DemandReportError(f'{field} must be a bounded list.')
+    normalized = []
+    accelerators: set[str] = set()
+    counts_by_priority: dict[str, int] = {}
+    for profile in value:
+        if (not isinstance(profile, dict) or set(profile) != {
+                'priority', 'compatible_accelerators', 'remaining_seconds',
+                'count'
+        }):
+            raise DemandReportError(f'{field} contains an invalid profile.')
+        parsed = lb_ha.CompatibilityDemand.from_dict(
+            {
+                'priority': profile.get('priority'),
+                'compatible_accelerators':
+                    profile.get('compatible_accelerators'),
+                'count': profile.get('count'),
+            },
+            require_timestamp=False)
+        remaining = profile.get('remaining_seconds')
+        if (parsed is None or not 0 <= parsed.priority <= 100 or
+                parsed.count > _MAX_COUNTER or not isinstance(remaining, int) or
+                isinstance(remaining, bool) or remaining < 0 or
+                remaining > constants.LB_REQUEST_DEADLINE_MAX_SECONDS or
+                remaining % constants.LB_REQUEST_DEADLINE_BUCKET_SECONDS != 0):
+            raise DemandReportError(f'{field} contains an invalid profile.')
+        if (len(parsed.compatible_accelerators)
+                > constants.LB_REQUEST_ACCELERATORS_MAX_ITEMS or
+                len(set(parsed.compatible_accelerators)) != len(
+                    parsed.compatible_accelerators)):
+            raise DemandReportError(
+                f'{field} contains an invalid accelerator set.')
+        normalized.append({
+            'priority': parsed.priority,
+            'compatible_accelerators': list(parsed.compatible_accelerators),
+            'remaining_seconds': remaining,
+            'count': parsed.count,
+        })
+        accelerators.update(parsed.compatible_accelerators)
+        priority = str(parsed.priority)
+        counts_by_priority[priority] = counts_by_priority.get(priority,
+                                                              0) + parsed.count
+    return normalized, accelerators, counts_by_priority
+
+
 def _validate_demand_window(
         value: Any,
         observed_at: float) -> tuple[dict[str, Any], bool, set[str]]:
@@ -455,6 +507,10 @@ def _validate_report(raw: Any) -> tuple[dict[str, Any], str, bool]:
          raw.get('queued_requests_by_compatibility'),
          'queued_requests_by_compatibility',
          require_timestamp=False)
+    (deadline_profiles, deadline_accelerators,
+     deadline_profiles_by_priority) = _validate_deadline_profiles(
+         raw.get('queued_request_deadline_buckets'),
+         'queued_request_deadline_buckets')
     (rejected_accelerators, rejected_profiles_by_priority,
      recent_rejected_profiles_by_priority) = _validate_compatibility_profiles(
          raw.get('rejected_requests_by_compatibility'),
@@ -490,9 +546,15 @@ def _validate_report(raw: Any) -> tuple[dict[str, Any], str, bool]:
         raise DemandReportError(
             'Compatibility profile priorities conflict with aggregate '
             'priority gauges.')
+    if deadline_profiles is not None:
+        deadline_count = sum(profile['count'] for profile in deadline_profiles)
+        if (deadline_count != counts['queue_depth'] or
+                deadline_profiles_by_priority != queue_by_priority):
+            raise DemandReportError(
+                'Queue deadline profiles must exactly cover queue gauges.')
     unknown_accelerators = (
-        demand_accelerators | queued_accelerators |
-        rejected_accelerators) - set(configured_accelerators)
+        demand_accelerators | queued_accelerators | rejected_accelerators |
+        deadline_accelerators) - set(configured_accelerators)
     if unknown_accelerators:
         raise DemandReportError(
             'Compatibility profiles contain accelerators outside the '
@@ -529,6 +591,7 @@ def _validate_report(raw: Any) -> tuple[dict[str, Any], str, bool]:
         reporter_observed_at=observed_at,
         demand_window=demand_window,
         configured_accelerators=configured_accelerators,
+        queued_request_deadline_buckets=deadline_profiles,
     )
     complete = bool(protocol >= 2 and routing_version is not None and
                     configured_accelerators and
@@ -1066,6 +1129,7 @@ def get_autoscaling_snapshot(
     timestamps: list[float] = []
     compatibility_profiles: list[dict[str, Any]] = []
     queued_profiles: list[dict[str, Any]] = []
+    queued_deadline_profiles: list[dict[str, Any]] = []
     rejected_profiles: list[dict[str, Any]] = []
     queue_depth = 0
     rejected = 0
@@ -1081,6 +1145,7 @@ def get_autoscaling_snapshot(
     }
     configured_accelerators: tuple[str, ...] | None = None
     compatibility_complete = True
+    deadline_profiles_complete = True
     aggregate_window_covered = True
     offered_arrival_tracking_saturated = False
     now_epoch = now.timestamp()
@@ -1168,6 +1233,18 @@ def get_autoscaling_snapshot(
         rejected += int(payload['rejected_in_window'])
         recent_rejected += int(payload['rejected_in_recent_window'])
         queued_profiles.extend(payload['queued_requests_by_compatibility'])
+        raw_deadlines = payload.get('queued_request_deadline_buckets')
+        if not isinstance(raw_deadlines, list):
+            deadline_profiles_complete = False
+        else:
+            for raw_profile in raw_deadlines:
+                profile = dict(raw_profile)
+                remaining = max(0.0,
+                                float(profile['remaining_seconds']) - elapsed)
+                bucket_seconds = (constants.LB_REQUEST_DEADLINE_BUCKET_SECONDS)
+                profile['remaining_seconds'] = int(
+                    remaining // bucket_seconds) * bucket_seconds
+                queued_deadline_profiles.append(profile)
         rejected_profiles.extend(payload['rejected_requests_by_compatibility'])
         if (not _add_counts(queue_by_priority,
                             payload['queue_depth_by_priority']) or
@@ -1257,6 +1334,8 @@ def get_autoscaling_snapshot(
         'timestamps': sorted(timestamps),
         'compatibility_profiles': compatibility_profiles,
         'queued_requests_by_compatibility': queued_profiles,
+        'queued_request_deadline_buckets':
+            (queued_deadline_profiles if deadline_profiles_complete else None),
         'rejected_requests_by_compatibility': rejected_profiles,
         'compatibility_demand_complete': compatibility_complete,
         'fresh_aggregate_zero': fresh_aggregate_zero,
@@ -1313,6 +1392,7 @@ def get_autoscaling_snapshot(
         'rejected_in_window': rejected,
         'recent_rejected_in_window': recent_rejected,
         'fresh_aggregate_zero': fresh_aggregate_zero,
+        'queue_deadline_profiles_complete': deadline_profiles_complete,
         # Exclude translated event timestamps: receipt time corrects reporter
         # clock skew, so those floats may move slightly on a heartbeat even
         # while the bounded demand classes and target are unchanged.

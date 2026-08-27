@@ -1656,6 +1656,8 @@ class SkyServeController:
             'compatibility_profiles', [])
         queued_compatibility_profiles = effective_request_data.get(
             'queued_requests_by_compatibility', [])
+        queued_deadline_profiles = effective_request_data.get(
+            'queued_request_deadline_buckets')
         rejected_compatibility_profiles = effective_request_data.get(
             'rejected_requests_by_compatibility', [])
         logger.info(f'Received {len(timestamps)} inflight requests.')
@@ -1690,6 +1692,7 @@ class SkyServeController:
                 'timestamps': timestamps,
                 'compatibility_profiles': compatibility_profiles,
                 'queued_requests_by_compatibility': queued_compatibility_profiles,
+                'queued_request_deadline_buckets': queued_deadline_profiles,
                 'rejected_requests_by_compatibility': rejected_compatibility_profiles,
                 'compatibility_demand_complete': compatibility_demand_complete,
                 'in_flight_by_replica_id': translated_in_flight,
@@ -2274,6 +2277,8 @@ class SkyServeController:
         unknown_urls = request_data.get('unknown_in_flight_urls')
         queued_compatibility_profiles = request_data.get(
             'queued_requests_by_compatibility')
+        queued_deadline_profiles = request_data.get(
+            'queued_request_deadline_buckets')
         rejected_compatibility_profiles = request_data.get(
             'rejected_requests_by_compatibility')
         return (isinstance(unknown_urls, list) and
@@ -2282,6 +2287,8 @@ class SkyServeController:
                     lb_ha.CompatibilityDemand.from_dict(
                         profile, require_timestamp=False) is not None
                     for profile in queued_compatibility_profiles) and
+                (queued_deadline_profiles is None or
+                 isinstance(queued_deadline_profiles, list)) and
                 isinstance(rejected_compatibility_profiles, list) and all(
                     lb_ha.CompatibilityDemand.from_dict(
                         profile, require_timestamp=False) is not None

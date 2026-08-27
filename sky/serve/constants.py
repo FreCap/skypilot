@@ -785,6 +785,12 @@ LB_REQUEST_ACCELERATORS_HEADER_BYTES = (
 LB_REQUEST_ACCELERATORS_VERSION = 1
 LB_REQUEST_ACCELERATORS_MAX_BYTES = 512
 LB_REQUEST_ACCELERATORS_MAX_ITEMS = 8
+# Queue deadlines are reported as conservative remaining-time lower bounds.
+# Five seconds is materially smaller than the shortest supported Boltz SLA
+# while preventing harmless sub-second report jitter from changing every
+# PostgreSQL demand fingerprint.
+LB_REQUEST_DEADLINE_BUCKET_SECONDS = 5
+LB_REQUEST_DEADLINE_MAX_SECONDS = 24 * 60 * 60
 
 # On SIGTERM the external LB first deregisters (stops POSTing
 # load_balancer_sync so the controller stops counting it -- avoiding a
@@ -1019,6 +1025,11 @@ AUTOSCALER_PROVISION_LEAD_AUTO = 'auto'
 # Minimum completed requests before a measured duration is trusted. One
 # decision tick of a small fleet should not redefine the sizing constant.
 AUTOSCALER_ADAPTIVE_DURATION_MIN_SAMPLES = 20
+# Exact-card duration estimates reuse the PostgreSQL async request ledger.  A
+# bounded recent sample protects controller latency and the p75 protects the
+# SLA from a mean dominated by fast requests.
+AUTOSCALER_CARD_DURATION_SAMPLE_CAP = 4096
+AUTOSCALER_CARD_DURATION_QUANTILE = 0.75
 # Smoothing for the measured-duration EMA. Deliberately slow: sizing must
 # track the workload's central tendency, not one burst of long requests.
 AUTOSCALER_ADAPTIVE_DURATION_EMA_ALPHA = 0.2
