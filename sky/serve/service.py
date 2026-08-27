@@ -442,6 +442,28 @@ class _ProviderPresentCleanupPreparation:
     failures: dict[tuple[int, str], str]
 
 
+@dataclasses.dataclass(frozen=True)
+class _BoundProviderReconciliation:
+    """One exact provider observation reduced for service teardown."""
+
+    cleanup_context: ordinary_launch_binding.BoundNonPoolLaunchContext | None
+    unresolved_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.cleanup_context is not None and self.unresolved_reason is not None:
+            raise ValueError('Resolved provider cleanup cannot also be '
+                             'unresolved.')
+
+
+@dataclasses.dataclass(frozen=True)
+class _BoundLaunchTeardownSettlement:
+    """Per-replica settlement result before bulk service cleanup."""
+
+    provider_present_cleanup_contexts: dict[tuple[
+        int, str], ordinary_launch_binding.BoundNonPoolLaunchContext]
+    provider_reconciliation_failures: dict[tuple[int, str], str]
+
+
 def _prepare_provider_present_cleanup(
     service_name: str,
     authority: ordinary_launch_binding.ControllerBindingAuthority | None,
@@ -460,8 +482,10 @@ def _prepare_provider_present_cleanup(
     contexts = dict(cleanup_contexts)
     projected_absence_keys: set[tuple[int, str]] = set()
     failures: dict[tuple[int, str], str] = {}
-    info_by_key = {(info.replica_id, info.replica_record_id): info
-                   for info in replica_infos}
+    info_by_key = {
+        (info.replica_id, info.replica_record_id): info
+        for info in replica_infos
+    }
     extra_keys = contexts.keys() - info_by_key.keys()
     if extra_keys:
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
@@ -571,7 +595,8 @@ def _cleanup(
     None = None,
     provider_present_cleanup_contexts: dict[tuple[
         int, str], ordinary_launch_binding.BoundNonPoolLaunchContext] |
-    None = None
+    None = None,
+    provider_reconciliation_failures: dict[tuple[int, str], str] | None = None,
 ) -> bool:
     """Clean up all service related resources, i.e. replicas and storage."""
     expected_owner = (controller_pid, controller_ip)
@@ -702,12 +727,29 @@ def _cleanup(
               ordinary_launch_binding.BoundNonPoolLaunchContext | None]] = []
     provider_present_cleanup_contexts = (provider_present_cleanup_contexts or
                                          {})
+    provider_reconciliation_failures = (provider_reconciliation_failures or {})
+    replica_keys = {
+        (info.replica_id, info.replica_record_id) for info in replica_infos
+    }
+    extra_failure_keys = provider_reconciliation_failures.keys() - replica_keys
+    overlapping_keys = (provider_reconciliation_failures.keys() &
+                        provider_present_cleanup_contexts.keys())
+    if extra_failure_keys or overlapping_keys:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider reconciliation failures lost their exact replica '
+            f'inventory: extra={sorted(extra_failure_keys)!r}, '
+            f'overlap={sorted(overlapping_keys)!r}.')
     preparation = _prepare_provider_present_cleanup(
         service_name, binding_authority, replica_infos, existing_cluster_names,
         provider_present_cleanup_contexts)
     provider_present_cleanup_contexts = preparation.contexts
     for info in replica_infos:
         cleanup_key = (info.replica_id, info.replica_record_id)
+        reconciliation_failure = provider_reconciliation_failures.get(
+            cleanup_key)
+        if reconciliation_failure is not None:
+            _set_to_failed_cleanup(info, reconciliation_failure)
+            continue
         preparation_failure = preparation.failures.get(cleanup_key)
         if preparation_failure is not None:
             _set_to_failed_cleanup(info, preparation_failure)
@@ -739,8 +781,8 @@ def _cleanup(
             if cleanup_fence is None:
                 absent_legacy_infos.append(info)
             else:
-                if (info.status_property.sky_down_status !=
-                        common_utils.ProcessStatus.RUNNING):
+                if (info.status_property.sky_down_status
+                        != common_utils.ProcessStatus.RUNNING):
                     info.status_property.sky_down_status = (
                         common_utils.ProcessStatus.SCHEDULED)
                 _persist_replica(info)
@@ -763,8 +805,8 @@ def _cleanup(
                     continue
                 presence = reserved_capacity.probe_physical_replica_presence(
                     cleanup_fence, info.cluster_name)
-                if (presence is
-                        reserved_capacity.PhysicalReplicaPresence.ABSENT):
+                if (presence
+                        is reserved_capacity.PhysicalReplicaPresence.ABSENT):
                     logger.info(
                         f'Replica {info.replica_id} owns no Pod on its fenced '
                         'physical cluster; provider cleanup is complete.')
@@ -868,8 +910,8 @@ def _cleanup(
         # committed RUNNING but before its provider worker completed.  That
         # row already consumes D and must stay RUNNING for idempotent adoption;
         # only fresh cleanup intent enters SCHEDULED admission.
-        if (info.status_property.sky_down_status !=
-                replica_managers.common_utils.ProcessStatus.RUNNING):
+        if (info.status_property.sky_down_status
+                != replica_managers.common_utils.ProcessStatus.RUNNING):
             info.status_property.sky_down_status = (
                 replica_managers.common_utils.ProcessStatus.SCHEDULED)
         _persist_replica(info)
@@ -1810,8 +1852,8 @@ def _project_bound_ordinary_launch_for_teardown(
          apply_immediate_provider_cleanup_replica_marker(info))
     elif provider_absent:
         assert provider_absence_projection is not None
-    elif (info.status_property.sky_launch_status !=
-          common_utils.ProcessStatus.INTERRUPTED):
+    elif (info.status_property.sky_launch_status
+          != common_utils.ProcessStatus.INTERRUPTED):
         if projection.status.value == 'SUCCEEDED':
             info.status_property.sky_launch_status = (
                 common_utils.ProcessStatus.SUCCEEDED)
@@ -1850,7 +1892,7 @@ def _reconcile_bound_provider_ambiguity_for_teardown(
     info: Any,
     context: Any,
     projector: Callable[..., bool],
-) -> ordinary_launch_binding.BoundNonPoolLaunchContext | None:
+) -> _BoundProviderReconciliation:
     """Resolve only an ambiguity with exact provider-absence authority."""
     if not isinstance(context,
                       ordinary_launch_binding.BoundNonPoolLaunchContext):
@@ -1864,20 +1906,20 @@ def _reconcile_bound_provider_ambiguity_for_teardown(
             f'{profile_kind.value} launch.')
     if (request_postgres.bound_non_pool_provider_present_cleanup_is_authorized(
             context, authority)):
-        return context
+        return _BoundProviderReconciliation(context)
     observation = non_pool_launch_reconciliation.reconcile(
         context, info, authority, projector)
     if observation.evidence == ordinary_launch_binding.ProviderEvidence.ABSENT:
-        return None
+        return _BoundProviderReconciliation(None)
     if (observation.evidence == ordinary_launch_binding.ProviderEvidence.PRESENT
             and request_postgres.
             bound_non_pool_provider_present_cleanup_is_authorized(
                 context, authority)):
-        return context
-    raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-        'Teardown provider reconciliation returned '
-        f'{observation.evidence.value} for {profile_kind.value} replica '
-        f'{info.replica_id}; refusing provider cleanup.')
+        return _BoundProviderReconciliation(context)
+    return _BoundProviderReconciliation(
+        None, 'teardown provider reconciliation returned '
+        f'{observation.evidence.value} for {profile_kind.value}; exact provider '
+        'cleanup remains unproven')
 
 
 def _supports_bound_provider_reconciliation(context: Any) -> bool:
@@ -1894,12 +1936,12 @@ def _supports_bound_provider_reconciliation(context: Any) -> bool:
 def _settle_bound_ordinary_launches_for_teardown(
     authority: ordinary_launch_binding.ControllerBindingAuthority | None,
     replica_infos: list[Any],
-) -> dict[tuple[int, str], ordinary_launch_binding.BoundNonPoolLaunchContext]:
+) -> _BoundLaunchTeardownSettlement:
     """Cancel and project every exact association before generic cleanup."""
     if (authority is None or authority.capable is not True or
-            authority.binding_mode !=
-            ordinary_launch_binding.BindingMode.BOUND):
-        return {}
+            authority.binding_mode
+            != ordinary_launch_binding.BindingMode.BOUND):
+        return _BoundLaunchTeardownSettlement({}, {})
     projector = functools.partial(_project_bound_ordinary_launch_for_teardown,
                                   authority)
     targets: list[tuple[Any, Any, bool]] = []
@@ -1935,14 +1977,31 @@ def _settle_bound_ordinary_launches_for_teardown(
 
     provider_present_cleanup_contexts: dict[tuple[
         int, str], ordinary_launch_binding.BoundNonPoolLaunchContext] = {}
+    provider_reconciliation_failures: dict[tuple[int, str], str] = {}
+
+    def _reconcile_safely(
+        info: Any,
+        context: Any,
+    ) -> _BoundProviderReconciliation:
+        try:
+            return _reconcile_bound_provider_ambiguity_for_teardown(
+                authority, info, context, projector)
+        except Exception as error:  # pylint: disable=broad-except
+            return _BoundProviderReconciliation(
+                None, 'teardown provider reconciliation raised for '
+                f'replica {info.replica_id}: '
+                f'{common_utils.format_exception(error)}')
+
     for info, target, reconcile_provider_ambiguity in targets:
         context = target.context
         if reconcile_provider_ambiguity:
-            cleanup_context = (_reconcile_bound_provider_ambiguity_for_teardown(
-                authority, info, context, projector))
-            if cleanup_context is not None:
-                provider_present_cleanup_contexts[(
-                    info.replica_id, info.replica_record_id)] = cleanup_context
+            result = _reconcile_safely(info, context)
+            key = (info.replica_id, info.replica_record_id)
+            if result.cleanup_context is not None:
+                provider_present_cleanup_contexts[key] = result.cleanup_context
+            elif result.unresolved_reason is not None:
+                provider_reconciliation_failures[key] = (
+                    result.unresolved_reason)
             continue
         reduction = request_postgres.reduce_bound_ordinary_launch(
             context, authority, project_replica_result=projector)
@@ -1955,13 +2014,14 @@ def _settle_bound_ordinary_launches_for_teardown(
                         'Teardown found a durably ambiguous ordinary launch '
                         f'for replica {info.replica_id}; refusing provider '
                         'cleanup.'))
-                cleanup_context = (
-                    _reconcile_bound_provider_ambiguity_for_teardown(
-                        authority, info, context, projector))
-                if cleanup_context is not None:
-                    provider_present_cleanup_contexts[(
-                        info.replica_id,
-                        info.replica_record_id)] = cleanup_context
+                result = _reconcile_safely(info, context)
+                key = (info.replica_id, info.replica_record_id)
+                if result.cleanup_context is not None:
+                    provider_present_cleanup_contexts[
+                        key] = result.cleanup_context
+                elif result.unresolved_reason is not None:
+                    provider_reconciliation_failures[key] = (
+                        result.unresolved_reason)
                 break
             if (getattr(reduction, 'projected', False) or disposition
                     in ('PROJECTED', 'PRE_EFFECT_TERMINAL', 'SETTLED')):
@@ -1981,7 +2041,8 @@ def _settle_bound_ordinary_launches_for_teardown(
             time.sleep(_BOUND_ORDINARY_LAUNCH_SETTLE_INTERVAL_SECONDS)
             reduction = request_postgres.reduce_bound_ordinary_launch(
                 context, authority, project_replica_result=projector)
-    return provider_present_cleanup_contexts
+    return _BoundLaunchTeardownSettlement(provider_present_cleanup_contexts,
+                                          provider_reconciliation_failures)
 
 
 def _run_cleanup_and_finalize(service_name: str,
@@ -2078,9 +2139,8 @@ def _run_cleanup_and_finalize(service_name: str,
     # killing the child alone does not prove launch quiescence. Every request is
     # backed by a replica row created before sdk.launch is submitted.
     try:
-        provider_present_cleanup_contexts = (
-            _settle_bound_ordinary_launches_for_teardown(
-                teardown_binding_authority, replica_infos))
+        settlement = _settle_bound_ordinary_launches_for_teardown(
+            teardown_binding_authority, replica_infos)
     except Exception as e:  # pylint: disable=broad-except
         logger.warning(
             f'Refusing generic cleanup until exact bound ordinary launches '
@@ -2114,12 +2174,12 @@ def _run_cleanup_and_finalize(service_name: str,
     lifecycle_lock = serve_utils.get_service_lifecycle_lock(
         service_name, advance_epoch=teardown_binding_authority is None)
     with lifecycle_lock:
-        _run_cleanup_and_finalize_locked(service_name, service_spec,
-                                         service_dir, job_id, service_hash,
-                                         controller_pid, controller_ip,
-                                         lifecycle_lock, resource_scope,
-                                         teardown_binding_authority,
-                                         provider_present_cleanup_contexts)
+        _run_cleanup_and_finalize_locked(
+            service_name, service_spec, service_dir, job_id, service_hash,
+            controller_pid, controller_ip, lifecycle_lock, resource_scope,
+            teardown_binding_authority,
+            settlement.provider_present_cleanup_contexts,
+            settlement.provider_reconciliation_failures)
 
 
 def _run_cleanup_and_finalize_locked(
@@ -2136,7 +2196,8 @@ def _run_cleanup_and_finalize_locked(
     None = None,
     provider_present_cleanup_contexts: dict[tuple[
         int, str], ordinary_launch_binding.BoundNonPoolLaunchContext] |
-    None = None
+    None = None,
+    provider_reconciliation_failures: dict[tuple[int, str], str] | None = None,
 ) -> None:
     """Owner-fenced cleanup while holding the service lifecycle lock."""
     expected_owner = (controller_pid, controller_ip)
@@ -2185,16 +2246,18 @@ def _run_cleanup_and_finalize_locked(
         if not _still_owns():
             raise ServiceOwnershipLostError(
                 'Ownership lost after load balancer quiesce.')
-        failed = _cleanup(service_name,
-                          service_spec.pool,
-                          service_hash,
-                          controller_pid,
-                          controller_ip,
-                          lifecycle_lock,
-                          resource_scope,
-                          binding_authority=binding_authority,
-                          provider_present_cleanup_contexts=(
-                              provider_present_cleanup_contexts))
+        failed = _cleanup(
+            service_name,
+            service_spec.pool,
+            service_hash,
+            controller_pid,
+            controller_ip,
+            lifecycle_lock,
+            resource_scope,
+            binding_authority=binding_authority,
+            provider_present_cleanup_contexts=(
+                provider_present_cleanup_contexts),
+            provider_reconciliation_failures=(provider_reconciliation_failures))
     except ServiceOwnershipLostError as e:
         # Another owner or a lost PG advisory-lock session means this process
         # must stop immediately. Preserve DB state and the recovery script;
@@ -2220,12 +2283,18 @@ def _run_cleanup_and_finalize_locked(
             logger.warning(f'Lost ownership before publishing '
                            f'FAILED_CLEANUP for {service_name!r}.')
             return
-        try:
-            serve_state.remove_ha_recovery_script_if_owner(
-                service_name, service_hash, controller_pid, controller_ip)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.warning(f'Failed to remove recovery script for '
-                           f'{service_name!r}: {e}')
+        if provider_reconciliation_failures:
+            logger.warning(
+                f'Retaining the HA recovery script for {service_name!r}; '
+                f'{len(provider_reconciliation_failures)} exact provider '
+                'reconciliation row(s) remain unresolved.')
+        else:
+            try:
+                serve_state.remove_ha_recovery_script_if_owner(
+                    service_name, service_hash, controller_pid, controller_ip)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(f'Failed to remove recovery script for '
+                               f'{service_name!r}: {e}')
         logger.error(f'Service {service_name} failed to clean up.')
         # A FAILED_CLEANUP service is no longer serving, so tear the data-plane
         # LB down here.
@@ -2412,8 +2481,8 @@ def _start(service_name: str,
                 raise RuntimeError(
                     f'Refusing stale HA recovery ownership for '
                     f'{service_name!r}: its service incarnation changed.')
-            if (recovery_owner_fence['lifecycle_epoch'] !=
-                    service.get('lifecycle_epoch')):
+            if (recovery_owner_fence['lifecycle_epoch']
+                    != service.get('lifecycle_epoch')):
                 raise RuntimeError(
                     f'Refusing stale HA recovery ownership for '
                     f'{service_name!r}: its lifecycle epoch changed.')

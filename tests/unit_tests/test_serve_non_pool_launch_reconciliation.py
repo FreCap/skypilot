@@ -354,11 +354,15 @@ def test_profile_without_durable_provider_uid_remains_unknown(
         'state': 'running',
     }], ordinary_launch_binding.ProviderEvidence.PRESENT),
 ])
+@pytest.mark.parametrize(
+    'profile_kind',
+    (ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+     ordinary_launch_binding.NonPoolLaunchProfileKind.
+     UNKNOWN_CAPACITY_REPLACEMENT))
 def test_aws_paid_observation_uses_exact_client_token_scope(
-        monkeypatch: pytest.MonkeyPatch, instances,
+        monkeypatch: pytest.MonkeyPatch, instances, profile_kind,
         expected: ordinary_launch_binding.ProviderEvidence) -> None:
-    context = _context(
-        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    context = _context(profile_kind)
     identity = {
         'aws_account_id': '096766144388',
         'client_token': 'a' * 64,
@@ -432,28 +436,32 @@ def test_aws_paid_census_uses_retained_profile_account_and_client_token(
 
         def paginate(self, **kwargs):
             calls.append(('paginate', kwargs))
-            return [{'Reservations': [{'Instances': [{
-                'BlockDeviceMappings': [{
-                    'Ebs': {
-                        'DeleteOnTermination': True,
-                    },
-                }],
-                'ClientToken': identity['client_token'],
-                'InstanceId': 'i-0123456789abcdef0',
-                'InstanceLifecycle': 'spot',
-                'InstanceType': identity['instance_type'],
-                'Placement': {
-                    'AvailabilityZone': identity['zone'],
-                },
-                'State': {
-                    'Name': 'running',
-                },
-                'Tags': [{
-                    'Key': reconciliation.provision_constants.
-                           TAG_RAY_CLUSTER_NAME,
-                    'Value': identity['cluster_name_on_cloud'],
-                }],
-            }]}]}]
+            return [{
+                'Reservations': [{
+                    'Instances': [{
+                        'BlockDeviceMappings': [{
+                            'Ebs': {
+                                'DeleteOnTermination': True,
+                            },
+                        }],
+                        'ClientToken': identity['client_token'],
+                        'InstanceId': 'i-0123456789abcdef0',
+                        'InstanceLifecycle': 'spot',
+                        'InstanceType': identity['instance_type'],
+                        'Placement': {
+                            'AvailabilityZone': identity['zone'],
+                        },
+                        'State': {
+                            'Name': 'running',
+                        },
+                        'Tags': [{
+                            'Key': reconciliation.provision_constants.
+                                   TAG_RAY_CLUSTER_NAME,
+                            'Value': identity['cluster_name_on_cloud'],
+                        }],
+                    }]
+                }]
+            }]
 
     class _Client:
 
@@ -492,10 +500,16 @@ def test_aws_paid_census_uses_retained_profile_account_and_client_token(
         'state': 'running',
     }]
     assert calls == [
-        ('session', {'profile': identity['credential_profile']}),
-        ('client', 'sts', {'region_name': identity['region']}),
+        ('session', {
+            'profile': identity['credential_profile']
+        }),
+        ('client', 'sts', {
+            'region_name': identity['region']
+        }),
         ('caller', 'sts'),
-        ('client', 'ec2', {'region_name': identity['region']}),
+        ('client', 'ec2', {
+            'region_name': identity['region']
+        }),
         ('paginator', 'ec2', 'describe_instances'),
         ('paginate', {
             'Filters': [{
@@ -658,8 +672,8 @@ def test_gcp_paid_observation_uses_frozen_exact_label_scope(
     assert observed.payload['provider_identity'] == identity
     assert observed.payload['instance_ids'] == sorted(instances)
     assert observed.payload['disk_ids'] == disks
-    expected_calls = (
-        2 if expected is ordinary_launch_binding.ProviderEvidence.ABSENT else 1)
+    expected_calls = (2 if expected
+                      is ordinary_launch_binding.ProviderEvidence.ABSENT else 1)
     assert calls == [{
         'provider_name': 'gcp',
         'cluster_name': 'svc-3',
@@ -1069,10 +1083,30 @@ def test_cancelled_gcp_exact_absence_is_neutral_cleanup() -> None:
     assert result is not None
     assert result.paid_capacity_outcome is paid_capacity.LaunchOutcome.OTHER_FAILURE
     assert status_property.failed_spot_availability is False
-    assert (status_property.sky_launch_status is
-            reconciliation.common_utils.ProcessStatus.INTERRUPTED)
+    assert (status_property.sky_launch_status
+            is reconciliation.common_utils.ProcessStatus.INTERRUPTED)
+    aws_pool_key = json.dumps(
+        {
+            'accelerators': [['l4', 1]],
+            'cloud': 'aws',
+            'instance_type': 'g6.2xlarge',
+            'num_nodes': 1,
+            'provider_identity': {
+                'aws_account_id': '123456789012',
+            },
+            'region': 'us-east-2',
+            'use_spot': True,
+            'version': 2,
+            'workspace': 'workspace-a',
+            'zone': 'us-east-2a',
+        },
+        sort_keys=True,
+        separators=(',', ':'))
+    assert ordinary_launch_binding.ordinary_paid_provider_terminal_shape_matches(
+        'CANCELLED', 'explicit_cancel', aws_pool_key)
     assert not ordinary_launch_binding.ordinary_paid_provider_terminal_shape_matches(
-        'CANCELLED', 'explicit_cancel', pool_key.replace('"gcp"', '"aws"'))
+        'CANCELLED', 'explicit_cancel',
+        aws_pool_key.replace('123456789012', 'unknown'))
 
 
 def test_ordinary_paid_reconcile_prefers_exact_terminal_negative_ack(

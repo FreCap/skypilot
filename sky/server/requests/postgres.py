@@ -215,8 +215,8 @@ def read_legacy_launch_request_evidence(
             sqlalchemy.select(QUEUE).where(
                 QUEUE.c.request_id == identity.request_id).with_for_update()
         ).mappings().one_or_none()
-        if (request_row is None or request_row['handler_name'] !=
-                _LEGACY_ORDINARY_LAUNCH_HANDLER_NAME or
+        if (request_row is None or request_row['handler_name']
+                != _LEGACY_ORDINARY_LAUNCH_HANDLER_NAME or
                 request_row['cluster_name'] != identity.cluster_name or
                 request_row['ordinary_launch_association_id'] is not None or
                 request_row['binding_protocol_version'] is not None):
@@ -862,10 +862,9 @@ class ServerInstanceLease:
             return False
         with self._state_lock:
             last_success = self._last_success_monotonic
-            return (
-                self._ready and not self._draining and
-                last_success is not None and
-                time.monotonic() - last_success <= self._stale_after_seconds)
+            return (self._ready and not self._draining and
+                    last_success is not None and time.monotonic() - last_success
+                    <= self._stale_after_seconds)
 
     def stop(self) -> None:
         """Mark the instance draining before stopping its heartbeat."""
@@ -912,8 +911,8 @@ def current_instance_is_ready() -> bool:
                     SERVER_INSTANCES.c.instance_id == instance_id,
                     SERVER_INSTANCES.c.ready,
                     SERVER_INSTANCES.c.draining_at.is_(None),
-                    SERVER_INSTANCES.c.heartbeat_at >=
-                    sqlalchemy.func.clock_timestamp() - datetime.timedelta(
+                    SERVER_INSTANCES.c.heartbeat_at
+                    >= sqlalchemy.func.clock_timestamp() - datetime.timedelta(
                         seconds=INSTANCE_STALE_AFTER_SECONDS))).scalar_one())
 
 
@@ -946,8 +945,8 @@ def ordinary_launch_binding_fleet_capable(
                 SERVER_INSTANCES.c.ordinary_launch_binding_capable).where(
                     SERVER_INSTANCES.c.role.in_(
                         ('all', 'api', 'executor', 'controller')),
-                    SERVER_INSTANCES.c.heartbeat_at >=
-                    sqlalchemy.func.clock_timestamp() - datetime.timedelta(
+                    SERVER_INSTANCES.c.heartbeat_at
+                    >= sqlalchemy.func.clock_timestamp() - datetime.timedelta(
                         seconds=quiescence_seconds))).mappings().all()
         acceptors = [
             row for row in rows
@@ -1005,20 +1004,20 @@ def non_pool_launch_binding_fleet_capable(
             where(
                 SERVER_INSTANCES.c.role.in_(
                     ('all', 'api', 'executor', 'controller')),
-                SERVER_INSTANCES.c.heartbeat_at >=
-                sqlalchemy.func.clock_timestamp() - datetime.timedelta(
+                SERVER_INSTANCES.c.heartbeat_at
+                >= sqlalchemy.func.clock_timestamp() - datetime.timedelta(
                     seconds=quiescence_seconds))).mappings().all()
         acceptor = False
         executor = False
         for row in rows:
             if (row['non_pool_launch_binding_capable'] is not True or
-                    row['non_pool_launch_binding_protocol_version'] !=
-                    ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION or
-                    row['non_pool_launch_capability_profile_set_digest'] !=
-                    expected_digest or
-                    row['non_pool_launch_capability_cohort_epoch'] !=
-                    ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH or
-                    row['non_pool_launch_receipt_protocol_version'] !=
+                    row['non_pool_launch_binding_protocol_version']
+                    != ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION
+                    or row['non_pool_launch_capability_profile_set_digest']
+                    != expected_digest or
+                    row['non_pool_launch_capability_cohort_epoch']
+                    != ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+                    or row['non_pool_launch_receipt_protocol_version'] !=
                     ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION):
                 return False
             ready = row['ready'] and row['draining_at'] is None
@@ -1063,17 +1062,17 @@ def ordered_capacity_admission_fleet_capable(
             where(
                 SERVER_INSTANCES.c.role.in_(
                     ('all', 'api', 'executor', 'controller')),
-                SERVER_INSTANCES.c.heartbeat_at >=
-                sqlalchemy.func.clock_timestamp() - datetime.timedelta(
+                SERVER_INSTANCES.c.heartbeat_at
+                >= sqlalchemy.func.clock_timestamp() - datetime.timedelta(
                     seconds=quiescence_seconds))).mappings().all()
         acceptor = False
         executor = False
         for row in rows:
             if (row['ordered_capacity_admission_capable'] is not True or
-                    row['ordered_capacity_admission_protocol_version'] !=
-                    ORDERED_CAPACITY_ADMISSION_PROTOCOL_VERSION or
-                    row['ordered_capacity_admission_cohort_epoch'] !=
-                    ORDERED_CAPACITY_ADMISSION_COHORT_EPOCH):
+                    row['ordered_capacity_admission_protocol_version']
+                    != ORDERED_CAPACITY_ADMISSION_PROTOCOL_VERSION or
+                    row['ordered_capacity_admission_cohort_epoch']
+                    != ORDERED_CAPACITY_ADMISSION_COHORT_EPOCH):
                 return False
             ready = row['ready'] and row['draining_at'] is None
             acceptor = acceptor or bool(ready and row['role'] in ('all', 'api'))
@@ -1105,8 +1104,8 @@ def recent_legacy_controller_consumers(quiescence_seconds: float) -> list[str]:
                 SERVER_INSTANCES.c.instance_id,
                 SERVER_INSTANCES.c.supported_handlers).where(
                     SERVER_INSTANCES.c.role.in_(['all', 'executor']),
-                    SERVER_INSTANCES.c.heartbeat_at >=
-                    sqlalchemy.func.clock_timestamp() - datetime.timedelta(
+                    SERVER_INSTANCES.c.heartbeat_at
+                    >= sqlalchemy.func.clock_timestamp() - datetime.timedelta(
                         seconds=quiescence_seconds))).mappings().all()
     blockers = []
     for row in rows:
@@ -1852,11 +1851,11 @@ def record_executor_termination_evidence(
         if (worker['pod_uid'] != observation.pod_uid or
                 worker['pod_name'] != observation.pod_name or
                 worker['pod_namespace'] != observation.pod_namespace or
-                expected_containers.get(worker_role) !=
-                observation.container_name or
+                expected_containers.get(worker_role)
+                != observation.container_name or
                 worker['executor_termination_evidence_capable'] is not True or
-                worker['executor_termination_evidence_protocol_version'] !=
-                EXECUTOR_TERMINATION_EVIDENCE_PROTOCOL_VERSION):
+                worker['executor_termination_evidence_protocol_version']
+                != EXECUTOR_TERMINATION_EVIDENCE_PROTOCOL_VERSION):
             raise ExecutorTerminationEvidenceRejected(
                 'Terminated Pod does not match a capable registered executor.')
         db_observed_at = connection.execute(
@@ -2010,8 +2009,8 @@ def fence_stale_controller_claims(instance_id: str,
                     sqlalchemy.or_(
                         REQUESTS.c.worker_instance_id != uuid.UUID(instance_id),
                         REQUESTS.c.controller_generation.is_(None),
-                        REQUESTS.c.controller_generation !=
-                        generation)).with_for_update()).mappings().all()
+                        REQUESTS.c.controller_generation
+                        != generation)).with_for_update()).mappings().all()
         for row in rows:
             registration = request_registry.resolve_handler(row['handler_name'])
             replayable = registration.replay_policy in (
@@ -2829,8 +2828,8 @@ def _validate_existing_bound_request_in_transaction(
                     for column in queue_columns)):
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                 'Existing queue delivery does not match the bound request.')
-        if ((queue_row['delivery_state'] == 'queued') !=
-            (queue_row['claim_generation'] is None)):
+        if ((queue_row['delivery_state'] == 'queued')
+                != (queue_row['claim_generation'] is None)):
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                 'Existing bound queue claim state is inconsistent.')
         if (queue_row['delivery_state'] == 'claimed' and
@@ -3048,8 +3047,8 @@ def _lock_bound_request_evidence(
         non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME if is_non_pool else
         ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME)
     if (request_row['handler_name'] != expected_handler or
-            request_row['ordinary_launch_association_id'] !=
-            context.association_id):
+            request_row['ordinary_launch_association_id']
+            != context.association_id):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Correlated request does not name the exact bound handler.')
     if is_non_pool:
@@ -3335,12 +3334,12 @@ def read_bound_reserved_fill_active_snapshot(
                        ordinary_launch_binding.ControllerBindingAuthority) or
             not authority.retained_non_pool_settlement_allowed or
             authority.service_name != context.service_name or
-            authority.non_pool_capability_cohort_epoch !=
-            context.capability_cohort_epoch or
-            authority.non_pool_profile_set_digest !=
-            context.capability_profile_set_digest or
-            authority.non_pool_receipt_protocol_version !=
-            context.receipt_protocol_version):
+            authority.non_pool_capability_cohort_epoch
+            != context.capability_cohort_epoch or
+            authority.non_pool_profile_set_digest
+            != context.capability_profile_set_digest or
+            authority.non_pool_receipt_protocol_version
+            != context.receipt_protocol_version):
         return None
     engine = initialize_and_get_db()
     if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
@@ -3945,8 +3944,8 @@ def reduce_bound_ordinary_launch_in_transaction(
                     facts.execution_generation,
                     REQUESTS.c.claim_token == facts.claim_token,
                     REQUESTS.c.worker_instance_id == facts.worker_instance_id,
-                    REQUESTS.c.lease_expires_at <=
-                    sqlalchemy.func.clock_timestamp(),
+                    REQUESTS.c.lease_expires_at
+                    <= sqlalchemy.func.clock_timestamp(),
                     REQUESTS.c.status.in_([
                         status.value for status in
                         requests_lib.RequestStatus.finished_status()
@@ -4153,12 +4152,12 @@ def _ordinary_paid_provider_absence_payload_from_locked_request(
     require_retention_pin: bool = True,
 ) -> dict[str, Any] | None:
     """Re-extract one exact zero-effect AWS receipt under request locks."""
-    if (context.profile.kind !=
-            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID or
-            request_row is None or association['effect_phase'] !=
-            ordinary_launch_binding.EffectPhase.PROVIDER_IO.value or
-            association['reconciliation_outcome'] !=
-            expected_reconciliation_outcome or
+    if (context.profile.kind
+            != ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID or
+            request_row is None or association['effect_phase']
+            != ordinary_launch_binding.EffectPhase.PROVIDER_IO.value or
+            association['reconciliation_outcome']
+            != expected_reconciliation_outcome or
             not isinstance(association['paid_capacity_pool_key'], str) or
             not association['paid_capacity_pool_key'] or
             association['service_job_id'] is not None or
@@ -4305,18 +4304,18 @@ def _ordinary_paid_aws_provider_identity_from_locked_request(
     """Recover exact AWS census scope from the retained launch request."""
     pool_identity = paid_capacity.pool_key_payload(
         str(association.get('paid_capacity_pool_key')))
-    if (context.profile.kind is not ordinary_launch_binding.
-            NonPoolLaunchProfileKind.ORDINARY_PAID or
+    if (not ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+            context.profile.kind) or
             not (ordinary_launch_binding.
                  ORDINARY_PAID_AWS_CLIENT_TOKEN_COHORT_FLOOR <=
                  context.capability_cohort_epoch <=
                  ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH) or
             not isinstance(pool_identity, Mapping) or
             pool_identity.get('cloud') != 'aws' or request_row is None or
-            association['effect_phase'] !=
-            ordinary_launch_binding.EffectPhase.PROVIDER_IO.value or
-            association['reconciliation_outcome'] !=
-            expected_reconciliation_outcome or
+            association['effect_phase']
+            != ordinary_launch_binding.EffectPhase.PROVIDER_IO.value or
+            association['reconciliation_outcome']
+            != expected_reconciliation_outcome or
             association['service_job_id'] is not None or
             not ordinary_launch_binding.
             ordinary_paid_provider_terminal_shape_matches(
@@ -4421,10 +4420,10 @@ def _ordinary_paid_gcp_provider_identity_from_locked_request(
               ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH)) or
             not isinstance(pool_identity, Mapping) or
             pool_identity.get('cloud') != 'gcp' or request_row is None or
-            association['effect_phase'] !=
-            ordinary_launch_binding.EffectPhase.PROVIDER_IO.value or
-            association['reconciliation_outcome'] !=
-            expected_reconciliation_outcome or
+            association['effect_phase']
+            != ordinary_launch_binding.EffectPhase.PROVIDER_IO.value or
+            association['reconciliation_outcome']
+            != expected_reconciliation_outcome or
             association['service_job_id'] is not None or
             not ordinary_launch_binding.
             ordinary_paid_provider_terminal_shape_matches(
@@ -4645,8 +4644,8 @@ def bound_non_pool_aws_provider_identity(
         association = ordinary_launch_binding.lock_reduction_authority_in_connection(
             connection, context)
         if (not _controller_authority_matches_reduction(association, authority)
-                or association['resolution'] !=
-                ordinary_launch_binding.Resolution.AMBIGUOUS.value):
+                or association['resolution']
+                != ordinary_launch_binding.Resolution.AMBIGUOUS.value):
             return None
         facts, request_row, queue_row, _ = _lock_bound_request_evidence(
             connection, context)
@@ -4674,8 +4673,8 @@ def bound_non_pool_aws_provider_absence_is_settled(
         association = ordinary_launch_binding.lock_reduction_authority_in_connection(
             connection, context)
         if (not _controller_authority_matches_reduction(association, authority)
-                or association['resolution'] !=
-                ordinary_launch_binding.Resolution.AMBIGUOUS.value):
+                or association['resolution']
+                != ordinary_launch_binding.Resolution.AMBIGUOUS.value):
             return False
         facts, request_row, queue_row, _ = _lock_bound_request_evidence(
             connection, context)
@@ -4706,8 +4705,8 @@ def bound_non_pool_gcp_provider_identity(
         association = ordinary_launch_binding.lock_reduction_authority_in_connection(
             connection, context)
         if (not _controller_authority_matches_reduction(association, authority)
-                or association['resolution'] !=
-                ordinary_launch_binding.Resolution.AMBIGUOUS.value):
+                or association['resolution']
+                != ordinary_launch_binding.Resolution.AMBIGUOUS.value):
             return None
         facts, request_row, queue_row, _ = _lock_bound_request_evidence(
             connection, context)
@@ -4737,8 +4736,8 @@ def bound_non_pool_gcp_provider_absence_is_settled(
         association = ordinary_launch_binding.lock_reduction_authority_in_connection(
             connection, context)
         if (not _controller_authority_matches_reduction(association, authority)
-                or association['resolution'] !=
-                ordinary_launch_binding.Resolution.AMBIGUOUS.value):
+                or association['resolution']
+                != ordinary_launch_binding.Resolution.AMBIGUOUS.value):
             return False
         facts, request_row, queue_row, _ = _lock_bound_request_evidence(
             connection, context)
@@ -4770,8 +4769,8 @@ def bound_non_pool_terminal_provider_absence_payload(
         association = ordinary_launch_binding.lock_reduction_authority_in_connection(
             connection, context)
         if (not _controller_authority_matches_reduction(association, authority)
-                or association['resolution'] !=
-                ordinary_launch_binding.Resolution.AMBIGUOUS.value):
+                or association['resolution']
+                != ordinary_launch_binding.Resolution.AMBIGUOUS.value):
             return None
         facts, request_row, queue_row, _ = _lock_bound_request_evidence(
             connection, context)
@@ -5243,17 +5242,16 @@ def bound_non_pool_projected_provider_absence_is_authorized(
                 terminal_cause = facts.terminal_cause
                 if (request_status is None or request_status
                         not in requests_lib.RequestStatus.finished_status() or
-                        terminal_cause is None or
-                        request_status.value != association['terminal_status']
-                        or
+                        terminal_cause is None or request_status.value
+                        != association['terminal_status'] or
                         terminal_cause.value != association['terminal_cause'] or
-                        facts.execution_generation !=
-                        association['terminal_execution_generation'] or
+                        facts.execution_generation
+                        != association['terminal_execution_generation'] or
                         facts.execution_quiescence_required is not True or
-                        facts.execution_quiesced_generation !=
-                        association['execution_quiesced_generation'] or
-                        facts.execution_quiesced_at !=
-                        association['execution_quiesced_at'] or
+                        facts.execution_quiesced_generation
+                        != association['execution_quiesced_generation'] or
+                        facts.execution_quiesced_at
+                        != association['execution_quiesced_at'] or
                         not facts.quiescent):
                     return False
             return True
@@ -5321,8 +5319,8 @@ def retire_bound_non_pool_projected_paid_provider_absence(
                     require_paid_claim=False,
                     require_retention_pin=False)
                 if (expected_payload is None or
-                        association['provider_evidence_payload'] !=
-                        expected_payload):
+                        association['provider_evidence_payload']
+                        != expected_payload):
                     return False
 
             route_leases = (
@@ -5381,8 +5379,8 @@ def bound_non_pool_provider_reconciliation_ready(
         association = ordinary_launch_binding.lock_reduction_authority_in_connection(
             connection, context)
         if (not _controller_authority_matches_reduction(association, authority)
-                or association['resolution'] !=
-                ordinary_launch_binding.Resolution.AMBIGUOUS.value or
+                or association['resolution']
+                != ordinary_launch_binding.Resolution.AMBIGUOUS.value or
                 association['reconciliation_outcome'] != ordinary_launch_binding
                 .ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value):
             return False
@@ -5665,10 +5663,10 @@ def _bound_ordinary_launch_requests_clear_in_transaction(
                 facts.terminal_cause is None or not facts.quiescent or
                 association['terminal_status'] != facts.status.value or
                 association['terminal_cause'] != facts.terminal_cause.value or
-                association['terminal_execution_generation'] !=
-                facts.execution_generation or
-                association['execution_quiesced_generation'] !=
-                facts.execution_quiesced_generation):
+                association['terminal_execution_generation']
+                != facts.execution_generation or
+                association['execution_quiesced_generation']
+                != facts.execution_quiesced_generation):
             return False
     return True
 
@@ -5997,8 +5995,8 @@ def gc_bound_ordinary_launch_tombstones_in_transaction(
                     value.value
                     for value in ordinary_launch_binding.SETTLED_RESOLUTIONS)),
             associations.c.pin_released_at.is_not(None),
-            associations.c.tombstone_not_before <=
-            sqlalchemy.func.clock_timestamp(), ~replica_reference_exists,
+            associations.c.tombstone_not_before
+            <= sqlalchemy.func.clock_timestamp(), ~replica_reference_exists,
             ~request_reference_exists, ~pin_reference_exists,
             *admission_absence_predicates).order_by(
                 associations.c.tombstone_not_before,
@@ -6014,8 +6012,8 @@ def gc_bound_ordinary_launch_tombstones_in_transaction(
                     value.value
                     for value in ordinary_launch_binding.SETTLED_RESOLUTIONS)),
             associations.c.pin_released_at.is_not(None),
-            associations.c.tombstone_not_before <=
-            sqlalchemy.func.clock_timestamp(), ~replica_reference_exists,
+            associations.c.tombstone_not_before
+            <= sqlalchemy.func.clock_timestamp(), ~replica_reference_exists,
             ~request_reference_exists, ~pin_reference_exists,
             *admission_absence_predicates))
     return result.rowcount
@@ -6089,8 +6087,8 @@ def _controller_claim_is_current() -> sqlalchemy.ColumnElement[bool]:
         _controller_leadership_is_current_predicate(
             REQUESTS.c.worker_instance_id, REQUESTS.c.controller_generation))
     return sqlalchemy.or_(
-        REQUESTS.c.execution_class !=
-        request_registry.ExecutionClass.CONTROLLER.value,
+        REQUESTS.c.execution_class
+        != request_registry.ExecutionClass.CONTROLLER.value,
         sqlalchemy.and_(REQUESTS.c.controller_generation.is_not(None),
                         current_leadership))
 
@@ -6278,9 +6276,9 @@ class PostgresRequestBackend(request_storage.RequestBackend):
     def _claim_predicates(
             self, execution_generation: int, claim_token: uuid.UUID
     ) -> tuple[sqlalchemy.ColumnElement[bool], ...]:
-        return (*self._claim_identity_predicates(execution_generation,
-                                                 claim_token),
-                REQUESTS.c.lease_expires_at > sqlalchemy.func.clock_timestamp(),
+        return (*self._claim_identity_predicates(
+            execution_generation, claim_token), REQUESTS.c.lease_expires_at
+                > sqlalchemy.func.clock_timestamp(),
                 _controller_claim_is_current())
 
     def _claim_identity_predicates(
@@ -6707,8 +6705,8 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             revoked_running = sqlalchemy.and_(
                 REQUESTS.c.status == requests_lib.RequestStatus.RUNNING.value,
                 sqlalchemy.or_(
-                    REQUESTS.c.lease_expires_at <=
-                    sqlalchemy.func.clock_timestamp(), ~claimed_delivery,
+                    REQUESTS.c.lease_expires_at
+                    <= sqlalchemy.func.clock_timestamp(), ~claimed_delivery,
                     ~_controller_claim_is_current()))
             cancelled_unquiesced = sqlalchemy.and_(
                 REQUESTS.c.status == requests_lib.RequestStatus.CANCELLED.value,
@@ -7039,8 +7037,8 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                         job_info.c.controller_generation.is_(None),
                         job_info.c.controller_slot_id.is_(None),
                         job_info.c.controller_slot_attempt.is_(None),
-                        job_info.c.controller_instance_id !=
-                        str(current_instance),
+                        job_info.c.controller_instance_id
+                        != str(current_instance),
                         job_info.c.controller_generation != current_generation,
                     )).order_by(job_info.c.spot_job_id).with_for_update()
             ).mappings().all()
@@ -7095,8 +7093,8 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                         REQUESTS.c.managed_job_controller_slot_attempt.is_(
                             None), REQUESTS.c.managed_job_controller_instance_id
                         != current_instance,
-                        REQUESTS.c.managed_job_controller_generation !=
-                        current_generation)).distinct()).all()
+                        REQUESTS.c.managed_job_controller_generation
+                        != current_generation)).distinct()).all()
             for row in request_origins:
                 if any(value is None for value in row):
                     raise request_storage.ManagedJobRequestQuiescenceError(
@@ -7186,8 +7184,8 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                 return False
             if (receipt.execution_quiesced_generation is not None or
                     receipt.execution_quiesced_at is not None):
-                if (receipt.execution_quiesced_generation !=
-                        claim.execution_generation or
+                if (receipt.execution_quiesced_generation
+                        != claim.execution_generation or
                         receipt.execution_quiesced_at is None):
                     return False
             else:
@@ -7278,8 +7276,8 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             # irrelevant: a retry delay equal to the lease must not strand a
             # completed generation before this transaction can run.
             if (row['execution_class'] != preview['execution_class'] or
-                    row['controller_generation'] !=
-                    preview['controller_generation']):
+                    row['controller_generation']
+                    != preview['controller_generation']):
                 return False
             now = sqlalchemy.func.clock_timestamp()
             result = connection.execute(
@@ -7865,8 +7863,8 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                 return
             if (normalized.claim_token is None or row['claim_token'] is None or
                     str(row['claim_token']) != normalized.claim_token or
-                    int(row['execution_generation']) !=
-                    normalized.execution_generation or
+                    int(row['execution_generation'])
+                    != normalized.execution_generation or
                     str(row['worker_instance_id']) != self._instance_id):
                 logger.warning('Ignoring stale requeue for request '
                                f'{normalized.request_id}.')
@@ -7878,8 +7876,8 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                     normalized.execution_generation,
                     REQUESTS.c.claim_token == uuid.UUID(normalized.claim_token),
                     REQUESTS.c.worker_instance_id == uuid.UUID(
-                        self._instance_id), REQUESTS.c.lease_expires_at >
-                    sqlalchemy.func.clock_timestamp(),
+                        self._instance_id), REQUESTS.c.lease_expires_at
+                    > sqlalchemy.func.clock_timestamp(),
                     _controller_claim_is_current()).values(
                         status=requests_lib.RequestStatus.WAITING.value,
                         pid=None,
@@ -8023,8 +8021,8 @@ class PostgresQueueBackend(queue_base.QueueBackend):
             sqlalchemy.func.clock_timestamp().label('_database_now')).join(
                 REQUESTS, REQUESTS.c.request_id == QUEUE.c.request_id).where(
                     QUEUE.c.schedule_type == self._schedule_type,
-                    QUEUE.c.delivery_state == 'queued',
-                    QUEUE.c.available_at <= sqlalchemy.func.clock_timestamp(),
+                    QUEUE.c.delivery_state == 'queued', QUEUE.c.available_at
+                    <= sqlalchemy.func.clock_timestamp(),
                     self._provider_mutation_predicate(provider_mutation),
                     *self._role_predicates())
         if request_id is not None:
@@ -8074,8 +8072,8 @@ class PostgresQueueBackend(queue_base.QueueBackend):
             queue_row = connection.execute(
                 sqlalchemy.select(QUEUE).where(
                     QUEUE.c.request_id == candidate['request_id'],
-                    QUEUE.c.delivery_state == 'queued', QUEUE.c.available_at <=
-                    sqlalchemy.func.clock_timestamp()).with_for_update(
+                    QUEUE.c.delivery_state == 'queued', QUEUE.c.available_at
+                    <= sqlalchemy.func.clock_timestamp()).with_for_update(
                         skip_locked=True)).mappings().first()
             if queue_row is None:
                 return None

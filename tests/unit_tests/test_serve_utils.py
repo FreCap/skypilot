@@ -556,7 +556,8 @@ def test_bound_ha_recovery_script_admits_fresh_guarded_child(tmp_path):
         script, config_path=str(config_path), config_bytes=config_bytes)
 
     child_env = dict(os.environ)
-    child_env['PYTHONPATH'] = os.getcwd()
+    child_env['PYTHONPATH'] = os.pathsep.join(
+        path for path in (os.getcwd(), child_env.get('PYTHONPATH')) if path)
     completed = subprocess.run(['/bin/bash', '-c', script],
                                cwd=os.getcwd(),
                                env=child_env,
@@ -3611,8 +3612,7 @@ class TestServiceStatusEndpointSnapshot:
             info.cluster_name: {
                 'launched_at': idx,
                 'handle': handle,
-            }
-            for idx, (info, handle) in enumerate(replicas_and_handles, start=1)
+            } for idx, (info, handle) in enumerate(replicas_and_handles, start=1)
         }
         endpoint_calls = []
 
@@ -3722,7 +3722,7 @@ class TestServiceStatusEndpointSnapshot:
                 'launched_at': index,
                 'handle': handle,
             } for index, (info,
-                          handle) in enumerate(replicas_and_handles, start=1)
+                         handle) in enumerate(replicas_and_handles, start=1)
         }
         depth = 0
         uid_reads = 0
@@ -3777,7 +3777,7 @@ class TestServiceStatusEndpointSnapshot:
                 'launched_at': index,
                 'handle': handle,
             } for index, (info,
-                          handle) in enumerate(replicas_and_handles, start=1)
+                         handle) in enumerate(replicas_and_handles, start=1)
         }
         depth = 0
         uid_reads = 0
@@ -5070,7 +5070,9 @@ class TestTerminateFailedServices:
                     'sky.serve.service.'
                     '_settle_bound_ordinary_launches_for_teardown',
                     side_effect=bound_settle_side_effect,
-                    return_value={}))
+                    return_value=types.SimpleNamespace(
+                        provider_present_cleanup_contexts={},
+                        provider_reconciliation_failures={})))
             stack.enter_context(
                 mock.patch(
                     'sky.serve.serve_utils.global_user_state.'
@@ -5080,9 +5082,9 @@ class TestTerminateFailedServices:
                 mock.patch(
                     'sky.serve.serve_utils.serve_state.'
                     'get_replica_resource_action_identities',
-                    side_effect=lambda _service_name, replica_ids:
-                    ({replica_id: None for replica_id in replica_ids}
-                     if teardown_identities is None else teardown_identities)))
+                    side_effect=lambda _service_name, replica_ids: ({
+                        replica_id: None for replica_id in replica_ids
+                    } if teardown_identities is None else teardown_identities)))
             stack.enter_context(
                 mock.patch('sky.serve.replica_managers.terminate_cluster',
                            side_effect=_terminate))
@@ -5192,7 +5194,8 @@ class TestTerminateFailedServices:
 
         def _settle(*_args):
             events.append('exact-settle')
-            return {}
+            return types.SimpleNamespace(provider_present_cleanup_contexts={},
+                                         provider_reconciliation_failures={})
 
         def _quiesce(*_args, **_kwargs):
             events.append('generic-quiesce')
@@ -5319,10 +5322,13 @@ class TestTerminateFailedServices:
                 info, require_scheduled=True))
 
         def _settle(_authority, _infos):
-            return {(info.replica_id, info.replica_record_id): context}
+            return types.SimpleNamespace(provider_present_cleanup_contexts={
+                (info.replica_id, info.replica_record_id): context
+            },
+                                         provider_reconciliation_failures={})
 
-        with mock.patch.object(
-                request_postgres,
+        with mock.patch(
+                'sky.serve.service.request_postgres.'
                 'bound_non_pool_provider_present_cleanup_is_authorized',
                 return_value=True):
             terminated, remove_service, _, message, _, _ = self._run(
@@ -5358,6 +5364,29 @@ class TestTerminateFailedServices:
         assert not terminated
         self.quiesce.assert_not_called()
         delete_lb.assert_not_called()
+        remove_service.assert_not_called()
+
+    def test_provider_reconciliation_failure_isolated_from_peer_cleanup(self):
+        authority = object()
+        failed_info = self._replica(1, 'svc-1')
+        healthy_info = self._replica(2, 'svc-2')
+        failed_key = (failed_info.replica_id, failed_info.replica_record_id)
+
+        def _settle(_authority, _infos):
+            return types.SimpleNamespace(
+                provider_present_cleanup_contexts={},
+                provider_reconciliation_failures={
+                    failed_key: 'AWS census remains unproven'
+                })
+
+        terminated, remove_service, _, message, _, _ = self._run(
+            [failed_info, healthy_info],
+            exists=lambda _name: True,
+            bound_authority=authority,
+            bound_settle_side_effect=_settle)
+
+        assert terminated == ['svc-2']
+        assert message is not None and 'some replica clusters' in message
         remove_service.assert_not_called()
 
     def test_action_owned_cluster_termination_uses_exact_record_uuid(self):
@@ -5978,7 +6007,8 @@ class TestTerminateFailedServices:
 
         def _settle(*_args):
             events.append('exact-settle')
-            return {}
+            return types.SimpleNamespace(provider_present_cleanup_contexts={},
+                                         provider_reconciliation_failures={})
 
         def _rotate(*_args, **_kwargs):
             events.append('rotate-authority')

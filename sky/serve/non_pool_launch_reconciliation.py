@@ -105,8 +105,8 @@ def apply_exact_provider_absence_replica_projection(
     pin, and paid claim in one PostgreSQL transaction.  This function performs
     no provider or database I/O.
     """
-    if (getattr(projection, 'provider_evidence', None) !=
-            ordinary_launch_binding.ProviderEvidence.ABSENT):
+    if (getattr(projection, 'provider_evidence', None)
+            != ordinary_launch_binding.ProviderEvidence.ABSENT):
         return None
     context = getattr(projection, 'context', None)
     if (not isinstance(context,
@@ -148,9 +148,7 @@ def apply_exact_provider_absence_replica_projection(
             pool_identity = (paid_capacity.pool_key_payload(pool_key)
                              if isinstance(pool_key, str) else None)
             instances = evidence_payload.get('instances')
-            if (context.profile.kind is not ordinary_launch_binding.
-                    NonPoolLaunchProfileKind.ORDINARY_PAID or
-                    not replica_shape_matches or not ordinary_launch_binding.
+            if (not replica_shape_matches or not ordinary_launch_binding.
                     ordinary_paid_provider_terminal_shape_matches(
                         status, cause, pool_key) or
                     not isinstance(pool_identity, Mapping) or
@@ -170,12 +168,12 @@ def apply_exact_provider_absence_replica_projection(
             pool_identity = (paid_capacity.pool_key_payload(pool_key)
                              if isinstance(pool_key, str) else None)
             replacement_shape_matches = bool(
-                context.profile.kind is
-                ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID
-                or (isinstance(pool_identity, Mapping) and
-                    pool_identity.get('cloud') == 'gcp' and
-                    pool_identity.get('version') == 1 and
-                    pool_identity.get('use_spot') is True))
+                context.profile.kind is ordinary_launch_binding.
+                NonPoolLaunchProfileKind.ORDINARY_PAID or
+                (isinstance(pool_identity, Mapping) and
+                 pool_identity.get('cloud') == 'gcp' and
+                 pool_identity.get('version') == 1 and
+                 pool_identity.get('use_spot') is True))
             if (not replacement_shape_matches or not replica_shape_matches or
                     not ordinary_launch_binding.
                     ordinary_paid_provider_terminal_shape_matches(
@@ -261,8 +259,8 @@ def apply_exact_provider_absence_replica_projection(
     elif explicit_paid_cancel:
         info.status_property.sky_launch_status = (
             common_utils.ProcessStatus.INTERRUPTED)
-    elif (info.status_property.sky_launch_status !=
-          common_utils.ProcessStatus.INTERRUPTED):
+    elif (info.status_property.sky_launch_status
+          != common_utils.ProcessStatus.INTERRUPTED):
         info.status_property.sky_launch_status = common_utils.ProcessStatus.FAILED
     return ProviderAbsenceReplicaProjection(paid_capacity_pool_key=pool_key,
                                             paid_capacity_outcome=paid_outcome)
@@ -364,8 +362,8 @@ def _query_aws_paid_provider_census(
                             'DescribeInstances returned a bad block device.')
                     ebs = block_device.get('Ebs')
                     if (ebs is not None and
-                            (not isinstance(ebs, Mapping) or
-                             ebs.get('DeleteOnTermination') is not True)):
+                        (not isinstance(ebs, Mapping) or
+                         ebs.get('DeleteOnTermination') is not True)):
                         raise ValueError(
                             'Exact AWS instance retains a non-ephemeral EBS '
                             'volume; native cleanup is unsafe.')
@@ -389,11 +387,9 @@ def _query_aws_paid_provider_census(
                         'DescribeInstances returned incomplete identity.')
                 canonical = cast(dict[str, str], raw_canonical)
                 instances.append(canonical)
-    instances = sorted(instances,
-                       key=lambda instance: instance['instance_id'])
-    if (len(instances) > provider_identity['num_nodes'] or
-            len({instance['instance_id']
-                 for instance in instances}) != len(instances)):
+    instances = sorted(instances, key=lambda instance: instance['instance_id'])
+    if (len(instances) > provider_identity['num_nodes'] or len(
+        {instance['instance_id'] for instance in instances}) != len(instances)):
         raise ValueError(
             'EC2 client-token census exceeded its immutable allocation.')
     allowed_states = {
@@ -402,9 +398,9 @@ def _query_aws_paid_provider_census(
     }
     for instance in instances:
         if (instance['availability_zone'] != provider_identity['zone'] or
-                instance['client_token'] != provider_identity['client_token']
-                or instance['cluster_name_on_cloud'] !=
-                provider_identity['cluster_name_on_cloud'] or
+                instance['client_token'] != provider_identity['client_token'] or
+                instance['cluster_name_on_cloud']
+                != provider_identity['cluster_name_on_cloud'] or
                 instance['instance_type'] != provider_identity['instance_type']
                 or instance['market'] != 'spot' or
                 instance['state'] not in allowed_states):
@@ -656,8 +652,8 @@ def observe_provider(
                 'probe_contract': 'immutable-paid-pool-presence-v1',
                 'reason': 'missing-immutable-paid-pool-identity',
             })
-    if (context.profile.kind !=
-            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
+    if (context.profile.kind
+            != ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
         return ProviderObservation(
             ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
                 **base,
@@ -732,8 +728,8 @@ def observe_post_teardown_absence_receipt(
     if not isinstance(receipt,
                       reserved_capacity.ProtocolV2PhysicalAbsenceReceipt):
         raise TypeError('receipt must be a protocol-v2 absence receipt.')
-    if (context.profile.kind !=
-            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
+    if (context.profile.kind
+            != ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Post-teardown physical absence requires a reserved-fill profile.')
     try:
@@ -836,8 +832,8 @@ def terminate_gcp_paid_provider_allocation(
             last_cleanup_error = error
         observation = _observe_gcp_paid_provider(context, replica_info,
                                                  authority)
-        if (observation.evidence is
-                ordinary_launch_binding.ProviderEvidence.ABSENT):
+        if (observation.evidence
+                is ordinary_launch_binding.ProviderEvidence.ABSENT):
             break
         time.sleep(_GCP_POST_TEARDOWN_ABSENCE_POLL_SECONDS)
     _reduce_observation(context, authority, project_replica_result, observation)
@@ -903,8 +899,8 @@ def terminate_aws_paid_provider_allocation(
                 continue
             observation = _observe_aws_paid_provider(context, replica_info,
                                                      authority)
-            if (observation.evidence is
-                    ordinary_launch_binding.ProviderEvidence.ABSENT):
+            if (observation.evidence
+                    is ordinary_launch_binding.ProviderEvidence.ABSENT):
                 break
             last_cleanup_error = None
         except Exception as error:  # pylint: disable=broad-except

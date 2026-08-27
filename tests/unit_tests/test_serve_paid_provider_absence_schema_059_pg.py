@@ -21,10 +21,12 @@ pytestmark = pytest.mark.xdist_group(
 
 _MIGRATION = importlib.import_module(
     'sky.schemas.db.serve_state.059_ordinary_paid_provider_absence')
-_CURRENT_MIGRATION = importlib.import_module(
+_GCP_REPLACEMENT_MIGRATION = importlib.import_module(
     'sky.schemas.db.serve_state.061_paid_replacement_gcp_reconciliation')
 _AWS_CENSUS_MIGRATION = importlib.import_module(
     'sky.schemas.db.serve_state.062_aws_paid_provider_census')
+_CURRENT_MIGRATION = importlib.import_module(
+    'sky.schemas.db.serve_state.063_aws_paid_replacement_reconciliation')
 
 
 def _function_definition(engine: sqlalchemy.engine.Engine,
@@ -51,6 +53,7 @@ def _compact(expression: str) -> str:
 
 
 def _paid_shape_is_accepted(connection: sqlalchemy.engine.Connection,
+                            expression: str = _MIGRATION._PROJECTION_CHECK,
                             **overrides) -> bool:
     quiesced_at = datetime.datetime(2026,
                                     8,
@@ -74,7 +77,6 @@ def _paid_shape_is_accepted(connection: sqlalchemy.engine.Connection,
         'terminal_cause': 'handler_failed',
     }
     values.update(overrides)
-    expression = _MIGRATION._PROJECTION_CHECK
     return bool(
         connection.execute(
             sqlalchemy.text(f'''
@@ -108,8 +110,8 @@ def _paid_pool_scope_is_accepted(
     profile_kind: str = 'ORDINARY_PAID',
     capability_cohort_epoch: int = 11,
     paid_capacity_pool_key: str | None,
+    expression: str = _MIGRATION._PAID_POOL_SCOPE_CHECK,
 ) -> bool:
-    expression = _MIGRATION._PAID_POOL_SCOPE_CHECK
     return bool(
         connection.execute(
             sqlalchemy.text(f'''
@@ -241,13 +243,18 @@ def test_serve059_lineage_and_runtime_metadata() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['062']
+    assert scripts.get_heads() == ['063']
+    assert scripts.get_revision('063').down_revision == '062'
     assert scripts.get_revision('062').down_revision == '061'
     assert scripts.get_revision('061').down_revision == '060'
     assert scripts.get_revision('060').down_revision == '059'
     assert scripts.get_revision('059').down_revision == '058'
-    assert migration_utils.SERVE_VERSION == '062'
+    assert migration_utils.SERVE_VERSION == '063'
     assert migration_utils.serve_target_version(sqlite) == '037'
+    assert (_CURRENT_MIGRATION._ASSOCIATION_PROFILE_SOURCE ==
+            _GCP_REPLACEMENT_MIGRATION._ASSOCIATION_PROFILE_REPLACEMENT)
+    assert (_CURRENT_MIGRATION._REPLICA_PROFILE_SOURCE ==
+            _GCP_REPLACEMENT_MIGRATION._REPLICA_PROFILE_REPLACEMENT)
 
     constraint = next(
         item for item in
@@ -260,13 +267,13 @@ def test_serve059_lineage_and_runtime_metadata() -> None:
         ordinary_launch_binding.ordinary_launch_associations_table.constraints
         if item.name == _MIGRATION._PAID_POOL_SCOPE_CONSTRAINT)
     assert _compact(str(paid_pool_constraint.sqltext)) == _compact(
-        _MIGRATION._PAID_POOL_SCOPE_CHECK)
+        _CURRENT_MIGRATION._PAID_POOL_SCOPE_CHECK)
     paid_receipt_constraint = next(
         item for item in
         ordinary_launch_binding.ordinary_launch_associations_table.constraints
         if item.name == _MIGRATION._PAID_RECEIPT_SCOPE_CONSTRAINT)
     assert _compact(str(paid_receipt_constraint.sqltext)) == _compact(
-        _AWS_CENSUS_MIGRATION._PAID_RECEIPT_SCOPE_CHECK)
+        _CURRENT_MIGRATION._PAID_RECEIPT_SCOPE_CHECK)
 
 
 def test_serve059_migrates_all_three_database_gates(empty_postgres) -> None:
@@ -523,3 +530,134 @@ def test_serve062_accepts_only_pool_bound_aws_census(empty_postgres) -> None:
             paid_capacity_pool_key=pool_key,
             provider_evidence_payload=changed,
             expression=_AWS_CENSUS_MIGRATION._PAID_RECEIPT_SCOPE_CHECK)
+
+
+def test_serve063_migrates_aws_replacement_database_gates(
+        empty_postgres) -> None:
+    config = migration_utils.get_alembic_config(empty_postgres,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '062')
+
+    old_association_guard = _function_definition(
+        empty_postgres, _CURRENT_MIGRATION._ASSOCIATION_GUARD_FUNCTION)
+    old_replica_guard = _function_definition(
+        empty_postgres, _CURRENT_MIGRATION._REPLICA_GUARD_FUNCTION)
+    assert _CURRENT_MIGRATION._ASSOCIATION_PROFILE_SOURCE in (
+        old_association_guard)
+    assert _CURRENT_MIGRATION._ASSOCIATION_PROFILE_REPLACEMENT not in (
+        old_association_guard)
+    assert _CURRENT_MIGRATION._REPLICA_PROFILE_SOURCE in old_replica_guard
+    assert (_CURRENT_MIGRATION._REPLICA_PROFILE_REPLACEMENT
+            not in old_replica_guard)
+
+    alembic_command.upgrade(config, '063')
+
+    assert migration_utils.get_current_alembic_revision(
+        empty_postgres, migration_utils.SERVE_DB_NAME) == '063'
+    assert _compact(
+        _constraint_definition(
+            empty_postgres,
+            _CURRENT_MIGRATION._PROJECTION_CONSTRAINT)) == _compact(
+                _CURRENT_MIGRATION._PROJECTION_CHECK)
+    assert _compact(
+        _constraint_definition(
+            empty_postgres,
+            _CURRENT_MIGRATION._PAID_POOL_SCOPE_CONSTRAINT)) == _compact(
+                _CURRENT_MIGRATION._PAID_POOL_SCOPE_CHECK)
+    assert _compact(
+        _constraint_definition(
+            empty_postgres,
+            _CURRENT_MIGRATION._PAID_RECEIPT_SCOPE_CONSTRAINT)) == _compact(
+                _CURRENT_MIGRATION._PAID_RECEIPT_SCOPE_CHECK)
+    assert _CURRENT_MIGRATION._ASSOCIATION_PROFILE_REPLACEMENT in (
+        _function_definition(empty_postgres,
+                             _CURRENT_MIGRATION._ASSOCIATION_GUARD_FUNCTION))
+    assert _CURRENT_MIGRATION._REPLICA_PROFILE_REPLACEMENT in (
+        _function_definition(empty_postgres,
+                             _CURRENT_MIGRATION._REPLICA_GUARD_FUNCTION))
+
+    with pytest.raises(RuntimeError, match='Serve063 is forward-only'):
+        alembic_command.downgrade(config, '062')
+    assert migration_utils.get_current_alembic_revision(
+        empty_postgres, migration_utils.SERVE_DB_NAME) == '063'
+
+
+def test_serve063_accepts_only_exact_aws_spot_replacement_evidence(
+        empty_postgres) -> None:
+    config = migration_utils.get_alembic_config(empty_postgres,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '063')
+    pool_key = _paid_pool_key(
+        cloud='aws', provider_identity={'aws_account_id': '123456789012'})
+    identity = {
+        'aws_account_id': '123456789012',
+        'client_token': 'a' * 64,
+        'cluster_name_on_cloud': 'service-1-tenant',
+        'credential_profile': 'prod',
+        'instance_type': 'gpu.large',
+        'num_nodes': 1,
+        'region': 'region-a',
+        'use_spot': True,
+        'workspace': 'default',
+        'zone': 'zone-a',
+    }
+    payload = {
+        'association_id': '59100000-0000-4000-8000-000000000001',
+        'cluster_name': 'service-1',
+        'instances': [],
+        'probe_contract': 'aws-client-token-instance-presence-v1',
+        'profile_kind': 'UNKNOWN_CAPACITY_REPLACEMENT',
+        'provider_identity': identity,
+        'replica_record_id': '59100000-0000-4000-8000-000000000003',
+        'result': 'ABSENT',
+    }
+    on_demand_payload = json.loads(pool_key)
+    on_demand_payload['use_spot'] = False
+    on_demand_pool_key = json.dumps(on_demand_payload,
+                                    sort_keys=True,
+                                    separators=(',', ':'))
+
+    with empty_postgres.connect() as connection:
+        assert _paid_pool_scope_is_accepted(
+            connection,
+            profile_kind='UNKNOWN_CAPACITY_REPLACEMENT',
+            capability_cohort_epoch=13,
+            paid_capacity_pool_key=pool_key,
+            expression=_CURRENT_MIGRATION._PAID_POOL_SCOPE_CHECK)
+        assert not _paid_pool_scope_is_accepted(
+            connection,
+            profile_kind='UNKNOWN_CAPACITY_REPLACEMENT',
+            capability_cohort_epoch=13,
+            paid_capacity_pool_key=on_demand_pool_key,
+            expression=_CURRENT_MIGRATION._PAID_POOL_SCOPE_CHECK)
+        assert _paid_receipt_scope_is_accepted(
+            connection,
+            profile_kind='UNKNOWN_CAPACITY_REPLACEMENT',
+            capability_cohort_epoch=13,
+            paid_capacity_pool_key=pool_key,
+            provider_evidence_payload=payload,
+            expression=_CURRENT_MIGRATION._PAID_RECEIPT_SCOPE_CHECK)
+        assert _paid_shape_is_accepted(
+            connection,
+            expression=_CURRENT_MIGRATION._PROJECTION_CHECK,
+            profile_kind='UNKNOWN_CAPACITY_REPLACEMENT',
+            paid_capacity_pool_key=pool_key,
+            terminal_status='CANCELLED',
+            terminal_cause='explicit_cancel')
+
+        changed = json.loads(json.dumps(payload))
+        changed['provider_identity']['aws_account_id'] = '999999999999'
+        assert not _paid_receipt_scope_is_accepted(
+            connection,
+            profile_kind='UNKNOWN_CAPACITY_REPLACEMENT',
+            capability_cohort_epoch=13,
+            paid_capacity_pool_key=pool_key,
+            provider_evidence_payload=changed,
+            expression=_CURRENT_MIGRATION._PAID_RECEIPT_SCOPE_CHECK)
+        assert not _paid_shape_is_accepted(
+            connection,
+            expression=_CURRENT_MIGRATION._PROJECTION_CHECK,
+            profile_kind='UNKNOWN_CAPACITY_REPLACEMENT',
+            paid_capacity_pool_key=on_demand_pool_key,
+            terminal_status='CANCELLED',
+            terminal_cause='explicit_cancel')
