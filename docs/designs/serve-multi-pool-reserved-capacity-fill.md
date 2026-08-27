@@ -249,6 +249,19 @@ allocation fields remain ``UNKNOWN``. GCP keeps its existing VM, disk, and
 retained-operation observer. This closes teardown without treating a missing
 SkyPilot cluster row as provider absence and without manual row deletion.
 
+The first AWS census correctly returned an exact empty allocation, but the
+live PostgreSQL ``serve059_paid_receipt_scope_ck`` still admitted only the
+older AWS negative-ack ``receipt`` envelope. The durable census reducer and
+the table constraint must recognize the same closed authority. Serve062
+therefore widens only that existing constraint to accept
+``aws-client-token-instance-presence-v1``. The application reducer validates
+the complete association-derived identity; the table constraint independently
+rechecks its account, workspace, region, zone, instance type, node count and
+Spot flag against the immutable paid pool, plus the canonical client-token and
+cluster-name shapes. The legacy negative-ack arm and non-AWS behavior are
+retained. No row is rewritten and no evidence is manufactured by the
+migration.
+
 Before PR #1758, aggregate queued work applied priority timeout weights while
 the exact-card compatibility allocator consumed raw queued profile counts. A
 complete compatibility report could therefore raise the aggregate target back
