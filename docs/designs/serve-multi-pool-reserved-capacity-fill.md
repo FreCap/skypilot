@@ -108,6 +108,76 @@ demand comparator is relaxed. The first reconcile after controller birth may
 prepare no inputs and fail closed; the captured demand then makes the next
 reconcile use the canonical short section.
 
+Release ``1.1.1524`` deployed that preparation order in Helm revision 643,
+using one immutable image digest across two API, two controller, and three
+executor Pods without recreating lifecycle 117. Run
+``final10k-1524-20260827-0246`` then accepted 2,125 stable identities, retained
+29 transport-ambiguous identities for exact reconciliation, and left 7,846
+unsubmitted identities when its verifier stopped. Live reports contained 128
+in-flight requests and queue depths of 1,758--1,770; the autoscaler computed
+targets of 414 and 494. Nevertheless three consecutive positive-plan rounds
+failed with ``Demand feed advanced with changed or unavailable semantics
+before plan publication``. PostgreSQL, AWS, and GCP remained at zero paid and
+zero on-demand capacity throughout. This is decisive evidence that shortening
+an optimistic post-demand section is not a correctness-complete design: two HA
+reporters may legitimately stagger changed demand often enough that no safe
+publication gap exists.
+
+The final steady-state boundary therefore does not compare a plan made from an
+earlier demand snapshot with a later one. Before the transaction, the
+controller prepares only immutable replica/runtime/shape/Kueue inputs and
+samples the durable planning fingerprint on both sides of that preparation.
+It then acquires the controller's short in-process routing epoch before any
+PostgreSQL row. This preserves the routing-epoch -> PostgreSQL order used by
+service-version transitions and prevents an update from deadlocking with
+planning. While that epoch remains held, one PostgreSQL transaction takes the
+existing deterministic protocol-first database lock order: protocol,
+service/owner/version, current demand generation and reporter rows, route,
+allocation, capacity/Kueue graph, and plan head. The transaction recomputes
+the planning fingerprint from the exact locked service and replica rows and
+rejects unless it equals the prepared fingerprint. Because every demand
+reporter locks the service row before changing
+its report or generation, the transaction reconstructs one exact current
+normalized demand snapshot while report writers briefly wait. It reconstructs
+the exact current economic reserved-supply projection from the already locked
+capacity graph, then invokes one bounded in-memory planning callback. The
+callback performs no PostgreSQL, provider, Kubernetes, HTTP, replica-manager
+lock, or filesystem I/O. It runs under the already-owned routing epoch and
+returns the supply-aware exact-card target and local
+actuation candidate; the same transaction validates the cap, persists the plan
+and head, and commits. Only the returned committed authority may publish local
+target state or initiate a provider effect.
+
+This collapses the optimistic supply projection plus later byte-comparison into
+one canonical locked input. It does not weaken freshness or treat changed
+demand as equivalent: demand that commits before the service lock is included
+in the plan, and demand that arrives after it commits in the next generation
+after the capacity transaction. Unknown, incomplete, stale, or route-mismatched
+demand still fails closed. The callback runs only after all conflict-prone rows
+are locked, so no expected concurrency rejection remains after it mutates the
+candidate autoscaler state; a database failure still publishes neither local
+state nor provider authority and the next current reconcile replaces that
+candidate state.
+
+The promoted controller has no second publisher or compatibility branch. The
+former controller-local ``_publish_ordered_paid_authority`` helper is removed;
+all promoted positive and zero residuals use the same
+``plan_and_publish_current`` transaction. The repository's lower-level
+``publish`` operation remains an internal primitive and claim-path validation
+surface, not an alternate promoted reconciliation path.
+
+A fresh positive snapshot can follow a committed zero-demand retirement while
+the pre-transaction replica snapshot still marks paid capacity as scaling
+down. Every nonterminal cleanup-unproven paid row remains part of the locked
+paid baseline even after ``is_scale_down`` becomes true, so the transaction
+cannot authorize a replacement for capacity that may still exist or bill.
+Cancellation remains its own exact service/demand-generation transaction and
+is not hidden in the planning callback. After the conservative plan commits,
+the controller cancels only retirements fenced by that exact positive demand
+generation; if any row changes, it publishes no local candidate, refreshes
+replica/runtime/shape inputs and their fingerprint, and retries. No manager or
+provider operation runs under the capacity transaction.
+
 Zero-residual revocation is deliberately unbound from a reserved allocation.
 It therefore discards any earlier economic supply projection before building
 the plan; carrying an allocation graph digest on an unbound zero plan is both
@@ -192,8 +262,8 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` at merge `f22c459d53749e0d3a707d45621b633f6528073e`, including PR #1750's after-lock claim authorization, PR #1749's cleanup evidence, PR #1748's exact post-ABSENT retirement, PR #1747's reserved-absence reducer correction, PR #1746's first claim-heartbeat ordering correction, and PRs #1739--#1744. |
-| Deployed control plane | SkyPilot `1.1.1519`, Helm revision 639. Two API, two controller, and three executor Pods are Ready with zero restarts and all use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:afef5d1ec58af318dc262e2b21bbcb246581e4872d30e94c3077a7646a6e1186`. Helm storage remains disabled and the namespace has no PVC. |
+| Source base | `origin/improvements` at merge `0caf9de01`, tag `v1.1.1524`, including PR #1755's immutable-input preparation, PRs #1752--#1754's earlier publication-order corrections, PR #1750's after-lock claim authorization, and the retained-row/reducer corrections in PRs #1746--#1749. The PostgreSQL-linearized planning correction described above is the active source change and is not yet deployed or proven. |
+| Deployed control plane | SkyPilot `1.1.1524`, Helm revision 643. Two API, two controller, and three executor Pods are Ready and all use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:13af0a9dacf43cd1f8768bedfa3a041ad43e4f831865b581ef3e6bf0c9c554b7`. Helm storage remains disabled and the namespace has no PVC. |
 | Writer protocol | Public API 93, worker projection 10, non-pool capability cohort 12, and async request-ledger protocol 1. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. |
 | Active service | Lifecycle 116 and all of its child authority were removed by the supported fenced purge after PR #1748 deployed. Lifecycle 117, incarnation `3bc2c88b-2c28-40fa-a9d5-482880767b3e`, was then recreated from the canonical PostgreSQL-only spec with paid residual cap 100 to continue heterogeneous qualification. Helm revision 640 deployed release `1.1.1521` and preserved lifecycle 117 and service version 1 while replacing the control plane and both warm-standby load-balancer slots. The service is test-only and not yet production-qualified. |
@@ -203,11 +273,11 @@ it has merged or been deployed.
 | Reserved teardown projection | Complete. PR #1747 projected all formerly blocked associations and retired 194 rows. PR #1748 normalized current writers to the existing immediate-removal marker and accepted only the exact `1.1.1516` `FAILED/FAILED` shape as an N-1 DB-retirement candidate. Release `1.1.1517` plus the supported orphan purge retired the final two rows through exact PostgreSQL authority and independent owner, record, cluster, and Kueue fences. No provider, Kueue, schema, migration, or manual-cleanup behavior changed. Exact service/control-plane/Kubernetes/GCP zero is production-proven. |
 | PHX access | The controller identity can exact-read the required namespace/queue and manage only worker Pod/Service lifecycle; it cannot list or patch ClusterQueues. The worker ServiceAccount is tokenless and cannot read Pods, queues, or secrets. A historical audit-only group still has an unused broad Kueue LIST grant from platform PR #8800; it is read-only, has no scheduling effect, and is not used or expanded by this rollout. |
 | Paid state at idle | The 23:11--23:12 UTC post-fix census found PostgreSQL paid claims 0, waiters 0, Spot replicas 0, paid-attributed replicas 0, and native provider inventories at zero: AWS across 18 regions had no service instance, open/active Spot request, or tagged volume; GCP had no service instance or disk. No scan errors occurred. Earlier lifecycle-gate exact-zero samples remain in the linked evidence bundle. |
-| Routing and queue | The recreated lifecycle-117 endpoint is Ready with 313/313 reserved replicas. The lifecycle-115 run attempted all 10,000 stable synthetic IDs at concurrency 256, but used them only as bounded provider-scale stimulus; it is not the separate 10,000-terminal-request ledger proof. A fresh nonzero queued/processing/in-flight/completed UI proof remains part of the final heterogeneous load run. |
+| Routing and queue | Lifecycle 117 is `READY` with 345 reserved replicas and no paid rows. The lifecycle-115 run attempted all 10,000 stable synthetic IDs at concurrency 256, but used them only as bounded provider-scale stimulus; it is not the separate 10,000-terminal-request ledger proof. Run `final10k-1524-20260827-0246` proved current nonzero queue/in-flight demand but stopped after the publication race described above. A fresh nonzero queued/processing/in-flight/completed UI proof remains part of the final heterogeneous load run. |
 | Partial mixed proof | Provider/DB censuses at 2026-08-25 19:45:47.538 and 19:45:56.281 UTC bracketed a 72-request completion wave and both had 44 reserved plus 28 paid replicas all `READY`, the same 28 AWS Spot instances—27 `g6.2xlarge` and one `g6.4xlarge`—and zero on-demand. The wave completed from 19:45:48.956 through 19:45:51.187; every request performed 9.533–12.451 seconds of concurrency-one GPU work, so at least 28 necessarily executed on Spot beside the 44 reserved workers. The Spot instances later fully drained at the provider. |
 | GCP Spot lifecycle proof | Complete on `1.1.1513`. The fixed-120 update completed at 18:23:39.277 UTC. After five fail-closed prospective conflicts while the traffic writer changed telemetry, the sixth attempt atomically committed all 120 debits at 18:25:12.183. Provider-native observations first reached 100 `RUNNING` at 18:28:54.100, then 107, 110, 114, and 117. Every object was GCP Spot `g2-standard-4` with exactly one NVIDIA L4; zero on-demand or non-Spot capacity appeared. The peak 117 VMs were in `asia-northeast3` and `asia-south1`. Normal teardown reached native `RUNNING=0` at 18:35:00.512 and exact all-state zero at 18:35:39.315. |
-| Final load proof | Not complete. The fresh lifecycle-117 run `final10k-20260827-0045` has retained the same immutable identities across two safe verifier stops. It has now accepted 3,959 requests with 26 transport-ambiguous outcomes and 6,015 pending identities. Live telemetry proved nonzero queued and in-flight counts. The verifier polls only known immutable marker keys, but S3 represents a missing exact key as a `403 AccessDenied` mentioning `s3:ListBucket` when the caller intentionally has `GetObject` without bucket listing. The verifier must treat only that precise response as absent and keep every other authorization failure fatal. No IAM expansion and no replacement run identity are required. |
-| Demand/publication ordering | Follow-up source correction in progress. Provider-mutation lock-convoy removal merged in PR #1728, with launch/reduction corrections in PRs #1742--#1744, and is deployed in `1.1.1513`. PR #1752 moved the 300-plus-replica supply projection before the fresh demand boundary and deployed in `1.1.1521`; the resumed load no longer repeated the demand-generation conflict. It did expose the redundant post-demand broker-allocation reread, which can discard that exact projection under normal heartbeat churn. The final path captures one allocation/projection pair per reconcile and relies on publication's PostgreSQL locks to revalidate demand, route, allocation, capacity graph, cap, and ownership without accepting changed telemetry. |
+| Final load proof | Not complete. Run `final10k-1524-20260827-0246` retains one immutable 10,000-ID manifest. It accepted 2,125 identities, classified 29 exact transport outcomes as ambiguous for durable reconciliation, and retained 7,846 pending identities before stopping on the publication defect. Live telemetry proved nonzero queued/in-flight demand and computed targets of 414 and 494. The exact 503 body `No replica has confirmed free async capacity. Use "sky serve status [SERVICE_NAME]" to check the replica status.` is a definitive retryable pre-dispatch rejection only when the PostgreSQL request receipt is exactly `REJECTED_PRE_DISPATCH`; the harness may classify that exact pair without relaxing any other 5xx outcome. The run identity must be resumed, not replaced. |
+| Demand/publication ordering | Root cause confirmed on deployed `1.1.1524`: an optimistic plan cannot reliably fit between staggered HA report changes, even after all known slow preparation was moved earlier. The source correction now uses one PostgreSQL-linearized current-demand/current-supply planning transaction with a bounded no-I/O callback, followed by local publication and actuation only after commit; the superseded promoted publisher and its duplicate tests are removed. The full controller and capacity-admission unit suites pass. Focused real-PostgreSQL tests prove current-demand inclusion, reporter serialization, callback rollback, locked allocation supply, cleanup-unproven paid accounting, and rejection of a replica mutation through the exact locked fingerprint. Deployment and final load proof remain pending. |
 
 The completed paid-gate post-rollout census was green after Helm revision 635:
 the service, replicas, claims, waiters, request associations, queue rows,
@@ -517,15 +587,31 @@ The result is clipped by the elected service cap and all cleanup-unproven paid
 rows. The plan carries exact demand, route, service, capacity-graph, reserved
 allocation, accelerator, and pool identity.
 
-Supply preparation precedes the demand correctness boundary. The controller
-may optimistically project the current reserved economic graph before reading
-demand, because that projection authorizes nothing. It then captures one fresh
-durable demand generation, computes the target against the prepared graph, and
-immediately publishes. The publication transaction locks and validates demand
-and route before reconstructing the capacity graph under its normal locks. The
-prepared graph must byte-match that locked reconstruction. Thus neither a stale
-supply projection nor a changed demand report can commit, while reporter
-cadence is no longer forced to outrun fleet-wide projection latency.
+Only immutable computation inputs are prepared before the correctness
+boundary: replica/runtime handles, autoscaler decision inputs, and a durable
+planning fingerprint sampled before and after preparation. The controller does
+not project economic supply or capture demand optimistically. It acquires its
+short routing epoch first; one PostgreSQL transaction then locks the service,
+current demand/report/route authority, allocation and current capacity/Kueue
+graph in deterministic database order. The transaction recomputes and matches
+the fingerprint from those locked service/replica rows before planning. It
+reconstructs both the current normalized demand snapshot and the exact current
+reserved-supply projection from those locked rows, then invokes one bounded
+in-memory planner. Reporter writers already take the service lock first, so a
+writer either commits before this snapshot and is included or waits and becomes
+the next generation. The resulting target, supply accounting, paid residual,
+plan and head therefore describe one linearized state, with no heartbeat-sized
+optimistic publication window and no duplicate supply projection to compare.
+
+The planning callback may inspect only its immutable prepared inputs and the
+locked demand/supply values passed by the repository. It performs no database,
+provider, Kubernetes, HTTP, filesystem, or replica-manager operation. All
+conflict-prone rows are locked before it runs; after it returns, only canonical
+validation and plan/head writes remain. Local target, logical reconcile state,
+retirement state, and provider effects are published only after commit.
+Fresh-positive retirement cancellation is a distinct exact-generation
+transaction after an aborted candidate and before a fully refreshed retry; it
+never runs inside the callback.
 
 A prospective Phase-A debit may cross newer demand receipt generations only
 when the semantic plan itself is unchanged. In the same PostgreSQL transaction
@@ -542,6 +628,12 @@ rolling-window arrival expiry remains the only accepted demand-semantic
 contraction. This lets a large provider-free candidate preparation wave survive
 HA heartbeat churn without weakening immediate zero-demand revocation or the
 commit-before-provider boundary.
+
+The semantic-equivalence comparator above remains a defensive contract for a
+previously committed plan used by later claim admission. The controller's
+canonical plan publisher no longer depends on it to race a current reporter:
+its plan is built from the exact demand generation already locked in the same
+transaction.
 
 One bounded paid wave uses one PostgreSQL transaction to:
 
@@ -926,6 +1018,31 @@ on-demand spill.
   Repeat with fresh-zero, queue, rejection, in-flight, compatibility, reporter,
   and route changes and prove the complete batch rolls back with zero rows,
   claims, waiters, or pool debits.
+- Hold the routing epoch, then hold the linearized planning callback after the transaction has locked the
+  current service, demand/report/route, allocation, capacity/Kueue, and plan
+  rows. Start both HA report writers and prove they wait at the service row;
+  prove the callback sees the exact last committed generation, one plan/head
+  commits, and both writers advance normally after commit. Repeat with changed
+  demand already committed before the lock and prove the new semantics are
+  planned rather than rejected as stale.
+- Race a service-version transition against that held callback and prove it
+  waits for the routing epoch without a routing/PostgreSQL lock inversion.
+  Mutate a replica between immutable input preparation and the transaction;
+  prove the locked fingerprint rejects the stale candidate without invoking
+  the callback or publishing local/provider state.
+- Instrument every PostgreSQL/provider/Kubernetes/HTTP/filesystem and
+  replica-manager boundary reachable from the callback to fail if invoked;
+  prove current-demand/current-supply planning completes with no I/O. Inject a
+  callback exception and a final plan-write failure and prove no plan/head,
+  claim, local target, or provider authority becomes visible.
+- Begin from a committed zero-demand retirement, advance to exact positive
+  demand, and give the planner a prepared snapshot containing that active paid
+  retirement. Prove the locked paid baseline still counts the row and commits
+  no replacement residual; prove the separate exact-generation cancellation
+  commits after that boundary, local publication is skipped, refreshed
+  preparation removes the retiring classification, and the next transaction
+  publishes exactly one correct residual without double-counting
+  cleanup-unproven paid capacity.
 - After an exact paid claim commits, expire or remove every demand report and
   prove its bound request may enter provider I/O once while a prospective claim
   still fails closed. Repeat with an ACTIVE-slot/cutover-generation mismatch.

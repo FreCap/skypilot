@@ -388,6 +388,33 @@ class CapacityPlanInput:
 
 
 @dataclasses.dataclass(frozen=True)
+class CapacityPlanDecision:
+    """Pure planner output for one locked current demand/supply snapshot.
+
+    The repository owns every durable identity and inventory field.  A planner
+    may return only the exact-card target plus the three derived autoscaler
+    fields that are intentionally embedded in ``normalized_demand`` for later
+    claim verification.
+    """
+
+    capacity_target_by_accelerator: Mapping[str, int]
+    normalized_demand_extensions: Mapping[str, Any]
+
+    def canonical_target(self, accounting_cards: set[str]) -> dict[str, int]:
+        target = _canonical_counts(self.capacity_target_by_accelerator,
+                                   'capacity_target_by_accelerator')
+        if set(target) != accounting_cards:
+            raise ValueError('Capacity planner target does not cover the exact '
+                             'accounting cards.')
+        if (not isinstance(self.normalized_demand_extensions, Mapping) or
+                set(self.normalized_demand_extensions)
+                != _PLAN_DERIVED_DEMAND_FIELDS):
+            raise ValueError('Capacity planner demand extensions are '
+                             'incomplete or contain authority fields.')
+        return target
+
+
+@dataclasses.dataclass(frozen=True)
 class PaidLaunchAuthority:
     """Immutable planner tuple copied into one or more paid claims."""
 
@@ -659,11 +686,14 @@ def _lock_capacity_rows(
             _ZERO_COST_INTENTS.c.service_hash == service_hash).order_by(
                 _ZERO_COST_INTENTS.c.intent_idempotency_key).with_for_update()
     ).mappings().all()
+    replica_revision = sqlalchemy.literal_column('replicas.xmin::text').label(
+        '_row_revision')
     replica_rows = connection.execute(
         sqlalchemy.select(
             _REPLICAS.c.replica_id, _REPLICAS.c.status, _REPLICAS.c.version,
             _REPLICAS.c.reserved_fill_intent_idempotency_key,
-            _REPLICAS.c.replica_state_version, _REPLICAS.c.replica_state).where(
+            _REPLICAS.c.replica_state_version, _REPLICAS.c.replica_state,
+            replica_revision).where(
                 _REPLICAS.c.service_name == service_name).order_by(
                     _REPLICAS.c.replica_id).with_for_update()).mappings().all()
 
@@ -719,6 +749,27 @@ def _lock_capacity_rows(
         live_intent_keys=frozenset(live_intent_keys),
         planned_capacity_by_intent_key=planned_capacity_by_intent_key,
         capacity_unit_by_intent_key=capacity_unit_by_intent_key)
+
+
+def _locked_planning_state_fingerprint(service: Mapping[str, Any],
+                                       locked: _LockedCapacityRows) -> str:
+    """Match the controller preload fingerprint from already locked rows."""
+    active_versions = service['active_versions']
+    if isinstance(active_versions, str):
+        active_versions = json.loads(active_versions) if active_versions else []
+    material = {
+        'runtime': {
+            'hash': service['hash'],
+            'controller_pid': service['controller_pid'],
+            'controller_ip': service['controller_ip'],
+            'active_versions': active_versions or [],
+        },
+        'replicas': [(int(row['replica_id']), row['_row_revision'])
+                     for row in locked.replica_rows],
+    }
+    encoded = json.dumps(material, sort_keys=True,
+                         separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _lock_kueue_projection(
@@ -783,7 +834,12 @@ def _project_capacity_inventory(
             continue
         state, planned_capacity, is_zero_cost, is_scale_down = (
             _validated_replica_attribution(row))
-        if is_scale_down:
+        # A reserved row stops contributing once its scheduler capacity is
+        # being yielded.  A paid row is different: until its exact claim and
+        # cleanup-proven provider allocation disappear it remains both a cost
+        # debit and capacity already purchased for residual accounting.  Do
+        # not launch a paid replacement merely because retirement began.
+        if is_scale_down and is_zero_cost:
             continue
         card = (AGGREGATE_ACCELERATOR if aggregate else _replica_card(state))
         if card not in accounting_cards:
@@ -1656,6 +1712,382 @@ class CapacityAdmissionRepository:
             economic_kueue_capacity_by_replica_id=economic_kueue,
             economic_capacity_graph_sha256=economic_digest)
 
+    @staticmethod
+    def _write_plan_in_connection(
+        connection: sqlalchemy.engine.Connection,
+        plan: CapacityPlanInput,
+        *,
+        full_zero_cost: Mapping[str, int],
+        full_paid: Mapping[str, int],
+        pending_zero_cost: Mapping[str, int],
+        allocation_reserved: Mapping[str, int],
+        ttl_seconds: int,
+    ) -> Mapping[str, Any]:
+        """Persist one already validated plan from its locked inventory."""
+        capacity_target = _canonical_counts(plan.capacity_target_by_accelerator,
+                                            'capacity_target_by_accelerator')
+        accounting_cards = set(capacity_target)
+        watermark_sha256 = _sha256(_canonical_watermark(plan.receipt_watermark))
+        head = connection.execute(
+            sqlalchemy.select(_HEADS).where(
+                _HEADS.c.service_name ==
+                plan.service_name).with_for_update()).mappings().one_or_none()
+        previous = None
+        if head is not None:
+            previous = connection.execute(
+                sqlalchemy.select(_PLANS).where(
+                    _PLANS.c.service_name == plan.service_name,
+                    _PLANS.c.generation ==
+                    head['generation'])).mappings().one_or_none()
+        duplicate_payload = None
+        duplicate_digest = None
+        if (previous is not None and
+                previous['service_hash'] == plan.service_hash and
+                previous['service_lifecycle_epoch']
+                == plan.service_lifecycle_epoch and
+                previous['service_version'] == plan.service_version and
+                previous['demand_source_epoch'] == plan.demand_source_epoch):
+            prior_claim_units = _claim_units_for_plan(
+                connection,
+                service_name=plan.service_name,
+                service_hash=plan.service_hash,
+                generation=int(previous['generation']),
+                accounting_cards=accounting_cards)
+            prior_paid_baseline = _subtract_counts(full_paid, prior_claim_units)
+            duplicate_payload = plan.payload(
+                existing_zero_cost_capacity_by_accelerator=full_zero_cost,
+                pending_zero_cost_capacity_by_accelerator=pending_zero_cost,
+                allocation_reserved_capacity_by_accelerator=(
+                    allocation_reserved),
+                existing_paid_capacity_by_accelerator=prior_paid_baseline,
+                paid_residual_by_accelerator=_paid_residual(
+                    capacity_target, full_zero_cost, pending_zero_cost,
+                    prior_paid_baseline, allocation_reserved))
+            duplicate_digest = _sha256(duplicate_payload)
+        duplicate = bool(previous is not None and
+                         duplicate_digest == previous['content_sha256'])
+        if duplicate:
+            assert previous is not None
+            generation = int(previous['generation'])
+            payload = duplicate_payload
+            digest = duplicate_digest
+        else:
+            payload = plan.payload(
+                existing_zero_cost_capacity_by_accelerator=full_zero_cost,
+                pending_zero_cost_capacity_by_accelerator=pending_zero_cost,
+                allocation_reserved_capacity_by_accelerator=(
+                    allocation_reserved),
+                existing_paid_capacity_by_accelerator=full_paid,
+                paid_residual_by_accelerator=_paid_residual(
+                    capacity_target, full_zero_cost, pending_zero_cost,
+                    full_paid, allocation_reserved))
+            digest = _sha256(payload)
+            maximum = connection.execute(
+                sqlalchemy.select(sqlalchemy.func.max(_PLANS.c.generation)).
+                where(_PLANS.c.service_name == plan.service_name)).scalar_one()
+            generation = 1 if maximum is None else int(maximum) + 1
+            now = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.clock_timestamp())).scalar_one()
+            connection.execute(
+                sqlalchemy.insert(_PLANS).values(
+                    service_name=plan.service_name,
+                    generation=generation,
+                    service_hash=plan.service_hash,
+                    service_lifecycle_epoch=plan.service_lifecycle_epoch,
+                    service_version=plan.service_version,
+                    demand_source_epoch=plan.demand_source_epoch,
+                    demand_feed_generation=plan.demand_feed_generation,
+                    route_generation=plan.route_generation,
+                    route_sha256=plan.route_sha256,
+                    route_source_epoch=plan.route_source_epoch,
+                    protocol_version=PROTOCOL_VERSION,
+                    content_sha256=digest,
+                    payload=payload,
+                    created_at=now))
+        assert payload is not None and digest is not None
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        head_insert = postgresql.insert(_HEADS).values(
+            service_name=plan.service_name,
+            generation=generation,
+            demand_feed_generation=plan.demand_feed_generation,
+            receipt_watermark_sha256=watermark_sha256,
+            refreshed_at=now,
+            valid_until=now + datetime.timedelta(seconds=ttl_seconds))
+        connection.execute(
+            head_insert.on_conflict_do_update(
+                index_elements=[_HEADS.c.service_name],
+                set_={
+                    'generation': generation,
+                    'demand_feed_generation': plan.demand_feed_generation,
+                    'receipt_watermark_sha256': watermark_sha256,
+                    'refreshed_at': now,
+                    'valid_until': now +
+                                   datetime.timedelta(seconds=ttl_seconds),
+                }))
+        # Capacity plans are operational fences, not an unbounded history
+        # store.  The current head and the composite claim FK retain every
+        # generation that can still authorize work; all other generations
+        # are superseded and may be removed in this same transaction.
+        connection.execute(
+            sqlalchemy.delete(_PLANS).where(
+                _PLANS.c.service_name == plan.service_name, _PLANS.c.generation
+                != generation, ~sqlalchemy.exists().where(
+                    _CLAIMS.c.service_name == _PLANS.c.service_name,
+                    _CLAIMS.c.capacity_plan_generation == _PLANS.c.generation)))
+        return connection.execute(
+            sqlalchemy.select(_PLANS).where(
+                _PLANS.c.service_name == plan.service_name,
+                _PLANS.c.generation == generation)).mappings().one()
+
+    def plan_and_publish_current(
+        self,
+        *,
+        service_name: str,
+        service_hash: str,
+        service_lifecycle_epoch: int,
+        service_version: int,
+        accounting_cards: Mapping[str, int],
+        sequenced_reserved_fill: bool,
+        reserved_fill_allocation_map: AuthenticatedAllocationMap | None,
+        planner: Callable[[
+            demand_state.DurableAutoscalingSnapshot, ReservedSupplyProjection |
+            None
+        ], CapacityPlanDecision],
+        expected_planning_state_fingerprint: str | None = None,
+        ttl_seconds: int = constants.CAPACITY_PLAN_TTL_SECONDS,
+    ) -> tuple[PaidLaunchAuthority, demand_state.DurableAutoscalingSnapshot]:
+        """Plan and publish from one PostgreSQL-linearized current graph.
+
+        Every potentially conflicting durable input is locked before
+        ``planner`` runs.  The callback must therefore be bounded, in-memory,
+        and free of database, provider, manager, network, or filesystem I/O.
+        Demand reporters lock the service row before replacing a report, so a
+        report is either part of this snapshot or the next generation.
+        """
+        canonical_cards = _canonical_counts(accounting_cards,
+                                            'accounting_cards')
+        card_set = set(canonical_cards)
+        if not card_set:
+            raise ValueError('accounting_cards must not be empty.')
+        if not isinstance(sequenced_reserved_fill, bool):
+            raise ValueError('sequenced_reserved_fill must be boolean.')
+        if (not sequenced_reserved_fill and
+                reserved_fill_allocation_map is not None):
+            raise ValueError('A non-fill plan cannot carry an allocation.')
+        if not callable(planner):
+            raise ValueError('planner must be callable.')
+        if (expected_planning_state_fingerprint is not None and
+                not _SHA256_RE.fullmatch(expected_planning_state_fingerprint)):
+            raise ValueError('expected_planning_state_fingerprint must be a '
+                             'lowercase SHA-256 digest.')
+        if not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
+            raise ValueError('ttl_seconds must be positive.')
+
+        with self.engine.begin() as connection:
+            if sequenced_reserved_fill:
+                # Allocation writers use this protocol mutex before any
+                # service-local row.  Taking it even for a possible zero plan
+                # lets current demand choose bound-positive versus unbound-zero
+                # without changing lock order after the snapshot is known.
+                serve_state.lock_zero_cost_protocol_for_bound_launch_observation(
+                    connection)
+            service = connection.execute(
+                sqlalchemy.select(_SERVICES).where(
+                    _SERVICES.c.name ==
+                    service_name).with_for_update()).mappings().one_or_none()
+            if (service is None or service['hash'] != service_hash or
+                    service['lifecycle_epoch'] != service_lifecycle_epoch or
+                    service['current_version'] != service_version):
+                raise CapacityAdmissionConflict(
+                    'Service changed before current capacity planning.')
+            fill_config = _reserved_fill_service_config_in_connection(
+                connection, service)
+            if fill_config.binding_required is not sequenced_reserved_fill:
+                raise CapacityAdmissionConflict(
+                    'Current capacity planner disagrees with the service '
+                    'reserved-fill authority mode.')
+
+            locked_generation = connection.execute(
+                sqlalchemy.select(_DEMAND_GENERATIONS.c.generation).where(
+                    _DEMAND_GENERATIONS.c.service_name == service_name,
+                    _DEMAND_GENERATIONS.c.service_hash ==
+                    service_hash).with_for_update()).scalar_one_or_none()
+            snapshot = demand_state.get_autoscaling_snapshot(
+                service_name, service_hash, connection=connection)
+            if (snapshot is None or
+                    snapshot.demand_feed_generation != locked_generation):
+                raise CapacityAdmissionConflict(
+                    'Current durable demand is unavailable or inconsistent.')
+
+            provisional_authority = (
+                ReservedFillPlanAuthority.zero_revocation()
+                if sequenced_reserved_fill else
+                ReservedFillPlanAuthority.not_applicable())
+            provisional = CapacityPlanInput(
+                service_name=service_name,
+                service_hash=service_hash,
+                service_lifecycle_epoch=service_lifecycle_epoch,
+                service_version=service_version,
+                demand_source_epoch=snapshot.demand_source_epoch,
+                demand_feed_generation=snapshot.demand_feed_generation,
+                receipt_watermark=snapshot.receipt_watermark,
+                route_generation=snapshot.route_generation,
+                route_sha256=snapshot.route_sha256,
+                route_source_epoch=snapshot.route_source_epoch,
+                normalized_demand=snapshot.normalized_demand,
+                capacity_target_by_accelerator={card: 0 for card in card_set},
+                reserved_fill_authority=provisional_authority)
+            # This locks and validates the exact current reporter and route
+            # rows.  The service lock already prevents their writers from
+            # advancing, but keeping validation centralized avoids a second
+            # interpretation of the promoted-demand contract.
+            self._validate_sources(connection, provisional, service)
+
+            validated_allocation = None
+            allocation_authority = None
+            if sequenced_reserved_fill and not snapshot.fresh_aggregate_zero:
+                if reserved_fill_allocation_map is None:
+                    raise CapacityAdmissionConflict(
+                        'Positive current demand has no reserved-fill '
+                        'allocation authority.')
+                allocation_authority = ReservedFillPlanAuthority.bound(
+                    reserved_fill_allocation_map.identity)
+                validated_allocation = (
+                    _validate_reserved_fill_authority_in_connection(
+                        connection,
+                        service,
+                        allocation_authority,
+                        reserved_fill_binding_required=True,
+                        protocol_and_service_prelocked=True))
+
+            now = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.clock_timestamp())).scalar_one()
+            locked_capacity = _lock_capacity_rows(connection,
+                                                  service_name=service_name,
+                                                  service_hash=service_hash,
+                                                  now=now)
+            if (expected_planning_state_fingerprint is not None and
+                    _locked_planning_state_fingerprint(service, locked_capacity)
+                    != expected_planning_state_fingerprint):
+                raise CapacityAdmissionConflict(
+                    'Prepared planning state changed before its rows were '
+                    'locked.')
+            lane_projection = _lock_kueue_projection(
+                connection,
+                service_name=service_name,
+                service_hash=service_hash,
+                service_lifecycle_epoch=service_lifecycle_epoch,
+                service_version=service_version,
+                accounting_cards=card_set,
+                locked=locked_capacity)
+            full_zero_cost, full_paid, pending_zero_cost = (
+                _project_capacity_inventory(locked_capacity,
+                                            service_version=service_version,
+                                            accounting_cards=card_set,
+                                            now=now,
+                                            lane_projection=lane_projection))
+            allocation_reserved = _project_allocation_reserved_capacity(
+                validated_allocation,
+                locked_capacity,
+                service_hash=service_hash,
+                service_version=service_version,
+                accounting_cards=card_set,
+                now=now,
+                config=fill_config,
+                lane_projection=lane_projection)
+            supply_projection = None
+            if validated_allocation is not None:
+                economic_infos, economic_kueue, economic_digest = (
+                    _economic_capacity_graph_snapshot(
+                        locked_capacity,
+                        lane_projection,
+                        service_version=service_version))
+                supply_projection = ReservedSupplyProjection(
+                    pending_zero_cost_capacity_by_accelerator=(
+                        pending_zero_cost),
+                    allocation_reserved_capacity_by_accelerator=(
+                        allocation_reserved),
+                    economic_replica_infos=economic_infos,
+                    economic_kueue_capacity_by_replica_id=economic_kueue,
+                    economic_capacity_graph_sha256=economic_digest)
+
+            # Lock the current head before invoking mutable in-memory planning.
+            # Service ownership prevents a competing publisher, while this row
+            # lock also freezes the prior-plan/claim baseline consumed below.
+            connection.execute(
+                sqlalchemy.select(_HEADS).where(
+                    _HEADS.c.service_name ==
+                    service_name).with_for_update()).mappings().one_or_none()
+            decision = planner(snapshot, supply_projection)
+            if not isinstance(decision, CapacityPlanDecision):
+                raise ValueError('planner returned no typed capacity decision.')
+            capacity_target = decision.canonical_target(card_set)
+            if snapshot.fresh_aggregate_zero and any(capacity_target.values()):
+                raise CapacityAdmissionConflict(
+                    'Fresh aggregate zero produced a positive capacity target.')
+            positive_target = any(capacity_target.values())
+            if sequenced_reserved_fill and positive_target:
+                if allocation_authority is None or supply_projection is None:
+                    raise CapacityAdmissionConflict(
+                        'Positive capacity target has no exact reserved supply '
+                        'authority.')
+                final_authority = allocation_authority
+            elif sequenced_reserved_fill:
+                final_authority = ReservedFillPlanAuthority.zero_revocation()
+            else:
+                final_authority = ReservedFillPlanAuthority.not_applicable()
+
+            normalized_demand = dict(snapshot.normalized_demand)
+            if set(normalized_demand) & set(
+                    decision.normalized_demand_extensions):
+                raise ValueError('Planner extensions overwrite demand '
+                                 'authority fields.')
+            normalized_demand.update(decision.normalized_demand_extensions)
+            bound_projection = (
+                supply_projection if final_authority.mode
+                is ReservedFillPlanAuthorityMode.ALLOCATION_BOUND else None)
+            plan = CapacityPlanInput(
+                service_name=service_name,
+                service_hash=service_hash,
+                service_lifecycle_epoch=service_lifecycle_epoch,
+                service_version=service_version,
+                demand_source_epoch=snapshot.demand_source_epoch,
+                demand_feed_generation=snapshot.demand_feed_generation,
+                receipt_watermark=snapshot.receipt_watermark,
+                route_generation=snapshot.route_generation,
+                route_sha256=snapshot.route_sha256,
+                route_source_epoch=snapshot.route_source_epoch,
+                normalized_demand=normalized_demand,
+                capacity_target_by_accelerator=capacity_target,
+                reserved_fill_authority=final_authority,
+                allocation_reserved_capacity_by_accelerator=(
+                    {} if bound_projection is None else
+                    bound_projection.allocation_reserved_capacity_by_accelerator
+                ),
+                expected_pending_zero_cost_capacity_by_accelerator=(
+                    {} if bound_projection is None else
+                    bound_projection.pending_zero_cost_capacity_by_accelerator),
+                expected_economic_capacity_graph_sha256=(
+                    None if bound_projection is None else
+                    bound_projection.economic_capacity_graph_sha256))
+            row = self._write_plan_in_connection(
+                connection,
+                plan,
+                full_zero_cost=full_zero_cost,
+                full_paid=full_paid,
+                pending_zero_cost=pending_zero_cost,
+                allocation_reserved=(allocation_reserved
+                                     if bound_projection is not None else {
+                                         card: 0 for card in card_set
+                                     }),
+                ttl_seconds=ttl_seconds)
+        return (_authority(
+            row,
+            demand_feed_generation=snapshot.demand_feed_generation), snapshot)
+
     def publish(
         self,
         plan: CapacityPlanInput,
@@ -1704,8 +2136,6 @@ class CapacityAdmissionRepository:
                     'Capacity plan reserved-fill authority does not match its '
                     'service actuation mode and target.')
             plan = self._validate_sources(connection, plan, service)
-            watermark_sha256 = _sha256(
-                _canonical_watermark(plan.receipt_watermark))
             validated_allocation = None
             if allocation_bound:
                 validated_allocation = (
@@ -1773,127 +2203,14 @@ class CapacityAdmissionRepository:
                 field='allocation_reserved_capacity_by_accelerator',
                 changed=('Reserved-fill allocation tail changed before plan '
                          'publication.'))
-            head = connection.execute(
-                sqlalchemy.select(_HEADS).where(
-                    _HEADS.c.service_name == plan.service_name).with_for_update(
-                    )).mappings().one_or_none()
-            previous = None
-            if head is not None:
-                previous = connection.execute(
-                    sqlalchemy.select(_PLANS).where(
-                        _PLANS.c.service_name == plan.service_name,
-                        _PLANS.c.generation ==
-                        head['generation'])).mappings().one_or_none()
-            duplicate_payload = None
-            duplicate_digest = None
-            if (previous is not None and
-                    previous['service_hash'] == plan.service_hash and
-                    previous['service_lifecycle_epoch']
-                    == plan.service_lifecycle_epoch and
-                    previous['service_version'] == plan.service_version and
-                    previous['demand_source_epoch']
-                    == plan.demand_source_epoch):
-                prior_claim_units = _claim_units_for_plan(
-                    connection,
-                    service_name=plan.service_name,
-                    service_hash=plan.service_hash,
-                    generation=int(previous['generation']),
-                    accounting_cards=accounting_cards)
-                prior_paid_baseline = _subtract_counts(full_paid,
-                                                       prior_claim_units)
-                duplicate_payload = plan.payload(
-                    existing_zero_cost_capacity_by_accelerator=full_zero_cost,
-                    pending_zero_cost_capacity_by_accelerator=(
-                        pending_zero_cost),
-                    allocation_reserved_capacity_by_accelerator=(
-                        allocation_reserved),
-                    existing_paid_capacity_by_accelerator=prior_paid_baseline,
-                    paid_residual_by_accelerator=_paid_residual(
-                        capacity_target, full_zero_cost, pending_zero_cost,
-                        prior_paid_baseline, allocation_reserved))
-                duplicate_digest = _sha256(duplicate_payload)
-            duplicate = bool(previous is not None and
-                             duplicate_digest == previous['content_sha256'])
-            if duplicate:
-                assert previous is not None
-                generation = int(previous['generation'])
-                payload = duplicate_payload
-                digest = duplicate_digest
-            else:
-                payload = plan.payload(
-                    existing_zero_cost_capacity_by_accelerator=full_zero_cost,
-                    pending_zero_cost_capacity_by_accelerator=(
-                        pending_zero_cost),
-                    allocation_reserved_capacity_by_accelerator=(
-                        allocation_reserved),
-                    existing_paid_capacity_by_accelerator=full_paid,
-                    paid_residual_by_accelerator=_paid_residual(
-                        capacity_target, full_zero_cost, pending_zero_cost,
-                        full_paid, allocation_reserved))
-                digest = _sha256(payload)
-                maximum = connection.execute(
-                    sqlalchemy.select(sqlalchemy.func.max(
-                        _PLANS.c.generation)).where(
-                            _PLANS.c.service_name ==
-                            plan.service_name)).scalar_one()
-                generation = 1 if maximum is None else int(maximum) + 1
-                now = connection.execute(
-                    sqlalchemy.select(
-                        sqlalchemy.func.clock_timestamp())).scalar_one()
-                connection.execute(
-                    sqlalchemy.insert(_PLANS).values(
-                        service_name=plan.service_name,
-                        generation=generation,
-                        service_hash=plan.service_hash,
-                        service_lifecycle_epoch=plan.service_lifecycle_epoch,
-                        service_version=plan.service_version,
-                        demand_source_epoch=plan.demand_source_epoch,
-                        demand_feed_generation=plan.demand_feed_generation,
-                        route_generation=plan.route_generation,
-                        route_sha256=plan.route_sha256,
-                        route_source_epoch=plan.route_source_epoch,
-                        protocol_version=PROTOCOL_VERSION,
-                        content_sha256=digest,
-                        payload=payload,
-                        created_at=now))
-            assert payload is not None and digest is not None
-            now = connection.execute(
-                sqlalchemy.select(
-                    sqlalchemy.func.clock_timestamp())).scalar_one()
-            head_insert = postgresql.insert(_HEADS).values(
-                service_name=plan.service_name,
-                generation=generation,
-                demand_feed_generation=plan.demand_feed_generation,
-                receipt_watermark_sha256=watermark_sha256,
-                refreshed_at=now,
-                valid_until=now + datetime.timedelta(seconds=ttl_seconds))
-            connection.execute(
-                head_insert.on_conflict_do_update(
-                    index_elements=[_HEADS.c.service_name],
-                    set_={
-                        'generation': generation,
-                        'demand_feed_generation': plan.demand_feed_generation,
-                        'receipt_watermark_sha256': watermark_sha256,
-                        'refreshed_at': now,
-                        'valid_until': now +
-                                       datetime.timedelta(seconds=ttl_seconds),
-                    }))
-            # Capacity plans are operational fences, not an unbounded history
-            # store.  The current head and the composite claim FK retain every
-            # generation that can still authorize work; all other generations
-            # are superseded and may be removed in this same transaction.
-            connection.execute(
-                sqlalchemy.delete(_PLANS).where(
-                    _PLANS.c.service_name == plan.service_name,
-                    _PLANS.c.generation != generation,
-                    ~sqlalchemy.exists().where(
-                        _CLAIMS.c.service_name == _PLANS.c.service_name,
-                        _CLAIMS.c.capacity_plan_generation
-                        == _PLANS.c.generation)))
-            row = connection.execute(
-                sqlalchemy.select(_PLANS).where(
-                    _PLANS.c.service_name == plan.service_name,
-                    _PLANS.c.generation == generation)).mappings().one()
+            row = self._write_plan_in_connection(
+                connection,
+                plan,
+                full_zero_cost=full_zero_cost,
+                full_paid=full_paid,
+                pending_zero_cost=pending_zero_cost,
+                allocation_reserved=allocation_reserved,
+                ttl_seconds=ttl_seconds)
         return _authority(row,
                           demand_feed_generation=plan.demand_feed_generation)
 
