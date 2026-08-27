@@ -117,6 +117,19 @@ class _LbRoleDatabaseSnapshot(NamedTuple):
     owner: dict[str, Any]
 
 
+@dataclasses.dataclass(frozen=True)
+class _LinearizedScalePlan:
+    """Post-commit local actuation candidate for one exact demand snapshot."""
+
+    snapshot: demand_state.DurableAutoscalingSnapshot
+    scaling_plan: tuple[list[autoscalers.AutoscalerDecision], int | None,
+                        autoscalers.UnrecoverableRolloutFailure | None, Any,
+                        Any, Any, bool]
+    logical_snapshot: replica_managers.LogicalReconcileSnapshot | None
+    notification_generation: int
+    demand_generation: int
+
+
 class _LbPromotionReason(str, enum.Enum):
     """Bounded, non-authoritative reason for one promotion decision."""
 
@@ -669,8 +682,8 @@ class SkyServeController:
                 f'{common_utils.format_exception(e)}')
             placement_policy_states = None
         self._autoscaler.load_cost_rebalance_state(
-            None if placement_policy_states is None else
-            placement_policy_states['cost_rebalance_state'])
+            None if placement_policy_states is
+            None else placement_policy_states['cost_rebalance_state'])
         self._configure_instance_aware_accelerators(service_spec)
         # [boltz fork] Reserved-capacity fill poller lifecycle: started
         # from run() when the service booted with the flag on, and
@@ -889,8 +902,8 @@ class SkyServeController:
             info: 'replica_managers.ReplicaInfo'
         ) -> tuple[str, str, int] | None:
             cached = self._lb_replica_cache.get(info.replica_id)
-            if (self._lb_replica_cache_record_ids.get(info.replica_id) !=
-                    info.replica_record_id):
+            if (self._lb_replica_cache_record_ids.get(info.replica_id)
+                    != info.replica_record_id):
                 return None
             return cached
 
@@ -1666,8 +1679,8 @@ class SkyServeController:
             current_source = capacity_admission.get_service_source_mode(
                 self._service_name)
             if (current_source is None and self._service_hash is not None) or (
-                    current_source is not None and current_source[0] is
-                    capacity_admission.DemandSourceMode.DURABLE_FEED):
+                    current_source is not None and current_source[0]
+                    is capacity_admission.DemandSourceMode.DURABLE_FEED):
                 return True
             self._reconcile_generation += 1
             reconcile_generation = self._reconcile_generation
@@ -2463,9 +2476,9 @@ class SkyServeController:
             # the first role response applied by the former active.
             clean = report.complete and report.local_in_flight == 0
         drain_started_at = state.drain_started_at
-        timed_out = (
-            drain_started_at is not None and
-            time.time() - drain_started_at >= self._lb_drain_timeout_seconds)
+        timed_out = (drain_started_at is not None and
+                     time.time() - drain_started_at
+                     >= self._lb_drain_timeout_seconds)
         if timed_out and not clean:
             logger.warning('Finishing HA LB drain after the bounded Pod '
                            f'termination budget for {self._service_name!r}.')
@@ -2638,8 +2651,8 @@ class SkyServeController:
         demand_transition_cancellation: asyncio.CancelledError | None = None
         demand_transition_invalidated_generation: int | None = None
 
-        async def run_demand_transition(phase: str, function: Callable,
-                                        *args: Any) -> Any:
+        async def run_demand_transition(phase: str, function: Callable, *args:
+                                        Any) -> Any:
             nonlocal demand_transition_cancellation
             operation = asyncio.create_task(
                 trace.run_in_executor(loop, phase, function, *args))
@@ -2802,7 +2815,8 @@ class SkyServeController:
                                           routing.legacy_selected)
             ready_by_slot = {
                 candidate_slot: {
-                    uid for uid in authority.ready_nonterminating_uids
+                    uid
+                    for uid in authority.ready_nonterminating_uids
                     if authority.slot_by_uid.get(uid) is candidate_slot
                 } for candidate_slot in lb_ha.LbSlot
             }
@@ -3610,9 +3624,8 @@ class SkyServeController:
             provisioning_capacity = 0
             for info in replica_infos:
                 status_property = info.status_property
-                retiring = (
-                    status_property.is_scale_down is True or
-                    getattr(status_property, 'preempted', False) is True)
+                retiring = (status_property.is_scale_down is True or getattr(
+                    status_property, 'preempted', False) is True)
                 if (info.is_terminal or
                         info.version != autoscaler.latest_version or retiring):
                     continue
@@ -3894,9 +3907,8 @@ class SkyServeController:
             service_spec: Any,
             candidate_autoscaler: autoscalers.Autoscaler | None = None) -> bool:
         """Whether routing and autoscaling share the exact-card contract."""
-        compatible_autoscaler = (self._autoscaler
-                                 if candidate_autoscaler is None else
-                                 candidate_autoscaler)
+        compatible_autoscaler = (self._autoscaler if candidate_autoscaler
+                                 is None else candidate_autoscaler)
         return (service_spec.load_balancing_policy
                 == 'instance_aware_least_load' and
                 isinstance(compatible_autoscaler,
@@ -4554,8 +4566,8 @@ class SkyServeController:
                 expected_installed_digest = (
                     prepared.source_digest if prepared.source_is_staged or
                     prepared.source_is_live else prepared.durable_digest)
-                if (hashlib.sha256(installed_bytes).hexdigest() !=
-                        expected_installed_digest):
+                if (hashlib.sha256(installed_bytes).hexdigest()
+                        != expected_installed_digest):
                     raise RuntimeError(
                         'Controller config snapshot changed between admission '
                         'and installation.')
@@ -4594,8 +4606,8 @@ class SkyServeController:
             raise RuntimeError(
                 'Service incarnation changed before LB migration.')
         if (expected_lifecycle_epoch is not None and
-                owner_record.get('lifecycle_epoch') !=
-                expected_lifecycle_epoch):
+                owner_record.get('lifecycle_epoch')
+                != expected_lifecycle_epoch):
             raise RuntimeError('Service lifecycle changed before LB migration.')
         service_hash = str(owner_record['hash'])
         assert actual_owner is not None
@@ -4780,9 +4792,9 @@ class SkyServeController:
                 placement_catalog = None
         needs_catalog = (validation_service.placement_contract.enabled and
                          placement_catalog is None)
-        needs_logical_validation = (
-            authoritative_retry_service is None and
-            validation_service.uses_logical_replicas is True)
+        needs_logical_validation = (authoritative_retry_service is None and
+                                    validation_service.uses_logical_replicas
+                                    is True)
         update_task = None
         if needs_catalog or needs_logical_validation:
             try:
@@ -5596,8 +5608,8 @@ class SkyServeController:
         Every optional diagnostic read fails unavailable; it cannot authorize
         a launch or make ``/autoscaler/info`` fail.
         """
-        enabled = (getattr(self._autoscaler, 'reserved_capacity_fill', False) is
-                   True)
+        enabled = (getattr(self._autoscaler, 'reserved_capacity_fill', False)
+                   is True)
         if not enabled:
             return self._reserved_fill_reconciliation_base(
                 enabled=False, authority_mode='disabled')
@@ -5739,30 +5751,30 @@ class SkyServeController:
                                 replica.reserved_fill is not True or
                                 replica.is_zero_cost is not True or
                                 replica.version != allocation.service_version or
-                                replica.reserved_fill_pool_key !=
-                                snapshot.pool_key or
-                                replica.reserved_fill_service_generation !=
-                                snapshot.service_generation or
-                                replica.reserved_fill_physical_cluster_uid !=
-                                snapshot.physical_cluster_uid or
+                                replica.reserved_fill_pool_key
+                                != snapshot.pool_key or
+                                replica.reserved_fill_service_generation
+                                != snapshot.service_generation or
+                                replica.reserved_fill_physical_cluster_uid
+                                != snapshot.physical_cluster_uid or
                                 replica.reserved_fill_kubernetes_context
                                 not in allowed_contexts or
-                                replica.reserved_fill_allocation_generation !=
-                                allocation.allocation_generation or
-                                replica.reserved_fill_allocation_input_sha256 !=
-                                allocation.allocation_input_sha256 or replica.
-                                reserved_fill_allocation_claim_generation !=
-                                allocation.allocation_claim_generation or
+                                replica.reserved_fill_allocation_generation
+                                != allocation.allocation_generation or
+                                replica.reserved_fill_allocation_input_sha256
+                                != allocation.allocation_input_sha256 or replica
+                                .reserved_fill_allocation_claim_generation
+                                != allocation.allocation_claim_generation or
                                 getattr(
                                     replica,
                                     'reserved_fill_reconciliation_gate_generation',
-                                    None) !=
-                                allocation.reconciliation_gate_generation or
+                                    None)
+                                != allocation.reconciliation_gate_generation or
                                 getattr(
                                     replica,
                                     'reserved_fill_reclaim_fleet_bundle_sha256',
-                                    None) !=
-                                allocation.reclaim_fleet_bundle_sha256 or
+                                    None)
+                                != allocation.reclaim_fleet_bundle_sha256 or
                                 getattr(
                                     replica,
                                     'reserved_fill_reclaim_policy_revision',
@@ -5770,18 +5782,19 @@ class SkyServeController:
                                 or getattr(
                                     replica,
                                     'reserved_fill_reclaim_provider_inventory_sha256',
-                                    None) !=
-                                allocation.reclaim_provider_inventory_sha256 or
-                                type(accelerator_count) is not int or
-                                accelerator_counts.get(accelerator) !=
-                                accelerator_count or getattr(
+                                    None)
+                                != allocation.reclaim_provider_inventory_sha256
+                                or type(accelerator_count) is not int or
+                                accelerator_counts.get(accelerator)
+                                != accelerator_count or getattr(
                                     replica,
                                     'reserved_fill_worker_projection_sha256',
                                     None) != projection_digests.get(accelerator)
                                 or replica.reserved_fill_observation_generation
                                 != snapshot.observation_generation or
-                                replica.reserved_fill_observation_sequence !=
-                                snapshot.observation_sequence or not isinstance(
+                                replica.reserved_fill_observation_sequence
+                                != snapshot.observation_sequence or
+                                not isinstance(
                                     replica.
                                     reserved_fill_intent_idempotency_key, str)
                                 or
@@ -5819,8 +5832,9 @@ class SkyServeController:
         sequenced_reserved_fill: bool,
         sequenced_reserved_fill_allocation: (
             reserved_fill_planner.AuthenticatedAllocationMap | None) = None,
-        prepared_decision_inputs: (
-            autoscalers.ScalingDecisionInputs | None) = None,
+        prepared_decision_inputs: (autoscalers.ScalingDecisionInputs |
+                                   None) = None,
+        planning_fingerprint_already_validated: bool = False,
     ) -> tuple[list[autoscalers.AutoscalerDecision], int | None,
                autoscalers.UnrecoverableRolloutFailure | None, Any, Any, Any,
                bool] | None:
@@ -5836,8 +5850,8 @@ class SkyServeController:
         """
         if (not self._scale_actuation_is_current(
                 actuation_generation, decision_autoscaler, decision_version) or
-                self._scale_reconcile_coordinator.generation !=
-                notification_generation or
+                self._scale_reconcile_coordinator.generation
+                != notification_generation or
                 self._reconcile_generation != demand_generation):
             return None
         decision_inputs = prepared_decision_inputs
@@ -5845,7 +5859,8 @@ class SkyServeController:
             decision_inputs = (
                 autoscalers.prepare_controller_scaling_decision_inputs(
                     decision_autoscaler, replica_infos))
-        if planning_state_fingerprint is not None:
+        if (planning_state_fingerprint is not None and
+                not planning_fingerprint_already_validated):
             current_fingerprint = (
                 serve_state.get_scale_planning_state_fingerprint(
                     self._service_name, require_version=True))
@@ -5858,8 +5873,8 @@ class SkyServeController:
         with self._routing_state_lock:
             if (not self._scale_actuation_is_current(
                     actuation_generation, decision_autoscaler, decision_version)
-                    or self._scale_reconcile_coordinator.generation !=
-                    notification_generation or
+                    or self._scale_reconcile_coordinator.generation
+                    != notification_generation or
                     self._reconcile_generation != demand_generation):
                 return None
             decision_autoscaler.set_spot_placer(
@@ -6035,10 +6050,10 @@ class SkyServeController:
             accelerators = (None if location is None else location.accelerators)
             if (snapshot is None or not isinstance(accelerators, dict) or
                     len(accelerators) != 1 or
-                    info.reserved_fill_service_generation !=
-                    snapshot.service_generation or
-                    info.reserved_fill_physical_cluster_uid !=
-                    snapshot.physical_cluster_uid):
+                    info.reserved_fill_service_generation
+                    != snapshot.service_generation or
+                    info.reserved_fill_physical_cluster_uid
+                    != snapshot.physical_cluster_uid):
                 raise ValueError('A same-allocation reserved-fill row has '
                                  'inconsistent durable pool attribution.')
             accelerator = str(next(iter(accelerators))).casefold()
@@ -6203,144 +6218,247 @@ class SkyServeController:
             return exact_target
         return {capacity_admission.AGGREGATE_ACCELERATOR: final_target}
 
-    def _publish_ordered_paid_authority(
+    def _plan_and_publish_current_capacity(
         self,
         decision_autoscaler: autoscalers.Autoscaler,
         decision_version: int,
+        actuation_generation: int,
+        notification_generation: int,
+        replica_infos: list[replica_managers.ReplicaInfo],
+        active_versions: list[int],
+        planning_state_fingerprint: str | None,
+        prepared_decision_inputs: autoscalers.ScalingDecisionInputs,
         *,
         sequenced_reserved_fill: bool,
-        force_zero: bool = False,
         reserved_fill_allocation_map: (
-            reserved_fill_planner.AuthenticatedAllocationMap | None) = None,
-        reserved_supply_projection: (
-            capacity_admission.ReservedSupplyProjection | None) = None,
-    ) -> capacity_admission.PaidLaunchAuthority | None:
-        """Bind a post-zero-cost residual to the current durable demand."""
-        snapshot = self._durable_demand_snapshot
+            reserved_fill_planner.AuthenticatedAllocationMap | None),
+    ) -> tuple[capacity_admission.PaidLaunchAuthority,
+               _LinearizedScalePlan] | None:
+        """Plan current demand and publish its residual in one DB boundary."""
         binding = self._ordinary_launch_binding_authority
-        if (snapshot is None or binding is None or
-                snapshot.service_hash != self._service_hash or
-                snapshot.demand_source_epoch <= 0):
+        service_hash = self._service_hash
+        if (binding is None or not isinstance(service_hash, str) or
+                not service_hash or
+                not isinstance(planning_state_fingerprint, str)):
             return None
-        capacity_target = self._ordered_capacity_target(decision_autoscaler,
-                                                        force_zero=force_zero)
-        if capacity_target is None:
-            logger.warning('Suppressing paid launch because the autoscaler '
-                           'has no complete supply-aware capacity target.')
+        accounting_cards = self._ordered_capacity_target(decision_autoscaler,
+                                                         force_zero=True)
+        if accounting_cards is None:
+            logger.warning('Suppressing current capacity planning because the '
+                           'autoscaler has no exact accounting cards.')
             return None
-        normalized_demand = dict(snapshot.normalized_demand)
-        normalized_demand.update(
-            autoscaler_target=(
-                0 if force_zero else
-                decision_autoscaler.get_final_target_num_replicas()),
-            replica_unit=decision_autoscaler.replica_unit,
-            demand_target_by_accelerator=(
-                decision_autoscaler.info().get('demand_target_by_accelerator')))
-        if (sequenced_reserved_fill and
-            (force_zero or not any(capacity_target.values()))):
-            reserved_fill_authority = (
-                capacity_admission.ReservedFillPlanAuthority.zero_revocation())
-        elif force_zero or not sequenced_reserved_fill:
-            reserved_fill_authority = (
-                capacity_admission.ReservedFillPlanAuthority.not_applicable())
-        else:
-            if reserved_fill_allocation_map is None:
-                logger.warning('Suppressing paid launch because sequenced '
-                               'reserved fill has no current allocation.')
-                return None
-            reserved_fill_authority = (
-                capacity_admission.ReservedFillPlanAuthority.bound(
-                    reserved_fill_allocation_map.identity))
-        supply_projection = reserved_supply_projection
-        if (reserved_fill_authority.mode is not capacity_admission.
-                ReservedFillPlanAuthorityMode.ALLOCATION_BOUND):
-            # A projected economic graph belongs only to the exact allocation
-            # it was captured with. Zero revocation and non-fill plans are
-            # deliberately unbound and must carry no stale allocation fields.
-            supply_projection = None
-        repository = capacity_admission.CapacityAdmissionRepository()
-        if (reserved_fill_authority.mode is capacity_admission.
-                ReservedFillPlanAuthorityMode.ALLOCATION_BOUND):
-            if not decision_autoscaler.supports_reserved_supply_economic_target(
-            ):
-                logger.warning(
-                    'Suppressing paid launch because this autoscaler has no '
-                    'work-conserving reserved-supply economic target.')
-                return None
-            if supply_projection is None:
-                logger.warning(
-                    'Suppressing paid launch because reserved supply was not '
-                    'projected before the durable demand boundary.')
+        if (sequenced_reserved_fill and not decision_autoscaler.
+                supports_reserved_supply_economic_target()):
+            logger.warning(
+                'Suppressing current capacity planning because this '
+                'autoscaler has no work-conserving reserved-supply target.')
+            return None
+
+        planned: _LinearizedScalePlan | None = None
+
+        def _planner(
+            snapshot: demand_state.DurableAutoscalingSnapshot,
+            supply: capacity_admission.ReservedSupplyProjection | None,
+        ) -> capacity_admission.CapacityPlanDecision:
+            nonlocal planned
+            request_information = dict(snapshot.request_information)
+            request_information['replace_request_window'] = True
+            logical_snapshot = None
+            with self._routing_state_lock:
+                if (not self._scale_actuation_is_current(
+                        actuation_generation, decision_autoscaler,
+                        decision_version) or
+                        self._scale_reconcile_coordinator.generation
+                        != notification_generation):
+                    raise capacity_admission.CapacityAdmissionConflict(
+                        'Controller actuation changed during current planning.')
+                durable_reconcile_generation = None
+                if decision_autoscaler.replica_unit == 'logical':
+                    if not isinstance(decision_autoscaler,
+                                      autoscalers.ConcurrencyAutoscaler):
+                        raise capacity_admission.CapacityAdmissionConflict(
+                            'Logical durable demand has no concurrency '
+                            'autoscaler.')
+                    durable_reconcile_generation = (
+                        snapshot.demand_feed_generation)
+                    request_generation = request_information.get(
+                        'reconcile_generation')
+                    if (type(request_generation) is not int or
+                            request_generation != durable_reconcile_generation):
+                        raise capacity_admission.CapacityAdmissionConflict(
+                            'Current request information has a mismatched '
+                            'generation.')
+                decision_autoscaler.collect_request_information(
+                    request_information)
+                if decision_autoscaler.replica_unit == 'logical':
+                    assert isinstance(decision_autoscaler,
+                                      autoscalers.ConcurrencyAutoscaler)
+                    assert durable_reconcile_generation is not None
+                    if (type(decision_autoscaler.reconcile_generation)
+                            is not int or
+                            decision_autoscaler.reconcile_generation
+                            != durable_reconcile_generation):
+                        raise capacity_admission.CapacityAdmissionConflict(
+                            'Autoscaler did not consume the exact current '
+                            'demand generation.')
+                    logical_snapshot = (
+                        replica_managers.LogicalReconcileSnapshot(
+                            version=decision_version,
+                            generation=durable_reconcile_generation,
+                            observed_slots_by_replica_id=dict(
+                                request_information[
+                                    'observed_slots_by_replica_id']),
+                            in_flight_by_replica_id=dict(
+                                request_information['in_flight_by_replica_id']),
+                            unknown_replica_ids=frozenset(request_information[
+                                'unknown_in_flight_replica_ids']),
+                            received_at=(snapshot.reconcile_authority.
+                                         read_started_monotonic),
+                            authority=snapshot.reconcile_authority))
+                self._reconcile_generation += 1
+                demand_generation = self._reconcile_generation
+                self._durable_demand_snapshot = snapshot
+                if snapshot.fresh_aggregate_zero:
+                    (decision_autoscaler.
+                     clear_paid_launch_authority_for_fresh_zero())
+
+            scaling_plan = self._plan_scale_reconciliation(
+                decision_autoscaler,
+                decision_version,
+                actuation_generation,
+                notification_generation,
+                demand_generation,
+                replica_infos,
+                active_versions,
+                planning_state_fingerprint,
+                sequenced_reserved_fill=sequenced_reserved_fill,
+                sequenced_reserved_fill_allocation=(
+                    reserved_fill_allocation_map),
+                prepared_decision_inputs=prepared_decision_inputs,
+                planning_fingerprint_already_validated=True)
+            if scaling_plan is None:
+                raise capacity_admission.CapacityAdmissionConflict(
+                    'Controller state changed during current planning.')
+            (scaling_options, target_num_replicas, rollout_failure,
+             logical_target, logical_retirement_floor, retirement_shelter,
+             invalidate_logical_target) = scaling_plan
+            if (retirement_shelter is not None and
+                    not retirement_shelter.authority_current):
+                raise capacity_admission.CapacityAdmissionConflict(
+                    'Reserved-fill shelter is not current.')
+            if snapshot.fresh_aggregate_zero:
+                target_num_replicas = 0
+                scaling_options = [
+                    option for option in scaling_options if option.operator !=
+                    autoscalers.AutoscalerDecisionOperator.SCALE_UP
+                ]
+                scaling_plan = (scaling_options, target_num_replicas,
+                                rollout_failure, logical_target,
+                                logical_retirement_floor, retirement_shelter,
+                                invalidate_logical_target)
+
+            capacity_target = self._ordered_capacity_target(
+                decision_autoscaler, force_zero=snapshot.fresh_aggregate_zero)
+            if capacity_target is None:
+                raise ValueError('Autoscaler has no complete supply-aware '
+                                 'capacity target.')
+            if sequenced_reserved_fill and any(capacity_target.values()):
+                if supply is None:
+                    raise capacity_admission.CapacityAdmissionConflict(
+                        'Current reserved supply is unavailable.')
+                try:
+                    economic_target = (
+                        decision_autoscaler.
+                        economic_capacity_target_by_accelerator(
+                            list(supply.economic_replica_infos),
+                            supply.additional_capacity_by_accelerator(),
+                            kueue_capacity_by_replica_id=(
+                                supply.economic_kueue_capacity_by_replica_id)))
+                except (capacity_admission.CapacityAdmissionError,
+                        ValueError) as error:
+                    raise capacity_admission.CapacityAdmissionConflict(
+                        'Compatible reserved supply could not produce an '
+                        'economic target.') from error
+                if not isinstance(economic_target, dict):
+                    raise ValueError(
+                        'Autoscaler returned no compatibility-safe '
+                        'economic target.')
+                canonical_economic: dict[str, int] = {}
+                for raw_card, count in economic_target.items():
+                    card = str(raw_card).casefold()
+                    if (card in canonical_economic or
+                            card not in capacity_target or
+                            not isinstance(count, int) or
+                            isinstance(count, bool) or count < 0):
+                        raise ValueError(
+                            'Economic capacity target is malformed.')
+                    canonical_economic[card] = count
+                canonical_economic = {
+                    card: canonical_economic.get(card, 0)
+                    for card in capacity_target
+                }
+                if sum(canonical_economic.values()) != sum(
+                        capacity_target.values()):
+                    raise ValueError('Economic capacity target changed '
+                                     'aggregate demand.')
+                capacity_target = canonical_economic
+
+            planned = _LinearizedScalePlan(
+                snapshot=snapshot,
+                scaling_plan=scaling_plan,
+                logical_snapshot=logical_snapshot,
+                notification_generation=notification_generation,
+                demand_generation=demand_generation)
+            return capacity_admission.CapacityPlanDecision(
+                capacity_target_by_accelerator=capacity_target,
+                normalized_demand_extensions={
+                    'autoscaler_target':
+                        (0 if snapshot.fresh_aggregate_zero else
+                         decision_autoscaler.get_final_target_num_replicas()),
+                    'replica_unit': decision_autoscaler.replica_unit,
+                    'demand_target_by_accelerator':
+                        (decision_autoscaler.info().get(
+                            'demand_target_by_accelerator')),
+                })
+
+        # Service-version transitions already use routing-epoch -> PostgreSQL
+        # order.  Own the same short epoch before the repository takes its
+        # service row; taking it from the callback would invert that order and
+        # could deadlock an update waiting on the same service row.
+        with self._routing_state_lock:
+            if (not self._scale_actuation_is_current(
+                    actuation_generation, decision_autoscaler, decision_version)
+                    or self._scale_reconcile_coordinator.generation
+                    != notification_generation):
                 return None
             try:
-                economic_target = (
-                    decision_autoscaler.economic_capacity_target_by_accelerator(
-                        list(supply_projection.economic_replica_infos),
-                        supply_projection.additional_capacity_by_accelerator(),
-                        kueue_capacity_by_replica_id=(
-                            supply_projection.
-                            economic_kueue_capacity_by_replica_id)))
+                authority, snapshot = (
+                    capacity_admission.CapacityAdmissionRepository(
+                    ).plan_and_publish_current(
+                        service_name=self._service_name,
+                        service_hash=service_hash,
+                        service_lifecycle_epoch=(
+                            binding.service_lifecycle_epoch),
+                        service_version=decision_version,
+                        accounting_cards=accounting_cards,
+                        sequenced_reserved_fill=sequenced_reserved_fill,
+                        reserved_fill_allocation_map=(
+                            reserved_fill_allocation_map),
+                        planner=_planner,
+                        expected_planning_state_fingerprint=(
+                            planning_state_fingerprint)))
             except (capacity_admission.CapacityAdmissionError,
                     ValueError) as error:
-                logger.warning('Suppressing paid launch because compatible '
-                               'reserved supply could not be projected: '
-                               f'{common_utils.format_exception(error)}')
+                logger.warning(
+                    'Suppressing paid launch because current demand/supply '
+                    'planning could not commit: '
+                    f'{common_utils.format_exception(error)}')
                 return None
-            if not isinstance(economic_target, dict):
-                logger.warning('Suppressing paid launch because the '
-                               'autoscaler has no compatibility-safe economic '
-                               'target.')
-                return None
-            canonical_economic: dict[str, int] = {}
-            for raw_card, count in economic_target.items():
-                card = str(raw_card).casefold()
-                if (card in canonical_economic or card not in capacity_target or
-                        not isinstance(count, int) or isinstance(count, bool) or
-                        count < 0):
-                    logger.warning('Suppressing paid launch because the '
-                                   'economic target is malformed.')
-                    return None
-                canonical_economic[card] = count
-            canonical_economic = {
-                card: canonical_economic.get(card, 0)
-                for card in capacity_target
-            }
-            if sum(canonical_economic.values()) != sum(
-                    capacity_target.values()):
-                logger.warning('Suppressing paid launch because compatible '
-                               'economic placement changed aggregate demand.')
-                return None
-            capacity_target = canonical_economic
-        plan = capacity_admission.CapacityPlanInput(
-            service_name=self._service_name,
-            service_hash=snapshot.service_hash,
-            service_lifecycle_epoch=binding.service_lifecycle_epoch,
-            service_version=decision_version,
-            demand_source_epoch=snapshot.demand_source_epoch,
-            demand_feed_generation=snapshot.demand_feed_generation,
-            receipt_watermark=snapshot.receipt_watermark,
-            route_generation=snapshot.route_generation,
-            route_sha256=snapshot.route_sha256,
-            route_source_epoch=snapshot.route_source_epoch,
-            normalized_demand=normalized_demand,
-            capacity_target_by_accelerator=capacity_target,
-            reserved_fill_authority=reserved_fill_authority,
-            allocation_reserved_capacity_by_accelerator=(
-                {} if supply_projection is None else
-                supply_projection.allocation_reserved_capacity_by_accelerator),
-            expected_pending_zero_cost_capacity_by_accelerator=(
-                {} if supply_projection is None else
-                supply_projection.pending_zero_cost_capacity_by_accelerator),
-            expected_economic_capacity_graph_sha256=(
-                None if supply_projection is None else
-                supply_projection.economic_capacity_graph_sha256))
-        try:
-            return repository.publish(plan)
-        except (capacity_admission.CapacityAdmissionError, ValueError) as error:
-            logger.warning('Suppressing paid launch because ordered capacity '
-                           'authority could not be published: '
-                           f'{common_utils.format_exception(error)}')
+        if planned is None or planned.snapshot != snapshot:
+            logger.warning('Suppressing paid launch because current planning '
+                           'returned no exact local candidate.')
             return None
+        return authority, planned
 
     def _reconcile_scale_once(self, reconcile_generation: int) -> None:
         """Plan and actuate one optimistic, version-fenced scale epoch."""
@@ -6365,13 +6483,10 @@ class SkyServeController:
                     self._replica_manager.invalidate_logical_reconcile_state()
                     return
                 durable_demand_promoted = (
-                    demand_source is not None and demand_source[0] is
-                    capacity_admission.DemandSourceMode.DURABLE_FEED)
-                logical_reconcile_invalidated = False
+                    demand_source is not None and demand_source[0]
+                    is capacity_admission.DemandSourceMode.DURABLE_FEED)
                 pre_demand_sequenced_fill = False
                 pre_demand_allocation = None
-                reserved_supply_projection = None
-                previous_demand = self._durable_demand_snapshot
                 if (durable_demand_promoted and
                         decision_autoscaler.reserved_capacity_fill):
                     # Sequenced fill spends an independently authenticated
@@ -6396,7 +6511,6 @@ class SkyServeController:
                         self._durable_demand_snapshot = None
                         self._replica_manager.invalidate_logical_reconcile_state(
                         )
-                        logical_reconcile_invalidated = True
                         reserved_fill_progress = (
                             self._accept_sequenced_reserved_fill(
                                 pre_demand_allocation, decision_autoscaler,
@@ -6411,337 +6525,153 @@ class SkyServeController:
                             # a lost wakeup or restart cannot duplicate them.
                             self._notify_scale_reconcile()
                             return
-                    previous_demand_may_be_positive = (
-                        previous_demand is None or
-                        not previous_demand.fresh_aggregate_zero)
-                    if (pre_demand_sequenced_fill and
-                            pre_demand_allocation is not None and
-                            previous_demand_may_be_positive):
-                        binding = self._ordinary_launch_binding_authority
-                        accounting_cards = self._ordered_capacity_target(
-                            decision_autoscaler, force_zero=True)
-                        if (binding is not None and
-                                self._service_hash is not None and
-                                accounting_cards is not None and
-                                decision_autoscaler.
-                                supports_reserved_supply_economic_target()):
-                            try:
-                                authority = (
-                                    capacity_admission.
-                                    ReservedFillPlanAuthority.bound(
-                                        pre_demand_allocation.identity))
-                                reserved_supply_projection = (
-                                    capacity_admission.
-                                    CapacityAdmissionRepository().
-                                    project_reserved_supply(
-                                        service_name=self._service_name,
-                                        service_hash=self._service_hash,
-                                        service_lifecycle_epoch=(
-                                            binding.service_lifecycle_epoch),
-                                        service_version=decision_version,
-                                        accounting_cards=accounting_cards,
-                                        authority=authority))
-                            except (capacity_admission.CapacityAdmissionError,
-                                    ValueError) as error:
-                                # Keep going so a fresh zero snapshot can
-                                # revoke older paid authority. A later positive
-                                # plan requires this exact pre-demand
-                                # projection and therefore remains fail closed.
-                                logger.warning(
-                                    'Reserved supply could not be projected '
-                                    'before the durable demand boundary: '
-                                    f'{common_utils.format_exception(error)}')
-                prepared_replica_infos: (
-                    list[replica_managers.ReplicaInfo] | None) = None
-                prepared_planning_state_fingerprint: str | None = None
-                prepared_decision_inputs: (
-                    autoscalers.ScalingDecisionInputs | None) = None
-                if durable_demand_promoted and previous_demand is not None:
-                    # Shape/Kueue input preparation may perform blocking
-                    # durable reads. Keep it on the supply side of the demand
-                    # boundary: after demand is captured, target computation
-                    # and PostgreSQL publication must be one short optimistic
-                    # section that can fit between LB report generations.
-                    prepared_replica_infos = serve_state.get_replica_infos(
-                        self._service_name)
-                    if (autoscalers.controller_prepares_scaling_decision_inputs(
-                            decision_autoscaler)):
-                        prepared_planning_state_fingerprint = (
-                            serve_state.get_scale_planning_state_fingerprint(
-                                self._service_name, require_version=True))
-                        assert prepared_planning_state_fingerprint is not None, (
-                            'No service record found for '
-                            f'{self._service_name}')
-                    prepared_decision_inputs = (
-                        autoscalers.prepare_controller_scaling_decision_inputs(
-                            decision_autoscaler, prepared_replica_infos))
-                durable_snapshot = None
-                durable_logical_snapshot: (
-                    replica_managers.LogicalReconcileSnapshot | None) = None
-                fresh_aggregate_zero = False
-                if durable_demand_promoted:
-                    try:
-                        durable_snapshot = demand_state.get_autoscaling_snapshot(
-                            self._service_name, self._service_hash or '')
-                    except Exception as error:  # pylint: disable=broad-except
-                        logger.warning(
-                            'Revoking durable logical reconcile authority '
-                            'because its PostgreSQL snapshot is unavailable: '
-                            f'{common_utils.format_exception(error)}')
-                        # Demand failure revokes actuation, but it must not
-                        # freeze the independent PostgreSQL replica census.
-                        self._refresh_replica_counts_snapshot()
-                        self._durable_demand_snapshot = None
-                        if not logical_reconcile_invalidated:
-                            self._replica_manager.invalidate_logical_reconcile_state(
-                            )
-                        return
-                    if durable_snapshot is None:
-                        # Stale or incomplete is unknown, never zero.  Do not
-                        # reuse the last promoted snapshot for either free or
-                        # paid capacity actuation.
-                        self._refresh_replica_counts_snapshot()
-                        self._durable_demand_snapshot = None
-                        if not logical_reconcile_invalidated:
-                            self._replica_manager.invalidate_logical_reconcile_state(
-                            )
-                        return
-                    request_information = dict(
-                        durable_snapshot.request_information)
-                    request_information['replace_request_window'] = True
-                    with self._routing_state_lock:
-                        if not self._scale_actuation_is_current(
-                                actuation_generation, decision_autoscaler,
-                                decision_version):
-                            return
-                        durable_reconcile_generation = None
-                        if decision_autoscaler.replica_unit == 'logical':
-                            if not isinstance(
-                                    decision_autoscaler,
-                                    autoscalers.ConcurrencyAutoscaler):
-                                logger.warning(
-                                    'Suppressing durable logical demand '
-                                    'because its autoscaler does not expose '
-                                    'the logical reconcile generation.')
-                                return
-                            durable_reconcile_generation = (
-                                durable_snapshot.demand_feed_generation)
-                            request_reconcile_generation = (
-                                request_information.get('reconcile_generation'))
-                            if (type(durable_reconcile_generation) is not int or
-                                    type(request_reconcile_generation)
-                                    is not int or request_reconcile_generation
-                                    != durable_reconcile_generation):
-                                logger.warning(
-                                    'Suppressing durable logical demand '
-                                    'because its request-information '
-                                    'generation does not match the durable '
-                                    'feed generation.')
-                                return
-                        decision_autoscaler.collect_request_information(
-                            request_information)
-                        if decision_autoscaler.replica_unit == 'logical':
-                            assert isinstance(decision_autoscaler,
-                                              autoscalers.ConcurrencyAutoscaler)
-                            assert durable_reconcile_generation is not None
-                            autoscaler_reconcile_generation = (
-                                decision_autoscaler.reconcile_generation)
-                            if (type(autoscaler_reconcile_generation) is not int
-                                    or autoscaler_reconcile_generation !=
-                                    durable_reconcile_generation):
-                                logger.warning(
-                                    'Suppressing durable logical demand '
-                                    'because the collected autoscaler '
-                                    'generation does not match the durable '
-                                    'feed generation.')
-                                return
-                            # Stage the capacity/occupancy half of the manager
-                            # fence without exposing it. Planning may block or
-                            # fail, and a newer snapshot paired with an older
-                            # lower target could otherwise release a recovered
-                            # retirement. A valid target and this snapshot are
-                            # installed atomically below.
-                            durable_logical_snapshot = (
-                                replica_managers.LogicalReconcileSnapshot(
-                                    version=decision_version,
-                                    generation=durable_reconcile_generation,
-                                    observed_slots_by_replica_id=dict(
-                                        request_information[
-                                            'observed_slots_by_replica_id']),
-                                    in_flight_by_replica_id=dict(
-                                        request_information[
-                                            'in_flight_by_replica_id']),
-                                    unknown_replica_ids=frozenset(
-                                        request_information[
-                                            'unknown_in_flight_replica_ids']),
-                                    received_at=(
-                                        durable_snapshot.reconcile_authority.
-                                        read_started_monotonic),
-                                    authority=(
-                                        durable_snapshot.reconcile_authority)))
-                        self._reconcile_generation += 1
-                        self._durable_demand_snapshot = durable_snapshot
-                        fresh_aggregate_zero = (
-                            durable_snapshot.fresh_aggregate_zero)
-                        if fresh_aggregate_zero:
-                            (decision_autoscaler.
-                             clear_paid_launch_authority_for_fresh_zero())
-                with self._routing_state_lock:
-                    notification_generation = (
-                        self._scale_reconcile_coordinator.generation)
-                    demand_generation = self._reconcile_generation
                 sequenced_reserved_fill = False
                 allocation = None
                 if decision_autoscaler.reserved_capacity_fill:
                     if durable_demand_promoted:
-                        # The projected supply and the subsequent demand
-                        # snapshot form one optimistic publication input.
-                        # Re-reading here can observe a newer broker heartbeat
-                        # and discard the exact projection on every busy-loop
-                        # iteration. CapacityAdmissionRepository.publish()
-                        # locks and revalidates this captured allocation and
-                        # graph with demand, so reuse is both safe and the only
-                        # way to preserve one atomic planning boundary.
                         sequenced_reserved_fill = pre_demand_sequenced_fill
                         allocation = pre_demand_allocation
                     else:
                         (sequenced_reserved_fill, allocation) = (
                             self._read_sequenced_reserved_fill_allocation())
-                planning_state_fingerprint = (
-                    prepared_planning_state_fingerprint)
-                decision_inputs = prepared_decision_inputs
-                if prepared_replica_infos is None:
-                    replica_infos = serve_state.get_replica_infos(
-                        self._service_name)
-                    if (autoscalers.
-                            controller_prepares_scaling_decision_inputs(
-                                decision_autoscaler)):
-                        planning_state_fingerprint = (
-                            serve_state.get_scale_planning_state_fingerprint(
-                                self._service_name, require_version=True))
-                        assert planning_state_fingerprint is not None, (
-                            'No service record found for '
-                            f'{self._service_name}')
-                else:
-                    replica_infos = prepared_replica_infos
-                ordered_paid_authority = None
-                retirement_changed = False
-                if durable_snapshot is not None and fresh_aggregate_zero:
-                    # Revoke every older paid claim before any provider-facing
-                    # zero-cost or ordinary action in this reconcile. Exact
-                    # card compatibility is unnecessary for an all-zero map.
-                    ordered_paid_authority = (
-                        self._publish_ordered_paid_authority(
-                            decision_autoscaler,
-                            decision_version,
-                            sequenced_reserved_fill=sequenced_reserved_fill,
-                            force_zero=True))
-                    if ordered_paid_authority is None:
-                        return
-                    retirement_changed = (
-                        self._replica_manager.
-                        reconcile_fresh_zero_paid_retirements(
-                            paid_retirement.FreshZeroAuthority(
-                                service_hash=durable_snapshot.service_hash,
-                                demand_source_epoch=(
-                                    durable_snapshot.demand_source_epoch),
-                                demand_feed_generation=(
-                                    durable_snapshot.demand_feed_generation),
-                                capacity_plan_generation=(
-                                    ordered_paid_authority.generation),
-                                capacity_plan_sha256=(
-                                    ordered_paid_authority.content_sha256),
-                                route_generation=(
-                                    durable_snapshot.route_generation)),
-                            replica_infos))
-                elif durable_snapshot is not None:
-                    normalized = durable_snapshot.normalized_demand
-                    aggregate_positive = any(
-                        int(normalized.get(field, 0) or 0) > 0
-                        for field in ('recent_request_count', 'queue_depth',
-                                      'rejected_in_window',
-                                      'recent_rejected_in_window'))
-                    if aggregate_positive:
-                        retirement_changed = (
-                            self._replica_manager.
-                            cancel_uncommitted_paid_retirements(
-                                durable_snapshot.service_hash,
-                                durable_snapshot.demand_feed_generation))
-                if retirement_changed:
-                    replica_infos = serve_state.get_replica_infos(
-                        self._service_name)
-                    if (autoscalers.controller_prepares_scaling_decision_inputs(
-                            decision_autoscaler)):
-                        planning_state_fingerprint = (
-                            serve_state.get_scale_planning_state_fingerprint(
-                                self._service_name, require_version=True))
-                        assert planning_state_fingerprint is not None, (
-                            'No service record found for '
-                            f'{self._service_name}')
-                        decision_inputs = (
-                            autoscalers.
-                            prepare_controller_scaling_decision_inputs(
-                                decision_autoscaler, replica_infos))
-                self._snapshot_replica_counts(replica_infos)
-                # Use the active versions set by replica manager to make
-                # sure we only scale down the outdated replicas that are
-                # not used by the load balancer.
+
+                prepares_inputs = (
+                    autoscalers.controller_prepares_scaling_decision_inputs(
+                        decision_autoscaler))
+                if durable_demand_promoted and not prepares_inputs:
+                    logger.warning(
+                        'Suppressing durable demand because its autoscaler has '
+                        'no controller-prepared no-I/O planning path.')
+                    self._durable_demand_snapshot = None
+                    self._replica_manager.invalidate_logical_reconcile_state()
+                    return
+                planning_fingerprint_before = None
+                if prepares_inputs:
+                    planning_fingerprint_before = (
+                        serve_state.get_scale_planning_state_fingerprint(
+                            self._service_name, require_version=True))
+                    assert planning_fingerprint_before is not None, (
+                        'No service record found for '
+                        f'{self._service_name}')
+                replica_infos = serve_state.get_replica_infos(
+                    self._service_name)
                 runtime_snapshot = serve_state.get_service_runtime_snapshot(
                     self._service_name, require_version=True)
                 assert runtime_snapshot is not None, (
                     'No service record found for '
                     f'{self._service_name}')
                 active_versions = runtime_snapshot['active_versions']
-                if (durable_demand_promoted and sequenced_reserved_fill and
-                        allocation is None):
-                    # Revoke before planning: notification, fingerprint, or
-                    # actuation churn can make planning return early, but none
-                    # of those optimistic exits may retain an older positive
-                    # paid head while sequenced allocation is UNKNOWN.
-                    if not self._scale_actuation_is_current(
-                            actuation_generation, decision_autoscaler,
-                            decision_version):
+                decision_inputs = (
+                    autoscalers.prepare_controller_scaling_decision_inputs(
+                        decision_autoscaler, replica_infos))
+                planning_state_fingerprint = planning_fingerprint_before
+                if prepares_inputs:
+                    planning_state_fingerprint = (
+                        serve_state.get_scale_planning_state_fingerprint(
+                            self._service_name, require_version=True))
+                    assert planning_state_fingerprint is not None, (
+                        'No service record found for '
+                        f'{self._service_name}')
+                    if (planning_state_fingerprint
+                            != planning_fingerprint_before):
+                        self._notify_scale_reconcile()
                         return
-                    if ordered_paid_authority is None:
-                        ordered_paid_authority = (
-                            self._publish_ordered_paid_authority(
-                                decision_autoscaler,
-                                decision_version,
-                                sequenced_reserved_fill=(
-                                    sequenced_reserved_fill),
-                                force_zero=True))
-                    self._replica_manager.invalidate_logical_reconcile_state()
-                    if ordered_paid_authority is None:
-                        logger.warning(
-                            'Unable to revoke paid authority while sequenced '
-                            'reserved capacity is unavailable.')
-                    return
-                plan = self._plan_scale_reconciliation(
-                    decision_autoscaler,
-                    decision_version,
-                    actuation_generation,
-                    notification_generation,
-                    demand_generation,
-                    replica_infos,
-                    active_versions,
-                    planning_state_fingerprint,
-                    sequenced_reserved_fill=(sequenced_reserved_fill),
-                    sequenced_reserved_fill_allocation=allocation,
-                    prepared_decision_inputs=decision_inputs)
-                if plan is None:
-                    return
+                self._snapshot_replica_counts(replica_infos)
+                with self._routing_state_lock:
+                    notification_generation = (
+                        self._scale_reconcile_coordinator.generation)
+                    demand_generation = self._reconcile_generation
+
+                ordered_paid_authority = None
+                durable_snapshot = None
+                durable_logical_snapshot = None
+                fresh_aggregate_zero = False
+                if durable_demand_promoted:
+                    assert decision_inputs is not None
+                    current_plan = self._plan_and_publish_current_capacity(
+                        decision_autoscaler,
+                        decision_version,
+                        actuation_generation,
+                        notification_generation,
+                        replica_infos,
+                        active_versions,
+                        planning_state_fingerprint,
+                        decision_inputs,
+                        sequenced_reserved_fill=sequenced_reserved_fill,
+                        reserved_fill_allocation_map=allocation)
+                    if current_plan is None:
+                        self._refresh_replica_counts_snapshot()
+                        self._durable_demand_snapshot = None
+                        self._replica_manager.invalidate_logical_reconcile_state(
+                        )
+                        return
+                    ordered_paid_authority, linearized = current_plan
+                    durable_snapshot = linearized.snapshot
+                    durable_logical_snapshot = linearized.logical_snapshot
+                    notification_generation = (
+                        linearized.notification_generation)
+                    demand_generation = linearized.demand_generation
+                    fresh_aggregate_zero = (
+                        durable_snapshot.fresh_aggregate_zero)
+                    plan = linearized.scaling_plan
+                    retirement_changed = False
+                    if fresh_aggregate_zero:
+                        retirement_changed = (
+                            self._replica_manager.
+                            reconcile_fresh_zero_paid_retirements(
+                                paid_retirement.FreshZeroAuthority(
+                                    service_hash=durable_snapshot.service_hash,
+                                    demand_source_epoch=(
+                                        durable_snapshot.demand_source_epoch),
+                                    demand_feed_generation=(
+                                        durable_snapshot.demand_feed_generation
+                                    ),
+                                    capacity_plan_generation=(
+                                        ordered_paid_authority.generation),
+                                    capacity_plan_sha256=(
+                                        ordered_paid_authority.content_sha256),
+                                    route_generation=(
+                                        durable_snapshot.route_generation)),
+                                replica_infos))
+                    else:
+                        normalized = durable_snapshot.normalized_demand
+                        aggregate_positive = any(
+                            int(normalized.get(field, 0) or 0) > 0
+                            for field in ('recent_request_count', 'queue_depth',
+                                          'rejected_in_window',
+                                          'recent_rejected_in_window'))
+                        if aggregate_positive:
+                            retirement_changed = (
+                                self._replica_manager.
+                                cancel_uncommitted_paid_retirements(
+                                    durable_snapshot.service_hash,
+                                    durable_snapshot.demand_feed_generation))
+                    if retirement_changed:
+                        # The committed plan conservatively counted every
+                        # cleanup-unproven paid row. Rebuild all immutable
+                        # inputs before publishing local state from the now
+                        # changed retirement graph.
+                        self._notify_scale_reconcile()
+                        return
+                else:
+                    legacy_plan = self._plan_scale_reconciliation(
+                        decision_autoscaler,
+                        decision_version,
+                        actuation_generation,
+                        notification_generation,
+                        demand_generation,
+                        replica_infos,
+                        active_versions,
+                        planning_state_fingerprint,
+                        sequenced_reserved_fill=(sequenced_reserved_fill),
+                        sequenced_reserved_fill_allocation=allocation,
+                        prepared_decision_inputs=decision_inputs)
+                    if legacy_plan is None:
+                        return
+                    plan = legacy_plan
                 (scaling_options, target_num_replicas, rollout_failure,
                  logical_target, logical_retirement_floor, retirement_shelter,
                  invalidate_logical_target) = plan
-                if (retirement_shelter is not None and
-                        not retirement_shelter.authority_current):
-                    allocation = None
-                if fresh_aggregate_zero:
-                    target_num_replicas = 0
-                    scaling_options = [
-                        option for option in scaling_options if option.operator
-                        != autoscalers.AutoscalerDecisionOperator.SCALE_UP
-                    ]
                 ordinary_physical_overrides: list[dict[str, Any] | None] = []
                 ordinary_logical_targets: list[
                     autoscalers.LogicalScaleTarget] = []
@@ -6771,38 +6701,7 @@ class SkyServeController:
                                 'Suppressing promoted logical paid launch '
                                 'without exact-card residual authority.')
                             return
-                    if (ordered_paid_authority is None and
-                            sequenced_reserved_fill):
-                        # The allocation-bound plan is the first side effect
-                        # after target computation. Publishing local target
-                        # state or probing ordinary zero-cost placement can
-                        # wait on the large-fleet manager lock and race the
-                        # next demand/allocation heartbeat. The sequenced
-                        # allocation already accounts for committed, pending,
-                        # and unmaterialized reserved supply; publication
-                        # locks and revalidates that exact graph with demand.
-                        ordered_paid_authority = (
-                            self._publish_ordered_paid_authority(
-                                decision_autoscaler,
-                                decision_version,
-                                sequenced_reserved_fill=True,
-                                reserved_fill_allocation_map=allocation,
-                                reserved_supply_projection=(
-                                    reserved_supply_projection)))
-                        if ordered_paid_authority is None:
-                            return
-                if (sequenced_reserved_fill and
-                        retirement_shelter is not None and
-                        retirement_shelter.authority_current):
-                    (still_sequenced, current_allocation) = (
-                        self._read_sequenced_reserved_fill_allocation())
-                    if (not still_sequenced or
-                            current_allocation != allocation):
-                        logger.info(
-                            'Reserved-fill allocation advanced while '
-                            'planning; retrying before target publication.')
-                        self._notify_scale_reconcile()
-                        return
+                    assert ordered_paid_authority is not None
                 if not self._scale_actuation_is_current(actuation_generation,
                                                         decision_autoscaler,
                                                         decision_version):
@@ -6854,8 +6753,8 @@ class SkyServeController:
                                     decision_version) or
                                     self._scale_reconcile_coordinator.generation
                                     != notification_generation or
-                                    self._reconcile_generation !=
-                                    demand_generation):
+                                    self._reconcile_generation
+                                    != demand_generation):
                                 return
                             if not (self._replica_manager.
                                     publish_logical_reconcile_state(
@@ -6909,26 +6808,10 @@ class SkyServeController:
                         # snapshot.
                         self._notify_scale_reconcile()
                         return
-                    # Publish on every fresh promoted reconcile, including a
-                    # zero target.  Duplicate semantic content refreshes the
-                    # current head for queued claims; a demand drop mints a
-                    # new zero-residual generation and revokes the old one.
-                    if ordered_paid_authority is None:
-                        reserved_supply_kwargs: dict[str, Any] = {}
-                        if sequenced_reserved_fill:
-                            reserved_supply_kwargs[
-                                'reserved_supply_projection'] = (
-                                    reserved_supply_projection)
-                        ordered_paid_authority = (
-                            self._publish_ordered_paid_authority(
-                                decision_autoscaler,
-                                decision_version,
-                                sequenced_reserved_fill=(
-                                    sequenced_reserved_fill),
-                                reserved_fill_allocation_map=allocation,
-                                **reserved_supply_kwargs))
-                    if ordered_paid_authority is None:
-                        return
+                    # Current demand, exact reserved supply and paid residual
+                    # already committed together before any local target or
+                    # zero-cost probe became visible.
+                    assert ordered_paid_authority is not None
                 # Batch consecutive SCALE_UP decisions into ONE
                 # replica-manager call: each scale_up acquires the manager
                 # lock, which the readiness-probe round holds for tens of
@@ -7120,11 +7003,12 @@ class SkyServeController:
                                      logical_scale_down_target.
                                      target_capacity_by_accelerator,
                                      logical_scale_down_target.
-                                     accelerator_shapes) !=
-                                    (first.version, first.reconcile_generation,
-                                     first.target_capacity,
-                                     first.target_capacity_by_accelerator,
-                                     first.accelerator_shapes)):
+                                     accelerator_shapes) != (
+                                         first.version,
+                                         first.reconcile_generation,
+                                         first.target_capacity,
+                                         first.target_capacity_by_accelerator,
+                                         first.accelerator_shapes)):
                                     _flush_logical_scale_down()
                             pending_logical_scale_down.append(
                                 logical_scale_down_target)
@@ -7285,9 +7169,9 @@ class SkyServeController:
                     'Could not snapshot reserved-fill reconciliation state: '
                     f'{common_utils.format_exception(e)}')
                 info['reserved_fill_reconciliation'] = {
-                    'enabled':
-                        (getattr(self._autoscaler, 'reserved_capacity_fill',
-                                 False) is True),
+                    'enabled': (getattr(self._autoscaler,
+                                        'reserved_capacity_fill', False)
+                                is True),
                     'authority_mode': 'unavailable',
                     'allocation_current': False,
                     'allocation_generation': None,
