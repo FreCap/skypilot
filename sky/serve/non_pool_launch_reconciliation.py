@@ -15,11 +15,12 @@ from collections.abc import Callable
 from collections.abc import Mapping
 import dataclasses
 import time
-from typing import Any
+from typing import Any, cast
 
 from sky import exceptions
 from sky.adaptors import common as adaptors_common
 from sky.provision import capacity_policy
+from sky.provision import constants as provision_constants
 from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
 from sky.serve import reserved_capacity
@@ -30,7 +31,11 @@ api_requests = adaptors_common.LazyImport('sky.server.requests.requests')
 provision = adaptors_common.LazyImport('sky.provision')
 gcp_provision = adaptors_common.LazyImport('sky.provision.gcp')
 gcp_cloud = adaptors_common.LazyImport('sky.clouds.gcp')
+aws_adaptor = adaptors_common.LazyImport('sky.adaptors.aws')
 
+_AWS_EMPTY_CENSUS_INTERVAL_SECONDS = 2.0
+_AWS_POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS = 420.0
+_AWS_POST_TEARDOWN_ABSENCE_POLL_SECONDS = 2.0
 _GCP_EMPTY_CENSUS_INTERVAL_SECONDS = 2.0
 _GCP_POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS = 420.0
 _GCP_POST_TEARDOWN_ABSENCE_POLL_SECONDS = 2.0
@@ -138,16 +143,39 @@ def apply_exact_provider_absence_replica_projection(
             info.is_zero_cost is False and info.reserved_fill is False and
             info.service_job_id is None)
         handler_failed = status == 'FAILED' and cause == 'handler_failed'
-        if probe_contract == 'gcp-vm-disk-operation-presence-v1':
+        if probe_contract == 'aws-client-token-instance-presence-v1':
+            assert isinstance(evidence_payload, Mapping)
+            pool_identity = (paid_capacity.pool_key_payload(pool_key)
+                             if isinstance(pool_key, str) else None)
+            instances = evidence_payload.get('instances')
+            if (context.profile.kind is not ordinary_launch_binding.
+                    NonPoolLaunchProfileKind.ORDINARY_PAID or
+                    not replica_shape_matches or not ordinary_launch_binding.
+                    ordinary_paid_provider_terminal_shape_matches(
+                        status, cause, pool_key) or
+                    not isinstance(pool_identity, Mapping) or
+                    pool_identity.get('cloud') != 'aws' or
+                    evidence_payload.get('result') != 'ABSENT' or
+                    not isinstance(instances, list) or
+                    any(not isinstance(instance, Mapping) or
+                        instance.get('state') != 'terminated'
+                        for instance in instances)):
+                return None
+            # A client-token census with no live instance proves cleanup, not
+            # a typed Spot shortage. Do not poison this pool's capacity model.
+            paid_outcome = paid_capacity.LaunchOutcome.OTHER_FAILURE
+            info.status_property.failed_spot_availability = False
+        elif probe_contract == 'gcp-vm-disk-operation-presence-v1':
+            assert isinstance(evidence_payload, Mapping)
             pool_identity = (paid_capacity.pool_key_payload(pool_key)
                              if isinstance(pool_key, str) else None)
             replacement_shape_matches = bool(
-                context.profile.kind is ordinary_launch_binding.
-                NonPoolLaunchProfileKind.ORDINARY_PAID or
-                (isinstance(pool_identity, Mapping) and
-                 pool_identity.get('cloud') == 'gcp' and
-                 pool_identity.get('version') == 1 and
-                 pool_identity.get('use_spot') is True))
+                context.profile.kind is
+                ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID
+                or (isinstance(pool_identity, Mapping) and
+                    pool_identity.get('cloud') == 'gcp' and
+                    pool_identity.get('version') == 1 and
+                    pool_identity.get('use_spot') is True))
             if (not replacement_shape_matches or not replica_shape_matches or
                     not ordinary_launch_binding.
                     ordinary_paid_provider_terminal_shape_matches(
@@ -279,6 +307,199 @@ def _gcp_observation_payload(
         'replica_record_id': str(context.replica_record_id),
         'result': evidence.value,
     }
+
+
+def _query_aws_paid_provider_census(
+    provider_identity: Mapping[str, Any],) -> list[dict[str, str]]:
+    """Perform one uncached, account-checked EC2 client-token census."""
+    session = aws_adaptor.session(
+        profile=provider_identity['credential_profile'])
+    region = provider_identity['region']
+    caller = session.client('sts', region_name=region).get_caller_identity()
+    if caller.get('Account') != provider_identity['aws_account_id']:
+        raise ValueError('AWS credential profile resolved to another account.')
+    client = session.client('ec2', region_name=region)
+    pages = client.get_paginator('describe_instances').paginate(Filters=[{
+        'Name': 'client-token',
+        'Values': [provider_identity['client_token']],
+    }])
+    instances: list[dict[str, str]] = []
+    for page in pages:
+        reservations = page.get('Reservations')
+        if not isinstance(reservations, list):
+            raise ValueError('DescribeInstances returned no reservations.')
+        for reservation in reservations:
+            if not isinstance(reservation, Mapping):
+                raise ValueError(
+                    'DescribeInstances returned a bad reservation.')
+            values = reservation.get('Instances')
+            if not isinstance(values, list):
+                raise ValueError('DescribeInstances returned no instances.')
+            for instance in values:
+                if not isinstance(instance, Mapping):
+                    raise ValueError(
+                        'DescribeInstances returned a bad instance.')
+                tags_list = instance.get('Tags', [])
+                if not isinstance(tags_list, list):
+                    raise ValueError('DescribeInstances returned invalid tags.')
+                tags: dict[str, str] = {}
+                for tag in tags_list:
+                    if (not isinstance(tag, Mapping) or
+                            not isinstance(tag.get('Key'), str) or
+                            not isinstance(tag.get('Value'), str) or
+                            tag['Key'] in tags):
+                        raise ValueError(
+                            'DescribeInstances returned non-canonical tags.')
+                    tags[tag['Key']] = tag['Value']
+                placement = instance.get('Placement')
+                state = instance.get('State')
+                lifecycle = instance.get('InstanceLifecycle')
+                block_devices = instance.get('BlockDeviceMappings')
+                if not isinstance(block_devices, list):
+                    raise ValueError(
+                        'DescribeInstances returned no block-device census.')
+                for block_device in block_devices:
+                    if not isinstance(block_device, Mapping):
+                        raise ValueError(
+                            'DescribeInstances returned a bad block device.')
+                    ebs = block_device.get('Ebs')
+                    if (ebs is not None and
+                            (not isinstance(ebs, Mapping) or
+                             ebs.get('DeleteOnTermination') is not True)):
+                        raise ValueError(
+                            'Exact AWS instance retains a non-ephemeral EBS '
+                            'volume; native cleanup is unsafe.')
+                raw_canonical = {
+                    'availability_zone': placement.get('AvailabilityZone')
+                                         if isinstance(placement, Mapping) else
+                                         None,
+                    'client_token': instance.get('ClientToken'),
+                    'cluster_name_on_cloud': tags.get(
+                        provision_constants.TAG_RAY_CLUSTER_NAME),
+                    'instance_id': instance.get('InstanceId'),
+                    'instance_type': instance.get('InstanceType'),
+                    'market': ('spot' if lifecycle == 'spot' else
+                               'on_demand' if lifecycle is None else lifecycle),
+                    'state': state.get('Name')
+                             if isinstance(state, Mapping) else None,
+                }
+                if any(not isinstance(value, str) or not value
+                       for value in raw_canonical.values()):
+                    raise ValueError(
+                        'DescribeInstances returned incomplete identity.')
+                canonical = cast(dict[str, str], raw_canonical)
+                instances.append(canonical)
+    instances = sorted(instances,
+                       key=lambda instance: instance['instance_id'])
+    if (len(instances) > provider_identity['num_nodes'] or
+            len({instance['instance_id']
+                 for instance in instances}) != len(instances)):
+        raise ValueError(
+            'EC2 client-token census exceeded its immutable allocation.')
+    allowed_states = {
+        'pending', 'running', 'shutting-down', 'terminated', 'stopping',
+        'stopped'
+    }
+    for instance in instances:
+        if (instance['availability_zone'] != provider_identity['zone'] or
+                instance['client_token'] != provider_identity['client_token']
+                or instance['cluster_name_on_cloud'] !=
+                provider_identity['cluster_name_on_cloud'] or
+                instance['instance_type'] != provider_identity['instance_type']
+                or instance['market'] != 'spot' or
+                instance['state'] not in allowed_states):
+            raise ValueError(
+                'EC2 client-token census escaped its immutable allocation.')
+    return instances
+
+
+def _aws_observation_payload(
+    context: ordinary_launch_binding.BoundNonPoolLaunchContext,
+    replica_info: Any,
+    provider_identity: Mapping[str, Any],
+    instances: list[dict[str, str]],
+    evidence: ordinary_launch_binding.ProviderEvidence,
+) -> dict[str, Any]:
+    """Build one closed exact-resource AWS observation envelope."""
+    return {
+        'association_id': str(context.association_id),
+        'cluster_name': getattr(replica_info, 'cluster_name', None),
+        'instances': instances,
+        'probe_contract': 'aws-client-token-instance-presence-v1',
+        'profile_kind': context.profile.kind.value,
+        'provider_identity': dict(provider_identity),
+        'replica_record_id': str(context.replica_record_id),
+        'result': evidence.value,
+    }
+
+
+def _observe_aws_paid_provider(
+    context: ordinary_launch_binding.BoundNonPoolLaunchContext,
+    replica_info: Any,
+    authority: ordinary_launch_binding.ControllerBindingAuthority,
+) -> ProviderObservation:
+    """Query frozen AWS account, placement, and EC2 client-token identity."""
+    identity = request_postgres.bound_non_pool_aws_provider_identity(
+        context, authority)
+    base = {
+        'association_id': str(context.association_id),
+        'cluster_name': getattr(replica_info, 'cluster_name', None),
+        'probe_contract': 'aws-client-token-instance-presence-v1',
+        'profile_kind': context.profile.kind.value,
+        'replica_record_id': str(context.replica_record_id),
+    }
+    if identity is None:
+        return ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
+                **base,
+                'reason': 'missing-immutable-aws-provider-identity',
+            })
+    try:
+        instances = _query_aws_paid_provider_census(identity)
+    except Exception as error:  # pylint: disable=broad-except
+        return ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
+                **base,
+                'error_type': type(error).__name__,
+                'provider_identity': identity,
+                'reason': 'aws-provider-read-failed',
+            })
+    live = [
+        instance for instance in instances if instance['state'] != 'terminated'
+    ]
+    if live:
+        evidence = ordinary_launch_binding.ProviderEvidence.PRESENT
+        return ProviderObservation(
+            evidence,
+            _aws_observation_payload(context, replica_info, identity, instances,
+                                     evidence))
+    if not request_postgres.bound_non_pool_aws_provider_absence_is_settled(
+            context, authority):
+        return ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
+                **base,
+                'instances': instances,
+                'provider_identity': identity,
+                'reason': 'aws-create-settling',
+            })
+    time.sleep(_AWS_EMPTY_CENSUS_INTERVAL_SECONDS)
+    try:
+        instances = _query_aws_paid_provider_census(identity)
+    except Exception as error:  # pylint: disable=broad-except
+        return ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
+                **base,
+                'error_type': type(error).__name__,
+                'provider_identity': identity,
+                'reason': 'aws-provider-second-read-failed',
+            })
+    evidence = (ordinary_launch_binding.ProviderEvidence.PRESENT if any(
+        instance['state'] != 'terminated' for instance in instances) else
+                ordinary_launch_binding.ProviderEvidence.ABSENT)
+    return ProviderObservation(
+        evidence,
+        _aws_observation_payload(context, replica_info, identity, instances,
+                                 evidence))
 
 
 def _query_gcp_paid_provider_census(
@@ -420,7 +641,21 @@ def observe_provider(
     }
     if (ordinary_launch_binding.is_paid_provider_reconciliation_profile(
             context.profile.kind) and authority is not None):
-        return _observe_gcp_paid_provider(context, replica_info, authority)
+        pool_key = getattr(replica_info, 'paid_capacity_pool_key', None)
+        pool_identity = (paid_capacity.pool_key_payload(pool_key) if isinstance(
+            pool_key, str) else None)
+        cloud = (pool_identity.get('cloud') if isinstance(
+            pool_identity, Mapping) else None)
+        if cloud == 'aws':
+            return _observe_aws_paid_provider(context, replica_info, authority)
+        if cloud == 'gcp':
+            return _observe_gcp_paid_provider(context, replica_info, authority)
+        return ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.UNKNOWN, {
+                **base,
+                'probe_contract': 'immutable-paid-pool-presence-v1',
+                'reason': 'missing-immutable-paid-pool-identity',
+            })
     if (context.profile.kind !=
             ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
         return ProviderObservation(
@@ -605,6 +840,77 @@ def terminate_gcp_paid_provider_allocation(
                 ordinary_launch_binding.ProviderEvidence.ABSENT):
             break
         time.sleep(_GCP_POST_TEARDOWN_ABSENCE_POLL_SECONDS)
+    _reduce_observation(context, authority, project_replica_result, observation)
+    return observation
+
+
+def terminate_aws_paid_provider_allocation(
+    context: ordinary_launch_binding.BoundNonPoolLaunchContext,
+    replica_info: Any,
+    authority: ordinary_launch_binding.ControllerBindingAuthority,
+    project_replica_result: Callable[..., bool],
+    *,
+    continue_guard: Callable[[], bool] | None = None,
+) -> ProviderObservation:
+    """Terminate exact client-token EC2 instances and prove fresh absence."""
+    if (context.profile.kind is not ordinary_launch_binding.
+            NonPoolLaunchProfileKind.ORDINARY_PAID or not request_postgres.
+            bound_non_pool_provider_present_cleanup_is_authorized(
+                context, authority)):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'AWS provider cleanup lacks exact durable PRESENT authority.')
+    identity = request_postgres.bound_non_pool_aws_provider_identity(
+        context, authority)
+    if identity is None:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'AWS provider cleanup lost its immutable request identity.')
+    deadline = time.monotonic() + _AWS_POST_TEARDOWN_ABSENCE_TIMEOUT_SECONDS
+    last_cleanup_error: BaseException | None = None
+    observation: ProviderObservation | None = None
+    while True:
+        if time.monotonic() >= deadline:
+            timeout_error = ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'AWS provider cleanup has no fresh exact client-token ABSENT '
+                'observation.')
+            if last_cleanup_error is not None:
+                raise timeout_error from last_cleanup_error
+            raise timeout_error
+        if continue_guard is not None and not continue_guard():
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'AWS provider cleanup lost authority while deleting the exact '
+                'allocation.')
+        try:
+            instances = _query_aws_paid_provider_census(identity)
+            live_ids = [
+                instance['instance_id']
+                for instance in instances
+                if instance['state'] != 'terminated'
+            ]
+            if live_ids:
+                session = aws_adaptor.session(
+                    profile=identity['credential_profile'])
+                account = session.client(
+                    'sts',
+                    region_name=identity['region']).get_caller_identity()
+                if account.get('Account') != identity['aws_account_id']:
+                    raise ValueError(
+                        'AWS cleanup credentials resolved to another account.')
+                session.client(
+                    'ec2', region_name=identity['region']).terminate_instances(
+                        InstanceIds=live_ids)
+                last_cleanup_error = None
+                time.sleep(_AWS_POST_TEARDOWN_ABSENCE_POLL_SECONDS)
+                continue
+            observation = _observe_aws_paid_provider(context, replica_info,
+                                                     authority)
+            if (observation.evidence is
+                    ordinary_launch_binding.ProviderEvidence.ABSENT):
+                break
+            last_cleanup_error = None
+        except Exception as error:  # pylint: disable=broad-except
+            last_cleanup_error = error
+        time.sleep(_AWS_POST_TEARDOWN_ABSENCE_POLL_SECONDS)
+    assert observation is not None
     _reduce_observation(context, authority, project_replica_result, observation)
     return observation
 

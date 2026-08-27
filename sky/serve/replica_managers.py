@@ -2633,33 +2633,44 @@ def terminate_bound_non_pool_provider_present_cluster(
     """Down one exact PRESENT allocation, then project fresh ABSENT proof."""
     if ordinary_launch_binding.is_paid_provider_reconciliation_profile(
             binding_context.profile.kind):
+        pool_identity = paid_capacity.pool_key_payload(
+            str(replica_info.paid_capacity_pool_key))
+        cloud = (pool_identity.get('cloud')
+                 if isinstance(pool_identity, dict) else None)
+        if cloud not in ('aws', 'gcp'):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Paid provider cleanup lost its immutable pool cloud.')
         expected_cluster_record_uuid = terminate_kwargs.get(
             'expected_cluster_record_uuid')
         if expected_cluster_record_uuid is None:
             if terminate_kwargs.get('cleanup_fence') is not None:
                 raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                    'Paid GCP cleanup acquired a reserved-fill fence.')
-            (non_pool_launch_reconciliation.
-             terminate_gcp_paid_provider_allocation)(
-                 binding_context,
-                 replica_info,
-                 authority,
-                 project_replica_result,
-                 continue_guard=terminate_kwargs.get('continue_guard'))
+                    'Paid cleanup acquired a reserved-fill fence.')
+            cleanup = (non_pool_launch_reconciliation.
+                       terminate_aws_paid_provider_allocation
+                       if cloud == 'aws' else non_pool_launch_reconciliation.
+                       terminate_gcp_paid_provider_allocation)
+            cleanup(binding_context,
+                    replica_info,
+                    authority,
+                    project_replica_result,
+                    continue_guard=terminate_kwargs.get('continue_guard'))
             return
         # A live exact SkyPilot cluster row retains the complete backend
         # teardown context. Use it to remove the provider object and cluster
-        # metadata, then independently prove the frozen GCP label is absent.
+        # metadata, then independently prove the frozen identity is absent.
         terminate_cluster(cluster_name, replica_drain_delay_seconds,
                           **terminate_kwargs)
-        observation = (
-            non_pool_launch_reconciliation.
-            terminate_gcp_paid_provider_allocation)(
-                binding_context,
-                replica_info,
-                authority,
-                project_replica_result,
-                continue_guard=terminate_kwargs.get('continue_guard'))
+        cleanup = (non_pool_launch_reconciliation.
+                   terminate_aws_paid_provider_allocation
+                   if cloud == 'aws' else non_pool_launch_reconciliation.
+                   terminate_gcp_paid_provider_allocation)
+        observation = cleanup(
+            binding_context,
+            replica_info,
+            authority,
+            project_replica_result,
+            continue_guard=terminate_kwargs.get('continue_guard'))
         assert (observation.evidence
                 is ordinary_launch_binding.ProviderEvidence.ABSENT)
         return

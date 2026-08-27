@@ -208,6 +208,47 @@ residual is authorized. Opportunistic fill is utilization-gated with a zero
 floor, so idle fill returns without changing East scheduling or Simone's PHX
 Kueue policy.
 
+The first deadline-planner production campaign on lifecycle 121 exposed a
+remaining violation of that demand-driven contract. Two hundred explicitly
+L4-only, priority-zero queue entries correctly produced an L4-only deadline
+target and 59 Spot L4 commitments, but the sequenced reserved-fill pre-demand
+phase also admitted 17 A100/H200 Kubernetes intents. The utilization governor
+had reduced only one aggregate fill budget; its typed fill planner still spent
+that budget in physical-pool order before reading the request compatibility
+classes. The campaign was stopped and the service was taken down immediately.
+No scheduler policy was changed.
+
+The canonical correction is deliberately smaller than adding a second
+per-accelerator entitlement protocol. A service with
+``utilization_gate: true`` does not run opportunistic pre-demand fill at all.
+Its already-existing ordinary demand path reads the current exact-card queue
+profiles, commits compatible scheduler-authorized reserved capacity first, and
+then commits only the paid residual. This produces the requested
+demand-proportional behavior through one compatibility allocator. Static
+``utilization_gate: false`` services retain pre-demand opportunistic fill and
+its authenticated allocation machinery. Existing gated fill holdings remain
+retirement-sheltered while they drain, but no new gated fill intent is
+admitted. Missing or N-1 compatibility telemetry therefore fails closed to the
+ordinary allocator's established conservative fallback; it never re-enables
+cross-card prefill.
+
+The same aborted lifecycle exposed an independent paid-teardown defect. An
+ambiguous AWS Spot association with a quiesced failed handler and no exact
+zero-effect rejection receipt was sent to the GCP provider observer. The GCP
+observer correctly refused an AWS pool with
+``missing-immutable-gcp-provider-identity``, but that fail-closed result made
+the service teardown retry forever. Paid reconciliation must dispatch on the
+immutable paid-pool cloud, never on the profile kind alone. AWS associations
+without a negative acknowledgement use their association-derived EC2
+``ClientToken``, frozen workspace credential profile, account, region, zone,
+instance type, Spot market, and cluster tag for an exact native census. A
+quiesced empty census is accepted only after the propagation horizon and two
+uncached reads. A matching live instance authorizes exact instance-ID
+termination followed by a fresh empty census; mismatched credentials or
+allocation fields remain ``UNKNOWN``. GCP keeps its existing VM, disk, and
+retained-operation observer. This closes teardown without treating a missing
+SkyPilot cluster row as provider absence and without manual row deletion.
+
 Before PR #1758, aggregate queued work applied priority timeout weights while
 the exact-card compatibility allocator consumed raw queued profile counts. A
 complete compatibility report could therefore raise the aggregate target back
@@ -389,6 +430,11 @@ paid-authority census.
 - Admit as much healthy, exact-card-compatible reserved capacity as the
   current priority/deadline-weighted demand target needs. Do not retain idle
   capacity merely to maximize occupancy.
+- For ``utilization_gate: true``, admit new reserved capacity only through the
+  ordinary exact-card demand plan. Do not let the aggregate activity governor
+  authorize pre-demand fill on a card absent from the request compatibility
+  classes. ``utilization_gate: false`` remains the explicit static-prefill
+  contract.
 - Count every GPU on a multi-GPU machine once. One logical asynchronous worker
   owns one GPU; an eight-GPU node can therefore host eight workers.
 - Treat available supply as dynamic. When research releases a compatible slot,

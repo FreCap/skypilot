@@ -71,6 +71,56 @@ def _reserved_replica() -> types.SimpleNamespace:
         })
 
 
+def _paid_replica(cloud: str) -> types.SimpleNamespace:
+    payload = {
+        'accelerators': [['l4', 1]],
+        'cloud': cloud,
+        'instance_type': ('g6.2xlarge' if cloud == 'aws' else 'g2-standard-4'),
+        'num_nodes': 1,
+        'region': 'us-east-2' if cloud == 'aws' else 'us-east4',
+        'use_spot': True,
+        'version': 2 if cloud == 'aws' else 1,
+        'workspace': 'workspace-a',
+        'zone': 'us-east-2c' if cloud == 'aws' else 'us-east4-a',
+    }
+    if cloud == 'aws':
+        payload['provider_identity'] = {'aws_account_id': '096766144388'}
+    return types.SimpleNamespace(cluster_name='svc-3',
+                                 paid_capacity_pool_key=json.dumps(
+                                     payload,
+                                     sort_keys=True,
+                                     separators=(',', ':')))
+
+
+def _association_for_context(
+    context: ordinary_launch_binding.BoundNonPoolLaunchContext,
+    pool_key: str,
+) -> dict:
+    profile = context.profile
+    return {
+        'association_id': context.association_id,
+        'request_id': context.request_id,
+        'service_name': context.service_name,
+        'replica_id': context.replica_id,
+        'replica_record_id': context.replica_record_id,
+        'launch_generation': context.launch_generation,
+        'input_digest': context.input_digest,
+        'cluster_name': 'svc-3',
+        'tenant_scope': 'tenant-a',
+        'paid_capacity_pool_key': pool_key,
+        'profile_kind': profile.kind.value,
+        'profile_version': profile.version,
+        'profile_digest': profile.digest,
+        'capability_cohort_epoch': context.capability_cohort_epoch,
+        'capability_profile_set_digest': context.capability_profile_set_digest,
+        'receipt_protocol_version': context.receipt_protocol_version,
+        'authorization_kind': profile.authorization_kind.value,
+        'authorization_reference': profile.authorization_reference,
+        'authorization_generation': profile.authorization_generation,
+        'authorization_digest': profile.authorization_digest,
+    }
+
+
 @pytest.mark.parametrize(('presence', 'expected'),
                          [(reserved_capacity.PhysicalReplicaPresence.PRESENT,
                            ordinary_launch_binding.ProviderEvidence.PRESENT),
@@ -292,6 +342,264 @@ def test_profile_without_durable_provider_uid_remains_unknown(
     assert observed.payload['reason'] == 'profile-has-no-durable-provider-uid'
 
 
+@pytest.mark.parametrize(('instances', 'expected'), [
+    ([], ordinary_launch_binding.ProviderEvidence.ABSENT),
+    ([{
+        'availability_zone': 'us-east-2c',
+        'client_token': 'a' * 64,
+        'cluster_name_on_cloud': 'svc-3-abc',
+        'instance_id': 'i-0123456789abcdef0',
+        'instance_type': 'g6.2xlarge',
+        'market': 'spot',
+        'state': 'running',
+    }], ordinary_launch_binding.ProviderEvidence.PRESENT),
+])
+def test_aws_paid_observation_uses_exact_client_token_scope(
+        monkeypatch: pytest.MonkeyPatch, instances,
+        expected: ordinary_launch_binding.ProviderEvidence) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    identity = {
+        'aws_account_id': '096766144388',
+        'client_token': 'a' * 64,
+        'cluster_name_on_cloud': 'svc-3-abc',
+        'credential_profile': 'prod',
+        'instance_type': 'g6.2xlarge',
+        'num_nodes': 1,
+        'region': 'us-east-2',
+        'use_spot': True,
+        'workspace': 'workspace-a',
+        'zone': 'us-east-2c',
+    }
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_aws_provider_identity',
+                        lambda *_args: identity)
+    calls = []
+    monkeypatch.setattr(
+        reconciliation, '_query_aws_paid_provider_census', lambda *_args: calls.
+        append('census') or [dict(instance) for instance in instances])
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_aws_provider_absence_is_settled',
+                        lambda *_args: True)
+    monkeypatch.setattr(reconciliation.time, 'sleep', lambda _seconds: None)
+
+    observed = reconciliation.observe_provider(context, _paid_replica('aws'),
+                                               'authority')
+
+    assert observed.evidence is expected
+    assert observed.payload['provider_identity'] == identity
+    assert observed.payload['instances'] == instances
+    assert calls == (['census', 'census'] if not instances else ['census'])
+
+
+def test_aws_empty_census_before_settle_horizon_is_unknown(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_aws_provider_identity',
+                        lambda *_args: {'region': 'us-east-2'})
+    monkeypatch.setattr(reconciliation, '_query_aws_paid_provider_census',
+                        lambda *_args: [])
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_aws_provider_absence_is_settled',
+                        lambda *_args: False)
+
+    observed = reconciliation.observe_provider(context, _paid_replica('aws'),
+                                               'authority')
+
+    assert observed.evidence is ordinary_launch_binding.ProviderEvidence.UNKNOWN
+    assert observed.payload['reason'] == 'aws-create-settling'
+
+
+def test_aws_paid_census_uses_retained_profile_account_and_client_token(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    identity = {
+        'aws_account_id': '096766144388',
+        'client_token': 'a' * 64,
+        'cluster_name_on_cloud': 'svc-3-abc',
+        'credential_profile': 'prod',
+        'instance_type': 'g6.2xlarge',
+        'num_nodes': 1,
+        'region': 'us-east-2',
+        'use_spot': True,
+        'workspace': 'workspace-a',
+        'zone': 'us-east-2c',
+    }
+    calls = []
+
+    class _Paginator:
+
+        def paginate(self, **kwargs):
+            calls.append(('paginate', kwargs))
+            return [{'Reservations': [{'Instances': [{
+                'BlockDeviceMappings': [{
+                    'Ebs': {
+                        'DeleteOnTermination': True,
+                    },
+                }],
+                'ClientToken': identity['client_token'],
+                'InstanceId': 'i-0123456789abcdef0',
+                'InstanceLifecycle': 'spot',
+                'InstanceType': identity['instance_type'],
+                'Placement': {
+                    'AvailabilityZone': identity['zone'],
+                },
+                'State': {
+                    'Name': 'running',
+                },
+                'Tags': [{
+                    'Key': reconciliation.provision_constants.
+                           TAG_RAY_CLUSTER_NAME,
+                    'Value': identity['cluster_name_on_cloud'],
+                }],
+            }]}]}]
+
+    class _Client:
+
+        def __init__(self, service):
+            self.service = service
+
+        def get_caller_identity(self):
+            calls.append(('caller', self.service))
+            return {'Account': identity['aws_account_id']}
+
+        def get_paginator(self, operation):
+            calls.append(('paginator', self.service, operation))
+            return _Paginator()
+
+    class _Session:
+
+        def client(self, service, **kwargs):
+            calls.append(('client', service, kwargs))
+            return _Client(service)
+
+    def _session(**kwargs):
+        calls.append(('session', kwargs))
+        return _Session()
+
+    monkeypatch.setattr(reconciliation.aws_adaptor, 'session', _session)
+
+    observed = reconciliation._query_aws_paid_provider_census(identity)
+
+    assert observed == [{
+        'availability_zone': identity['zone'],
+        'client_token': identity['client_token'],
+        'cluster_name_on_cloud': identity['cluster_name_on_cloud'],
+        'instance_id': 'i-0123456789abcdef0',
+        'instance_type': identity['instance_type'],
+        'market': 'spot',
+        'state': 'running',
+    }]
+    assert calls == [
+        ('session', {'profile': identity['credential_profile']}),
+        ('client', 'sts', {'region_name': identity['region']}),
+        ('caller', 'sts'),
+        ('client', 'ec2', {'region_name': identity['region']}),
+        ('paginator', 'ec2', 'describe_instances'),
+        ('paginate', {
+            'Filters': [{
+                'Name': 'client-token',
+                'Values': [identity['client_token']],
+            }],
+        }),
+    ]
+
+
+def test_aws_client_token_absence_evidence_is_canonical() -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    replica = _paid_replica('aws')
+    association = _association_for_context(context,
+                                           replica.paid_capacity_pool_key)
+    identity = ordinary_launch_binding.ordinary_paid_aws_provider_identity(
+        association, credential_profile='prod')
+    payload = {
+        'association_id': str(context.association_id),
+        'cluster_name': replica.cluster_name,
+        'instances': [],
+        'probe_contract': 'aws-client-token-instance-presence-v1',
+        'profile_kind': context.profile.kind.value,
+        'provider_identity': identity,
+        'replica_record_id': str(context.replica_record_id),
+        'result': ordinary_launch_binding.ProviderEvidence.ABSENT.value,
+    }
+
+    canonical, digest = (
+        ordinary_launch_binding._ordinary_paid_provider_evidence(  # pylint: disable=protected-access
+            association,
+            replica.cluster_name,
+            ordinary_launch_binding.ProviderEvidence.ABSENT,
+            evidence_payload=payload))
+
+    assert canonical == payload
+    assert len(digest) == 64
+
+
+def test_aws_paid_present_cleanup_terminates_only_exact_instance_ids(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+    identity = {
+        'aws_account_id': '096766144388',
+        'credential_profile': 'prod',
+        'region': 'us-east-2',
+    }
+    live = {
+        'instance_id': 'i-0123456789abcdef0',
+        'state': 'running',
+    }
+    events = []
+    censuses = iter([[live], []])
+    monkeypatch.setattr(
+        reconciliation.request_postgres,
+        'bound_non_pool_provider_present_cleanup_is_authorized',
+        lambda *_args: True)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_aws_provider_identity',
+                        lambda *_args: identity)
+    monkeypatch.setattr(
+        reconciliation, '_query_aws_paid_provider_census',
+        lambda *_args: events.append('census') or next(censuses))
+
+    class _Client:
+
+        def get_caller_identity(self):
+            return {'Account': identity['aws_account_id']}
+
+        def terminate_instances(self, *, InstanceIds):
+            events.append(('terminate', InstanceIds))
+
+    class _Session:
+
+        def client(self, _service, **_kwargs):
+            return _Client()
+
+    monkeypatch.setattr(reconciliation.aws_adaptor, 'session',
+                        lambda **_kwargs: _Session())
+    absent = reconciliation.ProviderObservation(
+        ordinary_launch_binding.ProviderEvidence.ABSENT, {'instances': []})
+    monkeypatch.setattr(reconciliation, '_observe_aws_paid_provider',
+                        lambda *_args: events.append('observe') or absent)
+    monkeypatch.setattr(reconciliation, '_reduce_observation',
+                        lambda *_args: events.append('reduce'))
+    monkeypatch.setattr(reconciliation.time, 'sleep',
+                        lambda _seconds: events.append('sleep'))
+
+    observed = reconciliation.terminate_aws_paid_provider_allocation(
+        context,
+        _paid_replica('aws'),
+        object(),
+        lambda *_args: True,
+        continue_guard=lambda: True)
+
+    assert observed is absent
+    assert events == [
+        'census', ('terminate', [live['instance_id']]), 'sleep', 'census',
+        'observe', 'reduce'
+    ]
+
+
 @pytest.mark.parametrize(
     ('instances', 'disks', 'expected'),
     [({}, [], ordinary_launch_binding.ProviderEvidence.ABSENT),
@@ -342,8 +650,8 @@ def test_gcp_paid_observation_uses_frozen_exact_label_scope(
                         lambda *_args, **_kwargs: True)
     monkeypatch.setattr(reconciliation.time, 'sleep', lambda _seconds: None)
 
-    observed = reconciliation.observe_provider(
-        context, types.SimpleNamespace(cluster_name='svc-3'), 'authority')
+    observed = reconciliation.observe_provider(context, _paid_replica('gcp'),
+                                               'authority')
 
     assert observed.evidence is expected
     assert observed.payload['profile_kind'] == profile_kind.value
@@ -401,8 +709,8 @@ def test_gcp_done_error_insert_and_empty_resources_is_absent(
         lambda *_args, **kwargs: settled_calls.append(kwargs) or True)
     monkeypatch.setattr(reconciliation.time, 'sleep', lambda _seconds: None)
 
-    observed = reconciliation.observe_provider(
-        context, types.SimpleNamespace(cluster_name='svc-3'), 'authority')
+    observed = reconciliation.observe_provider(context, _paid_replica('gcp'),
+                                               'authority')
 
     assert observed.evidence is ordinary_launch_binding.ProviderEvidence.ABSENT
     assert observed.payload['create_operation_targets'] == operation_targets
@@ -440,8 +748,8 @@ def test_gcp_non_done_insert_and_empty_resources_is_unknown(
         'bound_non_pool_gcp_provider_absence_is_settled', lambda *_args, **
         _kwargs: pytest.fail('in-flight create must not reach absence gate'))
 
-    observed = reconciliation.observe_provider(
-        context, types.SimpleNamespace(cluster_name='svc-3'), 'authority')
+    observed = reconciliation.observe_provider(context, _paid_replica('gcp'),
+                                               'authority')
 
     assert observed.evidence is ordinary_launch_binding.ProviderEvidence.UNKNOWN
     assert observed.payload['reason'] == 'gcp-create-operation-in-flight'
@@ -461,8 +769,8 @@ def test_gcp_paid_observation_fails_closed_without_frozen_project(
         reconciliation.provision, 'query_instances', lambda **_kwargs: pytest.
         fail('missing frozen identity must not reach GCP'))
 
-    observed = reconciliation.observe_provider(
-        context, types.SimpleNamespace(cluster_name='svc-3'), object())
+    observed = reconciliation.observe_provider(context, _paid_replica('gcp'),
+                                               object())
 
     assert observed.evidence is ordinary_launch_binding.ProviderEvidence.UNKNOWN
     assert observed.payload[
@@ -805,9 +1113,8 @@ def test_ordinary_paid_reconcile_prefers_exact_terminal_negative_ack(
                         'project_bound_non_pool_provider_absence',
                         lambda *_args, **_kwargs: calls.append(('project',)))
 
-    observed = reconciliation.reconcile(
-        context, types.SimpleNamespace(cluster_name='svc-3'), authority,
-        lambda *_args: True)
+    observed = reconciliation.reconcile(context, _paid_replica('aws'),
+                                        authority, lambda *_args: True)
 
     assert observed == reconciliation.ProviderObservation(
         ordinary_launch_binding.ProviderEvidence.ABSENT, payload)
@@ -831,7 +1138,7 @@ def test_ordinary_paid_reconcile_without_exact_receipt_remains_unknown(
                         'bound_non_pool_terminal_provider_absence_payload',
                         lambda *_args: None)
     monkeypatch.setattr(reconciliation.request_postgres,
-                        'bound_non_pool_gcp_provider_identity',
+                        'bound_non_pool_aws_provider_identity',
                         lambda *_args: None)
     monkeypatch.setattr(
         reconciliation.request_postgres,
@@ -843,13 +1150,12 @@ def test_ordinary_paid_reconcile_without_exact_receipt_remains_unknown(
         'project_bound_non_pool_provider_absence', lambda *_args, **_kwargs:
         pytest.fail('UNKNOWN must never release paid capacity'))
 
-    observed = reconciliation.reconcile(
-        context, types.SimpleNamespace(cluster_name='svc-3'), authority,
-        lambda *_args: True)
+    observed = reconciliation.reconcile(context, _paid_replica('aws'),
+                                        authority, lambda *_args: True)
 
     assert observed.evidence == ordinary_launch_binding.ProviderEvidence.UNKNOWN
     assert observed.payload[
-        'reason'] == 'missing-immutable-gcp-provider-identity'
+        'reason'] == 'missing-immutable-aws-provider-identity'
     assert calls == [
         ('record', ordinary_launch_binding.ProviderEvidence.UNKNOWN,
          observed.payload)

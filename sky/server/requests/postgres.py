@@ -4290,6 +4290,98 @@ def _gcp_launch_task_supports_plain_compute_disk_reconciliation(
     return saw_task
 
 
+def _ordinary_paid_aws_provider_identity_from_locked_request(
+    connection: sqlalchemy.engine.Connection,
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    association: Mapping[str, Any],
+    facts: BoundOrdinaryLaunchRequestFacts,
+    request_row: sqlalchemy.engine.RowMapping | None,
+    queue_row: sqlalchemy.engine.RowMapping | None,
+    *,
+    expected_reconciliation_outcome: str,
+    require_paid_claim: bool = True,
+    require_retention_pin: bool = True,
+) -> dict[str, Any] | None:
+    """Recover exact AWS census scope from the retained launch request."""
+    pool_identity = paid_capacity.pool_key_payload(
+        str(association.get('paid_capacity_pool_key')))
+    if (context.profile.kind is not ordinary_launch_binding.
+            NonPoolLaunchProfileKind.ORDINARY_PAID or
+            not (ordinary_launch_binding.
+                 ORDINARY_PAID_AWS_CLIENT_TOKEN_COHORT_FLOOR <=
+                 context.capability_cohort_epoch <=
+                 ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH) or
+            not isinstance(pool_identity, Mapping) or
+            pool_identity.get('cloud') != 'aws' or request_row is None or
+            association['effect_phase'] !=
+            ordinary_launch_binding.EffectPhase.PROVIDER_IO.value or
+            association['reconciliation_outcome'] !=
+            expected_reconciliation_outcome or
+            association['service_job_id'] is not None or
+            not ordinary_launch_binding.
+            ordinary_paid_provider_terminal_shape_matches(
+                facts.status, facts.terminal_cause,
+                association.get('paid_capacity_pool_key')) or
+            facts.execution_generation is None or
+            facts.execution_generation < 1 or
+            facts.execution_quiescence_required is not True or
+            facts.execution_quiesced_generation != facts.execution_generation or
+            facts.execution_quiesced_at is None or not facts.quiescent or
+            queue_row is not None or
+            facts.retention_pin_active is not require_retention_pin or
+            facts.return_value is not None or facts.error_decode_failed):
+        return None
+    claim_is_exact = (_paid_capacity_claim_is_exact(connection, association) if
+                      require_paid_claim else _paid_capacity_claim_is_released(
+                          connection, association))
+    if not claim_is_exact:
+        return None
+    try:
+        request = _request_from_mapping(
+            typing.cast(sqlalchemy.engine.RowMapping, request_row))
+        parsed_context = (
+            ordinary_launch_binding.parse_bound_non_pool_launch_context(
+                request.request_body.extra_launch_context))
+        if (parsed_context != context or
+                not _ordinary_paid_request_identity_matches(
+                    connection, association, request_row, request, context) or
+                _request_service_job_id(
+                    request_row, str(association['cluster_name'])) is not None):
+            return None
+        config_snapshot = request.request_body.override_skypilot_config
+        if not isinstance(config_snapshot, Mapping):
+            return None
+        workspace = association['service_workspace']
+        if (workspace != pool_identity.get('workspace') or
+                config_snapshot.get('active_workspace') != workspace):
+            return None
+        credential_profile = (
+            skypilot_config.get_effective_workspace_region_config_from_snapshot(
+                config_snapshot,
+                'aws', ('profile',),
+                region=pool_identity['region'],
+                workspace=workspace))
+        return ordinary_launch_binding.ordinary_paid_aws_provider_identity(
+            association, credential_profile=credential_profile)
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
+def _ordinary_paid_aws_absence_settle_horizon_elapsed(
+    connection: sqlalchemy.engine.Connection,
+    facts: BoundOrdinaryLaunchRequestFacts,
+) -> bool:
+    """Wait past EC2 list propagation before accepting an empty census."""
+    quiesced_at = facts.execution_quiesced_at
+    if quiesced_at is None:
+        return False
+    now = connection.execute(
+        sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+    return bool(now >= quiesced_at +
+                datetime.timedelta(seconds=ordinary_launch_binding.
+                                   ORDINARY_PAID_AWS_ABSENCE_SETTLE_SECONDS))
+
+
 def _gcp_paid_pool_is_plain_compute(pool_identity: Mapping[str, Any]) -> bool:
     """Reject TPU-VM pools from the compute-instance evidence contract."""
     accelerators = pool_identity.get('accelerators')
@@ -4451,6 +4543,38 @@ def _ordinary_paid_provider_payload_from_locked_request(
     cloud = pool_identity.get('cloud') if isinstance(pool_identity,
                                                      Mapping) else None
     if cloud == 'aws':
+        if evidence not in (ordinary_launch_binding.ProviderEvidence.ABSENT,
+                            ordinary_launch_binding.ProviderEvidence.PRESENT):
+            return None
+        if (isinstance(candidate_payload, Mapping) and
+                candidate_payload.get('probe_contract')
+                == 'aws-client-token-instance-presence-v1'):
+            identity = _ordinary_paid_aws_provider_identity_from_locked_request(
+                connection,
+                context,
+                association,
+                facts,
+                request_row,
+                queue_row,
+                expected_reconciliation_outcome=(
+                    expected_reconciliation_outcome),
+                require_paid_claim=require_paid_claim,
+                require_retention_pin=require_retention_pin)
+            if (identity is None or
+                    candidate_payload.get('provider_identity') != identity or
+                (evidence is ordinary_launch_binding.ProviderEvidence.ABSENT and
+                 not _ordinary_paid_aws_absence_settle_horizon_elapsed(
+                     connection, facts))):
+                return None
+            try:
+                canonical, _ = ordinary_launch_binding._ordinary_paid_provider_evidence(  # pylint: disable=protected-access
+                    association,
+                    str(association['cluster_name']),
+                    evidence,
+                    evidence_payload=candidate_payload)
+            except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
+                return None
+            return canonical
         if evidence is not ordinary_launch_binding.ProviderEvidence.ABSENT:
             return None
         payload = _ordinary_paid_provider_absence_payload_from_locked_request(
@@ -4507,6 +4631,67 @@ def _ordinary_paid_provider_payload_from_locked_request(
     except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
         return None
     return canonical
+
+
+def bound_non_pool_aws_provider_identity(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+) -> dict[str, Any] | None:
+    """Read exact AWS scope only after terminal request quiescence."""
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return None
+    with engine.begin() as connection:
+        association = ordinary_launch_binding.lock_reduction_authority_in_connection(
+            connection, context)
+        if (not _controller_authority_matches_reduction(association, authority)
+                or association['resolution'] !=
+                ordinary_launch_binding.Resolution.AMBIGUOUS.value):
+            return None
+        facts, request_row, queue_row, _ = _lock_bound_request_evidence(
+            connection, context)
+        return _ordinary_paid_aws_provider_identity_from_locked_request(
+            connection,
+            context,
+            association,
+            facts,
+            request_row,
+            queue_row,
+            expected_reconciliation_outcome=(
+                ordinary_launch_binding.ReconciliationOutcome.
+                POST_EFFECT_AMBIGUOUS.value))
+
+
+def bound_non_pool_aws_provider_absence_is_settled(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+) -> bool:
+    """Fence an empty AWS census behind terminal quiescence and time."""
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return False
+    with engine.begin() as connection:
+        association = ordinary_launch_binding.lock_reduction_authority_in_connection(
+            connection, context)
+        if (not _controller_authority_matches_reduction(association, authority)
+                or association['resolution'] !=
+                ordinary_launch_binding.Resolution.AMBIGUOUS.value):
+            return False
+        facts, request_row, queue_row, _ = _lock_bound_request_evidence(
+            connection, context)
+        identity = _ordinary_paid_aws_provider_identity_from_locked_request(
+            connection,
+            context,
+            association,
+            facts,
+            request_row,
+            queue_row,
+            expected_reconciliation_outcome=(
+                ordinary_launch_binding.ReconciliationOutcome.
+                POST_EFFECT_AMBIGUOUS.value))
+        return bool(identity is not None and
+                    _ordinary_paid_aws_absence_settle_horizon_elapsed(
+                        connection, facts))
 
 
 def bound_non_pool_gcp_provider_identity(

@@ -515,16 +515,14 @@ def _prepare_provider_present_cleanup(
                     ordinary_launch_binding.
                     is_paid_provider_reconciliation_profile(
                         cleanup_context.profile.kind)):
-                # Unlike Kubernetes UID-fenced fill, GCP's immutable project,
-                # zone, and exact cluster label support provider-native cleanup
-                # even when the local cluster row was never committed.
+                # Unlike Kubernetes UID-fenced fill, paid AWS/GCP immutable
+                # identities support provider-native cleanup even when the
+                # local cluster row was never committed.
                 continue
-            if (observation.evidence !=
-                    ordinary_launch_binding.ProviderEvidence.ABSENT):
-                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-                    'A provider-present cleanup marker lost its SkyPilot '
-                    'cluster record, but fresh exact provider evidence is '
-                    f'{observation.evidence.value}.')
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'A provider-present cleanup marker lost its SkyPilot cluster '
+                'record, but fresh exact provider evidence is '
+                f'{observation.evidence.value}.')
         except Exception as error:  # pylint: disable=broad-except
             failures[key] = common_utils.format_exception(error)
             contexts.pop(key, None)
@@ -1799,7 +1797,7 @@ def _project_bound_ordinary_launch_for_teardown(
                              if isinstance(pool_key, str) else None)
             shape_matches = bool(
                 isinstance(pool_identity, dict) and
-                pool_identity.get('cloud') == 'gcp' and
+                pool_identity.get('cloud') in ('aws', 'gcp') and
                 pool_identity.get('use_spot') is True and
                 info.paid_capacity_pool_key == pool_key and
                 info.is_spot is True and info.is_zero_cost is False and
