@@ -7943,7 +7943,7 @@ def get_ready_replica_infos(
 def get_scale_planning_state_fingerprint(service_name: str,
                                          require_version: bool = False
                                         ) -> str | None:
-    """Return a compact mutation fingerprint for autoscaler planning state.
+    """Return a semantic mutation fingerprint for autoscaler planning state.
 
     Shape-aware autoscalers may block while resolving legacy cluster handles.
     The controller samples this fingerprint before reading its planning rows
@@ -7951,11 +7951,13 @@ def get_scale_planning_state_fingerprint(service_name: str,
     runtime fields and every replica row stayed unchanged across the read and
     preload window; a mismatch makes the tick retry from durable state.
 
-    PostgreSQL's per-row ``xmin`` is used as the mutation revision so a large
-    terminal history contributes only ``(replica_id, revision)`` rather than
-    transferring every JSON document again. SQLite remains a supported local
-    controller/test database, so its fallback hashes the complete JSON rows.
-    The central API-server path is PostgreSQL-only.
+    The fingerprint hashes the normalized replica documents consumed by the
+    autoscaler, rather than PostgreSQL's physical ``xmin`` tuple revision.
+    Replica-manager writers may persist an identical document; that no-op must
+    not starve planning merely because PostgreSQL created a new tuple version.
+    An identity, state-version, or document change still changes the digest and
+    is rejected by the locked planner. The central API-server path is
+    PostgreSQL-only; local controller databases use the same semantic material.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -7973,14 +7975,19 @@ def get_scale_planning_state_fingerprint(service_name: str,
             return None
 
         if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
-            revision = sqlalchemy.literal_column('replicas.xmin::text').label(
-                '_row_revision')
+            state_sha256 = (
+                capacity_admission.replica_state_semantic_sha256_expression(
+                    replicas_table.c.replica_state).label(
+                        '_replica_state_sha256'))
             replica_rows = session.execute(
-                sqlalchemy.select(replicas_table.c.replica_id, revision).where(
-                    replicas_table.c.service_name == service_name).order_by(
-                        replicas_table.c.replica_id)).fetchall()
+                sqlalchemy.select(
+                    replicas_table.c.replica_id,
+                    replicas_table.c.replica_state_version, state_sha256).where(
+                        replicas_table.c.service_name == service_name).order_by(
+                            replicas_table.c.replica_id)).fetchall()
             replica_material: list[Any] = [
-                (int(row.replica_id), row._mapping['_row_revision'])  # pylint: disable=protected-access
+                (int(row.replica_id), row.replica_state_version,
+                 row._mapping['_replica_state_sha256'])  # pylint: disable=protected-access
                 for row in replica_rows
             ]
         else:

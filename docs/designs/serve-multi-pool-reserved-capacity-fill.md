@@ -166,6 +166,26 @@ all promoted positive and zero residuals use the same
 ``publish`` operation remains an internal primitive and claim-path validation
 surface, not an alternate promoted reconciliation path.
 
+PR #1756 merged this boundary as ``355cdc9168bb398fd8d73c886fa24e0abdf9e852``
+and release ``1.1.1525`` deployed it as Helm revision 644. Dark verification
+found a narrower liveness defect before traffic resumed: the prepared-state
+fingerprint used PostgreSQL ``xmin`` for every replica row. Replica-manager
+writers may persist an identical normalized ``ReplicaInfo`` document, which
+advances ``xmin`` without changing any input consumed by the autoscaler. With
+345 reserved replicas, those physical no-op rewrites repeatedly rejected the
+otherwise current locked graph as ``Prepared planning state changed``.
+
+The fingerprint contract is semantic, not physical. It covers the service
+runtime fields and a database-side SHA-256 of each canonical JSONB replica
+document consumed by planning, including row identity and state version, but
+excludes PostgreSQL tuple revisions and timestamps that are not part of those
+documents. This keeps the fingerprint compact while a byte-equivalent/no-op
+rewrite cannot starve publication. Any replica addition/removal or normalized
+state change still changes the fingerprint and fails closed before the
+callback. The transaction continues to lock and plan from the complete current
+rows; this correction changes neither demand, supply, Kueue, cap, nor provider
+authority.
+
 A fresh positive snapshot can follow a committed zero-demand retirement while
 the pre-transaction replica snapshot still marks paid capacity as scaling
 down. Every nonterminal cleanup-unproven paid row remains part of the locked
@@ -262,8 +282,8 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` at merge `0caf9de01`, tag `v1.1.1524`, including PR #1755's immutable-input preparation, PRs #1752--#1754's earlier publication-order corrections, PR #1750's after-lock claim authorization, and the retained-row/reducer corrections in PRs #1746--#1749. The PostgreSQL-linearized planning correction described above is the active source change and is not yet deployed or proven. |
-| Deployed control plane | SkyPilot `1.1.1524`, Helm revision 643. Two API, two controller, and three executor Pods are Ready and all use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:13af0a9dacf43cd1f8768bedfa3a041ad43e4f831865b581ef3e6bf0c9c554b7`. Helm storage remains disabled and the namespace has no PVC. |
+| Source base | `origin/improvements` at merge `355cdc916`, release `1.1.1525`, including PR #1756's PostgreSQL-linearized planner and the earlier ordering, claim, retained-row, and reducer corrections. The semantic prepared-state fingerprint correction described above is the active source change and is not yet deployed or proven. |
+| Deployed control plane | SkyPilot `1.1.1525`, Helm revision 644. Two API, two controller, and three executor Pods are Ready and all use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:75d01dd9777781c74a1d14f692c1568b20695bc673b1cf5e256aff4e903303eb`. Helm storage remains disabled and the namespace has no PVC. |
 | Writer protocol | Public API 93, worker projection 10, non-pool capability cohort 12, and async request-ledger protocol 1. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. |
 | Active service | Lifecycle 116 and all of its child authority were removed by the supported fenced purge after PR #1748 deployed. Lifecycle 117, incarnation `3bc2c88b-2c28-40fa-a9d5-482880767b3e`, was then recreated from the canonical PostgreSQL-only spec with paid residual cap 100 to continue heterogeneous qualification. Helm revision 640 deployed release `1.1.1521` and preserved lifecycle 117 and service version 1 while replacing the control plane and both warm-standby load-balancer slots. The service is test-only and not yet production-qualified. |
@@ -277,7 +297,7 @@ it has merged or been deployed.
 | Partial mixed proof | Provider/DB censuses at 2026-08-25 19:45:47.538 and 19:45:56.281 UTC bracketed a 72-request completion wave and both had 44 reserved plus 28 paid replicas all `READY`, the same 28 AWS Spot instances—27 `g6.2xlarge` and one `g6.4xlarge`—and zero on-demand. The wave completed from 19:45:48.956 through 19:45:51.187; every request performed 9.533–12.451 seconds of concurrency-one GPU work, so at least 28 necessarily executed on Spot beside the 44 reserved workers. The Spot instances later fully drained at the provider. |
 | GCP Spot lifecycle proof | Complete on `1.1.1513`. The fixed-120 update completed at 18:23:39.277 UTC. After five fail-closed prospective conflicts while the traffic writer changed telemetry, the sixth attempt atomically committed all 120 debits at 18:25:12.183. Provider-native observations first reached 100 `RUNNING` at 18:28:54.100, then 107, 110, 114, and 117. Every object was GCP Spot `g2-standard-4` with exactly one NVIDIA L4; zero on-demand or non-Spot capacity appeared. The peak 117 VMs were in `asia-northeast3` and `asia-south1`. Normal teardown reached native `RUNNING=0` at 18:35:00.512 and exact all-state zero at 18:35:39.315. |
 | Final load proof | Not complete. Run `final10k-1524-20260827-0246` retains one immutable 10,000-ID manifest. It accepted 2,125 identities, classified 29 exact transport outcomes as ambiguous for durable reconciliation, and retained 7,846 pending identities before stopping on the publication defect. Live telemetry proved nonzero queued/in-flight demand and computed targets of 414 and 494. The exact 503 body `No replica has confirmed free async capacity. Use "sky serve status [SERVICE_NAME]" to check the replica status.` is a definitive retryable pre-dispatch rejection only when the PostgreSQL request receipt is exactly `REJECTED_PRE_DISPATCH`; the harness may classify that exact pair without relaxing any other 5xx outcome. The run identity must be resumed, not replaced. |
-| Demand/publication ordering | Root cause confirmed on deployed `1.1.1524`: an optimistic plan cannot reliably fit between staggered HA report changes, even after all known slow preparation was moved earlier. The source correction now uses one PostgreSQL-linearized current-demand/current-supply planning transaction with a bounded no-I/O callback, followed by local publication and actuation only after commit; the superseded promoted publisher and its duplicate tests are removed. The full controller and capacity-admission unit suites pass. Focused real-PostgreSQL tests prove current-demand inclusion, reporter serialization, callback rollback, locked allocation supply, cleanup-unproven paid accounting, and rejection of a replica mutation through the exact locked fingerprint. Deployment and final load proof remain pending. |
+| Demand/publication ordering | PR #1756's PostgreSQL-linearized current-demand/current-supply transaction is merged and deployed on `1.1.1525`; the superseded promoted publisher is removed. Dark verification preserved lifecycle 117 and all 345 ready reserved replicas, but exposed repeated fail-closed planning conflicts caused by physical `xmin` churn on semantically unchanged replica documents. The active correction makes that fingerprint semantic while retaining rejection of every actual replica/runtime mutation. Final load proof remains pending. |
 
 The completed paid-gate post-rollout census was green after Helm revision 635:
 the service, replicas, claims, waiters, request associations, queue rows,
@@ -589,7 +609,10 @@ allocation, accelerator, and pool identity.
 
 Only immutable computation inputs are prepared before the correctness
 boundary: replica/runtime handles, autoscaler decision inputs, and a durable
-planning fingerprint sampled before and after preparation. The controller does
+semantic planning fingerprint sampled before and after preparation. The
+fingerprint hashes the complete normalized replica state consumed by planning;
+it does not hash PostgreSQL tuple revisions, so persisting an identical row is
+not a planning-state change. The controller does
 not project economic supply or capture demand optimistically. It acquires its
 short routing epoch first; one PostgreSQL transaction then locks the service,
 current demand/report/route authority, allocation and current capacity/Kueue
@@ -1027,9 +1050,11 @@ on-demand spill.
   planned rather than rejected as stale.
 - Race a service-version transition against that held callback and prove it
   waits for the routing epoch without a routing/PostgreSQL lock inversion.
-  Mutate a replica between immutable input preparation and the transaction;
-  prove the locked fingerprint rejects the stale candidate without invoking
-  the callback or publishing local/provider state.
+  Mutate a replica's normalized state between immutable input preparation and
+  the transaction; prove the locked semantic fingerprint rejects the stale
+  candidate without invoking the callback or publishing local/provider state.
+  Repeat with a PostgreSQL no-op update that advances ``xmin`` while preserving
+  the exact normalized document; prove the current plan commits.
 - Instrument every PostgreSQL/provider/Kubernetes/HTTP/filesystem and
   replica-manager boundary reachable from the callback to fail if invoked;
   prove current-demand/current-supply planning completes with no I/O. Inject a
@@ -1157,6 +1182,10 @@ condition of the already-complete paid Spot provider-lifecycle gate.
    backoff, and reconcile ambiguous outcomes by exact receipt lookup.
 5. Require paid claims and provider Spot units only for demand remaining after
    every current compatible reserved worker is committed first.
+   The convergence target is the configured paid cap or the lower
+   provider-available limit, not an instantaneous exact count of 100. Require
+   bounded overshoot/undershoot to reconcile within a few minutes and record
+   time-to-limit from the atomic paid-wave commit.
 6. Require zero ordinary on-demand instance, zero paid non-Spot row, and no
    provider action outside the armed service/run envelope.
 7. Record selection-time pool, instance shape, normalized price, provider
