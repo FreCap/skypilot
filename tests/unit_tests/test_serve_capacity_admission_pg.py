@@ -1219,6 +1219,60 @@ def test_current_planner_rejects_stale_prepared_fingerprint(capacity_database):
     planner.assert_not_called()
 
 
+def test_current_planner_accepts_semantic_noop_replica_rewrite(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                **_replica_values(101, zero_cost=False)))
+    planning_fingerprint = (
+        serve_state.get_scale_planning_state_fingerprint('svc'))
+    assert planning_fingerprint is not None
+    revision = sqlalchemy.literal_column('xmin::text').label('revision')
+    with engine.connect() as connection:
+        before_revision = connection.execute(
+            sqlalchemy.select(revision).select_from(
+                serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id ==
+                    101)).scalar_one()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id == 101).values(
+                    replica_state=(
+                        serve_state_schema.replicas_table.c.replica_state)))
+    with engine.connect() as connection:
+        after_revision = connection.execute(
+            sqlalchemy.select(revision).select_from(
+                serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id ==
+                    101)).scalar_one()
+    assert after_revision != before_revision
+    assert (serve_state.get_scale_planning_state_fingerprint('svc') ==
+            planning_fingerprint)
+    planner = mock.Mock(return_value=_current_decision(1))
+
+    authority, _ = (capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'l4': 0},
+            sequenced_reserved_fill=False,
+            reserved_fill_allocation_map=None,
+            planner=planner,
+            expected_planning_state_fingerprint=planning_fingerprint))
+
+    planner.assert_called_once()
+    assert not authority.remaining()
+
+
 def test_current_planner_serializes_concurrent_report_writer(capacity_database):
     engine, incarnation, route_receipt = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)

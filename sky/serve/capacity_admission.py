@@ -78,6 +78,16 @@ _TERMINAL_REPLICA_STATUSES = frozenset({
 })
 
 
+def replica_state_semantic_sha256_expression(
+    replica_state_column: Any,) -> sqlalchemy.ColumnElement[Any]:
+    """Return PostgreSQL's SHA-256 of one canonical JSONB document."""
+    canonical_json = sqlalchemy.cast(replica_state_column,
+                                     postgresql.JSONB).cast(sqlalchemy.Text)
+    return sqlalchemy.func.encode(
+        sqlalchemy.func.sha256(
+            sqlalchemy.func.convert_to(canonical_json, 'UTF8')), 'hex')
+
+
 class DemandSourceMode(str, enum.Enum):
     LEGACY_CONTROLLER = 'LEGACY_CONTROLLER'
     DURABLE_FEED = 'DURABLE_FEED'
@@ -686,14 +696,14 @@ def _lock_capacity_rows(
             _ZERO_COST_INTENTS.c.service_hash == service_hash).order_by(
                 _ZERO_COST_INTENTS.c.intent_idempotency_key).with_for_update()
     ).mappings().all()
-    replica_revision = sqlalchemy.literal_column('replicas.xmin::text').label(
-        '_row_revision')
+    replica_state_sha256 = replica_state_semantic_sha256_expression(
+        _REPLICAS.c.replica_state).label('_replica_state_sha256')
     replica_rows = connection.execute(
         sqlalchemy.select(
             _REPLICAS.c.replica_id, _REPLICAS.c.status, _REPLICAS.c.version,
             _REPLICAS.c.reserved_fill_intent_idempotency_key,
             _REPLICAS.c.replica_state_version, _REPLICAS.c.replica_state,
-            replica_revision).where(
+            replica_state_sha256).where(
                 _REPLICAS.c.service_name == service_name).order_by(
                     _REPLICAS.c.replica_id).with_for_update()).mappings().all()
 
@@ -753,7 +763,7 @@ def _lock_capacity_rows(
 
 def _locked_planning_state_fingerprint(service: Mapping[str, Any],
                                        locked: _LockedCapacityRows) -> str:
-    """Match the controller preload fingerprint from already locked rows."""
+    """Match the controller's semantic fingerprint from locked rows."""
     active_versions = service['active_versions']
     if isinstance(active_versions, str):
         active_versions = json.loads(active_versions) if active_versions else []
@@ -764,7 +774,8 @@ def _locked_planning_state_fingerprint(service: Mapping[str, Any],
             'controller_ip': service['controller_ip'],
             'active_versions': active_versions or [],
         },
-        'replicas': [(int(row['replica_id']), row['_row_revision'])
+        'replicas': [(int(row['replica_id']), row['replica_state_version'],
+                      row['_replica_state_sha256'])
                      for row in locked.replica_rows],
     }
     encoded = json.dumps(material, sort_keys=True,
