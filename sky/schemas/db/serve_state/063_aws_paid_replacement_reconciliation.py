@@ -141,7 +141,7 @@ _ASSOCIATION_PROFILE_REPLACEMENT = (
     "'true' AND\n"
     "                    OLD.paid_capacity_pool_key::jsonb -> "
     "'provider_identity' ->> 'aws_account_id' ~ "
-    "'^[0-9]{12}$'))) AND\n")
+    "'^[0-9]{12}$')))) AND\n")
 _REPLICA_PROFILE_SOURCE = (
     "                     (association.profile_kind = 'ORDINARY_PAID' OR\n"
     "                     (association.profile_kind = "
@@ -170,7 +170,7 @@ _REPLICA_PROFILE_REPLACEMENT = (
     "'use_spot' = 'true' AND\n"
     "                        association.paid_capacity_pool_key::jsonb -> "
     "'provider_identity' ->> 'aws_account_id' ~ "
-    "'^[0-9]{12}$'))) AND\n")
+    "'^[0-9]{12}$')))) AND\n")
 
 
 def _require_postgresql() -> None:
