@@ -365,7 +365,7 @@ it has merged or been deployed.
 | Reserved teardown projection | Complete. PR #1747 projected all formerly blocked associations and retired 194 rows. PR #1748 normalized current writers to the existing immediate-removal marker and accepted only the exact `1.1.1516` `FAILED/FAILED` shape as an N-1 DB-retirement candidate. Release `1.1.1517` plus the supported orphan purge retired the final two rows through exact PostgreSQL authority and independent owner, record, cluster, and Kueue fences. No provider, Kueue, schema, migration, or manual-cleanup behavior changed. Exact service/control-plane/Kubernetes/GCP zero is production-proven. |
 | PHX access | The controller identity can exact-read the required namespace/queue and manage only worker Pod/Service lifecycle; it cannot list or patch ClusterQueues. The worker ServiceAccount is tokenless and cannot read Pods, queues, or secrets. A historical audit-only group still has an unused broad Kueue LIST grant from platform PR #8800; it is read-only, has no scheduling effect, and is not used or expanded by this rollout. |
 | Paid state at idle | Lifecycle 119 reached 100 exact PostgreSQL Spot commitments and a native peak of 96 concurrently live GCP L4 Spot VMs during this run; the already-accepted lifecycle gate remains the earlier exact-100 proof. Zero on-demand was preserved. Natural retirement initially removed 76 VMs. A positive-demand rearm plus later acknowledged fresh-zero waves retired the remaining 24; at 2026-08-27 09:09 UTC the independent guard reported zero AWS/GCP instances and disks and zero on-demand, with one provider-free committed PostgreSQL cleanup row. Supported `serve down --purge` then removed lifecycle 119 without manual database mutation. Recreated lifecycle 120 has zero replica rows at idle. |
-| Routing and queue | Lifecycle 119's low-priority run produced a small deadline-weighted target; the high-priority run increased the target through 49, 64, 128, and 178 before the paid cap clipped it at 100. The bounded stimulus recorded 2,248 submission starts, 289 accepted requests, 252 completion markers, and definitive queue-full rejections/retries; it is not the separate 10,000-terminal-request ledger proof. A fresh nonzero queued/processing/in-flight/completed UI proof remains part of the final heterogeneous load run. |
+| Routing and queue | Lifecycle 119's low-priority run produced a small deadline-weighted target; the high-priority run increased the target through 49, 64, 128, and 178 before the paid cap clipped it at 100. The bounded stimulus recorded 2,248 submission starts, 289 accepted requests, 252 completion markers, and definitive queue-full rejections/retries; it is not the separate 10,000-terminal-request ledger proof. The deployed target uses one aggregate duration and applies launch lead uniformly; the capacity-time SLA refinement in this design remains open. A fresh nonzero queued/processing/in-flight/completed UI proof remains part of the final heterogeneous load run. |
 | Partial mixed proof | Provider/DB censuses at 2026-08-25 19:45:47.538 and 19:45:56.281 UTC bracketed a 72-request completion wave and both had 44 reserved plus 28 paid replicas all `READY`, the same 28 AWS Spot instances—27 `g6.2xlarge` and one `g6.4xlarge`—and zero on-demand. The wave completed from 19:45:48.956 through 19:45:51.187; every request performed 9.533–12.451 seconds of concurrency-one GPU work, so at least 28 necessarily executed on Spot beside the 44 reserved workers. The Spot instances later fully drained at the provider. |
 | GCP Spot lifecycle proof | Complete on `1.1.1513`. The fixed-120 update completed at 18:23:39.277 UTC. After five fail-closed prospective conflicts while the traffic writer changed telemetry, the sixth attempt atomically committed all 120 debits at 18:25:12.183. Provider-native observations first reached 100 `RUNNING` at 18:28:54.100, then 107, 110, 114, and 117. Every object was GCP Spot `g2-standard-4` with exactly one NVIDIA L4; zero on-demand or non-Spot capacity appeared. The peak 117 VMs were in `asia-northeast3` and `asia-south1`. Normal teardown reached native `RUNNING=0` at 18:35:00.512 and exact all-state zero at 18:35:39.315. |
 | Final load proof | Not complete. Run `final10k-1524-20260827-0246` retains one immutable 10,000-ID manifest. It accepted 2,125 identities, classified 29 exact transport outcomes as ambiguous for durable reconciliation, and retained 7,846 pending identities before stopping on the publication defect. Live telemetry proved nonzero queued/in-flight demand and computed targets of 414 and 494. The exact 503 body `No replica has confirmed free async capacity. Use "sky serve status [SERVICE_NAME]" to check the replica status.` is a definitive retryable pre-dispatch rejection only when the PostgreSQL request receipt is exactly `REJECTED_PRE_DISPATCH`; the harness may classify that exact pair without relaxing any other 5xx outcome. The run identity must be resumed, not replaced. |
@@ -427,6 +427,67 @@ paid-authority census.
 - The target counts logical GPU slots. Provider placement may coalesce those
   slots onto a compatible multi-GPU machine, but every device must expose and
   complete one independent worker slot.
+
+### Capacity-time SLA refinement (open)
+
+The deployed deadline weighting is a safe first-order backlog target, not the
+final minimum-cost SLA scheduler. It subtracts one effective launch lead from
+the timeout before converting every queued request to concurrent work. That
+is appropriate when the target is entirely cold, but it treats already-ready
+compatible slots as if they also had to launch. It can therefore overstate the
+paid residual for a large backlog that existing capacity can drain before its
+deadline.
+
+For one newly arrived batch with ``N`` requests, service time ``s``, dispatch
+deadline ``D``, utilization ``u``, and ``R`` already-ready compatible logical
+slots, the useful first approximation is capacity-time rather than a uniform
+per-request discount:
+
+``demand_seconds = N * s``
+
+``ready_budget = R * D * u``
+
+``committed_budget = sum(max(0, D - eta_i) * u)`` for each already-committed
+slot with a bounded ready-time estimate ``eta_i``
+
+``new_slot_budget = max(0, D - cold_lead) * u``
+
+``new_slots = ceil(max(0, demand_seconds - ready_budget - committed_budget) /
+new_slot_budget)``
+
+The implementation must use bounded discrete start capacity at deadline
+boundaries; the equations above state the policy, not a floating-point
+scheduler. With 1,000 ten-second requests, 50 ready slots, and 95% utilization,
+the ready budget is already 28,500 GPU-seconds for a 600-second objective, so
+the paid residual is zero. For a 60-second objective it covers 2,850 of 10,000
+GPU-seconds; with zero additional lead the residual is 126 slots. If cold lead
+is at least the remaining deadline, new capacity cannot rescue that batch.
+The controller must publish an infeasible-SLA signal and size only for later
+deadline buckets, continuing arrivals, and bounded backlog recovery instead of
+claiming that a one-slot-per-request launch meets the expired objective.
+
+The exact steady-state planner keeps one physical request queue and enriches
+its existing typed profiles; it does not create one queue per accelerator. It:
+
+- reports remaining-deadline buckets by ``(priority, compatible cards)`` so
+  queue age is not mistaken for a newly arrived batch;
+- learns a conservative service-time estimate per service version and exact
+  accelerator card, seeded from configuration, rather than using one
+  fleet-wide mean to promise an SLA;
+- builds a per-card capacity availability curve from ready reserved slots,
+  ready paid Spot, committed reserved/paid slots with bounded ETAs, and only
+  then prospective free-reserved and Spot candidates;
+- satisfies cumulative strict-priority deadline constraints with the existing
+  scarcity-aware compatibility allocator, protecting A100-only work before
+  assigning L4-or-A100 work; and
+- minimizes new paid Spot after reserved and already-committed compatible
+  capacity, while retaining the existing no-on-demand and paid-cap fences.
+
+A bounded aggregate implementation using current queue reports is a localized
+autoscaler change. The complete form requires request-age buckets plus
+per-card service-time and ready-time observations across LB demand protocol,
+autoscaling, persistence, UI, and load tests. It is an implementation phase,
+not part of the already-deployed proof.
 
 ### Paid residual
 
