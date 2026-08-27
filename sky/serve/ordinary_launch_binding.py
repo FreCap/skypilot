@@ -128,6 +128,20 @@ class EffectPhase(str, enum.Enum):
     SERVICE_JOB_RECORDED = 'SERVICE_JOB_RECORDED'
 
 
+_PAID_PROVIDER_RECONCILIATION_PHASES = frozenset(
+    (EffectPhase.PROVIDER_IO, EffectPhase.SERVICE_JOB_IO))
+
+
+def is_paid_provider_reconciliation_phase(
+        effect_phase: EffectPhase | str) -> bool:
+    """Whether paid provider allocation may exist without a job receipt."""
+    try:
+        phase = EffectPhase(effect_phase)
+    except (TypeError, ValueError):
+        return False
+    return phase in _PAID_PROVIDER_RECONCILIATION_PHASES
+
+
 class Resolution(str, enum.Enum):
     """Closed association resolution state."""
 
@@ -870,7 +884,7 @@ ordinary_launch_associations_table = sqlalchemy.Table(
         "provider_evidence = 'ABSENT' AND "
         "execution_quiesced_at IS NOT NULL AND "
         "provider_evidence_observed_at >= execution_quiesced_at AND "
-        "effect_phase = 'PROVIDER_IO' AND "
+        "effect_phase IN ('PROVIDER_IO', 'SERVICE_JOB_IO') AND "
         "paid_capacity_pool_key IS NOT NULL AND service_job_id IS NULL AND "
         f'{_ORDINARY_PAID_PROVIDER_TERMINAL_SQL})',
         name='serve047_provider_absence_projection_ck'),
@@ -5940,7 +5954,7 @@ def _replica_free_association_is_inert(association: Mapping[str, Any],) -> bool:
                 paid_provider_reconciliation_pool_shape_matches(
                     profile.kind, pool_key))
             if (not replacement_shape_matches or
-                    effect_phase is not EffectPhase.PROVIDER_IO or
+                    not is_paid_provider_reconciliation_phase(effect_phase) or
                     not ordinary_paid_provider_terminal_shape_matches(
                         terminal_status, terminal_cause, pool_key) or
                     not isinstance(pool_key, str) or not pool_key):
@@ -6870,14 +6884,14 @@ def provider_absence_projection_authority_in_connection(
         replacement_shape_matches = (
             paid_provider_reconciliation_pool_shape_matches(
                 profile_kind, pool_key))
-        shape_matches = bool(
-            replacement_shape_matches and
-            association['effect_phase'] == EffectPhase.PROVIDER_IO.value and
-            isinstance(pool_key, str) and pool_key and
-            association['service_job_id'] is None and
-            ordinary_paid_provider_terminal_shape_matches(
-                association['terminal_status'], association['terminal_cause'],
-                pool_key))
+        shape_matches = bool(replacement_shape_matches and
+                             is_paid_provider_reconciliation_phase(
+                                 association['effect_phase']) and
+                             isinstance(pool_key, str) and pool_key and
+                             association['service_job_id'] is None and
+                             ordinary_paid_provider_terminal_shape_matches(
+                                 association['terminal_status'],
+                                 association['terminal_cause'], pool_key))
     else:
         shape_matches = False
     if not shape_matches:
@@ -7550,10 +7564,12 @@ def provider_presence_cleanup_authority_in_connection(
         pool_identity = (paid_capacity.pool_key_payload(pool_key) if isinstance(
             pool_key, str) else None)
         shape_matches = bool(
-            association['effect_phase'] == EffectPhase.PROVIDER_IO.value and
-            isinstance(pool_identity, Mapping) and
-            pool_identity.get('cloud') == 'gcp' and
+            is_paid_provider_reconciliation_phase(association['effect_phase'])
+            and isinstance(pool_identity, Mapping) and
+            pool_identity.get('cloud') in ('aws', 'gcp') and
             pool_identity.get('use_spot') is True and
+            paid_provider_reconciliation_pool_shape_matches(
+                profile_kind, pool_key) and
             ordinary_paid_provider_terminal_shape_matches(
                 association['terminal_status'], association['terminal_cause'],
                 pool_key))
@@ -7682,7 +7698,8 @@ def _validate_projected_provider_absence_retirement_locked_rows(
             paid_provider_reconciliation_pool_shape_matches(
                 profile.kind, pool_key))
         if (not replacement_shape_matches or
-                association['effect_phase'] != EffectPhase.PROVIDER_IO.value or
+                not is_paid_provider_reconciliation_phase(
+                    association['effect_phase']) or
                 not isinstance(pool_key, str) or not pool_key or
                 not ordinary_paid_provider_terminal_shape_matches(
                     association['terminal_status'],

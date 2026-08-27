@@ -4312,8 +4312,8 @@ def _ordinary_paid_aws_provider_identity_from_locked_request(
                  ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH) or
             not isinstance(pool_identity, Mapping) or
             pool_identity.get('cloud') != 'aws' or request_row is None or
-            association['effect_phase']
-            != ordinary_launch_binding.EffectPhase.PROVIDER_IO.value or
+            not ordinary_launch_binding.is_paid_provider_reconciliation_phase(
+                association['effect_phase']) or
             association['reconciliation_outcome']
             != expected_reconciliation_outcome or
             association['service_job_id'] is not None or
@@ -4420,8 +4420,8 @@ def _ordinary_paid_gcp_provider_identity_from_locked_request(
               ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH)) or
             not isinstance(pool_identity, Mapping) or
             pool_identity.get('cloud') != 'gcp' or request_row is None or
-            association['effect_phase']
-            != ordinary_launch_binding.EffectPhase.PROVIDER_IO.value or
+            not ordinary_launch_binding.is_paid_provider_reconciliation_phase(
+                association['effect_phase']) or
             association['reconciliation_outcome']
             != expected_reconciliation_outcome or
             association['service_job_id'] is not None or
