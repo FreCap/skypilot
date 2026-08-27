@@ -1,10 +1,12 @@
-# SkyServe multi-pool reserved-capacity fill
+# SkyServe multi-pool reserved-capacity admission
 
 Last updated: 2026-08-27
 
 Status: **in progress**. The single PostgreSQL-authoritative reserved-capacity
 path has proved full East occupancy, reclaim, and synchronized post-fix
-East/PHX convergence. The independent paid provider-lifecycle gate is complete
+East/PHX convergence. Full idle occupancy is no longer a steady-state goal:
+reserved capacity is now demand-driven and returns through the existing
+utilization gate when idle. The independent paid provider-lifecycle gate is complete
 on release `1.1.1513`, PR #1744, merge
 `329f6f5a33bab85401fef59b023714b47fb1d5eb`. One atomic PostgreSQL wave
 committed 120 exact Spot debits; provider-native GCP observations then reached
@@ -186,6 +188,38 @@ callback. The transaction continues to lock and plan from the complete current
 rows; this correction changes neither demand, supply, Kueue, cap, nor provider
 authority.
 
+PR #1757 merged the semantic fingerprint as
+``fa97e7673719cb6721c73051e2185fe3086da31b``. Release ``1.1.1526`` deployed it
+as Helm revision 645 on one immutable image digest across two API, two
+controller, and three executor Pods. Lifecycle 117 remained version 1 and
+``READY`` with 345/345 zero-cost replicas. After startup, three samples over
+42 seconds held prepared-state conflicts at exactly zero; the only eight
+planning conflicts were conservative demand-unavailable results while the
+load-balancer slots started. PostgreSQL and provider-native guards remained at
+zero paid Spot and zero on-demand capacity.
+
+The accepted objective changed after that proof. The service no longer keeps
+every scheduler-free research GPU occupied merely because it is free. Its
+ordinary target is the minimum compatible logical capacity needed to satisfy
+the configured queue-wait objectives, subject to utilization headroom and
+bounded launch-to-ready estimates. Reserved capacity, already-running paid
+Spot, and already-committed paid Spot satisfy that target before a new paid
+residual is authorized. Opportunistic fill is utilization-gated with a zero
+floor, so idle fill returns without changing East scheduling or Simone's PHX
+Kueue policy.
+
+The existing implementation has one calculation defect relative to this
+contract. Aggregate queued work applies priority timeout weights, while the
+exact-card compatibility allocator consumes raw queued profile counts. A
+complete compatibility report can therefore raise the aggregate target back
+to one logical slot per queued request and erase the timeout weighting. The
+steady state has one queue-work representation: every queued compatibility
+profile is converted to work with the same priority timeout, expected request
+duration, launch lead, and utilization policy used by the aggregate target.
+That exact work is then allocated once across compatible cards. Raw counts
+remain only the conservative mixed-version fallback when the priority or
+compatibility report is incomplete; they are not a second current happy path.
+
 A fresh positive snapshot can follow a committed zero-demand retirement while
 the pre-transaction replica snapshot still marks paid capacity as scaling
 down. Every nonterminal cleanup-unproven paid row remains part of the locked
@@ -255,13 +289,18 @@ incident chronology is intentionally left to Git.
 
 Run one heterogeneous SkyServe service with one capacity authority:
 
-1. Observe compatible zero-cost Kubernetes capacity without mutating the
-   scheduler.
-2. Commit and debit scheduler-permitted reserved capacity in PostgreSQL.
-3. Compute paid residual only after that reserved commitment is visible.
-4. Admit only bounded L4 Spot for the residual.
-5. Make every provider effect conditional on the exact committed PostgreSQL
+1. Convert current in-flight, queued, rejected, and sustained-arrival demand
+   into one priority/deadline-weighted logical work target.
+2. Allocate that work once across its exact compatible accelerator sets.
+3. Observe and commit compatible zero-cost Kubernetes capacity without
+   mutating the scheduler.
+4. Satisfy the target with ready, committed, and newly admitted reserved
+   capacity, then with already-committed paid Spot.
+5. Admit only bounded L4 Spot for the remaining exact-card residual.
+6. Make every provider effect conditional on the exact committed PostgreSQL
    graph that authorized it.
+7. Release opportunistic zero-cost fill through the utilization gate when it
+   no longer backs demonstrated work.
 
 When recreated for the broader heterogeneous objective, the canonical service
 uses East A100 and A100-80GB as zero-cost reserved capacity and AWS/GCP L4 Spot
@@ -282,11 +321,11 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` at merge `355cdc916`, release `1.1.1525`, including PR #1756's PostgreSQL-linearized planner and the earlier ordering, claim, retained-row, and reducer corrections. The semantic prepared-state fingerprint correction described above is the active source change and is not yet deployed or proven. |
-| Deployed control plane | SkyPilot `1.1.1525`, Helm revision 644. Two API, two controller, and three executor Pods are Ready and all use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:75d01dd9777781c74a1d14f692c1568b20695bc673b1cf5e256aff4e903303eb`. Helm storage remains disabled and the namespace has no PVC. |
+| Source base | `origin/improvements` at merge `fa97e7673`, release `1.1.1526`, including PR #1757's semantic prepared-state fingerprint, PR #1756's PostgreSQL-linearized planner, and the earlier ordering, claim, retained-row, and reducer corrections. The unified priority/deadline-weighted exact-card target described here is the active source change and is not yet deployed or proven. |
+| Deployed control plane | SkyPilot `1.1.1526`, Helm revision 645. Two API, two controller, and three executor Pods are Ready and all use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:34e1ef5560dafd04612c5b415a395d4d0fedd1df86e7470511eb40ad12e9c59b`. Helm storage remains disabled and the namespace has no PVC. |
 | Writer protocol | Public API 93, worker projection 10, non-pool capability cohort 12, and async request-ledger protocol 1. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. |
-| Active service | Lifecycle 116 and all of its child authority were removed by the supported fenced purge after PR #1748 deployed. Lifecycle 117, incarnation `3bc2c88b-2c28-40fa-a9d5-482880767b3e`, was then recreated from the canonical PostgreSQL-only spec with paid residual cap 100 to continue heterogeneous qualification. Helm revision 640 deployed release `1.1.1521` and preserved lifecycle 117 and service version 1 while replacing the control plane and both warm-standby load-balancer slots. The service is test-only and not yet production-qualified. |
+| Active service | Lifecycle 117, incarnation `3bc2c88b-2c28-40fa-a9d5-482880767b3e`, is a clean current-schema PostgreSQL-only service at committed/applied version 1 with paid residual cap 100. At the 2026-08-27 baseline it is `READY` with 345/345 zero-cost replicas and no paid row. The submitted version still carries the superseded `utilization_gate: false`; changing that field to true is an explicit rollout gate below. The service is test-only and not yet production-qualified. |
 | Reserved occupancy | At 2026-08-26 23:09--23:13 UTC, East had 328 healthy compatible GPUs on 41 nodes: research requested 45 and 283 `boltz-l4-fleet` Pods requested the exact remainder; all 283 were Running and Ready, with zero free compatible GPU and zero pending research or fleet GPU Pod. PHX had 512 healthy H200 GPUs: research held 482 and the unchanged Kueue policy admitted 30/30 fleet Workloads; all 30 Pods were Running/Ready and PostgreSQL `READY`, with zero pending research GPU Workload. PostgreSQL independently reported exactly 63 A100, 220 A100-80GB, and 30 H200 reserved replicas `READY`, with zero durable intent pending. Thus the same lifecycle occupied East 328/328 and PHX 512/512 without changing scheduler policy. |
 | Reserved readiness projection | For the final PHX replica, PostgreSQL committed the intent at 22:43:32, the Pod appeared at 22:43:55, Kueue admitted it at 22:43:56, and the Pod became Ready at 22:44:32. PostgreSQL projected it `READY` only between 22:52:25 and 22:52:40, exposing a separate roughly eight-minute status-freshness lag rather than a capacity/admission failure. The post-Helm 23:13 UTC census retained the exact 30/30 admission and readiness with no churn. |
 | Claim-heartbeat convergence defect | Resolved in source, deployed, and dark-verified in production. Lifecycle 117 had logged successful exact reclaim-policy proofs followed 7--15 seconds later by rejected claim-set heartbeats because the broker minted the five-second ticket before entering the PostgreSQL replacement and its protocol/lifecycle locks. PR #1750 passes an authorization callback into the state transaction, locks protocol, owner, immutable version/projection, claim-set/edge rows and the legacy projection, reconstructs exact scope, and only then reads already-renewed PostgreSQL proof receipts. Proof logging completes before the ticket timestamp; the ticket is then immediately validated and written. Ordinary drained boundary failures remain fail-closed and boundary ambiguity remains controller-terminal. The correction changes neither Kueue nor TTL/batch/quantum limits. Real-PostgreSQL tests cover waits beyond the ticket lifetime on the affected lock paths. Release `1.1.1519` then produced eight consecutive observed successful claim/publish rounds after controller takeover with no rejected heartbeat. |
@@ -297,7 +336,7 @@ it has merged or been deployed.
 | Partial mixed proof | Provider/DB censuses at 2026-08-25 19:45:47.538 and 19:45:56.281 UTC bracketed a 72-request completion wave and both had 44 reserved plus 28 paid replicas all `READY`, the same 28 AWS Spot instances—27 `g6.2xlarge` and one `g6.4xlarge`—and zero on-demand. The wave completed from 19:45:48.956 through 19:45:51.187; every request performed 9.533–12.451 seconds of concurrency-one GPU work, so at least 28 necessarily executed on Spot beside the 44 reserved workers. The Spot instances later fully drained at the provider. |
 | GCP Spot lifecycle proof | Complete on `1.1.1513`. The fixed-120 update completed at 18:23:39.277 UTC. After five fail-closed prospective conflicts while the traffic writer changed telemetry, the sixth attempt atomically committed all 120 debits at 18:25:12.183. Provider-native observations first reached 100 `RUNNING` at 18:28:54.100, then 107, 110, 114, and 117. Every object was GCP Spot `g2-standard-4` with exactly one NVIDIA L4; zero on-demand or non-Spot capacity appeared. The peak 117 VMs were in `asia-northeast3` and `asia-south1`. Normal teardown reached native `RUNNING=0` at 18:35:00.512 and exact all-state zero at 18:35:39.315. |
 | Final load proof | Not complete. Run `final10k-1524-20260827-0246` retains one immutable 10,000-ID manifest. It accepted 2,125 identities, classified 29 exact transport outcomes as ambiguous for durable reconciliation, and retained 7,846 pending identities before stopping on the publication defect. Live telemetry proved nonzero queued/in-flight demand and computed targets of 414 and 494. The exact 503 body `No replica has confirmed free async capacity. Use "sky serve status [SERVICE_NAME]" to check the replica status.` is a definitive retryable pre-dispatch rejection only when the PostgreSQL request receipt is exactly `REJECTED_PRE_DISPATCH`; the harness may classify that exact pair without relaxing any other 5xx outcome. The run identity must be resumed, not replaced. |
-| Demand/publication ordering | PR #1756's PostgreSQL-linearized current-demand/current-supply transaction is merged and deployed on `1.1.1525`; the superseded promoted publisher is removed. Dark verification preserved lifecycle 117 and all 345 ready reserved replicas, but exposed repeated fail-closed planning conflicts caused by physical `xmin` churn on semantically unchanged replica documents. The active correction makes that fingerprint semantic while retaining rejection of every actual replica/runtime mutation. Final load proof remains pending. |
+| Demand/publication ordering | PR #1756's PostgreSQL-linearized current-demand/current-supply transaction and PR #1757's semantic prepared-state fingerprint are merged and deployed on `1.1.1526`; the superseded promoted publisher is removed. Dark verification preserved lifecycle 117 and all 345 ready reserved replicas and observed zero prepared-state conflicts after startup. Final deadline-weighted load proof remains pending. |
 
 The completed paid-gate post-rollout census was green after Helm revision 635:
 the service, replicas, claims, waiters, request associations, queue rows,
@@ -313,18 +352,48 @@ paid-authority census.
 
 ### Reserved capacity
 
-- Assign 100% of healthy, exact-card-compatible physical capacity exposed as
-  free in East and 100% of the compatible capacity actually admitted by
-  Simone's unchanged Kueue policy in PHX.
+- Admit as much healthy, exact-card-compatible reserved capacity as the
+  current priority/deadline-weighted demand target needs. Do not retain idle
+  capacity merely to maximize occupancy.
 - Count every GPU on a multi-GPU machine once. One logical asynchronous worker
   owns one GPU; an eight-GPU node can therefore host eight workers.
-- Treat the denominator as dynamic. When research releases a compatible slot,
-  the next fresh observation makes it eligible for fill; when research
-  or Kueue reclaims a slot, SkyPilot yields it and stops counting it as
-  spendable. SkyPilot does not claim that Kueue will choose a victim outside
+- Treat available supply as dynamic. When research releases a compatible slot,
+  the next fresh observation makes it eligible for demand placement; when
+  research or Kueue reclaims a slot, SkyPilot yields it and stops counting it
+  as spendable. SkyPilot does not claim that Kueue will choose a victim outside
   the policy it actually implements.
+- With no demonstrated demand, a zero-floor utilization-gated fill claim
+  converges to zero. Blind telemetry freezes briefly and then resumes bounded
+  release; it never restores a static full-pool reservation.
 - Never infer free capacity from nominal hardware totals, stale rows, or a
   pending workload that the scheduler has not admitted.
+
+### Deadline-aware target
+
+- Interpret `load_balancer.request_queue.timeout_seconds` and
+  `timeout_seconds_by_priority` as dispatch/wait objectives. They are not an
+  end-to-end scientific completion guarantee.
+- Seed request duration and launch lead from service configuration, then use
+  fresh empirical observations when the existing minimum-sample and freshness
+  gates are satisfied.
+- For a queued profile at priority ``p``, convert one request to
+  ``min(1, duration / max(duration, timeout(p) - launch_lead))`` units of
+  concurrent work. Apply the same conversion before both aggregate sizing and
+  exact-card allocation.
+- Existing in-flight work remains one occupied slot. Sustained arrival-rate
+  work remains an independent floor because a finite backlog deadline does not
+  authorize falling behind a continuing arrival stream. Rejected demand stays
+  bounded by the existing short and retained windows.
+- A complete current report groups queue work by `(priority, exact compatible
+  accelerator set)`. Allocate the highest priorities first and preserve the
+  request's compatibility set; within one priority, protect the profile with
+  the worst alternative before assigning flexible work.
+- Incomplete priority or compatibility telemetry fails conservatively to raw
+  queue work and cannot authorize a guessed exact-card provider effect. This is
+  the bounded N-1/N-2 transition behavior, not a parallel current policy.
+- The target counts logical GPU slots. Provider placement may coalesce those
+  slots onto a compatible multi-GPU machine, but every device must expose and
+  complete one independent worker slot.
 
 ### Paid residual
 
@@ -416,19 +485,18 @@ service:
     reserved_capacity_fill:
       floor_replicas: 0
       weight: 100
-      utilization_gate: false
+      utilization_gate: true
 ```
 
 `min_replicas: 0` and the paid cap make paid capacity demand-only and
-scale-to-zero. They do not make reserved occupancy scale to zero.
-`utilization_gate: false` deliberately fills free reserved GPUs even at zero
-traffic because the accepted objective is 100% use of free reserved capacity.
-This is an intentional departure from the general utilization-gated
-scale-to-zero default. It never creates paid demand.
+scale-to-zero. `utilization_gate: true` makes opportunistic reserved fill
+activity-backed as well: after the bounded idle dwell, the broker releases
+surplus in drain-safe steps until its zero floor is reached. It never creates
+paid demand and never changes scheduler policy.
 
 `floor_replicas: 0` is not a target of zero. It means there is no unconditional
-minimum. The fresh scheduler-authorized grant remains the target when the
-utilization gate is false.
+minimum. Fresh demonstrated work may raise the utilization cap and the ordinary
+demand path may still commit scheduler-authorized reserved capacity immediately.
 
 Every reserved intent is pinned to the exact zero-cost Kubernetes location and
 accelerator that authorized it. It cannot fall through to Spot. Paid Spot is a
@@ -982,7 +1050,7 @@ and it does not permit manual SQL deletion.
   ConfigMap omits the PHX namespace and replaces `workspaces` wholesale; the
   PostgreSQL server-config row is the current authority. Helm does not run that
   Job.
-- `min_replicas: 0`, fill floor 0, `utilization_gate: false`, and the explicit
+- `min_replicas: 0`, fill floor 0, `utilization_gate: true`, and the explicit
   paid cap read back from the submitted service version.
 - No task-owned namespace, service account, scheduler, priority, Kueue, raw
   Pod config, hostPath, or PVC override is present.
@@ -1031,6 +1099,25 @@ on-demand spill.
 ### Source qualification
 
 - Run formatter/type/lint checks on every changed source file.
+- With complete current telemetry and a zero launch-lead seed, prove 1,000
+  queued requests of ten seconds each produce the same
+  priority/deadline-weighted work in the aggregate and exact-card maps. At a
+  600-second timeout and 95% utilization the queue needs 18 logical slots;
+  fifty compatible ready slots authorize no additional launch. At a 60-second
+  timeout it needs 176 logical slots before other demand terms and hard caps
+  are applied.
+- Mix constrained A100-only demand with L4-or-A100 demand. Prove the constrained
+  profile retains A100 authority while flexible residual chooses L4 when both
+  can meet the same priority objective; higher numeric priority remains the
+  explicit first ordering key. Prove no flexible request is counted in two
+  card targets.
+- Prove an eight-GPU compatible backend supplies eight logical slots and that
+  ready, provisioning, reserved, and already-paid supply suppress the exact
+  corresponding cold residual.
+- Repeat with missing, partial, and N-1 priority/compatibility gauges. Missing
+  current semantics must use raw conservative queue work or hold prior
+  exact-card authority; it must never publish a discounted guessed-card paid
+  plan.
 - Run focused probe batching, replica-manager, paid-capacity, reserved
   admission, route, request-ledger, recovery, and teardown tests.
 - Run real-PostgreSQL tests for transaction atomicity, lost acknowledgements,
@@ -1112,10 +1199,14 @@ on-demand spill.
 - Reconcile physical East and PHX capacity, research occupancy, SkyPilot Pods,
   Kueue admission in PHX, PostgreSQL intents/replicas, routes, and ready workers
   at one synchronized observation.
-- Require every compatible free East GPU and every PHX GPU admitted by the
-  unchanged Kueue policy to be committed/provisioning or ready, with spendable
-  capacity zero and a typed reason for any residual. Waiting PHX Pods remain
-  visible as waiting and do not count as spendable or admitted capacity.
+- Under positive demand, require every logical target unit to be backed by a
+  compatible ready, committed, or scheduler-admitted reserved unit before a
+  paid residual appears. Waiting PHX Pods remain visible as waiting and do not
+  count as spendable or admitted capacity.
+- Under sustained zero demand, require the utilization-gated fill claim and
+  its fill-origin replicas to decrease according to the bounded dwell/step
+  contract and converge to zero without a paid launch. It is correct for
+  compatible research GPUs to remain free in this state.
 - Continuously inspect pending GPU research Workloads during qualification. If
   one remains quota-blocked while PHX fill holds admissions that unchanged
   Kueue does not promptly reclaim, disable PHX fill and record the scheduler

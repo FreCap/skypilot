@@ -113,6 +113,8 @@ _SLOT_CONVERSION_EPSILON = 1e-9
 _RESERVED_CAPACITY_MAX_FUTURE_SKEW_SECONDS = (
     constants.RESERVED_CAPACITY_POLL_INTERVAL_SECONDS *
     constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS)
+_CompatibilityWorkProfile = tuple[int, tuple[str, ...], float]
+_AnnotatedCompatibilityWorkProfile = tuple[int, tuple[str, ...], float, bool]
 
 
 def _canonical_additional_supply(
@@ -6531,33 +6533,134 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             timeout = threshold_timeout
         return timeout
 
-    def _queue_work(self) -> float:
-        if (self.replica_unit != 'logical' or
-                self.effective_request_duration_seconds is None or
-                not self._queue_timeout_thresholds or
-                self._queue_depth_by_priority is None or
+    def _queue_deadline_weighting_available(self) -> bool:
+        """Whether the current queue gauges support deadline weighting."""
+        return (self.replica_unit == 'logical' and
+                self.effective_request_duration_seconds is not None and
+                self._queue_timeout_seconds is not None and
+                self._queue_depth_by_priority is not None and
                 sum(self._queue_depth_by_priority.values())
-                < self._queue_depth):
+                >= self._queue_depth)
+
+    def _queued_request_work(self, priority: int) -> float:
+        """Concurrent work represented by one queued request."""
+        if not self._queue_deadline_weighting_available():
+            return 1.0
+        duration = self.effective_request_duration_seconds
+        assert duration is not None
+        timeout = self._priority_timeout(priority)
+        if timeout is None:
+            return 1.0
+        lead = self.effective_provision_lead_seconds
+        return min(1.0, duration / max(duration, timeout - lead))
+
+    def _queue_work(self) -> float:
+        if not self._queue_deadline_weighting_available():
             # A mixed-version HA floor can carry aggregate demand from an old
             # active beside an empty or partial priority map from the new
             # active. Never let the optional map erase that proven queue.
             return float(self._queue_depth)
-        # A queued request must be dispatched before its priority timeout,
-        # and newly authorized capacity only starts serving after the
-        # provisioning lead time. Sizing against the full timeout budget
-        # plans delivery exactly at the deadline assuming instant capacity;
-        # subtracting the lead sizes against the budget that actually
-        # remains once capacity can exist.
-        lead = self.effective_provision_lead_seconds
-        duration = self.effective_request_duration_seconds
-        work = 0.0
+        assert self._queue_depth_by_priority is not None
+        return sum(count * self._queued_request_work(priority)
+                   for priority, count in self._queue_depth_by_priority.items())
+
+    def _queued_compatibility_work(
+        self,
+        configured_cards: list[str],
+    ) -> tuple[list[_CompatibilityWorkProfile],
+               list[_CompatibilityWorkProfile]]:
+        """Return the queue's canonical priority/exact-card work profiles.
+
+        Aggregate target sizing and exact-card allocation must consume the
+        same queue-work representation.  The former historically applied
+        priority timeout weights while the latter consumed raw request counts,
+        so a complete compatibility report could silently erase the timeout
+        discount by raising the aggregate target back to one slot per request.
+
+        A current complete report carries matching aggregate, priority, and
+        compatibility gauges.  HA handoff and adjacent-version reports can be
+        conservatively floored or partial, so the result is bounded to the
+        aggregate queue work in strict-priority order and any unattributed
+        remainder stays flexible across all configured cards.  When deadline
+        gauges are incomplete, every request remains one raw work unit.
+        """
+        default_compatible = tuple(configured_cards)
+
+        def public_profiles(
+            entries: list[_AnnotatedCompatibilityWorkProfile],
+            *,
+            explicit_only: bool = False,
+        ) -> list[_CompatibilityWorkProfile]:
+            return [(priority, compatible, work)
+                    for priority, compatible, work, is_explicit in entries
+                    if not explicit_only or is_explicit]
+
+        profile_entries = [(int(profile['priority']),
+                            tuple(profile['compatible_accelerators']),
+                            float(profile['count']) *
+                            self._queued_request_work(int(profile['priority'])),
+                            True)
+                           for profile in self.queued_compatibility_profiles]
+        raw_profile_count = sum(
+            int(profile['count'])
+            for profile in self.queued_compatibility_profiles)
+        if not self._queue_deadline_weighting_available():
+            if self._queue_depth > raw_profile_count:
+                profile_entries.append(
+                    (constants.LB_REQUEST_PRIORITY_MIN, default_compatible,
+                     float(self._queue_depth - raw_profile_count), False))
+            return (public_profiles(profile_entries),
+                    public_profiles(profile_entries, explicit_only=True))
+
+        assert self._queue_depth_by_priority is not None
+        profiled_by_priority: dict[int, int] = {}
+        for profile in self.queued_compatibility_profiles:
+            priority = int(profile['priority'])
+            profiled_by_priority[priority] = (
+                profiled_by_priority.get(priority, 0) + int(profile['count']))
         for priority, count in self._queue_depth_by_priority.items():
-            timeout = self._priority_timeout(priority)
-            weight = 1.0
-            if timeout is not None:
-                weight = min(1.0, duration / max(duration, timeout - lead))
-            work += count * weight
-        return work
+            missing = max(0, count - profiled_by_priority.get(priority, 0))
+            if missing:
+                profile_entries.append(
+                    (priority, default_compatible,
+                     missing * self._queued_request_work(priority), False))
+
+        aggregate_work = self._queue_work()
+        represented_work = sum(entry[2] for entry in profile_entries)
+        if represented_work < aggregate_work - _SLOT_CONVERSION_EPSILON:
+            highest_priority = max(
+                (priority
+                 for priority, count in self._queue_depth_by_priority.items()
+                 if count > 0),
+                default=constants.LB_REQUEST_PRIORITY_MIN)
+            profile_entries.append((highest_priority, default_compatible,
+                                    aggregate_work - represented_work, False))
+            return (public_profiles(profile_entries),
+                    public_profiles(profile_entries, explicit_only=True))
+        if represented_work <= aggregate_work + _SLOT_CONVERSION_EPSILON:
+            return (public_profiles(profile_entries),
+                    public_profiles(profile_entries, explicit_only=True))
+
+        # Maximum-merged HA profiles can describe more simultaneous work than
+        # their aggregate gauge.  Keep the aggregate magnitude authoritative,
+        # retaining higher priorities first and preserving the distribution of
+        # equal-priority compatibility sets.
+        bounded_entries: list[_AnnotatedCompatibilityWorkProfile] = []
+        remaining = aggregate_work
+        for priority in sorted({item[0] for item in profile_entries},
+                               reverse=True):
+            group = [item for item in profile_entries if item[0] == priority]
+            group_work = sum(item[2] for item in group)
+            accepted = min(remaining, group_work)
+            if accepted <= _SLOT_CONVERSION_EPSILON:
+                break
+            scale = accepted / group_work
+            bounded_entries.extend(
+                (profile_priority, compatible, work * scale, is_explicit)
+                for profile_priority, compatible, work, is_explicit in group)
+            remaining -= accepted
+        return (public_profiles(bounded_entries),
+                public_profiles(bounded_entries, explicit_only=True))
 
     def _offered_arrival_count(self, window_seconds: int) -> int:
         if self._offered_arrival_tracking_saturated:
@@ -7396,20 +7499,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             else:
                 provisioning[card] += width
 
-        profiles = [(int(profile['priority']),
-                     tuple(profile['compatible_accelerators']),
-                     float(profile['count']))
-                    for profile in self.queued_compatibility_profiles]
-        explicit_profiles = list(profiles)
+        profiles, explicit_profiles = self._queued_compatibility_work(
+            configured_cards)
         paid_profiles = list(profiles)
-        queue_profile_total = sum(work for _, _, work in profiles)
         default_compatible = tuple(configured_cards)
-        if self._queue_depth > queue_profile_total:
-            default_queue_profile = (constants.LB_REQUEST_PRIORITY_MIN,
-                                     default_compatible,
-                                     self._queue_depth - queue_profile_total)
-            profiles.append(default_queue_profile)
-            paid_profiles.append(default_queue_profile)
         rejected_profiles = self._rejected_compatibility_work()
         profiles.extend(rejected_profiles)
         explicit_profiles.extend(rejected_profiles)
