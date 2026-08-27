@@ -6190,6 +6190,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 pre_ready_fill_holdings=pre_ready,
                 upscale_pending=self.upscale_counter > 0,
                 work_per_replica=work_per_replica,
+                planned_replicas=max(0,
+                                     int(self.get_final_target_num_replicas())),
             )
 
     def _replica_is_busy(self, info: 'replica_managers.ReplicaInfo') -> bool:

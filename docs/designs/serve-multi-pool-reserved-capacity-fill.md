@@ -258,6 +258,32 @@ replaces it under the existing allocation-generation CAS; it never uses that
 map for a new provider effect. A schema-5 writer rejects a schema-6 map and
 therefore also fails closed during a rolling deployment.
 
+Release ``1.1.1542`` deployed schema 6 on Helm revision 660. A fresh
+200-request idle-to-burst calibration proved the stale-map guard itself: while
+the locked queue was 200, the old idle and first-upward allocations repeatedly
+suppressed paid admission and PostgreSQL retained zero paid claims. The same
+run then exposed a narrower semantic mismatch. The SLA planner selected 28
+logical replicas, but ``FillDemandSample.demonstrated_need()`` represented only
+2.85 concurrency-work units and authenticated a utilization ceiling of four.
+After that smaller ceiling settled, the paid planner correctly treated only
+four reserved grants as committed and attempted the remainder on Spot even
+though the same allocation observed 185 compatible spendable GPUs. This is
+not Kueue or provider scarcity; the utilization gate and paid planner were
+using different demand units.
+
+The canonical demand witness is therefore the maximum of current concurrency
+work, busy/pre-ready fill holdings, and the current SLA-selected logical
+replica target. The target is already computed from the same locked durable
+demand snapshot inside the paid-plan callback; it is not a second planner or
+speculative capacity. A compatible positive paid plan additionally requires
+the authenticated utilization ceiling to cover that current target. The
+poller then publishes the same target through the existing claim, the existing
+one-sided release governor raises immediately, and the existing damped broker
+rounds settle real grants. If compatible physical supply is smaller than the
+target, settled grants debit that supply and only the genuine remainder may
+become Spot. No allocation schema, database migration, Kueue object, or
+provider contract changes for this correction.
+
 The first deadline-planner production campaign on lifecycle 121 exposed a
 remaining violation of that demand-driven contract. Two hundred explicitly
 L4-only, priority-zero queue entries correctly produced an L4-only deadline
@@ -547,8 +573,8 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` at merge `4cfccc3e8`, including PR #1772's Serve064 paid-`SERVICE_JOB_IO` reconciliation boundary and the preceding PRs #1769--#1771. |
-| Deployed control plane | SkyPilot `1.1.1541`, Helm revision 659. Two API, two controller, and three executor Pods use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:29f4d700253a79fa92ffbdabba8c0243203eba5f524d8b7ff730fbfcf9be52c3`. PostgreSQL is at Serve revision 064, Helm storage remains disabled, and PostgreSQL remains the sole central store. |
+| Source base | `origin/improvements` at merge `5a40b6f47`, including PR #1773's schema-6 utilization/allocation causality boundary and PR #1772's Serve064 paid-`SERVICE_JOB_IO` reconciliation boundary. |
+| Deployed control plane | SkyPilot `1.1.1542`, Helm revision 660. Two API, two controller, and three executor Pods use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:16b37652804a0f848fa2568249959574aafe5649b2e36f9b2be06cc462bdc179`. PostgreSQL is at Serve revision 064, Helm storage remains disabled, and PostgreSQL remains the sole central store. |
 | Writer protocol | Public API 93, worker projection 10, deployed and source non-pool capability cohort 13, and async request-ledger protocol 1. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. |
 | Active service | Lifecycle 124 is a clean recreation on release `1.1.1541`, service incarnation `c1b25022-4257-44c8-bb95-4d1ae087fd6f`, version 1, with two healthy HA load-balancer slots. It has `min_replicas: 0`, fill floor 0, `utilization_gate: true`, a 120 paid-GPU cap, only Spot L4 paid candidates, and reserved East A100/A100-80GB plus PHX H200 candidates. It has no task-owned scheduler override, file mount, EFS, PVC, or on-demand candidate. |
@@ -563,7 +589,7 @@ it has merged or been deployed.
 | GCP Spot lifecycle proof | Complete for the current writer. Release `1.1.1540` reached 105 concurrently `RUNNING` and peaked at 109 exact one-L4 Spot `g2-standard-4` VMs, with zero on-demand and zero wrong-shape instances. A fresh 256-request wave moved the native census 71 -> 105 in roughly two minutes. Normal down reduced 109 running VMs to one in 4 minutes 43 seconds; release `1.1.1541` / Serve064 deleted the final exact VM, projected `ABSENT`, and held provider/database active authority at zero through the full horizon. |
 | Final load proof | Not complete. Run `final10k-1524-20260827-0246` retains one immutable 10,000-ID manifest. It accepted 2,125 identities, classified 29 exact transport outcomes as ambiguous for durable reconciliation, and retained 7,846 pending identities before stopping on the publication defect. Live telemetry proved nonzero queued/in-flight demand and computed targets of 414 and 494. The exact 503 body `No replica has confirmed free async capacity. Use "sky serve status [SERVICE_NAME]" to check the replica status.` is a definitive retryable pre-dispatch rejection only when the PostgreSQL request receipt is exactly `REJECTED_PRE_DISPATCH`; the harness may classify that exact pair without relaxing any other 5xx outcome. The run identity must be resumed, not replaced. |
 | Demand/publication ordering | The PostgreSQL-linearized planner, semantic fingerprint, weighted exact-card target, current-generation cancellation, whole-wave drain seed, restored-route fence, capacity-time SLA target, demand-gated fill, and accelerator-scoped reserved authority are merged and deployed. The clean `1.1.1540` lifecycle published and actuated a 120-unit exact-L4 Spot target; provider availability converged to 105 running and later 109 without on-demand spill. |
-| Utilization/allocation causality | Open and source-in-progress after the lifecycle-124 calibration. The schema-5 allocation can be internally fresh yet precede the utilization sample for the locked positive demand, allowing a small paid residual before the next broker round. Schema 6 binds the demonstrated-need sample and upward-grant convergence; production proof must show the idle-to-burst transition commits compatible reserved capacity before the first new paid claim. |
+| Utilization/allocation causality | Schema 6 is merged, deployed, and proved to reject both the stale idle allocation and unsettled first-upward allocation on lifecycle 124. The follow-up calibration found that the gate authenticated four concurrency-derived slots while the locked SLA target was 28, allowing a later false Spot residual despite 185 observed compatible spendable GPUs. Source work now makes the existing fill sample and paid guard use the same SLA-selected target; production proof remains open. |
 
 The completed paid-gate post-rollout census was green after Helm revision 635:
 the service, replicas, claims, waiters, request associations, queue rows,
@@ -1397,9 +1423,10 @@ missing telemetry.
     fail-closed.
 19. **Demand-causal allocation:** a utilization-gated positive compatible paid
     plan may use only an authenticated allocation whose non-blind demonstrated
-    need covers the locked current sample and whose raw upward grants have all
-    reached their damped grants. An older idle or upward-in-flight allocation
-    is retryable unavailable authority, never paid residual evidence.
+    need and utilization ceiling cover the locked current SLA-selected target,
+    and whose raw upward grants have all reached their damped grants. An older
+    idle, concurrency-only, or upward-in-flight allocation is retryable
+    unavailable authority, never paid residual evidence.
 
 ## Compatibility contract
 
@@ -1674,10 +1701,11 @@ condition of the already-complete paid Spot provider-lifecycle gate.
    time-to-limit from the atomic paid-wave commit.
    From an authenticated idle map, additionally require the first positive
    paid claim to postdate a schema-6 allocation with a non-blind covering
-   utilization sample and ``upward_grants_settled=true``. Observe at least one
-   deliberately stale idle-to-burst pass committing neither a paid claim nor a
-   provider request, followed by reserved admission and only then the genuine
-   Spot residual.
+   utilization sample, a utilization ceiling covering the current locked SLA
+   target, and ``upward_grants_settled=true``. Observe at least one deliberately
+   stale idle-to-burst pass and one smaller concurrency-only allocation
+   committing neither a paid claim nor a provider request, followed by
+   reserved admission and only then the genuine Spot residual.
 6. Require zero ordinary on-demand instance, zero paid non-Spot row, and no
    provider action outside the armed service/run envelope.
 7. Record selection-time pool, instance shape, normalized price, provider

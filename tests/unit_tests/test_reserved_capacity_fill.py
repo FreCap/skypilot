@@ -8489,6 +8489,7 @@ class TestFillDemandSample(unittest.TestCase):
 
     def test_fully_idle_fleet_demonstrates_no_need(self):
         autoscaler = self._autoscaler()
+        autoscaler.target_num_replicas = 0
         replicas = [self._fill_replica(i) for i in range(1, 10)]
         autoscaler._in_flight_by_replica_id = {}
         autoscaler._unknown_in_flight_replica_ids = set()
@@ -8500,6 +8501,21 @@ class TestFillDemandSample(unittest.TestCase):
         self.assertIsNotNone(sample)
         self.assertEqual(sample.demonstrated_need(), 0)
         self.assertFalse(sample.boot_hold())
+
+    def test_sla_target_dominates_smaller_concurrency_work(self):
+        autoscaler = self._autoscaler()
+        autoscaler.target_num_replicas = 28
+        autoscaler._in_flight_by_replica_id = {}
+        autoscaler._unknown_in_flight_replica_ids = set()
+        autoscaler._report_received_at = time.time()
+        autoscaler._weighted_queue_work = 2.85
+        autoscaler._rejected_concurrency = 0.0
+
+        sample = autoscaler.fill_demand_sample([])
+
+        self.assertIsNotNone(sample)
+        self.assertEqual(sample.planned_replicas, 28)
+        self.assertEqual(sample.demonstrated_need(), 28)
 
     def test_demand_placed_zero_cost_rows_are_not_counted(self):
         # They are demand-protected and exempt from the grant ceiling, so

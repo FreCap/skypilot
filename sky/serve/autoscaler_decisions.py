@@ -84,6 +84,10 @@ class FillDemandSample:
     pre_ready_fill_holdings: int
     upscale_pending: bool
     work_per_replica: float
+    # Logical capacity selected by the current SLA plan.  The utilization
+    # gate and paid planner must share this witness: concurrency work alone
+    # can be much smaller than the fleet required to meet a deadline.
+    planned_replicas: int = 0
 
     def demonstrated_need(self) -> int:
         """Replicas this claimant can prove it is using right now."""
@@ -91,6 +95,8 @@ class FillDemandSample:
         return max(
             self.busy_fill_holdings + self.pre_ready_fill_holdings,
             math.ceil(max(0.0, self.outstanding_work) / per_replica),
+            0,
+            self.planned_replicas,
         )
 
     def boot_hold(self) -> bool:
