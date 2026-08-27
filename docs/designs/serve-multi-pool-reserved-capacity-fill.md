@@ -1,6 +1,6 @@
 # SkyServe multi-pool reserved-capacity fill
 
-Last updated: 2026-08-26
+Last updated: 2026-08-27
 
 Status: **in progress**. The single PostgreSQL-authoritative reserved-capacity
 path has proved full East occupancy, reclaim, and synchronized post-fix
@@ -41,6 +41,20 @@ authorization is minted. PR #1750 merged this correction as
 `f22c459d53749e0d3a707d45621b633f6528073e`; release `1.1.1519` deployed it as
 Helm revision 639. Eight consecutive observed post-rollout claim/publish rounds
 succeeded without a rejected claim-set heartbeat.
+
+The first lifecycle-117 terminal-ledger campaign exposed one additional
+ordering defect. With more than 300 reserved replicas, the optimistic
+reserved-supply projection can take longer than the load-balancer heartbeat
+interval. The controller captured demand first, projected supply second, and
+only then entered the publication transaction. Sustained traffic therefore
+advanced queue/in-flight semantics on every projection and correctly fenced
+every paid plan, creating deterministic starvation rather than a transient
+retry. The steady-state order is now ``prepare/project supply -> capture one
+fresh demand snapshot -> compute the decision -> begin publication -> lock
+demand/route first -> revalidate the same supply graph -> commit``. No
+blocking optimistic supply projection may occur after the demand snapshot.
+Changed demand still fails closed; this correction removes the avoidable race
+instead of treating different telemetry as equivalent.
 
 The normal lifecycle-116 teardown then exposed two independent reducer defects.
 First, exact reserved-fill absence reached the common replica projection, but
@@ -135,8 +149,8 @@ it has merged or been deployed.
 | Routing and queue | The recreated lifecycle-117 endpoint is Ready with 313/313 reserved replicas. The lifecycle-115 run attempted all 10,000 stable synthetic IDs at concurrency 256, but used them only as bounded provider-scale stimulus; it is not the separate 10,000-terminal-request ledger proof. A fresh nonzero queued/processing/in-flight/completed UI proof remains part of the final heterogeneous load run. |
 | Partial mixed proof | Provider/DB censuses at 2026-08-25 19:45:47.538 and 19:45:56.281 UTC bracketed a 72-request completion wave and both had 44 reserved plus 28 paid replicas all `READY`, the same 28 AWS Spot instances—27 `g6.2xlarge` and one `g6.4xlarge`—and zero on-demand. The wave completed from 19:45:48.956 through 19:45:51.187; every request performed 9.533–12.451 seconds of concurrency-one GPU work, so at least 28 necessarily executed on Spot beside the 44 reserved workers. The Spot instances later fully drained at the provider. |
 | GCP Spot lifecycle proof | Complete on `1.1.1513`. The fixed-120 update completed at 18:23:39.277 UTC. After five fail-closed prospective conflicts while the traffic writer changed telemetry, the sixth attempt atomically committed all 120 debits at 18:25:12.183. Provider-native observations first reached 100 `RUNNING` at 18:28:54.100, then 107, 110, 114, and 117. Every object was GCP Spot `g2-standard-4` with exactly one NVIDIA L4; zero on-demand or non-Spot capacity appeared. The peak 117 VMs were in `asia-northeast3` and `asia-south1`. Normal teardown reached native `RUNNING=0` at 18:35:00.512 and exact all-state zero at 18:35:39.315. |
-| Final load proof | Not complete. The prior run accepted 4,640 requests and observed 4,568 completion markers, but ended with 802 ambiguous submissions. Those identities must not be replayed as a substitute for a fresh exact-ledger run. |
-| Scale-convoy correction | Provider-mutation lock-convoy removal merged in PR #1728, with launch/reduction corrections in PRs #1742--#1744, and is deployed in `1.1.1513`. Source and tests cover exact cancellation and durable adoption. This production run proves atomic 120-wide admission, provider fan-out, and normal teardown of the 117-VM Spot peak to exact zero; it does not claim that the durable-adopter branch executed. One investigation remains: prospective fixed-floor admission still compares volatile telemetry even when every decision output may be unchanged. |
+| Final load proof | Not complete. The fresh lifecycle-117 run `final10k-20260827-0045` durably started 2,000 identities and received 1,985 accepted plus 15 transport-ambiguous outcomes before its verifier stopped. Live telemetry proved nonzero queued and in-flight counts. Paid authority remained zero because the post-demand reserved-supply projection lost every publication race to the next changed heartbeat. The verifier independently assumed `s3:ListBucket`, although its workload identity intentionally has only exact-object access; it must resume the same PostgreSQL-fenced identities and poll only their known immutable marker keys. No new identity may replace this adjudicable partial run. |
+| Demand/publication ordering | Source correction in progress. Provider-mutation lock-convoy removal merged in PR #1728, with launch/reduction corrections in PRs #1742--#1744, and is deployed in `1.1.1513`. Source and tests cover exact cancellation and durable adoption. The 120-Spot production run proves atomic admission, provider fan-out, and normal teardown. Lifecycle 117 then proved that projecting a 300-plus-replica supply graph after capturing demand can deterministically exceed the reporter cadence. Supply projection moves before the fresh demand boundary; publication continues to re-lock and revalidate demand, route, allocation, capacity graph, cap, and ownership without accepting changed telemetry. |
 
 The completed paid-gate post-rollout census was green after Helm revision 635:
 the service, replicas, claims, waiters, request associations, queue rows,
@@ -445,6 +459,16 @@ paid residual = max(
 The result is clipped by the elected service cap and all cleanup-unproven paid
 rows. The plan carries exact demand, route, service, capacity-graph, reserved
 allocation, accelerator, and pool identity.
+
+Supply preparation precedes the demand correctness boundary. The controller
+may optimistically project the current reserved economic graph before reading
+demand, because that projection authorizes nothing. It then captures one fresh
+durable demand generation, computes the target against the prepared graph, and
+immediately publishes. The publication transaction locks and validates demand
+and route before reconstructing the capacity graph under its normal locks. The
+prepared graph must byte-match that locked reconstruction. Thus neither a stale
+supply projection nor a changed demand report can commit, while reporter
+cadence is no longer forced to outrun fleet-wide projection latency.
 
 A prospective Phase-A debit may cross newer demand receipt generations only
 when the semantic plan itself is unchanged. In the same PostgreSQL transaction
