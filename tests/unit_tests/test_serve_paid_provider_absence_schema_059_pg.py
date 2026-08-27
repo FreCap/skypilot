@@ -27,6 +27,8 @@ _AWS_CENSUS_MIGRATION = importlib.import_module(
     'sky.schemas.db.serve_state.062_aws_paid_provider_census')
 _CURRENT_MIGRATION = importlib.import_module(
     'sky.schemas.db.serve_state.063_aws_paid_replacement_reconciliation')
+_SERVICE_JOB_IO_MIGRATION = importlib.import_module(
+    'sky.schemas.db.serve_state.064_paid_service_job_io_reconciliation')
 
 
 def _function_definition(engine: sqlalchemy.engine.Engine,
@@ -243,13 +245,14 @@ def test_serve059_lineage_and_runtime_metadata() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['063']
+    assert scripts.get_heads() == ['064']
+    assert scripts.get_revision('064').down_revision == '063'
     assert scripts.get_revision('063').down_revision == '062'
     assert scripts.get_revision('062').down_revision == '061'
     assert scripts.get_revision('061').down_revision == '060'
     assert scripts.get_revision('060').down_revision == '059'
     assert scripts.get_revision('059').down_revision == '058'
-    assert migration_utils.SERVE_VERSION == '063'
+    assert migration_utils.SERVE_VERSION == '064'
     assert migration_utils.serve_target_version(sqlite) == '037'
     assert (_CURRENT_MIGRATION._ASSOCIATION_PROFILE_SOURCE ==
             _GCP_REPLACEMENT_MIGRATION._ASSOCIATION_PROFILE_REPLACEMENT)
@@ -265,7 +268,7 @@ def test_serve059_lineage_and_runtime_metadata() -> None:
         ordinary_launch_binding.ordinary_launch_associations_table.constraints
         if item.name == _MIGRATION._PROJECTION_CONSTRAINT)
     assert _compact(str(constraint.sqltext)) == _compact(
-        _CURRENT_MIGRATION._PROJECTION_CHECK)
+        _SERVICE_JOB_IO_MIGRATION._PROJECTION_CHECK)
     paid_pool_constraint = next(
         item for item in
         ordinary_launch_binding.ordinary_launch_associations_table.constraints
@@ -558,21 +561,25 @@ def test_serve063_migrates_aws_replacement_database_gates(
 
     assert migration_utils.get_current_alembic_revision(
         empty_postgres, migration_utils.SERVE_DB_NAME) == '063'
-    assert _compact(
-        _constraint_definition(
-            empty_postgres,
-            _CURRENT_MIGRATION._PROJECTION_CONSTRAINT)) == _compact(
-                _CURRENT_MIGRATION._PROJECTION_CHECK)
-    assert _compact(
-        _constraint_definition(
-            empty_postgres,
-            _CURRENT_MIGRATION._PAID_POOL_SCOPE_CONSTRAINT)) == _compact(
-                _CURRENT_MIGRATION._PAID_POOL_SCOPE_CHECK)
-    assert _compact(
-        _constraint_definition(
-            empty_postgres,
-            _CURRENT_MIGRATION._PAID_RECEIPT_SCOPE_CONSTRAINT)) == _compact(
-                _CURRENT_MIGRATION._PAID_RECEIPT_SCOPE_CHECK)
+    projection_constraint = _constraint_definition(
+        empty_postgres, _CURRENT_MIGRATION._PROJECTION_CONSTRAINT)
+    # PostgreSQL canonicalizes the JSON/regex expression and may render the
+    # phase equality with extra casts or parentheses.  Assert the frozen 063
+    # semantic boundary here; revision 064 separately proves its expansion.
+    assert 'PROVIDER_IO' in projection_constraint
+    assert 'SERVICE_JOB_IO' not in projection_constraint
+    assert 'aws_account_id' in projection_constraint
+    paid_pool_scope = _constraint_definition(
+        empty_postgres, _CURRENT_MIGRATION._PAID_POOL_SCOPE_CONSTRAINT)
+    for fragment in ('UNKNOWN_CAPACITY_REPLACEMENT', 'aws', 'gcp',
+                     'aws_account_id'):
+        assert fragment in paid_pool_scope
+    paid_receipt_scope = _constraint_definition(
+        empty_postgres, _CURRENT_MIGRATION._PAID_RECEIPT_SCOPE_CONSTRAINT)
+    for fragment in ('UNKNOWN_CAPACITY_REPLACEMENT',
+                     'aws-client-token-instance-presence-v1', 'aws_account_id',
+                     'client_token'):
+        assert fragment in paid_receipt_scope
     assert _CURRENT_MIGRATION._ASSOCIATION_PROFILE_REPLACEMENT in (
         _function_definition(empty_postgres,
                              _CURRENT_MIGRATION._ASSOCIATION_GUARD_FUNCTION))
@@ -584,6 +591,59 @@ def test_serve063_migrates_aws_replacement_database_gates(
         alembic_command.downgrade(config, '062')
     assert migration_utils.get_current_alembic_revision(
         empty_postgres, migration_utils.SERVE_DB_NAME) == '063'
+
+
+def test_serve064_migrates_only_paid_provider_backed_phase_guards(
+        empty_postgres) -> None:
+    config = migration_utils.get_alembic_config(empty_postgres,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '063')
+
+    old_association_guard = _function_definition(
+        empty_postgres, _SERVICE_JOB_IO_MIGRATION._ASSOCIATION_GUARD_FUNCTION)
+    old_replica_guard = _function_definition(
+        empty_postgres, _SERVICE_JOB_IO_MIGRATION._REPLICA_GUARD_FUNCTION)
+    for source in (_SERVICE_JOB_IO_MIGRATION._ASSOCIATION_OLD_PHASE_SOURCE,
+                   _SERVICE_JOB_IO_MIGRATION._ASSOCIATION_NEW_PHASE_SOURCE):
+        assert source in old_association_guard
+    assert _SERVICE_JOB_IO_MIGRATION._REPLICA_PHASE_SOURCE in old_replica_guard
+
+    alembic_command.upgrade(config, '064')
+
+    assert migration_utils.get_current_alembic_revision(
+        empty_postgres, migration_utils.SERVE_DB_NAME) == '064'
+    constraint_definition = _constraint_definition(
+        empty_postgres, _SERVICE_JOB_IO_MIGRATION._PROJECTION_CONSTRAINT)
+    assert 'PROVIDER_IO' in constraint_definition
+    assert 'SERVICE_JOB_IO' in constraint_definition
+    new_association_guard = _function_definition(
+        empty_postgres, _SERVICE_JOB_IO_MIGRATION._ASSOCIATION_GUARD_FUNCTION)
+    new_replica_guard = _function_definition(
+        empty_postgres, _SERVICE_JOB_IO_MIGRATION._REPLICA_GUARD_FUNCTION)
+    for replacement in (
+            _SERVICE_JOB_IO_MIGRATION._ASSOCIATION_OLD_PHASE_REPLACEMENT,
+            _SERVICE_JOB_IO_MIGRATION._ASSOCIATION_NEW_PHASE_REPLACEMENT):
+        assert replacement in new_association_guard
+    assert (_SERVICE_JOB_IO_MIGRATION._REPLICA_PHASE_REPLACEMENT
+            in new_replica_guard)
+    with empty_postgres.connect() as connection:
+        assert _paid_shape_is_accepted(
+            connection,
+            expression=_SERVICE_JOB_IO_MIGRATION._PROJECTION_CHECK,
+            effect_phase='PROVIDER_IO')
+        assert _paid_shape_is_accepted(
+            connection,
+            expression=_SERVICE_JOB_IO_MIGRATION._PROJECTION_CHECK,
+            effect_phase='SERVICE_JOB_IO')
+        assert not _paid_shape_is_accepted(
+            connection,
+            expression=_SERVICE_JOB_IO_MIGRATION._PROJECTION_CHECK,
+            effect_phase='NOT_STARTED')
+
+    with pytest.raises(RuntimeError, match='Serve064 is forward-only'):
+        alembic_command.downgrade(config, '063')
+    assert migration_utils.get_current_alembic_revision(
+        empty_postgres, migration_utils.SERVE_DB_NAME) == '064'
 
 
 def test_serve063_accepts_only_exact_aws_spot_replacement_evidence(

@@ -550,10 +550,15 @@ def test_aws_client_token_absence_evidence_is_canonical() -> None:
     assert len(digest) == 64
 
 
+@pytest.mark.parametrize('profile_kind', [
+    ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+    ordinary_launch_binding.NonPoolLaunchProfileKind.
+    UNKNOWN_CAPACITY_REPLACEMENT
+])
 def test_aws_paid_present_cleanup_terminates_only_exact_instance_ids(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    context = _context(
-        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID)
+        monkeypatch: pytest.MonkeyPatch,
+        profile_kind: ordinary_launch_binding.NonPoolLaunchProfileKind) -> None:
+    context = _context(profile_kind)
     identity = {
         'aws_account_id': '096766144388',
         'credential_profile': 'prod',

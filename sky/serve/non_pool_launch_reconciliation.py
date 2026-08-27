@@ -849,8 +849,8 @@ def terminate_aws_paid_provider_allocation(
     continue_guard: Callable[[], bool] | None = None,
 ) -> ProviderObservation:
     """Terminate exact client-token EC2 instances and prove fresh absence."""
-    if (context.profile.kind is not ordinary_launch_binding.
-            NonPoolLaunchProfileKind.ORDINARY_PAID or not request_postgres.
+    if (not ordinary_launch_binding.is_paid_provider_reconciliation_profile(
+            context.profile.kind) or not request_postgres.
             bound_non_pool_provider_present_cleanup_is_authorized(
                 context, authority)):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(

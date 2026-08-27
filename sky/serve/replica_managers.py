@@ -2251,8 +2251,7 @@ class _ReplicaDrainTracker:
         self._seen = False
         self._unknown_tainted = False
         self._session: str | None = None
-        self._seed_from_existing_report(seed_report,
-                                        seed_report_captured_at)
+        self._seed_from_existing_report(seed_report, seed_report_captured_at)
 
     def _seed_from_existing_report(
         self,
@@ -2288,8 +2287,7 @@ class _ReplicaDrainTracker:
          session) = report
         if routing_urls is None or not isinstance(session, str) or not session:
             return
-        if (checked_at - received_at
-                > _IN_FLIGHT_REPORT_STALENESS_SECONDS):
+        if (checked_at - received_at > _IN_FLIGHT_REPORT_STALENESS_SECONDS):
             return
         url = self._replica_url
         if (url not in routing_urls and url not in unknown_urls and
@@ -4541,8 +4539,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                                  if isinstance(pool_key, str) else None)
                 shape_matches = bool(
                     isinstance(pool_identity, Mapping) and
-                    pool_identity.get('cloud') == 'gcp' and
+                    pool_identity.get('cloud') in ('aws', 'gcp') and
                     pool_identity.get('use_spot') is True and
+                    ordinary_launch_binding.
+                    paid_provider_reconciliation_pool_shape_matches(
+                        cleanup_context.profile.kind, pool_key) and
                     info.paid_capacity_pool_key == pool_key and
                     info.is_spot is True and info.is_zero_cost is False and
                     info.reserved_fill is False)
@@ -13211,10 +13212,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # required seen-then-clean seed.
         retirement_wave_seed_report = self._lb_in_flight_report
         retirement_wave_seed_captured_at = time.monotonic()
-        retirement_wave_acknowledged_urls = (
-            _fresh_lb_acknowledged_route_urls(
-                retirement_wave_seed_report,
-                retirement_wave_seed_captured_at))
+        retirement_wave_acknowledged_urls = (_fresh_lb_acknowledged_route_urls(
+            retirement_wave_seed_report, retirement_wave_seed_captured_at))
         retirement_wave_route_urls = {}
         if retirement_wave_acknowledged_urls:
             retirement_wave_route_urls = (
@@ -13249,8 +13248,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             if requires_idle_proof:
                 expected_route_url = retirement_wave_route_urls.get(
                     info.replica_id)
-                if (expected_route_url is None or expected_route_url not in
-                        retirement_wave_acknowledged_urls):
+                if (expected_route_url is None or expected_route_url
+                        not in retirement_wave_acknowledged_urls):
                     # Route revocation is only safe after the active LB session
                     # has acknowledged this exact current lease. In
                     # particular, a route re-added after positive demand may
@@ -13289,8 +13288,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     deadline=math.inf,
                     replica_url=record['route_url'],
                     seed_report=retirement_wave_seed_report,
-                    seed_report_captured_at=(
-                        retirement_wave_seed_captured_at))
+                    seed_report_captured_at=(retirement_wave_seed_captured_at))
             else:
                 try:
                     self._terminate_replica(info.replica_id,

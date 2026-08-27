@@ -590,7 +590,12 @@ def _prepare_paid_provider_absence_graph(
     explicit_cancel: bool = False,
     profile_kind: ordinary_launch_binding.NonPoolLaunchProfileKind = (
         ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID),
+    effect_phase: ordinary_launch_binding.EffectPhase = (
+        ordinary_launch_binding.EffectPhase.PROVIDER_IO),
 ) -> _PaidProviderAbsenceGraph:
+    if not ordinary_launch_binding.is_paid_provider_reconciliation_phase(
+            effect_phase):
+        raise ValueError('Test graph requires a paid reconciliation phase.')
     engine, _ = bound_request_database
     if pool_key is None:
         pool_key = _gc_paid_pool_key()
@@ -805,6 +810,15 @@ def _prepare_paid_provider_absence_graph(
                 association.c.association_id == context.association_id).values(
                     effect_phase=(
                         ordinary_launch_binding.EffectPhase.PROVIDER_IO.value),
+                    effect_phase_changed_at=(sqlalchemy.func.clock_timestamp()),
+                    owner_revision=association.c.owner_revision + 1,
+                    updated_at=sqlalchemy.func.clock_timestamp()))
+        if effect_phase is ordinary_launch_binding.EffectPhase.SERVICE_JOB_IO:
+            connection.execute(
+                sqlalchemy.update(association).where(
+                    association.c.association_id == context.association_id).
+                values(
+                    effect_phase=effect_phase.value,
                     effect_phase_changed_at=(sqlalchemy.func.clock_timestamp()),
                     owner_revision=association.c.owner_revision + 1,
                     updated_at=sqlalchemy.func.clock_timestamp()))
@@ -2935,15 +2949,121 @@ def test_paid_provider_negative_ack_projects_and_releases_debits_atomically(
     assert pool['last_failure_at'] is not None
 
 
+@pytest.mark.parametrize('effect_phase', [
+    ordinary_launch_binding.EffectPhase.PROVIDER_IO,
+    ordinary_launch_binding.EffectPhase.SERVICE_JOB_IO
+])
+def test_aws_paid_exact_identity_covers_provider_backed_phases(
+        bound_request_database, monkeypatch,
+        effect_phase: ordinary_launch_binding.EffectPhase) -> None:
+    graph = _prepare_paid_provider_absence_graph(bound_request_database,
+                                                 monkeypatch,
+                                                 effect_phase=effect_phase)
+
+    identity = request_postgres.bound_non_pool_aws_provider_identity(
+        graph.context, graph.authority)
+
+    assert identity == {
+        'aws_account_id': '123456789012',
+        'client_token': ordinary_launch_binding.ordinary_paid_aws_client_token(
+            graph.context),
+        'cluster_name_on_cloud': _gc_cloud_cluster_name(),
+        'credential_profile': None,
+        'instance_type': 'g6.xlarge',
+        'num_nodes': 1,
+        'region': 'us-east-1',
+        'use_spot': True,
+        'workspace': 'workspace-a',
+        'zone': 'us-east-1a',
+    }
+
+
+def test_aws_negative_ack_does_not_settle_service_job_io(
+        bound_request_database, monkeypatch) -> None:
+    graph = _prepare_paid_provider_absence_graph(
+        bound_request_database,
+        monkeypatch,
+        effect_phase=ordinary_launch_binding.EffectPhase.SERVICE_JOB_IO)
+
+    assert request_postgres.bound_non_pool_terminal_provider_absence_payload(
+        graph.context, graph.authority) is None
+    assert request_postgres.bound_non_pool_aws_provider_identity(
+        graph.context, graph.authority) is not None
+
+
+@pytest.mark.parametrize('profile_kind', [
+    ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+    ordinary_launch_binding.NonPoolLaunchProfileKind.
+    UNKNOWN_CAPACITY_REPLACEMENT
+])
+@pytest.mark.parametrize('effect_phase', [
+    ordinary_launch_binding.EffectPhase.PROVIDER_IO,
+    ordinary_launch_binding.EffectPhase.SERVICE_JOB_IO
+])
+def test_aws_paid_exact_presence_authorizes_only_immediate_cleanup(
+        bound_request_database, monkeypatch,
+        profile_kind: ordinary_launch_binding.NonPoolLaunchProfileKind,
+        effect_phase: ordinary_launch_binding.EffectPhase) -> None:
+    graph = _prepare_paid_provider_absence_graph(bound_request_database,
+                                                 monkeypatch,
+                                                 profile_kind=profile_kind,
+                                                 effect_phase=effect_phase)
+    identity = request_postgres.bound_non_pool_aws_provider_identity(
+        graph.context, graph.authority)
+    assert identity is not None
+    payload = {
+        'association_id': str(graph.context.association_id),
+        'cluster_name': 'gc-service-3',
+        'instances': [{
+            'availability_zone': identity['zone'],
+            'client_token': identity['client_token'],
+            'cluster_name_on_cloud': identity['cluster_name_on_cloud'],
+            'instance_id': 'i-0123456789abcdef0',
+            'instance_type': identity['instance_type'],
+            'market': 'spot',
+            'state': 'running',
+        }],
+        'probe_contract': 'aws-client-token-instance-presence-v1',
+        'profile_kind': profile_kind.value,
+        'provider_identity': identity,
+        'replica_record_id': str(_GC_REPLICA_RECORD_ID),
+        'result': 'PRESENT',
+    }
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        graph.context, graph.authority,
+        ordinary_launch_binding.ProviderEvidence.PRESENT, payload)
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    manager._service_name = 'gc-service'
+    manager._ordinary_launch_binding_authority = graph.authority
+    assert request_postgres.authorize_bound_non_pool_provider_present_cleanup(
+        graph.context,
+        graph.authority,
+        project_replica_result=lambda connection, projection: manager.
+        _project_bound_ordinary_launch(None, connection, projection))
+    info = serve_state.get_replica_info_from_id('gc-service', 3)
+    assert info is not None
+    assert ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+        info, require_scheduled=True)
+    assert request_postgres.bound_non_pool_provider_present_cleanup_is_authorized(
+        graph.context, graph.authority)
+
+
 @pytest.mark.parametrize('production_http_normalization', [False, True])
+@pytest.mark.parametrize('effect_phase', [
+    ordinary_launch_binding.EffectPhase.PROVIDER_IO,
+    ordinary_launch_binding.EffectPhase.SERVICE_JOB_IO
+])
 def test_gcp_paid_exact_label_absence_projects_and_releases_debits_atomically(
         bound_request_database, monkeypatch,
-        production_http_normalization: bool) -> None:
+        production_http_normalization: bool,
+        effect_phase: ordinary_launch_binding.EffectPhase) -> None:
     graph = _prepare_paid_provider_absence_graph(
         bound_request_database,
         monkeypatch,
         pool_key=_gc_gcp_paid_pool_key(),
-        production_http_normalization=production_http_normalization)
+        production_http_normalization=production_http_normalization,
+        effect_phase=effect_phase)
     identity = request_postgres.bound_non_pool_gcp_provider_identity(
         graph.context, graph.authority)
     assert identity == {
@@ -3264,14 +3384,20 @@ def test_gcp_paid_provider_identity_uses_frozen_region_for_project(
 
 
 @pytest.mark.parametrize('production_http_normalization', [False, True])
+@pytest.mark.parametrize('effect_phase', [
+    ordinary_launch_binding.EffectPhase.PROVIDER_IO,
+    ordinary_launch_binding.EffectPhase.SERVICE_JOB_IO
+])
 def test_gcp_paid_exact_presence_authorizes_only_immediate_cleanup(
         bound_request_database, monkeypatch,
-        production_http_normalization: bool) -> None:
+        production_http_normalization: bool,
+        effect_phase: ordinary_launch_binding.EffectPhase) -> None:
     graph = _prepare_paid_provider_absence_graph(
         bound_request_database,
         monkeypatch,
         pool_key=_gc_gcp_paid_pool_key(),
-        production_http_normalization=production_http_normalization)
+        production_http_normalization=production_http_normalization,
+        effect_phase=effect_phase)
     identity = request_postgres.bound_non_pool_gcp_provider_identity(
         graph.context, graph.authority)
     assert identity is not None
