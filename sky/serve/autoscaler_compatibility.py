@@ -1,8 +1,273 @@
 """Pure exact-card compatibility policy for Serve autoscalers."""
+import dataclasses
+import math
 import typing
 
 if typing.TYPE_CHECKING:
     from sky.serve import replica_managers
+
+
+@dataclasses.dataclass(frozen=True)
+class DeadlineDemand:
+    """One queue bucket with one dispatch deadline and routing class."""
+
+    priority: int
+    compatible_cards: tuple[str, ...]
+    count: int
+    remaining_seconds: float
+
+
+@dataclasses.dataclass(frozen=True)
+class DeadlineSupply:
+    """One finite or prospective logical GPU slot in economic tier order."""
+
+    card: str
+    available_after_seconds: float
+    tier: int
+
+
+@dataclasses.dataclass(frozen=True)
+class DeadlineCapacityPlan:
+    """Integer card target and queue work that no timely slot can rescue."""
+
+    target_by_card: dict[str, int]
+    infeasible_requests_by_priority: dict[int, float]
+
+
+@dataclasses.dataclass
+class _ActiveDeadlineSlot:
+    card: str
+    available_after_seconds: float
+
+
+def _allocate_deadline_capacity_target(
+    *,
+    configured_cards: list[str],
+    demand: list[DeadlineDemand],
+    finite_supply: list[DeadlineSupply],
+    paid_cold_order: list[str],
+    service_seconds_by_card: dict[str, float],
+    utilization: float,
+    paid_cold_lead_seconds: float,
+    max_slots: int,
+) -> DeadlineCapacityPlan:
+    """Allocate cumulative capacity-time without reusing one GPU-second.
+
+    Supply is activated lazily.  This is important when a service already has
+    more ready slots than its deadline needs: the target is the smallest
+    compatible subset, rather than the entire sunk fleet.  Finite supply is
+    ordered by its caller-assigned economic tier; prospective paid capacity is
+    considered only after every timely finite alternative.
+    """
+    epsilon = 1e-9
+    canonical = {card.casefold(): card for card in configured_cards}
+    prospective_cold_order = []
+    for raw_card in paid_cold_order:
+        card = canonical.get(raw_card.casefold())
+        if card is not None and card not in prospective_cold_order:
+            prospective_cold_order.append(card)
+    card_order = prospective_cold_order + [
+        card for card in configured_cards if card not in prospective_cold_order
+    ]
+    cold_rank = {card: index for index, card in enumerate(card_order)}
+    duration = {
+        canonical[raw_card.casefold()]: float(seconds)
+        for raw_card, seconds in service_seconds_by_card.items()
+        if raw_card.casefold() in canonical and
+        isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and
+        math.isfinite(seconds) and seconds > 0
+    }
+    if (not 0 < utilization <= 1 or max_slots <= 0 or not configured_cards or
+            not duration):
+        invalid_infeasible: dict[int, float] = {}
+        for item in demand:
+            if item.count > 0:
+                invalid_infeasible[item.priority] = (
+                    invalid_infeasible.get(item.priority, 0.0) + item.count)
+        return DeadlineCapacityPlan({}, invalid_infeasible)
+
+    def _valid_supply(item: DeadlineSupply) -> bool:
+        available = item.available_after_seconds
+        return (item.card.casefold() in canonical and
+                canonical[item.card.casefold()] in duration and
+                isinstance(available,
+                           (int, float)) and not isinstance(available, bool) and
+                math.isfinite(available) and available >= 0)
+
+    pending_supply = [item for item in finite_supply if _valid_supply(item)]
+    pending_supply.sort(key=lambda item: (
+        item.tier, item.available_after_seconds,
+        cold_rank.get(canonical[item.card.casefold()], len(cold_rank))))
+    active: list[_ActiveDeadlineSlot] = []
+    target = {card: 0 for card in configured_cards}
+    infeasible: dict[int, float] = {}
+
+    grouped: dict[tuple[int, float, tuple[str, ...]], int] = {}
+    for item in demand:
+        if (not isinstance(item.count, int) or isinstance(item.count, bool) or
+                item.count <= 0 or not isinstance(item.remaining_seconds,
+                                                  (int, float)) or
+                isinstance(item.remaining_seconds, bool) or
+                not math.isfinite(item.remaining_seconds)):
+            continue
+        requested = {
+            canonical[card.casefold()]
+            for card in item.compatible_cards
+            if card.casefold() in canonical
+        }
+        compatible = tuple(card for card in card_order
+                           if card in requested and card in duration)
+        if not compatible:
+            infeasible[item.priority] = (infeasible.get(item.priority, 0.0) +
+                                         item.count)
+            continue
+        key = (int(item.priority), max(0.0, float(item.remaining_seconds)),
+               compatible)
+        grouped[key] = grouped.get(key, 0) + item.count
+
+    def _slot_capacity(slot: _ActiveDeadlineSlot, deadline: float) -> float:
+        return max(0.0, deadline - slot.available_after_seconds) * (
+            utilization / duration[slot.card])
+
+    def _consume(slot: _ActiveDeadlineSlot, deadline: float,
+                 remaining: float) -> float:
+        capacity = _slot_capacity(slot, deadline)
+        used = min(remaining, capacity)
+        slot.available_after_seconds += used * duration[slot.card] / utilization
+        return remaining - used
+
+    def _finite_fallback_key(compatible: tuple[str, ...],
+                             deadline: float) -> tuple[int, int]:
+        options = sorted(
+            (item.tier,
+             cold_rank.get(canonical[item.card.casefold()], len(cold_rank)))
+            for item in pending_supply
+            if canonical[item.card.casefold()] in compatible and
+            item.available_after_seconds < deadline)
+        options.extend((1 << 20, cold_rank[card]) for card in compatible)
+        if len(options) > 1:
+            return options[1]
+        if options:
+            return options[0]
+        return 1 << 21, len(cold_rank)
+
+    def _profile_scarcity_key(compatible: tuple[str, ...],
+                              deadline: float) -> tuple[int, tuple[int, int]]:
+        return -len(compatible), _finite_fallback_key(compatible, deadline)
+
+    priorities = sorted({key[0] for key in grouped}, reverse=True)
+    for priority in priorities:
+        deadlines = sorted({key[1] for key in grouped if key[0] == priority})
+        for deadline in deadlines:
+            pending = [
+                (compatible, float(count))
+                for (item_priority, item_deadline,
+                     compatible), count in grouped.items()
+                if item_priority == priority and item_deadline == deadline
+            ]
+            while pending:
+                # Fewer compatible card types is the primary scarcity proof;
+                # an exact A100 bucket must own A100 before an A100-or-L4
+                # bucket even when several A100 slots make their immediate
+                # supply keys tie.  The worse second-best supply option then
+                # breaks equal-width profiles.  Exact ties retain report
+                # order.
+                selected_index = max(range(len(pending)),
+                                     key=lambda index: _profile_scarcity_key(
+                                         pending[index][0], deadline))
+                compatible, remaining = pending.pop(selected_index)
+
+                # Reuse activated capacity before materializing another slot.
+                # Larger remaining budgets go first so a partially used slot
+                # does not force an otherwise avoidable new target unit.
+                compatible_active = [
+                    slot for slot in active if slot.card in compatible
+                ]
+                for slot in sorted(
+                        compatible_active,
+                        key=lambda slot: _slot_capacity(slot, deadline),
+                        reverse=True):
+                    remaining = _consume(slot, deadline, remaining)
+                    if remaining <= epsilon:
+                        break
+
+                while remaining > epsilon and sum(target.values()) < max_slots:
+                    selected_supply_index = next(
+                        (index
+                         for index, supply_item in enumerate(pending_supply)
+                         if canonical[supply_item.card.casefold()] in compatible
+                         and supply_item.available_after_seconds < deadline),
+                        None)
+                    if selected_supply_index is not None:
+                        supply_item = pending_supply.pop(selected_supply_index)
+                        card = canonical[supply_item.card.casefold()]
+                        slot = _ActiveDeadlineSlot(
+                            card, float(supply_item.available_after_seconds))
+                    else:
+                        card = next((card for card in prospective_cold_order
+                                     if card in compatible), None)
+                        if (card is None or
+                                paid_cold_lead_seconds >= deadline or
+                                not math.isfinite(paid_cold_lead_seconds)):
+                            break
+                        slot = _ActiveDeadlineSlot(
+                            card, max(0.0, paid_cold_lead_seconds))
+                    if _slot_capacity(slot, deadline) <= epsilon:
+                        continue
+                    active.append(slot)
+                    target[slot.card] += 1
+                    remaining = _consume(slot, deadline, remaining)
+
+                if remaining > epsilon:
+                    infeasible[priority] = (infeasible.get(priority, 0.0) +
+                                            remaining)
+                    # A deadline that cold capacity can no longer meet is
+                    # still real queued work.  Recover it through the same
+                    # bounded target rather than making mathematical
+                    # infeasibility suppress every launch.  One slot per
+                    # residual request matches the existing raw concurrency
+                    # ceiling; max_slots and the caller's paid/provider fences
+                    # remain authoritative.  Debit the assigned request so a
+                    # later bucket cannot reuse its GPU-time.
+                    while (remaining > epsilon and
+                           sum(target.values()) < max_slots):
+                        selected_supply_index = next(
+                            (index
+                             for index, supply_item in enumerate(pending_supply)
+                             if canonical[supply_item.card.casefold()] in
+                             compatible), None)
+                        if selected_supply_index is not None:
+                            supply_item = pending_supply.pop(
+                                selected_supply_index)
+                            card = canonical[supply_item.card.casefold()]
+                            slot = _ActiveDeadlineSlot(
+                                card,
+                                float(supply_item.available_after_seconds))
+                        else:
+                            card = next((card for card in prospective_cold_order
+                                         if card in compatible), None)
+                            if card is None:
+                                break
+                            slot = _ActiveDeadlineSlot(
+                                card, (max(0.0, paid_cold_lead_seconds)
+                                       if math.isfinite(paid_cold_lead_seconds)
+                                       else float('inf')))
+                        active.append(slot)
+                        target[slot.card] += 1
+                        assigned = min(1.0, remaining)
+                        slot.available_after_seconds += (assigned *
+                                                         duration[slot.card] /
+                                                         utilization)
+                        remaining -= assigned
+
+    return DeadlineCapacityPlan(
+        {
+            card: count for card, count in target.items() if count > 0
+        }, {
+            priority: count
+            for priority, count in infeasible.items()
+            if count > epsilon
+        })
 
 
 def _allocate_compatibility_target(

@@ -1349,6 +1349,12 @@ def test_empty_fleet_records_compatibility_demand_before_admission():
             'compatible_accelerators': ['A100'],
             'count': 1,
         }]
+        assert lb._request_queue_deadline_profiles() == [{
+            'priority': 50,
+            'compatible_accelerators': ['A100'],
+            'remaining_seconds': 0,
+            'count': 1,
+        }]
         proxy.cancel()
         with pytest.raises(asyncio.CancelledError):
             await proxy

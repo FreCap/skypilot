@@ -484,11 +484,68 @@ its existing typed profiles; it does not create one queue per accelerator. It:
 - minimizes new paid Spot after reserved and already-committed compatible
   capacity, while retaining the existing no-on-demand and paid-cap fences.
 
-A bounded aggregate implementation using current queue reports is a localized
-autoscaler change. The complete form requires request-age buckets plus
-per-card service-time and ready-time observations across LB demand protocol,
-autoscaling, persistence, UI, and load tests. It is an implementation phase,
-not part of the already-deployed proof.
+The queue report carries bounded remaining-deadline buckets rather than a
+second scheduling queue.  Each bucket contains only priority, the exact
+compatible-card set, a conservative remaining-seconds lower bound, and a
+count.  Counts must cover the complete queue exactly under the same routing
+version and accelerator catalog as the existing compatibility gauges.  The
+load balancer derives the deadline from the request's actual queue timeout and
+floors remaining time to a fixed bucket; PostgreSQL receipt time subtracts
+transport/report age before the autoscaler consumes it.  Missing, partial,
+saturated, mixed-catalog, or adjacent-version deadline telemetry cannot
+authorize the capacity-time planner: it falls back to the existing raw safe
+queue target without creating a second current policy.
+
+For each decision tick the planner consumes one immutable supply curve:
+
+1. ready zero-cost slots, with busy slots delayed by their observed in-flight
+   work;
+2. committed zero-cost slots with a launch-age-adjusted ready estimate;
+3. free reserved slots with the conservative cold-start estimate;
+4. already-running and committed paid Spot slots; and
+5. prospective paid Spot slots in the placer's current cost order.
+
+The first four tiers are finite.  The fifth remains bounded by
+``max_replicas`` and ``max_live_paid_gpu_units`` and is still subject to the
+PostgreSQL paid-admission and provider-policy fences.  Within a priority the
+planner satisfies earlier deadlines first and protects the compatibility
+profile with the worst alternative before flexible profiles.  A slot's useful
+budget is continuous capacity-time, ``max(0, D - eta) * utilization``; the
+published target is an integer count of slots and every partial final slot is
+rounded up.  Capacity assigned to a higher-priority or earlier-deadline bucket
+is debited from later buckets, so the same GPU-second cannot satisfy two
+requests.
+
+Successful service time is read from the existing PostgreSQL asynchronous
+request ledger, grouped by selected worker service version and exact projected
+accelerator.  A bounded conservative quantile replaces the configured seed
+only after the existing minimum sample and freshness gates.  No new database,
+filesystem, EFS volume, or per-request mutable state is introduced.  Legacy or
+non-ledger completions continue to inform the aggregate estimator; a card with
+insufficient exact evidence uses the configured service-duration seed.  A
+committed replica's ETA is the measured conservative launch-to-ready lead minus
+its durable launch age, floored at zero.
+
+The planner publishes, in the existing autoscaler projection, the chosen
+target by card, demand seconds by deadline/priority, estimator source and
+freshness, and infeasible request counts.  ``infeasible`` means no capacity
+that can become available before that bucket's remaining deadline can rescue
+it; it never means the SLA was met.  Infeasibility does not suppress scaling:
+the residual is assigned best-effort through the same economic order, up to
+the existing raw-concurrency target, ``max_replicas``, paid-admission, and
+provider-policy ceilings.  This preserves recovery for a cold burst whose SLA
+is shorter than its measured provisioning lead while making the inevitable
+miss visible instead of representing that launch as SLA-compliant.
+
+This replaces the uniform cold-lead queue calculation whenever the elected
+load balancers provide a complete current deadline gauge; it is not an
+operator-selectable second scaler.  Standard N-1/N-2 compatibility is
+permanent: an adjacent-version report that lacks the additive deadline field
+takes only the existing bounded raw-target calculation, while a complete
+current report has exactly one capacity-time result.  Request-age buckets,
+exact-card service-time reads, ready-time observations, autoscaler/UI
+projection, and bounded load tests are therefore one implementation phase and
+are not part of the already-deployed proof recorded above.
 
 ### Paid residual
 

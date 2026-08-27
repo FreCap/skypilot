@@ -126,6 +126,7 @@ class _RequestQueueWaiter:
     priority: int
     sequence: int
     future: asyncio.Future
+    deadline_monotonic: float = 0.0
     granted: bool = False
     consumed: bool = False
     abandoned: bool = False
@@ -1589,6 +1590,46 @@ class SkyServeLoadBalancer:
              tuple(sorted(order.get(card, len(order)) for card in item[0][1]))))
                ]
 
+    def _request_queue_deadline_profiles(
+            self,
+            observed_monotonic: float | None = None) -> list[dict[str, Any]]:
+        """Return exact queue classes with conservative remaining deadlines."""
+        configured = self._configured_accelerators
+        if configured is None:
+            return []
+        if observed_monotonic is None:
+            observed_monotonic = time.monotonic()
+        order = {card: index for index, card in enumerate(configured)}
+        bucket_seconds = constants.LB_REQUEST_DEADLINE_BUCKET_SECONDS
+        grouped: dict[tuple[int, frozenset[str], int], int] = {}
+        for priority, bucket in self._request_queue_waiters_for_instance(
+        ).items():
+            for waiter in bucket.values():
+                if waiter.abandoned:
+                    continue
+                compatible = getattr(waiter.request, _REQUEST_ACCELERATORS_ATTR,
+                                     None)
+                cards = frozenset(
+                    compatible if compatible is not None else configured)
+                remaining = max(0.0,
+                                waiter.deadline_monotonic - observed_monotonic)
+                remaining_bucket = int(
+                    remaining // bucket_seconds) * bucket_seconds
+                key = (priority, cards, remaining_bucket)
+                grouped[key] = grouped.get(key, 0) + 1
+        return [{
+            'priority': priority,
+            'compatible_accelerators': sorted(
+                cards, key=lambda card: order.get(card, len(order))),
+            'remaining_seconds': remaining,
+            'count': count,
+        } for (priority, cards, remaining), count in sorted(
+            grouped.items(),
+            key=lambda item:
+            (-item[0][0], item[0][2],
+             tuple(sorted(order.get(card, len(order)) for card in item[0][1]))))
+               ]
+
     def _record_request_demand_once(self, request: fastapi.Request) -> None:
         """Commit one legacy/accepted demand event for this LB request."""
         if vars(request).get(_REQUEST_DEMAND_RECORDED_ATTR, False):
@@ -1853,6 +1894,7 @@ class SkyServeLoadBalancer:
                     request=request,
                     priority=priority,
                     sequence=sequence,
+                    deadline_monotonic=deadline,
                     future=asyncio.get_running_loop().create_future())
                 waiters = self._request_queue_waiters_for_instance()
                 waiters.setdefault(priority, {})[sequence] = waiter
@@ -3584,6 +3626,8 @@ class SkyServeLoadBalancer:
             'local_in_flight': self._active_request_count,
             'request_queue_depth': self._waiting_request_count,
             'queued_requests_by_compatibility': self._request_queue_profiles(),
+            'queued_request_deadline_buckets':
+                self._request_queue_deadline_profiles(),
             'rejected_requests_by_compatibility':
                 self._rejected_compatibility_profiles(),
             'in_flight_by_accelerator': self._in_flight_by_accelerator_locked(),
@@ -4218,6 +4262,8 @@ class SkyServeLoadBalancer:
                 'queue_depth': self._queue_depth,
                 'queued_requests_by_compatibility':
                     self._request_queue_profiles(),
+                'queued_request_deadline_buckets':
+                    self._request_queue_deadline_profiles(),
                 'rejected_requests_by_compatibility':
                     self._rejected_compatibility_profiles(),
                 'queue_depth_by_priority':
@@ -4850,12 +4896,14 @@ class SkyServeLoadBalancer:
         prediction = (
             self._request_aggregator.prediction_time_history_snapshot())
         self._demand_report_sequence += 1
+        reporter_observed_at = time.time()
+        reporter_observed_monotonic = time.monotonic()
         payload = {
             **self._ha_role_payload(current_routes_only=True),
             'protocol_version': constants.LB_DEMAND_REPORT_PROTOCOL_VERSION,
             'sequence': self._demand_report_sequence,
             'reporter_session_id': self._request_history_session_id,
-            'reporter_observed_at': time.time(),
+            'reporter_observed_at': reporter_observed_at,
             'demand_window': self._request_aggregator.demand_window_snapshot(),
             'request_history': request_history,
             'request_classification_history': classification,
@@ -4866,6 +4914,9 @@ class SkyServeLoadBalancer:
                 self._request_accelerator_compatibility_version,
             'queue_depth': self._queue_depth,
             'queued_requests_by_compatibility': self._request_queue_profiles(),
+            'queued_request_deadline_buckets':
+                self._request_queue_deadline_profiles(
+                    reporter_observed_monotonic),
             'rejected_requests_by_compatibility':
                 self._rejected_compatibility_profiles(),
             'queue_depth_by_priority': self._queue_depth_priority_snapshot(),

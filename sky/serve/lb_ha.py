@@ -13,6 +13,8 @@ import math
 import time
 from typing import Any
 
+from sky.serve import constants
+
 
 class LbSlot(str, enum.Enum):
     A = 'a'
@@ -391,6 +393,44 @@ class CompatibilityDemand:
 
 
 @dataclasses.dataclass(frozen=True)
+class QueueDeadlineDemand:
+    """One bounded queue class with a remaining dispatch deadline."""
+
+    priority: int
+    compatible_accelerators: tuple[str, ...]
+    remaining_seconds: int
+    count: int
+
+    @classmethod
+    def from_dict(cls, value: Any) -> QueueDeadlineDemand | None:
+        if not isinstance(value, dict):
+            return None
+        compatible = CompatibilityDemand.from_dict(
+            {
+                'priority': value.get('priority'),
+                'compatible_accelerators': value.get('compatible_accelerators'),
+                'count': value.get('count'),
+            },
+            require_timestamp=False)
+        remaining = value.get('remaining_seconds')
+        if (compatible is None or not isinstance(remaining, int) or
+                isinstance(remaining, bool) or remaining < 0 or
+                remaining > constants.LB_REQUEST_DEADLINE_MAX_SECONDS or
+                remaining % constants.LB_REQUEST_DEADLINE_BUCKET_SECONDS != 0):
+            return None
+        return cls(compatible.priority, compatible.compatible_accelerators,
+                   remaining, compatible.count)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'priority': self.priority,
+            'compatible_accelerators': list(self.compatible_accelerators),
+            'remaining_seconds': self.remaining_seconds,
+            'count': self.count,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class DemandSnapshot:
     """Durable scale-down-safe evidence retained across one promotion."""
 
@@ -401,6 +441,7 @@ class DemandSnapshot:
     unknown_in_flight_urls: tuple[str, ...] = ()
     compatibility_profiles: tuple[CompatibilityDemand, ...] = ()
     queued_compatibility_profiles: tuple[CompatibilityDemand, ...] = ()
+    queued_deadline_profiles: tuple[QueueDeadlineDemand, ...] | None = None
     rejected_compatibility_profiles: tuple[CompatibilityDemand, ...] = ()
     rejected_in_recent_window: int = 0
     # Compatibility profiles are meaningful only under the exact routing
@@ -474,6 +515,16 @@ class DemandSnapshot:
             profile for value in raw_queued_profiles
             if (profile := CompatibilityDemand.from_dict(
                 value, require_timestamp=False)) is not None)
+        raw_deadline_profiles = request_data.get(
+            'queued_request_deadline_buckets')
+        queued_deadline_profiles = None
+        if isinstance(raw_deadline_profiles, list):
+            parsed_deadlines = tuple(
+                deadline_profile for value in raw_deadline_profiles
+                if (deadline_profile := QueueDeadlineDemand.from_dict(value)
+                   ) is not None)
+            if len(parsed_deadlines) == len(raw_deadline_profiles):
+                queued_deadline_profiles = parsed_deadlines
         raw_rejected_profiles = request_data.get(
             'rejected_requests_by_compatibility', [])
         if not isinstance(raw_rejected_profiles, list):
@@ -497,6 +548,7 @@ class DemandSnapshot:
                 sorted(value for value in unknown if isinstance(value, str))),
             compatibility_profiles=compatibility_profiles,
             queued_compatibility_profiles=queued_compatibility_profiles,
+            queued_deadline_profiles=queued_deadline_profiles,
             rejected_compatibility_profiles=rejected_compatibility_profiles,
             rejected_in_recent_window=_nonnegative(
                 request_data.get('rejected_in_recent_window')),
@@ -534,6 +586,9 @@ class DemandSnapshot:
                 profile.to_dict()
                 for profile in self.queued_compatibility_profiles
             ],
+            'queued_request_deadline_buckets': ([
+                profile.to_dict() for profile in self.queued_deadline_profiles
+            ] if self.queued_deadline_profiles is not None else None),
             'rejected_requests_by_compatibility': [
                 profile.to_dict()
                 for profile in self.rejected_compatibility_profiles
@@ -569,6 +624,8 @@ class DemandSnapshot:
             'unknown_in_flight_urls': value.get('unknown_in_flight_urls'),
             'queued_requests_by_compatibility':
                 value.get('queued_requests_by_compatibility'),
+            'queued_request_deadline_buckets':
+                value.get('queued_request_deadline_buckets'),
             'rejected_requests_by_compatibility':
                 value.get('rejected_requests_by_compatibility'),
             'routing_version': value.get('routing_version'),
@@ -646,6 +703,17 @@ class DemandSnapshot:
             profile.to_dict() for profile in rejected_profiles.values()
         ]
         merged['queue_depth'] = max(self.queue_depth, current.queue_depth)
+        if (merged['queue_depth'] == current.queue_depth and
+                current.queued_deadline_profiles is not None and
+                sum(profile.count
+                    for profile in current.queued_deadline_profiles)
+                == current.queue_depth):
+            merged['queued_request_deadline_buckets'] = [
+                profile.to_dict()
+                for profile in current.queued_deadline_profiles
+            ]
+        else:
+            merged['queued_request_deadline_buckets'] = None
         merged['rejected_in_window'] = max(self.rejected_in_window,
                                            current.rejected_in_window)
         merged['rejected_in_recent_window'] = max(

@@ -905,6 +905,36 @@ def test_terminal_receipt_is_attempt_fenced_and_idempotent(
         repository.transition(_SERVICE_NAME, _SERVICE_HASH, future_fence)
 
 
+def test_service_time_estimate_uses_recent_exact_card_p75(
+        ledger_database) -> None:
+    engine, publication = ledger_database
+    repository = async_request_ledger.AsyncRequestLedgerRepository(engine)
+    for seconds in range(1, 26):
+        request_id = f'duration-{seconds}'
+        bound = repository.bind(
+            _SERVICE_NAME, _SERVICE_HASH,
+            _bind_payload(publication, request_id=request_id))
+        transition = {
+            'protocol_version': 1,
+            'operation': 'terminal',
+            'request_id': request_id,
+            'intent_sha256': _INTENT,
+            'attempt_id': bound.attempt_id,
+            'attempt_no': bound.attempt_no,
+            'expected_revision': bound.revision,
+            'terminal_status': 'SUCCEEDED',
+            'processing_time_us': seconds * 1_000_000,
+        }
+        repository.transition(_SERVICE_NAME, _SERVICE_HASH, transition)
+
+    estimates = async_request_ledger.get_service_time_estimates(
+        _SERVICE_NAME, _SERVICE_HASH, 1, engine)
+
+    assert estimates['L4']['duration_seconds'] == 19.0
+    assert estimates['L4']['samples'] == 25
+    assert estimates['L4']['observed_at'] > 0
+
+
 def test_shutdown_blocks_bind_and_service_recreation_fences_transitions(
         ledger_database) -> None:
     engine, publication = ledger_database

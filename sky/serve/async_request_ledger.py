@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import dataclasses
+import datetime
 import enum
 import hashlib
 import json
@@ -51,6 +52,88 @@ _KUEUE_ADMISSIONS = kueue_lane_lineage_schema.serve_kueue_admissions_table
 _SCHEMA_AVAILABLE_ENGINES: weakref.WeakKeyDictionary[
     sqlalchemy.engine.Engine, int] = weakref.WeakKeyDictionary()
 _SCHEMA_AVAILABLE_LOCK = threading.Lock()
+
+
+def get_service_time_estimates(
+    service_name: str,
+    service_hash: str,
+    service_version: int,
+    engine: sqlalchemy.engine.Engine | None = None,
+) -> dict[str, dict[str, float | int]]:
+    """Return fresh p75 processing time by exact projected accelerator.
+
+    The dispatch binding already contains both selected worker version and
+    exact card, so this reuses PostgreSQL operational truth without another
+    durable table or an LB-side attribution cache.  Missing or unavailable
+    evidence is an empty map; the autoscaler then uses its configured seed.
+    """
+    if (not isinstance(service_name, str) or not service_name or
+            not isinstance(service_hash, str) or not service_hash or
+            not isinstance(service_version, int) or
+            isinstance(service_version, bool) or service_version < 1):
+        return {}
+    sample_cap = constants.AUTOSCALER_CARD_DURATION_SAMPLE_CAP
+    min_samples = constants.AUTOSCALER_ADAPTIVE_DURATION_MIN_SAMPLES
+    try:
+        repository_engine = _postgres_engine(engine)
+        with repository_engine.connect() as connection:
+            now = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.clock_timestamp())).scalar_one()
+            cutoff = now - datetime.timedelta(
+                seconds=constants.AUTOSCALER_ADAPTIVE_SAMPLE_MAX_AGE_SECONDS)
+            projected_card = _ATTEMPTS.c.dispatch_binding[
+                'projected_accelerator'].as_string()
+            selected_version = _ATTEMPTS.c.dispatch_binding[
+                'selected_worker_service_version'].as_integer()
+            sample_rank = sqlalchemy.func.row_number().over(
+                partition_by=projected_card,
+                order_by=_ATTEMPTS.c.terminal_at.desc()).label('sample_rank')
+            recent_samples = sqlalchemy.select(
+                projected_card.label('projected_accelerator'),
+                _ATTEMPTS.c.processing_time_us, _ATTEMPTS.c.terminal_at,
+                sample_rank).where(_ATTEMPTS.c.service_name == service_name,
+                                   _ATTEMPTS.c.service_hash == service_hash,
+                                   _ATTEMPTS.c.terminal_status == 'SUCCEEDED',
+                                   _ATTEMPTS.c.terminal_at >= cutoff,
+                                   _ATTEMPTS.c.processing_time_us.is_not(None),
+                                   _ATTEMPTS.c.dispatch_binding.is_not(None),
+                                   selected_version == service_version,
+                                   projected_card.is_not(None)).subquery()
+            duration_p75 = sqlalchemy.func.percentile_disc(
+                constants.AUTOSCALER_CARD_DURATION_QUANTILE).within_group(
+                    recent_samples.c.processing_time_us).label('duration_us')
+            estimate_query = sqlalchemy.select(
+                recent_samples.c.projected_accelerator, duration_p75,
+                sqlalchemy.func.count().label('samples'),
+                sqlalchemy.func.max(
+                    recent_samples.c.terminal_at).label('observed_at')).where(
+                        recent_samples.c.sample_rank <= sample_cap)
+            estimate_query = estimate_query.group_by(
+                recent_samples.c.projected_accelerator).having(
+                    sqlalchemy.func.count() >= min_samples)
+            rows = connection.execute(estimate_query).mappings().all()
+    except (AsyncRequestLedgerUnavailable, RuntimeError,
+            sqlalchemy.exc.SQLAlchemyError, ValueError):
+        return {}
+    result: dict[str, dict[str, float | int]] = {}
+    for row in rows:
+        card = row['projected_accelerator']
+        micros = row['duration_us']
+        sample_count = row['samples']
+        observed_at = row['observed_at']
+        if (not isinstance(card, str) or not card or
+                not isinstance(micros, int) or isinstance(micros, bool) or
+                micros <= 0 or not isinstance(sample_count, int) or
+                isinstance(sample_count, bool) or sample_count < min_samples or
+                not isinstance(observed_at, datetime.datetime)):
+            continue
+        result[card] = {
+            'duration_seconds': micros / 1_000_000.0,
+            'samples': sample_count,
+            'observed_at': observed_at.timestamp(),
+        }
+    return result
 
 
 def schema_available(engine: sqlalchemy.engine.Engine | None = None) -> bool:

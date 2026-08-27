@@ -348,6 +348,45 @@ def test_demand_handoff_unions_old_and_new_in_flight_evidence():
     assert floored['unknown_in_flight_urls'] == ['unknown-new', 'unknown-old']
 
 
+def test_demand_handoff_uses_deadlines_only_for_the_authoritative_queue():
+    old_request = {
+        'queue_depth': 2,
+        'queued_request_deadline_buckets': [{
+            'priority': 50,
+            'compatible_accelerators': ['A100'],
+            'remaining_seconds': 55,
+            'count': 2,
+        }],
+    }
+    snapshot = lb_ha.DemandSnapshot.from_request(old_request)
+    assert lb_ha.DemandSnapshot.from_dict(snapshot.to_dict()) == snapshot
+    handoff = lb_ha.DemandHandoff(60)
+    handoff.begin(8, snapshot)
+
+    current = {
+        'queue_depth': 2,
+        'queued_request_deadline_buckets': [{
+            'priority': 20,
+            'compatible_accelerators': ['L4'],
+            'remaining_seconds': 595,
+            'count': 2,
+        }],
+    }
+    floored = handoff.apply(8, current, True, now=1)
+    assert (floored['queued_request_deadline_buckets'] ==
+            current['queued_request_deadline_buckets'])
+
+    smaller_current = dict(current)
+    smaller_current['queue_depth'] = 1
+    smaller_current['queued_request_deadline_buckets'] = [{
+        **current['queued_request_deadline_buckets'][0],
+        'count': 1,
+    }]
+    floored = handoff.apply(8, smaller_current, True, now=2)
+    assert floored['queue_depth'] == 2
+    assert floored['queued_request_deadline_buckets'] is None
+
+
 def test_demand_handoff_preserves_compatibility_arrivals_and_queue_floors():
     old_request = {
         'routing_version': 1,

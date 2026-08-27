@@ -187,7 +187,8 @@ def _report(autoscaler,
             headerless_arrivals_300s=None,
             arrival_tracking_saturated=False,
             pressure_report_is_floored=False,
-            prediction_time_history=None):
+            prediction_time_history=None,
+            deadline_profiles=None):
     report = {
         'timestamps': list(timestamps),
         'in_flight_by_replica_id': in_flight,
@@ -203,6 +204,8 @@ def _report(autoscaler,
         'rejected_requests_by_compatibility': list(rejected_profiles or []),
         'compatibility_demand_complete': compatibility_complete,
     }
+    if deadline_profiles is not None:
+        report['queued_request_deadline_buckets'] = list(deadline_profiles)
     if recent_rejected is not None:
         report['rejected_in_recent_window'] = recent_rejected
     if queue_depth_by_priority is not None:
@@ -556,6 +559,32 @@ class TestColdPaidCardOrdering(unittest.TestCase):
 
     def test_uses_catalog_costs_without_provider_resolution(self):
         self.assertEqual(self._order({'L4': 2.0, 'A100': 0.0}), ['L4', 'A100'])
+
+    def test_prospective_paid_cards_excludes_reserved_only_card(self):
+        placer = mock.Mock()
+        placer.known_location_costs.return_value = {
+            'L4': 2.0,
+            'A100': 0.0,
+        }
+
+        cards = autoscalers._prospective_paid_cards(['A100', 'L4'], placer,
+                                                    lambda _: 1,
+                                                    lambda location:
+                                                    (location, 1))
+
+        self.assertEqual(cards, ['L4'])
+        placer.known_location_costs.assert_called_once_with()
+
+    def test_prospective_paid_cards_fail_closed_on_catalog_error(self):
+        placer = mock.Mock()
+        placer.known_location_costs.side_effect = RuntimeError('unavailable')
+
+        cards = autoscalers._prospective_paid_cards(['A100', 'L4'], placer,
+                                                    lambda _: 1,
+                                                    lambda location:
+                                                    (location, 1))
+
+        self.assertEqual(cards, [])
 
     def test_unpriced_catalog_entry_preserves_service_order(self):
         self.assertEqual(self._order({
@@ -4601,6 +4630,245 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(autoscaler._raw_target_num_replicas, 18)
         self.assertEqual(_scale_ups(decisions), [])
         self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
+
+    def test_capacity_time_queue_uses_ready_budget_before_cold_lead(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=2000,
+            replica_unit='logical',
+            target_utilization_percentage=95,
+            expected_request_duration_seconds=10,
+            initial_provision_lead_time_seconds=600,
+            lb_request_queue={
+                'timeout_seconds': 600,
+                'timeout_seconds_by_priority': [],
+            },
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1})
+        replicas = [_replica(replica_id) for replica_id in range(1, 51)]
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1000,
+                queue_depth_by_priority={0: 1000},
+                queued_profiles=[self._profile(0, ['L4'], 1000)],
+                deadline_profiles=[{
+                    'priority': 0,
+                    'compatible_accelerators': ['L4'],
+                    'remaining_seconds': 600,
+                    'count': 1000,
+                }],
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler._raw_target_num_replicas, 18)
+        self.assertEqual(autoscaler._deadline_target_by_accelerator, {'L4': 18})
+        self.assertEqual(autoscaler._deadline_infeasible_by_priority, {})
+        self.assertEqual(_scale_ups(decisions), [])
+
+    def test_capacity_time_queue_reports_unrescuable_deadline(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=100,
+            replica_unit='logical',
+            target_utilization_percentage=95,
+            expected_request_duration_seconds=10,
+            initial_provision_lead_time_seconds=600,
+            lb_request_queue={
+                'timeout_seconds': 600,
+                'timeout_seconds_by_priority': [],
+            },
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1000,
+                queue_depth_by_priority={0: 1000},
+                queued_profiles=[self._profile(0, ['L4'], 1000)],
+                deadline_profiles=[{
+                    'priority': 0,
+                    'compatible_accelerators': ['L4'],
+                    'remaining_seconds': 600,
+                    'count': 1000,
+                }],
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, [])
+
+        self.assertEqual(autoscaler._raw_target_num_replicas, 100)
+        self.assertEqual(autoscaler._deadline_target_by_accelerator,
+                         {'L4': 100})
+        self.assertEqual(autoscaler._deadline_infeasible_by_priority,
+                         {0: 1000.0})
+        self.assertEqual(len(_scale_ups(decisions)), 1)
+        self.assertEqual(
+            dict(
+                _scale_ups(decisions)[0].target.target_capacity_by_accelerator),
+            {'L4': 100})
+
+    def test_capacity_time_queue_protects_scarce_a100_for_high_priority(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=2000,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            expected_request_duration_seconds=10,
+            initial_provision_lead_time_seconds=0,
+            lb_request_queue={
+                'timeout_seconds': 600,
+                'timeout_seconds_by_priority': [{
+                    'min_priority': 50,
+                    'timeout_seconds': 60,
+                }],
+            },
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        a100_location = mock.Mock(accelerators={'A100': 1})
+        l4_location = mock.Mock(accelerators={'L4': 1})
+        placer = mock.Mock()
+        placer.known_location_costs.return_value = {
+            a100_location: 0.0,
+            l4_location: 1.0,
+        }
+        autoscaler.set_spot_placer(placer)
+        replicas = []
+        for replica_id in range(1, 11):
+            replica = _replica(replica_id, card='A100')
+            replica.is_zero_cost = True
+            replicas.append(replica)
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1060,
+                queue_depth_by_priority={
+                    0: 1000,
+                    50: 60
+                },
+                queued_profiles=[
+                    self._profile(0, ['L4', 'A100'], 1000),
+                    self._profile(50, ['A100'], 60),
+                ],
+                deadline_profiles=[{
+                    'priority': 0,
+                    'compatible_accelerators': ['L4', 'A100'],
+                    'remaining_seconds': 600,
+                    'count': 1000,
+                }, {
+                    'priority': 50,
+                    'compatible_accelerators': ['A100'],
+                    'remaining_seconds': 60,
+                    'count': 60,
+                }],
+                compatibility_complete=True)
+
+        _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler._deadline_target_by_accelerator, {
+            'L4': 8,
+            'A100': 10,
+        })
+        self.assertEqual(autoscaler._deadline_infeasible_by_priority, {})
+
+    def test_capacity_time_queue_protects_exact_card_at_equal_priority(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=2000,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            expected_request_duration_seconds=10,
+            initial_provision_lead_time_seconds=0,
+            lb_request_queue={
+                'timeout_seconds': 600,
+                'timeout_seconds_by_priority': [],
+            },
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        a100_location = mock.Mock(accelerators={'A100': 1})
+        l4_location = mock.Mock(accelerators={'L4': 1})
+        placer = mock.Mock()
+        placer.known_location_costs.return_value = {
+            a100_location: 0.0,
+            l4_location: 1.0,
+        }
+        autoscaler.set_spot_placer(placer)
+        replicas = []
+        for replica_id in range(1, 11):
+            replica = _replica(replica_id, card='A100')
+            replica.is_zero_cost = True
+            replicas.append(replica)
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1060,
+                queue_depth_by_priority={0: 1060},
+                queued_profiles=[
+                    self._profile(0, ['L4', 'A100'], 1000),
+                    self._profile(0, ['A100'], 60),
+                ],
+                deadline_profiles=[{
+                    'priority': 0,
+                    'compatible_accelerators': ['L4', 'A100'],
+                    'remaining_seconds': 600,
+                    'count': 1000,
+                }, {
+                    'priority': 0,
+                    'compatible_accelerators': ['A100'],
+                    'remaining_seconds': 600,
+                    'count': 60,
+                }],
+                compatibility_complete=True)
+
+        _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler._deadline_target_by_accelerator, {
+            'L4': 8,
+            'A100': 10,
+        })
+        self.assertEqual(autoscaler._deadline_infeasible_by_priority, {})
+
+    def test_capacity_time_queue_uses_fresh_postgres_card_duration(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=100,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            expected_request_duration_seconds=10,
+            initial_provision_lead_time_seconds=0,
+            lb_request_queue={
+                'timeout_seconds': 600,
+                'timeout_seconds_by_priority': [],
+            },
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=600,
+                queue_depth_by_priority={0: 600},
+                queued_profiles=[self._profile(0, ['L4'], 600)],
+                deadline_profiles=[{
+                    'priority': 0,
+                    'compatible_accelerators': ['L4'],
+                    'remaining_seconds': 600,
+                    'count': 600,
+                }],
+                compatibility_complete=True)
+        estimate = {
+            'L4': {
+                'duration_seconds': 20.0,
+                'samples': 100,
+                'observed_at': time.time(),
+            }
+        }
+
+        with mock.patch.object(serve_state,
+                               'get_service_hash',
+                               return_value='service-hash'), mock.patch.object(
+                                   autoscalers.async_request_ledger,
+                                   'get_service_time_estimates',
+                                   return_value=estimate):
+            _decisions(autoscaler, [])
+
+        self.assertEqual(autoscaler._deadline_target_by_accelerator, {'L4': 20})
+        self.assertEqual(autoscaler._service_time_source_by_accelerator,
+                         {'L4': 'postgresql_async_ledger_p75'})
 
     def test_priority_sla_work_preserves_exact_card_constraints(self):
         autoscaler = _make_autoscaler(
