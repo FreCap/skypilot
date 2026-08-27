@@ -443,6 +443,27 @@ class TestReplicaDrainTracker:
             rm._lb_in_flight_report = self._report(1001.0, {}, set())
             assert tracker()
 
+    def test_wave_seed_freshness_is_frozen_before_serial_admission(self):
+        rm = _manager()
+        seed_report = self._report(999.0, {}, {self.URL})
+        # Registration happens much later in a large serial retirement wave.
+        # Freshness belongs to the instant the wave captured the report, not
+        # the instant this tail tracker was finally constructed.
+        with mock.patch.object(replica_managers.time,
+                               'monotonic',
+                               return_value=1100.0):
+            tracker = replica_managers._ReplicaDrainTracker(
+                rm,
+                self.URL,
+                1100.0,
+                seed_report=seed_report,
+                seed_report_captured_at=1000.0)
+        rm._lb_in_flight_report = self._report(1101.0, {}, set())
+        with mock.patch.object(replica_managers.time,
+                               'monotonic',
+                               return_value=1102.0):
+            assert tracker()
+
     def test_seed_report_at_drain_start_cannot_finish_drain(self):
         rm = _manager()
         rm._lb_in_flight_report = self._report(1000.0, {}, {self.URL})

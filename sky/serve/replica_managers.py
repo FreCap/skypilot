@@ -2191,6 +2191,10 @@ def _classify_abort_reason(reason: str) -> str:
     return drain_observability.ABORT_REASON_OTHER
 
 
+_LbDrainReport = tuple[float, dict[str, int], set[str] | None, set[str],
+                       set[str], str | None]
+
+
 class _ReplicaDrainTracker:
     """Stateful drain-complete predicate for one retiring replica.
 
@@ -2217,17 +2221,29 @@ class _ReplicaDrainTracker:
     False, degrading the wait to its deadline.
     """
 
-    def __init__(self, manager: 'ReplicaManager', replica_url: str,
-                 drain_started: float) -> None:
+    def __init__(
+        self,
+        manager: 'ReplicaManager',
+        replica_url: str,
+        drain_started: float,
+        *,
+        seed_report: _LbDrainReport | None = None,
+        seed_report_captured_at: float | None = None,
+    ) -> None:
         self._manager = manager
         self._replica_url = replica_url
         self._drain_started = drain_started
         self._seen = False
         self._unknown_tainted = False
         self._session: str | None = None
-        self._seed_from_existing_report()
+        self._seed_from_existing_report(seed_report,
+                                        seed_report_captured_at)
 
-    def _seed_from_existing_report(self) -> None:
+    def _seed_from_existing_report(
+        self,
+        seed_report: _LbDrainReport | None,
+        seed_report_captured_at: float | None,
+    ) -> None:
         """Carry a fresh pre-retirement LB acknowledgement into the drain.
 
         Route removal is applied in the response to a sync. An idle client can
@@ -2236,14 +2252,28 @@ class _ReplicaDrainTracker:
         The prior report is only an acknowledgement, never a clean proof: a
         later report from the same LB session must still show the url idle.
         """
-        report = self._manager._lb_in_flight_report  # pylint: disable=protected-access
+        report = seed_report
+        if report is None:
+            report = self._manager._lb_in_flight_report  # pylint: disable=protected-access
+            checked_at = time.monotonic()
+        else:
+            # A multi-replica retirement wave removes each route immediately
+            # after its own admission transaction.  Freeze freshness at the
+            # start of that wave: registration of a later tracker must not
+            # race a newer LB report that has already observed its route
+            # removal, nor should serial PostgreSQL commits make the shared
+            # pre-removal report appear stale merely because this item is near
+            # the tail of the same wave.
+            if seed_report_captured_at is None:
+                return
+            checked_at = seed_report_captured_at
         if report is None:
             return
         (received_at, in_flight, routing_urls, unknown_urls, draining_urls,
          session) = report
         if routing_urls is None or not isinstance(session, str) or not session:
             return
-        if (time.monotonic() - received_at
+        if (checked_at - received_at
                 > _IN_FLIGHT_REPORT_STALENESS_SECONDS):
             return
         url = self._replica_url
@@ -3016,9 +3046,7 @@ class ReplicaManager:
         self._update_mode = serve_utils.DEFAULT_UPDATE_MODE
         self._is_pool = False
         self._spot_placer: spot_placer.SpotPlacer | None = None
-        self._lb_in_flight_report: tuple[float, dict[str, int], set[str] | None,
-                                         set[str], set[str],
-                                         str | None] | None = None
+        self._lb_in_flight_report: _LbDrainReport | None = None
         self._logical_state_lock = threading.RLock()
         self._logical_reconcile_state = _LogicalReconcileState(target=None,
                                                                snapshot=None)
@@ -11762,7 +11790,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             self,
             info: ReplicaInfo,
             deadline: float | None = None,
-            replica_url: Any = _REPLICA_URL_NOT_PROVIDED) -> None:
+            replica_url: Any = _REPLICA_URL_NOT_PROVIDED,
+            *,
+            seed_report: _LbDrainReport | None = None,
+            seed_report_captured_at: float | None = None) -> None:
         """Register exact drain state without resolving a provider URL."""
         existing = self._wait_for_idle_trackers.get(info.replica_id)
         if (existing is not None and
@@ -11820,7 +11851,12 @@ class SkyPilotReplicaManager(ReplicaManager):
         if (replica_url is not _REPLICA_URL_NOT_PROVIDED and
                 replica_url is not None and not self._is_pool):
             assert isinstance(replica_url, str), replica_url
-            tracker = _ReplicaDrainTracker(self, replica_url, drain_started)
+            tracker = _ReplicaDrainTracker(
+                self,
+                replica_url,
+                drain_started,
+                seed_report=seed_report,
+                seed_report_captured_at=seed_report_captured_at)
         self._wait_for_idle_trackers[info.replica_id] = _WaitForIdleState(
             replica_record_id=info.replica_record_id,
             deadline=deadline,
@@ -13142,6 +13178,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._controller_owner is None or
                 authority.service_hash != self._service_hash):
             return False
+        # One pre-removal drain snapshot belongs to the whole retirement wave.
+        # Admission commits each row separately and revokes its route, so
+        # reading this field again inside the loop can observe a post-removal
+        # report for the tail of a large wave and permanently lose the
+        # required seen-then-clean seed.
+        retirement_wave_seed_report = self._lb_in_flight_report
+        retirement_wave_seed_captured_at = time.monotonic()
         changed = False
         for original in sorted(replica_infos, key=lambda item: item.replica_id):
             if (original.is_terminal or original.is_zero_cost is True or
@@ -13190,9 +13233,13 @@ class SkyPilotReplicaManager(ReplicaManager):
             changed = True
             if requires_idle_proof:
                 self._wait_for_idle_trackers.pop(info.replica_id, None)
-                self._register_wait_for_idle(info,
-                                             deadline=math.inf,
-                                             replica_url=record['route_url'])
+                self._register_wait_for_idle(
+                    info,
+                    deadline=math.inf,
+                    replica_url=record['route_url'],
+                    seed_report=retirement_wave_seed_report,
+                    seed_report_captured_at=(
+                        retirement_wave_seed_captured_at))
             else:
                 try:
                     self._terminate_replica(info.replica_id,
