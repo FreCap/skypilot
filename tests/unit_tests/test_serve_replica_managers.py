@@ -13635,12 +13635,17 @@ class TestLogicalCapacityPlanning:
             'replica_record_id': retiring.replica_record_id,
             'route_url': 'http://replica:8000',
         }
-        wave_report = (1000.0, {}, {'http://replica:8000'}, set(), set(),
+        wave_report = (replica_managers.time.monotonic(), {},
+                       {'http://replica:8000'}, set(), set(),
                        'ha-generation-11')
         mgr._lb_in_flight_report = wave_report
         mgr._register_wait_for_idle = mock.Mock()
 
         with mock.patch.object(
+                replica_managers.paid_retirement,
+                'list_active_route_urls',
+                return_value={1: 'http://replica:8000'}), \
+             mock.patch.object(
                 replica_managers.serve_state,
                 'get_replica_info_from_id',
                 return_value=retiring), \
@@ -13663,6 +13668,8 @@ class TestLogicalCapacityPlanning:
                                       retiring,
                                       authority,
                                       requires_idle_proof=True,
+                                      expected_route_url=(
+                                          'http://replica:8000'),
                                       expected_service_hash='svc-hash',
                                       expected_controller_owner=(123,
                                                                  '10.0.0.5'))
@@ -13672,6 +13679,46 @@ class TestLogicalCapacityPlanning:
             replica_url='http://replica:8000',
             seed_report=wave_report,
             seed_report_captured_at=mock.ANY)
+
+    def test_fresh_zero_paid_retirement_waits_for_exact_lb_acknowledgement(
+            self):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._service_hash = 'svc-hash'
+        mgr._controller_owner = (123, '10.0.0.5')
+        mgr._update_recovery_required = False
+        retiring = self._ready_backend(1, 1)
+        route_url = 'http://replica:8000'
+        mgr._lb_in_flight_report = (
+            replica_managers.time.monotonic(), {},
+            {'http://different-replica:8000'}, set(), set(),
+            'ha-generation-11')
+        authority = replica_managers.paid_retirement.FreshZeroAuthority(
+            service_hash='svc-hash',
+            demand_source_epoch=2,
+            demand_feed_generation=7,
+            capacity_plan_generation=9,
+            capacity_plan_sha256='a' * 64,
+            route_generation=11)
+
+        with mock.patch.object(
+                replica_managers.paid_retirement,
+                'list_active_route_urls',
+                return_value={1: route_url}), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_info_from_id',
+                 return_value=retiring), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'admit_paid_retirement') as admit:
+            changed = mgr.reconcile_fresh_zero_paid_retirements(
+                authority, [retiring])
+
+        assert not changed
+        assert not retiring.status_property.is_scale_down
+        assert retiring.status_property.sky_down_status is None
+        admit.assert_not_called()
 
     def test_fresh_zero_paid_retirement_isolates_ambiguous_bound_launch(self):
         mgr = _make_manager()
@@ -13698,6 +13745,10 @@ class TestLogicalCapacityPlanning:
             capacity_plan_generation=9,
             capacity_plan_sha256='a' * 64,
             route_generation=11)
+        wave_report = (replica_managers.time.monotonic(), {},
+                       {'http://replica-2:8000'}, set(), set(),
+                       'ha-generation-11')
+        mgr._lb_in_flight_report = wave_report
         mgr._register_wait_for_idle = mock.Mock()
         unresolved = replica_managers._BoundOrdinaryLaunchUnresolvedError(
             'durably ambiguous')
@@ -13715,6 +13766,10 @@ class TestLogicalCapacityPlanning:
 
         mgr._terminate_replica = mock.Mock(side_effect=_terminate)
         with mock.patch.object(
+                replica_managers.paid_retirement,
+                'list_active_route_urls',
+                return_value={2: 'http://replica-2:8000'}), \
+             mock.patch.object(
                 replica_managers.serve_state,
                 'get_replica_info_from_id',
                 side_effect=lambda _service_name, replica_id: infos[
@@ -13737,7 +13792,7 @@ class TestLogicalCapacityPlanning:
             ready,
             deadline=math.inf,
             replica_url='http://replica-2:8000',
-            seed_report=None,
+            seed_report=wave_report,
             seed_report_captured_at=mock.ANY)
 
     def test_fresh_zero_paid_retirement_defers_remaining_wave(self):
@@ -13757,10 +13812,21 @@ class TestLogicalCapacityPlanning:
             capacity_plan_generation=9,
             capacity_plan_sha256='a' * 64,
             route_generation=11)
+        route_urls = {
+            info.replica_id: f'http://replica-{info.replica_id}:8000'
+            for info in replicas
+        }
+        mgr._lb_in_flight_report = (
+            replica_managers.time.monotonic(), {}, set(route_urls.values()),
+            set(), set(), 'ha-generation-11')
         mgr._register_wait_for_idle = mock.Mock()
         mgr._terminate_replica = mock.Mock()
 
         with mock.patch.object(
+                replica_managers.paid_retirement,
+                'list_active_route_urls',
+                return_value=route_urls), \
+             mock.patch.object(
                 replica_managers.serve_state,
                 'get_replica_info_from_id',
                 side_effect=lambda _service_name, replica_id: infos[

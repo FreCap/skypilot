@@ -307,6 +307,7 @@ def admit_in_session(
     replica_record_id: str,
     service_version: int,
     requires_idle_proof: bool,
+    expected_route_url: str | None,
     authority: FreshZeroAuthority,
     expected_controller_owner: tuple[int | None, str | None],
 ) -> Mapping[str, Any]:
@@ -317,6 +318,14 @@ def admit_in_session(
         raise PaidRetirementConflict('Replica version is invalid.')
     if type(requires_idle_proof) is not bool:
         raise PaidRetirementConflict('Idle-proof requirement is invalid.')
+    if (requires_idle_proof and
+            (not isinstance(expected_route_url, str) or
+             not expected_route_url)):
+        raise PaidRetirementConflict(
+            'Idle-proof retirement requires an acknowledged route URL.')
+    if not requires_idle_proof and expected_route_url is not None:
+        raise PaidRetirementConflict(
+            'A non-routable retirement cannot expect a route URL.')
     record_id = _canonical_record_id(replica_record_id)
     owner, _, final_valid_until = _lock_authority(session, service_name,
                                                   authority,
@@ -364,6 +373,9 @@ def admit_in_session(
             route_url = existing['route_url']
         else:
             route_url = lease['route_url']
+        if route_url != expected_route_url:
+            raise PaidRetirementConflict(
+                'Paid retirement route changed after LB acknowledgement.')
     now = session.execute(sqlalchemy.select(
         sqlalchemy.func.clock_timestamp())).scalar_one()
     if final_valid_until is None or final_valid_until <= now:
@@ -571,6 +583,50 @@ def list_for_service(service_name: str) -> dict[int, dict[str, Any]]:
             sqlalchemy.select(_RETIREMENTS).where(
                 _RETIREMENTS.c.service_name == service_name)).mappings().all()
     return {int(row['replica_id']): dict(row) for row in rows}
+
+
+def list_active_route_urls(
+    service_name: str,
+    service_hash: str,
+    replica_record_ids: Mapping[int, str],
+) -> dict[int, str]:
+    """Read exact current route URLs without contacting a provider.
+
+    The result is only a preflight snapshot. Retirement admission locks the
+    lease and compares the same URL again before revoking it, so a concurrent
+    route-material replacement fails closed.
+    """
+    if not isinstance(service_name, str) or not service_name:
+        raise PaidRetirementConflict('Service name is invalid.')
+    if not isinstance(service_hash, str) or not service_hash:
+        raise PaidRetirementConflict('Service hash is invalid.')
+    identities: dict[int, uuid.UUID] = {}
+    for replica_id, replica_record_id in replica_record_ids.items():
+        if type(replica_id) is not int or replica_id < 1:
+            raise PaidRetirementConflict('Replica ID is invalid.')
+        identities[replica_id] = _canonical_record_id(replica_record_id)
+    if not identities:
+        return {}
+    engine = serve_state_schema.get_database_engine()
+    if engine.dialect.name != 'postgresql':
+        return {}
+    with engine.connect() as connection:
+        rows = connection.execute(
+            sqlalchemy.select(
+                _ROUTE_LEASES.c.replica_id,
+                _ROUTE_LEASES.c.replica_record_id,
+                _ROUTE_LEASES.c.route_url,
+            ).where(
+                _ROUTE_LEASES.c.service_name == service_name,
+                _ROUTE_LEASES.c.service_hash == service_hash,
+                _ROUTE_LEASES.c.replica_id.in_(identities),
+                _ROUTE_LEASES.c.revoked_at.is_(None),
+            )).mappings().all()
+    return {
+        int(row['replica_id']): str(row['route_url'])
+        for row in rows
+        if identities.get(int(row['replica_id'])) == row['replica_record_id']
+    }
 
 
 def get_for_replica(service_name: str,

@@ -2195,6 +2195,21 @@ _LbDrainReport = tuple[float, dict[str, int], set[str] | None, set[str],
                        set[str], str | None]
 
 
+def _fresh_lb_acknowledged_route_urls(
+    report: _LbDrainReport | None,
+    checked_at: float,
+) -> frozenset[str]:
+    """Return exact URLs acknowledged by one fresh authoritative LB report."""
+    if report is None:
+        return frozenset()
+    (received_at, in_flight, routing_urls, unknown_urls, draining_urls,
+     session) = report
+    if (routing_urls is None or not isinstance(session, str) or not session or
+            checked_at - received_at > _IN_FLIGHT_REPORT_STALENESS_SECONDS):
+        return frozenset()
+    return frozenset(routing_urls).union(in_flight, unknown_urls, draining_urls)
+
+
 class _ReplicaDrainTracker:
     """Stateful drain-complete predicate for one retiring replica.
 
@@ -13185,6 +13200,19 @@ class SkyPilotReplicaManager(ReplicaManager):
         # required seen-then-clean seed.
         retirement_wave_seed_report = self._lb_in_flight_report
         retirement_wave_seed_captured_at = time.monotonic()
+        retirement_wave_acknowledged_urls = (
+            _fresh_lb_acknowledged_route_urls(
+                retirement_wave_seed_report,
+                retirement_wave_seed_captured_at))
+        retirement_wave_route_urls = {}
+        if retirement_wave_acknowledged_urls:
+            retirement_wave_route_urls = (
+                paid_retirement.list_active_route_urls(
+                    self._service_name, self._service_hash, {
+                        info.replica_id: info.replica_record_id
+                        for info in replica_infos
+                        if not info.is_terminal and info.is_zero_cost is False
+                    }))
         changed = False
         for original in sorted(replica_infos, key=lambda item: item.replica_id):
             if (original.is_terminal or original.is_zero_cost is True or
@@ -13206,6 +13234,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                             (int, float)) and
                  not isinstance(info.status_property.first_ready_time, bool) and
                  info.status_property.first_ready_time >= 0))
+            expected_route_url = None
+            if requires_idle_proof:
+                expected_route_url = retirement_wave_route_urls.get(
+                    info.replica_id)
+                if (expected_route_url is None or expected_route_url not in
+                        retirement_wave_acknowledged_urls):
+                    # Route revocation is only safe after the active LB session
+                    # has acknowledged this exact current lease. In
+                    # particular, a route re-added after positive demand may
+                    # not yet appear in the frozen report for this wave.
+                    continue
             status = info.status_property
             status.is_scale_down = True
             status.purged = False
@@ -13222,6 +13261,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 info,
                 authority,
                 requires_idle_proof=requires_idle_proof,
+                expected_route_url=expected_route_url,
                 expected_service_hash=self._service_hash,
                 expected_controller_owner=self._controller_owner)
             if record is None:
