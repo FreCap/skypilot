@@ -1044,6 +1044,31 @@ class TestTargetMath(unittest.TestCase):
         self.assertEqual(autoscaler._weighted_queue_work, 10)
         self.assertEqual(autoscaler.target_num_replicas, 12)
 
+    def test_default_queue_timeout_weights_retained_queue_work(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=2000,
+            replica_unit='logical',
+            target_utilization_percentage=95,
+            expected_request_duration_seconds=10,
+            initial_provision_lead_time_seconds=0,
+            lb_request_queue={
+                'timeout_seconds': 600,
+                'timeout_seconds_by_priority': [],
+            },
+        )
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1000,
+                queue_depth_by_priority={0: 1000})
+
+        self._recompute(autoscaler, [])
+
+        # The base timeout is the default SLA even without priority-specific
+        # overrides: 1000 * 10/600 / 95% requires 18 logical slots.
+        self.assertAlmostEqual(autoscaler._weighted_queue_work, 1000 / 60)
+        self.assertEqual(autoscaler.target_num_replicas, 18)
+
     def test_launch_priority_uses_highest_active_demand(self):
         autoscaler = _make_autoscaler(knob=1, max_replicas=1000)
         _report(autoscaler,
@@ -4516,6 +4541,135 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertGreater(
             autoscaler.target_num_replicas_by_accelerator.get('A100', 0),
             autoscaler.target_num_replicas_by_accelerator.get('L4', 0))
+
+    def test_exact_card_queue_uses_same_default_sla_work_as_aggregate(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=2000,
+            replica_unit='logical',
+            target_utilization_percentage=95,
+            expected_request_duration_seconds=10,
+            initial_provision_lead_time_seconds=0,
+            lb_request_queue={
+                'timeout_seconds': 600,
+                'timeout_seconds_by_priority': [],
+            },
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1000,
+                queue_depth_by_priority={0: 1000},
+                queued_profiles=[self._profile(0, ['L4'], 1000)],
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, [])
+
+        self.assertEqual(autoscaler.target_num_replicas, 18)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 18})
+        self.assertEqual(len(_scale_ups(decisions)), 1)
+        self.assertEqual(
+            dict(
+                _scale_ups(decisions)[0].target.target_capacity_by_accelerator),
+            {'L4': 18})
+
+    def test_ready_supply_above_sla_target_authorizes_no_cold_launch(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=2000,
+            replica_unit='logical',
+            target_utilization_percentage=95,
+            expected_request_duration_seconds=10,
+            initial_provision_lead_time_seconds=0,
+            lb_request_queue={
+                'timeout_seconds': 600,
+                'timeout_seconds_by_priority': [],
+            },
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1})
+        replicas = [_replica(replica_id) for replica_id in range(1, 51)]
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=1000,
+                queue_depth_by_priority={0: 1000},
+                queued_profiles=[self._profile(0, ['L4'], 1000)],
+                compatibility_complete=True)
+
+        decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler._raw_target_num_replicas, 18)
+        self.assertEqual(_scale_ups(decisions), [])
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
+
+    def test_priority_sla_work_preserves_exact_card_constraints(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=2000,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            expected_request_duration_seconds=10,
+            initial_provision_lead_time_seconds=0,
+            lb_request_queue={
+                'timeout_seconds': 600,
+                'timeout_seconds_by_priority': [{
+                    'min_priority': 50,
+                    'timeout_seconds': 60,
+                }],
+            },
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=110,
+                queue_depth_by_priority={
+                    0: 100,
+                    50: 10,
+                },
+                queued_profiles=[
+                    self._profile(0, ['L4'], 100),
+                    self._profile(50, ['A100'], 10),
+                ],
+                compatibility_complete=True)
+
+        _decisions(autoscaler, [])
+
+        # Both profiles are 5/3 work units. Independent exact-card rounding
+        # requires two slots of each card while preserving four total slots.
+        self.assertAlmostEqual(autoscaler._weighted_queue_work, 10 / 3)
+        self.assertEqual(autoscaler.target_num_replicas, 4)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator, {
+            'L4': 2,
+            'A100': 2,
+        })
+
+    def test_incomplete_priority_gauge_keeps_raw_exact_card_queue_floor(self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            max_replicas=2000,
+            replica_unit='logical',
+            expected_request_duration_seconds=10,
+            initial_provision_lead_time_seconds=0,
+            lb_request_queue={
+                'timeout_seconds': 600,
+                'timeout_seconds_by_priority': [],
+            },
+        )
+        autoscaler.set_configured_accelerator_shapes({'L4': 1})
+        _report(autoscaler,
+                in_flight={},
+                queue_depth=110,
+                queued_profiles=[self._profile(0, ['L4'], 110)],
+                compatibility_complete=True)
+
+        _decisions(autoscaler, [])
+
+        # An old or partially elected LB cannot provide the priority gauge
+        # needed to prove patience. Fail closed to one slot per request.
+        self.assertEqual(autoscaler._weighted_queue_work, 110)
+        self.assertEqual(autoscaler.target_num_replicas, 110)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 110})
 
     def test_logical_target_carries_card_slots_and_physical_shapes(self):
         autoscaler = _make_autoscaler(knob=1,
