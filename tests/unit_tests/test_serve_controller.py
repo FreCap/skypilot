@@ -4429,6 +4429,7 @@ class TestAutoscalerRuntimeSnapshot:
                                   utilization_gate_armed: bool = False,
                                   utilization_demonstrated_need: int |
                                   None = None,
+                                  utilization_ceiling: int | None = None,
                                   upward_grants_settled: bool = True):
         location = reserved_fill_planner.LocationSnapshot(
             cloud='Kubernetes',
@@ -4470,7 +4471,9 @@ class TestAutoscalerRuntimeSnapshot:
             reclaim_provider_inventory_sha256='d' * 64,
             utilization_gate_armed=utilization_gate_armed,
             utilization_demonstrated_need=(utilization_demonstrated_need),
-            utilization_ceiling=(utilization_demonstrated_need or 0),
+            utilization_ceiling=(utilization_demonstrated_need or 0
+                                 if utilization_ceiling is None else
+                                 utilization_ceiling),
             upward_grants_settled=upward_grants_settled,
             pool_snapshots=(snapshot,))
         return allocation, pool_key
@@ -4504,6 +4507,30 @@ class TestAutoscalerRuntimeSnapshot:
                 _allocation_covers_current_utilization(scaler, [], allocation)
 
         assert covered is expected
+
+    def test_paid_plan_requires_ceiling_to_cover_current_sla_target(self):
+        scaler = self._durable_autoscaler(28)
+        scaler.reserved_fill_utilization_gate = True
+        scaler.fill_demand_sample.return_value = autoscalers.FillDemandSample(
+            outstanding_work=2.85,
+            busy_fill_holdings=0,
+            pre_ready_fill_holdings=0,
+            upscale_pending=False,
+            work_per_replica=1,
+            planned_replicas=28)
+        allocation, _ = self._reserved_fill_allocation(
+            utilization_gate_armed=True,
+            utilization_demonstrated_need=28,
+            utilization_ceiling=4,
+            upward_grants_settled=True)
+
+        with mock.patch.object(controller.reserved_capacity_broker,
+                               'utilization_gate_enabled',
+                               return_value=True):
+            covered = controller.SkyServeController.\
+                _allocation_covers_current_utilization(scaler, [], allocation)
+
+        assert not covered
 
     def test_paid_plan_does_not_require_utilization_witness_when_gate_is_off(
             self):

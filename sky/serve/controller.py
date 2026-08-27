@@ -6244,8 +6244,9 @@ class SkyServeController:
         sample = decision_autoscaler.fill_demand_sample(replica_infos)
         if sample is None:
             return False
-        return (allocation.utilization_demonstrated_need
-                >= sample.demonstrated_need())
+        current_need = sample.demonstrated_need()
+        return (allocation.utilization_demonstrated_need >= current_need and
+                allocation.utilization_ceiling >= current_need)
 
     def _plan_and_publish_current_capacity(
         self,

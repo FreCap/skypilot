@@ -66,10 +66,12 @@ def test_fill_demand_sample_contract():
                                           busy_fill_holdings=1,
                                           pre_ready_fill_holdings=2,
                                           upscale_pending=False,
-                                          work_per_replica=2.0)
+                                          work_per_replica=2.0,
+                                          planned_replicas=4)
 
-    assert sample.demonstrated_need() == 3
+    assert sample.demonstrated_need() == 4
     assert sample.boot_hold()
+    assert pickle.loads(pickle.dumps(sample)) == sample
 
 
 @pytest.mark.parametrize('contract_type', _CONTRACT_TYPES)
