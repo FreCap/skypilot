@@ -4047,6 +4047,26 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                 'H200': 1,
             })
 
+    def test_fresh_zero_retention_uses_only_existing_exact_card_capacity(self):
+        autoscaler = _make_autoscaler(max_replicas=30, replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        replicas = [_replica(i, card='A100') for i in range(1, 12)]
+        for replica in replicas:
+            replica.is_zero_cost = True
+        _report(autoscaler,
+                in_flight={replica.replica_id: 0 for replica in replicas},
+                queue_depth=0,
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=True)
+
+        self.assertEqual(
+            autoscaler.existing_capacity_retention_target_by_accelerator(
+                replicas, 5), {'A100': 5})
+        self.assertEqual(
+            autoscaler.existing_capacity_retention_target_by_accelerator(
+                replicas, 21), {'A100': 11})
+
     def test_economic_target_never_uses_h200_for_l4_only_work(self):
         autoscaler = _make_autoscaler(max_replicas=1)
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})

@@ -66,8 +66,10 @@ class ScalingDecisionInputs:
     kueue_blocked_retirement_shapes: frozenset[tuple[str, int]] = frozenset()
     kueue_transition_replica_ids: frozenset[int] = frozenset()
     kueue_ready_paid_replacement_replica_ids: frozenset[int] = frozenset()
-    service_time_estimates_by_accelerator: dict[
-        str, dict[str, float | int]] = dataclasses.field(default_factory=dict)
+    service_time_estimates_by_accelerator: dict[str,
+                                                dict[str, float |
+                                                     int]] = dataclasses.field(
+                                                         default_factory=dict)
 
 
 # Preserve historical private import and pickle identities while the pure
@@ -371,8 +373,7 @@ def _prospective_paid_cards(
         if not math.isfinite(hourly_cost) or hourly_cost < 0 or hourly_cost > 0:
             paid_capable.add(card)
     ordered = _order_cold_paid_cards(configured_cards, placer,
-                                     configured_gpu_count,
-                                     location_gpu_shape,
+                                     configured_gpu_count, location_gpu_shape,
                                      known_location_costs)
     return [card for card in ordered if card in paid_capable]
 
@@ -965,8 +966,7 @@ class Autoscaler:
                 self._cold_paid_location_costs_for_tick)
         return _prospective_paid_cards(configured_cards,
                                        self._cost_rebalance_spot_placer,
-                                       configured_gpu_count,
-                                       location_gpu_shape)
+                                       configured_gpu_count, location_gpu_shape)
 
     def _clear_cost_rebalance_candidates(self) -> None:
         if self._cost_rebalance_candidate_since:
@@ -2900,6 +2900,23 @@ class Autoscaler:
             return None
         return {'*': max(0, int(self.get_final_target_num_replicas()))}
 
+    def existing_capacity_retention_target_by_accelerator(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        requested_capacity: int,
+        *,
+        kueue_capacity_by_replica_id: Mapping[
+            int, kueue_lane_capacity.KueueReplicaCapacityClass] | None = None,
+    ) -> dict[str, int] | None:
+        """Select a bounded target using only already-committed capacity.
+
+        Heterogeneous logical autoscalers override this.  Aggregate and QPS
+        policies have no exact-card proof that can safely fence a retained
+        logical retirement wave.
+        """
+        del (replica_infos, requested_capacity, kueue_capacity_by_replica_id)
+        return None
+
     def supports_reserved_supply_economic_target(self) -> bool:
         """Whether pending/tail supply has a work-conserving target proof."""
         return False
@@ -4156,8 +4173,8 @@ class _GpuShapeResolverMixin:
                     float(estimate['duration_seconds']) <= 0 or
                     not isinstance(estimate.get('samples'), int) or
                     isinstance(estimate.get('samples'), bool) or
-                    int(estimate['samples']) <
-                    constants.AUTOSCALER_ADAPTIVE_DURATION_MIN_SAMPLES or
+                    int(estimate['samples'])
+                    < constants.AUTOSCALER_ADAPTIVE_DURATION_MIN_SAMPLES or
                     not isinstance(estimate.get('observed_at'), (int, float)) or
                     isinstance(estimate.get('observed_at'), bool)):
                 raise ValueError('Scaling decision inputs have invalid '
@@ -6064,12 +6081,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                                                     self._configured_gpu_count,
                                                     self._location_gpu_shape)
 
-    def _prospective_paid_card_order(
-            self, configured_cards: list[str]) -> list[str]:
+    def _prospective_paid_card_order(self,
+                                     configured_cards: list[str]) -> list[str]:
         """Return cards on which a new paid replica can actually launch."""
-        return self._prospective_paid_cards_for_tick(
-            configured_cards, self._configured_gpu_count,
-            self._location_gpu_shape)
+        return self._prospective_paid_cards_for_tick(configured_cards,
+                                                     self._configured_gpu_count,
+                                                     self._location_gpu_shape)
 
     def _staleness_threshold_seconds(self) -> float:
         """Age beyond which a demand report no longer counts as fresh.
@@ -6108,9 +6125,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         return self._reconcile_generation
 
     @property
-    def logical_target_state(
-        self,
-    ) -> LogicalCapacityTarget | None:
+    def logical_target_state(self,) -> LogicalCapacityTarget | None:
         """Version, report generation, and demand actuation target."""
         with self._logical_state_lock:
             return self._last_logical_target_state
@@ -6805,8 +6820,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                        float(created_at)) if isinstance(created_at,
                                                         (int, float)) and
                    not isinstance(created_at, bool) else 0.0)
-            available = max(0.0,
-                            self.effective_provision_lead_seconds - age)
+            available = max(0.0, self.effective_provision_lead_seconds - age)
             tier = 1 if zero_cost else 4
             finite_supply.extend(
                 DeadlineSupply(card, available, tier) for _ in range(width))
@@ -6818,12 +6832,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 DeadlineSupply(card, self.effective_provision_lead_seconds, 2)
                 for _ in range(max(0, int(count))))
         demand = [
-            DeadlineDemand(priority=int(profile['priority']),
-                           compatible_cards=tuple(
-                               profile['compatible_accelerators']),
-                           count=int(profile['count']),
-                           remaining_seconds=float(
-                               profile['remaining_seconds']))
+            DeadlineDemand(
+                priority=int(profile['priority']),
+                compatible_cards=tuple(profile['compatible_accelerators']),
+                count=int(profile['count']),
+                remaining_seconds=float(profile['remaining_seconds']))
             for profile in self.queued_deadline_profiles or ()
         ]
         return _allocate_deadline_capacity_target(
@@ -6850,9 +6863,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def _queue_work(self) -> float:
         if self._deadline_capacity_plan is not None:
-            planned_work = (sum(
-                self._deadline_capacity_plan.target_by_card.values()) *
-                            self._effective_logical_capacity_per_gpu())
+            planned_work = (
+                sum(self._deadline_capacity_plan.target_by_card.values()) *
+                self._effective_logical_capacity_per_gpu())
             running_work = float(
                 sum((self._in_flight_by_replica_id or {}).values()))
             return max(0.0, planned_work - running_work)
@@ -7904,8 +7917,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             def _merge_deadline_floor(
                     fixed: dict[str, float]) -> dict[str, float]:
                 return {
-                    card: max(fixed.get(card, 0.0),
-                              deadline_fixed.get(card, 0.0))
+                    card:
+                        max(fixed.get(card, 0.0), deadline_fixed.get(card, 0.0))
                     for card in configured_cards
                     if (fixed.get(card, 0.0) > 0 or
                         deadline_fixed.get(card, 0.0) > 0)
@@ -8006,6 +8019,78 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 sum(allocation.target_by_accelerator.values()) != final_target):
             return None
         return allocation.target_by_accelerator
+
+    def existing_capacity_retention_target_by_accelerator(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        requested_capacity: int,
+        *,
+        kueue_capacity_by_replica_id: Mapping[
+            int, kueue_lane_capacity.KueueReplicaCapacityClass] | None = None,
+    ) -> dict[str, int] | None:
+        """Place a fresh-zero hold exclusively on committed exact cards."""
+        if (type(requested_capacity) is not int or requested_capacity < 0 or
+                self.replica_unit != 'logical'):
+            return None
+        configured_by_name = {
+            card.casefold(): card
+            for card in self._configured_cards_from_profiles()
+        }
+        if not configured_by_name:
+            return None
+
+        committed: dict[str, int] = {}
+        for info in replica_infos:
+            if (info.is_terminal or _replica_is_retiring_card_supply(info)):
+                continue
+            if info.version == self.latest_version:
+                width = self._committed_capacity(info)
+            elif info.is_ready:
+                # Match the manager's rolling-version retirement bridge:
+                # historical READY rows conservatively contribute one slot.
+                width = 1
+            else:
+                continue
+            raw_card, _ = self._get_gpu_shape_from_replica_info(info)
+            card = configured_by_name.get(raw_card.casefold())
+            if card is None or width <= 0:
+                continue
+            committed[card] = committed.get(card, 0) + width
+
+        retained_capacity = min(requested_capacity, sum(committed.values()))
+        if retained_capacity == 0:
+            return {}
+        prior_retention = dict(self.warm_retention_target_by_accelerator)
+        prior_kueue = self._kueue_capacity_by_replica_id_for_tick
+        if kueue_capacity_by_replica_id is not None:
+            if (set(kueue_capacity_by_replica_id) -
+                {info.replica_id for info in replica_infos} or not all(
+                    isinstance(value,
+                               kueue_lane_capacity.KueueReplicaCapacityClass)
+                    for value in kueue_capacity_by_replica_id.values())):
+                return None
+            self._kueue_capacity_by_replica_id_for_tick = dict(
+                kueue_capacity_by_replica_id)
+        try:
+            allocation = self._calculate_concurrency_target_by_accelerator(
+                replica_infos,
+                target_ceiling=retained_capacity,
+                min_replicas_override=retained_capacity,
+                use_existing_supply=True,
+                pin_running_work=False,
+                use_free_reserved=False,
+                additional_zero_cost_supply_by_accelerator={},
+                economic_supply_snapshot=True)
+        finally:
+            self.warm_retention_target_by_accelerator = prior_retention
+            self._kueue_capacity_by_replica_id_for_tick = prior_kueue
+        target = allocation.target_by_accelerator
+        if (not allocation.card_attribution_complete or
+                sum(target.values()) != retained_capacity or
+                any(count > committed.get(card, 0)
+                    for card, count in target.items())):
+            return None
+        return target
 
     def supports_reserved_supply_economic_target(self) -> bool:
         """Logical GPU slots conserve work across compatible card choices."""
@@ -8867,9 +8952,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         try:
             service_hash = serve_state.get_service_hash(self._service_name)
         except Exception as error:  # pylint: disable=broad-except
-            logger.warning('Failed to resolve service incarnation for exact '
-                           'card timing: %s',
-                           common_utils.format_exception(error))
+            logger.warning(
+                'Failed to resolve service incarnation for exact '
+                'card timing: %s', common_utils.format_exception(error))
             return {}
         if not isinstance(service_hash, str) or not service_hash:
             return {}
@@ -9955,13 +10040,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 'compatible_accelerators': list(
                     profile['compatible_accelerators']),
             } for profile in self.queued_compatibility_profiles],
-            'queued_deadline_profiles': ([{
-                **profile,
-                'compatible_accelerators': list(
-                    profile['compatible_accelerators']),
-            } for profile in self.queued_deadline_profiles]
-                                         if self.queued_deadline_profiles
-                                         is not None else None),
+            'queued_deadline_profiles':
+                ([{
+                    **profile,
+                    'compatible_accelerators': list(
+                        profile['compatible_accelerators']),
+                } for profile in self.queued_deadline_profiles]
+                 if self.queued_deadline_profiles is not None else None),
             'rejected_compatibility_profiles': [{
                 **profile,
                 'compatible_accelerators': list(
