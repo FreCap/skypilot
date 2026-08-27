@@ -560,11 +560,16 @@ def test_allocation_map_hash_binds_complete_ordered_authority() -> None:
         reclaim_fleet_bundle_sha256=_RECLAIM_FLEET_BUNDLE_SHA256,
         reclaim_policy_revision=_RECLAIM_POLICY_REVISION,
         reclaim_provider_inventory_sha256=(_RECLAIM_PROVIDER_INVENTORY_SHA256),
+        utilization_gate_armed=True,
+        utilization_demonstrated_need=3,
+        utilization_boot_hold=True,
+        utilization_ceiling=4,
+        upward_grants_settled=False,
         pool_snapshots=(east, west))
 
     assert (reserved_fill_planner.AuthenticatedAllocationMap.from_mapping(
         allocation_map.to_mapping()) == allocation_map)
-    assert allocation_map.to_mapping()['schema_version'] == 5
+    assert allocation_map.to_mapping()['schema_version'] == 6
 
     inflated_east = dataclasses.replace(east,
                                         edge_cap=2,
@@ -584,6 +589,10 @@ def test_allocation_map_hash_binds_complete_ordered_authority() -> None:
             'reclaim_fleet_bundle_sha256': 'e' * 64,
             'reclaim_policy_revision': 'kueue-reclaim-v2',
             'reclaim_provider_inventory_sha256': 'f' * 64,
+            'utilization_demonstrated_need': 4,
+            'utilization_boot_hold': False,
+            'utilization_ceiling': 5,
+            'upward_grants_settled': True,
     }.items():
         with pytest.raises(ValueError, match='does not match'):
             dataclasses.replace(allocation_map, **{field: value})

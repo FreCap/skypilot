@@ -224,6 +224,40 @@ residual is authorized. Opportunistic fill is utilization-gated with a zero
 floor, so idle fill returns without changing East scheduling or Simone's PHX
 Kueue policy.
 
+A clean lifecycle-124 calibration on release ``1.1.1541`` exposed one final
+reserved-before-paid causality gap in that demand-driven path. Two hundred
+fresh requests arrived while the last authenticated allocation still described
+the preceding idle utilization sample: all three compatible physical pools
+reported 193 spendable GPUs, but the service-wide utilization ceiling and all
+grants were still zero. The locked paid planner treated that internally
+consistent allocation as current supply authority and committed two L4 Spot
+replicas. The next broker cycle observed the demand, raised the raw
+entitlement, and began A100/H200 reserved admission. This was neither provider
+scarcity nor Kueue rejection; it was a missing causal dimension in allocation
+schema 5.
+
+Allocation schema 6 closes that gap without adding another scheduler or
+capacity path. Each authenticated service-wide map also binds the exact
+utilization-gate sample that produced its ceiling (non-blind demonstrated need
+and boot state) and a service-wide ``upward_grants_settled`` bit derived from
+every locked pool round's raw and damped grants. For positive compatible paid
+authority, the current locked demand callback recomputes the same demonstrated
+need. The map is usable only when its non-blind sample dominates that need and
+every raw upward entitlement has reached the conservative fill grant. An idle,
+blind, or first-upward-round map therefore publishes no paid residual; the
+existing poller advances the one canonical broker path and reconciliation
+retries. Once settled, the existing exact-card allocation tail is debited
+before paid capacity, so there is no speculative raw-capacity projection and
+no duplicate fairness implementation. Static fill keeps the same allocator;
+downward damping may conservatively suppress paid but never authorizes it.
+
+The allocation JSON is the only durable shape changed. There is no new table,
+column, EFS state, provider call, Kueue object, or platform dependency. A
+schema-6 writer treats the immediately preceding schema-5 map as stale and
+replaces it under the existing allocation-generation CAS; it never uses that
+map for a new provider effect. A schema-5 writer rejects a schema-6 map and
+therefore also fails closed during a rolling deployment.
+
 The first deadline-planner production campaign on lifecycle 121 exposed a
 remaining violation of that demand-driven contract. Two hundred explicitly
 L4-only, priority-zero queue entries correctly produced an L4-only deadline
@@ -517,7 +551,7 @@ it has merged or been deployed.
 | Deployed control plane | SkyPilot `1.1.1541`, Helm revision 659. Two API, two controller, and three executor Pods use immutable image `255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:29f4d700253a79fa92ffbdabba8c0243203eba5f524d8b7ff730fbfcf9be52c3`. PostgreSQL is at Serve revision 064, Helm storage remains disabled, and PostgreSQL remains the sole central store. |
 | Writer protocol | Public API 93, worker projection 10, deployed and source non-pool capability cohort 13, and async request-ledger protocol 1. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. |
-| Active service | Absent after supported Serve064 cleanup. Replica 101's retained `SERVICE_JOB_IO` graph used exact provider cleanup and then projected `ABSENT`; the service, replica, paid claim, waiter, retention pin, queue row, and cluster record are gone. The terminal request and projected association remain inert audit tombstones until 2026-10-26. The service definition had no reserved/Kueue resources, file mount, EFS, PVC, or on-demand candidate. |
+| Active service | Lifecycle 124 is a clean recreation on release `1.1.1541`, service incarnation `c1b25022-4257-44c8-bb95-4d1ae087fd6f`, version 1, with two healthy HA load-balancer slots. It has `min_replicas: 0`, fill floor 0, `utilization_gate: true`, a 120 paid-GPU cap, only Spot L4 paid candidates, and reserved East A100/A100-80GB plus PHX H200 candidates. It has no task-owned scheduler override, file mount, EFS, PVC, or on-demand candidate. |
 | Reserved occupancy | At 2026-08-26 23:09--23:13 UTC, East had 328 healthy compatible GPUs on 41 nodes: research requested 45 and 283 `boltz-l4-fleet` Pods requested the exact remainder; all 283 were Running and Ready, with zero free compatible GPU and zero pending research or fleet GPU Pod. PHX had 512 healthy H200 GPUs: research held 482 and the unchanged Kueue policy admitted 30/30 fleet Workloads; all 30 Pods were Running/Ready and PostgreSQL `READY`, with zero pending research GPU Workload. PostgreSQL independently reported exactly 63 A100, 220 A100-80GB, and 30 H200 reserved replicas `READY`, with zero durable intent pending. Thus the same lifecycle occupied East 328/328 and PHX 512/512 without changing scheduler policy. |
 | Reserved readiness projection | For the final PHX replica, PostgreSQL committed the intent at 22:43:32, the Pod appeared at 22:43:55, Kueue admitted it at 22:43:56, and the Pod became Ready at 22:44:32. PostgreSQL projected it `READY` only between 22:52:25 and 22:52:40, exposing a separate roughly eight-minute status-freshness lag rather than a capacity/admission failure. The post-Helm 23:13 UTC census retained the exact 30/30 admission and readiness with no churn. |
 | Claim-heartbeat convergence defect | Resolved in source, deployed, and dark-verified in production. Lifecycle 117 had logged successful exact reclaim-policy proofs followed 7--15 seconds later by rejected claim-set heartbeats because the broker minted the five-second ticket before entering the PostgreSQL replacement and its protocol/lifecycle locks. PR #1750 passes an authorization callback into the state transaction, locks protocol, owner, immutable version/projection, claim-set/edge rows and the legacy projection, reconstructs exact scope, and only then reads already-renewed PostgreSQL proof receipts. Proof logging completes before the ticket timestamp; the ticket is then immediately validated and written. Ordinary drained boundary failures remain fail-closed and boundary ambiguity remains controller-terminal. The correction changes neither Kueue nor TTL/batch/quantum limits. Real-PostgreSQL tests cover waits beyond the ticket lifetime on the affected lock paths. Release `1.1.1519` then produced eight consecutive observed successful claim/publish rounds after controller takeover with no rejected heartbeat. |
@@ -529,6 +563,7 @@ it has merged or been deployed.
 | GCP Spot lifecycle proof | Complete for the current writer. Release `1.1.1540` reached 105 concurrently `RUNNING` and peaked at 109 exact one-L4 Spot `g2-standard-4` VMs, with zero on-demand and zero wrong-shape instances. A fresh 256-request wave moved the native census 71 -> 105 in roughly two minutes. Normal down reduced 109 running VMs to one in 4 minutes 43 seconds; release `1.1.1541` / Serve064 deleted the final exact VM, projected `ABSENT`, and held provider/database active authority at zero through the full horizon. |
 | Final load proof | Not complete. Run `final10k-1524-20260827-0246` retains one immutable 10,000-ID manifest. It accepted 2,125 identities, classified 29 exact transport outcomes as ambiguous for durable reconciliation, and retained 7,846 pending identities before stopping on the publication defect. Live telemetry proved nonzero queued/in-flight demand and computed targets of 414 and 494. The exact 503 body `No replica has confirmed free async capacity. Use "sky serve status [SERVICE_NAME]" to check the replica status.` is a definitive retryable pre-dispatch rejection only when the PostgreSQL request receipt is exactly `REJECTED_PRE_DISPATCH`; the harness may classify that exact pair without relaxing any other 5xx outcome. The run identity must be resumed, not replaced. |
 | Demand/publication ordering | The PostgreSQL-linearized planner, semantic fingerprint, weighted exact-card target, current-generation cancellation, whole-wave drain seed, restored-route fence, capacity-time SLA target, demand-gated fill, and accelerator-scoped reserved authority are merged and deployed. The clean `1.1.1540` lifecycle published and actuated a 120-unit exact-L4 Spot target; provider availability converged to 105 running and later 109 without on-demand spill. |
+| Utilization/allocation causality | Open and source-in-progress after the lifecycle-124 calibration. The schema-5 allocation can be internally fresh yet precede the utilization sample for the locked positive demand, allowing a small paid residual before the next broker round. Schema 6 binds the demonstrated-need sample and upward-grant convergence; production proof must show the idle-to-burst transition commits compatible reserved capacity before the first new paid claim. |
 
 The completed paid-gate post-rollout census was green after Helm revision 635:
 the service, replicas, claims, waiters, request associations, queue rows,
@@ -1360,6 +1395,11 @@ missing telemetry.
     retries only its own association; independent cleanup proceeds, while any
     shared identity or controller-authority failure remains globally
     fail-closed.
+19. **Demand-causal allocation:** a utilization-gated positive compatible paid
+    plan may use only an authenticated allocation whose non-blind demonstrated
+    need covers the locked current sample and whose raw upward grants have all
+    reached their damped grants. An older idle or upward-in-flight allocation
+    is retryable unavailable authority, never paid residual evidence.
 
 ## Compatibility contract
 
@@ -1632,6 +1672,12 @@ condition of the already-complete paid Spot provider-lifecycle gate.
    provider-available limit, not an instantaneous exact count of 100. Require
    bounded overshoot/undershoot to reconcile within a few minutes and record
    time-to-limit from the atomic paid-wave commit.
+   From an authenticated idle map, additionally require the first positive
+   paid claim to postdate a schema-6 allocation with a non-blind covering
+   utilization sample and ``upward_grants_settled=true``. Observe at least one
+   deliberately stale idle-to-burst pass committing neither a paid claim nor a
+   provider request, followed by reserved admission and only then the genuine
+   Spot residual.
 6. Require zero ordinary on-demand instance, zero paid non-Spot row, and no
    provider action outside the armed service/run envelope.
 7. Record selection-time pool, instance shape, normalized price, provider

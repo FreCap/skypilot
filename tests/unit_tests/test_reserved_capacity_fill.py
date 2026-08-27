@@ -2693,6 +2693,10 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
         get_replicas.assert_called_once_with('svc')
         autoscaler.fill_demand_sample.assert_called_once_with([])
         replace.assert_called_once()
+        utilization_state = replace.call_args.kwargs['utilization_state']
+        self.assertEqual(utilization_state['demonstrated_need'], 4)
+        self.assertFalse(utilization_state['boot_hold'])
+        self.assertFalse(utilization_state['blind'])
         edges = replace.call_args.kwargs['edges']
         self.assertEqual([edge['access_context'] for edge in edges],
                          ['east-context', 'phx-context'])
