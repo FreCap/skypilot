@@ -5396,6 +5396,76 @@ class TestAutoscalerRuntimeSnapshot:
         assert call_order == ['supply', 'demand']
         repository.project_reserved_supply.assert_called_once()
 
+    def test_promoted_reconcile_reuses_projected_allocation_for_publication(
+            self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._ordinary_launch_binding_authority = types.SimpleNamespace(  # pylint: disable=protected-access
+            service_lifecycle_epoch=3)
+        ctrl._durable_demand_snapshot = self._durable_snapshot()  # pylint: disable=protected-access
+        scaler = self._logical_durable_autoscaler(target=2, emit_scale_up=True)
+        scaler.reserved_capacity_fill = True
+        scaler.supports_reserved_supply_economic_target.return_value = True
+        ctrl._autoscaler = scaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        allocation, _ = self._reserved_fill_allocation()
+        projection = controller.capacity_admission.ReservedSupplyProjection(
+            pending_zero_cost_capacity_by_accelerator={'l4': 0},
+            allocation_reserved_capacity_by_accelerator={'l4': 1},
+            economic_replica_infos=(),
+            economic_kueue_capacity_by_replica_id={},
+            economic_capacity_graph_sha256='f' * 64)
+        repository = mock.Mock()
+        repository.project_reserved_supply.return_value = projection
+        authority = mock.Mock()
+        retirement_shelter = types.SimpleNamespace(authority_current=True)
+        plan = ([], 2, None, None, None, retirement_shelter, False)
+
+        with mock.patch.object(
+                controller.capacity_admission,
+                'get_service_source_mode',
+                return_value=(controller.capacity_admission.DemandSourceMode.
+                              DURABLE_FEED, 1)), \
+             mock.patch.object(controller.capacity_admission,
+                               'CapacityAdmissionRepository',
+                               return_value=repository), \
+             mock.patch.object(controller.demand_state,
+                               'get_autoscaling_snapshot',
+                               return_value=self._durable_snapshot()), \
+             mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1]}), \
+             mock.patch.object(ctrl,
+                               '_read_sequenced_reserved_fill_allocation',
+                               return_value=(True, allocation)) as read_fill, \
+             mock.patch.object(ctrl,
+                               '_accept_sequenced_reserved_fill',
+                               return_value=False), \
+             mock.patch.object(ctrl,
+                               '_plan_scale_reconciliation',
+                               return_value=plan), \
+             mock.patch.object(ctrl,
+                               '_persist_cost_rebalance_state',
+                               return_value=True), \
+             mock.patch.object(ctrl,
+                               '_publish_ordered_paid_authority',
+                               return_value=authority) as publish:
+            ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
+
+        assert read_fill.call_args_list == [mock.call(), mock.call()]
+        repository.project_reserved_supply.assert_called_once()
+        publish.assert_called_once_with(  # pylint: disable=protected-access
+            scaler,
+            1,
+            sequenced_reserved_fill=True,
+            reserved_fill_allocation_map=allocation,
+            reserved_supply_projection=projection)
+
     def test_promoted_paid_launch_uses_post_zero_cost_plan_authority(self):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access

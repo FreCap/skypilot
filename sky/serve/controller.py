@@ -6358,6 +6358,7 @@ class SkyServeController:
                     demand_source is not None and demand_source[0] is
                     capacity_admission.DemandSourceMode.DURABLE_FEED)
                 logical_reconcile_invalidated = False
+                pre_demand_sequenced_fill = False
                 pre_demand_allocation = None
                 reserved_supply_projection = None
                 previous_demand = self._durable_demand_snapshot
@@ -6370,9 +6371,10 @@ class SkyServeController:
                     # durable intents only.  It supplies no ordinary-demand
                     # debit and installs no target, paid authority, or
                     # retirement decision.
-                    (sequenced_fill, pre_demand_allocation) = (
+                    (pre_demand_sequenced_fill, pre_demand_allocation) = (
                         self._read_sequenced_reserved_fill_allocation())
-                    if sequenced_fill and pre_demand_allocation is not None:
+                    if (pre_demand_sequenced_fill and
+                            pre_demand_allocation is not None):
                         if not self._scale_actuation_is_current(
                                 actuation_generation, decision_autoscaler,
                                 decision_version):
@@ -6402,7 +6404,7 @@ class SkyServeController:
                     previous_demand_may_be_positive = (
                         previous_demand is None or
                         not previous_demand.fresh_aggregate_zero)
-                    if (sequenced_fill and
+                    if (pre_demand_sequenced_fill and
                             pre_demand_allocation is not None and
                             previous_demand_may_be_positive):
                         binding = self._ordinary_launch_binding_authority
@@ -6566,8 +6568,20 @@ class SkyServeController:
                 sequenced_reserved_fill = False
                 allocation = None
                 if decision_autoscaler.reserved_capacity_fill:
-                    (sequenced_reserved_fill, allocation) = (
-                        self._read_sequenced_reserved_fill_allocation())
+                    if durable_demand_promoted:
+                        # The projected supply and the subsequent demand
+                        # snapshot form one optimistic publication input.
+                        # Re-reading here can observe a newer broker heartbeat
+                        # and discard the exact projection on every busy-loop
+                        # iteration. CapacityAdmissionRepository.publish()
+                        # locks and revalidates this captured allocation and
+                        # graph with demand, so reuse is both safe and the only
+                        # way to preserve one atomic planning boundary.
+                        sequenced_reserved_fill = pre_demand_sequenced_fill
+                        allocation = pre_demand_allocation
+                    else:
+                        (sequenced_reserved_fill, allocation) = (
+                            self._read_sequenced_reserved_fill_allocation())
                 replica_infos = serve_state.get_replica_infos(
                     self._service_name)
                 ordered_paid_authority = None
@@ -6827,9 +6841,7 @@ class SkyServeController:
                         if sequenced_reserved_fill:
                             reserved_supply_kwargs[
                                 'reserved_supply_projection'] = (
-                                    reserved_supply_projection
-                                    if allocation == pre_demand_allocation else
-                                    None)
+                                    reserved_supply_projection)
                         ordered_paid_authority = (
                             self._publish_ordered_paid_authority(
                                 decision_autoscaler,
