@@ -19,7 +19,7 @@ from sky.serve import reserved_capacity_broker
 from sky.serve import spot_placer
 
 _SHA256_PATTERN = re.compile(r'^[0-9a-f]{64}$')
-ALLOCATION_MAP_SCHEMA_VERSION = 5
+ALLOCATION_MAP_SCHEMA_VERSION = 6
 _LOCATION_PICKLEABLE_FIELDS = frozenset({
     'cloud',
     'region',
@@ -61,6 +61,11 @@ _AUTHENTICATED_ALLOCATION_MAP_FIELDS = frozenset({
     'reclaim_fleet_bundle_sha256',
     'reclaim_policy_revision',
     'reclaim_provider_inventory_sha256',
+    'utilization_gate_armed',
+    'utilization_demonstrated_need',
+    'utilization_boot_hold',
+    'utilization_ceiling',
+    'upward_grants_settled',
     'pool_snapshots',
 })
 
@@ -569,6 +574,11 @@ class AuthenticatedAllocationMap:
     reclaim_fleet_bundle_sha256: str
     reclaim_policy_revision: str
     reclaim_provider_inventory_sha256: str
+    utilization_gate_armed: bool
+    utilization_demonstrated_need: int | None
+    utilization_boot_hold: bool
+    utilization_ceiling: int
+    upward_grants_settled: bool
     pool_snapshots: tuple[PoolFillSnapshot, ...]
 
     @staticmethod
@@ -581,6 +591,11 @@ class AuthenticatedAllocationMap:
         reclaim_fleet_bundle_sha256: str,
         reclaim_policy_revision: str,
         reclaim_provider_inventory_sha256: str,
+        utilization_gate_armed: bool,
+        utilization_demonstrated_need: int | None,
+        utilization_boot_hold: bool,
+        utilization_ceiling: int,
+        upward_grants_settled: bool,
         pool_snapshots: tuple[PoolFillSnapshot, ...],
     ) -> dict[str, Any]:
         return {
@@ -593,6 +608,11 @@ class AuthenticatedAllocationMap:
             'reclaim_fleet_bundle_sha256': reclaim_fleet_bundle_sha256,
             'reclaim_policy_revision': reclaim_policy_revision,
             'reclaim_provider_inventory_sha256': reclaim_provider_inventory_sha256,
+            'utilization_gate_armed': utilization_gate_armed,
+            'utilization_demonstrated_need': utilization_demonstrated_need,
+            'utilization_boot_hold': utilization_boot_hold,
+            'utilization_ceiling': utilization_ceiling,
+            'upward_grants_settled': upward_grants_settled,
             'pool_snapshots': [
                 snapshot.canonical_payload() for snapshot in pool_snapshots
             ],
@@ -611,6 +631,11 @@ class AuthenticatedAllocationMap:
         reclaim_policy_revision: str,
         reclaim_provider_inventory_sha256: str,
         pool_snapshots: tuple[PoolFillSnapshot, ...],
+        utilization_gate_armed: bool = False,
+        utilization_demonstrated_need: int | None = None,
+        utilization_boot_hold: bool = False,
+        utilization_ceiling: int = 0,
+        upward_grants_settled: bool = True,
     ) -> 'AuthenticatedAllocationMap':
         """Create an allocation map and bind its complete canonical input."""
         _require_int(allocation_generation, 'Allocation generation', minimum=1)
@@ -630,6 +655,21 @@ class AuthenticatedAllocationMap:
                                  'Reclaim policy revision')
         _require_sha256(reclaim_provider_inventory_sha256,
                         'Reclaim provider inventory hash')
+        if type(utilization_gate_armed) is not bool:
+            raise ValueError('Utilization gate armed must be a boolean.')
+        if utilization_demonstrated_need is not None:
+            _require_int(utilization_demonstrated_need,
+                         'Utilization demonstrated need')
+        if type(utilization_boot_hold) is not bool:
+            raise ValueError('Utilization boot hold must be a boolean.')
+        _require_int(utilization_ceiling, 'Utilization ceiling')
+        if type(upward_grants_settled) is not bool:
+            raise ValueError('Upward grants settled must be a boolean.')
+        if (not utilization_gate_armed and
+            (utilization_demonstrated_need is not None or
+             utilization_boot_hold)):
+            raise ValueError('An unarmed utilization gate cannot carry a '
+                             'demand sample.')
         if type(pool_snapshots) is not tuple or any(
                 not isinstance(snapshot, PoolFillSnapshot)
                 for snapshot in pool_snapshots):
@@ -642,7 +682,9 @@ class AuthenticatedAllocationMap:
                 ordinary_zero_cost_admission_sequence_high_water,
                 reconciliation_gate_generation, reclaim_fleet_bundle_sha256,
                 reclaim_policy_revision, reclaim_provider_inventory_sha256,
-                pool_snapshots))
+                utilization_gate_armed, utilization_demonstrated_need,
+                utilization_boot_hold, utilization_ceiling,
+                upward_grants_settled, pool_snapshots))
         return cls(
             allocation_generation=allocation_generation,
             allocation_input_sha256=input_hash,
@@ -655,6 +697,11 @@ class AuthenticatedAllocationMap:
             reclaim_policy_revision=reclaim_policy_revision,
             reclaim_provider_inventory_sha256=(
                 reclaim_provider_inventory_sha256),
+            utilization_gate_armed=utilization_gate_armed,
+            utilization_demonstrated_need=utilization_demonstrated_need,
+            utilization_boot_hold=utilization_boot_hold,
+            utilization_ceiling=utilization_ceiling,
+            upward_grants_settled=upward_grants_settled,
             pool_snapshots=pool_snapshots,
         )
 
@@ -692,6 +739,12 @@ class AuthenticatedAllocationMap:
             reclaim_policy_revision=data['reclaim_policy_revision'],
             reclaim_provider_inventory_sha256=(
                 data['reclaim_provider_inventory_sha256']),
+            utilization_gate_armed=data['utilization_gate_armed'],
+            utilization_demonstrated_need=(
+                data['utilization_demonstrated_need']),
+            utilization_boot_hold=data['utilization_boot_hold'],
+            utilization_ceiling=data['utilization_ceiling'],
+            upward_grants_settled=data['upward_grants_settled'],
             pool_snapshots=snapshots,
         )
 
@@ -716,6 +769,21 @@ class AuthenticatedAllocationMap:
                                  'Reclaim policy revision')
         _require_sha256(self.reclaim_provider_inventory_sha256,
                         'Reclaim provider inventory hash')
+        if type(self.utilization_gate_armed) is not bool:
+            raise ValueError('Utilization gate armed must be a boolean.')
+        if self.utilization_demonstrated_need is not None:
+            _require_int(self.utilization_demonstrated_need,
+                         'Utilization demonstrated need')
+        if type(self.utilization_boot_hold) is not bool:
+            raise ValueError('Utilization boot hold must be a boolean.')
+        _require_int(self.utilization_ceiling, 'Utilization ceiling')
+        if type(self.upward_grants_settled) is not bool:
+            raise ValueError('Upward grants settled must be a boolean.')
+        if (not self.utilization_gate_armed and
+            (self.utilization_demonstrated_need is not None or
+             self.utilization_boot_hold)):
+            raise ValueError('An unarmed utilization gate cannot carry a '
+                             'demand sample.')
         if type(self.pool_snapshots) is not tuple:
             raise ValueError('Pool snapshots must be an immutable tuple.')
         if any(not isinstance(snapshot, PoolFillSnapshot)
@@ -759,7 +827,10 @@ class AuthenticatedAllocationMap:
                 self.ordinary_zero_cost_admission_sequence_high_water,
                 self.reconciliation_gate_generation,
                 self.reclaim_fleet_bundle_sha256, self.reclaim_policy_revision,
-                self.reclaim_provider_inventory_sha256, self.pool_snapshots))
+                self.reclaim_provider_inventory_sha256,
+                self.utilization_gate_armed, self.utilization_demonstrated_need,
+                self.utilization_boot_hold, self.utilization_ceiling,
+                self.upward_grants_settled, self.pool_snapshots))
         if self.allocation_input_sha256 != expected_hash:
             raise ValueError('Allocation input hash does not match the '
                              'complete canonical allocation map.')
@@ -780,6 +851,11 @@ class AuthenticatedAllocationMap:
             'reclaim_policy_revision': self.reclaim_policy_revision,
             'reclaim_provider_inventory_sha256':
                 self.reclaim_provider_inventory_sha256,
+            'utilization_gate_armed': self.utilization_gate_armed,
+            'utilization_demonstrated_need': self.utilization_demonstrated_need,
+            'utilization_boot_hold': self.utilization_boot_hold,
+            'utilization_ceiling': self.utilization_ceiling,
+            'upward_grants_settled': self.upward_grants_settled,
             'pool_snapshots': [
                 snapshot.canonical_payload() for snapshot in self.pool_snapshots
             ],

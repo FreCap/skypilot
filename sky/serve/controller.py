@@ -59,6 +59,7 @@ from sky.serve import pool_capacity_observation
 from sky.serve import provider_phase
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
+from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_allocation
 from sky.serve import reserved_fill_planner
 from sky.serve import route_projection
@@ -6225,6 +6226,27 @@ class SkyServeController:
             return exact_target
         return {capacity_admission.AGGREGATE_ACCELERATOR: final_target}
 
+    @staticmethod
+    def _allocation_covers_current_utilization(
+        decision_autoscaler: autoscalers.Autoscaler,
+        replica_infos: list[replica_managers.ReplicaInfo],
+        allocation: reserved_fill_planner.AuthenticatedAllocationMap,
+    ) -> bool:
+        """Whether a gated allocation causally covers the current demand."""
+        if (not getattr(decision_autoscaler, 'reserved_fill_utilization_gate',
+                        allocation.utilization_gate_armed) or
+                not reserved_capacity_broker.utilization_gate_enabled()):
+            return True
+        if (not allocation.utilization_gate_armed or
+                allocation.utilization_demonstrated_need is None or
+                not allocation.upward_grants_settled):
+            return False
+        sample = decision_autoscaler.fill_demand_sample(replica_infos)
+        if sample is None:
+            return False
+        return (allocation.utilization_demonstrated_need
+                >= sample.demonstrated_need())
+
     def _plan_and_publish_current_capacity(
         self,
         decision_autoscaler: autoscalers.Autoscaler,
@@ -6378,6 +6400,14 @@ class SkyServeController:
                     not in positive_cards and
                     positive_cards.isdisjoint(supply.reserved_accelerators))
                 if supply.allocation_bound:
+                    assert reserved_fill_allocation_map is not None
+                    if not self._allocation_covers_current_utilization(
+                            decision_autoscaler, replica_infos,
+                            reserved_fill_allocation_map):
+                        raise capacity_admission.CapacityAdmissionConflict(
+                            'Current reserved allocation predates the '
+                            'utilization sample or has an unsettled upward '
+                            'grant.')
                     try:
                         economic_target = (
                             decision_autoscaler.

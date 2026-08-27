@@ -134,6 +134,52 @@ def _exact_nonnegative_counts(value: Any, subject: str) -> dict[str, int]:
     return normalized
 
 
+def _claim_utilization_authority(
+    set_row: RowMapping,) -> tuple[bool, int | None, bool, int]:
+    """Decode the exact service-wide utilization witness for one map."""
+    ceiling = set_row['utilization_ceiling']
+    headroom = set_row['global_headroom']
+    if (type(ceiling) is not int or ceiling < 0 or type(headroom) is not int or
+            headroom < 0 or ceiling > headroom):
+        raise ReservedFillAllocationCorruptionError(
+            'Reserved-fill utilization ceiling is malformed.')
+    raw_state = set_row['utilization_state']
+    if raw_state is None:
+        if ceiling != headroom:
+            raise ReservedFillAllocationCorruptionError(
+                'An ungated reserved-fill claim has a reduced ceiling.')
+        return False, None, False, ceiling
+    state = _decode_json_object(raw_state, 'Claim utilization state')
+    required = {
+        'cap', 'hot_until', 'stepped_at', 'blind_since', 'demonstrated_need',
+        'boot_hold', 'blind'
+    }
+    if set(state) != required:
+        raise ReservedFillAllocationCorruptionError(
+            'Claim utilization state has an unsupported shape.')
+    cap = state['cap']
+    need = state['demonstrated_need']
+    boot_hold = state['boot_hold']
+    blind = state['blind']
+    times = (state['hot_until'], state['stepped_at'])
+    blind_since = state['blind_since']
+    if (type(cap) is not int or cap < 0 or ceiling != min(headroom, cap) or
+            type(boot_hold) is not bool or type(blind) is not bool or any(
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(float(value)) or value < 0
+                for value in times) or
+        (blind_since is not None and
+         (isinstance(blind_since, bool) or
+          not isinstance(blind_since, (int, float)) or
+          not math.isfinite(float(blind_since)) or blind_since < 0)) or
+        (need is not None and (type(need) is not int or need < 0)) or
+        (blind and
+         (need is not None or boot_hold)) or (not blind and need is None)):
+        raise ReservedFillAllocationCorruptionError(
+            'Claim utilization witness is malformed.')
+    return True, need, boot_hold, ceiling
+
+
 def _decode_accelerator_names(value: Any) -> tuple[str, ...]:
     if isinstance(value, str):
         try:
@@ -604,6 +650,21 @@ class ReservedFillAllocationRepository:
         return True
 
     @staticmethod
+    def _upward_grant_is_settled(
+        service_name: str,
+        snapshot: reserved_fill_planner.PoolFillSnapshot,
+        round_row: RowMapping,
+    ) -> bool:
+        """Whether this pool's damped grant has reached its raw entitlement."""
+        raw_grants = _decode_json_object(round_row['raw_grants'],
+                                         'Round raw grants')
+        raw = raw_grants.get(service_name)
+        if type(raw) is not int or raw < 0 or raw > snapshot.edge_cap:
+            raise ReservedFillAllocationCorruptionError(
+                'Round raw grant is malformed or exceeds its edge cap.')
+        return raw <= snapshot.grant
+
+    @staticmethod
     def _read_allocation_columns(
         connection: sqlalchemy.engine.Connection,
         service_name: str,
@@ -635,6 +696,12 @@ class ReservedFillAllocationRepository:
         if type(raw_map) is not dict:
             raise ReservedFillAllocationCorruptionError(
                 'Published allocation map must be a JSON object.')
+        if raw_map.get('schema_version') == 5:
+            # N-1 is readable only as stale authority.  The schema-6 writer
+            # replaces it under the existing generation CAS; no positive
+            # provider effect may consume an allocation that lacks the
+            # utilization causality witness.
+            return None
         try:
             allocation = (reserved_fill_planner.AuthenticatedAllocationMap.
                           from_mapping(raw_map))
@@ -725,6 +792,9 @@ class ReservedFillAllocationRepository:
             set_row, edges = claim_state
             if set_row['generation'] != claim_generation:
                 return None
+            (utilization_gate_armed, utilization_demonstrated_need,
+             utilization_boot_hold,
+             utilization_ceiling) = _claim_utilization_authority(set_row)
             if (service_row['current_version'] != set_row['service_version'] or
                     not self._lock_projection_source(
                         connection, name, set_row['service_version'], edges)):
@@ -734,11 +804,15 @@ class ReservedFillAllocationRepository:
                 return None
 
             now = _database_now(connection)
+            upward_grants_settled = True
             for snapshot in pool_snapshots:
+                round_row = locked_rounds[snapshot.pool_key]
                 if not self._validate_round(connection, name, snapshot,
-                                            locked_rounds[snapshot.pool_key],
-                                            now):
+                                            round_row, now):
                     return None
+                upward_grants_settled = (upward_grants_settled and
+                                         self._upward_grant_is_settled(
+                                             name, snapshot, round_row))
 
             allocation_columns = self._read_allocation_columns(connection, name)
             if allocation_columns is None:
@@ -763,7 +837,13 @@ class ReservedFillAllocationRepository:
                     == protocol_authority['reclaim_policy_revision'] and
                     current.reclaim_provider_inventory_sha256
                     == protocol_authority['reclaim_provider_inventory_sha256']
-                    and allocation_columns['allocation_gate_generation']
+                    and current.utilization_gate_armed == utilization_gate_armed
+                    and current.utilization_demonstrated_need
+                    == utilization_demonstrated_need and
+                    current.utilization_boot_hold == utilization_boot_hold and
+                    current.utilization_ceiling == utilization_ceiling and
+                    current.upward_grants_settled == upward_grants_settled and
+                    allocation_columns['allocation_gate_generation']
                     == gate_generation):
                 return current
 
@@ -786,6 +866,11 @@ class ReservedFillAllocationRepository:
                     protocol_authority['reclaim_policy_revision']),
                 reclaim_provider_inventory_sha256=(
                     protocol_authority['reclaim_provider_inventory_sha256']),
+                utilization_gate_armed=utilization_gate_armed,
+                utilization_demonstrated_need=(utilization_demonstrated_need),
+                utilization_boot_hold=utilization_boot_hold,
+                utilization_ceiling=utilization_ceiling,
+                upward_grants_settled=upward_grants_settled,
                 pool_snapshots=pool_snapshots)
             allocation_table = (pool_capacity_observation_schema.
                                 reserved_fill_service_allocation_table)
@@ -878,6 +963,9 @@ class ReservedFillAllocationRepository:
         if claim_state is None:
             return None
         set_row, edges = claim_state
+        (utilization_gate_armed, utilization_demonstrated_need,
+         utilization_boot_hold,
+         utilization_ceiling) = _claim_utilization_authority(set_row)
         if (service_row['current_version'] != set_row['service_version'] or
                 not self._lock_projection_source(
                     connection, name, set_row['service_version'], edges)):
@@ -923,6 +1011,11 @@ class ReservedFillAllocationRepository:
                 != protocol_authority['reclaim_policy_revision'] or
                 allocation.reclaim_provider_inventory_sha256
                 != protocol_authority['reclaim_provider_inventory_sha256'] or
+                allocation.utilization_gate_armed != utilization_gate_armed or
+                allocation.utilization_demonstrated_need
+                != utilization_demonstrated_need or
+                allocation.utilization_boot_hold != utilization_boot_hold or
+                allocation.utilization_ceiling != utilization_ceiling or
                 not self._validate_snapshot_topology(allocation.pool_snapshots,
                                                      int(set_row['generation']),
                                                      edges)):
@@ -933,10 +1026,17 @@ class ReservedFillAllocationRepository:
                 any(snapshot.valid_until < now
                     for snapshot in allocation.pool_snapshots)):
             return None
+        upward_grants_settled = True
         for snapshot in allocation.pool_snapshots:
-            if not self._validate_round(connection, name, snapshot,
-                                        locked_rounds[snapshot.pool_key], now):
+            round_row = locked_rounds[snapshot.pool_key]
+            if not self._validate_round(connection, name, snapshot, round_row,
+                                        now):
                 return None
+            upward_grants_settled = (upward_grants_settled and
+                                     self._upward_grant_is_settled(
+                                         name, snapshot, round_row))
+        if allocation.upward_grants_settled != upward_grants_settled:
+            return None
         return allocation
 
     def read_current(  # pylint: disable=too-many-locals

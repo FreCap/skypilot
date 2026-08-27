@@ -3544,14 +3544,17 @@ def _broker_cycle_v2(
     if (autoscaler.reserved_fill_utilization_gate and
             reserved_capacity_broker.utilization_gate_enabled()):
         sample = autoscaler.fill_demand_sample(replica_infos)
+        demonstrated_need = (None
+                             if sample is None else sample.demonstrated_need())
+        boot_hold = False if sample is None else sample.boot_hold()
         prior_state = (previous_set.get('utilization_state')
                        if previous_set is not None else None)
         utilization_state = reserved_capacity_broker.advance_release_target(
             prior_state if isinstance(prior_state, dict) else None,
             floor=0,
             holdings=total_fill_holdings,
-            need=0 if sample is None else sample.demonstrated_need(),
-            boot_hold=False if sample is None else sample.boot_hold(),
+            need=0 if demonstrated_need is None else demonstrated_need,
+            boot_hold=boot_hold,
             blind=sample is None,
             now=now,
             dwell=constants.RESERVED_FILL_IDLE_DWELL_SECONDS,
@@ -3560,6 +3563,15 @@ def _broker_cycle_v2(
             min_step=constants.RESERVED_FILL_RELEASE_MIN_STEP,
             headroom=constants.RESERVED_FILL_UTILIZATION_HEADROOM,
             blind_grace=constants.RESERVED_FILL_BLIND_GRACE_SECONDS)
+        # Allocation schema 6 binds the activity sample that produced this
+        # ceiling.  The release governor ignores these additive witness keys,
+        # while the PostgreSQL allocation publisher authenticates them before
+        # a compatible positive paid plan may consume the map.
+        utilization_state.update({
+            'demonstrated_need': demonstrated_need,
+            'boot_hold': boot_hold,
+            'blind': sample is None,
+        })
         utilization_ceiling = min(global_headroom,
                                   max(0, int(utilization_state['cap'])))
     else:

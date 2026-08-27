@@ -4290,6 +4290,7 @@ class TestAutoscalerRuntimeSnapshot:
         scaler.latest_version = 1
         scaler.replica_unit = 'physical_backend'
         scaler.reserved_capacity_fill = False
+        scaler.reserved_fill_utilization_gate = False
         scaler.has_recomputed_with_fresh_data.return_value = True
         scaler.get_final_target_num_replicas.return_value = target
         scaler.unrecoverable_rollout_failure = None
@@ -4310,6 +4311,7 @@ class TestAutoscalerRuntimeSnapshot:
         scaler.latest_version = 1
         scaler.replica_unit = 'logical'
         scaler.reserved_capacity_fill = False
+        scaler.reserved_fill_utilization_gate = False
         scaler.has_recomputed_with_fresh_data.return_value = True
         scaler.get_final_target_num_replicas.return_value = target
         scaler.unrecoverable_rollout_failure = None
@@ -4421,7 +4423,13 @@ class TestAutoscalerRuntimeSnapshot:
         return repository
 
     @staticmethod
-    def _reserved_fill_allocation(*, grant: int = 1, accelerator: str = 'L4'):
+    def _reserved_fill_allocation(*,
+                                  grant: int = 1,
+                                  accelerator: str = 'L4',
+                                  utilization_gate_armed: bool = False,
+                                  utilization_demonstrated_need: int |
+                                  None = None,
+                                  upward_grants_settled: bool = True):
         location = reserved_fill_planner.LocationSnapshot(
             cloud='Kubernetes',
             region='context-a',
@@ -4460,8 +4468,53 @@ class TestAutoscalerRuntimeSnapshot:
             reclaim_fleet_bundle_sha256='c' * 64,
             reclaim_policy_revision='reclaim-v1',
             reclaim_provider_inventory_sha256='d' * 64,
+            utilization_gate_armed=utilization_gate_armed,
+            utilization_demonstrated_need=(utilization_demonstrated_need),
+            utilization_ceiling=(utilization_demonstrated_need or 0),
+            upward_grants_settled=upward_grants_settled,
             pool_snapshots=(snapshot,))
         return allocation, pool_key
+
+    @pytest.mark.parametrize(
+        ('allocation_need', 'upward_grants_settled', 'expected'), [
+            (2, True, False),
+            (3, True, True),
+            (4, True, True),
+            (3, False, False),
+        ])
+    def test_paid_plan_requires_current_settled_utilization_allocation(
+            self, allocation_need, upward_grants_settled, expected):
+        scaler = self._durable_autoscaler(3)
+        scaler.reserved_fill_utilization_gate = True
+        scaler.fill_demand_sample.return_value = autoscalers.FillDemandSample(
+            outstanding_work=3,
+            busy_fill_holdings=0,
+            pre_ready_fill_holdings=0,
+            upscale_pending=False,
+            work_per_replica=1)
+        allocation, _ = self._reserved_fill_allocation(
+            utilization_gate_armed=True,
+            utilization_demonstrated_need=allocation_need,
+            upward_grants_settled=upward_grants_settled)
+
+        with mock.patch.object(controller.reserved_capacity_broker,
+                               'utilization_gate_enabled',
+                               return_value=True):
+            covered = controller.SkyServeController.\
+                _allocation_covers_current_utilization(scaler, [], allocation)
+
+        assert covered is expected
+
+    def test_paid_plan_does_not_require_utilization_witness_when_gate_is_off(
+            self):
+        scaler = self._durable_autoscaler(3)
+        scaler.reserved_fill_utilization_gate = False
+        allocation, _ = self._reserved_fill_allocation()
+
+        assert controller.SkyServeController.\
+            _allocation_covers_current_utilization(scaler, [],
+                                                   allocation)
+        scaler.fill_demand_sample.assert_not_called()
 
     def test_ordered_target_uses_supply_aware_cross_card_allocation(self):
         scaler = self._durable_autoscaler(65)
@@ -5260,11 +5313,19 @@ class TestAutoscalerRuntimeSnapshot:
             service_lifecycle_epoch=3)
         scaler = self._logical_durable_autoscaler(target=2, emit_scale_up=True)
         scaler.reserved_capacity_fill = True
+        scaler.reserved_fill_utilization_gate = True
         scaler.supports_reserved_supply_economic_target.return_value = True
+        scaler.fill_demand_sample.return_value = autoscalers.FillDemandSample(
+            outstanding_work=2,
+            busy_fill_holdings=0,
+            pre_ready_fill_holdings=0,
+            upscale_pending=False,
+            work_per_replica=1)
         ctrl._autoscaler = scaler  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
         ctrl._replica_manager.spot_placer = None
-        allocation, _ = self._reserved_fill_allocation()
+        allocation, _ = self._reserved_fill_allocation(
+            utilization_gate_armed=True, utilization_demonstrated_need=2)
         projection = controller.capacity_admission.ReservedSupplyProjection(
             pending_zero_cost_capacity_by_accelerator={'l4': 0},
             allocation_reserved_capacity_by_accelerator={'l4': 1},
@@ -5330,6 +5391,9 @@ class TestAutoscalerRuntimeSnapshot:
                                              False)), \
              mock.patch.object(ctrl,
                                '_persist_cost_rebalance_state',
+                               return_value=True), \
+             mock.patch.object(controller.reserved_capacity_broker,
+                               'utilization_gate_enabled',
                                return_value=True):
             ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
 

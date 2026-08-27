@@ -2103,6 +2103,19 @@ def _claim_set_edge() -> dict[str, object]:
     }
 
 
+def _utilization_state(*, cap: int, demonstrated_need: int,
+                       stepped_at: float) -> dict[str, object]:
+    return {
+        'cap': cap,
+        'hot_until': stepped_at + 60,
+        'stepped_at': stepped_at,
+        'blind_since': None,
+        'demonstrated_need': demonstrated_need,
+        'boot_hold': False,
+        'blind': False,
+    }
+
+
 def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
         allocation_engine, monkeypatch) -> None:
     monkeypatch.setattr(serve_state._db_manager, '_engine', allocation_engine)
@@ -2149,10 +2162,9 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
         semantic_hash='semantic-a',
         global_headroom=5,
         utilization_ceiling=4,
-        utilization_state={
-            'cap': 4,
-            'stepped_at': 3.0
-        },
+        utilization_state=_utilization_state(cap=4,
+                                             demonstrated_need=3,
+                                             stepped_at=3.0),
         edges=(runtime_edge,),
         heartbeat_ts=3,
         expected_service_hash=_SERVICE_HASH,
@@ -2160,7 +2172,20 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
         expected_controller_owner=_OWNER,
         reclaim_claim_authorizer=same_authorizer)
     assert runtime_generation == 11
-    assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) == published
+    # The topology generation is unchanged, but schema 6 treats a new demand
+    # witness as new paid-planning authority.  It cannot reuse the idle map.
+    assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) is None
+    republished = repository.publish(_SERVICE,
+                                     expected_service_hash=_SERVICE_HASH,
+                                     expected_controller_owner=_OWNER,
+                                     expected_claim_generation=11,
+                                     expected_gate_generation=1,
+                                     pool_snapshots=(snapshot,))
+    assert republished is not None
+    assert republished.allocation_generation == 2
+    assert republished.utilization_gate_armed
+    assert republished.utilization_demonstrated_need == 3
+    assert republished.utilization_ceiling == 4
 
     lower_cap_edge = dict(runtime_edge)
     lower_cap_edge['effective_cap'] = 4
@@ -2169,10 +2194,9 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
         semantic_hash='semantic-a',
         global_headroom=4,
         utilization_ceiling=4,
-        utilization_state={
-            'cap': 4,
-            'stepped_at': 4.0
-        },
+        utilization_state=_utilization_state(cap=4,
+                                             demonstrated_need=3,
+                                             stepped_at=4.0),
         edges=(lower_cap_edge,),
         heartbeat_ts=4,
         expected_service_hash=_SERVICE_HASH,
@@ -2181,7 +2205,7 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
         reclaim_claim_authorizer=same_authorizer)
     assert lower_cap_generation == 11
     # Same-generation cap changes do not clear the publication row, but the
-    # schema-5 reader immediately rejects the stale edge-cap authority.
+    # schema-6 reader immediately rejects the stale edge-cap authority.
     with allocation_engine.connect() as connection:
         assert connection.execute(
             sqlalchemy.text("""
@@ -2190,7 +2214,7 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
                 WHERE service_name = :name
             """), {
                 'name': _SERVICE
-            }).scalar_one() == 1
+            }).scalar_one() == 2
     assert repository.read_current(_SERVICE, _SERVICE_HASH, _OWNER) is None
 
     next_authorizer = _claim_policy_authorizer('semantic-b')
@@ -2218,6 +2242,37 @@ def test_semantic_claim_replacement_clears_but_noop_preserves_publication(
                 'name': _SERVICE
             }).one()
     assert tuple(cleared) == (0, None, None, None)
+
+
+def test_publication_records_unsettled_upward_grant(allocation_engine,
+                                                    monkeypatch) -> None:
+    monkeypatch.setattr(serve_state._db_manager, '_engine', allocation_engine)
+    _, snapshot = _commit_evidence(allocation_engine)
+    with allocation_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                UPDATE reserved_fill_rounds
+                SET grants = :grants, raw_grants = :raw_grants
+                WHERE pool_key = :pool_key
+            """), {
+                'grants': json.dumps({_SERVICE: 4}),
+                'raw_grants': json.dumps({_SERVICE: 8}),
+                'pool_key': _POOL_KEY,
+            })
+    snapshot = dataclasses.replace(snapshot, grant=4)
+    repository = _repository(allocation_engine)
+
+    allocation = repository.publish(_SERVICE,
+                                    expected_service_hash=_SERVICE_HASH,
+                                    expected_controller_owner=_OWNER,
+                                    expected_claim_generation=11,
+                                    expected_gate_generation=1,
+                                    pool_snapshots=(snapshot,))
+
+    assert allocation is not None
+    assert not allocation.upward_grants_settled
+    assert repository.read_current(_SERVICE, _SERVICE_HASH,
+                                   _OWNER) == allocation
 
 
 @pytest.mark.parametrize('lock_target', ['protocol', 'legacy-projection'])
