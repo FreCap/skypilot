@@ -92,6 +92,27 @@ publication still rejects atomically, and every later paid claim revalidates
 the current plan and graph. This is an ordering correction, not permission to
 accept changed demand or stale reserved capacity.
 
+Release ``1.1.1523`` deployed that order in Helm revision 642. The preserved
+run resumed at 8,080 accepted identities and proved that local actuation was no
+longer ahead of publication, but also exposed that shape/Kueue decision-input
+preparation itself remained on the demand side of the boundary. That
+preparation resolves durable replica handles and lane capacity and may outlive
+an LB report interval; rising queue/in-flight telemetry therefore still
+advanced before the now-immediate publication. The canonical boundary includes
+all immutable decision preparation: ``project supply -> load replica/runtime
+and shape/Kueue inputs -> capture demand -> compute target -> publish``. A
+durable planning fingerprint captured with the prepared replica snapshot is
+rechecked after demand, while the publication transaction independently
+reconstructs allocation, economic supply, route, lifecycle, and demand. No
+demand comparator is relaxed. The first reconcile after controller birth may
+prepare no inputs and fail closed; the captured demand then makes the next
+reconcile use the canonical short section.
+
+Zero-residual revocation is deliberately unbound from a reserved allocation.
+It therefore discards any earlier economic supply projection before building
+the plan; carrying an allocation graph digest on an unbound zero plan is both
+meaningless and rejected by the repository.
+
 The normal lifecycle-116 teardown then exposed two independent reducer defects.
 First, exact reserved-fill absence reached the common replica projection, but
 terminal request status and cause were read only in the paid-provider branch.

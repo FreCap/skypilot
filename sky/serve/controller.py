@@ -5819,6 +5819,8 @@ class SkyServeController:
         sequenced_reserved_fill: bool,
         sequenced_reserved_fill_allocation: (
             reserved_fill_planner.AuthenticatedAllocationMap | None) = None,
+        prepared_decision_inputs: (
+            autoscalers.ScalingDecisionInputs | None) = None,
     ) -> tuple[list[autoscalers.AutoscalerDecision], int | None,
                autoscalers.UnrecoverableRolloutFailure | None, Any, Any, Any,
                bool] | None:
@@ -5838,9 +5840,11 @@ class SkyServeController:
                 notification_generation or
                 self._reconcile_generation != demand_generation):
             return None
-        decision_inputs = (
-            autoscalers.prepare_controller_scaling_decision_inputs(
-                decision_autoscaler, replica_infos))
+        decision_inputs = prepared_decision_inputs
+        if decision_inputs is None:
+            decision_inputs = (
+                autoscalers.prepare_controller_scaling_decision_inputs(
+                    decision_autoscaler, replica_infos))
         if planning_state_fingerprint is not None:
             current_fingerprint = (
                 serve_state.get_scale_planning_state_fingerprint(
@@ -6248,6 +6252,12 @@ class SkyServeController:
                 capacity_admission.ReservedFillPlanAuthority.bound(
                     reserved_fill_allocation_map.identity))
         supply_projection = reserved_supply_projection
+        if (reserved_fill_authority.mode is not capacity_admission.
+                ReservedFillPlanAuthorityMode.ALLOCATION_BOUND):
+            # A projected economic graph belongs only to the exact allocation
+            # it was captured with. Zero revocation and non-fill plans are
+            # deliberately unbound and must carry no stale allocation fields.
+            supply_projection = None
         repository = capacity_admission.CapacityAdmissionRepository()
         if (reserved_fill_authority.mode is capacity_admission.
                 ReservedFillPlanAuthorityMode.ALLOCATION_BOUND):
@@ -6441,6 +6451,30 @@ class SkyServeController:
                                     'Reserved supply could not be projected '
                                     'before the durable demand boundary: '
                                     f'{common_utils.format_exception(error)}')
+                prepared_replica_infos: (
+                    list[replica_managers.ReplicaInfo] | None) = None
+                prepared_planning_state_fingerprint: str | None = None
+                prepared_decision_inputs: (
+                    autoscalers.ScalingDecisionInputs | None) = None
+                if durable_demand_promoted and previous_demand is not None:
+                    # Shape/Kueue input preparation may perform blocking
+                    # durable reads. Keep it on the supply side of the demand
+                    # boundary: after demand is captured, target computation
+                    # and PostgreSQL publication must be one short optimistic
+                    # section that can fit between LB report generations.
+                    prepared_replica_infos = serve_state.get_replica_infos(
+                        self._service_name)
+                    if (autoscalers.controller_prepares_scaling_decision_inputs(
+                            decision_autoscaler)):
+                        prepared_planning_state_fingerprint = (
+                            serve_state.get_scale_planning_state_fingerprint(
+                                self._service_name, require_version=True))
+                        assert prepared_planning_state_fingerprint is not None, (
+                            'No service record found for '
+                            f'{self._service_name}')
+                    prepared_decision_inputs = (
+                        autoscalers.prepare_controller_scaling_decision_inputs(
+                            decision_autoscaler, prepared_replica_infos))
                 durable_snapshot = None
                 durable_logical_snapshot: (
                     replica_managers.LogicalReconcileSnapshot | None) = None
@@ -6556,15 +6590,6 @@ class SkyServeController:
                     notification_generation = (
                         self._scale_reconcile_coordinator.generation)
                     demand_generation = self._reconcile_generation
-                planning_state_fingerprint = None
-                if (autoscalers.controller_prepares_scaling_decision_inputs(
-                        decision_autoscaler)):
-                    planning_state_fingerprint = (
-                        serve_state.get_scale_planning_state_fingerprint(
-                            self._service_name, require_version=True))
-                    assert planning_state_fingerprint is not None, (
-                        'No service record found for '
-                        f'{self._service_name}')
                 sequenced_reserved_fill = False
                 allocation = None
                 if decision_autoscaler.reserved_capacity_fill:
@@ -6582,8 +6607,23 @@ class SkyServeController:
                     else:
                         (sequenced_reserved_fill, allocation) = (
                             self._read_sequenced_reserved_fill_allocation())
-                replica_infos = serve_state.get_replica_infos(
-                    self._service_name)
+                planning_state_fingerprint = (
+                    prepared_planning_state_fingerprint)
+                decision_inputs = prepared_decision_inputs
+                if prepared_replica_infos is None:
+                    replica_infos = serve_state.get_replica_infos(
+                        self._service_name)
+                    if (autoscalers.
+                            controller_prepares_scaling_decision_inputs(
+                                decision_autoscaler)):
+                        planning_state_fingerprint = (
+                            serve_state.get_scale_planning_state_fingerprint(
+                                self._service_name, require_version=True))
+                        assert planning_state_fingerprint is not None, (
+                            'No service record found for '
+                            f'{self._service_name}')
+                else:
+                    replica_infos = prepared_replica_infos
                 ordered_paid_authority = None
                 retirement_changed = False
                 if durable_snapshot is not None and fresh_aggregate_zero:
@@ -6630,6 +6670,18 @@ class SkyServeController:
                 if retirement_changed:
                     replica_infos = serve_state.get_replica_infos(
                         self._service_name)
+                    if (autoscalers.controller_prepares_scaling_decision_inputs(
+                            decision_autoscaler)):
+                        planning_state_fingerprint = (
+                            serve_state.get_scale_planning_state_fingerprint(
+                                self._service_name, require_version=True))
+                        assert planning_state_fingerprint is not None, (
+                            'No service record found for '
+                            f'{self._service_name}')
+                        decision_inputs = (
+                            autoscalers.
+                            prepare_controller_scaling_decision_inputs(
+                                decision_autoscaler, replica_infos))
                 self._snapshot_replica_counts(replica_infos)
                 # Use the active versions set by replica manager to make
                 # sure we only scale down the outdated replicas that are
@@ -6674,7 +6726,8 @@ class SkyServeController:
                     active_versions,
                     planning_state_fingerprint,
                     sequenced_reserved_fill=(sequenced_reserved_fill),
-                    sequenced_reserved_fill_allocation=allocation)
+                    sequenced_reserved_fill_allocation=allocation,
+                    prepared_decision_inputs=decision_inputs)
                 if plan is None:
                     return
                 (scaling_options, target_num_replicas, rollout_failure,

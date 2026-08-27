@@ -4502,8 +4502,7 @@ class TestAutoscalerRuntimeSnapshot:
                 reserved_fill_allocation_map=(
                     allocation if sequenced_reserved_fill else None),
                 reserved_supply_projection=(
-                    supply_projection
-                    if expected_mode == 'ALLOCATION_BOUND' else None))
+                    supply_projection if sequenced_reserved_fill else None))
 
         assert result is expected
         repository.project_reserved_supply.assert_not_called()
@@ -4513,6 +4512,9 @@ class TestAutoscalerRuntimeSnapshot:
             assert plan.reserved_fill_authority.allocation == allocation.identity
         else:
             assert plan.reserved_fill_authority.allocation is None
+            assert plan.allocation_reserved_capacity_by_accelerator == {}
+            assert plan.expected_pending_zero_cost_capacity_by_accelerator == {}
+            assert plan.expected_economic_capacity_graph_sha256 is None
 
     def test_ordered_paid_publication_uses_compatibility_aware_tail_target(
             self):
@@ -4717,7 +4719,7 @@ class TestAutoscalerRuntimeSnapshot:
                                return_value=[]) as get_replicas:
             ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
 
-        get_replicas.assert_called_once_with('svc')
+        assert get_replicas.call_args_list == [mock.call('svc'), mock.call('svc')]
         assert ctrl._durable_demand_snapshot is None  # pylint: disable=protected-access
         ctrl._replica_manager.invalidate_logical_reconcile_state.assert_called_once_with()  # pylint: disable=line-too-long
 
@@ -5343,6 +5345,7 @@ class TestAutoscalerRuntimeSnapshot:
     def test_reserved_supply_projection_precedes_durable_demand_snapshot(self):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._durable_demand_snapshot = self._durable_snapshot()  # pylint: disable=protected-access
         ctrl._ordinary_launch_binding_authority = types.SimpleNamespace(  # pylint: disable=protected-access
             service_lifecycle_epoch=3)
         scaler = self._logical_durable_autoscaler(target=2,
@@ -5370,6 +5373,10 @@ class TestAutoscalerRuntimeSnapshot:
             call_order.append('demand')
             return None
 
+        def _prepare(*_args, **_kwargs):
+            call_order.append('planning-inputs')
+            return mock.Mock()
+
         repository.project_reserved_supply.side_effect = _project
         with mock.patch.object(
                 controller.capacity_admission,
@@ -5385,6 +5392,22 @@ class TestAutoscalerRuntimeSnapshot:
              mock.patch.object(controller.serve_state,
                                'get_replica_infos',
                                return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1]}), \
+             mock.patch.object(
+                 controller.autoscalers,
+                 'controller_prepares_scaling_decision_inputs',
+                 return_value=True), \
+             mock.patch.object(
+                 controller.autoscalers,
+                 'prepare_controller_scaling_decision_inputs',
+                 side_effect=_prepare), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_scale_planning_state_fingerprint',
+                 return_value='fingerprint'), \
              mock.patch.object(ctrl,
                                '_read_sequenced_reserved_fill_allocation',
                                return_value=(True, allocation)), \
@@ -5393,7 +5416,7 @@ class TestAutoscalerRuntimeSnapshot:
                                return_value=False):
             ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
 
-        assert call_order == ['supply', 'demand']
+        assert call_order == ['supply', 'planning-inputs', 'demand']
         repository.project_reserved_supply.assert_called_once()
 
     def test_promoted_reconcile_publishes_projected_allocation_before_local_state(
