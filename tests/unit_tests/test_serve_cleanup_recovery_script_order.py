@@ -11,9 +11,9 @@ consuming resources.
 
 The recovery script must outlive replica teardown so a crash partway through
 leaves recovery able to respawn the controller and re-run cleanup. A successful
-finalizer removes it atomically with the exact service row; a failed finalizer
-first publishes ``FAILED_CLEANUP`` and only then removes the script to avoid a
-persistent recovery loop.
+finalizer removes it atomically with the exact service row. Generic persistent
+failures publish ``FAILED_CLEANUP`` and remove the script; typed provider
+uncertainty retains it so a later exact census can finish automatically.
 """
 # pylint: disable=protected-access
 import types
@@ -226,7 +226,8 @@ def test_finalize_claims_and_settles_bound_launches_before_generic_quiescence(
     monkeypatch.setattr(
         service, '_settle_bound_ordinary_launches_for_teardown',
         lambda claimed, infos: calls.append(
-            ('settle_binding', claimed.service_name, len(infos))))
+            ('settle_binding', claimed.service_name, len(infos)
+            )) or service._BoundLaunchTeardownSettlement({}, {}))
 
     service._run_cleanup_and_finalize('svc', types.SimpleNamespace(pool=False),
                                       '/tmp/svc', 1, 'incarnation-a', 123, None)
@@ -443,9 +444,15 @@ def test_teardown_keeps_pre_token_paid_ambiguity_fail_closed(monkeypatch):
     monkeypatch.setattr(service.non_pool_launch_reconciliation, 'reconcile',
                         reconcile)
 
-    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
-                       match='UNKNOWN for ORDINARY_PAID replica'):
-        service._settle_bound_ordinary_launches_for_teardown(authority, [info])
+    settlement = service._settle_bound_ordinary_launches_for_teardown(
+        authority, [info])
+
+    assert not settlement.provider_present_cleanup_contexts
+    assert settlement.provider_reconciliation_failures == {
+        (info.replica_id, info.replica_record_id):
+            ('teardown provider reconciliation returned UNKNOWN for '
+             'ORDINARY_PAID; exact provider cleanup remains unproven')
+    }
 
     cancel.assert_not_called()
     reduce.assert_not_called()
@@ -502,12 +509,81 @@ def test_teardown_reconciles_paid_replacement_before_cancellation(monkeypatch):
     monkeypatch.setattr(service.non_pool_launch_reconciliation, 'reconcile',
                         reconcile)
 
-    assert service._settle_bound_ordinary_launches_for_teardown(
-        authority, [info]) == {}
+    settlement = service._settle_bound_ordinary_launches_for_teardown(
+        authority, [info])
+    assert not settlement.provider_present_cleanup_contexts
+    assert not settlement.provider_reconciliation_failures
 
     cancel.assert_not_called()
     reduce.assert_not_called()
     reconcile.assert_called_once()
+
+
+def test_teardown_reconciliation_exception_isolated_from_peer(monkeypatch):
+    infos = [_replica(1), _replica(2)]
+    profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+        authorization_reference='paid-capacity:test',
+        authorization_generation=1,
+        authorization_payload={'pool': 'test'})
+    contexts = [
+        ordinary_launch_binding.BoundNonPoolLaunchContext(
+            association_id=uuid.UUID(
+                f'11111111-1111-4111-8111-{info.replica_id:012d}'),
+            request_id=f'request-{info.replica_id}',
+            service_name='svc',
+            replica_id=info.replica_id,
+            replica_record_id=uuid.UUID(info.replica_record_id),
+            launch_generation=1,
+            input_digest='a' * 64,
+            profile=profile,
+            capability_cohort_epoch=(
+                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+            capability_profile_set_digest=(
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            ),
+            receipt_protocol_version=1) for info in infos
+    ]
+    authority = types.SimpleNamespace(
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        service_name='svc')
+    targets = [
+        types.SimpleNamespace(context=context, cancel_reason=None)
+        for context in contexts
+    ]
+    inspections = [
+        types.SimpleNamespace(context=context, disposition='AMBIGUOUS')
+        for context in contexts
+    ]
+    reconcile = mock.Mock(side_effect=[
+        RuntimeError('provider credentials unavailable'),
+        types.SimpleNamespace(
+            evidence=ordinary_launch_binding.ProviderEvidence.ABSENT),
+    ])
+    monkeypatch.setattr(service.request_postgres,
+                        'lookup_bound_ordinary_launch_cancel_target',
+                        mock.Mock(side_effect=targets))
+    monkeypatch.setattr(service.request_postgres,
+                        'inspect_bound_ordinary_launch',
+                        mock.Mock(side_effect=inspections))
+    monkeypatch.setattr(
+        service.request_postgres,
+        'bound_non_pool_provider_present_cleanup_is_authorized',
+        mock.Mock(return_value=False))
+    monkeypatch.setattr(service.non_pool_launch_reconciliation, 'reconcile',
+                        reconcile)
+
+    settlement = service._settle_bound_ordinary_launches_for_teardown(
+        authority, infos)
+
+    first_key = (infos[0].replica_id, infos[0].replica_record_id)
+    assert settlement.provider_reconciliation_failures == {
+        first_key: ('teardown provider reconciliation raised for replica 1: '
+                    'RuntimeError: provider credentials unavailable')
+    }
+    assert not settlement.provider_present_cleanup_contexts
+    assert reconcile.call_count == 2
 
 
 def test_teardown_recovery_evidence_conflict_does_not_orphan(
@@ -553,9 +629,10 @@ def test_teardown_recovery_two_claimants_orphan_only_cas_loser(monkeypatch):
         'legacy_expected_recovery_version': 2,
     }
 
-    assert service._claim_teardown_recovery_controller(
-        'svc', 'incarnation-a', (123, '10.0.0.2'),
-        (456, '10.0.0.3'), **kwargs) is winner
+    assert service._claim_teardown_recovery_controller('svc', 'incarnation-a',
+                                                       (123, '10.0.0.2'),
+                                                       (456, '10.0.0.3'),
+                                                       **kwargs) is winner
     orphan_exit.assert_not_called()
     with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
                        match='parent-owner fence changed'):
@@ -602,6 +679,46 @@ def test_finalize_marks_failed_cleanup_when_teardown_fails(monkeypatch):
     # FAILED_CLEANUP is published first, then the recovery script is removed
     # so a persistent cleanup failure cannot loop forever.
     assert ('remove_script', 'svc') in calls
+
+
+def test_provider_uncertainty_retains_recovery_script_for_exact_retry(
+        monkeypatch):
+    calls = []
+    info = _replica(1)
+    authority = types.SimpleNamespace(
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        service_name='svc')
+    failure_key = (info.replica_id, info.replica_record_id)
+    settlement = service._BoundLaunchTeardownSettlement(
+        {}, {failure_key: 'AWS census remains unproven'})
+    _patch_finalize(monkeypatch, calls)
+    monkeypatch.setattr(serve_state, 'get_replica_infos',
+                        lambda _service_name: [info])
+    monkeypatch.setattr(
+        service.ordinary_launch_binding, 'begin_service_teardown_if_owner',
+        lambda *_args, **_kwargs: types.SimpleNamespace(disposition=(
+            ordinary_launch_binding.ServiceTeardownDisposition.MARKED_BOUND),
+                                                        authority=authority))
+    monkeypatch.setattr(service.ordinary_launch_binding,
+                        'claim_controller_incarnation',
+                        lambda *_args, **_kwargs: authority)
+    monkeypatch.setattr(service, '_settle_bound_ordinary_launches_for_teardown',
+                        lambda *_args, **_kwargs: settlement)
+
+    def _cleanup(*_args, **kwargs):
+        assert kwargs['provider_reconciliation_failures'] == {
+            failure_key: 'AWS census remains unproven'
+        }
+        return True
+
+    monkeypatch.setattr(service, '_cleanup', _cleanup)
+
+    service._run_cleanup_and_finalize('svc', types.SimpleNamespace(pool=False),
+                                      '/tmp/svc', 1, 'incarnation-a', 123, None)
+
+    assert ('status', serve_state.ServiceStatus.FAILED_CLEANUP) in calls
+    assert ('remove_script', 'svc') not in calls
 
 
 def test_finalize_contains_cleanup_exception_and_breaks_recovery_loop(

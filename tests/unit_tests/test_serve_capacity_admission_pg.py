@@ -1391,6 +1391,93 @@ def test_current_planner_uses_locked_allocation_supply(capacity_database,
         is capacity_admission.ReservedFillPlanAuthorityMode.ALLOCATION_BOUND)
 
 
+def test_exact_paid_plan_ignores_only_statically_incompatible_reserved_cards(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=True)
+    h200_projection = copy.deepcopy(_CAPACITY_KUEUE_PROJECTION)
+    h200_projection['accelerator_name'] = 'H200'
+    h200_projection['accelerator_scheduling']['label_values'] = ['NVIDIA-H200']
+    projections = [h200_projection]
+    projection_digest = capacity_admission._sha256(projections)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    worker_placement_projections=projections))
+
+    authority, _ = (capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'l4': 0},
+            sequenced_reserved_fill=True,
+            reserved_fill_allocation_map=None,
+            planner=lambda _snapshot, supply:
+            (_current_decision(1) if supply is not None else pytest.fail(
+                'static authority still requires the locked projection'))))
+
+    assert authority.remaining() == {'l4': 1}
+    assert (authority.reserved_fill_authority.mode is capacity_admission.
+            ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE)
+    assert authority.reserved_fill_authority.incompatible_accelerators == (
+        'l4',)
+    assert (authority.reserved_fill_authority.worker_projection_sha256 ==
+            projection_digest)
+    _validate_prospective_claim(engine, authority.claim_values('l4'))
+
+    # The worker projection is immutable in production. Simulate corruption to
+    # prove a previously issued claim fails closed if that fence ever changes.
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    worker_placement_projections=[_CAPACITY_KUEUE_PROJECTION]))
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='no longer proves static incompatibility'):
+        _validate_prospective_claim(engine, authority.claim_values('l4'))
+
+
+@pytest.mark.parametrize('target', ({'h200': 1}, {'*': 1}))
+def test_paid_plan_without_allocation_stays_closed_for_compatible_or_flexible(
+        capacity_database, target):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=True)
+    h200_projection = copy.deepcopy(_CAPACITY_KUEUE_PROJECTION)
+    h200_projection['accelerator_name'] = 'H200'
+    h200_projection['accelerator_scheduling']['label_values'] = ['NVIDIA-H200']
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    worker_placement_projections=[h200_projection]))
+
+    decision = capacity_admission.CapacityPlanDecision(
+        capacity_target_by_accelerator=target,
+        normalized_demand_extensions={
+            'autoscaler_target': 1,
+            'replica_unit': 'physical_backend',
+            'demand_target_by_accelerator': target,
+        })
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='no exact reserved supply authority'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_publish_current(
+                service_name='svc',
+                service_hash='svc-hash',
+                service_lifecycle_epoch=3,
+                service_version=1,
+                accounting_cards={card: 0 for card in target},
+                sequenced_reserved_fill=True,
+                reserved_fill_allocation_map=None,
+                planner=lambda _snapshot, _supply: decision)
+
+
 def test_cleanup_unproven_paid_row_remains_in_current_baseline(
         capacity_database):
     engine, incarnation, _ = capacity_database

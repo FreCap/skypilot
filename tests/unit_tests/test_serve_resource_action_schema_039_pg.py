@@ -158,11 +158,11 @@ def test_serve039_lineage_metadata_and_dialect_target(monkeypatch) -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
     revision = scripts.get_revision('039')
-    assert scripts.get_heads() == ['061']
+    assert scripts.get_heads() == ['063']
     assert Path(revision.path).name == (
         '039_serve_resource_action_execution_history.py')
     assert revision.down_revision == '038'
-    assert migration_utils.SERVE_VERSION == '061'
+    assert migration_utils.SERVE_VERSION == '063'
     assert migration_utils.serve_target_version(sqlite) == '037'
     assert set(m4_schema.SERVE039_METADATA.tables) == _NEW_TABLES
     assert not _NEW_TABLES.intersection(m4_schema.SERVE038_METADATA.tables)

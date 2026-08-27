@@ -282,11 +282,12 @@ def _foreign_keys(
     inspector: sqlalchemy.Inspector, table: str
 ) -> dict[str, tuple[str, tuple[str, ...], tuple[str, ...], str | None]]:
     return {
-        str(foreign_key['name']): (str(foreign_key['referred_table']),
-                                   tuple(foreign_key['constrained_columns']),
-                                   tuple(foreign_key['referred_columns']),
-                                   foreign_key['options'].get('ondelete'))
-        for foreign_key in inspector.get_foreign_keys(table)
+        str(foreign_key['name']): (
+            str(foreign_key['referred_table']),
+            tuple(foreign_key['constrained_columns']),
+            tuple(foreign_key['referred_columns']),
+            foreign_key['options'].get('ondelete')
+        ) for foreign_key in inspector.get_foreign_keys(table)
     }
 
 
@@ -471,7 +472,7 @@ def _assert_head_table_catalog(inspector: sqlalchemy.Inspector,
 
     expected_uniques = {
         str(constraint.name):
-        tuple(column.name for column in constraint.columns)
+            tuple(column.name for column in constraint.columns)
         for constraint in expected.constraints
         if isinstance(constraint, sqlalchemy.UniqueConstraint)
     }
@@ -483,10 +484,11 @@ def _assert_head_table_catalog(inspector: sqlalchemy.Inspector,
 
     expected_foreign_keys = {
         str(constraint.name):
-        (next(iter(constraint.elements)).column.table.name,
-         tuple(element.parent.name for element in constraint.elements),
-         tuple(element.column.name for element in constraint.elements),
-         constraint.ondelete)
+            (next(iter(constraint.elements)).column.table.name,
+             tuple(element.parent.name
+                   for element in constraint.elements),
+             tuple(element.column.name
+                   for element in constraint.elements), constraint.ondelete)
         for constraint in expected.constraints
         if isinstance(constraint, sqlalchemy.ForeignKeyConstraint)
     }
@@ -538,8 +540,8 @@ def _assert_final_postgres_catalog(engine: sqlalchemy.engine.Engine) -> None:
             assert (str(actual['type'].compile(dialect=dialect)).upper() == str(
                 expected.type.compile(dialect=dialect)).upper())
             assert bool(actual['nullable']) == bool(expected.nullable)
-            assert ((actual['default'] is None) == (expected.server_default is
-                                                    None))
+            assert ((actual['default'] is None) == (expected.server_default
+                                                    is None))
     assert _normalized(
         _column_map(
             inspector,
@@ -641,7 +643,7 @@ def test_serve_alembic_lineage_has_033_through_action_history_039() -> None:
     revisions = list(scripts.walk_revisions())
     revision_ids = [revision.revision for revision in revisions]
     assert len(revision_ids) == len(set(revision_ids))
-    assert scripts.get_heads() == ['061']
+    assert scripts.get_heads() == ['063']
     revision_032 = scripts.get_revision('032')
     revision_033 = scripts.get_revision('033')
     revision_034 = scripts.get_revision('034')
@@ -671,7 +673,7 @@ def test_serve_alembic_lineage_has_033_through_action_history_039() -> None:
     assert Path(revision_039.path).name == (
         '039_serve_resource_action_execution_history.py')
     assert revision_039.down_revision == '038'
-    assert migration_utils.SERVE_VERSION == '061'
+    assert migration_utils.SERVE_VERSION == '063'
     assert migration_utils.SERVE_NON_POSTGRES_VERSION == '037'
 
 
@@ -680,17 +682,17 @@ def test_staged_and_head_schema_aliases_are_disjoint_and_complete() -> None:
         'serve_resource_action_shadow_samples',
         'serve_resource_action_shadow_attempts',
     }
-    assert (action_schema.STAGED_SHADOW_SAMPLES is
-            action_schema.shadow_samples_table)
-    assert (action_schema.STAGED_SHADOW_ATTEMPTS is
-            action_schema.shadow_attempts_table)
+    assert (action_schema.STAGED_SHADOW_SAMPLES
+            is action_schema.shadow_samples_table)
+    assert (action_schema.STAGED_SHADOW_ATTEMPTS
+            is action_schema.shadow_attempts_table)
     assert set(action_schema.RESOURCE_ACTION_STATE_METADATA.tables) == set(
         _EVIDENCE_TABLES)
     assert action_schema.SHADOW_SAMPLES is not action_schema.STAGED_SHADOW_SAMPLES
     assert action_schema.SHADOW_ATTEMPTS is not action_schema.STAGED_SHADOW_ATTEMPTS
     assert 'legacy_effect_trace' not in action_schema.STAGED_SHADOW_ATTEMPTS.c
-    assert {'legacy_effect_trace', 'legacy_effect_trace_sha256'} <= set(
-        action_schema.SHADOW_ATTEMPTS.c.keys())
+    assert {'legacy_effect_trace', 'legacy_effect_trace_sha256'
+           } <= set(action_schema.SHADOW_ATTEMPTS.c.keys())
     foreign_keys = {
         constraint.name: constraint
         for constraint in action_schema.SHADOW_SAMPLES.foreign_key_constraints

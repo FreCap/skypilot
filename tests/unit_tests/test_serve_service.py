@@ -974,7 +974,8 @@ class TestRunCleanupAndFinalizeDeletesLb:
              mock.patch.object(
                  service,
                  '_settle_bound_ordinary_launches_for_teardown',
-                 return_value=cleanup_contexts), \
+                 return_value=service._BoundLaunchTeardownSettlement(
+                     cleanup_contexts, {})), \
              mock.patch.object(
                  service.serve_utils,
                  'quiesce_service_replica_launch_requests',
@@ -993,7 +994,7 @@ class TestRunCleanupAndFinalizeDeletesLb:
                                               '10.0.0.1')
 
         get_lock.assert_called_once_with('svc', advance_epoch=False)
-        assert locked.call_args.args[-2:] == (authority, cleanup_contexts)
+        assert locked.call_args.args[-3:] == (authority, cleanup_contexts, {})
 
     def test_failed_cleanup_lb_delete_error_is_swallowed(self):
         with mock.patch('sky.serve.service._cleanup',
@@ -1977,11 +1978,8 @@ def test_failed_cleanup_retires_only_authorized_absent_reserved_1516_replica(
                            'terminate_cluster') as provider_down, \
          mock.patch.object(service,
                            'cleanup_storage_intents', return_value=True):
-        failed = service._cleanup('svc',
-                                  True,
-                                  'incarnation-a',
-                                  expected_owner[0],
-                                  expected_owner[1],
+        failed = service._cleanup('svc', True, 'incarnation-a',
+                                  expected_owner[0], expected_owner[1],
                                   lifecycle_lock)
 
     assert failed is (not expected_removed)
@@ -2324,9 +2322,11 @@ def test_cleanup_skips_tail_sleep_after_final_start_failure():
         def join(self):
             events.append('join')
 
-    replica = mock.Mock(replica_id=1,
-                        cluster_name='svc-a-r1',
-                        status_property=mock.Mock())
+    replica = mock.Mock(
+        replica_id=1,
+        replica_record_id='11111111-1111-4111-8111-111111111111',
+        cluster_name='svc-a-r1',
+        status_property=mock.Mock())
     lifecycle_lock = mock.Mock(epoch=31)
     with mock.patch.object(serve_state,
                            'get_replica_infos', return_value=[replica]), \

@@ -6349,10 +6349,6 @@ class SkyServeController:
             (scaling_options, target_num_replicas, rollout_failure,
              logical_target, logical_retirement_floor, retirement_shelter,
              invalidate_logical_target) = scaling_plan
-            if (retirement_shelter is not None and
-                    not retirement_shelter.authority_current):
-                raise capacity_admission.CapacityAdmissionConflict(
-                    'Reserved-fill shelter is not current.')
             if snapshot.fresh_aggregate_zero:
                 target_num_replicas = 0
                 scaling_options = [
@@ -6373,42 +6369,55 @@ class SkyServeController:
                 if supply is None:
                     raise capacity_admission.CapacityAdmissionConflict(
                         'Current reserved supply is unavailable.')
-                try:
-                    economic_target = (
-                        decision_autoscaler.
-                        economic_capacity_target_by_accelerator(
-                            list(supply.economic_replica_infos),
-                            supply.additional_capacity_by_accelerator(),
-                            kueue_capacity_by_replica_id=(
-                                supply.economic_kueue_capacity_by_replica_id)))
-                except (capacity_admission.CapacityAdmissionError,
-                        ValueError) as error:
-                    raise capacity_admission.CapacityAdmissionConflict(
-                        'Compatible reserved supply could not produce an '
-                        'economic target.') from error
-                if not isinstance(economic_target, dict):
-                    raise ValueError(
-                        'Autoscaler returned no compatibility-safe '
-                        'economic target.')
-                canonical_economic: dict[str, int] = {}
-                for raw_card, count in economic_target.items():
-                    card = str(raw_card).casefold()
-                    if (card in canonical_economic or
-                            card not in capacity_target or
-                            not isinstance(count, int) or
-                            isinstance(count, bool) or count < 0):
-                        raise ValueError(
-                            'Economic capacity target is malformed.')
-                    canonical_economic[card] = count
-                canonical_economic = {
-                    card: canonical_economic.get(card, 0)
-                    for card in capacity_target
+                positive_cards = {
+                    card for card, count in capacity_target.items() if count > 0
                 }
-                if sum(canonical_economic.values()) != sum(
-                        capacity_target.values()):
-                    raise ValueError('Economic capacity target changed '
-                                     'aggregate demand.')
-                capacity_target = canonical_economic
+                statically_incompatible = bool(
+                    not supply.allocation_bound and
+                    capacity_admission.AGGREGATE_ACCELERATOR
+                    not in positive_cards and
+                    positive_cards.isdisjoint(supply.reserved_accelerators))
+                if supply.allocation_bound:
+                    try:
+                        economic_target = (
+                            decision_autoscaler.
+                            economic_capacity_target_by_accelerator(
+                                list(supply.economic_replica_infos),
+                                supply.additional_capacity_by_accelerator(),
+                                kueue_capacity_by_replica_id=(
+                                    supply.economic_kueue_capacity_by_replica_id
+                                )))
+                    except (capacity_admission.CapacityAdmissionError,
+                            ValueError) as error:
+                        raise capacity_admission.CapacityAdmissionConflict(
+                            'Compatible reserved supply could not produce an '
+                            'economic target.') from error
+                    if not isinstance(economic_target, dict):
+                        raise ValueError(
+                            'Autoscaler returned no compatibility-safe '
+                            'economic target.')
+                    canonical_economic: dict[str, int] = {}
+                    for raw_card, count in economic_target.items():
+                        card = str(raw_card).casefold()
+                        if (card in canonical_economic or
+                                card not in capacity_target or
+                                not isinstance(count, int) or
+                                isinstance(count, bool) or count < 0):
+                            raise ValueError(
+                                'Economic capacity target is malformed.')
+                        canonical_economic[card] = count
+                    canonical_economic = {
+                        card: canonical_economic.get(card, 0)
+                        for card in capacity_target
+                    }
+                    if sum(canonical_economic.values()) != sum(
+                            capacity_target.values()):
+                        raise ValueError('Economic capacity target changed '
+                                         'aggregate demand.')
+                    capacity_target = canonical_economic
+                elif not statically_incompatible:
+                    raise capacity_admission.CapacityAdmissionConflict(
+                        'Compatible reserved supply is unavailable.')
 
             planned = _LinearizedScalePlan(
                 snapshot=snapshot,

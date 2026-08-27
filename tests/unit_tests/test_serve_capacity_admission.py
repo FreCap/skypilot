@@ -209,6 +209,38 @@ def test_reserved_fill_plan_authority_round_trips_canonical_identity():
         })
 
 
+def test_static_incompatibility_authority_round_trips_exact_cards():
+    authority = (
+        capacity_admission.ReservedFillPlanAuthority.statically_incompatible(
+            ('L4',), '4' * 64))
+
+    encoded = authority.to_mapping()
+
+    assert encoded == {
+        'mode': 'STATICALLY_INCOMPATIBLE',
+        'incompatible_accelerators': ['l4'],
+        'worker_projection_sha256': '4' * 64,
+    }
+    assert (capacity_admission.ReservedFillPlanAuthority.from_mapping(encoded)
+            == authority)
+    with pytest.raises(ValueError, match='not canonical and complete'):
+        capacity_admission.ReservedFillPlanAuthority.statically_incompatible(
+            ('*',), '4' * 64)
+
+
+def test_static_incompatibility_authority_must_match_positive_target():
+    authority = (
+        capacity_admission.ReservedFillPlanAuthority.statically_incompatible(
+            ('L4',), '4' * 64))
+    plan = _input(capacity_target_by_accelerator={'H200': 1},
+                  reserved_fill_authority=authority)
+
+    with pytest.raises(ValueError, match='positive target cards'):
+        plan.payload(existing_zero_cost_capacity_by_accelerator={'H200': 0},
+                     existing_paid_capacity_by_accelerator={'H200': 0},
+                     paid_residual_by_accelerator={'H200': 1})
+
+
 def test_zero_revocation_is_explicit_unbound_and_all_zero():
     authority = capacity_admission.ReservedFillPlanAuthority.zero_revocation()
     zero_input = _input(capacity_target_by_accelerator={'L4': 0},

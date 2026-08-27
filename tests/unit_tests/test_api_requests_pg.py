@@ -1592,7 +1592,7 @@ def test_api009_binding_catalog_matches_literal_contract(postgres_engine):
     assert foreign_key['options'].get('ondelete') == 'RESTRICT'
     pin_checks = {
         check['name']:
-        ''.join(check['sqltext'].split()).replace('(', '').replace(')', '')
+            ''.join(check['sqltext'].split()).replace('(', '').replace(')', '')
         for check in inspector.get_check_constraints(
             'api_request_retention_pins')
     }
@@ -1609,10 +1609,10 @@ def test_api009_binding_catalog_matches_literal_contract(postgres_engine):
         'column_names'] == ['request_id']
 
     request_checks = {
-        check['name']:
-        ''.join(check['sqltext'].replace('::text', '').split()).replace(
-            '(', '').replace(')', '')
-        for check in inspector.get_check_constraints('api_requests')
+        check['name']: ''.join(check['sqltext'].replace(
+            '::text', '').split()).replace('(', '').replace(
+                ')',
+                '') for check in inspector.get_check_constraints('api_requests')
     }
     assert request_checks['ck_api_requests_ordinary_launch_handler'] == (
         "ordinary_launch_association_idISNULL=handler_name<>"
@@ -2141,10 +2141,9 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
     monkeypatch.setattr(ordinary_launch_binding,
                         'resolve_non_pool_launch_profile_in_connection',
                         lambda *_args, **_kwargs: profile)
-    monkeypatch.setattr(
-        ordinary_launch_binding,
-        '_resolve_non_pool_launch_profile_in_connection',
-        lambda *_args, **_kwargs: (profile, None))
+    monkeypatch.setattr(ordinary_launch_binding,
+                        '_resolve_non_pool_launch_profile_in_connection',
+                        lambda *_args, **_kwargs: (profile, None))
     monkeypatch.setattr(
         ordinary_launch_binding, '_reserved_fill_cleanup_payload',
         lambda *_args, **_kwargs: {'physical_cluster_uid': 'physical-uid-a'})
@@ -2240,9 +2239,7 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
             authority, connection, projection)
 
     assert request_postgres.project_bound_non_pool_provider_absence(
-        context,
-        authority,
-        project_replica_result=_project_teardown)
+        context, authority, project_replica_result=_project_teardown)
     with engine.connect() as connection:
         association = connection.execute(
             sqlalchemy.select(
@@ -2314,10 +2311,9 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
          mock.patch.object(replica_managers, 'terminate_cluster') \
              as provider_down:
         assert manager._finalize_projected_provider_absence_cleanup(3)
-    remove.assert_called_once_with(
-        3,
-        str(_GC_REPLICA_RECORD_ID),
-        allow_active_provider_free_pre_job=True)
+    remove.assert_called_once_with(3,
+                                   str(_GC_REPLICA_RECORD_ID),
+                                   allow_active_provider_free_pre_job=True)
     provider_down.assert_not_called()
     # Full active provider-free retirement, including normalized intent and
     # Kueue lineage deletion, is exercised by the dedicated Kueue PostgreSQL
@@ -2837,7 +2833,8 @@ def test_paid_provider_negative_ack_projects_and_releases_debits_atomically(
     assert payload['cluster_name'] == 'gc-service-3'
     assert payload['receipt']['cluster_name_on_cloud'] == (
         _gc_cloud_cluster_name())
-    assert payload['receipt']['cluster_name_on_cloud'] != payload['cluster_name']
+    assert payload['receipt']['cluster_name_on_cloud'] != payload[
+        'cluster_name']
     assert request_postgres.record_bound_non_pool_provider_evidence(
         graph.context, graph.authority,
         ordinary_launch_binding.ProviderEvidence.ABSENT, payload)
@@ -3429,10 +3426,11 @@ def test_service_teardown_settles_exact_paid_provider_negative_ack(
     info = serve_state.get_replica_info_from_id('gc-service', 3)
     assert info is not None
 
-    cleanup_contexts = service._settle_bound_ordinary_launches_for_teardown(
+    settlement = service._settle_bound_ordinary_launches_for_teardown(
         teardown.authority, [info])
 
-    assert cleanup_contexts == {}
+    assert not settlement.provider_present_cleanup_contexts
+    assert not settlement.provider_reconciliation_failures
     with graph.engine.connect() as connection:
         association = connection.execute(
             sqlalchemy.select(
@@ -8935,13 +8933,13 @@ def test_registry_owns_controller_classes_and_replay_policies():
     assert jobs_queue.replay_policy is registry.ReplayPolicy.READ_ONLY
     assert serve_status.execution_class is registry.ExecutionClass.CONTROLLER
     assert serve_status.replay_policy is registry.ReplayPolicy.READ_ONLY
-    assert (authorized_serve_status.execution_class is
-            registry.ExecutionClass.CONTROLLER)
+    assert (authorized_serve_status.execution_class
+            is registry.ExecutionClass.CONTROLLER)
     assert authorized_serve_status.replay_policy is registry.ReplayPolicy.READ_ONLY
-    assert (authorized_serve_placement.execution_class is
-            registry.ExecutionClass.CONTROLLER)
-    assert (authorized_serve_placement.replay_policy is
-            registry.ReplayPolicy.READ_ONLY)
+    assert (authorized_serve_placement.execution_class
+            is registry.ExecutionClass.CONTROLLER)
+    assert (authorized_serve_placement.replay_policy
+            is registry.ReplayPolicy.READ_ONLY)
     assert authorized_serve_status.name != serve_status.name
     assert normal_read.execution_class is registry.ExecutionClass.NORMAL
     assert normal_read.replay_policy is registry.ReplayPolicy.READ_ONLY
@@ -9699,8 +9697,8 @@ def test_shutdown_retry_waits_for_exact_quiescence_receipt(
     monkeypatch.setattr(request_postgres, '_signal_exact_executor_process',
                         signal_exact)
 
-    assert (backend.interrupt_request_for_shutdown_retry(request_id) is
-            signal_delivered)
+    assert (backend.interrupt_request_for_shutdown_retry(request_id)
+            is signal_delivered)
     signal_exact.assert_called_once_with(1234, 424242, signal.SIGTERM)
     request_row, queue_row = _execution_claim_state(engine, request_id)
     # Signal delivery is not stop proof: polling cannot observe client retry

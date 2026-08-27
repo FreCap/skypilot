@@ -986,8 +986,8 @@ def test_historical_cohort_cannot_start_provider_effect(
         _generic_controller_authority(),
         non_pool_capability_cohort_epoch=historical_cohort)
     assert not authority.generic_launches_required
-    assert (authority.retained_non_pool_settlement_allowed is
-            (history_distance == 1))
+    assert (authority.retained_non_pool_settlement_allowed
+            is (history_distance == 1))
     with binding_database.begin() as connection:
         if history_distance == 1:
             association = binding.lock_reduction_authority_in_connection(
@@ -2121,7 +2121,7 @@ def test_retained_v7_v8_reserved_fill_graph_settles_provider_absence(
 def test_reserved_fill_cleanup_rejects_older_or_mismatched_cohorts(
         binding_database, monkeypatch, service_cohort,
         association_cohort) -> None:
-    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 12
+    assert binding.NON_POOL_CAPABILITY_COHORT_EPOCH == 13
     service, replica, association, _ = _reserved_fill_cleanup_rows(
         service_cohort, association_cohort)
     profile_validation_called = False

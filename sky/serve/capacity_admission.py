@@ -46,6 +46,8 @@ reserved_fill_planner = adaptors_common.LazyImport(
     'sky.serve.reserved_fill_planner')
 serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
 service_spec = adaptors_common.LazyImport('sky.serve.service_spec')
+kubernetes_identity = adaptors_common.LazyImport(
+    'sky.serve.kubernetes_identity')
 zero_cost_actuation = adaptors_common.LazyImport(
     'sky.serve.zero_cost_actuation')
 
@@ -98,6 +100,7 @@ class ReservedFillPlanAuthorityMode(str, enum.Enum):
 
     NOT_APPLICABLE = 'NOT_APPLICABLE'
     ALLOCATION_BOUND = 'ALLOCATION_BOUND'
+    STATICALLY_INCOMPATIBLE = 'STATICALLY_INCOMPATIBLE'
     UNBOUND_ZERO_REVOCATION = 'UNBOUND_ZERO_REVOCATION'
 
 
@@ -192,14 +195,37 @@ class ReservedFillPlanAuthority:
 
     mode: ReservedFillPlanAuthorityMode
     allocation: ReservedFillAllocationIdentity | None = None
+    incompatible_accelerators: tuple[str, ...] = ()
+    worker_projection_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, ReservedFillPlanAuthorityMode):
             raise ValueError('Reserved-fill plan authority mode is invalid.')
-        if ((self.mode is ReservedFillPlanAuthorityMode.ALLOCATION_BOUND)
-                != (self.allocation is not None)):
+        allocation_bound = (self.mode
+                            is ReservedFillPlanAuthorityMode.ALLOCATION_BOUND)
+        statically_incompatible = (
+            self.mode is ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE)
+        if allocation_bound != (self.allocation is not None):
             raise ValueError('Only an allocation-bound plan may carry a '
                              'reserved-fill allocation identity.')
+        if statically_incompatible:
+            canonical = tuple(
+                sorted({
+                    card.casefold()
+                    for card in self.incompatible_accelerators
+                    if isinstance(card, str) and card
+                }))
+            if (not canonical or canonical != self.incompatible_accelerators or
+                    AGGREGATE_ACCELERATOR in canonical or
+                    not isinstance(self.worker_projection_sha256, str) or
+                    _SHA256_RE.fullmatch(
+                        self.worker_projection_sha256) is None):
+                raise ValueError('Statically incompatible authority is not '
+                                 'canonical and complete.')
+        elif (self.incompatible_accelerators or
+              self.worker_projection_sha256 is not None):
+            raise ValueError('Only statically incompatible authority may carry '
+                             'accelerator projection evidence.')
 
     @classmethod
     def not_applicable(cls) -> 'ReservedFillPlanAuthority':
@@ -218,9 +244,23 @@ class ReservedFillPlanAuthority:
         return cls(ReservedFillPlanAuthorityMode.ALLOCATION_BOUND, identity)
 
     @classmethod
+    def statically_incompatible(
+        cls,
+        accelerators: Sequence[str],
+        worker_projection_sha256: str,
+    ) -> 'ReservedFillPlanAuthority':
+        canonical = tuple(sorted({card.casefold() for card in accelerators}))
+        return cls(ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE,
+                   incompatible_accelerators=canonical,
+                   worker_projection_sha256=worker_projection_sha256)
+
+    @classmethod
     def from_mapping(cls, value: Any) -> 'ReservedFillPlanAuthority':
-        if not isinstance(value,
-                          Mapping) or set(value) - {'mode', 'allocation'}:
+        allowed = {
+            'mode', 'allocation', 'incompatible_accelerators',
+            'worker_projection_sha256'
+        }
+        if not isinstance(value, Mapping) or set(value) - allowed:
             raise ValueError('Reserved-fill plan authority is malformed.')
         try:
             mode = ReservedFillPlanAuthorityMode(value.get('mode'))
@@ -233,17 +273,35 @@ class ReservedFillPlanAuthority:
                     'Allocation-bound plan authority is incomplete.')
             allocation = (reserved_fill_planner.ReservedFillAllocationIdentity.
                           from_mapping(value['allocation']))
+            accelerators: tuple[str, ...] = ()
+            projection_digest = None
+        elif mode is ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE:
+            if set(value) != {
+                    'mode', 'incompatible_accelerators',
+                    'worker_projection_sha256'
+            } or not isinstance(value['incompatible_accelerators'], list):
+                raise ValueError(
+                    'Statically incompatible plan authority is incomplete.')
+            allocation = None
+            accelerators = tuple(value['incompatible_accelerators'])
+            projection_digest = value['worker_projection_sha256']
         else:
             if set(value) != {'mode'}:
                 raise ValueError(
                     'Unbound plan authority must not carry an allocation.')
             allocation = None
-        return cls(mode, allocation)
+            accelerators = ()
+            projection_digest = None
+        return cls(mode, allocation, accelerators, projection_digest)
 
     def to_mapping(self) -> dict[str, Any]:
         result: dict[str, Any] = {'mode': self.mode.value}
         if self.allocation is not None:
             result['allocation'] = self.allocation.to_mapping()
+        if self.mode is ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE:
+            result['incompatible_accelerators'] = list(
+                self.incompatible_accelerators)
+            result['worker_projection_sha256'] = self.worker_projection_sha256
         return result
 
 
@@ -356,6 +414,14 @@ class CapacityPlanInput:
         elif economic_graph_sha256 is not None:
             raise ValueError('An unbound capacity plan must not carry an '
                              'economic capacity graph digest.')
+        positive_target_cards = tuple(
+            sorted(
+                card for card, count in capacity_target.items() if count > 0))
+        if (authority.mode
+                is ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE and
+                authority.incompatible_accelerators != positive_target_cards):
+            raise ValueError('Statically incompatible authority does not name '
+                             'the exact positive target cards.')
         if (authority.mode
                 is ReservedFillPlanAuthorityMode.UNBOUND_ZERO_REVOCATION and
                 any(capacity_target.values())):
@@ -469,6 +535,8 @@ class ReservedSupplyProjection:
     economic_kueue_capacity_by_replica_id: Mapping[
         int, kueue_lane_capacity.KueueReplicaCapacityClass]
     economic_capacity_graph_sha256: str
+    reserved_accelerators: tuple[str, ...] = ()
+    allocation_bound: bool = True
 
     def additional_capacity_by_accelerator(self) -> dict[str, int]:
         cards = (set(self.pending_zero_cost_capacity_by_accelerator) |
@@ -528,6 +596,23 @@ def _validate_reserved_fill_authority_in_connection(
     if authority.mode is ReservedFillPlanAuthorityMode.UNBOUND_ZERO_REVOCATION:
         raise CapacityAdmissionConflict(
             'An unbound zero revocation cannot authorize a paid claim.')
+    if authority.mode is ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE:
+        if not reserved_fill_binding_required:
+            raise CapacityAdmissionConflict(
+                'Static reserved incompatibility requires enabled durable '
+                'intent actuation.')
+        config = _reserved_fill_service_config_in_connection(
+            connection, service)
+        if (config.reserved_accelerators is None or
+                config.worker_projection_sha256 is None or
+                authority.worker_projection_sha256
+                != config.worker_projection_sha256 or
+                set(authority.incompatible_accelerators) &
+                set(config.reserved_accelerators)):
+            raise CapacityAdmissionConflict(
+                'Paid plan no longer proves static incompatibility with the '
+                'current reserved worker projection.')
+        return None
     binding = authority.allocation
     assert binding is not None
     if not reserved_fill_binding_required:
@@ -564,6 +649,8 @@ class _ReservedFillServiceConfig:
     binding_required: bool
     max_capacity: int
     capacity_unit: FillCapacityUnit
+    reserved_accelerators: tuple[str, ...] | None
+    worker_projection_sha256: str | None
 
 
 def _reserved_fill_service_config_in_connection(
@@ -572,13 +659,15 @@ def _reserved_fill_service_config_in_connection(
 ) -> _ReservedFillServiceConfig:
     """Read the immutable fill discriminator and ceiling under lock."""
     version_row = connection.execute(
-        sqlalchemy.select(_VERSION_SPECS.c.spec).where(
-            _VERSION_SPECS.c.service_name == service['name'],
-            _VERSION_SPECS.c.version == service['current_version'],
-            _VERSION_SPECS.c.yaml_content.isnot(None),
-            _VERSION_SPECS.c.quarantined_at.is_(None),
-            _VERSION_SPECS.c.retired_at.is_(None)).with_for_update(
-                read=True)).one_or_none()
+        sqlalchemy.select(
+            _VERSION_SPECS.c.spec,
+            _VERSION_SPECS.c.worker_placement_projections).where(
+                _VERSION_SPECS.c.service_name == service['name'],
+                _VERSION_SPECS.c.version == service['current_version'],
+                _VERSION_SPECS.c.yaml_content.isnot(None),
+                _VERSION_SPECS.c.quarantined_at.is_(None),
+                _VERSION_SPECS.c.retired_at.is_(None)).with_for_update(
+                    read=True)).one_or_none()
     if version_row is None:
         raise CapacityAdmissionConflict(
             'Current service version has no immutable reserved-fill spec.')
@@ -614,10 +703,30 @@ def _reserved_fill_service_config_in_connection(
     capacity_unit = (reserved_fill_planner.FillCapacityUnit.LOGICAL
                      if replica_unit == 'logical' else
                      reserved_fill_planner.FillCapacityUnit.PHYSICAL)
-    return _ReservedFillServiceConfig(binding_required=fill_enabled and
-                                      mode == 'DURABLE_INTENT',
-                                      max_capacity=maximum,
-                                      capacity_unit=capacity_unit)
+    reserved_accelerators = None
+    worker_projection_sha256 = None
+    raw_worker_projections = version_row[1]
+    if raw_worker_projections is not None:
+        try:
+            worker_projections = (
+                kubernetes_identity.validate_worker_placement_projections(
+                    raw_worker_projections, allow_none=False))
+        except (TypeError, ValueError) as error:
+            raise CapacityAdmissionConflict(
+                'Current service worker projection is malformed.') from error
+        assert worker_projections is not None
+        reserved_accelerators = tuple(
+            sorted({
+                str(projection['accelerator_name']).casefold()
+                for projection in worker_projections
+            }))
+        worker_projection_sha256 = _sha256(worker_projections)
+    return _ReservedFillServiceConfig(
+        binding_required=fill_enabled and mode == 'DURABLE_INTENT',
+        max_capacity=maximum,
+        capacity_unit=capacity_unit,
+        reserved_accelerators=(reserved_accelerators),
+        worker_projection_sha256=(worker_projection_sha256))
 
 
 def _reserved_fill_binding_required_in_connection(
@@ -1959,19 +2068,16 @@ class CapacityAdmissionRepository:
             validated_allocation = None
             allocation_authority = None
             if sequenced_reserved_fill and not snapshot.fresh_aggregate_zero:
-                if reserved_fill_allocation_map is None:
-                    raise CapacityAdmissionConflict(
-                        'Positive current demand has no reserved-fill '
-                        'allocation authority.')
-                allocation_authority = ReservedFillPlanAuthority.bound(
-                    reserved_fill_allocation_map.identity)
-                validated_allocation = (
-                    _validate_reserved_fill_authority_in_connection(
-                        connection,
-                        service,
-                        allocation_authority,
-                        reserved_fill_binding_required=True,
-                        protocol_and_service_prelocked=True))
+                if reserved_fill_allocation_map is not None:
+                    allocation_authority = ReservedFillPlanAuthority.bound(
+                        reserved_fill_allocation_map.identity)
+                    validated_allocation = (
+                        _validate_reserved_fill_authority_in_connection(
+                            connection,
+                            service,
+                            allocation_authority,
+                            reserved_fill_binding_required=True,
+                            protocol_and_service_prelocked=True))
 
             now = connection.execute(
                 sqlalchemy.select(
@@ -2010,7 +2116,7 @@ class CapacityAdmissionRepository:
                 config=fill_config,
                 lane_projection=lane_projection)
             supply_projection = None
-            if validated_allocation is not None:
+            if sequenced_reserved_fill:
                 economic_infos, economic_kueue, economic_digest = (
                     _economic_capacity_graph_snapshot(
                         locked_capacity,
@@ -2023,7 +2129,10 @@ class CapacityAdmissionRepository:
                         allocation_reserved),
                     economic_replica_infos=economic_infos,
                     economic_kueue_capacity_by_replica_id=economic_kueue,
-                    economic_capacity_graph_sha256=economic_digest)
+                    economic_capacity_graph_sha256=economic_digest,
+                    reserved_accelerators=(fill_config.reserved_accelerators or
+                                           ()),
+                    allocation_bound=validated_allocation is not None)
 
             # Lock the current head before invoking mutable in-memory planning.
             # Service ownership prevents a competing publisher, while this row
@@ -2041,11 +2150,27 @@ class CapacityAdmissionRepository:
                     'Fresh aggregate zero produced a positive capacity target.')
             positive_target = any(capacity_target.values())
             if sequenced_reserved_fill and positive_target:
-                if allocation_authority is None or supply_projection is None:
+                positive_cards = tuple(
+                    sorted(card for card, count in capacity_target.items()
+                           if count > 0))
+                statically_incompatible = bool(
+                    AGGREGATE_ACCELERATOR not in positive_cards and
+                    fill_config.reserved_accelerators is not None and
+                    fill_config.worker_projection_sha256 is not None and
+                    set(positive_cards).isdisjoint(
+                        fill_config.reserved_accelerators))
+                if allocation_authority is not None:
+                    final_authority = allocation_authority
+                elif statically_incompatible:
+                    assert fill_config.worker_projection_sha256 is not None
+                    final_authority = (
+                        ReservedFillPlanAuthority.statically_incompatible(
+                            positive_cards,
+                            fill_config.worker_projection_sha256))
+                else:
                     raise CapacityAdmissionConflict(
                         'Positive capacity target has no exact reserved supply '
                         'authority.')
-                final_authority = allocation_authority
             elif sequenced_reserved_fill:
                 final_authority = ReservedFillPlanAuthority.zero_revocation()
             else:
@@ -2136,19 +2261,29 @@ class CapacityAdmissionRepository:
             reserved_fill_binding_required = fill_config.binding_required
             positive_target = any(capacity_target.values())
             authority_mode = plan.reserved_fill_authority.mode
-            expected_authority_mode = (
-                ReservedFillPlanAuthorityMode.ALLOCATION_BOUND
-                if reserved_fill_binding_required and positive_target else
-                ReservedFillPlanAuthorityMode.UNBOUND_ZERO_REVOCATION
-                if reserved_fill_binding_required else
-                ReservedFillPlanAuthorityMode.NOT_APPLICABLE)
-            if authority_mode is not expected_authority_mode:
+            if reserved_fill_binding_required and positive_target:
+                allowed_authority_modes = {
+                    ReservedFillPlanAuthorityMode.ALLOCATION_BOUND,
+                    ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE,
+                }
+            elif reserved_fill_binding_required:
+                allowed_authority_modes = {
+                    ReservedFillPlanAuthorityMode.UNBOUND_ZERO_REVOCATION
+                }
+            else:
+                allowed_authority_modes = {
+                    ReservedFillPlanAuthorityMode.NOT_APPLICABLE
+                }
+            if authority_mode not in allowed_authority_modes:
                 raise CapacityAdmissionConflict(
                     'Capacity plan reserved-fill authority does not match its '
                     'service actuation mode and target.')
             plan = self._validate_sources(connection, plan, service)
             validated_allocation = None
-            if allocation_bound:
+            if authority_mode in {
+                    ReservedFillPlanAuthorityMode.ALLOCATION_BOUND,
+                    ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE,
+            }:
                 validated_allocation = (
                     _validate_reserved_fill_authority_in_connection(
                         connection,
@@ -2450,6 +2585,22 @@ def validate_paid_claim_in_connection(
             ReservedFillPlanAuthority.not_applicable())
     else:
         reserved_fill_binding_required = fill_config.binding_required
+    try:
+        plan_capacity_target = _canonical_counts(
+            payload.get('capacity_target_by_accelerator', {}),
+            'capacity_target_by_accelerator')
+    except ValueError as error:
+        raise CapacityAdmissionConflict(
+            'Paid claim capacity target is malformed.') from error
+    positive_target_cards = tuple(
+        sorted(
+            card for card, count in plan_capacity_target.items() if count > 0))
+    if (plan_reserved_fill_authority.mode
+            is ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE and
+            plan_reserved_fill_authority.incompatible_accelerators
+            != positive_target_cards):
+        raise CapacityAdmissionConflict(
+            'Paid claim static incompatibility changed target cards.')
     validated_allocation = _validate_reserved_fill_authority_in_connection(
         connection,
         service,

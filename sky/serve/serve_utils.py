@@ -302,9 +302,10 @@ def _find_ha_recovery_controller_launch_index(lines: list[str]) -> int:
             continue
         if not tokens:
             continue
-        module_pair_count = sum(token == '-m' and index + 1 < len(tokens) and
-                                tokens[index + 1] == 'sky.serve.service'
-                                for index, token in enumerate(tokens))
+        module_pair_count = sum(
+            token == '-m' and index +
+            1 < len(tokens) and tokens[index + 1] == 'sky.serve.service'
+            for index, token in enumerate(tokens))
         if module_pair_count != 1:
             continue
         direct_python = (_HA_RECOVERY_PYTHON_EXECUTABLE_RE.fullmatch(
@@ -753,8 +754,8 @@ class ServiceComponentTarget:
 
     def __post_init__(self):
         """Validate that replica_id is only provided for REPLICA component."""
-        if (self.component
-                == ServiceComponent.REPLICA) != (self.replica_id is None):
+        if (self.component == ServiceComponent.REPLICA) != (self.replica_id
+                                                            is None):
             raise ValueError(
                 'replica_id must be specified if and only if component is '
                 'REPLICA.')
@@ -1313,8 +1314,8 @@ def ha_recovery_for_consolidation_mode(pool: bool,
                 recovery_snapshot = current_snapshot
                 if (runtime_profile.guarded_ha_ephemeral_artifacts_enabled() and
                     (not current_snapshot.get('config_protocol_active') or
-                     current_snapshot.get('controller_config_snapshot') is None)
-                   ):
+                     current_snapshot.get('controller_config_snapshot')
+                     is None)):
                     f.write(f'{capnoun} {service_name} has no complete '
                             'PostgreSQL controller recovery snapshot; guarded '
                             'HA will not use a predecessor-local or embedded '
@@ -2051,8 +2052,8 @@ def secure_staged_controller_config(config_path: str,
             raise RuntimeError('Staged controller config snapshot is not a '
                                'regular file.')
         if (pre_open_stat is not None and
-            (pre_open_stat.st_dev, pre_open_stat.st_ino) !=
-            (staged_stat.st_dev, staged_stat.st_ino)):
+            (pre_open_stat.st_dev, pre_open_stat.st_ino)
+                != (staged_stat.st_dev, staged_stat.st_ino)):
             raise RuntimeError('Staged controller config snapshot changed '
                                'while it was being opened.')
         if staged_stat.st_size > 1024 * 1024:
@@ -3684,7 +3685,8 @@ def _run_status_phase_fanout(
     work: list[list[_PreparedReplicaStatus]],
     worker: Callable[
         [list[_PreparedReplicaStatus], provider_phase.ProviderPhaseAdmission],
-        list[tuple[_PreparedServiceStatus, int, dict[str, Any]]],],
+        list[tuple[_PreparedServiceStatus, int, dict[str, Any]]],
+    ],
     admission: provider_phase.ProviderPhaseAdmission,
     parent_ctx: contextvars.Context,
 ) -> None:
@@ -4656,8 +4658,8 @@ def quiesce_service_replica_launch_requests(
                     # contract. Protocol v2 cannot create those rows, and
                     # replica creation time excludes reused cluster names.
                     continue
-                if (request.execution_quiesced_generation !=
-                        execution_generation or
+                if (request.execution_quiesced_generation
+                        != execution_generation or
                         request.execution_quiesced_at is None):
                     terminal_unproven[request.request_id] = (
                         execution_generation)
@@ -4727,8 +4729,8 @@ def quiesce_service_replica_launch_requests(
                         f'({request.status})')
                     return False
                 if (request.execution_quiescence_required is not True or
-                        request.execution_quiesced_generation !=
-                        expected_generation or
+                        request.execution_quiesced_generation
+                        != expected_generation or
                         request.execution_quiesced_at is None):
                     waiting.append(request_id)
 
@@ -5065,9 +5067,9 @@ def _terminate_failed_services_locked(
     high_availability = bool(owner.get('lb_ha_enabled'))
     if owner.get('controller_port') != constants.CONTROLLER_TEARDOWN_ACK_PORT:
         recovery_script = serve_state.get_ha_recovery_script(service_name)
-        unrecoverable = (
-            recovery_script is not None and
-            serve_state.get_latest_committed_version(service_name) is None)
+        unrecoverable = (recovery_script is not None and
+                         serve_state.get_latest_committed_version(service_name)
+                         is None)
         if (bound_authority is not None and
             (recovery_script is None or unrecoverable)):
             # The old PID/IP cannot be rewritten in place for a bound service:
@@ -5166,6 +5168,7 @@ def _terminate_failed_services_locked(
 
     replica_infos = serve_state.get_replica_infos(service_name)
     provider_present_cleanup_contexts: dict[tuple[int, str], Any] = {}
+    provider_reconciliation_failures: dict[tuple[int, str], str] = {}
     if bound_authority is not None:
         try:
             # A live parent may rotate the controller incarnation between the
@@ -5186,9 +5189,13 @@ def _terminate_failed_services_locked(
             # pylint: disable=import-outside-toplevel,protected-access
             from sky.serve import service as service_lib
 
-            provider_present_cleanup_contexts = (
+            settlement = (
                 service_lib._settle_bound_ordinary_launches_for_teardown(
                     bound_authority, replica_infos))
+            provider_present_cleanup_contexts = (
+                settlement.provider_present_cleanup_contexts)
+            provider_reconciliation_failures = (
+                settlement.provider_reconciliation_failures)
             # pylint: enable=import-outside-toplevel,protected-access
             # Settlement may atomically persist the provider-present cleanup
             # marker on a separately locked ReplicaInfo instance.  Refresh
@@ -5293,11 +5300,28 @@ def _terminate_failed_services_locked(
                 f'was retained for retry.{colorama.Style.RESET_ALL}')
     # pylint: enable=import-outside-toplevel,protected-access
     provider_present_cleanup_contexts = preparation.contexts
+    replica_keys = {
+        (info.replica_id, info.replica_record_id) for info in replica_infos
+    }
+    extra_failure_keys = provider_reconciliation_failures.keys() - replica_keys
+    overlapping_failure_keys = (provider_reconciliation_failures.keys() &
+                                provider_present_cleanup_contexts.keys())
+    if extra_failure_keys or overlapping_failure_keys:
+        return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
+                'could not be purged because exact provider reconciliation '
+                'lost its replica inventory; durable cleanup inventory was '
+                f'retained for retry.{colorama.Style.RESET_ALL}')
+    cleanup_failures = dict(preparation.failures)
+    cleanup_failures.update(provider_reconciliation_failures)
+    for cleanup_key, reason in cleanup_failures.items():
+        logger.warning(
+            'Retaining exact failed-service cleanup target %r for %r: %s.',
+            cleanup_key, service_name, reason)
     remaining_replica_clusters.extend(
         info.cluster_name
         for info in replica_infos
-        if (info.replica_id, info.replica_record_id) in preparation.failures)
-    skipped_cleanup_keys = (set(preparation.failures) |
+        if (info.replica_id, info.replica_record_id) in cleanup_failures)
+    skipped_cleanup_keys = (set(cleanup_failures) |
                             set(preparation.projected_absence_keys))
     partition_infos = [
         info for info in replica_infos
@@ -5449,8 +5473,8 @@ def _terminate_failed_services_locked(
         cleanup_work: list[tuple[Any, thread_utils.SafeThread]] = []
         for target in cleanup_targets:
             info = target[0]
-            if (info.status_property.sky_down_status !=
-                    common_utils.ProcessStatus.RUNNING):
+            if (info.status_property.sky_down_status
+                    != common_utils.ProcessStatus.RUNNING):
                 info.status_property.sky_down_status = (
                     common_utils.ProcessStatus.SCHEDULED)
             _persist_cleanup(info)
@@ -5737,8 +5761,8 @@ def _terminate_orphaned_service_children_impl(
 
         orphan_cleanup_work: list[tuple[Any, thread_utils.SafeThread]] = []
         for info, cleanup_fence in to_terminate:
-            if (info.status_property.sky_down_status !=
-                    common_utils.ProcessStatus.RUNNING):
+            if (info.status_property.sky_down_status
+                    != common_utils.ProcessStatus.RUNNING):
                 info.status_property.sky_down_status = (
                     common_utils.ProcessStatus.SCHEDULED)
             _persist_orphan_cleanup(info)
@@ -5966,8 +5990,8 @@ def terminate_services(service_names: list[str] | None, purge: bool,
         if (service_status is None or
             (service_status['status']
              not in serve_state.ServiceStatus.failed_statuses() and
-             service_status['status'] != serve_state.ServiceStatus.SHUTTING_DOWN
-            ) or not purge):
+             service_status['status']
+             != serve_state.ServiceStatus.SHUTTING_DOWN) or not purge):
             terminated_service_names.append(f'{service_name!r}')
     if not terminated_service_names:
         messages.append(f'No {noun} to terminate.')

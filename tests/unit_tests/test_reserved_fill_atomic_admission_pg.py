@@ -589,10 +589,12 @@ def test_failed_teardown_present_ambiguity_authorizes_cleanup_marker(
         lambda *_args, **_kwargs: pytest.fail(
             'an ambiguous reserved-fill request must not be cancelled'))
 
-    cleanup_contexts = (service._settle_bound_ordinary_launches_for_teardown(
+    settlement = (service._settle_bound_ordinary_launches_for_teardown(
         authority, [info]))
+    cleanup_contexts = settlement.provider_present_cleanup_contexts
 
     assert provider_reads == ['physical-cluster-uid', 'replica-presence']
+    assert not settlement.provider_reconciliation_failures
     assert cleanup_contexts == {
         (info.replica_id, info.replica_record_id): context
     }
@@ -678,8 +680,10 @@ def test_failed_teardown_present_marker_without_cluster_record_reconciles(
     _install_failed_teardown_provider_observation(
         monkeypatch, atomic_database, info,
         ordinary_launch_binding.ProviderEvidence.PRESENT)
-    cleanup_contexts = (service._settle_bound_ordinary_launches_for_teardown(
+    settlement = (service._settle_bound_ordinary_launches_for_teardown(
         authority, [info]))
+    cleanup_contexts = settlement.provider_present_cleanup_contexts
+    assert not settlement.provider_reconciliation_failures
     persisted = serve_state.get_replica_info_from_id(_SERVICE, info.replica_id)
     assert persisted is not None
     cleanup_reads = _install_failed_teardown_provider_observation(
@@ -731,8 +735,10 @@ def test_failed_teardown_present_marker_rejects_stale_authority(
     _install_failed_teardown_provider_observation(
         monkeypatch, atomic_database, info,
         ordinary_launch_binding.ProviderEvidence.PRESENT)
-    cleanup_contexts = (service._settle_bound_ordinary_launches_for_teardown(
+    settlement = (service._settle_bound_ordinary_launches_for_teardown(
         authority, [info]))
+    cleanup_contexts = settlement.provider_present_cleanup_contexts
+    assert not settlement.provider_reconciliation_failures
     persisted = serve_state.get_replica_info_from_id(_SERVICE, info.replica_id)
     assert persisted is not None
     stale_authority = dataclasses.replace(
@@ -807,10 +813,14 @@ def test_failed_teardown_uncertain_provider_ambiguity_stays_fail_closed(
         lambda *_args, **_kwargs: pytest.fail(
             'an ambiguous reserved-fill request must not be cancelled'))
 
-    with pytest.raises(
-            ordinary_launch_binding.OrdinaryLaunchBindingConflict,
-            match=f'returned {evidence.value}.*refusing provider cleanup'):
-        service._settle_bound_ordinary_launches_for_teardown(authority, [info])
+    settlement = service._settle_bound_ordinary_launches_for_teardown(
+        authority, [info])
+    assert not settlement.provider_present_cleanup_contexts
+    assert settlement.provider_reconciliation_failures.keys() == {
+        (info.replica_id, info.replica_record_id)
+    }
+    assert (f'returned {evidence.value}'
+            in next(iter(settlement.provider_reconciliation_failures.values())))
 
     expected_reads = ['physical-cluster-uid']
     if evidence == ordinary_launch_binding.ProviderEvidence.UNKNOWN:
@@ -872,13 +882,13 @@ def test_serve059_lineage_and_sqlite_ceiling() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ['061']
+    assert scripts.get_heads() == ['063']
     assert scripts.get_revision('060').down_revision == '059'
     assert scripts.get_revision('059').down_revision == '058'
     assert scripts.get_revision('058').down_revision == '057'
     assert scripts.get_revision('056').down_revision == '055'
     assert scripts.get_revision('055').down_revision == '054'
-    assert migration_utils.SERVE_VERSION == '061'
+    assert migration_utils.SERVE_VERSION == '063'
     assert migration_utils.serve_target_version(sqlite) == '037'
     with pytest.raises(RuntimeError, match='PostgreSQL-only'):
         alembic_command.upgrade(config, '056')
@@ -1950,8 +1960,10 @@ def test_remove_service_completely_removes_intent_linked_replica_graph(
     _install_failed_teardown_provider_observation(
         monkeypatch, atomic_database, info,
         ordinary_launch_binding.ProviderEvidence.PRESENT)
-    cleanup_contexts = service._settle_bound_ordinary_launches_for_teardown(
+    settlement = service._settle_bound_ordinary_launches_for_teardown(
         authority, [info])
+    cleanup_contexts = settlement.provider_present_cleanup_contexts
+    assert not settlement.provider_reconciliation_failures
     assert cleanup_contexts == {
         (info.replica_id, info.replica_record_id): context
     }

@@ -110,8 +110,8 @@ def _resolve_failover_policy_symbol(path: str):
 
 
 def test_failover_error_policy_historical_contract():
-    assert (backend._RSYNC_NOT_FOUND_MESSAGE is
-            failover_error_policy._RSYNC_NOT_FOUND_MESSAGE)
+    assert (backend._RSYNC_NOT_FOUND_MESSAGE
+            is failover_error_policy._RSYNC_NOT_FOUND_MESSAGE)
     for handler_name in ('FailoverCloudErrorHandlerV1',
                          'FailoverCloudErrorHandlerV2'):
         handler = getattr(backend, handler_name)
@@ -421,10 +421,12 @@ def test_provider_negative_ack_validator_returns_closed_canonical_copy():
     assert canonical == receipt
     assert canonical is not receipt
     assert canonical['invocations'] is not receipt['invocations']
-    assert backend.validate_provider_negative_ack(
-        receipt, cluster_name='other-cluster', requested_count=2) is None
-    assert backend.validate_provider_negative_ack(
-        receipt, cluster_name='sky-cluster', requested_count=1) is None
+    assert backend.validate_provider_negative_ack(receipt,
+                                                  cluster_name='other-cluster',
+                                                  requested_count=2) is None
+    assert backend.validate_provider_negative_ack(receipt,
+                                                  cluster_name='sky-cluster',
+                                                  requested_count=1) is None
 
 
 @pytest.mark.parametrize(('path', 'value'), [
@@ -455,8 +457,9 @@ def test_provider_negative_ack_validator_fails_closed(path, value):
         target = target[key]
     target[path[-1]] = value
 
-    assert backend.validate_provider_negative_ack(
-        receipt, cluster_name='sky-cluster', requested_count=2) is None
+    assert backend.validate_provider_negative_ack(receipt,
+                                                  cluster_name='sky-cluster',
+                                                  requested_count=2) is None
 
 
 @pytest.mark.parametrize('principal_arn', [
@@ -474,8 +477,9 @@ def test_provider_negative_ack_validator_rejects_malformed_principal_arn(
     receipt['invocations'][0]['attempts'][0][
         'aws_principal_arn'] = principal_arn
 
-    assert backend.validate_provider_negative_ack(
-        receipt, cluster_name='sky-cluster', requested_count=2) is None
+    assert backend.validate_provider_negative_ack(receipt,
+                                                  cluster_name='sky-cluster',
+                                                  requested_count=2) is None
 
 
 def test_provider_negative_ack_validator_rejects_principal_account_mismatch():
@@ -483,8 +487,9 @@ def test_provider_negative_ack_validator_rejects_principal_account_mismatch():
     receipt['aws_account_id'] = '210987654321'
     receipt['invocations'][0]['attempts'][0]['aws_account_id'] = '210987654321'
 
-    assert backend.validate_provider_negative_ack(
-        receipt, cluster_name='sky-cluster', requested_count=2) is None
+    assert backend.validate_provider_negative_ack(receipt,
+                                                  cluster_name='sky-cluster',
+                                                  requested_count=2) is None
 
 
 def test_provider_negative_ack_extractor_aggregates_every_nested_leaf():
@@ -1122,8 +1127,13 @@ def test_retry_zones_preserves_structured_provider_failure(
 
 
 @pytest.mark.parametrize('provider_outcome', ['negative-ack', 'ambiguous'])
+@pytest.mark.parametrize(
+    'profile_kind',
+    (ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+     ordinary_launch_binding.NonPoolLaunchProfileKind.
+     UNKNOWN_CAPACITY_REPLACEMENT))
 def test_retry_zones_paid_provider_outcome_cleanup_contract(
-        tmp_path, monkeypatch, provider_outcome):
+        tmp_path, monkeypatch, provider_outcome, profile_kind):
     provisioner = _early_retry_provisioner(tmp_path, monkeypatch)
     provisioner._local_wheel_path = None
     provisioner._wheel_hash = None
@@ -1147,10 +1157,9 @@ def test_retry_zones_paid_provider_outcome_cleanup_contract(
                           hint='replay same association and ClientToken',
                           retry_wait_seconds=5))
     bound_context = types.SimpleNamespace(
-        profile=types.SimpleNamespace(kind=ordinary_launch_binding.
-                                      NonPoolLaunchProfileKind.ORDINARY_PAID),
-        capability_cohort_epoch=(ordinary_launch_binding.
-                                 ORDINARY_PAID_AWS_CLIENT_TOKEN_COHORT_FLOOR),
+        profile=types.SimpleNamespace(kind=profile_kind),
+        capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
     )
 
     monkeypatch.setattr(clouds.AWS, 'check_quota_available', lambda *_: True)
@@ -1243,6 +1252,80 @@ def test_retry_zones_paid_provider_outcome_cleanup_contract(
     else:
         assert exc_info.value is provider_error
         blocklist.assert_not_called()
+
+
+def test_retry_zones_refuses_pre_identity_aws_paid_replacement(
+        tmp_path, monkeypatch):
+    provisioner = _early_retry_provisioner(tmp_path, monkeypatch)
+    provisioner._local_wheel_path = None
+    provisioner._wheel_hash = None
+    provisioner._active_cluster_hash = None
+    provisioner._is_managed = False
+    provisioner._workload_type = 'service'
+    provisioner._is_launched_by_jobs_controller = False
+    provisioner._extra_launch_context = {
+        ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY: 2,
+    }
+    provisioner._validate_service_replica_launch_preflight = lambda: None
+    provisioner._service_replica_launch_provider_guard = (
+        lambda: contextlib.nullcontext())
+    bound_context = types.SimpleNamespace(
+        profile=types.SimpleNamespace(
+            kind=ordinary_launch_binding.NonPoolLaunchProfileKind.
+            UNKNOWN_CAPACITY_REPLACEMENT),
+        capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH - 1),
+    )
+    monkeypatch.setattr(clouds.AWS, 'check_quota_available', lambda *_: True)
+    monkeypatch.setattr(provisioner, '_yield_zones',
+                        lambda *_: iter([[clouds.Zone('us-east-1a')]]))
+    monkeypatch.setattr(backend, '_capacity_cache_exhausted_zone_names',
+                        lambda *_: set())
+    monkeypatch.setattr(backend, '_get_image_demand_attribution',
+                        lambda *_: mock.MagicMock())
+    monkeypatch.setattr(backend, '_resolve_container_image_for_placement',
+                        lambda resources, **_: resources)
+    monkeypatch.setattr(backend, '_get_cluster_config_template',
+                        lambda *_: '/tmp/template')
+    monkeypatch.setattr(
+        backend.backend_utils, 'write_cluster_config', lambda *_, **__: {
+            'ray': '/tmp/cluster.yaml',
+            'cluster_name_on_cloud': 'test-cluster',
+        })
+    monkeypatch.setattr(backend, '_get_workload_attribution', lambda *_:
+                        (None, None))
+    monkeypatch.setattr(backend.global_user_state, 'add_or_update_cluster',
+                        lambda *_, **__: 'cluster-hash')
+    monkeypatch.setattr(backend.global_user_state, 'add_cluster_event',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(backend.global_user_state,
+                        'set_owner_identity_for_cluster', lambda *_, **__: None)
+    monkeypatch.setattr(backend.usage_lib.messages.usage,
+                        'update_final_cluster_status', lambda *_: None)
+    monkeypatch.setattr(backend.controller_utils.Controllers, 'from_name',
+                        lambda *_: None)
+    bulk_provision = mock.Mock()
+    monkeypatch.setattr(backend.provisioner, '_BUILTIN_BULK_PROVISION',
+                        bulk_provision)
+    monkeypatch.setattr(backend.provisioner, 'bulk_provision', bulk_provision)
+    monkeypatch.setattr(backend, '_record_service_placement_event',
+                        lambda *_, **__: None)
+    monkeypatch.setattr(ordinary_launch_binding, 'has_bound_launch_context',
+                        lambda *_: True)
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'parse_bound_non_pool_launch_context',
+                        lambda *_: bound_context)
+
+    with pytest.raises(exceptions.ServeReplicaLaunchFenceError,
+                       match='predates immutable create identity'):
+        _call_retry_zones(provisioner,
+                          _to_provision(),
+                          cloud_user_identity=[
+                              'arn:aws:iam::123456789012:role/test',
+                              '123456789012'
+                          ])
+
+    bulk_provision.assert_not_called()
 
 
 def test_retry_zones_passes_template_override_to_config_writer(
@@ -1667,8 +1750,9 @@ def test_new_provisioner_post_bulk_callback_is_authoritative(
         'bulk_provision',
         'deploy_vars:post_bulk',
     ]
-    assert {key: writer_results[0][key] for key in writer_variables
-           } == writer_variables
+    assert {
+        key: writer_results[0][key] for key in writer_variables
+    } == writer_variables
     assert result['resources_vars'] == post_bulk_variables
     assert result['provision_record'] is provision_record
     bulk_provision.assert_called_once()
@@ -1881,8 +1965,9 @@ def test_new_provisioner_short_circuit_skips_bulk_and_post_bulk_callback(
         'resources_deploy_vars',
         'deploy_vars:writer',
     ]
-    assert {key: writer_results[0][key] for key in writer_variables
-           } == writer_variables
+    assert {
+        key: writer_results[0][key] for key in writer_variables
+    } == writer_variables
     assert result['provisioning_skipped'] is provisioning_skipped
     bulk_provision.assert_not_called()
     cleanup.assert_not_called()
@@ -2001,9 +2086,11 @@ def test_only_reserved_fill_builtin_kubernetes_splits_provider_effect_guard(
                     builtin,
                     guard_factory,
                     reserved_fill=True) is None
-    assert selector(
-        clouds.DO(), builtin, builtin, guard_factory,
-        reserved_fill=True) is None
+    assert selector(clouds.DO(),
+                    builtin,
+                    builtin,
+                    guard_factory,
+                    reserved_fill=True) is None
     assert selector(clouds.Kubernetes(),
                     builtin,
                     builtin,
@@ -2326,8 +2413,8 @@ def test_reserved_fill_backend_installs_successful_adoption_guard(
         skip_unnecessary_provisioning=True)
 
     assert result == (handle, False)
-    assert (backend_instance._reserved_fill_materialized_guard_factory is
-            fresh_guard)
+    assert (backend_instance._reserved_fill_materialized_guard_factory
+            is fresh_guard)
     assert backend_instance._reserved_fill_pod_materialized is True
     assert events.count('guard-enter') >= 3
     provision_with_retries.assert_called_once_with(task, to_provision_config,

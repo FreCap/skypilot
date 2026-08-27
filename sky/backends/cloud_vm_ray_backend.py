@@ -870,8 +870,8 @@ class RetryingVmProvisioner:
                     fence, resources)
                 cloud = resources.cloud
                 assert cloud is not None
-                if (cloud.PROVISIONER_VERSION !=
-                        clouds.ProvisionerVersion.SKYPILOT):
+                if (cloud.PROVISIONER_VERSION
+                        != clouds.ProvisionerVersion.SKYPILOT):
                     raise ValueError('Reserved-fill Kubernetes requires the '
                                      'attested in-tree provisioner path.')
         except ValueError as error:
@@ -889,8 +889,8 @@ class RetryingVmProvisioner:
                 'SkyServe binding-excluded launch context is malformed.'
             ) from error
         if (excluded is None or excluded.get(
-                serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY) !=
-                serve_constants.
+                serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY)
+                != serve_constants.
                 ORDINARY_LAUNCH_BINDING_EXCLUDED_SYSTEM_RECOVERY_PROFILE):
             return
         claim = request_storage.active_execution_claim()
@@ -1831,9 +1831,14 @@ class RetryingVmProvisioner:
                         list(
                             resources_utils.port_ranges_to_set(
                                 to_provision.ports))
-                        if to_provision.cloud.OPEN_PORTS_VERSION <=
-                        clouds.OpenPortsVersion.LAUNCH_ONLY else None)
+                        if to_provision.cloud.OPEN_PORTS_VERSION
+                        <= clouds.OpenPortsVersion.LAUNCH_ONLY else None)
                     reserved_fill_pod_materialized = False
+                    # The broad provisioning handler below can run before the
+                    # paid binding is parsed. Keep provider-identity locals
+                    # total so a pre-parse failure cannot mask its real cause.
+                    paid_aws_client_token: str | None = None
+                    paid_aws_account_id: str | None = None
                     try:
                         controller = controller_utils.Controllers.from_name(
                             cluster_name)
@@ -1872,8 +1877,6 @@ class RetryingVmProvisioner:
                             assert self._active_cluster_hash is not None
                             bulk_provision_kwargs['cluster_incarnation'] = (
                                 self._active_cluster_hash)
-                        paid_aws_client_token = None
-                        paid_aws_account_id = None
                         if (isinstance(to_provision.cloud, clouds.AWS) and
                                 ordinary_launch_binding.
                                 has_bound_launch_context(
@@ -1883,13 +1886,32 @@ class RetryingVmProvisioner:
                                 in self._extra_launch_context):
                             paid_context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
                                 self._extra_launch_context)
-                            if (paid_context.profile.kind is
-                                    ordinary_launch_binding.
-                                    NonPoolLaunchProfileKind.ORDINARY_PAID and
-                                    paid_context.capability_cohort_epoch >=
-                                    ordinary_launch_binding.
-                                    ORDINARY_PAID_AWS_CLIENT_TOKEN_COHORT_FLOOR
+                            paid_profile = paid_context.profile.kind
+                            if (paid_profile is ordinary_launch_binding.
+                                    NonPoolLaunchProfileKind.
+                                    UNKNOWN_CAPACITY_REPLACEMENT and
+                                    paid_context.capability_cohort_epoch
+                                    < ordinary_launch_binding.
+                                    ORDINARY_PAID_AWS_REPLACEMENT_CREATE_COHORT_FLOOR
                                ):
+                                raise exceptions.ServeReplicaLaunchFenceError(
+                                    'Paid AWS replacement predates immutable '
+                                    'create identity; refusing a new provider '
+                                    'effect.')
+                            token_capable = bool(
+                                paid_profile is ordinary_launch_binding.
+                                NonPoolLaunchProfileKind.ORDINARY_PAID and
+                                paid_context.capability_cohort_epoch
+                                >= ordinary_launch_binding.
+                                ORDINARY_PAID_AWS_CLIENT_TOKEN_COHORT_FLOOR or
+                                paid_profile is ordinary_launch_binding.
+                                NonPoolLaunchProfileKind.
+                                UNKNOWN_CAPACITY_REPLACEMENT and
+                                paid_context.capability_cohort_epoch
+                                >= ordinary_launch_binding.
+                                ORDINARY_PAID_AWS_REPLACEMENT_CREATE_COHORT_FLOOR
+                            )
+                            if token_capable:
                                 paid_aws_client_token = (
                                     ordinary_launch_binding.
                                     ordinary_paid_aws_client_token(paid_context)
@@ -3188,8 +3210,8 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
         # When a cluster is on a cloud that does not support the new
         # provisioner, we should skip updating cluster_info.
         if (self.launched_resources.cloud is not None and
-                self.launched_resources.cloud.PROVISIONER_VERSION >=
-                clouds.ProvisionerVersion.SKYPILOT):
+                self.launched_resources.cloud.PROVISIONER_VERSION
+                >= clouds.ProvisionerVersion.SKYPILOT):
             provider_name = str(self.launched_resources.cloud).lower()
             config = {}
             # It is possible that the cluster yaml is not available when
@@ -3366,8 +3388,8 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
 
         launched_resources = self.launched_resources.assert_launchable()
         updated_to_skypilot_provisioner_after_provisioned = (
-            launched_resources.cloud.PROVISIONER_VERSION >=
-            clouds.ProvisionerVersion.SKYPILOT and
+            launched_resources.cloud.PROVISIONER_VERSION
+            >= clouds.ProvisionerVersion.SKYPILOT and
             self.cached_external_ips is not None and
             self.cached_cluster_info is None)
         if updated_to_skypilot_provisioner_after_provisioned:
@@ -3376,8 +3398,8 @@ class CloudVmRayResourceHandle(backends.backend.ResourceHandle):
                 f'provisioner after cluster {self.cluster_name} was '
                 f'provisioned. Cached IPs are used for connecting to the '
                 'cluster.')
-        if (clouds.ProvisionerVersion.RAY_PROVISIONER_SKYPILOT_TERMINATOR >=
-                launched_resources.cloud.PROVISIONER_VERSION or
+        if (clouds.ProvisionerVersion.RAY_PROVISIONER_SKYPILOT_TERMINATOR
+                >= launched_resources.cloud.PROVISIONER_VERSION or
                 updated_to_skypilot_provisioner_after_provisioned):
             ip_list = (self.cached_external_ips
                        if force_cached else self.external_ips())
@@ -4146,8 +4168,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             return False
         cluster_owner_identity = cluster_record.get('owner')
         if (not isinstance(cluster_owner_identity, list) or
-                tuple(cluster_owner_identity) !=
-                evidence.provision_owner_identity):
+                tuple(cluster_owner_identity)
+                != evidence.provision_owner_identity):
             return False
         if (evidence.request_id != current_request_id or
                 bound_request_id != current_request_id or
@@ -4987,8 +5009,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 ports_to_reconcile = current_ports_set
         if ports_to_reconcile:
             launched_resources = handle.launched_resources.assert_launchable()
-            if not (launched_resources.cloud.OPEN_PORTS_VERSION <=
-                    clouds.OpenPortsVersion.LAUNCH_ONLY):
+            if not (launched_resources.cloud.OPEN_PORTS_VERSION
+                    <= clouds.OpenPortsVersion.LAUNCH_ONLY):
                 with rich_utils.safe_status(
                         ux_utils.spinner_message(
                             'Launching - Opening new ports')):
@@ -5975,9 +5997,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                             'Ignoring malformed system recovery state for job '
                             f'{job_id}: {error}')
                 for job_id in tuple(detail_statuses):
-                    if ((detail_statuses[job_id]
-                         == job_lib.JobSystemRecoveryDetailStatus.PRESENT) !=
-                        (job_id in recovery_infos)):
+                    if ((detail_statuses[job_id] ==
+                         job_lib.JobSystemRecoveryDetailStatus.PRESENT)
+                            != (job_id in recovery_infos)):
                         detail_statuses[job_id] = (
                             job_lib.JobSystemRecoveryDetailStatus.MALFORMED)
                         recovery_infos.pop(job_id, None)
@@ -7453,8 +7475,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             to_provision = handle.launched_resources
             assert to_provision is not None
             to_provision = to_provision.assert_launchable()
-            if (to_provision.cloud.OPEN_PORTS_VERSION <=
-                    clouds.OpenPortsVersion.LAUNCH_ONLY):
+            if (to_provision.cloud.OPEN_PORTS_VERSION
+                    <= clouds.OpenPortsVersion.LAUNCH_ONLY):
                 if not requested_ports_set <= current_ports_set:
                     current_cloud = to_provision.cloud
                     with ux_utils.print_exception_no_traceback():
