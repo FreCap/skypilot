@@ -225,10 +225,15 @@ the pre-transaction replica snapshot still marks paid capacity as scaling
 down. Every nonterminal cleanup-unproven paid row remains part of the locked
 paid baseline even after ``is_scale_down`` becomes true, so the transaction
 cannot authorize a replacement for capacity that may still exist or bill.
-Cancellation remains its own exact service/demand-generation transaction and
-is not hidden in the planning callback. After the conservative plan commits,
-the controller cancels only retirements fenced by that exact positive demand
-generation; if any row changes, it publishes no local candidate, refreshes
+Cancellation remains its own service/demand transaction and is not hidden in
+the planning callback. After the conservative plan commits, the controller
+takes the service lock once, reconstructs the current fresh durable demand,
+and atomically cancels the still-active retirement subset when that current
+generation is at least the positive generation observed by the planner and is
+independently still positive. A newer zero, stale, or incomplete generation
+fails closed. This one-transaction wave prevents normal load-balancer
+heartbeats from racing one exact-generation transaction per replica. If any
+row changes, the controller publishes no local candidate, refreshes
 replica/runtime/shape inputs and their fingerprint, and retries. No manager or
 provider operation runs under the capacity transaction.
 
@@ -700,9 +705,11 @@ provider, Kubernetes, HTTP, filesystem, or replica-manager operation. All
 conflict-prone rows are locked before it runs; after it returns, only canonical
 validation and plan/head writes remain. Local target, logical reconcile state,
 retirement state, and provider effects are published only after commit.
-Fresh-positive retirement cancellation is a distinct exact-generation
-transaction after an aborted candidate and before a fully refreshed retry; it
-never runs inside the callback.
+Fresh-positive retirement cancellation is a distinct current-generation batch
+transaction after an aborted candidate and before a fully refreshed retry. It
+accepts a generation newer than the caller's observation only after
+reconstructing fresh positive demand under the service lock; it never runs
+inside the callback.
 
 A prospective Phase-A debit may cross newer demand receipt generations only
 when the semantic plan itself is unchanged. In the same PostgreSQL transaction
@@ -1147,14 +1154,15 @@ on-demand spill.
   prove current-demand/current-supply planning completes with no I/O. Inject a
   callback exception and a final plan-write failure and prove no plan/head,
   claim, local target, or provider authority becomes visible.
-- Begin from a committed zero-demand retirement, advance to exact positive
+- Begin from an active zero-demand retirement wave, advance to exact positive
   demand, and give the planner a prepared snapshot containing that active paid
   retirement. Prove the locked paid baseline still counts the row and commits
-  no replacement residual; prove the separate exact-generation cancellation
-  commits after that boundary, local publication is skipped, refreshed
-  preparation removes the retiring classification, and the next transaction
-  publishes exactly one correct residual without double-counting
-  cleanup-unproven paid capacity.
+  no replacement residual; advance the positive demand generation again and
+  prove the separate current-positive batch cancellation commits every
+  still-active row atomically after that boundary. Prove local publication is
+  skipped, refreshed preparation removes the retiring classification, and the
+  next transaction publishes exactly one correct residual without
+  double-counting cleanup-unproven paid capacity.
 - After an exact paid claim commits, expire or remove every demand report and
   prove its bound request may enter provider I/O once while a prospective claim
   still fails closed. Repeat with an ACTIVE-slot/cutover-generation mismatch.

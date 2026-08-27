@@ -831,3 +831,124 @@ def test_newer_positive_demand_cancels_only_uncommitted_intent(
         ).mappings().one()
     assert state == paid_retirement.PaidRetirementState.CANCELLED.value
     assert lease['revoked_at'] is not None
+
+
+def test_positive_demand_batch_cancellation_accepts_newer_positive_generation(
+        retirement_database):
+    engine, info, authority = retirement_database
+    _mark_retiring(info)
+    assert serve_state.admit_paid_retirement(
+        'svc',
+        1,
+        info,
+        authority,
+        requires_idle_proof=True,
+        expected_service_hash='svc-hash',
+        expected_controller_owner=_OWNER) is not None
+
+    info2 = replica_managers.ReplicaInfo(replica_id=2,
+                                         cluster_name='svc-2',
+                                         replica_port='8000',
+                                         is_spot=True,
+                                         location=None,
+                                         version=1,
+                                         resources_override=None)
+    info2.status_property.sky_launch_status = (
+        common_utils.ProcessStatus.SUCCEEDED)
+    info2.status_property.service_ready_now = True
+    info2.status_property.first_ready_time = time.time()
+    _mark_retiring(info2)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                **serve_state._replica_row_values('svc', 2, info2)))
+        retirement = dict(
+            connection.execute(
+                sqlalchemy.select(
+                    paid_retirement.serve_paid_replica_retirements_table).
+                where(paid_retirement.serve_paid_replica_retirements_table.c.
+                      replica_id == 1)).mappings().one())
+        retirement.update(replica_id=2,
+                          replica_record_id=uuid.UUID(
+                              info2.replica_record_id))
+        connection.execute(
+            sqlalchemy.insert(
+                paid_retirement.serve_paid_replica_retirements_table).values(
+                    **retirement))
+
+    route_receipt = route_projection.RoutePublicationReceipt(
+        generation=1,
+        content_sha256=route_projection._content_sha256(
+            _route_response(), _route_identities(info.replica_record_id)),
+        duplicate=True,
+        valid_until=datetime.datetime.now(datetime.timezone.utc) +
+        datetime.timedelta(seconds=60))
+    first_positive = demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(),
+                       route_receipt,
+                       sequence=2,
+                       request_count=2))
+    latest_positive = demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(),
+                       route_receipt,
+                       sequence=3,
+                       request_count=3))
+    assert latest_positive.generation > first_positive.generation
+
+    for candidate in (info, info2):
+        candidate.status_property.is_scale_down = False
+        candidate.status_property.sky_down_status = None
+        candidate.status_property.wait_for_idle_before_termination = False
+    assert serve_state.cancel_paid_retirements(
+        'svc', [(1, info), (2, info2)],
+        first_positive.generation,
+        expected_service_hash='svc-hash',
+        expected_controller_owner=_OWNER) == {1, 2}
+
+    with engine.connect() as connection:
+        states = connection.execute(
+            sqlalchemy.select(
+                paid_retirement.serve_paid_replica_retirements_table.c.
+                replica_id, paid_retirement.
+                serve_paid_replica_retirements_table.c.state).order_by(
+                    paid_retirement.serve_paid_replica_retirements_table.c.
+                    replica_id)).all()
+    assert states == [
+        (1, paid_retirement.PaidRetirementState.CANCELLED.value),
+        (2, paid_retirement.PaidRetirementState.CANCELLED.value),
+    ]
+    persisted = serve_state.get_replica_infos_from_ids('svc', [1, 2])
+    assert all(not candidate.status_property.is_scale_down
+               for candidate in persisted.values())
+    assert all(candidate.status_property.sky_down_status is None
+               for candidate in persisted.values())
+
+
+def test_batch_cancellation_rejects_current_fresh_zero(retirement_database):
+    engine, info, authority = retirement_database
+    _mark_retiring(info)
+    assert serve_state.admit_paid_retirement(
+        'svc',
+        1,
+        info,
+        authority,
+        requires_idle_proof=True,
+        expected_service_hash='svc-hash',
+        expected_controller_owner=_OWNER) is not None
+    info.status_property.is_scale_down = False
+    info.status_property.sky_down_status = None
+    info.status_property.wait_for_idle_before_termination = False
+
+    assert serve_state.cancel_paid_retirements(
+        'svc', [(1, info)],
+        authority.demand_feed_generation,
+        expected_service_hash='svc-hash',
+        expected_controller_owner=_OWNER) == set()
+    with engine.connect() as connection:
+        state = connection.execute(
+            sqlalchemy.select(
+                paid_retirement.serve_paid_replica_retirements_table.c.state)
+        ).scalar_one()
+    assert state == paid_retirement.PaidRetirementState.ACTIVE.value
