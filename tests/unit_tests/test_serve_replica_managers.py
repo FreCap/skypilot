@@ -18547,6 +18547,133 @@ class TestPaidLocationLaunchBudget:
         assert all(candidate.replica_info.paid_capacity_pool_key == pool_key
                    for candidate in candidates)
 
+    def test_paid_authority_stages_full_nineteen_location_cold_frontier(self):
+        locations = [
+            dataclasses.replace(make_location('us-central1', {'L4': 1},
+                                              cloud_name='GCP',
+                                              instance_type='g2-standard-4'),
+                                zone=f'us-central1-test-{index:02d}')
+            for index in range(19)
+        ]
+        manager = self._manager({
+            location: float(index + 1)
+            for index, location in enumerate(locations)
+        })
+        manager._service_hash = 'svc-hash'
+        manager._controller_owner = (1, '10.0.0.1')
+        manager._next_replica_id = 1
+        manager._pending_version = None
+        manager._version_specs[1].max_live_paid_gpu_units = 100
+        manager._uses_shared_zero_cost_demand_budget = mock.Mock(
+            return_value=False)
+        manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
+        manager._demand_should_skip_saturated_zero_cost = mock.Mock(
+            return_value=False)
+        manager._persist_new_replica = mock.Mock()
+        existing = []
+        pool_keys = {
+            location: paid_capacity.pool_key(
+                location, workspace='default',
+                num_nodes=1) for location in locations
+        }
+        pool_states = {
+            pool_key: {
+                'active_claims': 0,
+                'admission_limit': 4,
+                'remaining': 4,
+                'admission_state': 'active',
+                'last_success_at': None,
+                'legacy_overage': 0,
+            } for pool_key in pool_keys.values()
+        }
+        authority = capacity_admission.PaidLaunchAuthority(
+            service_name='svc',
+            service_hash='svc-hash',
+            generation=8,
+            content_sha256='a' * 64,
+            demand_feed_generation=9,
+            demand_source_epoch=3,
+            paid_residual_by_accelerator=(('l4', 100),),
+            paid_launch_target_by_accelerator=(('l4', 100),),
+            capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND,
+            physical_gpu_width_by_accelerator=(('l4', 1),),
+            reserved_fill_authority=(
+                capacity_admission.ReservedFillPlanAuthority.not_applicable()))
+        workers = []
+
+        def _make_worker(*_args, **_kwargs):
+            worker = mock.Mock()
+            workers.append(worker)
+            return worker
+
+        def _admit_batch(**kwargs):
+            candidates = kwargs['candidates']
+            assert len(candidates) == 76
+            assert all(
+                candidate.location.use_spot is True for candidate in candidates)
+            assert collections.Counter(
+                candidate.location for candidate in candidates) == {
+                    location: 4 for location in locations
+                }
+            budget = kwargs['budget']
+            assert budget.plan_bound_cohort is not None
+            assert budget.plan_bound_cohort.backend_claim_count == 100
+            assert budget.plan_bound_cohort.frontier_limits() == {('l4',): 19}
+            assert budget.max_live_paid_gpu_units == 100
+            assert budget.live_paid_gpu_units == 0
+            assert budget.service_remaining == 24
+            return paid_capacity.PaidClaimBatchResult(
+                tuple(
+                    paid_capacity.PaidClaimBatchMemberResult(
+                        candidate.replica_id, candidate.replica_info.
+                        replica_record_id, paid_capacity.ClaimResult.ACQUIRED)
+                    for candidate in candidates))
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=existing), \
+             mock.patch.object(paid_capacity,
+                               'central_authority_available',
+                               return_value=True), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_paid_capacity_pool_states',
+                               return_value=pool_states), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_paid_capacity_plan_claimed_units',
+                 return_value={}), \
+             mock.patch.object(paid_capacity,
+                               'try_persist_claim_batch',
+                               side_effect=_admit_batch) as admit_batch, \
+             mock.patch.object(paid_capacity,
+                               'try_persist_claim') as singleton, \
+             mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True), \
+             mock.patch('sky.serve.replica_managers._get_resources_ports',
+                        return_value='8080'), \
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread',
+                        side_effect=_make_worker):
+            accepted = manager._scale_up_batch_locked(
+                [{
+                    'accelerators': {
+                        'L4': 1
+                    }
+                }] * 100,
+                paid_launch_authority=authority)
+
+        admit_batch.assert_called_once()
+        singleton.assert_not_called()
+        manager._persist_new_replica.assert_not_called()
+        assert len(accepted) == 76
+        assert [result.replica_id for result in accepted] == list(range(1, 77))
+        assert [info.replica_id for info in existing] == list(range(1, 77))
+        assert manager._next_replica_id == 77
+        assert len(workers) == 76
+        assert all(worker.start.call_count == 0 for worker in workers)
+        assert {
+            replica_id for replica_id, _ in manager._launch_thread_pool.items()
+        } == set(range(1, 77))
+
     def test_paid_wave_exception_drops_staged_rows_and_workers(self):
         paid = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
         manager = self._manager({paid: 1.0})
