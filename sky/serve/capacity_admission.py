@@ -2980,7 +2980,11 @@ class CapacityAdmissionRepository:
         ``valid_until`` is intentionally not consulted here: it remains the
         independent provider-effect fence.  Every current service, demand,
         route, plan-head, content-hash, and immutable fill-policy identity is
-        nevertheless revalidated in this one PostgreSQL snapshot.
+        nevertheless revalidated through one connection-bounded read.  A
+        newer heartbeat generation may reuse the plan only when the
+        reconstructed normalized demand and exact route context are
+        decision-equivalent; this witness carries no provider-effect
+        authority.
         """
         if (not isinstance(service_name, str) or not service_name or
                 not isinstance(expected_service_hash, str) or
@@ -3041,13 +3045,16 @@ class CapacityAdmissionRepository:
                     _ROUTE_SNAPSHOTS.c.generation
                     == route_head['generation'])).mappings().one_or_none())
             refreshed_at = head['refreshed_at']
+            plan_demand_generation = (None if plan is None else
+                                      plan['demand_feed_generation'])
             if (plan is None or route_head is None or route is None or
                     not isinstance(refreshed_at, datetime.datetime) or
                     refreshed_at > now or now - refreshed_at
                     > datetime.timedelta(seconds=float(max_age_seconds)) or
-                    head['demand_feed_generation'] != current_demand_generation
-                    or plan['demand_feed_generation']
-                    != current_demand_generation or
+                    type(current_demand_generation) is not int or
+                    type(plan_demand_generation) is not int or
+                    head['demand_feed_generation'] != plan_demand_generation or
+                    plan_demand_generation > current_demand_generation or
                     plan['service_hash'] != service['hash'] or
                     plan['service_lifecycle_epoch']
                     != service['lifecycle_epoch'] or
@@ -3079,14 +3086,34 @@ class CapacityAdmissionRepository:
                  validate_snapshot_row(route))
                 if not route_projection.snapshot_owner_matches(route, service):
                     return None
+                if plan_demand_generation < current_demand_generation:
+                    current_snapshot = demand_state.get_autoscaling_snapshot(
+                        service_name,
+                        expected_service_hash,
+                        connection=connection)
+                    if (current_snapshot is None or
+                            current_snapshot.demand_feed_generation
+                            != current_demand_generation or
+                            current_snapshot.demand_source_epoch
+                            != service['demand_source_epoch'] or
+                            current_snapshot.route_generation
+                            != plan['route_generation'] or
+                            current_snapshot.route_sha256
+                            != plan['route_sha256'] or
+                            current_snapshot.route_source_epoch
+                            != plan['route_source_epoch'] or
+                            _changed_demand_semantics(
+                                payload.get('normalized_demand'),
+                                current_snapshot.normalized_demand)):
+                        return None
                 planner_snapshot, candidate = _decode_planner_payload(
                     payload.get('planner'))
                 if (planner_snapshot.service_version
                         != service['current_version'] or
                         planner_snapshot.source_generation
-                        != current_demand_generation or
-                        candidate.source_generation != current_demand_generation
-                        or not candidate.attribution_complete or
+                        != plan_demand_generation or
+                        candidate.source_generation != plan_demand_generation or
+                        not candidate.attribution_complete or
                         planner_snapshot.reservation.gate_policy
                         is not capacity_planning.ReservationGatePolicy.
                         DEMAND_GATED):

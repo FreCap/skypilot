@@ -35,6 +35,25 @@ def _demand(priority: int,
                                                  work=work)
 
 
+def _deadline(*,
+              remaining_seconds: float,
+              priority: int = 50,
+              cards: tuple[str, ...] = ('A100',),
+              count: int = 1) -> capacity_planning.DeadlinePlanningInput:
+    return capacity_planning.DeadlinePlanningInput(
+        demand=(autoscaler_compatibility.DeadlineDemand(
+            sequence=0,
+            priority=priority,
+            compatible_cards=cards,
+            count=count,
+            remaining_seconds=remaining_seconds),),
+        finite_supply=(),
+        service_seconds_by_accelerator=_work(L4=30, A100=30),
+        service_time_sources=(('L4', 'seed'), ('A100', 'seed')),
+        utilization=0.95,
+        paid_cold_lead_seconds=600)
+
+
 def _reservation(
     *,
     gate_policy: capacity_planning.ReservationGatePolicy = (
@@ -894,6 +913,138 @@ def test_matching_gate_witness_commits_reservation_before_spot_residual(
     assert plan.new_reserved_capacity_committed.as_dict() == {'A100': 1}
     assert plan.paid_residual.as_dict() == {'A100': 2}
     assert plan.paid_launch_target.as_dict() == {'A100': 2}
+
+
+def test_gate_witness_survives_equivalent_deadline_heartbeat() -> None:
+    initial_demand = (_demand(50, ('A100',), 0.49),)
+    acquisition_snapshot = _snapshot(
+        demand_profiles=initial_demand,
+        explicit_demand_profiles=initial_demand,
+        paid_demand_profiles=initial_demand,
+        deadline=_deadline(remaining_seconds=3600),
+        reservation=_reservation(
+            gate_policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+            evidence_state=(capacity_planning.ReservationEvidenceState.
+                            AUTHENTICATED_UNSETTLED),
+            authenticated=_capacity(A100=1)))
+    acquisition = capacity_planning.plan_capacity(acquisition_snapshot)
+    assert acquisition.kind is (
+        capacity_planning.CapacityPlanKind.GATE_ACQUISITION)
+    witness = acquisition.demand_witness_sha256
+    assert witness is not None
+
+    refreshed_demand = (_demand(50, ('A100',), 0.105),)
+    settled_snapshot = dataclasses.replace(
+        acquisition_snapshot,
+        demand_profiles=refreshed_demand,
+        explicit_demand_profiles=refreshed_demand,
+        paid_demand_profiles=refreshed_demand,
+        deadline=_deadline(remaining_seconds=3595),
+        reservation=_reservation(
+            gate_policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+            evidence_state=(capacity_planning.ReservationEvidenceState.
+                            AUTHENTICATED_SETTLED),
+            authenticated=_capacity(A100=1),
+            eligible=_capacity(A100=1),
+            allocation_witness=witness,
+            demonstrated_need=1,
+            allocation_ceiling=1))
+    settled = capacity_planning.plan_capacity(settled_snapshot)
+
+    assert settled.demand_witness_sha256 == witness
+    assert settled.kind is capacity_planning.CapacityPlanKind.DEMAND
+    assert settled.new_reserved_capacity_committed.as_dict() == {'A100': 1}
+    assert settled.reserved_launch_target.as_dict() == {'A100': 1}
+
+
+def test_gate_witness_survives_equivalent_deadline_bucket_merge() -> None:
+    split_deadline = capacity_planning.DeadlinePlanningInput(
+        demand=(
+            autoscaler_compatibility.DeadlineDemand(sequence=0,
+                                                    priority=50,
+                                                    compatible_cards=('A100',),
+                                                    count=1,
+                                                    remaining_seconds=3600),
+            autoscaler_compatibility.DeadlineDemand(sequence=1,
+                                                    priority=50,
+                                                    compatible_cards=('A100',),
+                                                    count=1,
+                                                    remaining_seconds=3595),
+        ),
+        finite_supply=(),
+        service_seconds_by_accelerator=_work(L4=30, A100=30),
+        service_time_sources=(('L4', 'seed'), ('A100', 'seed')),
+        utilization=0.95,
+        paid_cold_lead_seconds=600)
+    merged_deadline = _deadline(remaining_seconds=3590, count=2)
+    demand = (_demand(50, ('A100',), 1),)
+    split = _snapshot(
+        demand_profiles=demand,
+        explicit_demand_profiles=demand,
+        paid_demand_profiles=demand,
+        deadline=split_deadline,
+        reservation=_reservation(
+            gate_policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+            evidence_state=(capacity_planning.ReservationEvidenceState.
+                            AUTHENTICATED_UNSETTLED),
+            authenticated=_capacity(A100=2)))
+    merged = dataclasses.replace(split, deadline=merged_deadline)
+
+    assert capacity_planning.demand_witness_semantic_sha256(
+        split, aggregate_demand_target=2, demand_attribution=_capacity(
+            A100=2)) == (capacity_planning.demand_witness_semantic_sha256(
+                merged,
+                aggregate_demand_target=2,
+                demand_attribution=_capacity(A100=2)))
+
+
+def test_gate_witness_changes_with_request_class_target_or_card() -> None:
+    demand = (_demand(50, ('A100',), 1),)
+    snapshot = _snapshot(
+        demand_profiles=demand,
+        explicit_demand_profiles=demand,
+        paid_demand_profiles=demand,
+        deadline=_deadline(remaining_seconds=3600),
+        reservation=_reservation(
+            gate_policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+            evidence_state=(capacity_planning.ReservationEvidenceState.
+                            AUTHENTICATED_UNSETTLED),
+            authenticated=_capacity(A100=2)))
+    baseline = capacity_planning.demand_witness_semantic_sha256(
+        snapshot,
+        aggregate_demand_target=1,
+        demand_attribution=_capacity(A100=1))
+
+    priority_demand = (_demand(20, ('A100',), 1),)
+    priority_snapshot = dataclasses.replace(
+        snapshot,
+        demand_profiles=priority_demand,
+        explicit_demand_profiles=priority_demand,
+        paid_demand_profiles=priority_demand,
+        deadline=_deadline(remaining_seconds=3600, priority=20))
+    flexible_demand = (_demand(50, ('L4', 'A100'), 1),)
+    compatibility_snapshot = dataclasses.replace(
+        snapshot,
+        demand_profiles=flexible_demand,
+        explicit_demand_profiles=flexible_demand,
+        paid_demand_profiles=flexible_demand,
+        deadline=_deadline(remaining_seconds=3600, cards=('L4', 'A100')))
+
+    assert capacity_planning.demand_witness_semantic_sha256(
+        priority_snapshot,
+        aggregate_demand_target=1,
+        demand_attribution=_capacity(A100=1)) != baseline
+    assert capacity_planning.demand_witness_semantic_sha256(
+        compatibility_snapshot,
+        aggregate_demand_target=1,
+        demand_attribution=_capacity(A100=1)) != baseline
+    assert capacity_planning.demand_witness_semantic_sha256(
+        snapshot,
+        aggregate_demand_target=2,
+        demand_attribution=_capacity(A100=2)) != baseline
+    assert capacity_planning.demand_witness_semantic_sha256(
+        snapshot, aggregate_demand_target=1,
+        demand_attribution=_capacity(L4=1)) != baseline
 
 
 def test_stale_gate_witness_with_large_numeric_ceiling_has_no_effect() -> None:
