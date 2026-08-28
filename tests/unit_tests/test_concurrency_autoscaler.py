@@ -448,6 +448,56 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
             result.envelope.candidate.next_policy_state.source_generation, 1)
         self.assertIsNone(result.rollout_failure)
 
+    def test_durable_planner_never_borrows_process_local_kueue_tick_state(self):
+        autoscaler = _durable_autoscaler()
+        warm_retention = {'L4': 7}
+        kueue_capacity = {
+            999: kueue_lane_capacity.KueueReplicaCapacityClass.UNKNOWN,
+        }
+        blocked_shapes = frozenset({('*', 0)})
+        transition_ids = frozenset({998})
+        replacement_ids = frozenset({997})
+        autoscaler.warm_retention_target_by_accelerator = warm_retention
+        autoscaler._kueue_capacity_by_replica_id_for_tick = kueue_capacity
+        autoscaler._kueue_blocked_retirement_shapes_for_tick = blocked_shapes
+        autoscaler._kueue_transition_replica_ids_for_tick = transition_ids
+        autoscaler._kueue_ready_paid_replacement_replica_ids_for_tick = (
+            replacement_ids)
+        real_plan = capacity_planning.plan_capacity
+
+        def assert_isolated(snapshot):
+            self.assertIs(autoscaler.warm_retention_target_by_accelerator,
+                          warm_retention)
+            self.assertIs(autoscaler._kueue_capacity_by_replica_id_for_tick,
+                          kueue_capacity)
+            self.assertIs(autoscaler._kueue_blocked_retirement_shapes_for_tick,
+                          blocked_shapes)
+            self.assertIs(autoscaler._kueue_transition_replica_ids_for_tick,
+                          transition_ids)
+            self.assertIs(
+                autoscaler._kueue_ready_paid_replacement_replica_ids_for_tick,
+                replacement_ids)
+            return real_plan(snapshot)
+
+        with mock.patch.object(capacity_planning,
+                               'plan_capacity',
+                               side_effect=assert_isolated) as plan:
+            result = self._plan(autoscaler)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(plan.call_count, 1)
+        self.assertIs(autoscaler.warm_retention_target_by_accelerator,
+                      warm_retention)
+        self.assertIs(autoscaler._kueue_capacity_by_replica_id_for_tick,
+                      kueue_capacity)
+        self.assertIs(autoscaler._kueue_blocked_retirement_shapes_for_tick,
+                      blocked_shapes)
+        self.assertIs(autoscaler._kueue_transition_replica_ids_for_tick,
+                      transition_ids)
+        self.assertIs(
+            autoscaler._kueue_ready_paid_replacement_replica_ids_for_tick,
+            replacement_ids)
+
     def test_post_commit_policy_install_is_generation_and_fingerprint_cas(self):
         autoscaler = _durable_autoscaler()
         result = self._plan(autoscaler)
@@ -686,12 +736,11 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
     def test_locked_kueue_snapshot_rebinds_equivalent_replica_order(self):
         first = _replica(1)
         second = _replica(2)
-        prepared = dataclasses.replace(
-            _durable_inputs((second, first)),
-            gpu_shapes_by_replica_id={
-                2: ('l4', 1),
-                1: ('h200', 1),
-            })
+        prepared = dataclasses.replace(_durable_inputs((second, first)),
+                                       gpu_shapes_by_replica_id={
+                                           2: ('l4', 1),
+                                           1: ('h200', 1),
+                                       })
         locked = kueue_lane_capacity.KueueReplicaCapacitySnapshot({})
 
         bound = autoscalers.bind_locked_kueue_capacity_snapshot(
@@ -708,8 +757,7 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         prepared = _durable_inputs((first, third))
         locked = kueue_lane_capacity.KueueReplicaCapacitySnapshot({})
 
-        with self.assertRaisesRegex(ValueError,
-                                    'different replica snapshot'):
+        with self.assertRaisesRegex(ValueError, 'different replica snapshot'):
             autoscalers.bind_locked_kueue_capacity_snapshot(
                 prepared, [first, second], locked)
 
