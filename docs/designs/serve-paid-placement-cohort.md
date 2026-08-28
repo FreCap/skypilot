@@ -2,7 +2,7 @@
 
 _Created: 2026-07-22_
 _Expanded: 2026-07-23_
-_Last updated: 2026-08-26_
+_Last updated: 2026-08-28_
 
 ## Status
 
@@ -15,6 +15,10 @@ projected route before the remaining prospective claims could commit. GCP
 usually produced a `RUNNING` VM 10-30 seconds after commitment, but repeated
 route-plan self-invalidation stretched 100 Spot L4 VMs to 27 minutes 53
 seconds.
+
+The 2026-08-28 retained-route semantic-equivalence correction described below
+is source-complete and under qualification. It is not part of the earlier
+production evidence in this status section.
 
 Release `1.1.1508` deploys paid claim acquisition as one bounded PostgreSQL
 transaction for the accepted batch instead of N singleton commits. Its first
@@ -75,16 +79,28 @@ total, and independent PostgreSQL
 and GCP censuses remained zero.
 
 The steady-state contract distinguishes those boundaries. Prospective planning
-continues to require fresh complete reports from the exact current ACTIVE slot,
-validate their immutable route references, and reject a mixed HA generation
-before any debit commits. After the debit commits, report expiry, ingestion
-blackout, or HA-role heartbeat advancement is display-only: it may neither
-authorize nor revoke the claim's one provider effect. Phase B instead requires
-the exact durable action graph, immutable plan and bounded debit, monotonic
-source generations, unchanged lifecycle/source ownership, and an unexpired
-current route head whose immutable snapshot has the current owner. Wrong
-ownership, lifecycle/version drift, corrupt or expired current route evidence,
-or an overdrawn immutable debit still fails closed.
+continues to require fresh complete reports from the exact current ACTIVE slot
+and rejects a mixed HA role/cutover generation before any debit commits. Route
+projection generations have a separate contract: a report may reference the
+current head or a retained immutable generation only when its full digest is
+exact and PostgreSQL proves the retained snapshot has the current owner,
+lifecycle, service version, producer protocol, and exactly the current head's
+demand-report route-context digest. Capacity-hint-only successors can therefore
+compose; route expansion, contraction, identity, routing-policy,
+async-occupancy, or queue-compatibility-mode changes cannot. Translation, plan
+authority, and every prospective effect always bind the fresh current head,
+never the retained generation. Every ordinary or route-only LB sync installs
+the queue-attribution mode atomically with that route head; a malformed
+response installs neither, while response-only history acknowledgements remain
+outside this semantic fence. After the debit commits, report expiry,
+ingestion blackout, or HA-role heartbeat advancement is display-only: it may
+neither authorize nor revoke the claim's one provider effect. Phase B instead
+requires the exact durable action graph, immutable plan and bounded debit,
+monotonic source generations, unchanged lifecycle/source ownership, and an
+unexpired current route head whose immutable snapshot has the current owner.
+Wrong ownership, lifecycle/version/producer drift, semantic route mixing,
+corrupt or expired current or retained route evidence, or an overdrawn
+immutable debit still fails closed.
 
 The PostgreSQL global paid-capacity authority shipped with database migration
 027. PR #909 reduced its exact-pool bootstrap from 60 to four, added a sticky

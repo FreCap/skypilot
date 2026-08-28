@@ -60,6 +60,7 @@ def test_occupancy_context_excludes_capacity_but_fences_replica_identity():
                 'async_occupancy': 'true',
             }
         },
+        'num_ready_replicas': 1,
         'capacity_hint': {
             'warm_retention_target_by_accelerator': {}
         },
@@ -120,6 +121,77 @@ def test_occupancy_context_excludes_capacity_but_fences_replica_identity():
     assert (route_projection._occupancy_context_sha256(with_draining,
                                                        draining_identities)
             != draining)
+
+
+def test_demand_report_context_fences_queue_mode_not_capacity_or_ack():
+    response = {
+        'service_version': 7,
+        'routing_spec': {
+            'load_balancing_policy_name': 'least_load'
+        },
+        'replica_info': {
+            'http://replica:8080': {
+                'async_occupancy': 'true',
+            }
+        },
+        'capacity_hint': {
+            'warm_retention_target_by_accelerator': {}
+        },
+        'request_history_accepted': False,
+        'queued_compatibility_demand_supported': True,
+    }
+    identities = {
+        'http://replica:8080': {
+            'replica_record_id': str(uuid.uuid4()),
+        }
+    }
+    digest = route_projection.demand_report_route_context_sha256(
+        response, identities)
+
+    capacity_only = copy.deepcopy(response)
+    capacity_only['capacity_hint'] = {
+        'warm_retention_target_by_accelerator': {
+            'H200': 30
+        }
+    }
+    ready_count_only = copy.deepcopy(response)
+    ready_count_only['num_ready_replicas'] = 2
+    acknowledged = copy.deepcopy(response)
+    acknowledged['request_history_accepted'] = True
+    queue_rollback = copy.deepcopy(response)
+    queue_rollback['queued_compatibility_demand_supported'] = False
+    changed_replica = copy.deepcopy(response)
+    changed_replica['replica_info']['http://replica:8080'][
+        'async_occupancy'] = 'false'
+    changed_identity = copy.deepcopy(identities)
+    changed_identity['http://replica:8080']['replica_record_id'] = str(
+        uuid.uuid4())
+    changed_draining = copy.deepcopy(response)
+    changed_draining[constants.LB_DRAINING_REPLICA_INFO_KEY] = {
+        'http://retired:8080': {
+            'async_occupancy': 'true',
+        }
+    }
+    changed_routing = copy.deepcopy(response)
+    changed_routing['routing_spec']['load_balancing_policy_name'] = (
+        'round_robin')
+
+    assert (route_projection.demand_report_route_context_sha256(
+        capacity_only, identities) == digest)
+    assert (route_projection.demand_report_route_context_sha256(
+        ready_count_only, identities) == digest)
+    assert (route_projection.demand_report_route_context_sha256(
+        acknowledged, identities) == digest)
+    assert (route_projection.demand_report_route_context_sha256(
+        queue_rollback, identities) != digest)
+    assert (route_projection.demand_report_route_context_sha256(
+        changed_replica, identities) != digest)
+    assert (route_projection.demand_report_route_context_sha256(
+        response, changed_identity) != digest)
+    assert (route_projection.demand_report_route_context_sha256(
+        changed_draining, identities) != digest)
+    assert (route_projection.demand_report_route_context_sha256(
+        changed_routing, identities) != digest)
 
 
 def test_selected_route_context_ignores_unrelated_fleet_churn():

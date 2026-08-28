@@ -408,10 +408,18 @@ def test_draining_observation_cannot_overlap_routable_url():
             {url: info}, {url: info})
 
 
-def test_foreground_route_only_sync_preserves_all_demand_history():
+def test_foreground_route_only_sync_preserves_history_and_backfills_downgrade():
     lb = _make_lb()
     lb._service_hash = 'service-hash-a'
     lb._queued_compatibility_demand_supported = True
+    queued_request = types.SimpleNamespace()
+    lb._request_queue_waiters = {
+        50: {
+            1: types.SimpleNamespace(request=queued_request,
+                                     abandoned=False,
+                                     deadline_monotonic=time.monotonic() + 60)
+        }
+    }
     digest = 'b' * 64
     response = {
         'replica_info': {
@@ -429,7 +437,8 @@ def test_foreground_route_only_sync_preserves_all_demand_history():
         'route_projection_sha256': digest,
         'route_source_epoch': 3,
         'async_request_ledger_protocol_version': 1,
-        # A route-only read never negotiates demand-report capability.
+        # Queue-attribution mode is part of the coherent route contract even
+        # though a route-only read never drains or acknowledges history.
         'queued_compatibility_demand_supported': False,
         # Nor may an unexpected ack clear a history snapshot it did not send.
         'request_history_accepted': True,
@@ -461,7 +470,8 @@ def test_foreground_route_only_sync_preserves_all_demand_history():
     history_ack.assert_not_called()
     classification_ack.assert_not_called()
     prediction_ack.assert_not_called()
-    assert lb._queued_compatibility_demand_supported is True
+    assert lb._queued_compatibility_demand_supported is False
+    assert len(aggregator.timestamps) == 1
     assert lb._route_projection_generation == 11
     assert lb._route_projection_sha256 == digest
     assert lb._route_sync_generation == 1
@@ -836,11 +846,13 @@ def test_partial_projected_route_fence_is_rejected_without_advancing():
                     'load_balancing_policy_name': 'least_load',
                 },
                 'service_version': 7,
+                'queued_compatibility_demand_supported': True,
                 'route_projection_generation': 1,
             })
 
     assert lb._routing_version is None
     assert lb._route_projection_generation is None
+    assert lb._queued_compatibility_demand_supported is False
 
     with pytest.raises(ValueError, match='occupancy context is malformed'):
         _run_one_sync(
@@ -859,6 +871,28 @@ def test_partial_projected_route_fence_is_rejected_without_advancing():
 
     assert lb._routing_version is None
     assert lb._route_projection_generation is None
+
+
+def test_route_only_sync_coherently_applies_queue_compatibility_mode():
+    lb = _make_lb()
+
+    _run_one_sync(lb, {
+        'replica_info': {},
+        'num_ready_replicas': 0,
+        'routing_spec': {
+            'load_balancing_policy_name': 'least_load',
+        },
+        'service_version': 7,
+        'queued_compatibility_demand_supported': True,
+        'route_projection_generation': 1,
+        'route_projection_sha256': 'a' * 64,
+        'route_source_epoch': 1,
+    },
+                  route_only=True)
+
+    assert lb._queued_compatibility_demand_supported is True
+    assert lb._routing_version == 7
+    assert lb._route_projection_generation == 1
 
 
 def test_role_route_and_projection_fence_are_one_locked_snapshot(monkeypatch):

@@ -3060,16 +3060,15 @@ class CapacityAdmissionRepository:
         if not route_projection.snapshot_owner_matches(route, service):
             raise CapacityAdmissionConflict(
                 'Fresh projected route belongs to a different owner.')
-        for row in reports:
-            payload = row['payload']
-            if (not isinstance(payload, Mapping) or
-                    payload.get('route_projection_generation')
-                    != plan.route_generation or
-                    payload.get('route_projection_sha256') != plan.route_sha256
-                    or payload.get('route_source_epoch')
-                    != plan.route_source_epoch):
-                raise CapacityAdmissionConflict(
-                    'Demand report does not name the exact fresh route.')
+        route_context = demand_state.validate_report_route_contexts(
+            connection, service, reports, route_head, route, now)
+        if (route_context is None or
+                route_context.generation != plan.route_generation or
+                route_context.content_sha256 != plan.route_sha256 or
+                route_context.source_epoch != plan.route_source_epoch):
+            raise CapacityAdmissionConflict(
+                'Demand reports do not match the fresh projected route '
+                'context.')
         return plan
 
     def project_reserved_supply(
@@ -4175,15 +4174,15 @@ def validate_paid_claim_in_connection(
                 fresh_reports, service)):
         raise CapacityAdmissionConflict(
             'Paid claim lost its fresh demand receipt watermark.')
-    for row in fresh_reports:
-        report = row['payload']
-        if (not isinstance(report, Mapping) or
-                report.get('route_projection_generation')
-                != plan['route_generation'] or
-                report.get('route_projection_sha256') != plan['route_sha256'] or
-                report.get('route_source_epoch') != plan['route_source_epoch']):
-            raise CapacityAdmissionConflict(
-                'Paid claim demand receipts no longer name its exact route.')
+    route_context = demand_state.validate_report_route_contexts(
+        connection, service, fresh_reports, route_head, route, now)
+    if (route_context is None or
+            route_context.generation != plan['route_generation'] or
+            route_context.content_sha256 != plan['route_sha256'] or
+            route_context.source_epoch != plan['route_source_epoch']):
+        raise CapacityAdmissionConflict(
+            'Paid claim demand receipts no longer match its fresh route '
+            'context.')
     # This is the prospective boundary: the current demand semantics, supply,
     # inventory, and immutable plan remain exact until the replica+claim debit
     # commits.  Ingest serializes on the already-locked service row, so this
@@ -4585,25 +4584,12 @@ def promote_service_in_connection(
                 reports, service)):
         raise CapacityAdmissionUnavailable(
             'Promotion requires fresh complete demand and route evidence.')
-    try:
-        route_projection.RouteProjectionRepository.validate_snapshot_row(route)
-    except route_projection.RouteProjectionError as error:
+    route_context = demand_state.validate_report_route_contexts(
+        connection, service, reports, route_head, route, now)
+    if route_context is None:
         raise CapacityAdmissionUnavailable(
-            'Promotion route evidence is corrupt.') from error
-    if not route_projection.snapshot_owner_matches(route, service):
-        raise CapacityAdmissionUnavailable(
-            'Promotion route evidence belongs to a different owner.')
-    for report in reports:
-        payload = report['payload']
-        if (report['protocol_version'] != 2 or
-                not isinstance(payload, Mapping) or
-                payload.get('route_projection_generation')
-                != route_head['generation'] or
-                payload.get('route_projection_sha256')
-                != route['content_sha256'] or payload.get('route_source_epoch')
-                != service['route_source_epoch']):
-            raise CapacityAdmissionUnavailable(
-                'Fresh demand does not name the current projected route.')
+            'Fresh demand does not match the current projected route '
+            'context.')
     next_epoch = int(service['demand_source_epoch']) + 1
     connection.execute(
         sqlalchemy.update(_SERVICES).where(

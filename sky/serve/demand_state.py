@@ -9,6 +9,7 @@ controller is wedged or restarting.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from collections.abc import Sequence
 import dataclasses
 import datetime
 import hashlib
@@ -113,6 +114,17 @@ class DurableAutoscalingSnapshot:
     normalized_demand: dict[str, Any]
     fresh_aggregate_zero: bool
     reconcile_authority: DurableReconcileAuthority
+
+
+@dataclasses.dataclass(frozen=True)
+class ValidatedReportRouteContext:
+    """Current route authority shared by every durable-demand boundary."""
+
+    generation: int
+    content_sha256: str
+    source_epoch: int
+    response: Mapping[str, Any]
+    identities: Mapping[str, Mapping[str, Any]]
 
 
 def _postgres_engine() -> sqlalchemy.engine.Engine:
@@ -1030,6 +1042,164 @@ def get_request_summary(service_name: str, service_hash: str) -> dict[str, Any]:
                               generation=generation)
 
 
+def validate_report_route_contexts(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    reports: Sequence[Mapping[str, Any]],
+    route_head: Mapping[str, Any] | None,
+    current_route: Mapping[str, Any] | None,
+    now: datetime.datetime,
+) -> ValidatedReportRouteContext | None:
+    """Validate report routes against one fresh current semantic context.
+
+    Full route generations advance when observation-only capacity hints change.
+    A fresh reporter may therefore name an immutable retained generation while
+    the current head already names its capacity-only successor.  This is the
+    sole equivalence validator for durable demand: every retained snapshot must
+    be present, content-addressed, current-owner/version/epoch compatible, and
+    have exactly the current head's demand-report route context. The returned
+    authority and translation always come from the current head.
+
+    The only query is a batch read bounded by distinct fresh reporter
+    generations.  Callers supply their existing transaction and current rows;
+    this function never opens another transaction or performs external I/O.
+    """
+    service_name = service.get('name')
+    service_hash = service.get('hash')
+    route_protocol = service.get('route_projection_protocol_version')
+    route_epoch = service.get('route_source_epoch')
+    if (not isinstance(service_name, str) or not service_name or
+            not isinstance(service_hash, str) or not service_hash or
+            service.get('pool') not in (0, False) or
+            service.get('route_source_mode') != 'DURABLE_PROJECTED' or
+            service.get('route_projection_capable') is not True or
+            service.get('route_projection_controller_incarnation')
+            != service.get('controller_incarnation') or
+            route_protocol not in (1, 2) or not isinstance(route_epoch, int) or
+            isinstance(route_epoch, bool) or route_epoch < 1 or
+            not isinstance(now, datetime.datetime) or now.tzinfo is None or
+            not reports or route_head is None or current_route is None):
+        return None
+    route_generation = route_head.get('generation')
+    valid_until = route_head.get('valid_until')
+    if (route_head.get('service_name') != service_name or
+            not isinstance(route_generation, int) or
+            isinstance(route_generation, bool) or route_generation < 1 or
+            not isinstance(valid_until, datetime.datetime) or
+            valid_until.tzinfo is None or valid_until <= now or
+            current_route.get('service_name') != service_name or
+            current_route.get('generation') != route_generation or
+            current_route.get('service_hash') != service_hash or
+            current_route.get('service_lifecycle_epoch')
+            != service.get('lifecycle_epoch') or
+            current_route.get('controller_incarnation')
+            != service.get('controller_incarnation') or
+            current_route.get('service_version')
+            != service.get('current_version') or
+            current_route.get('protocol_version') != 1 or
+            current_route.get('producer_protocol_version') != route_protocol):
+        return None
+    try:
+        current_response, current_identities = (
+            route_projection.RouteProjectionRepository.validate_snapshot_row(
+                current_route))
+    except route_projection.RouteProjectionError:
+        return None
+    if not route_projection.snapshot_owner_matches(current_route, service):
+        return None
+    route_sha256 = current_route.get('content_sha256')
+    if (not isinstance(route_sha256, str) or
+            re.fullmatch(r'[0-9a-f]{64}', route_sha256) is None):
+        return None
+    current_demand_report_context_sha256 = (
+        route_projection.demand_report_route_context_sha256(
+            current_response, current_identities))
+
+    reported_route_digests: dict[int, str] = {}
+    for row in reports:
+        payload = row.get('payload')
+        routing_version = (payload.get('routing_version') if isinstance(
+            payload, Mapping) else None)
+        reported_generation = (payload.get('route_projection_generation')
+                               if isinstance(payload, Mapping) else None)
+        reported_digest = (payload.get('route_projection_sha256') if isinstance(
+            payload, Mapping) else None)
+        reported_epoch = (payload.get('route_source_epoch') if isinstance(
+            payload, Mapping) else None)
+        report_valid_until = row.get('valid_until')
+        if (row.get('service_name') != service_name or
+                row.get('service_hash') != service_hash or
+                row.get('protocol_version') != 2 or
+                not isinstance(report_valid_until, datetime.datetime) or
+                report_valid_until.tzinfo is None or
+                report_valid_until <= now or not isinstance(payload, Mapping) or
+                payload.get('protocol_version') != 2 or
+                not isinstance(routing_version, int) or
+                isinstance(routing_version, bool) or
+                routing_version != service.get('current_version') or
+                not isinstance(reported_generation, int) or isinstance(
+                    reported_generation, bool) or reported_generation < 1 or
+                reported_generation > route_generation or
+                not isinstance(reported_digest, str) or
+                re.fullmatch(r'[0-9a-f]{64}', reported_digest) is None or
+                not isinstance(reported_epoch, int) or
+                isinstance(reported_epoch, bool) or
+                reported_epoch != route_epoch):
+            return None
+        prior_digest = reported_route_digests.get(reported_generation)
+        if prior_digest is not None and prior_digest != reported_digest:
+            return None
+        reported_route_digests[reported_generation] = reported_digest
+
+    routes = route_projection_schema.serve_route_snapshots_table
+    retained_generations = set(reported_route_digests) - {route_generation}
+    retained_routes_by_generation: dict[int, Mapping[str, Any]] = {}
+    if retained_generations:
+        retained_rows = connection.execute(
+            sqlalchemy.select(routes).where(
+                routes.c.service_name == service_name,
+                routes.c.generation.in_(
+                    sorted(retained_generations)))).mappings().all()
+        retained_routes_by_generation = {
+            int(retained['generation']): retained for retained in retained_rows
+        }
+        if set(retained_routes_by_generation) != retained_generations:
+            return None
+
+    for reported_generation, reported_digest in reported_route_digests.items():
+        if reported_generation == route_generation:
+            if reported_digest != route_sha256:
+                return None
+            continue
+        retained_route = retained_routes_by_generation[reported_generation]
+        if (retained_route.get('content_sha256') != reported_digest or
+                retained_route.get('protocol_version') != 1 or
+                retained_route.get('producer_protocol_version')
+                != route_protocol or
+                not route_projection.snapshot_owner_matches(
+                    retained_route, service)):
+            return None
+        try:
+            retained_response, retained_identities = (
+                route_projection.RouteProjectionRepository.
+                validate_snapshot_row(retained_route))
+        except route_projection.RouteProjectionError:
+            return None
+        # Immutable snapshots intentionally omit the dynamic draining-route
+        # observation overlay.  Durable demand reports are built with
+        # ``current_routes_only=True`` under the LB routing lock, so they can
+        # contain no occupancy URL outside this stored current-route context.
+        if (route_projection.demand_report_route_context_sha256(
+                retained_response, retained_identities)
+                != current_demand_report_context_sha256):
+            return None
+    return ValidatedReportRouteContext(generation=route_generation,
+                                       content_sha256=route_sha256,
+                                       source_epoch=route_epoch,
+                                       response=current_response,
+                                       identities=current_identities)
+
+
 def get_autoscaling_snapshot(
     service_name: str,
     service_hash: str,
@@ -1040,10 +1210,14 @@ def get_autoscaling_snapshot(
     """Read the sole promoted demand source and translate its exact routes.
 
     Unlike the public summary, this read fails closed on every incomplete
-    reporter, mixed route generation, unknown URL identity, or source-mode
-    mismatch. It never calls a provider or controller.  A caller that already
-    owns the canonical PostgreSQL locks may provide its transaction so this
-    same normalizer can prove demand semantics at an effect boundary.
+    reporter, semantically incompatible route generation, unknown URL
+    identity, or source-mode mismatch.  Reports from retained route generations
+    remain usable only when their immutable demand-report route context exactly
+    matches the current fresh head. Translation and returned authority always
+    bind to that current head. This function never calls a provider or
+    controller. A caller that already owns the canonical PostgreSQL locks may
+    provide its transaction so this same normalizer can prove demand semantics
+    at an effect boundary.
     """
     read_started_monotonic = (_read_started_monotonic if _read_started_monotonic
                               is not None else time.monotonic())
@@ -1102,24 +1276,15 @@ def get_autoscaling_snapshot(
             reports_table.c.service_hash == service_hash,
             reports_table.c.valid_until > now).order_by(
                 reports_table.c.reporter_session_id)).mappings().all()
-    if (route is None or route['service_hash'] != service_hash or
-            route['service_lifecycle_epoch'] != service['lifecycle_epoch'] or
-            route['controller_incarnation'] != service['controller_incarnation']
-            or route['service_version'] != service['current_version'] or
-            route['protocol_version'] != 1 or not rows or
-            route['producer_protocol_version']
-            != service['route_projection_protocol_version']):
+    route_context = validate_report_route_contexts(connection, service, rows,
+                                                   head, route, now)
+    if route_context is None:
         return None
-    try:
-        _, identities = (route_projection.RouteProjectionRepository.
-                         validate_snapshot_row(route))
-    except route_projection.RouteProjectionError:
-        return None
-    if not route_projection.snapshot_owner_matches(route, service):
-        return None
-    route_generation = int(head['generation'])
-    route_sha256 = route['content_sha256']
-    route_epoch = int(service['route_source_epoch'])
+    identities = route_context.identities
+    route_generation = route_context.generation
+    route_sha256 = route_context.content_sha256
+    route_epoch = route_context.source_epoch
+
     ledger = lb_ha.LbSessionLedger(constants.LB_DEMAND_REPORT_TTL_SECONDS,
                                    constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS)
     if not reports_match_current_lb_authority(rows, service):
@@ -1162,13 +1327,6 @@ def get_autoscaling_snapshot(
 
     for row in rows:
         payload = row['payload']
-        if (not isinstance(payload, dict) or
-                payload.get('protocol_version') != 2 or
-                payload.get('routing_version') != service['current_version'] or
-                payload.get('route_projection_generation') != route_generation
-                or payload.get('route_projection_sha256') != route_sha256 or
-                payload.get('route_source_epoch') != route_epoch):
-            return None
         compatibility_complete = (compatibility_complete and
                                   row['complete'] is True)
         configured = tuple(payload.get('configured_accelerators', ()))

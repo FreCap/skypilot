@@ -6785,12 +6785,7 @@ def _logical_retirement_reports_are_current(
         payload = row['payload']
         if (not isinstance(payload, Mapping) or
                 payload.get('protocol_version') != 2 or
-                payload.get('routing_version') != authority.service_version or
-                payload.get('route_projection_generation')
-                != authority.route_generation or
-                payload.get('route_projection_sha256') != authority.route_sha256
-                or payload.get('route_source_epoch')
-                != authority.route_source_epoch):
+                payload.get('routing_version') != authority.service_version):
             return False
         try:
             role = lb_ha.LbRole(payload.get('applied_role'))
@@ -7071,10 +7066,25 @@ def commit_logical_retirement(
         current = _replica_from_state(row.replica_state_version,
                                       row.replica_state)
 
-        # Every potentially blocking evidence lock is now held.  Sample one
-        # final database clock so authority that expired while waiting cannot
-        # authorize teardown.  The allocation validator retained all of its
-        # locks, so an in-memory final expiry check is sufficient here.
+        # Resolve and hash every immutable current/retained route before the
+        # final clock. A retained generation can require a bounded history
+        # SELECT and full payload validation; doing that after the purported
+        # final sample would let destructive authority expire during hashing.
+        route_context = demand_state.validate_report_route_contexts(
+            session.connection(), service, report_rows, route_head, route,
+            report_query_now)
+        route_context_matches = bool(
+            route_context is not None and
+            route_context.generation == authority.route_generation and
+            route_context.content_sha256 == authority.route_sha256 and
+            route_context.source_epoch == authority.route_source_epoch)
+
+        # Every potentially blocking evidence read and content validation is
+        # now complete. Sample one final database clock so authority, report,
+        # route-head, allocation, or occupancy freshness that expired while
+        # waiting or hashing cannot authorize teardown. The allocation
+        # validator retained all of its locks, so the remaining checks are
+        # in-memory and perform no external I/O.
         now = session.execute(
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
         allocation_fresh = bool(
@@ -7084,7 +7094,8 @@ def commit_logical_retirement(
         if (authority_valid_until <= now or not allocation_fresh or
                 current_generation != authority.demand_feed_generation or
                 not all(report['valid_until'] > now for report in report_rows)
-                or not _logical_retirement_reports_are_current(
+                or not route_context_matches or
+                not _logical_retirement_reports_are_current(
                     report_rows, service, authority, now) or
                 route_head is None or route is None or
                 route_head['generation'] != authority.route_generation or
@@ -7101,17 +7112,6 @@ def commit_logical_retirement(
                 route['protocol_version'] != 1 or
                 route['producer_protocol_version']
                 != service['route_projection_protocol_version']):
-            session.rollback()
-            return LogicalRetirementCommitResult(
-                LogicalRetirementCommitState.REJECTED)
-        try:
-            route_projection.RouteProjectionRepository.validate_snapshot_row(
-                route)
-        except route_projection.RouteProjectionError:
-            session.rollback()
-            return LogicalRetirementCommitResult(
-                LogicalRetirementCommitState.REJECTED)
-        if not route_projection.snapshot_owner_matches(route, service):
             session.rollback()
             return LogicalRetirementCommitResult(
                 LogicalRetirementCommitState.REJECTED)
