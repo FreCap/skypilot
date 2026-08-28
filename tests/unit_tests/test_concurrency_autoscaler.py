@@ -17,9 +17,11 @@ import unittest
 from unittest import mock
 
 from sky.serve import autoscalers
+from sky.serve import capacity_planning
 from sky.serve import constants
 from sky.serve import kueue_lane_capacity
 from sky.serve import reserved_capacity_broker
+from sky.serve import reserved_fill_planner
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
@@ -27,6 +29,7 @@ from sky.utils import common_utils
 
 _SCALE_UP = autoscalers.AutoscalerDecisionOperator.SCALE_UP
 _SCALE_DOWN = autoscalers.AutoscalerDecisionOperator.SCALE_DOWN
+_AUTO_GATE_WITNESS = '0' * 64
 
 
 @dataclasses.dataclass
@@ -232,6 +235,644 @@ def _report(autoscaler,
     autoscaler.collect_request_information(report)
 
 
+def _durable_report(*,
+                    queue_depth=0,
+                    rejected=0,
+                    generation=1,
+                    in_flight=None,
+                    observed_slots=None,
+                    unknown_capacity=(),
+                    compatibility_profiles=(),
+                    queued_profiles=(),
+                    rejected_profiles=()):
+    """Return the raw durable LB projection consumed by the pure adapter."""
+    return {
+        'timestamps': [],
+        'in_flight_by_replica_id': dict(in_flight or {}),
+        'queue_depth': queue_depth,
+        'rejected_in_window': rejected,
+        'unknown_in_flight_replica_ids': [],
+        'observed_slots_by_replica_id': dict(observed_slots or {}),
+        'unknown_capacity_replica_ids': list(unknown_capacity),
+        'reconcile_generation': generation,
+        'compatibility_profiles': list(compatibility_profiles),
+        'queued_requests_by_compatibility': list(queued_profiles),
+        'rejected_requests_by_compatibility': list(rejected_profiles),
+        'compatibility_demand_complete': True,
+    }
+
+
+def _durable_reservation(
+    *,
+    policy=capacity_planning.ReservationGatePolicy.NOT_CONFIGURED,
+    evidence=capacity_planning.ReservationEvidenceState.NOT_APPLICABLE,
+    authenticated=0,
+    eligible=0,
+    pending=0,
+    existing_zero_cost=0,
+    existing_paid=0,
+    card='L4',
+    allocation_witness=None,
+    demonstrated_need=None,
+    allocation_ceiling=None,
+):
+    applicable = policy is not (
+        capacity_planning.ReservationGatePolicy.NOT_CONFIGURED)
+    gated_settled = (
+        policy is capacity_planning.ReservationGatePolicy.DEMAND_GATED and
+        evidence
+        is capacity_planning.ReservationEvidenceState.AUTHENTICATED_SETTLED)
+    if gated_settled and allocation_witness is None:
+        allocation_witness = _AUTO_GATE_WITNESS
+    if gated_settled and demonstrated_need is None:
+        demonstrated_need = 1_000_000
+    if gated_settled and allocation_ceiling is None:
+        allocation_ceiling = 1_000_000
+    return capacity_planning.ReservationPlanningInput(
+        gate_policy=policy,
+        evidence_state=evidence,
+        authenticated_capacity=(
+            capacity_planning.AcceleratorCapacity.from_mapping(
+                {card: authenticated})),
+        eligible_capacity=(capacity_planning.AcceleratorCapacity.from_mapping(
+            {card: eligible})),
+        pending_zero_cost_capacity=(
+            capacity_planning.AcceleratorCapacity.from_mapping({card: pending
+                                                               })),
+        existing_zero_cost_capacity=(
+            capacity_planning.AcceleratorCapacity.from_mapping(
+                {card: existing_zero_cost})),
+        existing_paid_capacity=(
+            capacity_planning.AcceleratorCapacity.from_mapping(
+                {card: existing_paid})),
+        charged_paid_gpu_units=existing_paid,
+        evidence_fingerprint='e' * 64 if applicable else '',
+        allocation_demand_witness_sha256=allocation_witness,
+        allocation_demonstrated_need=demonstrated_need,
+        allocation_ceiling=allocation_ceiling or 0)
+
+
+def _durable_inputs(replicas=()):
+    return autoscalers.ScalingDecisionInputs(
+        replica_ids=tuple(info.replica_id for info in replicas),
+        gpu_shape_handles={},
+        historical_scaling_values={},
+        cold_paid_accelerator_order=('L4',),
+        prospective_paid_accelerator_order=('L4',))
+
+
+def _durable_autoscaler(**overrides):
+    options = {'replica_unit': 'logical', 'max_replicas': 20}
+    options.update(overrides)
+    autoscaler = _make_autoscaler(**options)
+    autoscaler.set_configured_accelerator_shapes({'L4': 1})
+    return autoscaler
+
+
+def _retirement_shelter(
+    target,
+    *,
+    version=1,
+    shapes=None,
+):
+    if shapes is None:
+        shapes = {card: 1 for card in target}
+    return reserved_fill_planner.SequencedRetirementShelter(
+        service_version=version,
+        target_capacity=sum(target.values()),
+        target_capacity_by_accelerator=tuple(target.items()),
+        accelerator_shapes=tuple(shapes.items()),
+        allocation_identity=None)
+
+
+class TestDurableCapacityPlannerAdapter(unittest.TestCase):
+    """The controller adapter creates and installs one immutable plan."""
+
+    _INSTANT = autoscalers.PlanningInstant(wall_time=1_000_000_000.0,
+                                           monotonic_time=100.0)
+
+    def _plan(self,
+              autoscaler,
+              *,
+              queue_depth=3,
+              reservation=None,
+              replicas=(),
+              report=None,
+              decision_inputs=None,
+              fresh_zero=False,
+              retirement_shelter=None,
+              max_live_paid_gpu_units=None,
+              configured_reservation_accelerators=None,
+              demand_witness_scope_sha256=None):
+        if reservation is None:
+            reservation = _durable_reservation()
+        if report is None:
+            report = _durable_report(queue_depth=queue_depth)
+        if decision_inputs is None:
+            decision_inputs = _durable_inputs(replicas)
+        gated = (reservation.gate_policy
+                 is capacity_planning.ReservationGatePolicy.DEMAND_GATED)
+        if configured_reservation_accelerators is None:
+            reservation_cards = {
+                card.casefold(): card
+                for capacity in (reservation.authenticated_capacity,
+                                 reservation.eligible_capacity,
+                                 reservation.pending_zero_cost_capacity)
+                for card, _ in capacity.entries
+            }
+            if not reservation_cards and gated:
+                reservation_cards = {
+                    card.casefold(): card
+                    for card in autoscaler.configured_accelerator_shapes
+                }
+            configured_reservation_accelerators = tuple(
+                sorted(reservation_cards.values(), key=str.casefold))
+        if demand_witness_scope_sha256 is None:
+            demand_witness_scope_sha256 = 'a' * 64 if gated else ''
+
+        def plan(current_reservation):
+            return autoscaler.plan_durable_capacity_reconcile(
+                replicas,
+                report,
+                current_reservation,
+                source_fingerprint='f' * 64,
+                decision_inputs=decision_inputs,
+                retirement_shelter=retirement_shelter,
+                max_live_paid_gpu_units=max_live_paid_gpu_units,
+                fresh_zero=fresh_zero,
+                planning_instant=self._INSTANT,
+                configured_reservation_accelerators=(
+                    configured_reservation_accelerators),
+                demand_witness_scope_sha256=demand_witness_scope_sha256)
+
+        if (gated and reservation.evidence_state is capacity_planning.
+                ReservationEvidenceState.AUTHENTICATED_SETTLED and
+                reservation.allocation_demand_witness_sha256
+                == _AUTO_GATE_WITNESS):
+            acquisition_reservation = dataclasses.replace(
+                reservation,
+                evidence_state=(capacity_planning.ReservationEvidenceState.
+                                AUTHENTICATED_UNSETTLED),
+                eligible_capacity=capacity_planning.AcceleratorCapacity(),
+                allocation_demand_witness_sha256=None,
+                allocation_demonstrated_need=None,
+                allocation_ceiling=0)
+            acquisition = plan(acquisition_reservation)
+            assert acquisition is not None
+            witness = acquisition.envelope.candidate.demand_witness_sha256
+            assert witness is not None
+            reservation = dataclasses.replace(
+                reservation, allocation_demand_witness_sha256=witness)
+        return plan(reservation)
+
+    def test_one_snapshot_calls_the_canonical_planner_once_without_mutation(
+            self):
+        autoscaler = _durable_autoscaler()
+        before = autoscaler.export_durable_capacity_policy_state()
+
+        with mock.patch.object(capacity_planning,
+                               'plan_capacity',
+                               wraps=capacity_planning.plan_capacity) as plan:
+            result = self._plan(autoscaler)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(plan.call_count, 1)
+        self.assertEqual(autoscaler.export_durable_capacity_policy_state(),
+                         before)
+        self.assertEqual(result.expected_prior_generation, 0)
+        self.assertEqual(result.envelope.snapshot.source_generation, 1)
+        self.assertEqual(
+            result.envelope.snapshot.prior_policy_state.source_generation, 0)
+        self.assertEqual(
+            result.envelope.candidate.next_policy_state.source_generation, 1)
+        self.assertIsNone(result.rollout_failure)
+
+    def test_post_commit_policy_install_is_generation_and_fingerprint_cas(self):
+        autoscaler = _durable_autoscaler()
+        result = self._plan(autoscaler)
+        assert result is not None
+        next_state = result.envelope.candidate.next_policy_state
+        assert next_state is not None
+
+        installed = autoscaler.install_committed_capacity_plan(
+            expected_prior_fingerprint=result.prior_policy_fingerprint,
+            expected_prior_generation=result.expected_prior_generation,
+            next_policy_state=next_state)
+
+        self.assertTrue(installed)
+        self.assertEqual(autoscaler.export_durable_capacity_policy_state(),
+                         next_state)
+        committed = autoscaler.export_durable_capacity_policy_state()
+        self.assertFalse(
+            autoscaler.install_committed_capacity_plan(
+                expected_prior_fingerprint=result.prior_policy_fingerprint,
+                expected_prior_generation=result.expected_prior_generation,
+                next_policy_state=next_state))
+        self.assertEqual(autoscaler.export_durable_capacity_policy_state(),
+                         committed)
+
+    def test_reservations_and_usage_gate_share_one_economic_path(self):
+        settled = (
+            capacity_planning.ReservationEvidenceState.AUTHENTICATED_SETTLED)
+        cases = (
+            ('gated',
+             _durable_reservation(
+                 policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+                 evidence=settled,
+                 authenticated=3,
+                 eligible=1), 1, 1, 2),
+            ('ungated',
+             _durable_reservation(
+                 policy=capacity_planning.ReservationGatePolicy.UNGATED,
+                 evidence=settled,
+                 authenticated=3,
+                 eligible=3), 3, 3, 0),
+            ('disabled-with-pending', _durable_reservation(pending=2), 2, 0, 1),
+        )
+        for name, reservation, committed, launched, paid in cases:
+            with self.subTest(name=name):
+                result = self._plan(_durable_autoscaler(),
+                                    reservation=reservation)
+                assert result is not None
+                candidate = result.envelope.candidate
+                self.assertEqual(candidate.reserved_capacity_committed.total(),
+                                 committed)
+                self.assertEqual(candidate.reserved_launch_target.total(),
+                                 launched)
+                self.assertEqual(candidate.paid_residual.total(), paid)
+
+    def test_cleanup_unproven_retiring_paid_row_remains_economic_inventory(
+            self):
+        retiring = _replica(1)
+        retiring.status_property.is_scale_down = True
+        reservation = _durable_reservation(existing_paid=1)
+        report = _durable_report(queue_depth=2, in_flight={1: 0})
+
+        result = self._plan(_durable_autoscaler(),
+                            reservation=reservation,
+                            replicas=(retiring,),
+                            report=report)
+
+        assert result is not None
+        candidate = result.envelope.candidate
+        self.assertEqual(candidate.paid_residual.as_dict(), {'L4': 1})
+        self.assertEqual(candidate.reserved_launch_target.total(), 0)
+
+    def test_paid_cap_clips_cold_authority_without_clipping_residual(self):
+        autoscaler = _durable_autoscaler(max_replicas=20)
+        autoscaler.set_configured_accelerator_shapes({'A100': 8})
+        report = _durable_report(queue_depth=9,
+                                 queued_profiles=[{
+                                     'priority': 50,
+                                     'compatible_accelerators': ['A100'],
+                                     'count': 9,
+                                 }])
+        inputs = dataclasses.replace(
+            _durable_inputs(),
+            cold_paid_accelerator_order=('A100',),
+            prospective_paid_accelerator_order=('A100',))
+
+        result = self._plan(autoscaler,
+                            report=report,
+                            reservation=_durable_reservation(card='A100'),
+                            decision_inputs=inputs,
+                            max_live_paid_gpu_units=8)
+
+        assert result is not None
+        candidate = result.envelope.candidate
+        self.assertEqual(candidate.paid_residual.as_dict(), {'A100': 9})
+        self.assertEqual(candidate.paid_launch_target.as_dict(), {'A100': 8})
+        self.assertEqual(candidate.paid_cap.remaining_paid_gpu_units, 8)
+        scale_ups = [
+            decision for decision in result.scaling_decisions
+            if decision.operator is _SCALE_UP
+        ]
+        self.assertEqual(len(scale_ups), 1)
+        self.assertEqual(
+            dict(scale_ups[0].target.cold_launch_authority_by_accelerator),
+            {'A100': 8})
+
+    def test_retirement_shelter_is_planned_once_and_never_scales_up(self):
+        shelter = _retirement_shelter({'l4': 3})
+
+        result = self._plan(_durable_autoscaler(),
+                            queue_depth=1,
+                            retirement_shelter=shelter)
+
+        assert result is not None
+        self.assertIs(result.retirement_shelter, shelter)
+        self.assertEqual(
+            result.envelope.snapshot.retirement_shelter_target.as_dict(), {
+                'L4': 3,
+            })
+        self.assertEqual(result.logical_target.target_capacity, 1)
+        self.assertEqual(result.logical_retirement_floor.target_capacity, 3)
+        self.assertEqual(
+            dict(
+                result.logical_retirement_floor.target_capacity_by_accelerator),
+            {'L4': 3})
+        scale_ups = [
+            decision for decision in result.scaling_decisions
+            if decision.operator is _SCALE_UP
+        ]
+        self.assertEqual(len(scale_ups), 1)
+        self.assertEqual(scale_ups[0].target.launch_budget, 1)
+
+    def test_scale_down_victims_respect_planned_retirement_floor(self):
+        replicas = tuple(_replica(replica_id) for replica_id in range(1, 4))
+        autoscaler = _durable_autoscaler()
+        autoscaler._adopt_total_capacity_on_next_recompute = False
+        report = _durable_report(
+            queue_depth=1,
+            in_flight={replica.replica_id: 0 for replica in replicas},
+            observed_slots={replica.replica_id: 1 for replica in replicas})
+
+        result = self._plan(autoscaler,
+                            replicas=replicas,
+                            report=report,
+                            reservation=_durable_reservation(existing_paid=3),
+                            decision_inputs=_durable_inputs(replicas),
+                            retirement_shelter=_retirement_shelter({'l4': 3}))
+
+        assert result is not None
+        self.assertEqual(result.logical_target.target_capacity, 1)
+        self.assertEqual(result.logical_retirement_floor.target_capacity, 3)
+        self.assertFalse(
+            any(decision.operator is _SCALE_DOWN
+                for decision in result.scaling_decisions))
+
+    def test_ungated_zero_demand_blackout_preserves_static_fill_holdings(self):
+        replicas = tuple(
+            _replica(replica_id, reserved_fill=True)
+            for replica_id in range(1, 4))
+        for replica in replicas:
+            replica.is_zero_cost = True
+        report = _durable_report(
+            queue_depth=0,
+            in_flight={replica.replica_id: 0 for replica in replicas},
+            observed_slots={replica.replica_id: 1 for replica in replicas})
+        reservation = _durable_reservation(
+            policy=capacity_planning.ReservationGatePolicy.UNGATED,
+            evidence=capacity_planning.ReservationEvidenceState.UNAVAILABLE,
+            existing_zero_cost=3)
+
+        result = self._plan(_durable_autoscaler(reserved_capacity_fill=True),
+                            queue_depth=0,
+                            reservation=reservation,
+                            replicas=replicas,
+                            report=report,
+                            decision_inputs=_durable_inputs(replicas),
+                            retirement_shelter=_retirement_shelter({'l4': 3}))
+
+        assert result is not None
+        candidate = result.envelope.candidate
+        self.assertEqual(candidate.aggregate_demand_target, 0)
+        self.assertEqual(candidate.reserved_launch_target.total(), 0)
+        self.assertEqual(candidate.paid_launch_target.total(), 0)
+        self.assertEqual(candidate.retirement_floor_target.as_dict(), {
+            'L4': 3,
+        })
+        self.assertFalse(
+            any(decision.operator is _SCALE_DOWN
+                for decision in result.scaling_decisions))
+
+    def test_unavailable_typed_zero_shelter_fails_before_planning(self):
+        unavailable = reserved_fill_planner.SequencedRetirementShelter(
+            service_version=1,
+            target_capacity=0,
+            target_capacity_by_accelerator=(),
+            accelerator_shapes=(),
+            allocation_identity=None)
+
+        with mock.patch.object(capacity_planning, 'plan_capacity') as planner:
+            result = self._plan(_durable_autoscaler(),
+                                retirement_shelter=unavailable)
+
+        self.assertIsNone(result)
+        planner.assert_not_called()
+
+    def test_durable_plan_rejects_floor_that_differs_from_candidate(self):
+        shelter = _retirement_shelter({'l4': 3})
+        result = self._plan(_durable_autoscaler(),
+                            queue_depth=1,
+                            retirement_shelter=shelter)
+        assert result is not None
+
+        with self.assertRaisesRegex(ValueError, 'malformed'):
+            dataclasses.replace(result,
+                                logical_retirement_floor=result.logical_target)
+
+    def test_locked_kueue_snapshot_replaces_prelock_admission_authority(self):
+        reserved = _replica(1, reserved_fill=True)
+        reserved.is_zero_cost = True
+        prepared = dataclasses.replace(
+            _durable_inputs((reserved,)),
+            kueue_capacity_by_replica_id={
+                1: kueue_lane_capacity.KueueReplicaCapacityClass.FRESH_WAITING,
+            })
+        locked = kueue_lane_capacity.KueueReplicaCapacitySnapshot({
+            1: kueue_lane_capacity.KueueReplicaCapacityClass.POLICY_ADMITTED,
+        })
+
+        bound = autoscalers.bind_locked_kueue_capacity_snapshot(
+            prepared, [reserved], locked)
+
+        self.assertEqual(bound.kueue_capacity_by_replica_id, {
+            1: kueue_lane_capacity.KueueReplicaCapacityClass.POLICY_ADMITTED,
+        })
+        self.assertEqual(bound.kueue_blocked_retirement_shapes, frozenset())
+
+    def test_bounded_kueue_unknown_is_committed_on_its_exact_card(self):
+        unknown = _replica(1, reserved_fill=True)
+        unknown.is_zero_cost = True
+        inputs = dataclasses.replace(
+            _durable_inputs((unknown,)),
+            kueue_capacity_by_replica_id={
+                1: kueue_lane_capacity.KueueReplicaCapacityClass.UNKNOWN,
+            },
+            kueue_blocked_retirement_shapes=frozenset({('l4', 1)}))
+
+        result = self._plan(
+            _durable_autoscaler(),
+            queue_depth=1,
+            reservation=_durable_reservation(existing_zero_cost=1),
+            replicas=(unknown,),
+            decision_inputs=inputs)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.envelope.candidate.paid_residual.total(), 0)
+        self.assertFalse(
+            any(decision.operator is _SCALE_UP
+                for decision in result.scaling_decisions))
+
+    def test_bounded_kueue_unknown_does_not_freeze_unrelated_paid_card(self):
+        autoscaler = _durable_autoscaler()
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
+        unknown = _replica(1, card='H200', reserved_fill=True)
+        unknown.is_zero_cost = True
+        report = _durable_report(queue_depth=1)
+        report['queued_requests_by_compatibility'] = [{
+            'priority': 50,
+            'compatible_accelerators': ['L4'],
+            'count': 1,
+        }]
+        inputs = dataclasses.replace(
+            _durable_inputs((unknown,)),
+            kueue_capacity_by_replica_id={
+                1: kueue_lane_capacity.KueueReplicaCapacityClass.UNKNOWN,
+            },
+            kueue_blocked_retirement_shapes=frozenset({('h200', 1)}))
+        empty = capacity_planning.AcceleratorCapacity()
+        reservation = capacity_planning.ReservationPlanningInput(
+            gate_policy=capacity_planning.ReservationGatePolicy.NOT_CONFIGURED,
+            evidence_state=(
+                capacity_planning.ReservationEvidenceState.NOT_APPLICABLE),
+            authenticated_capacity=empty,
+            eligible_capacity=empty,
+            pending_zero_cost_capacity=empty,
+            existing_zero_cost_capacity=(
+                capacity_planning.AcceleratorCapacity.from_mapping({'H200': 1
+                                                                   })),
+            existing_paid_capacity=empty,
+            charged_paid_gpu_units=0,
+            evidence_fingerprint='')
+
+        result = self._plan(autoscaler,
+                            reservation=reservation,
+                            replicas=(unknown,),
+                            report=report,
+                            decision_inputs=inputs)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        candidate = result.envelope.candidate
+        self.assertEqual(candidate.supply_aware_demand_target.as_dict(),
+                         {'L4': 1})
+        self.assertEqual(candidate.paid_residual.as_dict(), {'L4': 1})
+        self.assertTrue(
+            any(decision.operator is _SCALE_UP
+                for decision in result.scaling_decisions))
+
+    def test_reserved_supply_preserves_priority_and_multi_gpu_compatibility(
+            self):
+        autoscaler = _durable_autoscaler(max_replicas=5)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 4})
+        report = _durable_report(queue_depth=5,
+                                 queued_profiles=[{
+                                     'priority': 50,
+                                     'compatible_accelerators': ['L4'],
+                                     'count': 1,
+                                 }, {
+                                     'priority': 20,
+                                     'compatible_accelerators': ['L4', 'H200'],
+                                     'count': 4,
+                                 }])
+        reservation = _durable_reservation(
+            policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+            evidence=(capacity_planning.ReservationEvidenceState.
+                      AUTHENTICATED_SETTLED),
+            authenticated=4,
+            eligible=4,
+            card='H200')
+
+        result = self._plan(autoscaler, report=report, reservation=reservation)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        candidate = result.envelope.candidate
+        self.assertEqual(candidate.demand_attribution.as_dict(), {'L4': 5})
+        self.assertEqual(candidate.supply_aware_demand_target.as_dict(), {
+            'L4': 1,
+            'H200': 4,
+        })
+        self.assertEqual(candidate.reserved_launch_target.as_dict(),
+                         {'H200': 4})
+        self.assertEqual(candidate.paid_residual.as_dict(), {'L4': 1})
+
+    def test_durable_plan_places_demand_and_padding_from_one_snapshot(self):
+        autoscaler = _durable_autoscaler(max_replicas=20, num_overprovision=3)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        report = _durable_report(queue_depth=12,
+                                 queued_profiles=[{
+                                     'priority': 20,
+                                     'compatible_accelerators': ['L4', 'A100'],
+                                     'count': 12,
+                                 }])
+        reservation = _durable_reservation(
+            policy=capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+            evidence=(capacity_planning.ReservationEvidenceState.
+                      AUTHENTICATED_SETTLED),
+            authenticated=15,
+            eligible=15,
+            card='A100')
+
+        result = self._plan(autoscaler, report=report, reservation=reservation)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        candidate = result.envelope.candidate
+        self.assertEqual(candidate.demand_attribution.as_dict(), {'L4': 12})
+        self.assertEqual(candidate.supply_aware_demand_target.as_dict(),
+                         {'A100': 12})
+        self.assertEqual(candidate.zero_cost_padding_target.as_dict(),
+                         {'A100': 3})
+        self.assertEqual(candidate.supply_aware_actuation_target.as_dict(),
+                         {'A100': 15})
+        self.assertEqual(candidate.paid_demand_attribution.total(), 0)
+        self.assertEqual(candidate.paid_residual.as_dict(), {})
+
+    def test_durable_callback_never_resolves_provider_handle(self):
+        autoscaler = _durable_autoscaler(max_replicas=1)
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
+        provisioning = _replica(1,
+                                card='H200',
+                                status=serve_state.ReplicaStatus.PROVISIONING)
+        provisioning.is_zero_cost = True
+        provisioning.resources_override = None
+        provisioning.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.RUNNING)
+        report = _durable_report(queue_depth=1,
+                                 queued_profiles=[{
+                                     'priority': 20,
+                                     'compatible_accelerators': ['L4', 'H200'],
+                                     'count': 1,
+                                 }])
+        calls_before = provisioning.handle.call_count
+
+        result = self._plan(autoscaler,
+                            replicas=(provisioning,),
+                            report=report,
+                            decision_inputs=_durable_inputs((provisioning,)))
+
+        self.assertIsNone(result)
+        self.assertEqual(provisioning.handle.call_count, calls_before)
+
+    def test_unbounded_kueue_unknown_aborts_before_planning(self):
+        inputs = dataclasses.replace(_durable_inputs(),
+                                     kueue_blocked_retirement_shapes=frozenset({
+                                         ('*', 0)
+                                     }))
+
+        with mock.patch.object(capacity_planning, 'plan_capacity') as planner:
+            result = self._plan(_durable_autoscaler(), decision_inputs=inputs)
+
+        self.assertIsNone(result)
+        planner.assert_not_called()
+
+    def test_malformed_required_counts_fail_before_planning(self):
+        autoscaler = _durable_autoscaler()
+        malformed = _durable_report(queue_depth=1)
+        del malformed['queue_depth']
+
+        with mock.patch.object(capacity_planning, 'plan_capacity') as planner:
+            result = self._plan(autoscaler, report=malformed)
+
+        self.assertIsNone(result)
+        planner.assert_not_called()
+
+
 def _decisions(autoscaler, replicas, active_versions=(1,)):
     return autoscaler.generate_scaling_decisions(replicas,
                                                  list(active_versions))
@@ -251,12 +892,53 @@ def _allocation(target,
                 explicit_target=None,
                 paid_target=None):
     explicit = target if explicit_target is None else explicit_target
-    return autoscalers._CompatibilityTargetResult(
-        target_by_accelerator=target,
-        explicit_target_by_accelerator=explicit,
-        paid_target_by_accelerator=(explicit
-                                    if paid_target is None else paid_target),
-        card_attribution_complete=complete)
+    paid = explicit if paid_target is None else paid_target
+    capacity = capacity_planning.AcceleratorCapacity.from_mapping(target)
+    paid_capacity = capacity_planning.AcceleratorCapacity.from_mapping(paid)
+    return capacity_planning.CapacityPlanCandidate(
+        kind=capacity_planning.CapacityPlanKind.DEMAND,
+        capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+        physical_gpu_width_by_accelerator=(
+            capacity_planning.AcceleratorCapacity.from_mapping(
+                {card: 1 for card in target})),
+        aggregate_demand_target=sum(target.values()),
+        raw_demand_target=sum(target.values()),
+        demand_attribution=capacity,
+        supply_aware_demand_target=capacity,
+        reserved_capacity_committed=capacity_planning.AcceleratorCapacity(),
+        new_reserved_capacity_committed=(
+            capacity_planning.AcceleratorCapacity()),
+        reserved_launch_target=capacity_planning.AcceleratorCapacity(),
+        reserved_packing_padding_target=(
+            capacity_planning.AcceleratorCapacity()),
+        paid_residual=paid_capacity,
+        paid_launch_target=paid_capacity,
+        paid_packing_padding_target=(capacity_planning.AcceleratorCapacity()),
+        zero_cost_padding_target=capacity_planning.AcceleratorCapacity(),
+        static_prefill_target=capacity_planning.AcceleratorCapacity(),
+        retained_existing_target=capacity_planning.AcceleratorCapacity(),
+        transition_retention_target=capacity_planning.AcceleratorCapacity(),
+        wave_limited_actuation_target=capacity,
+        supply_aware_actuation_target=capacity,
+        explicit_demand_attribution=(
+            capacity_planning.AcceleratorCapacity.from_mapping(explicit)),
+        paid_demand_attribution=paid_capacity,
+        warm_retention_target=capacity_planning.AcceleratorCapacity(),
+        deadline_target=capacity_planning.AcceleratorCapacity(),
+        paid_cap=capacity_planning.PaidCapProjection(
+            max_live_paid_gpu_units=None,
+            charged_paid_gpu_units=0,
+            remaining_paid_gpu_units=None),
+        retirement_floor_target=capacity,
+        infeasible_demand_by_priority=(),
+        service_time_sources=(),
+        attribution_complete=complete,
+        source_generation=0,
+        snapshot_fingerprint='test',
+        demand_witness_sha256='0' * 64,
+        reservation_demand_relation=(
+            capacity_planning.ReservationDemandRelation.NOT_APPLICABLE),
+        statically_disjoint_demand_accelerators=())
 
 
 class TestKueueAdmissionCapacity(unittest.TestCase):
@@ -547,6 +1229,20 @@ class TestFromSpecSelection(unittest.TestCase):
 class TestColdPaidCardOrdering(unittest.TestCase):
     """Cold-card ordering reads only the complete centralized catalog."""
 
+    @staticmethod
+    def _location(card: str, *, use_spot: bool) -> spot_placer.Location:
+        return spot_placer.Location(cloud=mock.Mock(),
+                                    region=f'{card.lower()}-region',
+                                    zone=None,
+                                    accelerators={card: 1},
+                                    use_spot=use_spot)
+
+    @staticmethod
+    def _location_gpu_shape(location: spot_placer.Location) -> tuple[str, int]:
+        assert location.accelerators is not None
+        assert len(location.accelerators) == 1
+        return next(iter(location.accelerators.items()))
+
     def _order(self, costs):
         placer = mock.Mock()
         placer.known_location_costs.return_value = costs
@@ -560,20 +1256,36 @@ class TestColdPaidCardOrdering(unittest.TestCase):
     def test_uses_catalog_costs_without_provider_resolution(self):
         self.assertEqual(self._order({'L4': 2.0, 'A100': 0.0}), ['L4', 'A100'])
 
-    def test_prospective_paid_cards_excludes_reserved_only_card(self):
+    def test_prospective_paid_cards_mixed_catalog_keeps_only_spot_cards(self):
+        l4_spot = self._location('L4', use_spot=True)
+        a100_ondemand = self._location('A100', use_spot=False)
         placer = mock.Mock()
         placer.known_location_costs.return_value = {
-            'L4': 2.0,
-            'A100': 0.0,
+            l4_spot: 2.0,
+            a100_ondemand: 1.0,
         }
 
         cards = autoscalers._prospective_paid_cards(['A100', 'L4'], placer,
                                                     lambda _: 1,
-                                                    lambda location:
-                                                    (location, 1))
+                                                    self._location_gpu_shape)
 
         self.assertEqual(cards, ['L4'])
         placer.known_location_costs.assert_called_once_with()
+
+    def test_prospective_paid_cards_excludes_ondemand_only_catalog(self):
+        for raw_cost in (2.0, float('inf')):
+            with self.subTest(raw_cost=raw_cost):
+                a100_ondemand = self._location('A100', use_spot=False)
+                placer = mock.Mock()
+                placer.known_location_costs.return_value = {
+                    a100_ondemand: raw_cost,
+                }
+
+                cards = autoscalers._prospective_paid_cards(
+                    ['A100'], placer, lambda _: 1, self._location_gpu_shape)
+
+                self.assertEqual(cards, [])
+                placer.known_location_costs.assert_called_once_with()
 
     def test_prospective_paid_cards_fail_closed_on_catalog_error(self):
         placer = mock.Mock()
@@ -581,10 +1293,27 @@ class TestColdPaidCardOrdering(unittest.TestCase):
 
         cards = autoscalers._prospective_paid_cards(['A100', 'L4'], placer,
                                                     lambda _: 1,
-                                                    lambda location:
-                                                    (location, 1))
+                                                    self._location_gpu_shape)
 
         self.assertEqual(cards, [])
+
+    def test_prospective_paid_cards_fail_closed_on_empty_catalog(self):
+        placer = mock.Mock()
+        placer.known_location_costs.return_value = {}
+
+        cards = autoscalers._prospective_paid_cards(['A100', 'L4'], placer,
+                                                    lambda _: 1,
+                                                    self._location_gpu_shape)
+
+        self.assertEqual(cards, [])
+        placer.known_location_costs.assert_called_once_with()
+
+    def test_prospective_paid_cards_without_placer_keep_configured_cards(self):
+        cards = autoscalers._prospective_paid_cards(['A100', 'L4'], None,
+                                                    lambda _: 1,
+                                                    self._location_gpu_shape)
+
+        self.assertEqual(cards, ['A100', 'L4'])
 
     def test_unpriced_catalog_entry_preserves_service_order(self):
         self.assertEqual(self._order({
@@ -3233,9 +3962,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                         [old_a100],
                         target_ceiling=1,
                         min_replicas_override=1,
-                        use_existing_supply=True,
-                        pin_running_work=False,
-                        use_free_reserved=False))
+                        purpose=(capacity_planning.CapacityPlanningPurpose.
+                                 LOCAL_ACTUATION)))
                 decisions = autoscaler._generate_logical_scaling_decisions(
                     [old_a100], [])
 
@@ -3273,9 +4001,7 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             [preempted_a100],
             target_ceiling=1,
             min_replicas_override=1,
-            use_existing_supply=True,
-            pin_running_work=False,
-            use_free_reserved=False)
+            purpose=(capacity_planning.CapacityPlanningPurpose.LOCAL_ACTUATION))
         decisions = autoscaler._generate_logical_scaling_decisions(
             [preempted_a100], [])
 
@@ -3311,9 +4037,7 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             [degraded],
             target_ceiling=1,
             min_replicas_override=1,
-            use_existing_supply=True,
-            pin_running_work=False,
-            use_free_reserved=False)
+            purpose=(capacity_planning.CapacityPlanningPurpose.LOCAL_ACTUATION))
         decisions = autoscaler._generate_logical_scaling_decisions([degraded],
                                                                    [degraded])
 
@@ -3352,9 +4076,7 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             [replacement],
             target_ceiling=1,
             min_replicas_override=1,
-            use_existing_supply=True,
-            pin_running_work=False,
-            use_free_reserved=False)
+            purpose=(capacity_planning.CapacityPlanningPurpose.LOCAL_ACTUATION))
         decisions = autoscaler._generate_logical_scaling_decisions(
             [replacement], [replacement])
 
@@ -3414,9 +4136,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                         [old_a100],
                         target_ceiling=2,
                         min_replicas_override=2,
-                        use_existing_supply=True,
-                        pin_running_work=False,
-                        use_free_reserved=False))
+                        purpose=(capacity_planning.CapacityPlanningPurpose.
+                                 LOCAL_ACTUATION)))
                 decisions = autoscaler._generate_logical_scaling_decisions(
                     [old_a100], [])
 
@@ -3481,9 +4202,8 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                         [old_a100],
                         target_ceiling=3,
                         min_replicas_override=3,
-                        use_existing_supply=True,
-                        pin_running_work=False,
-                        use_free_reserved=False))
+                        purpose=(capacity_planning.CapacityPlanningPurpose.
+                                 LOCAL_ACTUATION)))
                 decisions = autoscaler._generate_logical_scaling_decisions(
                     [old_a100], [])
 
@@ -4027,217 +4747,6 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
         self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
         self.assertEqual(decisions, [])
 
-    def test_economic_target_uses_h200_before_paid_l4_residual(self):
-        autoscaler = _make_autoscaler(max_replicas=2)
-        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
-        _report(autoscaler,
-                in_flight={},
-                queue_depth=2,
-                queued_profiles=[self._profile(20, ['L4', 'H200'], 2)],
-                rejected_profiles=[],
-                compatibility_complete=True)
-        _decisions(autoscaler, [])
-
-        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
-                         {'L4': 2})
-        self.assertEqual(
-            autoscaler.economic_capacity_target_by_accelerator([], {'h200': 1}),
-            {
-                'L4': 1,
-                'H200': 1,
-            })
-
-    def test_fresh_zero_retention_uses_only_existing_exact_card_capacity(self):
-        autoscaler = _make_autoscaler(max_replicas=30, replica_unit='logical')
-        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
-        replicas = [_replica(i, card='A100') for i in range(1, 12)]
-        for replica in replicas:
-            replica.is_zero_cost = True
-        _report(autoscaler,
-                in_flight={replica.replica_id: 0 for replica in replicas},
-                queue_depth=0,
-                queued_profiles=[],
-                rejected_profiles=[],
-                compatibility_complete=True)
-
-        self.assertEqual(
-            autoscaler.existing_capacity_retention_target_by_accelerator(
-                replicas, 5), {'A100': 5})
-        self.assertEqual(
-            autoscaler.existing_capacity_retention_target_by_accelerator(
-                replicas, 21), {'A100': 11})
-
-    def test_economic_target_never_uses_h200_for_l4_only_work(self):
-        autoscaler = _make_autoscaler(max_replicas=1)
-        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
-        _report(autoscaler,
-                in_flight={},
-                queue_depth=1,
-                queued_profiles=[self._profile(50, ['L4'], 1)],
-                rejected_profiles=[],
-                compatibility_complete=True)
-        _decisions(autoscaler, [])
-
-        self.assertEqual(
-            autoscaler.economic_capacity_target_by_accelerator([], {'h200': 1}),
-            {'L4': 1})
-
-    def test_economic_target_preserves_priority_and_compatibility(self):
-        autoscaler = _make_autoscaler(max_replicas=2)
-        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
-        _report(autoscaler,
-                in_flight={},
-                queue_depth=2,
-                queued_profiles=[
-                    self._profile(50, ['L4'], 1),
-                    self._profile(20, ['L4', 'H200'], 1),
-                ],
-                rejected_profiles=[],
-                compatibility_complete=True)
-        _decisions(autoscaler, [])
-
-        self.assertEqual(
-            autoscaler.economic_capacity_target_by_accelerator([], {'h200': 1}),
-            {
-                'L4': 1,
-                'H200': 1,
-            })
-
-    def test_logical_economic_target_uses_multi_gpu_capacity_units(self):
-        autoscaler = _make_autoscaler(max_replicas=5, replica_unit='logical')
-        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 4})
-        _report(autoscaler,
-                in_flight={},
-                queue_depth=5,
-                queued_profiles=[
-                    self._profile(50, ['L4'], 1),
-                    self._profile(20, ['L4', 'H200'], 4),
-                ],
-                rejected_profiles=[],
-                compatibility_complete=True)
-        _decisions(autoscaler, [])
-
-        self.assertEqual(
-            autoscaler.economic_capacity_target_by_accelerator([], {'h200': 4}),
-            {
-                'L4': 1,
-                'H200': 4,
-            })
-
-    def test_economic_target_uses_durable_width_during_local_capacity_blackout(
-            self):
-        autoscaler = _make_autoscaler(max_replicas=1, replica_unit='logical')
-        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
-        h200 = _replica(1, card='H200', planned_capacity=1)
-        h200.is_zero_cost = True
-        _report(autoscaler,
-                in_flight={1: 0},
-                queue_depth=1,
-                queued_profiles=[self._profile(20, ['L4', 'H200'], 1)],
-                unknown_capacity=[1],
-                compatibility_complete=True)
-        _decisions(autoscaler, [h200])
-
-        self.assertEqual(
-            autoscaler.economic_capacity_target_by_accelerator(
-                [h200], {
-                    'l4': 0,
-                    'h200': 0,
-                },
-                kueue_capacity_by_replica_id={
-                    1: kueue_lane_capacity.KueueReplicaCapacityClass.
-                       POLICY_ADMITTED,
-                }), {'H200': 1})
-
-    def test_economic_target_uses_admitted_historical_reserved_width(self):
-        autoscaler = autoscalers.ConcurrencyAutoscaler(
-            'svc', _spec(max_replicas=1, replica_unit='logical'), version=2)
-        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
-        predecessor = _replica(1,
-                               card='H200',
-                               version=1,
-                               planned_capacity=1,
-                               reserved_fill=True)
-        predecessor.is_zero_cost = True
-        _report(autoscaler,
-                in_flight={},
-                queue_depth=1,
-                queued_profiles=[self._profile(20, ['L4', 'H200'], 1)],
-                compatibility_complete=True)
-        _decisions(autoscaler, [], active_versions=(2,))
-
-        self.assertEqual(
-            autoscaler.economic_capacity_target_by_accelerator(
-                [predecessor], {
-                    'l4': 0,
-                    'h200': 0,
-                },
-                kueue_capacity_by_replica_id={
-                    1: kueue_lane_capacity.KueueReplicaCapacityClass.
-                       POLICY_ADMITTED,
-                }), {'H200': 1})
-
-    def test_only_logical_concurrency_supports_reserved_economic_authority(
-            self):
-        self.assertFalse(
-            _make_autoscaler().supports_reserved_supply_economic_target())
-        self.assertTrue(
-            _make_autoscaler(replica_unit='logical').
-            supports_reserved_supply_economic_target())
-
-    def test_economic_target_does_not_mutate_adoption_or_retirement_state(self):
-        autoscaler = _make_autoscaler(max_replicas=2, replica_unit='logical')
-        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'H200': 1})
-        _report(autoscaler,
-                in_flight={},
-                queue_depth=2,
-                queued_profiles=[self._profile(20, ['L4', 'H200'], 2)],
-                rejected_profiles=[],
-                compatibility_complete=True)
-        _decisions(autoscaler, [])
-        autoscaler.warm_retention_target_by_accelerator = {'L4': 1}
-        autoscaler.cold_launch_authority_by_accelerator = {'L4': 2}
-        before = {
-            'target': autoscaler.target_num_replicas,
-            'target_by_card': dict(autoscaler.target_num_replicas_by_accelerator
-                                  ),
-            'warm': dict(autoscaler.warm_retention_target_by_accelerator),
-            'cold': dict(autoscaler.cold_launch_authority_by_accelerator),
-            'pending_floor': autoscaler._pending_retention_floor,
-            'pending_capacity': autoscaler._pending_capacity_at_adoption,
-            'pending_budget': autoscaler._pending_budget_spent,
-            'logical_target': dict(
-                autoscaler._logical_actuation_target_by_accelerator),
-            'logical_desired': dict(
-                autoscaler._logical_actuation_desired_by_accelerator),
-            'adopted_explicit': dict(
-                autoscaler._logical_adopted_explicit_target_by_accelerator),
-            'adopted_paid': dict(
-                autoscaler._logical_adopted_paid_target_by_accelerator),
-        }
-
-        autoscaler.economic_capacity_target_by_accelerator([], {'h200': 1})
-
-        after = {
-            'target': autoscaler.target_num_replicas,
-            'target_by_card': dict(autoscaler.target_num_replicas_by_accelerator
-                                  ),
-            'warm': dict(autoscaler.warm_retention_target_by_accelerator),
-            'cold': dict(autoscaler.cold_launch_authority_by_accelerator),
-            'pending_floor': autoscaler._pending_retention_floor,
-            'pending_capacity': autoscaler._pending_capacity_at_adoption,
-            'pending_budget': autoscaler._pending_budget_spent,
-            'logical_target': dict(
-                autoscaler._logical_actuation_target_by_accelerator),
-            'logical_desired': dict(
-                autoscaler._logical_actuation_desired_by_accelerator),
-            'adopted_explicit': dict(
-                autoscaler._logical_adopted_explicit_target_by_accelerator),
-            'adopted_paid': dict(
-                autoscaler._logical_adopted_paid_target_by_accelerator),
-        }
-        self.assertEqual(after, before)
-
     def test_retiring_warm_card_does_not_authorize_paid_replacement(self):
         interval = constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS
         autoscaler = _make_autoscaler(max_replicas=2,
@@ -4745,8 +5254,16 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             },
         )
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
-        a100_location = mock.Mock(accelerators={'A100': 1})
-        l4_location = mock.Mock(accelerators={'L4': 1})
+        a100_location = spot_placer.Location(cloud=mock.Mock(),
+                                             region='a100-region',
+                                             zone=None,
+                                             accelerators={'A100': 1},
+                                             use_spot=True)
+        l4_location = spot_placer.Location(cloud=mock.Mock(),
+                                           region='l4-region',
+                                           zone=None,
+                                           accelerators={'L4': 1},
+                                           use_spot=True)
         placer = mock.Mock()
         placer.known_location_costs.return_value = {
             a100_location: 0.0,
@@ -4804,8 +5321,16 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
             },
         )
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
-        a100_location = mock.Mock(accelerators={'A100': 1})
-        l4_location = mock.Mock(accelerators={'L4': 1})
+        a100_location = spot_placer.Location(cloud=mock.Mock(),
+                                             region='a100-region',
+                                             zone=None,
+                                             accelerators={'A100': 1},
+                                             use_spot=True)
+        l4_location = spot_placer.Location(cloud=mock.Mock(),
+                                           region='l4-region',
+                                           zone=None,
+                                           accelerators={'L4': 1},
+                                           use_spot=True)
         placer = mock.Mock()
         placer.known_location_costs.return_value = {
             a100_location: 0.0,
@@ -6539,6 +7064,24 @@ class TestLogicalReplicaSemantics(unittest.TestCase):
                 generation=5)
         _decisions(autoscaler, [])
 
+        self.assertIsNone(autoscaler.logical_target_state)
+
+    def test_missing_in_flight_replica_fails_closed_without_planner_crash(self):
+        autoscaler = _make_autoscaler(knob=1,
+                                      max_replicas=30,
+                                      replica_unit='logical')
+        autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
+        _report(autoscaler,
+                in_flight={99: 1},
+                queue_depth=0,
+                queued_profiles=[],
+                rejected_profiles=[],
+                compatibility_complete=True,
+                generation=4)
+
+        decisions = _decisions(autoscaler, [])
+
+        self.assertEqual(decisions, [])
         self.assertIsNone(autoscaler.logical_target_state)
 
     def test_existing_eight_slot_backend_emits_one_capacity_target(self):

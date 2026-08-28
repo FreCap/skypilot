@@ -2474,14 +2474,6 @@ def remove_claim(
         return removed
 
 
-def utilization_gate_enabled() -> bool:
-    """Process-wide kill switch for the utilization gate."""
-    override = os.environ.get(constants.RESERVED_FILL_UTILIZATION_GATE_ENV_VAR)
-    if override is None:
-        return True
-    return override.strip().lower() not in ('0', 'false', 'no', 'off', '')
-
-
 @dataclasses.dataclass(frozen=True)
 class ActivityInput:
     """One claimant's utilization signal, or the absence of one.
@@ -2503,8 +2495,6 @@ def _activity_input(row: dict[str, Any]) -> ActivityInput:
                             demonstrated_need=0,
                             boot_hold=False,
                             blind=True)
-    if not utilization_gate_enabled():
-        return ungated
     activity_ts = row.get('activity_ts')
     if activity_ts is None:
         # All activity columns NULL is the durable explicit opt-out (and the
@@ -2557,22 +2547,6 @@ def _apply_utilization_gate(
     declared floor. A claimant with no entry in the returned state is
     explicitly ungated, which preserves static-reservation behavior.
     """
-    if not utilization_gate_enabled():
-        # PROCESS-WIDE KILL SWITCH. The behavior contract (requirement 2)
-        # is that a disabled gate leaves every service ungated at exactly
-        # today's entitlement and "never fails toward release", and the env
-        # var "disables it for every service in the process" (requirement
-        # 10). Relying on _activity_input returning `blind` is not enough:
-        # an already-gated claimant (one carrying prev release state) would
-        # take the blind FREEZE path below instead, holding its decayed cap
-        # and, past RESERVED_FILL_BLIND_GRACE_SECONDS, resuming the decay
-        # toward its floor on a service the operator just told the gate to
-        # stop touching. Force-ungate here and drop all release state; the
-        # empty state clears utilization_state on the round row (the writer
-        # publishes NULL for a falsy state), exactly as "disarming must
-        # clear the state" requires, so re-enabling re-arms from current
-        # holdings rather than resuming a half-finished decay.
-        return claims, {}
     gated: dict[str, reserved_capacity_allocation.ClaimInput] = {}
     state: dict[str, dict[str, Any]] = {}
     for name, claim in claims.items():

@@ -996,12 +996,6 @@ RESERVED_FILL_ACTIVITY_MAX_LAG_SECONDS = 3.0 * LB_CONTROLLER_SYNC_INTERVAL_SECON
 # for a transient outage, but a permanently wedged load balancer must not
 # pin a whole pool indefinitely. 15 rounds, 3x the claim TTL.
 RESERVED_FILL_BLIND_GRACE_SECONDS = 900.0
-# Process-wide kill switch for the gate, parsed like the poll interval and
-# claim TTL overrides. Set to a false-y value to disarm the gate for every
-# service in this api-server without a spec update.
-RESERVED_FILL_UTILIZATION_GATE_ENV_VAR = (
-    'SKYPILOT_SERVE_RESERVED_FILL_UTILIZATION_GATE')
-
 # Default interval in seconds to probe replica endpoint.
 DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS = 10
 # Backward compatibility alias.

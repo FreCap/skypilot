@@ -7,6 +7,7 @@ decides whether preempted reserved capacity is re-priced or re-bought.
 """
 from sky.serve.autoscaler_compatibility import _allocate_compatibility_target
 from sky.serve.autoscaler_compatibility import _revalidate_actuation_target
+from sky.serve.autoscaler_compatibility import SupplyPreference
 
 CARDS = ['L4', 'L40S', 'A100', 'A100-80GB', 'H100', 'H200', 'B200']
 TOTAL = 66  # observed aggregate target
@@ -29,9 +30,19 @@ def allocate(ready_zero_cost, ready, use_existing_supply):
         demand_profiles=[(0, tuple(CARDS), float(TOTAL))],
         fixed_work_by_accelerator={},
         ready_zero_cost=ready_zero_cost,
-        ready=ready,
-        provisioning={},
+        committed_zero_cost=ready_zero_cost,
         free_reserved={},
+        ready_paid={
+            card: max(0,
+                      ready.get(card, 0) -
+                      ready_zero_cost.get(card, 0)) for card in CARDS
+        },
+        committed_paid={
+            card: max(0,
+                      ready.get(card, 0) -
+                      ready_zero_cost.get(card, 0)) for card in CARDS
+        },
+        supply_preference=SupplyPreference.WARM_FIRST,
         cold_order=CARDS,  # cheapest first
         use_existing_supply=use_existing_supply)
 

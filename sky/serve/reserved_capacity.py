@@ -44,6 +44,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import kubernetes
 from sky.catalog import kubernetes_catalog
+from sky.serve import capacity_admission
 from sky.serve import constants
 from sky.serve import pool_capacity_observation
 from sky.serve import pool_capacity_observer
@@ -228,8 +229,8 @@ class FillPoolSpec:
     def __post_init__(self) -> None:
         contexts = self.observation_contexts or (self.context,)
         if (self.context not in contexts or
-                len(set(contexts)) != len(contexts) or len(contexts) >
-                pool_capacity_observer.MAX_OBSERVATION_ROUTES_PER_POOL):
+                len(set(contexts)) != len(contexts) or len(contexts)
+                > pool_capacity_observer.MAX_OBSERVATION_ROUTES_PER_POOL):
             raise ValueError('A fill pool needs unique observation routes '
                              'including its placement context.')
         object.__setattr__(self, 'observation_contexts', contexts)
@@ -833,8 +834,8 @@ def protocol_v2_provider_fence(
                     'A physical-only provider fence cannot consume a phase '
                     'admission.')
             return contextlib.nullcontext()
-        if (phase_admission is not None and phase_admission.mode !=
-                provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
+        if (phase_admission is not None and phase_admission.mode
+                != provider_phase.ProviderPhaseMode.AMBIENT_LEGACY):
             raise exceptions.ProviderPhaseMisuseError(
                 'An ordinary provider operation requires ambient admission.')
         if phase_admission is None:
@@ -1177,9 +1178,9 @@ def parse_protocol_v2_launch_fence(
         raise ValueError('Reserved-fill accelerator count is invalid.')
     if policy_bound and (
             type(gate_generation) is not int or gate_generation < 1 or
-            type(reclaim_fleet_bundle_sha256) is not str or
-            re.fullmatch(r'[0-9a-f]{64}', reclaim_fleet_bundle_sha256) is None
-            or type(reclaim_policy_revision) is not str or
+            type(reclaim_fleet_bundle_sha256) is not str or re.fullmatch(
+                r'[0-9a-f]{64}', reclaim_fleet_bundle_sha256) is None or
+            type(reclaim_policy_revision) is not str or
             not reclaim_policy_revision or
             type(reclaim_provider_inventory_sha256) is not str or re.fullmatch(
                 r'[0-9a-f]{64}', reclaim_provider_inventory_sha256) is None or
@@ -1305,8 +1306,8 @@ def validate_protocol_v2_launch_fence_against_replica(
                            isinstance(resource_cloud, str) and
                            resource_cloud.casefold() == 'kubernetes')
     accelerators = resources_override.get('accelerators')
-    if (not is_kubernetes_cloud or resources_override.get('region') !=
-            persisted.get('reserved_fill_kubernetes_context') or
+    if (not is_kubernetes_cloud or resources_override.get('region')
+            != persisted.get('reserved_fill_kubernetes_context') or
             not isinstance(accelerators, Mapping) or len(accelerators) != 1):
         raise ValueError('Reserved-fill launch row resource pin is malformed.')
     accelerator, raw_count = next(iter(accelerators.items()))
@@ -1656,8 +1657,8 @@ def group_zero_cost_fill_pools(
                                   for name, _ in shapes)))
     exact_card_pool_count = sum(
         len(candidate.shapes) for candidate in candidates)
-    if (exact_card_pool_count >
-            pool_capacity_observation.MAX_OBSERVATION_COHORT_POOLS):
+    if (exact_card_pool_count
+            > pool_capacity_observation.MAX_OBSERVATION_COHORT_POOLS):
         raise ValueError(
             'Reserved-fill capacity exceeds the bounded '
             'Kubernetes pool count '
@@ -1938,8 +1939,8 @@ def _sequenced_fill_pool_specs_from_current_claim_authority(
                 return ()
             _, configured_width, locations = configured
             if (configured_width != width or
-                    expected_position_by_location[(context, card)] !=
-                    pool_position or
+                    expected_position_by_location[(context, card)]
+                    != pool_position or
                     legacy_pool_key != reserved_capacity_broker.make_pool_key(
                         context, card)):
                 return ()
@@ -3513,9 +3514,9 @@ def _broker_cycle_v2(
         return
 
     location_keys = {
-        spec.pool_key:
-        [location.to_pickleable() for location in spec.locations]
-        for spec in specs
+        spec.pool_key: [
+            location.to_pickleable() for location in spec.locations
+        ] for spec in specs
     }
     autoscaler.seed_zero_cost_pools(location_keys)
     previous_set = serve_state.get_reserved_fill_service_claim_set(service_name)
@@ -3537,16 +3538,67 @@ def _broker_cycle_v2(
         replica_infos, location_keys, pool_authority)
 
     now = time.time()
-    global_headroom = max(
-        0, autoscaler.max_replicas - autoscaler.get_final_target_num_replicas())
+    durable_feed = False
+    durable_source_unavailable = False
+    if sequenced_active:
+        source = capacity_admission.get_service_source_mode(service_name)
+        if (source is not None and
+                source[0] is capacity_admission.DemandSourceMode.DURABLE_FEED):
+            durable_feed = True
+        elif (source is None or source[0]
+              is not capacity_admission.DemandSourceMode.LEGACY_CONTROLLER):
+            durable_source_unavailable = True
+    if durable_feed:
+        # Canonical reserved rows are supply for the immutable demand target,
+        # not spare replicas overlaid above it. The PostgreSQL intent boundary
+        # independently debits every replica, intent, and Kueue admission
+        # against max_replicas before anything can reach a provider.
+        global_headroom = autoscaler.max_replicas
+    elif durable_source_unavailable:
+        # A sequenced service must not fall back to mutable process state when
+        # its durable demand owner cannot be proven.
+        global_headroom = 0
+    else:
+        # Transitional direct/legacy fill remains an overlay above demand.
+        global_headroom = max(
+            0, autoscaler.max_replicas -
+            autoscaler.get_final_target_num_replicas())
     total_fill_holdings = sum(
         holdings_by_pool.get(spec.pool_key, (0, 0))[0] for spec in specs)
-    if (autoscaler.reserved_fill_utilization_gate and
-            reserved_capacity_broker.utilization_gate_enabled()):
-        sample = autoscaler.fill_demand_sample(replica_infos)
-        demonstrated_need = (None
-                             if sample is None else sample.demonstrated_need())
-        boot_hold = False if sample is None else sample.boot_hold()
+    if autoscaler.reserved_fill_utilization_gate:
+        demand_witness_sha256 = None
+        if durable_feed:
+            witness = None
+            if (expected_service_hash is not None and
+                    expected_controller_owner is not None):
+                try:
+                    witness = (capacity_admission.CapacityAdmissionRepository(
+                    ).read_current_fill_demand_witness(
+                        service_name,
+                        expected_service_hash,
+                        expected_controller_owner,
+                        max_age_seconds=(3.0 * poll_interval_seconds())))
+                except Exception as error:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Reserved-fill durable demand witness is unavailable: '
+                        f'{common_utils.format_exception(error)}')
+            demonstrated_need = (None if witness is None else
+                                 witness.target_capacity)
+            demand_witness_sha256 = (None if witness is None else
+                                     witness.semantic_sha256)
+            pre_ready_statuses = (
+                serve_state.ReplicaStatus.PENDING,
+                serve_state.ReplicaStatus.PROVISIONING,
+                serve_state.ReplicaStatus.STARTING,
+            )
+            boot_hold = any(
+                info.reserved_fill is True and not info.is_terminal and
+                info.status in pre_ready_statuses for info in replica_infos)
+        else:
+            sample = autoscaler.fill_demand_sample(replica_infos)
+            demonstrated_need = (None if sample is None else
+                                 sample.demonstrated_need())
+            boot_hold = False if sample is None else sample.boot_hold()
         prior_state = (previous_set.get('utilization_state')
                        if previous_set is not None else None)
         utilization_state = reserved_capacity_broker.advance_release_target(
@@ -3555,7 +3607,7 @@ def _broker_cycle_v2(
             holdings=total_fill_holdings,
             need=0 if demonstrated_need is None else demonstrated_need,
             boot_hold=boot_hold,
-            blind=sample is None,
+            blind=demonstrated_need is None,
             now=now,
             dwell=constants.RESERVED_FILL_IDLE_DWELL_SECONDS,
             step_seconds=constants.RESERVED_FILL_RELEASE_STEP_SECONDS,
@@ -3563,14 +3615,15 @@ def _broker_cycle_v2(
             min_step=constants.RESERVED_FILL_RELEASE_MIN_STEP,
             headroom=constants.RESERVED_FILL_UTILIZATION_HEADROOM,
             blind_grace=constants.RESERVED_FILL_BLIND_GRACE_SECONDS)
-        # Allocation schema 6 binds the activity sample that produced this
+        # Allocation schema 7 binds the activity sample that produced this
         # ceiling.  The release governor ignores these additive witness keys,
         # while the PostgreSQL allocation publisher authenticates them before
         # a compatible positive paid plan may consume the map.
         utilization_state.update({
             'demonstrated_need': demonstrated_need,
+            'demand_witness_sha256': demand_witness_sha256,
             'boot_hold': boot_hold,
-            'blind': sample is None,
+            'blind': demonstrated_need is None,
         })
         utilization_ceiling = min(global_headroom,
                                   max(0, int(utilization_state['cap'])))
@@ -3836,8 +3889,8 @@ def _observation_targets(
                     pool_key)
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-            if (identity.protocol_version !=
-                    reserved_capacity_broker.PROTOCOL_V2 or
+            if (identity.protocol_version
+                    != reserved_capacity_broker.PROTOCOL_V2 or
                     identity.physical_cluster_uid != physical_uid):
                 continue
             claim_routes.setdefault(pool_key, set()).add(context)
@@ -3852,8 +3905,8 @@ def _observation_targets(
         contexts = list(spec.observation_contexts)
         contexts.extend(
             sorted(claim_routes.get(spec.pool_key, set()).difference(contexts)))
-        if (len(contexts) >
-                pool_capacity_observer.MAX_OBSERVATION_ROUTES_PER_POOL):
+        if (len(contexts)
+                > pool_capacity_observer.MAX_OBSERVATION_ROUTES_PER_POOL):
             logger.warning(
                 'Reserved-fill physical pool has more authenticated '
                 'aliases than one bounded observation can query; '
@@ -4075,8 +4128,9 @@ def poller_loop(
     behavior; the stacked cleanup removes that compatibility branch after all
     controller images use generation fencing.
     """
-    callbacks_are_paired = ((get_actuation_generation is
-                             None) == (actuation_generation_is_current is None))
+    callbacks_are_paired = ((get_actuation_generation
+                             is None) == (actuation_generation_is_current
+                                          is None))
     if not callbacks_are_paired:
         raise ValueError('Actuation generation capture and validation must be '
                          'configured together.')
@@ -4099,6 +4153,9 @@ def poller_loop(
                                     if service_name is not None else None)
     last_resolved_specs: tuple[FillPoolSpec, ...] = ()
     deadline = time.monotonic()
+    witness_wake_sequence = (
+        capacity_admission.fill_demand_witness_wake_sequence(service_name)
+        if service_name is not None else 0)
     try:
         while stop_event is None or not stop_event.is_set():
             # The fallback holds the historical broad lock only for callers
@@ -4247,9 +4304,8 @@ def poller_loop(
                                         PoolCapacityObserver(
                                             observation_repository,
                                             query_target,
-                                            publish=(None
-                                                     if notify_reconcile is None
-                                                     else lambda _row:
+                                            publish=(None if notify_reconcile
+                                                     is None else lambda _row:
                                                      notify_reconcile()),
                                             interval_seconds=(
                                                 poll_interval_seconds()),
@@ -4378,7 +4434,22 @@ def poller_loop(
             now = time.monotonic()
             deadline = _poller_fixed_rate_deadline(deadline, now, interval)
             delay = max(0.0, deadline - now)
-            if stop_event is None:
+            if service_name is not None:
+                witness_wake_sequence, witness_changed = (
+                    capacity_admission.wait_for_fill_demand_witness(
+                        service_name,
+                        witness_wake_sequence,
+                        delay,
+                        stop_event=stop_event))
+                if stop_event is not None and stop_event.is_set():
+                    return
+                if witness_changed:
+                    # Reconcile the new semantic target immediately, then
+                    # restart the fixed-rate provider-observation cadence from
+                    # that point instead of issuing a second scheduled read.
+                    deadline = time.monotonic()
+                    continue
+            elif stop_event is None:
                 time.sleep(delay)
             elif stop_event.wait(delay):
                 return

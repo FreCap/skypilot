@@ -1,5 +1,6 @@
 """Pure exact-card compatibility policy for Serve autoscalers."""
 import dataclasses
+import enum
 import math
 import typing
 
@@ -7,17 +8,46 @@ if typing.TYPE_CHECKING:
     from sky.serve import replica_managers
 
 
-@dataclasses.dataclass(frozen=True)
+class SupplyPreference(enum.Enum):
+    """Economic ordering for compatible already-committed capacity."""
+
+    WARM_FIRST = 'warm_first'
+    ZERO_COST_FIRST = 'zero_cost_first'
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class DeadlineDemand:
     """One queue bucket with one dispatch deadline and routing class."""
 
+    sequence: int
     priority: int
     compatible_cards: tuple[str, ...]
     count: int
     remaining_seconds: float
 
+    def __post_init__(self) -> None:
+        if (type(self.sequence) is not int or self.sequence < 0 or
+                type(self.priority) is not int or type(self.count) is not int or
+                self.count < 0 or not isinstance(self.remaining_seconds,
+                                                 (int, float)) or
+                isinstance(self.remaining_seconds, bool) or
+                not math.isfinite(float(self.remaining_seconds))):
+            raise ValueError('Deadline demand is malformed.')
+        compatible = tuple(
+            sorted({
+                card.casefold(): card
+                for card in self.compatible_cards
+                if isinstance(card, str) and card
+            }.values(),
+                   key=str.casefold))
+        if self.count > 0 and not compatible:
+            raise ValueError('Positive deadline demand has no accelerator.')
+        object.__setattr__(self, 'compatible_cards', compatible)
+        object.__setattr__(self, 'remaining_seconds',
+                           float(self.remaining_seconds))
 
-@dataclasses.dataclass(frozen=True)
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class DeadlineSupply:
     """One finite or prospective logical GPU slot in economic tier order."""
 
@@ -25,8 +55,19 @@ class DeadlineSupply:
     available_after_seconds: float
     tier: int
 
+    def __post_init__(self) -> None:
+        if (not isinstance(self.card, str) or not self.card or
+                not isinstance(self.available_after_seconds, (int, float)) or
+                isinstance(self.available_after_seconds, bool) or
+                not math.isfinite(float(self.available_after_seconds)) or
+                self.available_after_seconds < 0 or
+                type(self.tier) is not int or self.tier < 0):
+            raise ValueError('Deadline supply is malformed.')
+        object.__setattr__(self, 'available_after_seconds',
+                           float(self.available_after_seconds))
 
-@dataclasses.dataclass(frozen=True)
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class DeadlineCapacityPlan:
     """Integer card target and queue work that no timely slot can rescue."""
 
@@ -84,7 +125,9 @@ def _allocate_deadline_capacity_target(
             if item.count > 0:
                 invalid_infeasible[item.priority] = (
                     invalid_infeasible.get(item.priority, 0.0) + item.count)
-        return DeadlineCapacityPlan({}, invalid_infeasible)
+        return DeadlineCapacityPlan(
+            target_by_card={},
+            infeasible_requests_by_priority=invalid_infeasible)
 
     def _valid_supply(item: DeadlineSupply) -> bool:
         available = item.available_after_seconds
@@ -260,14 +303,14 @@ def _allocate_deadline_capacity_target(
                                                          utilization)
                         remaining -= assigned
 
-    return DeadlineCapacityPlan(
-        {
-            card: count for card, count in target.items() if count > 0
-        }, {
-            priority: count
-            for priority, count in infeasible.items()
-            if count > epsilon
-        })
+    return DeadlineCapacityPlan(target_by_card={
+        card: count for card, count in target.items() if count > 0
+    },
+                                infeasible_requests_by_priority={
+                                    priority: count
+                                    for priority, count in infeasible.items()
+                                    if count > epsilon
+                                })
 
 
 def _allocate_compatibility_target(
@@ -280,9 +323,11 @@ def _allocate_compatibility_target(
     demand_profiles: list[tuple[int, tuple[str, ...], float]],
     fixed_work_by_accelerator: dict[str, float],
     ready_zero_cost: dict[str, int],
-    ready: dict[str, int],
-    provisioning: dict[str, int],
+    committed_zero_cost: dict[str, int],
     free_reserved: dict[str, int],
+    ready_paid: dict[str, int],
+    committed_paid: dict[str, int],
+    supply_preference: SupplyPreference,
     cold_order: list[str],
     use_existing_supply: bool,
 ) -> dict[str, int]:
@@ -293,6 +338,15 @@ def _allocate_compatibility_target(
     its current card before flexible queued/rejected profiles are considered.
     `demand_profiles` contains work units, not request counts, which lets the
     same scarcity/supply allocator serve both QPS and concurrency policies.
+
+    The supply maps are disjoint economic facts except for the explicit subset
+    relationships ``ready_zero_cost <= committed_zero_cost`` and
+    ``ready_paid <= committed_paid``. The promoted durable planner uses
+    ``ZERO_COST_FIRST`` so flexible work consumes every compatible zero-cost
+    tier before paid supply. The retained generic adapter uses ``WARM_FIRST``
+    until that path is promoted; its reservation launches remain an
+    independent padding projection. Fixed work above never moves between cards
+    under either policy.
     """
     demand_epsilon = 1e-9
     # A logical scale-up wave can deliberately place a ceiling below the
@@ -358,15 +412,47 @@ def _allocate_compatibility_target(
     # traffic target.
     planned_by_tier: list[dict[str, int]] = []
     if use_existing_supply:
-        planned_by_tier = [dict(ready_zero_cost), dict(ready)]
-        planned_by_tier.append({
-            card: ready.get(card, 0) + provisioning.get(card, 0)
-            for card in configured_cards
-        })
-        planned_by_tier.append({
-            card: (ready.get(card, 0) + provisioning.get(card, 0) +
-                   free_reserved.get(card, 0)) for card in configured_cards
-        })
+        if not isinstance(supply_preference, SupplyPreference):
+            raise ValueError('Supply preference is malformed.')
+        for card in configured_cards:
+            if (ready_zero_cost.get(card, 0) > committed_zero_cost.get(card, 0)
+                    or ready_paid.get(card, 0) > committed_paid.get(card, 0)):
+                raise ValueError('Ready capacity exceeds committed capacity.')
+        if supply_preference is SupplyPreference.ZERO_COST_FIRST:
+            zero_with_reservation = {
+                card: (committed_zero_cost.get(card, 0) +
+                       free_reserved.get(card, 0)) for card in configured_cards
+            }
+            planned_by_tier = [
+                dict(ready_zero_cost),
+                dict(committed_zero_cost),
+                zero_with_reservation,
+                {
+                    card: (zero_with_reservation.get(card, 0) +
+                           ready_paid.get(card, 0)) for card in configured_cards
+                },
+                {
+                    card: (zero_with_reservation.get(card, 0) +
+                           committed_paid.get(card, 0)
+                          ) for card in configured_cards
+                },
+            ]
+        else:
+            ready_all = {
+                card: (ready_zero_cost.get(card, 0) + ready_paid.get(card, 0))
+                for card in configured_cards
+            }
+            committed_all = {
+                card: (committed_zero_cost.get(card, 0) +
+                       committed_paid.get(card, 0)) for card in configured_cards
+            }
+            planned_by_tier = [
+                dict(ready_zero_cost), ready_all, committed_all, {
+                    card: (committed_all.get(card, 0) +
+                           free_reserved.get(card, 0)
+                          ) for card in configured_cards
+                }
+            ]
 
     def fallback_after_next_assignment(
             compatible: tuple[str, ...]) -> tuple[int, int]:

@@ -128,6 +128,7 @@ LB_DATA_PLANE_AUTH_VOLUME_NAME = 'skypilot-serve-lb-auth'
 _LB_DATA_PLANE_AUTH_MOUNT_PATH = ('/etc/skypilot/serve-auth/lb-data-plane')
 
 _SHA256_DIGEST_RE = re.compile(r'^sha256:[0-9a-fA-F]{64}$')
+_IMAGE_TAG_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$')
 _RUNTIME_IMAGE_ID_PREFIXES = ('docker-pullable://', 'containerd://',
                               'docker://')
 _SERVICE_ACCOUNT_NAMESPACE_PATH = (
@@ -531,47 +532,81 @@ def _resolve_lb_image(namespace: str,
     """Resolve the controller image used for the external LB.
 
     Reads the controller pod (name from ``POD_NAME_ENV_VAR``) and returns its
-    first container's resolved image and imagePullPolicy. When Kubernetes has
-    populated the container's runtime ``imageID``, common runtime forms are
-    normalized to an immutable ``repository@sha256:...`` reference and that
-    reference is used as the LB container image itself. The pull policy MUST
-    be mirrored together with the image: the platform deploys a moving tag
-    (``-improvements``) with ``Always``, and an LB Deployment hardcoding
-    ``IfNotPresent`` silently pins whatever digest its node had cached — the
-    controller and its LB then run DIFFERENT code from the SAME tag (observed
-    live: an LB missing the /_lb/capacity route the controller image carried,
-    so the request fell through to the catch-all and was proxied to the model
-    server). A digest-pinned deployment keeps its own policy unchanged.
+    first container's immutable LB image, imagePullPolicy, and canonical digest
+    evidence. A declared ``repository:tag@sha256:...`` remains byte-for-byte
+    unchanged after the runtime confirms the same repository and digest. A
+    mutable ``repository:tag`` is pinned as
+    ``repository:tag@runtime-sha256:...``. Canonical
+    ``repository@sha256:...`` remains the rollout/digest evidence in both
+    cases.
+
+    The declared and runtime repositories must match. If the declared image is
+    already immutable, its digest must match the runtime digest too. This
+    prevents either registry drift or a stale tag from creating an LB running
+    code different from its controller. The pull policy MUST be mirrored
+    together with the image: the platform can deploy a moving tag with
+    ``Always``, and an LB Deployment hardcoding ``IfNotPresent`` silently pins
+    whatever digest its node had cached. A digest-pinned deployment keeps its
+    own policy unchanged.
+
     Raises if the pod-name env var is unavailable; it is part of the platform
     contract used to mirror both image identity and projected auth volumes.
     """
     if pod is None:
         pod = _read_controller_pod(namespace, context)
     container = _controller_container(pod)
+    declared_image = container.image
+    declared_repository = _image_repository(declared_image)
+    if declared_repository is None:
+        raise RuntimeError(
+            'Cannot pin the external load balancer image: controller image '
+            f'{declared_image!r} has no valid repository.')
+
     # The RESOLVED digest of the running controller image (imageID from the
-    # container status; None while the status is not yet populated). Pinning
-    # the actual image field is critical: an annotation-only rollout still
-    # lets a moving tag resolve to a different digest on the LB node.
+    # container status; None while the status is not yet populated). The
+    # canonical reference intentionally omits a tag so repository/digest
+    # comparisons are independent of representation.
     declared_digest_reference = _resolved_image_reference(
-        container.image, container.image)
+        declared_image, declared_image)
     digest_reference = declared_digest_reference
     status = _controller_container_status(pod, container)
     if status is not None and getattr(status, 'image_id', None):
         image_id = status.image_id
-        digest_reference = _resolved_image_reference(container.image, image_id)
+        digest_reference = _resolved_image_reference(declared_image, image_id)
         if digest_reference is None:
             raise RuntimeError(
                 f'Cannot pin the external load balancer image: controller '
                 f'imageID {image_id!r} is not a valid sha256 reference.')
+        runtime_repository = _image_repository(digest_reference)
+        if runtime_repository != declared_repository:
+            raise RuntimeError(
+                'Cannot pin the external load balancer image: controller '
+                f'image repository {declared_repository!r} does not match '
+                f'runtime repository {runtime_repository!r}.')
+        if (declared_digest_reference is not None and
+                declared_digest_reference != digest_reference):
+            raise RuntimeError(
+                'Cannot pin the external load balancer image: controller '
+                'declared digest does not match its runtime digest.')
     if digest_reference is None:
         raise RuntimeError(
             'Cannot pin the external load balancer image: Kubernetes has not '
             f'published a sha256 imageID for mutable image '
-            f'{container.image!r}. '
+            f'{declared_image!r}. '
             'Retry after the API container status is ready or deploy the API '
             'container with an immutable digest reference.')
-    return (digest_reference, (container.image_pull_policy or
-                               'IfNotPresent'), digest_reference)
+
+    if declared_digest_reference is not None:
+        lb_image = declared_image
+    else:
+        if '@' in declared_image:
+            raise RuntimeError(
+                'Cannot pin the external load balancer image: controller '
+                f'image {declared_image!r} has an invalid digest reference.')
+        runtime_digest = digest_reference.rsplit('@', 1)[1]
+        lb_image = f'{declared_image}@{runtime_digest}'
+    return (lb_image, (container.image_pull_policy or
+                       'IfNotPresent'), digest_reference)
 
 
 def _resolved_image_reference(image: str, image_id: str) -> str | None:
@@ -599,9 +634,11 @@ def _resolved_image_reference(image: str, image_id: str) -> str | None:
         if '://' in candidate:
             return None
 
+    if candidate.count('@') > 1:
+        return None
     if '@' in candidate:
         repository, digest = candidate.rsplit('@', 1)
-        repository = _valid_image_repository(repository)
+        repository = _image_repository(repository)
     else:
         repository = _image_repository(image)
         digest = candidate
@@ -619,11 +656,23 @@ def _image_repository(image: str) -> str | None:
     if (not reference or '://' in reference or
             any(char.isspace() for char in reference)):
         return None
-    reference = reference.split('@', 1)[0]
+    if reference.count('@') > 1:
+        return None
+    if '@' in reference:
+        reference, digest = reference.rsplit('@', 1)
+        if _SHA256_DIGEST_RE.fullmatch(digest) is None:
+            return None
     last_slash = reference.rfind('/')
     last_colon = reference.rfind(':')
     if last_colon > last_slash:
+        tag = reference[last_colon + 1:]
+        if _IMAGE_TAG_RE.fullmatch(tag) is None:
+            return None
         reference = reference[:last_colon]
+        # A second colon in the final path component is neither a registry port
+        # nor a valid tag separator (for example ``repo:bad:tag``).
+        if reference.rfind(':') > reference.rfind('/'):
+            return None
     return _valid_image_repository(reference)
 
 

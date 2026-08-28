@@ -31,9 +31,12 @@ def _allocate(**overrides):
         'demand_profiles': [],
         'fixed_work_by_accelerator': {},
         'ready_zero_cost': {},
-        'ready': {},
-        'provisioning': {},
+        'committed_zero_cost': {},
         'free_reserved': {},
+        'ready_paid': {},
+        'committed_paid': {},
+        'supply_preference':
+            (autoscaler_compatibility.SupplyPreference.WARM_FIRST),
         'cold_order': ['A100', 'L4'],
         'use_existing_supply': False,
     }
@@ -48,8 +51,11 @@ def test_historical_helper_identity_and_signatures():
              'floors: dict[str, int], min_replicas: int, max_replicas: int, '
              'demand_profiles: list[tuple[int, tuple[str, ...], float]], '
              'fixed_work_by_accelerator: dict[str, float], '
-             'ready_zero_cost: dict[str, int], ready: dict[str, int], '
-             'provisioning: dict[str, int], free_reserved: dict[str, int], '
+             'ready_zero_cost: dict[str, int], committed_zero_cost: '
+             'dict[str, int], free_reserved: dict[str, int], ready_paid: '
+             'dict[str, int], committed_paid: dict[str, int], '
+             'supply_preference: sky.serve.autoscaler_compatibility.'
+             'SupplyPreference, '
              'cold_order: list[str], use_existing_supply: bool) -> '
              'dict[str, int]'),
         '_replica_is_retiring_card_supply':
@@ -130,11 +136,26 @@ def test_allocate_uses_cold_order_for_flexible_work():
 def test_allocate_reuses_materialized_supply_before_cold_order():
     demand = [(10, ('L4', 'A100'), 1.0)]
     assert _allocate(demand_profiles=demand,
-                     ready={'L4': 1},
+                     ready_paid={'L4': 1},
+                     committed_paid={'L4': 1},
                      use_existing_supply=True) == {
                          'L4': 1
                      }
     assert _allocate(demand_profiles=demand) == {'A100': 1}
+
+
+def test_allocate_prefers_free_reservation_over_ready_paid_supply():
+    demand = [(10, ('L4', 'A100'), 1.0)]
+    assert _allocate(
+        demand_profiles=demand,
+        free_reserved={'A100': 1},
+        ready_paid={'L4': 1},
+        committed_paid={'L4': 1},
+        supply_preference=(
+            autoscaler_compatibility.SupplyPreference.ZERO_COST_FIRST),
+        use_existing_supply=True) == {
+            'A100': 1
+        }
 
 
 def test_allocate_prioritizes_more_constrained_equal_priority_demand():

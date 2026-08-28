@@ -37,6 +37,12 @@ from sky.utils import locks
 _POOL = broker.make_pool_key('research-ctx', 'A100')
 
 
+def test_usage_gate_policy_has_no_process_local_override():
+    assert not hasattr(serve_constants,
+                       'RESERVED_FILL_UTILIZATION_GATE_ENV_VAR')
+    assert not hasattr(broker, 'utilization_gate_enabled')
+
+
 def test_protocol_v2_pool_key_uses_physical_identity_not_context_alias():
     first = broker.make_pool_key('research-alias', ('H200', 'A100'),
                                  protocol_version=broker.PROTOCOL_V2,
@@ -2812,7 +2818,7 @@ class TestClaimLifecycle:
         engine = serve_state._db_manager.get_engine()
         with orm.Session(engine) as session:
             session.execute(serve_state.services_table.insert().values(
-                name='svc-a', hash='incarnation-a'))
+                name='svc-a', hash='incarnation-a', lifecycle_epoch=1))
             session.commit()
         assert serve_state.remove_service_completely('svc-a', 'incarnation-a')
         live = {
@@ -4574,14 +4580,6 @@ class TestActivityInputSkew:
     def test_negative_lag_reads_blind(self):
         assert broker._activity_input(self._row(heartbeat_ts=999.0)).blind
 
-    def test_env_kill_switch_blinds_every_claim(self):
-        with mock.patch.dict(
-                'os.environ',
-            {serve_constants.RESERVED_FILL_UTILIZATION_GATE_ENV_VAR: 'false'}):
-            got = broker._activity_input(self._row())
-        assert got.armed is False
-        assert got.blind
-
 
 def test_armed_blind_claim_persists_fresh_null_need(_broker_db):
     broker.upsert_claim('svc',
@@ -4723,43 +4721,6 @@ class TestApplyUtilizationGate:
         }
         gated, state = broker._apply_utilization_gate(claims, activity, prev,
                                                       1000.0)
-        assert gated['a'].utilization_cap is None
-        assert not state
-
-    def test_env_kill_switch_ungates_an_already_gated_service(self):
-        # Requirement 10: the process-wide kill switch disables the gate for
-        # every service and restores static entitlement. A claimant that
-        # already accrued release state must be fully ungated (cap dropped,
-        # state cleared), not frozen at its decayed cap the way a transient
-        # telemetry blind is. Freezing under the kill switch would eventually
-        # walk a busy service down through the very lever meant to stop the
-        # gate.
-        now = 1_000_000.0
-        claims = {'a': self._claim(floor=16, weight=4.0, holdings_fill=40)}
-        # A genuinely BUSY claim: fresh paired signal, high demonstrated need.
-        row = {
-            'demonstrated_need': 50,
-            'boot_hold': False,
-            'activity_ts': now,
-            'heartbeat_ts': now,
-        }
-        prev = {
-            'a': {
-                'cap': 40,
-                'hot_until': now - 1.0,
-                'stepped_at': now - 10_000.0,
-                'blind_since': None,
-            }
-        }
-        with mock.patch.dict(
-                'os.environ',
-            {serve_constants.RESERVED_FILL_UTILIZATION_GATE_ENV_VAR: '0'}):
-            activity = {'a': broker._activity_input(row)}
-            gated, state = broker._apply_utilization_gate(
-                claims, activity, prev, now)
-        # Ungated: today's entitlement (no cap), and the release state is
-        # cleared so the round writer publishes NULL utilization_state
-        # (`if utilization_state else None`) rather than a stale target.
         assert gated['a'].utilization_cap is None
         assert not state
 

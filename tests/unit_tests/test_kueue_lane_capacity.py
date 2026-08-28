@@ -1,10 +1,12 @@
 """Unit tests for the minimal Kueue admission capacity projection."""
+import dataclasses
 import datetime
 from types import SimpleNamespace
 import uuid
 
 import pytest
 
+from sky.serve import capacity_admission
 from sky.serve import kueue_lane_capacity
 from sky.serve import kueue_lane_lineage
 
@@ -142,10 +144,87 @@ def _project(monkeypatch,
 
 def test_non_kueue_intent_has_no_override(monkeypatch):
     projection = _project(monkeypatch, [], expected_kueue=False)
+    snapshot = kueue_lane_capacity.replica_capacity_snapshot_from_projection(
+        (SimpleNamespace(replica_id=7,
+                         replica_record_id=_RECORD_ID,
+                         reserved_fill_intent_idempotency_key='intent-1'),),
+        projection)
 
     assert projection.demand_supply_for_intent('intent-1') is None
     assert projection.assigned_gpu_for_intent('intent-1') is None
+    assert projection.uses_ordinary_scheduler('intent-1')
+    assert projection.ordinary_scheduler_intent_keys == {'intent-1'}
     assert not projection.has_unknown
+    assert snapshot.by_replica_id == {}
+    assert snapshot.ordinary_scheduler_replica_ids == {7}
+
+
+def test_unclassified_missing_admission_preserves_no_override(monkeypatch):
+    projection = dataclasses.replace(_project(monkeypatch, [],
+                                              expected_kueue=False),
+                                     ordinary_scheduler_intent_keys=frozenset())
+    snapshot = kueue_lane_capacity.replica_capacity_snapshot_from_projection(
+        (SimpleNamespace(replica_id=7,
+                         replica_record_id=_RECORD_ID,
+                         reserved_fill_intent_idempotency_key='intent-1'),),
+        projection)
+
+    assert snapshot.by_replica_id == {}
+    assert snapshot.ordinary_scheduler_replica_ids == frozenset()
+
+
+def test_non_kueue_intent_with_stray_admission_is_unknown(monkeypatch):
+    projection = _project(
+        monkeypatch,
+        [_row(kueue_lane_lineage.KueueAdmissionState.POLICY_ADMITTED)],
+        expected_kueue=False)
+
+    assert not projection.uses_ordinary_scheduler('intent-1')
+    assert projection.ordinary_scheduler_intent_keys == frozenset()
+    assert projection.assigned_gpu_for_intent('intent-1') is True
+    assert projection.unknown_shapes == {('h200', 8)}
+
+
+@pytest.mark.parametrize('replica_version', [2, 3])
+def test_proven_ordinary_scheduler_replica_is_economic_supply_across_n_minus_one(
+        monkeypatch, replica_version):
+    projection = _project(monkeypatch, [], expected_kueue=False)
+    state = {
+        'replica_info_version': 18,
+        'status_property': {
+            'is_scale_down': False,
+        },
+        'planned_capacity': 8,
+        'is_zero_cost': True,
+        'resources_override': {
+            'accelerators': {
+                'H200': 8,
+            },
+        },
+    }
+    locked = capacity_admission._LockedCapacityRows(
+        replica_rows=({
+            'status': 'READY',
+            'version': replica_version,
+            'replica_state_version': 1,
+            'replica_state': state,
+            'reserved_fill_intent_idempotency_key': 'intent-1',
+        },),
+        intent_rows=(),
+        live_replica_record_ids=frozenset(),
+        provider_present_replica_record_ids=frozenset(),
+        live_intent_keys=frozenset({'intent-1'}),
+        planned_capacity_by_intent_key={'intent-1': 1},
+        capacity_unit_by_intent_key={'intent-1': 'physical'})
+
+    inventory = capacity_admission._project_capacity_inventory(
+        locked,
+        service_version=3,
+        accounting_cards={'h200'},
+        now=_NOW,
+        lane_projection=projection)
+
+    assert inventory == ({'h200': 8}, {'h200': 0}, {'h200': 0}, 0)
 
 
 def test_missing_expected_kueue_admission_is_unknown(monkeypatch):
@@ -153,6 +232,7 @@ def test_missing_expected_kueue_admission_is_unknown(monkeypatch):
 
     assert projection.demand_supply_for_intent('intent-1') is False
     assert projection.assigned_gpu_for_intent('intent-1') is True
+    assert not projection.uses_ordinary_scheduler('intent-1')
     assert projection.unknown_shapes == {('h200', 8)}
 
 

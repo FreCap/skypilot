@@ -267,9 +267,6 @@ def test_policy_admitted_is_supply_and_assigned_before_replica_ready(
     assert projection.assigned_gpu_for_intent(key) is True
     assert projection.admitted_replica_record_ids == {(1, record_id)}
     assert inventory == ({'h200': 1}, {'h200': 0}, {'h200': 0})
-    zero_cost, paid, pending = inventory
-    assert capacity_admission._paid_residual({'h200': 1}, zero_cost, pending,
-                                             paid) == {}
 
 
 def test_missing_kueue_admission_is_exact_shape_unknown(
@@ -558,9 +555,6 @@ def test_terminal_never_materialized_admission_is_conservative_debit(
     assert projection.unknown_shapes == {('h200', 1)}
     assert not projection.unbounded_unknown
     assert inventory == ({'h200': 0}, {'h200': 0}, {'h200': 1})
-    zero_cost, paid, pending = inventory
-    assert capacity_admission._paid_residual({'h200': 1}, zero_cost, pending,
-                                             paid) == {}
 
 
 def test_bounded_unknown_shape_does_not_block_unrelated_paid_card(
@@ -577,11 +571,6 @@ def test_bounded_unknown_shape_does_not_block_unrelated_paid_card(
     assert projection.unknown_shapes == {('h200', 1)}
     assert not projection.unbounded_unknown
     assert inventory == ({'l4': 0}, {'l4': 0}, {'l4': 0})
-    zero_cost, paid, pending = inventory
-    assert capacity_admission._paid_residual({'l4': 1}, zero_cost, pending,
-                                             paid) == {
-                                                 'l4': 1
-                                             }
 
 
 def test_surge_lease_survives_shutting_down_until_provider_cleanup(

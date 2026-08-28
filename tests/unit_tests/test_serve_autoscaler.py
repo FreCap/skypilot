@@ -521,6 +521,7 @@ class TestInstanceAwareGpuShapeCache(unittest.TestCase):
         autoscaler.qps_window_size = (
             constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS)
         autoscaler.latest_version = 1
+        autoscaler._service_name = 'svc'
         return autoscaler
 
     def _make_replica(self, gpu_type, launch_status, count=1):
@@ -1352,7 +1353,11 @@ class TestInstanceAwareMixedVersionArithmetic(unittest.TestCase):
                     autoscalers.AutoscalerDecisionOperator.SCALE_UP
                 ]), 5)
             mock_get.assert_called_once_with('svc', [1])
-            self.assertEqual(mock_warning.call_count, 1)
+            historical_warnings = [
+                call for call in mock_warning.call_args_list
+                if 'Failed to batch-load historical service specs' in str(call)
+            ]
+            self.assertEqual(len(historical_warnings), 1)
 
             second = autoscaler.generate_scaling_decisions(replicas, [1, 2])
             self.assertEqual([
@@ -1578,7 +1583,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
                          {'L4': 1})
 
-    def test_qps_economic_target_is_not_work_conserving_across_cards(self):
+    def test_qps_target_remains_on_ordinary_physical_policy(self):
         autoscaler = self._autoscaler(max_replicas=2)
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
         now = time.time()
@@ -1590,9 +1595,7 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
 
         self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
                          {'L4': 2})
-        self.assertIsNone(
-            autoscaler.economic_capacity_target_by_accelerator([], {'a100': 1}))
-        self.assertFalse(autoscaler.supports_reserved_supply_economic_target())
+        self.assertNotIsInstance(autoscaler, autoscalers.ConcurrencyAutoscaler)
 
     def test_qps_shape_preload_does_not_hold_demand_state_lock(self):
         autoscaler = self._autoscaler(max_replicas=1)

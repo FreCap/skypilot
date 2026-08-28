@@ -1,5 +1,6 @@
 """Unit tests for the pure protocol-v2 reserved-fill planner."""
 
+from collections.abc import Mapping
 import copy
 import dataclasses
 from typing import Any
@@ -94,6 +95,7 @@ def _plan(
     planned_replicas: int = 0,
     capacity_unit: reserved_fill_planner.FillCapacityUnit = (
         reserved_fill_planner.FillCapacityUnit.PHYSICAL),
+    target_capacity_by_accelerator: Mapping[str, int] | None = None,
     committed_fill_debits: tuple[reserved_fill_planner.CommittedFillDebit,
                                  ...] = (),
     rotation_anchor: str | None = None,
@@ -125,6 +127,7 @@ def _plan(
         max_replicas=max_replicas,
         planned_replicas=planned_replicas,
         capacity_unit=capacity_unit,
+        target_capacity_by_accelerator=target_capacity_by_accelerator,
         committed_fill_debits=committed_fill_debits,
         rotation_anchor=rotation_anchor,
     )
@@ -366,6 +369,60 @@ def test_logical_headroom_charges_exact_accelerator_width() -> None:
         reserved_fill_planner.FillCapacityUnit.LOGICAL)
 
 
+def test_exact_card_target_only_emits_budgeted_accelerator() -> None:
+    mixed = _snapshot('mixed-context',
+                      'uid-mixed', {
+                          'a100': 2,
+                          'h200': 2,
+                          'l4': 2,
+                      },
+                      location_order=('A100', 'H200', 'L4'))
+
+    plan = _plan((mixed,), target_capacity_by_accelerator={'L4': 2})
+
+    assert [intent.accelerator for intent in plan.intents] == ['L4', 'L4']
+
+
+def test_logical_exact_card_target_charges_multi_gpu_intent_width() -> None:
+    wide = _snapshot('wide-context',
+                     'uid-wide', {'h200': 3},
+                     accelerator_count=4)
+
+    plan = _plan((wide,),
+                 capacity_unit=reserved_fill_planner.FillCapacityUnit.LOGICAL,
+                 target_capacity_by_accelerator={'h200': 7})
+
+    assert len(plan.intents) == 1
+    assert plan.intents[0].accelerator_count == 4
+    assert sum(
+        plan.capacity_unit.intent_cost(intent.accelerator_count)
+        for intent in plan.intents) == 4
+
+
+@pytest.mark.parametrize('target', [
+    [('l4', 1)],
+    {
+        'L4': 1,
+        'l4': 1,
+    },
+    {
+        'l4': -1,
+    },
+    {
+        'l4': True,
+    },
+    {
+        'unknown': 1,
+    },
+])
+def test_exact_card_target_rejects_malformed_or_unauthenticated_capacity(
+        target: Any) -> None:
+    snapshot = _snapshot('east-context', 'uid-east', {'l4': 1})
+
+    with pytest.raises(ValueError):
+        _plan((snapshot,), target_capacity_by_accelerator=target)
+
+
 def test_committed_fill_debit_prevents_same_allocation_replay() -> None:
     east = _snapshot('east-context', 'uid-east', {'a100': 3})
     allocation_map = reserved_fill_planner.AuthenticatedAllocationMap.create(
@@ -392,6 +449,35 @@ def test_committed_fill_debit_prevents_same_allocation_replay() -> None:
 
     assert len(plan.intents) == 1
     assert plan.intents[0].accelerator == 'a100'
+
+
+def test_exact_card_target_is_prospective_of_committed_fill_debits() -> None:
+    east = _snapshot('east-context', 'uid-east', {'l4': 3})
+    allocation_map = reserved_fill_planner.AuthenticatedAllocationMap.create(
+        allocation_generation=5,
+        allocation_claim_generation=11,
+        service_version=_SERVICE_VERSION,
+        ordinary_zero_cost_admission_sequence_high_water=(
+            east.ordinary_zero_cost_admission_sequence),
+        reconciliation_gate_generation=_RECONCILIATION_GATE_GENERATION,
+        reclaim_fleet_bundle_sha256=_RECLAIM_FLEET_BUNDLE_SHA256,
+        reclaim_policy_revision=_RECLAIM_POLICY_REVISION,
+        reclaim_provider_inventory_sha256=(_RECLAIM_PROVIDER_INVENTORY_SHA256),
+        pool_snapshots=(east,))
+    committed = reserved_fill_planner.CommittedFillDebit(
+        allocation_generation=allocation_map.allocation_generation,
+        allocation_input_sha256=allocation_map.allocation_input_sha256,
+        allocation_claim_generation=(
+            allocation_map.allocation_claim_generation),
+        pool_key=east.pool_key,
+        accelerator='l4',
+        replica_slots=1)
+
+    plan = _plan((east,),
+                 target_capacity_by_accelerator={'l4': 2},
+                 committed_fill_debits=(committed,))
+
+    assert len(plan.intents) == 2
 
 
 def test_remaining_capacity_projection_matches_canonical_plan_tail() -> None:
@@ -562,6 +648,7 @@ def test_allocation_map_hash_binds_complete_ordered_authority() -> None:
         reclaim_provider_inventory_sha256=(_RECLAIM_PROVIDER_INVENTORY_SHA256),
         utilization_gate_armed=True,
         utilization_demonstrated_need=3,
+        utilization_demand_witness_sha256='d' * 64,
         utilization_boot_hold=True,
         utilization_ceiling=4,
         upward_grants_settled=False,
@@ -569,7 +656,8 @@ def test_allocation_map_hash_binds_complete_ordered_authority() -> None:
 
     assert (reserved_fill_planner.AuthenticatedAllocationMap.from_mapping(
         allocation_map.to_mapping()) == allocation_map)
-    assert allocation_map.to_mapping()['schema_version'] == 6
+    assert (allocation_map.to_mapping()['schema_version'] ==
+            reserved_fill_planner.ALLOCATION_MAP_SCHEMA_VERSION)
 
     inflated_east = dataclasses.replace(east,
                                         edge_cap=2,
@@ -590,6 +678,7 @@ def test_allocation_map_hash_binds_complete_ordered_authority() -> None:
             'reclaim_policy_revision': 'kueue-reclaim-v2',
             'reclaim_provider_inventory_sha256': 'f' * 64,
             'utilization_demonstrated_need': 4,
+            'utilization_demand_witness_sha256': 'e' * 64,
             'utilization_boot_hold': False,
             'utilization_ceiling': 5,
             'upward_grants_settled': True,

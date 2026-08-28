@@ -13,8 +13,8 @@ if typing.TYPE_CHECKING:
 logger = sky_logging.init_logger(__name__)
 
 # Define a registry for load balancing policies
-LB_POLICIES = {}
-DEFAULT_LB_POLICY = None
+LB_POLICIES: dict[str, typing.Type['LoadBalancingPolicy']] = {}
+DEFAULT_LB_POLICY: str | None = None
 
 
 class LoadBalancingPolicy:

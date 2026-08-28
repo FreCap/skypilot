@@ -42,6 +42,7 @@ from sky import task as task_lib
 from sky.adaptors import common as adaptors_common
 from sky.serve import autoscalers
 from sky.serve import capacity_admission
+from sky.serve import capacity_planning
 from sky.serve import constants as serve_constants
 from sky.serve import controller_history
 from sky.serve import demand_state
@@ -59,7 +60,6 @@ from sky.serve import pool_capacity_observation
 from sky.serve import provider_phase
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
-from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_allocation
 from sky.serve import reserved_fill_planner
 from sky.serve import route_projection
@@ -145,6 +145,31 @@ class _LinearizedScalePlan:
     logical_snapshot: replica_managers.LogicalReconcileSnapshot | None
     notification_generation: int
     demand_generation: int
+    zero_cost_padding_target_by_accelerator: tuple[tuple[str, int], ...] = ()
+    capacity_planning_snapshot: (capacity_planning.CapacityPlanningSnapshot |
+                                 None) = None
+    capacity_plan_candidate: capacity_planning.CapacityPlanCandidate | None = (
+        None)
+    reserved_fill_allocation_map: (
+        reserved_fill_planner.AuthenticatedAllocationMap | None) = None
+
+
+def _promoted_cost_rebalance_is_spot(
+        option: autoscalers.AutoscalerDecision) -> bool:
+    """Whether one promoted option respects prospective-Spot-only paid use.
+
+    Cost rebalance is an older, independently generated economic decision and
+    therefore carries no ``PaidLaunchAuthority``.  Once durable capacity
+    planning owns the service, admit a replacement only when its exact pinned
+    target explicitly proves Spot.  Non-rebalance work and scale-down remain
+    governed by their existing paths.
+    """
+    if (option.operator is not autoscalers.AutoscalerDecisionOperator.SCALE_UP
+            or option.reason
+            is not autoscalers.AutoscalerDecisionReason.COST_REBALANCE):
+        return True
+    return (isinstance(option.target, dict) and
+            option.target.get('use_spot') is True)
 
 
 class _LbPromotionReason(str, enum.Enum):
@@ -678,7 +703,7 @@ class SkyServeController:
                     self._reserved_fill_allocation_repository = (
                         reserved_fill_allocation.
                         ReservedFillAllocationRepository(engine))
-            except (RuntimeError, ValueError) as error:
+            except ValueError as error:
                 # Repository absence is fail-closed for sequenced fill and
                 # does not affect ordinary service reconciliation.
                 logger.warning('Reserved-fill sequenced authority could not '
@@ -3892,15 +3917,17 @@ class SkyServeController:
             return {}
         task = replica_managers.load_task_with_service_spec(
             yaml_content, service_spec)
-        configured_by_name = {card.casefold(): card for card in configured}
-        counts_by_name: dict[str, int] = {}
-        for resources in task.resources:
-            for accelerator, raw_count in (resources.accelerators or
-                                           {}).items():
-                card = configured_by_name.get(accelerator.casefold())
-                if card is not None:
-                    counts_by_name[card.casefold()] = int(raw_count)
-        return {card: counts_by_name[card.casefold()] for card in configured}
+        exact_shapes = replica_managers.exact_accelerator_shapes_from_resources(
+            task.resources)
+        exact_shapes_by_name = {
+            card.casefold(): width for card, width in exact_shapes.items()
+        }
+        if any(card.casefold() not in exact_shapes_by_name
+               for card in configured):
+            return {}
+        return {
+            card: exact_shapes_by_name[card.casefold()] for card in configured
+        }
 
     def _configure_instance_aware_accelerators(self, service_spec: Any) -> None:
         """Feed task-authoritative exact shapes to the compatible autoscaler."""
@@ -4762,6 +4789,25 @@ class SkyServeController:
             # until a dedicated selector migration is requested explicitly.
             service = service.copy(lb_high_availability=self._lb_ha_enabled)
             validation_service = service
+        current_autoscaler = self._autoscaler
+        durable_logical_update = False
+        if (authoritative_retry_service is None and not self._is_pool and
+                current_autoscaler.replica_unit == 'logical'):
+            source_mode = capacity_admission.get_service_source_mode(
+                self._service_name)
+            durable_logical_update = (
+                source_mode is not None and source_mode[0]
+                is capacity_admission.DemandSourceMode.DURABLE_FEED)
+        if durable_logical_update:
+            self._discard_prepared_controller_config(prepared_config)
+            return responses.JSONResponse(content={
+                'message':
+                    'This PostgreSQL-authoritative logical service uses '
+                    'the single-version capacity protocol and cannot be '
+                    'updated in place. Scale it to exact zero, delete it, '
+                    'and recreate it with the new definition.'
+            },
+                                          status_code=409)
         if (authoritative_retry_service is None and
                 isinstance(validation_service, serve.SkyServiceSpec) and
                 validation_service.lb_high_availability_specified and
@@ -4771,7 +4817,6 @@ class SkyServeController:
                 validation_service,
                 expected_service_hash=requested_service_hash,
                 expected_lifecycle_epoch=lifecycle_epoch)
-        current_autoscaler = self._autoscaler
         if (authoritative_retry_service is None and
                 current_autoscaler.replica_unit == 'logical' and
                 validation_service.replica_unit != 'logical'):
@@ -5551,21 +5596,16 @@ class SkyServeController:
         logger.info('Starting autoscaler reconciliation coordinator.')
         self._scale_reconcile_coordinator.run()
 
-    def _read_sequenced_reserved_fill_allocation(
-        self,
-    ) -> tuple[bool, reserved_fill_planner.AuthenticatedAllocationMap | None]:
-        """Read the one-way planner selector and current service authority.
+    def _sequenced_reserved_fill_is_active(self) -> bool:
+        """Read only the one-way durable fill selector.
 
-        The boolean selects the implementation, independently of whether a
-        fresh map exists.  Once the durable gate is sequenced, a missing,
-        expired, malformed, or temporarily unreadable map must withhold new
-        fill instead of falling back to the speculative legacy actuator.
+        Durable capacity admission reads the exact current allocation later,
+        under the PostgreSQL protocol and service locks.  Keeping this selector
+        read separate prevents an optimistic allocation identity from becoming
+        an accidental precondition for that transaction.
         """
         observation_repository = getattr(
             self, '_reserved_fill_observation_repository', None)
-        allocation_repository = getattr(self,
-                                        '_reserved_fill_allocation_repository',
-                                        None)
         if observation_repository is None:
             # Central PostgreSQL is the only topology that can carry the
             # one-way selector.  Repository construction is normally
@@ -5579,17 +5619,31 @@ class SkyServeController:
                 logger.warning('Reserved-fill reconciliation storage could '
                                'not be classified; withholding new fill: '
                                f'{common_utils.format_exception(error)}')
-                return True, None
-            return is_postgres, None
+                return True
+            return is_postgres
         try:
             gate = observation_repository.read_reconciliation_gate()
         except Exception as error:  # pylint: disable=broad-except
             logger.warning('Reserved-fill reconciliation gate could not be '
                            'read; withholding new fill for this pass: '
                            f'{common_utils.format_exception(error)}')
-            return True, None
-        if not gate.sequenced_active:
+            return True
+        return bool(gate.sequenced_active)
+
+    def _read_sequenced_reserved_fill_allocation(
+        self,
+    ) -> tuple[bool, reserved_fill_planner.AuthenticatedAllocationMap | None]:
+        """Read the one-way selector and legacy planning allocation.
+
+        This combined read remains only for the legacy controller planning
+        path.  Once the selector is active, a missing or invalid map withholds
+        legacy fill instead of falling back to speculative actuation.
+        """
+        if not self._sequenced_reserved_fill_is_active():
             return False, None
+        allocation_repository = getattr(self,
+                                        '_reserved_fill_allocation_repository',
+                                        None)
         if (allocation_repository is None or
                 not isinstance(self._service_hash, str) or
                 not self._service_hash):
@@ -5860,6 +5914,8 @@ class SkyServeController:
         prepared_decision_inputs: (autoscalers.ScalingDecisionInputs |
                                    None) = None,
         planning_fingerprint_already_validated: bool = False,
+        runtime_autoscaler: autoscalers.Autoscaler | None = None,
+        detached_planning: bool = False,
     ) -> _ScaleReconciliationPlan | None:
         """Mutate one exact autoscaler while update/LB publication is fenced.
 
@@ -5871,11 +5927,14 @@ class SkyServeController:
         compact durable mutation fingerprint rejects replica/runtime changes
         that do not publish an in-process notification.
         """
-        if (not self._scale_actuation_is_current(
-                actuation_generation, decision_autoscaler, decision_version) or
+        runtime = (decision_autoscaler
+                   if runtime_autoscaler is None else runtime_autoscaler)
+        if (not self._scale_actuation_is_current(actuation_generation, runtime,
+                                                 decision_version) or
                 self._scale_reconcile_coordinator.generation
                 != notification_generation or
-                self._reconcile_generation != demand_generation):
+            (not detached_planning and
+             self._reconcile_generation != demand_generation)):
             return None
         decision_inputs = prepared_decision_inputs
         if decision_inputs is None:
@@ -5895,10 +5954,11 @@ class SkyServeController:
                 return None
         with self._routing_state_lock:
             if (not self._scale_actuation_is_current(
-                    actuation_generation, decision_autoscaler, decision_version)
-                    or self._scale_reconcile_coordinator.generation
+                    actuation_generation, runtime, decision_version) or
+                    self._scale_reconcile_coordinator.generation
                     != notification_generation or
-                    self._reconcile_generation != demand_generation):
+                (not detached_planning and
+                 self._reconcile_generation != demand_generation)):
                 return None
             decision_autoscaler.set_spot_placer(
                 self._replica_manager.spot_placer)
@@ -6005,14 +6065,11 @@ class SkyServeController:
                 invalidate_logical_target = (
                     (logical_target is None or logical_retirement_floor is None)
                     and bool(decision_autoscaler.configured_accelerator_shapes))
-            if (sequenced_reserved_fill and
-                    sequenced_reserved_fill_allocation is None):
-                # Unavailable is distinct from a current grant of zero.  It
-                # authorizes neither typed fill nor an ordinary/paid launch.
-                scaling_options = [
-                    option for option in scaling_options if option.operator !=
-                    autoscalers.AutoscalerDecisionOperator.SCALE_UP
-                ]
+            # Missing or unsettled reservation evidence revokes only new
+            # zero-cost fill.  Ordinary scale-up remains a candidate and is
+            # later bounded by the PostgreSQL-paid residual.  Suppressing it
+            # here would incorrectly turn a usage-gate observation gap into a
+            # service outage even when Spot can satisfy the exact card.
             if (sequenced_reserved_fill and
                     decision_autoscaler.replica_unit != 'logical'):
                 # Logical retirement has a PostgreSQL commit seam at which the
@@ -6128,8 +6185,9 @@ class SkyServeController:
         decision_autoscaler: autoscalers.Autoscaler,
         decision_version: int,
         reconcile_generation: int,
+        target_capacity_by_accelerator: dict[str, int],
     ) -> bool:
-        """Admit provider-free fill from PostgreSQL before demand planning."""
+        """Admit only the exact-card zero-cost budget already committed."""
         if allocation is None or not allocation.pool_snapshots:
             return False
         service_hash = self._service_hash
@@ -6173,6 +6231,7 @@ class SkyServeController:
             planned_replicas=planned_capacity,
             capacity_unit=capacity_unit,
             committed_fill_debits=all_committed_debits,
+            target_capacity_by_accelerator=(target_capacity_by_accelerator),
             rotation_anchor=(
                 decision_autoscaler.reserved_fill_rotation_anchor()))
         if not plan.intents:
@@ -6195,252 +6254,60 @@ class SkyServeController:
         return accepted
 
     @staticmethod
-    def _ordered_capacity_target(
-        decision_autoscaler: autoscalers.Autoscaler,
-        *,
-        force_zero: bool = False,
-    ) -> dict[str, int] | None:
-        """Return the supply-aware target used for paid residual accounting.
+    def _reservation_input_from_locked_supply(
+        supply: capacity_admission.ReservedSupplyProjection,
+    ) -> capacity_planning.ReservationPlanningInput:
+        """Translate one PostgreSQL-locked supply projection without census.
 
-        The public demand target deliberately assigns flexible work to the
-        cheapest compatible cold card.  It is explanatory placement demand,
-        not an accounting class: compatible materialized A100/H200 capacity
-        can satisfy work whose cold attribution is L4.  Shape-aware
-        autoscalers therefore publish the complete actuation target selected
-        after compatible existing supply is considered.  Missing or partial
-        exact-card state fails closed instead of becoming paid authority.
+        In particular, ``existing_paid_capacity_by_accelerator`` includes
+        cleanup-unproven retiring rows.  Rebuilding that field from the
+        controller's filtered replica view would authorize replacement Spot
+        capacity before the old provider resource is proven gone.
         """
-        final_target = max(
-            0, int(decision_autoscaler.get_final_target_num_replicas()))
-        configured = decision_autoscaler.configured_accelerator_shapes
-        if force_zero:
-            if configured:
-                return {str(card).casefold(): 0 for card in configured}
-            return {capacity_admission.AGGREGATE_ACCELERATOR: 0}
-        if configured:
-            if getattr(decision_autoscaler, 'capacity_target_complete',
-                       False) is not True:
-                return None
-            raw_target = getattr(decision_autoscaler,
-                                 'capacity_target_by_accelerator', {})
-            if not isinstance(raw_target, dict):
-                return None
-            canonical_configured = {
-                str(card).casefold(): str(card)
-                for card in configured
-                if isinstance(card, str) and card
-            }
-            if len(canonical_configured) != len(configured):
-                return None
-            exact_target = {card: 0 for card in canonical_configured}
-            for raw_card, count in raw_target.items():
-                if (not isinstance(raw_card, str) or
-                        raw_card.casefold() not in canonical_configured or
-                        not isinstance(count, int) or isinstance(count, bool) or
-                        count < 0):
-                    return None
-                exact_target[raw_card.casefold()] = count
-            if sum(exact_target.values()) != final_target:
-                return None
-            return exact_target
-        return {capacity_admission.AGGREGATE_ACCELERATOR: final_target}
-
-    @staticmethod
-    def _allocation_covers_current_utilization(
-        decision_autoscaler: autoscalers.Autoscaler,
-        replica_infos: list[replica_managers.ReplicaInfo],
-        allocation: reserved_fill_planner.AuthenticatedAllocationMap,
-    ) -> bool:
-        """Whether a gated allocation causally covers the current demand."""
-        if (not getattr(decision_autoscaler, 'reserved_fill_utilization_gate',
-                        allocation.utilization_gate_armed) or
-                not reserved_capacity_broker.utilization_gate_enabled()):
-            return True
-        if (not allocation.utilization_gate_armed or
-                allocation.utilization_demonstrated_need is None or
-                not allocation.upward_grants_settled):
-            return False
-        sample = decision_autoscaler.fill_demand_sample(replica_infos)
-        if sample is None:
-            return False
-        current_need = sample.demonstrated_need()
-        return (allocation.utilization_demonstrated_need >= current_need and
-                allocation.utilization_ceiling >= current_need)
-
-    @staticmethod
-    def _install_committed_logical_capacity_target(
-        planned: _LinearizedScalePlan,
-        authority: capacity_admission.PaidLaunchAuthority,
-        max_capacity: int,
-    ) -> _LinearizedScalePlan:
-        """Make one committed economic target the only logical target.
-
-        The autoscaler initially assigns demand to request accelerator classes.
-        The PostgreSQL capacity-plan transaction may assign that same aggregate
-        demand to compatible reserved accelerators before calculating a paid
-        residual.  Local launch and retirement decisions must use the latter
-        assignment; mixing the two makes reserved supply unspendable while the
-        database correctly refuses to authorize paid capacity.
-        """
-        scaling_plan = planned.scaling_plan
-        logical_target = scaling_plan.logical_target
-        if logical_target is None:
-            return planned
-        if not isinstance(logical_target, autoscalers.LogicalCapacityTarget):
-            raise ValueError('Logical target has no canonical capacity state.')
-        original_target_capacity = logical_target.target_capacity
-        target_capacity = planned.actuation_target_capacity
-        if type(target_capacity) is not int or target_capacity < 0:
-            raise ValueError('Logical actuation target is malformed.')
-        fresh_zero_retention = planned.snapshot.fresh_aggregate_zero
-        if ((not fresh_zero_retention and
-             target_capacity != original_target_capacity) or
-            (fresh_zero_retention and
-             target_capacity > original_target_capacity)):
-            raise ValueError('Logical actuation target changed aggregate '
-                             'demand without fresh-zero retention authority.')
-        raw_shapes = (logical_target.accelerator_shapes or
-                      planned.accelerator_shapes)
-        if type(raw_shapes) is not tuple:
-            raise ValueError('Logical accelerator shapes are not immutable.')
-
-        display_cards: dict[str, str] = {}
-        shapes: list[tuple[str, int]] = []
-        for raw_card, width in raw_shapes:
-            if (not isinstance(raw_card, str) or not raw_card or
-                    type(width) is not int or width <= 0):
-                raise ValueError('Logical accelerator shapes are malformed.')
-            card = raw_card.casefold()
-            if card in display_cards:
-                raise ValueError('Logical accelerator shapes repeat a card.')
-            display_cards[card] = raw_card
-            shapes.append((raw_card, width))
-
-        committed_demand: dict[str, int] = {}
-        for raw_card, count in planned.committed_demand_target_by_accelerator:
-            if not isinstance(raw_card, str) or not raw_card:
-                raise ValueError('Committed demand target is malformed.')
-            card = raw_card.casefold()
-            if (card in committed_demand or card not in display_cards or
-                    type(count) is not int or count < 0):
-                raise ValueError('Committed demand target is malformed.')
-            committed_demand[card] = count
-        committed_demand = {
-            card: committed_demand.get(card, 0) for card in display_cards
-        }
-        if ((fresh_zero_retention and any(committed_demand.values())) or
-            (not fresh_zero_retention and
-             sum(committed_demand.values()) != target_capacity)):
-            raise ValueError('Committed demand target is incompatible with '
-                             'local actuation.')
-
-        actuation: dict[str, int] = {}
-        for raw_card, count in planned.actuation_target_by_accelerator:
-            if not isinstance(raw_card, str) or not raw_card:
-                raise ValueError('Actuation capacity target is malformed.')
-            card = raw_card.casefold()
-            if (card in actuation or card not in display_cards or
-                    type(count) is not int or count < 0):
-                raise ValueError('Actuation capacity target is malformed.')
-            actuation[card] = count
-        actuation = {card: actuation.get(card, 0) for card in display_cards}
-        if sum(actuation.values()) != target_capacity:
-            raise ValueError('Actuation capacity target changed aggregate '
-                             'logical capacity.')
-        target_by_accelerator = tuple(
-            (display_card, actuation[card])
-            for card, display_card in display_cards.items()
-            if actuation[card] > 0)
-
-        remaining = authority.remaining()
-        if not isinstance(remaining, dict):
-            raise ValueError('Paid launch authority has no exact residual.')
-        paid: dict[str, int] = {}
-        for raw_card, count in remaining.items():
-            if not isinstance(raw_card, str) or not raw_card:
-                raise ValueError('Paid launch residual is incompatible with '
-                                 'the committed capacity target.')
-            card = raw_card.casefold()
-            if (card in paid or card not in display_cards or
-                    type(count) is not int or count < 0 or
-                    count > committed_demand[card]):
-                raise ValueError('Paid launch residual is incompatible with '
-                                 'the committed demand target.')
-            paid[card] = count
-        paid_by_accelerator = tuple(
-            (display_card, paid.get(card, 0))
-            for card, display_card in display_cards.items()
-            if paid.get(card, 0) > 0)
-
-        retargeted_options: list[autoscalers.AutoscalerDecision] = []
-        for option in scaling_plan.scaling_options:
-            target = option.target
-            if isinstance(target, autoscalers.LogicalScaleTarget):
-                if fresh_zero_retention:
-                    raise ValueError('Fresh aggregate zero retained a logical '
-                                     'scale-up option.')
-                if target.target_capacity != target_capacity:
-                    raise ValueError('Logical scale-up aggregate differs from '
-                                     'the actuation capacity target.')
-                target = dataclasses.replace(
-                    target,
-                    target_capacity_by_accelerator=target_by_accelerator,
-                    accelerator_shapes=tuple(shapes),
-                    launch_priority_by_accelerator=tuple(
-                        (card, target.launch_priority)
-                        for card, _ in target_by_accelerator),
-                    cold_launch_authority_by_accelerator=(paid_by_accelerator))
-            elif isinstance(target, autoscalers.LogicalScaleDownTarget):
-                expected_option_capacity = (original_target_capacity
-                                            if fresh_zero_retention else
-                                            target_capacity)
-                if target.target_capacity != expected_option_capacity:
-                    raise ValueError(
-                        'Logical scale-down aggregate differs from '
-                        'the actuation capacity target.')
-                target = dataclasses.replace(
-                    target,
-                    target_capacity=target_capacity,
-                    target_capacity_by_accelerator=target_by_accelerator,
-                    accelerator_shapes=tuple(shapes))
-            retargeted_options.append(
-                autoscalers.AutoscalerDecision(option.operator, target,
-                                               option.reason))
-
-        committed_logical_target = autoscalers.LogicalCapacityTarget(
-            version=logical_target.version,
-            generation=logical_target.generation,
-            target_capacity=target_capacity,
-            target_capacity_by_accelerator=target_by_accelerator,
-            accelerator_shapes=tuple(shapes))
-        retirement_shelter = scaling_plan.retirement_shelter
-        if retirement_shelter is None:
-            retirement_floor = committed_logical_target
-        else:
-            floor = reserved_fill_planner.compose_retirement_capacity_floor(
-                demand_capacity=target_capacity,
-                demand_capacity_by_accelerator=target_by_accelerator,
-                accelerator_shapes=tuple(shapes),
-                shelter=retirement_shelter,
-                max_capacity=max_capacity)
-            if floor is None:
-                raise ValueError('Committed capacity target cannot compose an '
-                                 'exact retirement floor.')
-            retirement_floor = autoscalers.LogicalCapacityTarget(
-                version=logical_target.version,
-                generation=logical_target.generation,
-                target_capacity=floor.capacity,
-                target_capacity_by_accelerator=floor.capacity_by_accelerator,
-                accelerator_shapes=floor.accelerator_shapes)
-        return dataclasses.replace(
-            planned,
-            scaling_plan=dataclasses.replace(
-                scaling_plan,
-                scaling_options=tuple(retargeted_options),
-                target_num_replicas=target_capacity,
-                logical_target=committed_logical_target,
-                logical_retirement_floor=retirement_floor,
-                invalidate_logical_target=False))
+        gate_policy = {
+            capacity_admission.ReservedSupplyPolicy.DISABLED:
+                capacity_planning.ReservationGatePolicy.NOT_CONFIGURED,
+            capacity_admission.ReservedSupplyPolicy.STATIC_PREFILL:
+                capacity_planning.ReservationGatePolicy.UNGATED,
+            capacity_admission.ReservedSupplyPolicy.DEMAND_GATED:
+                capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+        }[supply.policy]
+        evidence_state = {
+            capacity_admission.ReservedSupplyEvidenceState.NOT_APPLICABLE:
+                capacity_planning.ReservationEvidenceState.NOT_APPLICABLE,
+            capacity_admission.ReservedSupplyEvidenceState.AUTHENTICATED_SETTLED:
+                capacity_planning.ReservationEvidenceState.
+                AUTHENTICATED_SETTLED,
+            capacity_admission.ReservedSupplyEvidenceState.AUTHENTICATED_UNSETTLED:
+                capacity_planning.ReservationEvidenceState.
+                AUTHENTICATED_UNSETTLED,
+            capacity_admission.ReservedSupplyEvidenceState.UNAVAILABLE:
+                capacity_planning.ReservationEvidenceState.UNAVAILABLE,
+        }[supply.evidence_state]
+        return capacity_planning.ReservationPlanningInput(
+            gate_policy=gate_policy,
+            evidence_state=evidence_state,
+            authenticated_capacity=(
+                capacity_planning.AcceleratorCapacity.from_mapping(
+                    supply.authenticated_capacity_by_accelerator)),
+            eligible_capacity=(
+                capacity_planning.AcceleratorCapacity.from_mapping(
+                    supply.eligible_capacity_by_accelerator)),
+            pending_zero_cost_capacity=(
+                capacity_planning.AcceleratorCapacity.from_mapping(
+                    supply.pending_zero_cost_capacity_by_accelerator)),
+            existing_zero_cost_capacity=(
+                capacity_planning.AcceleratorCapacity.from_mapping(
+                    supply.existing_zero_cost_capacity_by_accelerator)),
+            existing_paid_capacity=(
+                capacity_planning.AcceleratorCapacity.from_mapping(
+                    supply.existing_paid_capacity_by_accelerator)),
+            charged_paid_gpu_units=supply.charged_paid_gpu_units,
+            evidence_fingerprint=supply.reservation_evidence_sha256,
+            allocation_demand_witness_sha256=(
+                supply.allocation_demand_witness_sha256),
+            allocation_demonstrated_need=(supply.allocation_demonstrated_need),
+            allocation_ceiling=supply.allocation_ceiling)
 
     def _plan_and_publish_current_capacity(
         self,
@@ -6448,14 +6315,10 @@ class SkyServeController:
         decision_version: int,
         actuation_generation: int,
         notification_generation: int,
-        replica_infos: list[replica_managers.ReplicaInfo],
-        active_versions: list[int],
         planning_state_fingerprint: str | None,
         prepared_decision_inputs: autoscalers.ScalingDecisionInputs,
         *,
         sequenced_reserved_fill: bool,
-        reserved_fill_allocation_map: (
-            reserved_fill_planner.AuthenticatedAllocationMap | None),
     ) -> tuple[capacity_admission.PaidLaunchAuthority,
                _LinearizedScalePlan] | None:
         """Plan current demand and publish its residual in one DB boundary."""
@@ -6465,29 +6328,52 @@ class SkyServeController:
                 not service_hash or
                 not isinstance(planning_state_fingerprint, str)):
             return None
-        accounting_cards = self._ordered_capacity_target(decision_autoscaler,
-                                                         force_zero=True)
-        if accounting_cards is None:
+        assert planning_state_fingerprint is not None
+        if (not isinstance(decision_autoscaler,
+                           autoscalers.ConcurrencyAutoscaler) or
+                decision_autoscaler.replica_unit != 'logical'):
+            logger.warning('Suppressing promoted capacity planning because the '
+                           'autoscaler has no pure durable logical planner.')
+            return None
+        try:
+            configured_shapes = capacity_planning.AcceleratorCapacity.from_mapping(
+                decision_autoscaler.configured_accelerator_shapes)
+            if (not configured_shapes.entries or
+                    any(width <= 0 for _, width in configured_shapes.entries)):
+                raise ValueError('No positive accelerator shape.')
+        except (TypeError, ValueError):
             logger.warning('Suppressing current capacity planning because the '
                            'autoscaler has no exact accounting cards.')
             return None
-        if (sequenced_reserved_fill and not decision_autoscaler.
-                supports_reserved_supply_economic_target()):
+        accounting_cards = {
+            card.casefold(): 0 for card, _ in configured_shapes.entries
+        }
+        try:
+            max_live_paid_gpu_units = (
+                self._replica_manager.max_live_paid_gpu_units)
+        except (TypeError, ValueError) as error:
             logger.warning(
-                'Suppressing current capacity planning because this '
-                'autoscaler has no work-conserving reserved-supply target.')
+                'Suppressing promoted capacity planning because '
+                'the active service paid cap is unavailable: %s',
+                common_utils.format_exception(error))
+            return None
+        if (max_live_paid_gpu_units is not None and
+            (type(max_live_paid_gpu_units) is not int or
+             max_live_paid_gpu_units < 0)):
+            logger.warning('Suppressing promoted capacity planning because '
+                           'the active service paid cap is malformed.')
             return None
 
         planned: _LinearizedScalePlan | None = None
+        durable_plan: autoscalers.DurableCapacityReconcilePlan | None = None
 
         def _planner(
             snapshot: demand_state.DurableAutoscalingSnapshot,
             supply: capacity_admission.ReservedSupplyProjection | None,
         ) -> capacity_admission.CapacityPlanDecision:
-            nonlocal planned
+            nonlocal durable_plan, planned
             request_information = dict(snapshot.request_information)
             request_information['replace_request_window'] = True
-            logical_snapshot = None
             with self._routing_state_lock:
                 if (not self._scale_actuation_is_current(
                         actuation_generation, decision_autoscaler,
@@ -6496,224 +6382,233 @@ class SkyServeController:
                         != notification_generation):
                     raise capacity_admission.CapacityAdmissionConflict(
                         'Controller actuation changed during current planning.')
-                durable_reconcile_generation = None
-                if decision_autoscaler.replica_unit == 'logical':
-                    if not isinstance(decision_autoscaler,
-                                      autoscalers.ConcurrencyAutoscaler):
-                        raise capacity_admission.CapacityAdmissionConflict(
-                            'Logical durable demand has no concurrency '
-                            'autoscaler.')
-                    durable_reconcile_generation = (
-                        snapshot.demand_feed_generation)
-                    request_generation = request_information.get(
-                        'reconcile_generation')
-                    if (type(request_generation) is not int or
-                            request_generation != durable_reconcile_generation):
-                        raise capacity_admission.CapacityAdmissionConflict(
-                            'Current request information has a mismatched '
-                            'generation.')
-                decision_autoscaler.collect_request_information(
-                    request_information)
-                if decision_autoscaler.replica_unit == 'logical':
-                    assert isinstance(decision_autoscaler,
-                                      autoscalers.ConcurrencyAutoscaler)
-                    assert durable_reconcile_generation is not None
-                    if (type(decision_autoscaler.reconcile_generation)
-                            is not int or
-                            decision_autoscaler.reconcile_generation
-                            != durable_reconcile_generation):
-                        raise capacity_admission.CapacityAdmissionConflict(
-                            'Autoscaler did not consume the exact current '
-                            'demand generation.')
-                    logical_snapshot = (
-                        replica_managers.LogicalReconcileSnapshot(
-                            version=decision_version,
-                            generation=durable_reconcile_generation,
-                            observed_slots_by_replica_id=dict(
-                                request_information[
-                                    'observed_slots_by_replica_id']),
-                            in_flight_by_replica_id=dict(
-                                request_information['in_flight_by_replica_id']),
-                            unknown_replica_ids=frozenset(request_information[
-                                'unknown_in_flight_replica_ids']),
-                            received_at=(snapshot.reconcile_authority.
-                                         read_started_monotonic),
-                            authority=snapshot.reconcile_authority))
-                self._reconcile_generation += 1
-                demand_generation = self._reconcile_generation
-                self._durable_demand_snapshot = snapshot
-                if snapshot.fresh_aggregate_zero:
-                    (decision_autoscaler.
-                     clear_paid_launch_authority_for_fresh_zero())
-
-            scaling_plan = self._plan_scale_reconciliation(
-                decision_autoscaler,
-                decision_version,
-                actuation_generation,
-                notification_generation,
-                demand_generation,
-                replica_infos,
-                active_versions,
-                planning_state_fingerprint,
-                sequenced_reserved_fill=sequenced_reserved_fill,
-                sequenced_reserved_fill_allocation=(
-                    reserved_fill_allocation_map),
-                prepared_decision_inputs=prepared_decision_inputs,
-                planning_fingerprint_already_validated=True)
-            if scaling_plan is None:
+            if supply is None:
                 raise capacity_admission.CapacityAdmissionConflict(
-                    'Controller state changed during current planning.')
+                    'Current locked capacity inventory is unavailable.')
+            demand_generation = snapshot.demand_feed_generation
+            request_generation = request_information.get('reconcile_generation')
+            if (type(request_generation) is not int or
+                    request_generation != demand_generation):
+                raise capacity_admission.CapacityAdmissionConflict(
+                    'Current request information has a mismatched generation.')
+            reservation_input = self._reservation_input_from_locked_supply(
+                supply)
+            locked_replica_infos = list(supply.economic_replica_infos)
+            try:
+                locked_decision_inputs = (
+                    autoscalers.bind_locked_kueue_capacity_snapshot(
+                        prepared_decision_inputs, locked_replica_infos,
+                        supply.economic_kueue_capacity))
+                locked_source_fingerprint = (
+                    capacity_admission.locked_planning_source_fingerprint(
+                        planning_state_fingerprint,
+                        supply.economic_capacity_graph_sha256))
+            except (TypeError, ValueError) as error:
+                raise capacity_admission.CapacityAdmissionConflict(
+                    'Locked scheduler capacity could not bind the local '
+                    'planner snapshot.') from error
+            retirement_shelter = None
+            if sequenced_reserved_fill:
+                try:
+                    holdings = (
+                        decision_autoscaler.sequenced_reserved_fill_holdings(
+                            locked_replica_infos))
+                    derived_shelter = (
+                        reserved_fill_planner.
+                        derive_sequenced_retirement_shelter(
+                            allocation=supply.allocation_map,
+                            holdings=holdings,
+                            service_version=decision_version,
+                            max_capacity=decision_autoscaler.max_replicas,
+                            capacity_unit=(reserved_fill_planner.
+                                           FillCapacityUnit.LOGICAL)))
+                    # With no allocation and no materialized holdings, the
+                    # locked graph itself proves that there is no retirement
+                    # shelter.  Missing allocation evidence still withholds
+                    # new reserved launches in admission; it does not invent
+                    # a backend that must be retained.
+                    if (derived_shelter.target_capacity > 0 or
+                            derived_shelter.authority_current):
+                        retirement_shelter = derived_shelter
+                except (TypeError, ValueError) as error:
+                    raise capacity_admission.CapacityAdmissionConflict(
+                        'Locked reserved-fill state could not produce an '
+                        'exact retirement shelter.') from error
+            try:
+                durable_plan = (
+                    decision_autoscaler.plan_durable_capacity_reconcile(
+                        locked_replica_infos,
+                        request_information,
+                        reservation_input,
+                        source_fingerprint=locked_source_fingerprint,
+                        decision_inputs=locked_decision_inputs,
+                        retirement_shelter=retirement_shelter,
+                        max_live_paid_gpu_units=max_live_paid_gpu_units,
+                        fresh_zero=snapshot.fresh_aggregate_zero,
+                        configured_reservation_accelerators=(
+                            supply.reserved_accelerators),
+                        demand_witness_scope_sha256=(
+                            supply.demand_witness_scope_sha256)))
+            except (TypeError, ValueError) as error:
+                raise capacity_admission.CapacityAdmissionConflict(
+                    'Locked demand and supply could not produce the durable '
+                    'capacity plan.') from error
+            if not isinstance(durable_plan,
+                              autoscalers.DurableCapacityReconcilePlan):
+                raise capacity_admission.CapacityAdmissionConflict(
+                    'Autoscaler returned no pure durable capacity plan.')
+            envelope = durable_plan.envelope
+            candidate = envelope.candidate
+            next_policy_state = candidate.next_policy_state
+            acquiring_gate = (
+                candidate.kind
+                is capacity_planning.CapacityPlanKind.GATE_ACQUISITION)
+            if (candidate.kind not in (
+                    capacity_planning.CapacityPlanKind.DEMAND,
+                    capacity_planning.CapacityPlanKind.STATIC_PREFILL,
+                    capacity_planning.CapacityPlanKind.FRESH_ZERO_RETENTION,
+                    capacity_planning.CapacityPlanKind.GATE_ACQUISITION) or
+                    not candidate.attribution_complete or
+                    candidate.source_generation != demand_generation or
+                (acquiring_gate != (next_policy_state is None)) or
+                (next_policy_state is not None and
+                 next_policy_state.source_generation != demand_generation) or
+                    envelope.snapshot.source_fingerprint
+                    != locked_source_fingerprint):
+                raise ValueError('Autoscaler returned a stale or incomplete '
+                                 'durable capacity plan.')
+
+            if acquiring_gate:
+                if (durable_plan.logical_target is not None or
+                        durable_plan.logical_retirement_floor is not None or
+                        durable_plan.retirement_shelter is not None or
+                        durable_plan.scaling_decisions or
+                        durable_plan.rollout_failure is not None):
+                    raise ValueError('Gate acquisition carries a local '
+                                     'controller effect.')
+                planned = _LinearizedScalePlan(
+                    snapshot=snapshot,
+                    scaling_plan=_ScaleReconciliationPlan(
+                        scaling_options=(),
+                        target_num_replicas=None,
+                        rollout_failure=None,
+                        logical_target=None,
+                        logical_retirement_floor=None,
+                        retirement_shelter=None,
+                        invalidate_logical_target=False),
+                    committed_demand_target_by_accelerator=(),
+                    actuation_target_capacity=0,
+                    actuation_target_by_accelerator=(),
+                    accelerator_shapes=tuple(
+                        decision_autoscaler.configured_accelerator_shapes.items(
+                        )),
+                    logical_snapshot=None,
+                    notification_generation=notification_generation,
+                    demand_generation=demand_generation,
+                    capacity_planning_snapshot=envelope.snapshot,
+                    capacity_plan_candidate=candidate,
+                    reserved_fill_allocation_map=supply.allocation_map)
+                return capacity_admission.CapacityPlanDecision(
+                    capacity_target_by_accelerator={
+                        card: 0 for card in accounting_cards
+                    },
+                    normalized_demand_extensions={
+                        'autoscaler_target': 0,
+                        'replica_unit': decision_autoscaler.replica_unit,
+                        'demand_target_by_accelerator': {},
+                    },
+                    reserved_capacity_commitment_by_accelerator={},
+                    expected_paid_residual_by_accelerator={},
+                    expected_paid_launch_target_by_accelerator={},
+                    static_reserved_fill_target_by_accelerator={},
+                    planner_payload=envelope.canonical_payload())
+
+            if next_policy_state is None:
+                raise ValueError('Effectful durable capacity plan has no '
+                                 'next policy state.')
+
+            observed_slots = request_information.get(
+                'observed_slots_by_replica_id')
+            in_flight = request_information.get('in_flight_by_replica_id')
+            unknown_in_flight = request_information.get(
+                'unknown_in_flight_replica_ids')
+            if (not isinstance(observed_slots, dict) or
+                    not isinstance(in_flight, dict) or
+                    not isinstance(unknown_in_flight, (list, tuple, set))):
+                raise capacity_admission.CapacityAdmissionConflict(
+                    'Durable logical occupancy is malformed.')
+            logical_snapshot = replica_managers.LogicalReconcileSnapshot(
+                version=decision_version,
+                generation=demand_generation,
+                observed_slots_by_replica_id=dict(observed_slots),
+                in_flight_by_replica_id=dict(in_flight),
+                unknown_replica_ids=frozenset(unknown_in_flight),
+                received_at=(
+                    snapshot.reconcile_authority.read_started_monotonic),
+                authority=snapshot.reconcile_authority)
+
+            logical_target = durable_plan.logical_target
+            assert logical_target is not None
+            retirement_shelter = durable_plan.retirement_shelter
+            retirement_floor = durable_plan.logical_retirement_floor
+            assert retirement_floor is not None
+            scaling_options = durable_plan.scaling_decisions
             if snapshot.fresh_aggregate_zero:
                 scaling_options = tuple(
-                    option for option in scaling_plan.scaling_options
-                    if option.operator !=
+                    option for option in scaling_options if option.operator !=
                     autoscalers.AutoscalerDecisionOperator.SCALE_UP)
-                scaling_plan = dataclasses.replace(
-                    scaling_plan,
-                    scaling_options=scaling_options,
-                    # Logical services publish a bounded, existing-capacity
-                    # retention target below so autoscaler hysteresis can
-                    # retire in waves.  Physical services have no such
-                    # committed-target protocol and retain the established
-                    # immediate-zero behavior.
-                    target_num_replicas=(scaling_plan.target_num_replicas
-                                         if scaling_plan.logical_target
-                                         is not None else 0))
-
-            capacity_target = self._ordered_capacity_target(
-                decision_autoscaler, force_zero=snapshot.fresh_aggregate_zero)
-            if capacity_target is None:
-                raise ValueError('Autoscaler has no complete supply-aware '
-                                 'capacity target.')
-            if sequenced_reserved_fill and any(capacity_target.values()):
-                if supply is None:
-                    raise capacity_admission.CapacityAdmissionConflict(
-                        'Current reserved supply is unavailable.')
-                positive_cards = {
-                    card for card, count in capacity_target.items() if count > 0
-                }
-                statically_incompatible = bool(
-                    not supply.allocation_bound and
-                    capacity_admission.AGGREGATE_ACCELERATOR
-                    not in positive_cards and
-                    positive_cards.isdisjoint(supply.reserved_accelerators))
-                if supply.allocation_bound:
-                    assert reserved_fill_allocation_map is not None
-                    if not self._allocation_covers_current_utilization(
-                            decision_autoscaler, replica_infos,
-                            reserved_fill_allocation_map):
-                        raise capacity_admission.CapacityAdmissionConflict(
-                            'Current reserved allocation predates the '
-                            'utilization sample or has an unsettled upward '
-                            'grant.')
-                    try:
-                        economic_target = (
-                            decision_autoscaler.
-                            economic_capacity_target_by_accelerator(
-                                list(supply.economic_replica_infos),
-                                supply.additional_capacity_by_accelerator(),
-                                kueue_capacity_by_replica_id=(
-                                    supply.economic_kueue_capacity_by_replica_id
-                                )))
-                    except (capacity_admission.CapacityAdmissionError,
-                            ValueError) as error:
-                        raise capacity_admission.CapacityAdmissionConflict(
-                            'Compatible reserved supply could not produce an '
-                            'economic target.') from error
-                    if not isinstance(economic_target, dict):
-                        raise ValueError(
-                            'Autoscaler returned no compatibility-safe '
-                            'economic target.')
-                    canonical_economic: dict[str, int] = {}
-                    for raw_card, count in economic_target.items():
-                        card = str(raw_card).casefold()
-                        if (card in canonical_economic or
-                                card not in capacity_target or
-                                not isinstance(count, int) or
-                                isinstance(count, bool) or count < 0):
-                            raise ValueError(
-                                'Economic capacity target is malformed.')
-                        canonical_economic[card] = count
-                    canonical_economic = {
-                        card: canonical_economic.get(card, 0)
-                        for card in capacity_target
-                    }
-                    if sum(canonical_economic.values()) != sum(
-                            capacity_target.values()):
-                        raise ValueError('Economic capacity target changed '
-                                         'aggregate demand.')
-                    capacity_target = canonical_economic
-                elif not statically_incompatible:
-                    raise capacity_admission.CapacityAdmissionConflict(
-                        'Compatible reserved supply is unavailable.')
-
-            actuation_target = dict(capacity_target)
-            actuation_target_capacity = sum(actuation_target.values())
-            logical_target = scaling_plan.logical_target
-            if snapshot.fresh_aggregate_zero and logical_target is not None:
-                retention_infos = (list(supply.economic_replica_infos)
-                                   if supply is not None else replica_infos)
-                retention_kueue = (supply.economic_kueue_capacity_by_replica_id
-                                   if supply is not None else None)
-                try:
-                    retained = (
-                        decision_autoscaler.
-                        existing_capacity_retention_target_by_accelerator(
-                            retention_infos,
-                            logical_target.target_capacity,
-                            kueue_capacity_by_replica_id=(retention_kueue)))
-                except (capacity_admission.CapacityAdmissionError,
-                        ValueError) as error:
-                    raise capacity_admission.CapacityAdmissionConflict(
-                        'Existing capacity could not produce a fresh-zero '
-                        'retention target.') from error
-                if not isinstance(retained, dict):
-                    raise capacity_admission.CapacityAdmissionConflict(
-                        'Fresh-zero retention has no exact-card target.')
-                canonical_retained: dict[str, int] = {}
-                for raw_card, count in retained.items():
-                    card = str(raw_card).casefold()
-                    if (card in canonical_retained or
-                            card not in capacity_target or
-                            not isinstance(count, int) or
-                            isinstance(count, bool) or count < 0):
-                        raise ValueError(
-                            'Fresh-zero retention target is malformed.')
-                    canonical_retained[card] = count
-                actuation_target = {
-                    card: canonical_retained.get(card, 0)
-                    for card in capacity_target
-                }
-                actuation_target_capacity = sum(actuation_target.values())
-                if (actuation_target_capacity > logical_target.target_capacity):
-                    raise ValueError('Fresh-zero retention increased the '
-                                     'autoscaler target.')
+            scaling_plan = _ScaleReconciliationPlan(
+                scaling_options=scaling_options,
+                target_num_replicas=logical_target.target_capacity,
+                rollout_failure=durable_plan.rollout_failure,
+                logical_target=logical_target,
+                logical_retirement_floor=retirement_floor,
+                retirement_shelter=retirement_shelter,
+                invalidate_logical_target=False)
+            capacity_target = candidate.supply_aware_demand_target.as_dict()
+            actuation_target = (
+                candidate.wave_limited_actuation_target.as_dict())
+            if (sum(actuation_target.values())
+                    != logical_target.target_capacity):
+                raise ValueError('Durable logical target differs from its '
+                                 'capacity-plan candidate.')
+            padding = next_policy_state.zero_cost_padding_target.as_dict()
 
             planned = _LinearizedScalePlan(
                 snapshot=snapshot,
                 scaling_plan=scaling_plan,
                 committed_demand_target_by_accelerator=tuple(
                     capacity_target.items()),
-                actuation_target_capacity=actuation_target_capacity,
+                actuation_target_capacity=logical_target.target_capacity,
                 actuation_target_by_accelerator=tuple(actuation_target.items()),
-                accelerator_shapes=(tuple(
-                    decision_autoscaler.configured_accelerator_shapes.items())
-                                    if decision_autoscaler.replica_unit
-                                    == 'logical' else ()),
+                accelerator_shapes=tuple(
+                    decision_autoscaler.configured_accelerator_shapes.items()),
                 logical_snapshot=logical_snapshot,
                 notification_generation=notification_generation,
-                demand_generation=demand_generation)
+                demand_generation=demand_generation,
+                zero_cost_padding_target_by_accelerator=(tuple(
+                    padding.items()) if not snapshot.fresh_aggregate_zero else
+                                                         ()),
+                capacity_planning_snapshot=envelope.snapshot,
+                capacity_plan_candidate=candidate,
+                reserved_fill_allocation_map=supply.allocation_map)
             return capacity_admission.CapacityPlanDecision(
                 capacity_target_by_accelerator=capacity_target,
                 normalized_demand_extensions={
-                    'autoscaler_target':
-                        (0 if snapshot.fresh_aggregate_zero else
-                         decision_autoscaler.get_final_target_num_replicas()),
+                    'autoscaler_target': logical_target.target_capacity,
                     'replica_unit': decision_autoscaler.replica_unit,
                     'demand_target_by_accelerator':
-                        (decision_autoscaler.info().get(
-                            'demand_target_by_accelerator')),
-                })
+                        (candidate.demand_attribution.as_dict()),
+                },
+                reserved_capacity_commitment_by_accelerator=(
+                    candidate.new_reserved_capacity_committed.as_dict()),
+                expected_paid_residual_by_accelerator=(
+                    candidate.paid_residual.as_dict()),
+                expected_paid_launch_target_by_accelerator=(
+                    candidate.paid_launch_target.as_dict()),
+                static_reserved_fill_target_by_accelerator=(
+                    candidate.static_prefill_target.as_dict()),
+                planner_payload=envelope.canonical_payload())
 
         # Service-version transitions already use routing-epoch -> PostgreSQL
         # order.  Own the same short epoch before the repository takes its
@@ -6726,21 +6621,17 @@ class SkyServeController:
                     != notification_generation):
                 return None
             try:
-                authority, snapshot = (
-                    capacity_admission.CapacityAdmissionRepository(
-                    ).plan_and_publish_current(
-                        service_name=self._service_name,
-                        service_hash=service_hash,
-                        service_lifecycle_epoch=(
-                            binding.service_lifecycle_epoch),
-                        service_version=decision_version,
-                        accounting_cards=accounting_cards,
-                        sequenced_reserved_fill=sequenced_reserved_fill,
-                        reserved_fill_allocation_map=(
-                            reserved_fill_allocation_map),
-                        planner=_planner,
-                        expected_planning_state_fingerprint=(
-                            planning_state_fingerprint)))
+                committed = (capacity_admission.CapacityAdmissionRepository(
+                ).plan_and_publish_current(
+                    service_name=self._service_name,
+                    service_hash=service_hash,
+                    service_lifecycle_epoch=(binding.service_lifecycle_epoch),
+                    service_version=decision_version,
+                    accounting_cards=accounting_cards,
+                    sequenced_reserved_fill=sequenced_reserved_fill,
+                    planner=_planner,
+                    expected_planning_state_fingerprint=(
+                        planning_state_fingerprint)))
             except (capacity_admission.CapacityAdmissionError,
                     ValueError) as error:
                 logger.warning(
@@ -6748,20 +6639,56 @@ class SkyServeController:
                     'planning could not commit: '
                     f'{common_utils.format_exception(error)}')
                 return None
-        if planned is None or planned.snapshot != snapshot:
-            logger.warning('Suppressing local capacity actuation because '
-                           'current planning returned no exact candidate.')
-            return None
-        if planned.scaling_plan.logical_target is not None:
-            try:
-                planned = self._install_committed_logical_capacity_target(
-                    planned, authority, decision_autoscaler.max_replicas)
-            except ValueError as error:
-                logger.warning(
-                    'Suppressing local capacity actuation because the '
-                    'committed capacity target could not be installed: '
-                    f'{common_utils.format_exception(error)}')
+            authority = committed.authority
+            snapshot = committed.demand_snapshot
+            if (planned is None or planned.snapshot != snapshot or
+                    durable_plan is None or planned.capacity_planning_snapshot
+                    != committed.planner_snapshot or
+                    planned.capacity_plan_candidate != committed.candidate):
+                logger.warning('Suppressing local capacity actuation because '
+                               'the committed planner candidate changed.')
                 return None
+            planned = dataclasses.replace(
+                planned,
+                capacity_planning_snapshot=committed.planner_snapshot,
+                capacity_plan_candidate=committed.candidate,
+                reserved_fill_allocation_map=committed.allocation_map)
+            next_policy_state = committed.candidate.next_policy_state
+            if next_policy_state is None:
+                if (committed.candidate.kind
+                        is capacity_planning.CapacityPlanKind.GATE_ACQUISITION):
+                    # This transaction durably published the exact demand
+                    # witness consumed by the utilization-gate poller.  It is
+                    # intentionally a committed no-effect disposition: keep
+                    # the current policy/replica state intact. Publication
+                    # wakes the fill poller; its allocation round then wakes
+                    # this controller, with bounded polling as the fallback.
+                    return authority, planned
+                logger.warning('Committed capacity plan has no next policy '
+                               'state.')
+                return None
+            try:
+                installed = decision_autoscaler.install_committed_capacity_plan(
+                    expected_prior_fingerprint=(
+                        durable_plan.prior_policy_fingerprint),
+                    expected_prior_generation=(
+                        durable_plan.expected_prior_generation),
+                    next_policy_state=next_policy_state)
+            except (TypeError, ValueError) as error:
+                logger.warning(
+                    'Committed capacity plan could not install its local '
+                    'policy state: %s', common_utils.format_exception(error))
+                self._notify_scale_reconcile()
+                return None
+            if not installed:
+                logger.warning('Committed capacity policy lost its '
+                               'post-commit compare-and-swap.')
+                self._notify_scale_reconcile()
+                return None
+            # These controller-local cursors become visible only after the
+            # PostgreSQL transaction committed the exact demand generation.
+            self._reconcile_generation = planned.demand_generation
+            self._durable_demand_snapshot = snapshot
         return authority, planned
 
     def _reconcile_scale_once(self, reconcile_generation: int) -> None:
@@ -6789,63 +6716,12 @@ class SkyServeController:
                 durable_demand_promoted = (
                     demand_source is not None and demand_source[0]
                     is capacity_admission.DemandSourceMode.DURABLE_FEED)
-                pre_demand_sequenced_fill = False
-                pre_demand_allocation = None
-                if (durable_demand_promoted and
-                        decision_autoscaler.reserved_capacity_fill):
-                    # Sequenced fill spends an independently authenticated
-                    # PostgreSQL allocation.  Admit that free capacity before
-                    # consulting LB demand: route/report convergence must not
-                    # starve a current reserved grant.  This phase publishes
-                    # durable intents only.  It supplies no ordinary-demand
-                    # debit and installs no target, paid authority, or
-                    # retirement decision.
-                    (pre_demand_sequenced_fill, pre_demand_allocation) = (
-                        self._read_sequenced_reserved_fill_allocation())
-                    if (pre_demand_sequenced_fill and
-                            pre_demand_allocation is not None and
-                            getattr(decision_autoscaler,
-                                    'reserved_fill_utilization_gate',
-                                    False) is not True):
-                        # Static fill is intentionally independent of demand,
-                        # so it may consume its authenticated allocation
-                        # before a demand snapshot exists.  A utilization-
-                        # gated service has the opposite contract: admit only
-                        # the exact-card reserved capacity selected by the
-                        # ordinary demand planner below.  Letting its scalar
-                        # activity cap reach this pre-demand planner can turn
-                        # L4-only queue work into unrelated A100/H200 fill.
-                        if not self._scale_actuation_is_current(
-                                actuation_generation, decision_autoscaler,
-                                decision_version):
-                            return
-                        # A successful admission returns before demand is
-                        # read.  Revoke any prior logical retirement pair
-                        # first so unknown demand can never retain destructive
-                        # authority across that early return.
-                        self._durable_demand_snapshot = None
-                        self._replica_manager.invalidate_logical_reconcile_state(
-                        )
-                        reserved_fill_progress = (
-                            self._accept_sequenced_reserved_fill(
-                                pre_demand_allocation, decision_autoscaler,
-                                decision_version, reconcile_generation))
-                        if not self._scale_actuation_is_current(
-                                actuation_generation, decision_autoscaler,
-                                decision_version):
-                            return
-                        if reserved_fill_progress:
-                            # Replan from the accepted durable debits.  The
-                            # manager's PostgreSQL admission is idempotent, so
-                            # a lost wakeup or restart cannot duplicate them.
-                            self._notify_scale_reconcile()
-                            return
                 sequenced_reserved_fill = False
                 allocation = None
                 if decision_autoscaler.reserved_capacity_fill:
                     if durable_demand_promoted:
-                        sequenced_reserved_fill = pre_demand_sequenced_fill
-                        allocation = pre_demand_allocation
+                        sequenced_reserved_fill = (
+                            self._sequenced_reserved_fill_is_active())
                     else:
                         (sequenced_reserved_fill, allocation) = (
                             self._read_sequenced_reserved_fill_allocation())
@@ -6908,12 +6784,9 @@ class SkyServeController:
                         decision_version,
                         actuation_generation,
                         notification_generation,
-                        replica_infos,
-                        active_versions,
                         planning_state_fingerprint,
                         decision_inputs,
-                        sequenced_reserved_fill=sequenced_reserved_fill,
-                        reserved_fill_allocation_map=allocation)
+                        sequenced_reserved_fill=sequenced_reserved_fill)
                     if current_plan is None:
                         self._refresh_replica_counts_snapshot()
                         self._durable_demand_snapshot = None
@@ -6929,6 +6802,37 @@ class SkyServeController:
                     fresh_aggregate_zero = (
                         durable_snapshot.fresh_aggregate_zero)
                     plan = linearized.scaling_plan
+                    committed_capacity_plan = (
+                        linearized.capacity_plan_candidate)
+                    committed_planning_snapshot = (
+                        linearized.capacity_planning_snapshot)
+                    if (committed_capacity_plan is None or
+                            committed_planning_snapshot is None):
+                        logger.warning(
+                            'Suppressing actuation because the committed '
+                            'capacity plan is unavailable.')
+                        return
+                    if (committed_capacity_plan.kind is capacity_planning.
+                            CapacityPlanKind.GATE_ACQUISITION):
+                        # A gate-acquisition publication is neither a planning
+                        # failure nor a target of zero.  Preserve the active
+                        # logical target and every replica until the durable
+                        # allocation witness unlocks a later generation.
+                        return
+                    reservation_budget = (committed_capacity_plan.
+                                          reserved_launch_target.as_dict())
+                    if any(reservation_budget.values()):
+                        self._accept_sequenced_reserved_fill(
+                            linearized.reserved_fill_allocation_map,
+                            decision_autoscaler, decision_version,
+                            reconcile_generation, reservation_budget)
+                        # Reservation rows are committed before a provider
+                        # launch. Whether admission accepted, deferred, or
+                        # found an already-spent debit, recompute from durable
+                        # rows instead of spending the reserved and paid
+                        # projections in one tick.
+                        self._notify_scale_reconcile()
+                        return
                     retirement_changed = False
                     if fresh_aggregate_zero:
                         retirement_changed = (
@@ -6985,6 +6889,18 @@ class SkyServeController:
                         return
                     plan = legacy_plan
                 scaling_options = list(plan.scaling_options)
+                if durable_demand_promoted:
+                    unfiltered_count = len(scaling_options)
+                    scaling_options = [
+                        option for option in scaling_options
+                        if _promoted_cost_rebalance_is_spot(option)
+                    ]
+                    suppressed_count = unfiltered_count - len(scaling_options)
+                    if suppressed_count:
+                        logger.error(
+                            'Suppressed %s promoted cost-rebalance scale-up(s) '
+                            'whose pinned paid location was not explicit Spot.',
+                            suppressed_count)
                 target_num_replicas = plan.target_num_replicas
                 rollout_failure = plan.rollout_failure
                 logical_target = plan.logical_target
