@@ -133,9 +133,9 @@ def bind_locked_kueue_capacity_snapshot(
         raise TypeError('Locked Kueue capacity binding is malformed.')
     replica_ids = tuple(info.replica_id for info in replica_infos)
     prepared_replica_ids = decision_inputs.replica_ids
-    if (not isinstance(prepared_replica_ids, tuple) or
-            any(type(replica_id) is not int or replica_id < 1
-                for replica_id in (*prepared_replica_ids, *replica_ids)) or
+    if (not isinstance(prepared_replica_ids, tuple) or any(
+            type(replica_id) is not int or replica_id < 1
+            for replica_id in (*prepared_replica_ids, *replica_ids)) or
             len(set(prepared_replica_ids)) != len(prepared_replica_ids) or
             len(set(replica_ids)) != len(replica_ids) or
             set(prepared_replica_ids) != set(replica_ids)):
@@ -789,6 +789,9 @@ class Autoscaler:
         self.rejected_compatibility_profiles: list[dict[str, Any]] = []
         self._compatibility_demand_complete: bool = False
         self.configured_accelerator_shapes: dict[str, int] = {}
+        # Exact task node count for one backend. Logical services remain 1;
+        # physical paid-cap accounting multiplies each per-node GPU shape by it.
+        self.backend_num_nodes: int = 1
         self.free_reserved_slots_by_accelerator: dict[str, int] = {}
         # Shape-aware autoscalers publish a per-tick handle snapshot before
         # entering their state lock. The neutral value is part of the shared
@@ -4750,15 +4753,26 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             self.target_num_replicas_by_accelerator[card] = (
                 self.target_num_replicas_by_accelerator.get(card, 0) + 1)
 
-    def set_configured_accelerator_shapes(self, shapes: dict[str, int]) -> None:
+    def set_configured_accelerator_shapes(self,
+                                          shapes: dict[str, int],
+                                          *,
+                                          backend_num_nodes: int = 1) -> None:
         """Set canonical exact-card GPU counts from active task resources."""
         with self._instance_state_lock:
-            self._set_configured_accelerator_shapes_locked(shapes)
+            self._set_configured_accelerator_shapes_locked(
+                shapes, backend_num_nodes=backend_num_nodes)
 
     def _set_configured_accelerator_shapes_locked(
-            self, shapes: dict[str, int]) -> None:
+            self,
+            shapes: dict[str, int],
+            *,
+            backend_num_nodes: int = 1) -> None:
         """Set exact-card shapes while holding the instance-state lock."""
+        if (not isinstance(backend_num_nodes, int) or
+                isinstance(backend_num_nodes, bool) or backend_num_nodes < 1):
+            raise ValueError('Backend node count must be a positive integer.')
         previous_shapes = self.configured_accelerator_shapes
+        previous_num_nodes = self.backend_num_nodes
         configured_shapes = {
             str(card): int(count)
             for card, count in shapes.items()
@@ -4766,8 +4780,10 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             not isinstance(count, bool) and count > 0
         }
         catalog_changed = (bool(previous_shapes) and
-                           configured_shapes != previous_shapes)
+                           (configured_shapes != previous_shapes or
+                            backend_num_nodes != previous_num_nodes))
         self.configured_accelerator_shapes = configured_shapes
+        self.backend_num_nodes = backend_num_nodes
         if catalog_changed or not configured_shapes:
             self.compatibility_profiles = []
             self.queued_compatibility_profiles = []
@@ -4923,6 +4939,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             self._compatibility_demand_complete)
         states['configured_accelerator_shapes'] = dict(
             self.configured_accelerator_shapes)
+        states['backend_num_nodes'] = self.backend_num_nodes
         states['launch_priority_report_received_at'] = (
             self._launch_priority_report_received_at)
         return states
@@ -4939,6 +4956,7 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         compatibility_complete = bool(
             dynamic_states.pop('compatibility_demand_complete', False))
         source_shapes = dynamic_states.pop('configured_accelerator_shapes', {})
+        source_num_nodes = dynamic_states.pop('backend_num_nodes', 1)
         priority_report_received_at = dynamic_states.pop(
             'launch_priority_report_received_at', None)
         super()._load_dynamic_states(dynamic_states)
@@ -4951,6 +4969,10 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             if isinstance(card, str) and card and isinstance(count, int) and
             not isinstance(count, bool) and count > 0
         } if isinstance(source_shapes, dict) else {}
+        self.backend_num_nodes = (source_num_nodes
+                                  if isinstance(source_num_nodes, int) and
+                                  not isinstance(source_num_nodes, bool) and
+                                  source_num_nodes > 0 else 1)
         # Cross-type dumps from older binaries do not identify the catalog
         # that admitted their profiles. Preserve aggregate timestamps but fail
         # closed on exact-card transfer until a fresh report arrives.
@@ -5883,13 +5905,18 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             self._update_version_locked(version, spec, update_mode)
 
     def update_version_and_accelerator_shapes(
-            self, version: int, spec: 'service_spec.SkyServiceSpec',
+            self,
+            version: int,
+            spec: 'service_spec.SkyServiceSpec',
             update_mode: serve_utils.UpdateMode,
-            accelerator_shapes: dict[str, int]) -> None:
+            accelerator_shapes: dict[str, int],
+            *,
+            backend_num_nodes: int = 1) -> None:
         """Atomically publish a QPS version and its exact-card catalog."""
         with self._instance_state_lock:
             self._update_version_locked(version, spec, update_mode)
-            self._set_configured_accelerator_shapes_locked(accelerator_shapes)
+            self._set_configured_accelerator_shapes_locked(
+                accelerator_shapes, backend_num_nodes=backend_num_nodes)
 
     def _update_version_locked(self, version: int,
                                spec: 'service_spec.SkyServiceSpec',
@@ -7235,6 +7262,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 service_version=self.latest_version,
                 configured_accelerators=configured_cards,
                 capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+                backend_num_nodes=1,
                 physical_gpu_width_by_accelerator=(
                     capacity_planning.AcceleratorCapacity.from_mapping(
                         self.configured_accelerator_shapes)),
@@ -7530,15 +7558,26 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 scaling_decisions=tuple(decisions),
                 rollout_failure=rollout_failure)
 
-    def set_configured_accelerator_shapes(self, shapes: dict[str, int]) -> None:
+    def set_configured_accelerator_shapes(self,
+                                          shapes: dict[str, int],
+                                          *,
+                                          backend_num_nodes: int = 1) -> None:
         """Set the active version's authoritative exact-card shapes."""
         with self._logical_state_lock:
-            self._set_configured_accelerator_shapes_locked(shapes)
+            self._set_configured_accelerator_shapes_locked(
+                shapes, backend_num_nodes=backend_num_nodes)
 
     def _set_configured_accelerator_shapes_locked(
-            self, shapes: dict[str, int]) -> None:
+            self,
+            shapes: dict[str, int],
+            *,
+            backend_num_nodes: int = 1) -> None:
         """Set exact-card shapes while holding the decision-state lock."""
+        if (not isinstance(backend_num_nodes, int) or
+                isinstance(backend_num_nodes, bool) or backend_num_nodes < 1):
+            raise ValueError('Backend node count must be a positive integer.')
         previous_shapes = self.configured_accelerator_shapes
+        previous_num_nodes = self.backend_num_nodes
         configured_shapes = {
             str(card): int(count)
             for card, count in shapes.items()
@@ -7546,8 +7585,10 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             not isinstance(count, bool) and count > 0
         }
         catalog_changed = (bool(previous_shapes) and
-                           configured_shapes != previous_shapes)
+                           (configured_shapes != previous_shapes or
+                            backend_num_nodes != previous_num_nodes))
         self.configured_accelerator_shapes = configured_shapes
+        self.backend_num_nodes = backend_num_nodes
         if catalog_changed:
             # Compatibility gauges describe the catalog under which the LB
             # admitted them. Never reinterpret an A100-only waiter as H100
@@ -9545,6 +9586,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             capacity_unit=(capacity_planning.CapacityUnit.LOGICAL_GPU
                            if self.replica_unit == 'logical' else
                            capacity_planning.CapacityUnit.PHYSICAL_BACKEND),
+            backend_num_nodes=(1 if self.replica_unit == 'logical' else
+                               self.backend_num_nodes),
             physical_gpu_width_by_accelerator=(
                 capacity_planning.AcceleratorCapacity.from_mapping({
                     card: self._configured_gpu_count(card)
@@ -10639,13 +10682,18 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             self._update_version_locked(version, spec, update_mode)
 
     def update_version_and_accelerator_shapes(
-            self, version: int, spec: 'service_spec.SkyServiceSpec',
+            self,
+            version: int,
+            spec: 'service_spec.SkyServiceSpec',
             update_mode: serve_utils.UpdateMode,
-            accelerator_shapes: dict[str, int]) -> None:
+            accelerator_shapes: dict[str, int],
+            *,
+            backend_num_nodes: int = 1) -> None:
         """Atomically publish a version and its exact-card policy state."""
         with self._logical_state_lock:
             self._update_version_locked(version, spec, update_mode)
-            self._set_configured_accelerator_shapes_locked(accelerator_shapes)
+            self._set_configured_accelerator_shapes_locked(
+                accelerator_shapes, backend_num_nodes=backend_num_nodes)
 
     def _update_version_locked(self, version: int,
                                spec: 'service_spec.SkyServiceSpec',
@@ -11566,6 +11614,7 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 self._compatibility_demand_complete,
             'configured_accelerator_shapes': dict(
                 self.configured_accelerator_shapes),
+            'backend_num_nodes': self.backend_num_nodes,
         }
 
     def _load_dynamic_states(self, dynamic_states: dict[str, Any]) -> None:
@@ -11653,6 +11702,11 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                     isinstance(count, int) and not isinstance(count, bool) and
                     count > 0
                 }
+        source_num_nodes = dynamic_states.pop('backend_num_nodes', 1)
+        self.backend_num_nodes = (source_num_nodes
+                                  if isinstance(source_num_nodes, int) and
+                                  not isinstance(source_num_nodes, bool) and
+                                  source_num_nodes > 0 else 1)
         if (not self.configured_accelerator_shapes or
                 not compatibility_arrivals_present):
             self.compatibility_profiles = []

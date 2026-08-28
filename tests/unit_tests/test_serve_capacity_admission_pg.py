@@ -4,6 +4,7 @@
 import copy
 import dataclasses
 import datetime
+import json
 import pickle
 import threading
 import time
@@ -419,6 +420,7 @@ def _current_decision(
     capacity_unit: capacity_planning.CapacityUnit = (
         capacity_planning.CapacityUnit.PHYSICAL_BACKEND),
     physical_gpu_width_by_accelerator: dict[str, int] | None = None,
+    backend_num_nodes: int = 1,
     provisioning_by_accelerator: dict[str, int] | None = None,
     max_live_paid_gpu_units: int | None = None,
 ) -> capacity_admission.CapacityPlanDecision:
@@ -513,6 +515,7 @@ def _current_decision(
         service_version=1,
         configured_accelerators=configured,
         capacity_unit=capacity_unit,
+        backend_num_nodes=backend_num_nodes,
         physical_gpu_width_by_accelerator=_capacity(
             ({
                 card: 1 for card in configured
@@ -582,10 +585,32 @@ def _current_decision(
             planner_snapshot, candidate))
 
 
+def _paid_pool_key(accelerator: str = 'L4',
+                   accelerator_count: int = 1,
+                   num_nodes: int = 1) -> str:
+    return json.dumps(
+        {
+            'version': 1,
+            'workspace': 'workspace-a',
+            'cloud': 'gcp',
+            'region': 'us-central1',
+            'zone': None,
+            'instance_type': None,
+            'accelerators': [[accelerator.casefold(), accelerator_count]],
+            'use_spot': True,
+            'num_nodes': num_nodes,
+        },
+        sort_keys=True,
+        separators=(',', ':'))
+
+
 def _replica_values(replica_id: int,
                     *,
                     zero_cost: bool,
-                    accelerator: str = 'L4') -> dict:
+                    accelerator: str = 'L4',
+                    accelerator_count: int = 1,
+                    planned_capacity: int = 1,
+                    num_nodes: int = 1) -> dict:
     info = replica_managers.ReplicaInfo(
         replica_id=replica_id,
         cluster_name=f'svc-{replica_id}',
@@ -594,11 +619,14 @@ def _replica_values(replica_id: int,
         location=None,
         version=1,
         resources_override={'accelerators': {
-            accelerator: 1,
-        }})
+            accelerator: accelerator_count,
+        }},
+        planned_capacity=planned_capacity)
     info.is_zero_cost = zero_cost
     if not zero_cost:
-        info.paid_capacity_pool_key = 'gcp:L4'
+        info.paid_capacity_pool_key = _paid_pool_key(accelerator,
+                                                     accelerator_count,
+                                                     num_nodes)
     return {
         'service_name': 'svc',
         'replica_id': replica_id,
@@ -861,7 +889,7 @@ def _insert_claim(engine, authority, replica_id: int) -> dict:
             protocol_and_service_prelocked=True)
         connection.execute(
             postgresql.insert(pools).values(
-                pool_key='gcp:L4',
+                pool_key=_paid_pool_key(),
                 current_limit=10,
                 successes_since_resize=0,
                 updated_at=time.time()).on_conflict_do_nothing())
@@ -872,7 +900,7 @@ def _insert_claim(engine, authority, replica_id: int) -> dict:
             sqlalchemy.insert(claims).values(service_name='svc',
                                              service_hash='svc-hash',
                                              replica_id=replica_id,
-                                             pool_key='gcp:L4',
+                                             pool_key=_paid_pool_key(),
                                              priority=50,
                                              claimed_at=time.time(),
                                              **claim))
@@ -2446,6 +2474,7 @@ def test_shutting_down_paid_row_leaves_baseline_only_after_cleanup_proof(
         'sky_launch_status'] = 'SUCCEEDED'
     replica['replica_state']['status_property']['is_scale_down'] = True
     replica['replica_state']['status_property']['sky_down_status'] = down_status
+    replica['sky_down_status'] = down_status
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.insert(
@@ -2489,6 +2518,7 @@ def test_old_version_paid_row_charges_cap_without_covering_current_demand(
         'sky_launch_status'] = 'SUCCEEDED'
     replica['replica_state']['status_property']['is_scale_down'] = True
     replica['replica_state']['status_property']['sky_down_status'] = down_status
+    replica['sky_down_status'] = down_status
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.insert(
@@ -2514,6 +2544,142 @@ def test_old_version_paid_row_charges_cap_without_covering_current_demand(
     assert committed.authority.remaining_launch_capacity() == ({
         'l4': expected_launch
     } if expected_launch else {})
+
+
+@pytest.mark.parametrize(
+    ('replica_unit', 'capacity_unit', 'physical_width', 'planned_capacity',
+     'num_nodes', 'target', 'cap', 'expected_existing', 'expected_charged',
+     'expected_launch'),
+    [('logical', capacity_planning.CapacityUnit.LOGICAL_GPU, 4, 4, 1, 8, 8, 4,
+      4, 4),
+     ('physical_backend', capacity_planning.CapacityUnit.PHYSICAL_BACKEND, 8, 1,
+      2, 2, 16, 1, 16, 0)])
+def test_paid_cap_separates_service_units_from_physical_gpu_debit(
+        capacity_database, replica_unit, capacity_unit, physical_width,
+        planned_capacity, num_nodes, target, cap, expected_existing,
+        expected_charged, expected_launch):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           replica_unit=replica_unit)
+    replica = _replica_values(104,
+                              zero_cost=False,
+                              accelerator_count=physical_width,
+                              planned_capacity=planned_capacity,
+                              num_nodes=num_nodes)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.replicas_table).values(**replica))
+
+    committed = (capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'l4': 0},
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot,
+                supply,
+                target,
+                capacity_unit=capacity_unit,
+                backend_num_nodes=num_nodes,
+                physical_gpu_width_by_accelerator={'l4': physical_width},
+                max_live_paid_gpu_units=cap)))
+
+    payload = _capacity_plan_payload(engine, committed.authority.generation)
+    assert payload['existing_paid_capacity_by_accelerator'] == {
+        'l4': expected_existing
+    }
+    assert committed.candidate.paid_cap.charged_paid_gpu_units == (
+        expected_charged)
+    assert committed.candidate.paid_launch_target.as_dict() == ({
+        'l4': expected_launch
+    } if expected_launch else {})
+
+
+def test_paid_cap_rejects_malformed_physical_width_attribution(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    replica = _replica_values(105,
+                              zero_cost=False,
+                              accelerator_count=8,
+                              planned_capacity=1)
+    replica['replica_state']['resources_override']['accelerators'] = {'L4': 4}
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.replicas_table).values(**replica))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='physical GPU attribution is malformed'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_publish_current(
+                service_name='svc',
+                service_hash='svc-hash',
+                service_lifecycle_epoch=3,
+                service_version=1,
+                accounting_cards={'l4': 0},
+                sequenced_reserved_fill=False,
+                planner=lambda snapshot, supply: _current_decision(
+                    snapshot,
+                    supply,
+                    1,
+                    physical_gpu_width_by_accelerator={'l4': 8},
+                    max_live_paid_gpu_units=8))
+
+
+@pytest.mark.parametrize('contradiction',
+                         ('pool_copy', 'missing_copy', 'missing_scalar',
+                          'zero_cost_copy', 'cleanup_copy'))
+def test_locked_paid_replica_relational_authority_rejects_json_contradiction(
+        capacity_database, contradiction):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    replica = _replica_values(106,
+                              zero_cost=False,
+                              accelerator_count=8,
+                              planned_capacity=1)
+    if contradiction == 'pool_copy':
+        replica['replica_state']['paid_capacity_pool_key'] = _paid_pool_key(
+            accelerator_count=4)
+    elif contradiction == 'missing_copy':
+        replica['replica_state']['paid_capacity_pool_key'] = None
+    elif contradiction == 'missing_scalar':
+        replica['paid_capacity_pool_key'] = None
+    elif contradiction == 'zero_cost_copy':
+        replica['status'] = 'SHUTTING_DOWN'
+        replica['replica_state']['status_property']['is_scale_down'] = True
+        replica['replica_state']['is_zero_cost'] = True
+    else:
+        replica['sky_down_status'] = 'SCHEDULED'
+        replica['replica_state']['status_property'][
+            'sky_down_status'] = 'SUCCEEDED'
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.replicas_table).values(**replica))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_publish_current(
+                service_name='svc',
+                service_hash='svc-hash',
+                service_lifecycle_epoch=3,
+                service_version=1,
+                accounting_cards={'l4': 0},
+                sequenced_reserved_fill=False,
+                planner=lambda snapshot, supply: _current_decision(
+                    snapshot,
+                    supply,
+                    1,
+                    backend_num_nodes=1,
+                    physical_gpu_width_by_accelerator={'l4': 8},
+                    max_live_paid_gpu_units=8))
 
 
 def test_noncurrent_removed_reserved_card_is_retirement_only_inventory(
@@ -2592,7 +2758,7 @@ def test_durable_unknown_replacement_requires_and_persists_plan_tuple(
         }},
         unknown_capacity_replacement=True)
     admission_kwargs = {
-        'pool_key': 'gcp:L4',
+        'pool_key': _paid_pool_key(),
         'priority': 50,
         'base_limit': 10,
         'max_limit': 10,
@@ -3901,6 +4067,387 @@ def test_prospective_hundred_claim_batch_survives_heartbeat_churn(
     assert fresh_until > datetime.datetime.now(datetime.timezone.utc)
 
 
+@pytest.mark.parametrize('cap, sequential, expected_results', [
+    (16, False, ['acquired', 'service_saturated']),
+    (32, True, ['acquired', 'acquired']),
+])
+def test_atomic_paid_cap_charges_physical_backend_gpu_width(
+        capacity_database, monkeypatch, cap, sequential, expected_results):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    committed = (capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'l4': 0},
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot,
+                supply,
+                2,
+                backend_num_nodes=2,
+                physical_gpu_width_by_accelerator={'l4': 8},
+                max_live_paid_gpu_units=cap)))
+    claim = committed.authority.claim_values('l4')
+    pool_key = _paid_pool_key(accelerator_count=8, num_nodes=2)
+    specs = []
+    for replica_id in (201, 202):
+        info = replica_managers.ReplicaInfo(
+            replica_id=replica_id,
+            cluster_name=f'svc-{replica_id}',
+            replica_port='8000',
+            is_spot=True,
+            location=None,
+            version=1,
+            resources_override={'accelerators': {
+                'L4': 8,
+            }},
+            planned_capacity=1)
+        specs.append(
+            paid_capacity.PaidClaimPersistenceSpec(
+                candidate=paid_capacity.PaidClaimCandidate(
+                    replica_id=replica_id,
+                    replica_info=info,
+                    location=None,  # type: ignore[arg-type]
+                    priority=50,
+                    capacity_plan_claim=claim),
+                pool_key=pool_key,
+                frontier_key=('l4',),
+                frontier_limit=2))
+
+    monkeypatch.setattr(serve_state,
+                        '_current_max_live_paid_gpu_units_in_session',
+                        lambda *_args, **_kwargs: (True, cap))
+
+    def _admit(batch):
+        return serve_state.try_add_replicas_with_paid_capacity_claims(
+            'svc',
+            'svc-hash',
+            batch,
+            base_limit=2,
+            max_limit=2,
+            service_limit=2,
+            max_live_paid_gpu_units=cap,
+            now=None,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=60,
+            waiter_ttl_seconds=30,
+            frontier_default_limit=2,
+            expected_controller_owner=(123, '10.0.0.5'))
+
+    if sequential:
+        results = _admit(specs[:1]) + _admit(specs[1:])
+    else:
+        results = _admit(specs)
+
+    assert results == expected_results
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.replicas_table)).scalar_one() == (
+                    expected_results.count('acquired'))
+
+
+def test_atomic_cpu_paid_pool_succeeds_without_gpu_cap(capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    with engine.begin() as connection:
+        capacity_admission.demote_service_in_connection(
+            connection,
+            service_name='svc',
+            controller_incarnation=incarnation,
+            expected_source_epoch=1)
+    pool_key = json.dumps(
+        {
+            'version': 1,
+            'workspace': 'workspace-a',
+            'cloud': 'gcp',
+            'region': 'us-central1',
+            'zone': None,
+            'instance_type': None,
+            'accelerators': [],
+            'use_spot': True,
+            'num_nodes': 3,
+        },
+        sort_keys=True,
+        separators=(',', ':'))
+    info = replica_managers.ReplicaInfo(replica_id=220,
+                                        cluster_name='svc-220',
+                                        replica_port='8000',
+                                        is_spot=True,
+                                        location=None,
+                                        version=1,
+                                        resources_override={},
+                                        planned_capacity=1)
+    spec = paid_capacity.PaidClaimPersistenceSpec(
+        candidate=paid_capacity.PaidClaimCandidate(
+            replica_id=220,
+            replica_info=info,
+            location=None,  # type: ignore[arg-type]
+            priority=50,
+            capacity_plan_claim=None),
+        pool_key=pool_key,
+        frontier_key=(),
+        frontier_limit=1)
+
+    result = serve_state.try_add_replicas_with_paid_capacity_claims(
+        'svc',
+        'svc-hash', [spec],
+        base_limit=1,
+        max_limit=1,
+        service_limit=1,
+        max_live_paid_gpu_units=None,
+        now=None,
+        success_ttl_seconds=60,
+        failure_cooldown_seconds=60,
+        waiter_ttl_seconds=30,
+        frontier_default_limit=1,
+        expected_controller_owner=(123, '10.0.0.5'))
+
+    assert result == ['acquired']
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.paid_capacity_pool_key).
+            where(serve_state_schema.replicas_table.c.replica_id ==
+                  220)).scalar_one()
+        assert paid_capacity.paid_pool_gpu_units(row) == 0
+
+
+def test_atomic_paid_census_rejects_relational_cleanup_contradiction(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    committed = (capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'l4': 0},
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot,
+                supply,
+                1,
+                physical_gpu_width_by_accelerator={'l4': 1},
+                max_live_paid_gpu_units=8)))
+    existing = _replica_values(230, zero_cost=False)
+    existing['sky_down_status'] = 'SUCCEEDED'
+    existing['replica_state']['status_property'][
+        'sky_down_status'] = 'SCHEDULED'
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.replicas_table).values(**existing))
+
+    info = replica_managers.ReplicaInfo(
+        replica_id=231,
+        cluster_name='svc-231',
+        replica_port='8000',
+        is_spot=True,
+        location=None,
+        version=1,
+        resources_override={'accelerators': {
+            'L4': 1,
+        }},
+        planned_capacity=1)
+    spec = paid_capacity.PaidClaimPersistenceSpec(
+        candidate=paid_capacity.PaidClaimCandidate(
+            replica_id=231,
+            replica_info=info,
+            location=None,  # type: ignore[arg-type]
+            priority=50,
+            capacity_plan_claim=committed.authority.claim_values('l4')),
+        pool_key=_paid_pool_key(),
+        frontier_key=('l4',),
+        frontier_limit=1)
+    monkeypatch.setattr(serve_state,
+                        '_current_max_live_paid_gpu_units_in_session',
+                        lambda *_args, **_kwargs: (True, 8))
+    validate_batch = mock.Mock(
+        side_effect=AssertionError('Phase A census was bypassed'))
+    monkeypatch.setattr(capacity_admission,
+                        'validate_prospective_paid_claim_batch_in_connection',
+                        validate_batch)
+
+    result = serve_state.try_add_replicas_with_paid_capacity_claims(
+        'svc',
+        'svc-hash', [spec],
+        base_limit=1,
+        max_limit=1,
+        service_limit=1,
+        max_live_paid_gpu_units=8,
+        now=None,
+        success_ttl_seconds=60,
+        failure_cooldown_seconds=60,
+        waiter_ttl_seconds=30,
+        frontier_default_limit=1,
+        expected_controller_owner=(123, '10.0.0.5'))
+
+    assert result == ['service_saturated']
+    assert not validate_batch.called
+
+
+def test_atomic_paid_census_cleanup_proof_dominates_stale_shape_copies(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    cleaned = _replica_values(232, zero_cost=False)
+    cleaned['status'] = 'SHUTTING_DOWN'
+    cleaned['sky_down_status'] = 'SUCCEEDED'
+    cleaned['replica_state']['status_property']['sky_down_status'] = 'SUCCEEDED'
+    cleaned['replica_state']['is_zero_cost'] = True
+    cleaned['replica_state']['paid_capacity_pool_key'] = _paid_pool_key(
+        accelerator_count=4)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.replicas_table).values(**cleaned))
+    committed = (capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'l4': 0},
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot,
+                supply,
+                1,
+                physical_gpu_width_by_accelerator={'l4': 1},
+                max_live_paid_gpu_units=8)))
+
+    info = replica_managers.ReplicaInfo(
+        replica_id=233,
+        cluster_name='svc-233',
+        replica_port='8000',
+        is_spot=True,
+        location=None,
+        version=1,
+        resources_override={'accelerators': {
+            'L4': 1,
+        }},
+        planned_capacity=1)
+    spec = paid_capacity.PaidClaimPersistenceSpec(
+        candidate=paid_capacity.PaidClaimCandidate(
+            replica_id=233,
+            replica_info=info,
+            location=None,  # type: ignore[arg-type]
+            priority=50,
+            capacity_plan_claim=committed.authority.claim_values('l4')),
+        pool_key=_paid_pool_key(),
+        frontier_key=('l4',),
+        frontier_limit=1)
+    monkeypatch.setattr(serve_state,
+                        '_current_max_live_paid_gpu_units_in_session',
+                        lambda *_args, **_kwargs: (True, 8))
+
+    result = serve_state.try_add_replicas_with_paid_capacity_claims(
+        'svc',
+        'svc-hash', [spec],
+        base_limit=1,
+        max_limit=1,
+        service_limit=1,
+        max_live_paid_gpu_units=8,
+        now=None,
+        success_ttl_seconds=60,
+        failure_cooldown_seconds=60,
+        waiter_ttl_seconds=30,
+        frontier_default_limit=1,
+        expected_controller_owner=(123, '10.0.0.5'))
+
+    assert result == ['acquired']
+
+
+def test_concurrent_atomic_multinode_paid_cap_admits_exactly_one(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    committed = (capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'l4': 0},
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot,
+                supply,
+                2,
+                backend_num_nodes=2,
+                physical_gpu_width_by_accelerator={'l4': 8},
+                max_live_paid_gpu_units=16)))
+    claim = committed.authority.claim_values('l4')
+    pool_key = _paid_pool_key(accelerator_count=8, num_nodes=2)
+
+    def _spec(replica_id):
+        info = replica_managers.ReplicaInfo(
+            replica_id=replica_id,
+            cluster_name=f'svc-{replica_id}',
+            replica_port='8000',
+            is_spot=True,
+            location=None,
+            version=1,
+            resources_override={'accelerators': {
+                'L4': 8,
+            }},
+            planned_capacity=1)
+        return paid_capacity.PaidClaimPersistenceSpec(
+            candidate=paid_capacity.PaidClaimCandidate(
+                replica_id=replica_id,
+                replica_info=info,
+                location=None,  # type: ignore[arg-type]
+                priority=50,
+                capacity_plan_claim=claim),
+            pool_key=pool_key,
+            frontier_key=('l4',),
+            frontier_limit=2)
+
+    monkeypatch.setattr(serve_state,
+                        '_current_max_live_paid_gpu_units_in_session',
+                        lambda *_args, **_kwargs: (True, 16))
+    barrier = threading.Barrier(2)
+    results = []
+
+    def _run(replica_id):
+        barrier.wait()
+        result = serve_state.try_add_replicas_with_paid_capacity_claims(
+            'svc',
+            'svc-hash', [_spec(replica_id)],
+            base_limit=2,
+            max_limit=2,
+            service_limit=2,
+            max_live_paid_gpu_units=16,
+            now=None,
+            success_ttl_seconds=60,
+            failure_cooldown_seconds=60,
+            waiter_ttl_seconds=30,
+            frontier_default_limit=2,
+            expected_controller_owner=(123, '10.0.0.5'))
+        results.append(result[0])
+
+    threads = [
+        threading.Thread(target=_run, args=(replica_id,))
+        for replica_id in (221, 222)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert sorted(results) == ['acquired', 'service_saturated']
+    with engine.connect() as connection:
+        rows = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table.c.
+                              paid_capacity_pool_key)).scalars().all()
+    assert sum(paid_capacity.paid_pool_gpu_units(row) for row in rows) == 16
+
+
 def test_atomic_hundred_claim_batch_rejects_fresh_zero_without_rows(
         capacity_database):
     engine, incarnation, route_receipt = capacity_database
@@ -3940,7 +4487,7 @@ def test_atomic_hundred_claim_batch_rejects_fresh_zero_without_rows(
                     location=None,  # type: ignore[arg-type]
                     priority=50,
                     capacity_plan_claim=claim),
-                pool_key='gcp:L4',
+                pool_key=_paid_pool_key(),
                 frontier_key=('l4',),
                 frontier_limit=100))
 

@@ -675,6 +675,40 @@ def test_paid_cap_preserves_residual_while_authorizing_one_whole_backend(
         remaining_paid_gpu_units=8)
 
 
+@pytest.mark.parametrize(('cap', 'existing', 'expected_launch'),
+                         ((16, 0, 1), (32, 0, 2), (32, 1, 1)))
+def test_physical_paid_cap_debits_every_backend_node(
+        cap: int, existing: int, expected_launch: int) -> None:
+    demand = (_demand(50, ('A100',), 2),)
+    reservation = _reservation(existing_paid=_capacity(A100=existing))
+    reservation = dataclasses.replace(reservation,
+                                      charged_paid_gpu_units=existing * 16)
+
+    plan = capacity_planning.plan_capacity(
+        _snapshot(capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND,
+                  backend_num_nodes=2,
+                  physical_gpu_width_by_accelerator=_capacity(L4=1, A100=8),
+                  demand_profiles=demand,
+                  explicit_demand_profiles=demand,
+                  paid_demand_profiles=demand,
+                  reservation=reservation,
+                  max_live_paid_gpu_units=cap))
+
+    assert plan.paid_residual.as_dict() == {'A100': 2 - existing}
+    assert plan.paid_launch_target.as_dict() == ({
+        'A100': expected_launch
+    } if expected_launch else {})
+    assert plan.backend_num_nodes == 2
+
+
+def test_physical_backend_shape_product_overflow_is_rejected() -> None:
+    with pytest.raises(ValueError, match='exact accounting range'):
+        _snapshot(capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND,
+                  backend_num_nodes=2,
+                  physical_gpu_width_by_accelerator=_capacity(L4=(1 << 63) - 1,
+                                                              A100=8))
+
+
 def test_existing_paid_capacity_is_charged_before_new_authority() -> None:
     demand = (_demand(50, ('A100',), 1),)
 
@@ -1644,6 +1678,33 @@ def test_planner_envelope_rejects_invalid_schema_and_digests(
     payload[field] = invalid_value
 
     with pytest.raises(ValueError):
+        capacity_planning.decode_planner_envelope(payload)
+
+
+@pytest.mark.parametrize('old_schema', (1, 2))
+def test_schema_three_rejects_old_envelopes_without_backend_node_count(
+        old_schema: int) -> None:
+    payload = _planner_payload()
+    payload['schema_version'] = old_schema
+    snapshot = payload['snapshot']
+    candidate = payload['candidate']
+    assert isinstance(snapshot, dict)
+    assert isinstance(candidate, dict)
+    del snapshot['backend_num_nodes']
+    del candidate['backend_num_nodes']
+
+    with pytest.raises(ValueError, match='Unsupported.*schema'):
+        capacity_planning.decode_planner_envelope(payload)
+
+
+@pytest.mark.parametrize('record', ('snapshot', 'candidate'))
+def test_schema_three_requires_backend_node_count(record: str) -> None:
+    payload = _planner_payload()
+    nested = payload[record]
+    assert isinstance(nested, dict)
+    del nested['backend_num_nodes']
+
+    with pytest.raises(ValueError, match='missing or unexpected'):
         capacity_planning.decode_planner_envelope(payload)
 
 

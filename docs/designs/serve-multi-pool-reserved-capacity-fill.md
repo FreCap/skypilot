@@ -6,15 +6,28 @@ Status: **in progress**. The single PostgreSQL-authoritative reserved-capacity
 path has proved full East occupancy, reclaim, and synchronized post-fix
 East/PHX convergence. The immutable planner (PR #1777), complete sparse target
 (PR #1778), locked-capacity ordering (PR #1779), and equivalent retained-route
-demand (PR #1781) are merged and were deployed through release `1.1.1550`, Helm
-revision 670, and lifecycle 136. This is deployed source, not final
-production proof: lifecycle 136 reached the required exact 100 GCP Spot L4
-instances and clean teardown, but its cold scale-out took materially longer than
-the 3--5 minute acceptance window. The pending plan-authoritative first-paid-
-cohort correction is neither merged nor deployed. PR #1783's processing versus
-in-flight telemetry is merged at `b0a847b3a51b2aa332e62fb1337c6f1f80816806` and
-release/chart `1.1.1552` is published, but it is not deployed. Full idle
-occupancy is no longer a steady-state goal:
+demand (PR #1781) were deployed through release `1.1.1550`, Helm revision 670,
+and lifecycle 136. This is deployed source, not final production proof:
+lifecycle 136 reached the required exact 100 GCP Spot L4 instances and clean
+teardown, but its cold scale-out took materially longer than the 3--5 minute
+acceptance window. PR #1783's processing/in-flight telemetry and PR #1784's
+plan-authoritative first-paid cohort are now merged in the release `1.1.1554`
+source cohort; PR #1785 adds unrelated AWS Hyderabad catalog coverage. Release
+`1.1.1554` must complete its own Spot-100 proof and supported exact teardown
+before the schema-3 amendment below is activated. Full idle occupancy is no
+longer a steady-state goal:
+
+The 2026-08-28 source amendment makes multi-node physical paid accounting
+explicit. Capacity-planning envelope schema 3 carries one task-authoritative
+``backend_num_nodes`` scalar beside the exact per-node accelerator shape;
+total provider debit is derived as their product. It also advances the demand
+witness domain to v2. This amendment is implementation-complete in the current
+branch and pending review; it is neither merged nor deployed and has no
+production evidence. Schema-3 decoding is strict-current: schema-1/2 plans are
+not a mixed-rollout compatibility path and no database migration rewrites them.
+The authorized test service must be cleanly downed and recreated on a
+homogeneous schema-3 controller cohort before provider effects resume.
+
 reserved capacity is now demand-driven and returns through the existing
 utilization gate when idle. The historical paid provider-lifecycle gate was
 completed on release `1.1.1513`, PR #1744, merge
@@ -550,10 +563,18 @@ livelock a physical launch or mint a second machine. Paid packing padding is
 never demand, is never attributed to a request, and cannot independently
 retain a machine after the covered demand drains.
 
-The logical planner has one authoritative physical backend width for each
-accelerator card in a service version. The adapter must never obtain that
-width by last-write-wins iteration over ``task.resources``. A logical service
-version that offers the same card at conflicting widths is rejected during
+The planner has one authoritative per-node physical GPU width for each
+accelerator card and one task-authoritative ``backend_num_nodes`` for the
+service version. Logical replicas require ``backend_num_nodes=1``. Physical
+backend service units remain one per backend, while the hard paid-cap debit is
+``per_node_width * backend_num_nodes``. A CPU-only paid pool has an empty
+accelerator shape and a typed zero-GPU debit; its legacy non-planner Phase-A
+path remains subject to ordinary claim, pool, service, and provider policy.
+The GPU-only immutable planner does not synthesize an aggregate accelerator to
+represent CPU. The adapter loads width and node count from the same exact task
+and must never obtain either by last-write-wins
+iteration over ``task.resources``. A logical service version that offers the
+same card at conflicting widths is rejected during
 preflight until the public contract is extended with a typed backend-shape
 dimension; silently choosing the first, last, minimum, or maximum width would
 make reserved and paid debits describe different provider effects. This
@@ -943,12 +964,12 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` at `b0a847b3a51b2aa332e62fb1337c6f1f80816806` (release `1.1.1552`). It includes PR #1777's immutable planner merge `11ed18e135cd9ef4d54ee1563d0c387997f2f946`, PR #1778's complete sparse target, PR #1779's locked-capacity ordering, PR #1781's retained-route demand correction, and PR #1783's processing/in-flight telemetry. PR #1782 / release `1.1.1551` is the unrelated AWS Malaysia catalog change. |
-| Immutable planner correction | **Source-complete and deployed through `1.1.1550`; not yet production-proven at the required cold-scale bound.** PR #1777 supplies one typed immutable snapshot for demand attribution, supply-aware actuation, reservation commitment, static prefill, packing padding, retention, and prospective-Spot residual. Its explicit zero-cost-first policy prefers ready and committed zero-cost capacity, then compatible free reservation, then already-paid capacity. PRs #1778, #1779, and #1781 complete the sparse-target, ordering, and retained-route-demand portions of that same deployed path. The remaining source defect is narrower: make the first paid cohort plan-authoritative. That correction is pending review/merge and has no deployed image. |
-| Deployed control plane | **Deployed:** SkyPilot `1.1.1550`, Helm revision 670, lifecycle 136. **Published but not deployed:** `1.1.1552` / PR #1783 telemetry. The next deployment must combine the reviewed first-paid-cohort correction with the latest published telemetry cohort; AWS authentication currently blocks that deployment. PostgreSQL remains the sole central store and Helm storage remains disabled. |
+| Source base | `origin/improvements` at `e21b840769b02356ef9c3b0cc62bbc9ffe855bdc` (release `1.1.1554` source cohort). It includes PR #1777's immutable planner merge `11ed18e135cd9ef4d54ee1563d0c387997f2f946`, PR #1778's complete sparse target, PR #1779's locked-capacity ordering, PR #1781's retained-route demand correction, PR #1783's processing/in-flight telemetry, and PR #1784's plan-authoritative paid cohort. PR #1785 is unrelated AWS Hyderabad catalog coverage. |
+| Immutable planner correction | **Merged through the `1.1.1554` source cohort; current-cohort production proof remains open.** PR #1777 supplies one typed immutable snapshot for demand attribution, supply-aware actuation, reservation commitment, static prefill, packing padding, retention, and prospective-Spot residual. Its explicit zero-cost-first policy prefers ready and committed zero-cost capacity, then compatible free reservation, then already-paid capacity. PRs #1778, #1779, and #1781 complete the sparse-target, ordering, and retained-route-demand portions, and PR #1784 makes the first paid cohort plan-authoritative. The schema-3 multi-node debit amendment in this branch is implementation-complete and pending review; it is not part of `1.1.1554`. |
+| Deployed control plane | The latest production evidence recorded here remains SkyPilot `1.1.1550`, Helm revision 670, lifecycle 136. The merged `1.1.1554` source cohort must be deployed homogeneously, complete the Spot-100 gate, and finish supported exact teardown before schema-3 activation begins. PostgreSQL remains the sole central store and Helm storage remains disabled. |
 | Lifecycle-136 evidence | Run `9462207b-e026-4c5e-b610-acaba61e9b0a` on `1.1.1550` reached exactly 100 provider-`RUNNING` GCP Spot L4 VMs, with zero on-demand and zero non-L4 VMs. It accepted the 10,000-ID continuation and subsequent 5,000-ID extension. Normal teardown reached provider zero in about 3 minutes 16 seconds and full PostgreSQL/provider/disk zero in about 3 minutes 45 seconds. The immutable bundle records SHA-256 `audit.jsonl` `51807331f170d1352e9001324bd2e66f169a8a04867b7ca9bf94d8c4b953a8d7`, `arm.json` `92542d925ad50f0916cd8dcdc3977d27aa7f6a5e27b269445e03b70eadc36e70`, and `guard.json` `54a503e1f83eaa4899bce38bcc254591f885587ba87e81241fe3332a4188a649`. |
 | Cold-scale timing | **Not accepted.** Lifecycle 136 first recorded a paid PostgreSQL row at 15:41:06 UTC; DB paid count 94 at +6 minutes 21 seconds, DB paid count 100 at +9 minutes 20 seconds, and provider `RUNNING=100` at +10 minutes 33 seconds. This regresses the historical `1.1.1513` provider-100 benchmark of about 3 minutes 41.9 seconds, so the current deployed writer does not meet the required 3--5 minute cold-scale gate. |
-| Telemetry | PR #1783 is source-merged at `b0a847b3a51b2aa332e62fb1337c6f1f80816806`; its `1.1.1552` release/chart is published but not deployed. No live nonzero processing/in-flight telemetry proof exists for that cohort. |
+| Telemetry | PR #1783 is merged and carried by the `1.1.1554` source cohort. No live nonzero processing/in-flight telemetry proof for that cohort is recorded here. |
 | Writer protocol | Public API 93, worker projection 10, deployed and source non-pool capability cohort 13, and async request-ledger protocol 1. |
 | Storage | PostgreSQL is the sole central correctness store; Helm `storage.enabled=false`; no SkyPilot EFS or PVC. |
 | Active service | Lifecycle 136, service incarnation `e4d0d076-594a-4c54-be12-60ccba86141f`, version 1, is healthy and idle. It has `min_replicas: 0`, fill floor 0, `utilization_gate: true`, a 120 paid-GPU cap, only Spot L4 paid candidates, and reserved East A100/A100-80GB plus PHX H200 candidates. It has no task-owned Kueue or scheduler override, file mount, EFS, PVC, or on-demand candidate. Lifecycle 124's retained-ledger counts do not describe this service and are not used as its qualification baseline. |
@@ -962,8 +983,8 @@ it has merged or been deployed.
 | Partial mixed proof | Provider/DB censuses at 2026-08-25 19:45:47.538 and 19:45:56.281 UTC bracketed a 72-request completion wave and both had 44 reserved plus 28 paid replicas all `READY`, the same 28 AWS Spot instances—27 `g6.2xlarge` and one `g6.4xlarge`—and zero on-demand. The wave completed from 19:45:48.956 through 19:45:51.187; every request performed 9.533–12.451 seconds of concurrency-one GPU work, so at least 28 necessarily executed on Spot beside the 44 reserved workers. The Spot instances later fully drained at the provider. |
 | GCP Spot lifecycle proof | **Count and teardown production evidence exists; cold-scale performance remains open.** Lifecycle 136 on `1.1.1550` reached exactly 100 concurrently provider-`RUNNING` one-L4 GCP Spot VMs with zero on-demand/non-L4 capacity and clean complete teardown. Its provider-100 time was +10 minutes 33 seconds, not the required 3--5 minutes. The older `1.1.1513` proof reached provider 100 in about 3 minutes 41.9 seconds, but does not qualify the current deployed cohort. |
 | Final load proof | Not complete. Historical run `final10k-1524-20260827-0246` retains one immutable 10,000-ID manifest. It accepted 2,125 identities, classified 29 exact transport outcomes as ambiguous for durable reconciliation, and retained 7,846 pending identities before stopping on the publication defect. Live telemetry proved nonzero queued/in-flight demand and computed targets of 414 and 494. It remains immutable historical evidence and must not be rebound to a different service incarnation. The final proof will use a fresh 10,000-ID manifest after the required clean service recreation. The exact 503 body `No replica has confirmed free async capacity. Use "sky serve status [SERVICE_NAME]" to check the replica status.` is a definitive retryable pre-dispatch rejection only when the PostgreSQL request receipt is exactly `REJECTED_PRE_DISPATCH`; the harness may classify that exact pair without relaxing any other 5xx outcome. |
-| Demand/publication ordering | PRs #1777, #1778, #1779, and #1781 are merged and deployed through `1.1.1550`; lifecycle 136 proves the deployed cohort can create an exact 100-L4 Spot wave without on-demand spill. The first-paid-cohort plan-authority correction remains unmerged and undeployed, and the deployed cold-scale time is not accepted. |
-| Utilization/allocation causality | Schema 6 and the shared SLA-selected utilization witness remain merged and deployed. The immutable planner is no longer worktree-only: PR #1777 merged at `11ed18e135cd9ef4d54ee1563d0c387997f2f946` and its supporting PRs #1778, #1779, and #1781 reached `1.1.1550`. Production proof remains incomplete pending the plan-authoritative first paid cohort, a combined latest Helm deployment, the reservation/gate matrix, nonzero telemetry, mixed reserved-plus-Spot proof, terminal receipts, and HA takeover. |
+| Demand/publication ordering | PRs #1777, #1778, #1779, and #1781 are deployed through `1.1.1550`; PR #1784's first-paid-cohort authority is merged in `1.1.1554`. Lifecycle 136 proves the older deployed cohort can create an exact 100-L4 Spot wave without on-demand spill, but the merged `1.1.1554` writer still requires its own bounded-time proof and teardown before schema-3 cutover. |
+| Utilization/allocation causality | Schema 6 and the shared SLA-selected utilization witness remain merged and deployed. PR #1777 merged at `11ed18e135cd9ef4d54ee1563d0c387997f2f946`; PRs #1778, #1779, #1781, and now #1784 complete the current source path through `1.1.1554`. Production proof remains incomplete pending the `1.1.1554` Spot-100/teardown gate, the reservation/gate matrix, nonzero telemetry, mixed reserved-plus-Spot proof, terminal receipts, and HA takeover. |
 
 The completed paid-gate post-rollout census was green after Helm revision 635:
 the service, replicas, claims, waiters, request associations, queue rows,
@@ -1431,6 +1452,16 @@ cleanup success consumes the paid GPU cap. Keeping these two projections
 separate avoids both false suppression of an upgrade and duplicate billable
 capacity.
 
+The relational ``sky_down_status`` scalar is cleanup authority and its
+ReplicaInfo JSON copy must match. A matched ``SUCCEEDED`` proof removes the row
+from both locked planning and Phase-A billing before either seam inspects stale
+historical pool, zero-cost, or shape copies; durable cleanup therefore cannot
+leave phantom paid capacity. If cleanup is not proven, the relational
+``paid_capacity_pool_key`` is authoritative and the JSON pool key and zero-cost
+classification must agree exactly, including both missing-copy directions.
+Malformed or contradictory cleanup-unproven rows fail closed identically in
+locked planning and atomic Phase A.
+
 That logical result is clipped by the elected service target. The pure planner
 then projects it to the smallest whole paid backend count per exact card. The
 whole-backend ``cold_launch_authority`` (not the raw logical residual) is clipped
@@ -1516,11 +1547,14 @@ transaction.
 
 For a planner-bound paid call, the immutable plan's
 ``paid_launch_target_by_accelerator`` is the sole aggregate Phase-A purchase
-authority. ``PaidLaunchAuthority`` carries the capacity unit and exact physical
-GPU width from that same committed planner candidate; the controller does not
-reconstruct either value from mutable task overrides. One physical backend
-therefore debits one plan unit for ``PHYSICAL_BACKEND`` plans and its exact GPU
-width for ``LOGICAL_GPU`` plans. Candidate preparation first subtracts durable
+authority. ``PaidLaunchAuthority`` carries the capacity unit, exact per-node
+physical GPU width, and ``backend_num_nodes`` from that same committed planner
+candidate; the controller does not reconstruct those values from mutable task
+overrides. One physical backend therefore debits one service-plan unit for
+``PHYSICAL_BACKEND`` plans but consumes the full
+per-node-width-times-node-count GPU cap. A ``LOGICAL_GPU`` backend still has one
+node and debits its exact logical GPU width. Candidate preparation first
+subtracts durable
 claims already debited to the same service incarnation, plan generation, and
 content digest. It then converts only the uncommitted plan units into whole
 backend claims.
@@ -1536,6 +1570,8 @@ window remains only for true non-planner callers. A missing or malformed
 candidate set defers only that accelerator card; it cannot suppress an
 independent card with complete exact-shape Spot candidates. For planner-bound
 admission,
+the canonical pool card, per-node width, and node count must all match the
+immutable authority; equality of total GPU count alone is insufficient.
 the transactional service-claim bound is the existing unresolved claim count
 plus this exact backend cohort; the per-service paid-GPU cap, global execution
 cap, priority, stale-generation, exact-pool, and provider-policy fences remain
@@ -1799,7 +1835,11 @@ missing telemetry.
    Kubernetes candidate.
 5. **No on-demand:** paid residual can effect only Spot candidates.
 6. **Bounded cost:** every cleanup-unproven paid GPU unit counts against the
-   elected global cap.
+   elected global cap. The relational ``paid_capacity_pool_key`` and
+   ``sky_down_status`` columns are canonical; their ReplicaInfo JSON copies are
+   cross-checks. Missing or contradictory copies fail closed. Pool card,
+   per-node width, and node count match immutable planner authority before a
+   prospective or restarted provider effect.
 7. **Scheduler ownership:** SkyPilot consumes, queues, or yields under external
    scheduler policy and never changes that policy.
 8. **Exact identity:** lifecycle, incarnation, replica record, association,
@@ -1949,6 +1989,19 @@ change for this durable logical fleet; no compatibility migration is run.
 Teardown still must finish through supported evidence-backed cleanup, and
 callers must refresh the endpoint after recreation.
 
+Envelope schema 3 requires a hard homogeneous cutover, not a rolling mixed
+deployment. First complete release 1.1.1554's Spot-100 proof and its supported
+exact teardown. Then inventory and quiesce every remaining Serve service, plan,
+claim, and provider effect under that old homogeneous release; any other live
+service blocks activation. Verify PostgreSQL has zero capacity-plan rows, zero
+planner-bound paid claims, and no pending provider effect. Deploy every API,
+controller, and executor role to one schema-3 Helm image, verify every role is
+homogeneous and Ready, then recreate only the reviewed canonical test service.
+Schema-1 and schema-2 envelopes are strict decode failures; there is no N-2
+decoder or row rewrite. Once any schema-3 plan or claim exists, rollback to
+schema-1/2 binaries is unsafe and recovery is fix-forward on a newer homogeneous
+image.
+
 ### Failure and rollback
 
 The capacity-authority transition is one-way. After activation or an additive
@@ -2006,6 +2059,22 @@ on-demand spill.
   and prove it contributes no capacity while only the required later
   cost-ordered pools open. Include prior same-generation debits and prove they
   are subtracted before candidate preparation.
+- For an eight-GPU, two-node ``PHYSICAL_BACKEND``, prove cap 16 grants exactly
+  one backend, cap 32 grants two, and one existing backend leaves exactly one
+  new backend at cap 32. Prove advisory headroom 15 rejects, headroom 16 admits
+  and debits to zero, and concurrent PostgreSQL Phase-A transactions at cap 16
+  commit exactly one claim. Reject wrong per-node width, wrong node count,
+  malformed huge integers and products, relational/JSON pool contradictions,
+  and cleanup scalar contradictions. Prove a matched durable cleanup proof
+  ignores stale historical pool/zero-cost copies at both billing seams, while
+  the same contradiction without cleanup proof fails closed. Prove an
+  empty-accelerator CPU pool commits through the legacy non-planner Phase-A
+  path with zero GPU debit when no GPU cap is configured, without changing
+  zero-cost routing.
+- Encode a schema-3 plan and prove strict rejection of schema-1 and schema-2
+  envelopes. Before qualification, cleanly down/recreate the test service on a
+  homogeneous schema-3 cohort; there is no in-place plan migration or mixed
+  decoder rollout.
 - Hold the routing epoch, then hold the linearized planning callback after the transaction has locked the
   current service, demand/report/route, allocation, capacity/Kueue, and plan
   rows. Start both HA report writers and prove they wait at the service row;
@@ -2235,25 +2304,26 @@ Lifecycle 136 on `1.1.1550` adds current-cohort count/no-on-demand/teardown
 evidence, but its +10 minutes 33 seconds provider-100 time does not meet the
 current 3--5 minute cold-scale criterion. The remaining gates are:
 
-1. Review and merge the plan-authoritative first-paid-cohort correction, with
-   adversarial tests proving one authoritative planner input/commit per
-   generation and no paid cohort outside the committed plan. It must preserve the
-   reservation-policy/``utilization_gate`` matrix, fail-closed route and demand
-   behavior, zero-cost-first ordering, and the no-provider-I/O PostgreSQL
-   callback boundary.
-2. Deploy one combined latest Helm cohort: the merged first-paid-cohort fix plus
-   already-merged PR #1783 telemetry (`1.1.1552` or its successor). AWS
-   authentication currently blocks this deployment. Read back the homogeneous
-   image/chart, role inventory, lifecycle/version/route authority, and exact
-   server configuration before generating provider effects.
+1. Deploy the merged release `1.1.1554` cohort, which contains PR #1783
+   telemetry and PR #1784 plan-authoritative paid admission, on one homogeneous
+   image. Re-run the GCP Spot lifecycle and require at least 100 exact one-L4
+   Spot VMs concurrently provider-``RUNNING`` within 3--5 minutes, with zero
+   ordinary on-demand/wrong-shape capacity, then complete normal exact
+   PostgreSQL/provider/disk teardown. This proof and teardown must finish on
+   schema 1 before any schema-3 activation.
+2. Review and merge the schema-3 multi-node debit amendment. After gate 1,
+   inventory and quiesce every other Serve service, capacity plan, paid claim,
+   and pending provider effect; any other live service blocks activation.
+   Verify those old-authority rows/effects are zero, deploy one homogeneous
+   schema-3 API/controller/executor image, and recreate only the reviewed test
+   service. There is no mixed decoder, row rewrite, or rollback to schema-1/2
+   binaries after schema-3 authority exists; recovery is fix-forward.
 3. Capture live nonzero telemetry from that deployed cohort: queued,
    processing, in-flight, and completed values must be internally coherent in
    the service UI, then return to a fresh idle-zero sample after drain.
-4. Re-run the GCP Spot lifecycle on the combined deployed cohort. Require at
-   least 100 exact one-L4 Spot VMs concurrently provider-`RUNNING` within 3--5
-   minutes, zero ordinary on-demand and wrong-shape capacity, and normal exact
-   PostgreSQL/provider/disk teardown. Retain the same compact hashable evidence
-   bundle.
+4. Re-run the same provider/native billing and exact teardown checks after the
+   schema-3 recreation, including multi-node physical-width accounting. Retain
+   the compact hashable evidence bundle without rebinding historical proof.
 5. Audit the deployment and recreated min-zero heterogeneous service for no
    EFS/PVC and no Kueue policy, Terraform, Terragrunt, KubeRay, IAM, or
    `boltz-platform` application change. The audit is an invariant check, not

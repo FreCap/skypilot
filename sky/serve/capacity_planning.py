@@ -10,9 +10,23 @@ from typing import Mapping, TypeVar
 
 from sky.serve import autoscaler_compatibility
 
-CAPACITY_PLANNING_ENVELOPE_SCHEMA_VERSION = 1
+CAPACITY_PLANNING_ENVELOPE_SCHEMA_VERSION = 3
+_MAX_EXACT_ACCOUNTING_INTEGER = (1 << 63) - 1
 
 _EnumT = TypeVar('_EnumT', bound=enum.Enum)
+
+
+def _validate_physical_shape_accounting(
+    physical_widths: 'AcceleratorCapacity',
+    backend_num_nodes: int,
+) -> None:
+    """Keep every derived physical-backend GPU debit in BIGINT range."""
+    if (type(backend_num_nodes) is not int or  # pylint: disable=unidiomatic-typecheck
+            not 1 <= backend_num_nodes <= _MAX_EXACT_ACCOUNTING_INTEGER
+            or any(width > _MAX_EXACT_ACCOUNTING_INTEGER // backend_num_nodes
+                   for _, width in physical_widths.entries)):
+        raise ValueError(
+            'Physical backend shape exceeds exact accounting range.')
 
 
 def _require_exact_keys(value: object, expected: frozenset[str],
@@ -697,7 +711,11 @@ class CapacityPlanningSnapshot:
     service_version: int
     configured_accelerators: tuple[str, ...]
     capacity_unit: CapacityUnit
+    # Exact GPUs on each node in one launched backend.
     physical_gpu_width_by_accelerator: AcceleratorCapacity
+    # Task-authoritative node count for one launched backend. Logical replica
+    # semantics require one node; physical paid GPU debit is width * node count.
+    backend_num_nodes: int = 1
     capacity_per_accelerator: AcceleratorWork
     floors: AcceleratorCapacity
     minimum_capacity: int
@@ -748,6 +766,8 @@ class CapacityPlanningSnapshot:
                 self.capacity_unit is CapacityUnit.UNKNOWN or
                 not isinstance(self.physical_gpu_width_by_accelerator,
                                AcceleratorCapacity) or
+                type(self.backend_num_nodes) is not int or
+                self.backend_num_nodes < 1 or
                 not isinstance(self.capacity_per_accelerator, AcceleratorWork)
                 or not isinstance(self.floors, AcceleratorCapacity) or
                 not isinstance(self.fixed_work, AcceleratorWork) or
@@ -779,6 +799,8 @@ class CapacityPlanningSnapshot:
                     bool) or not math.isfinite(float(self.planning_time))):
             raise ValueError(
                 'Capacity planning identity or bounds are invalid.')
+        _validate_physical_shape_accounting(
+            self.physical_gpu_width_by_accelerator, self.backend_num_nodes)
         if ((self.prior_policy_state is None) != (self.policy_input is None)):
             raise ValueError('Capacity policy state and input must be paired.')
         if self.prior_policy_state is not None:
@@ -937,8 +959,11 @@ class CapacityPlanningSnapshot:
         current_paid_gpu_units = _capacity_gpu_units(
             capacity_unit=self.capacity_unit,
             physical_widths=(self.physical_gpu_width_by_accelerator.as_dict()),
+            backend_num_nodes=self.backend_num_nodes,
             capacity=self.reservation.existing_paid_capacity)
-        if self.reservation.charged_paid_gpu_units < current_paid_gpu_units:
+        if (self.max_live_paid_gpu_units is not None and
+                self.reservation.charged_paid_gpu_units
+                < current_paid_gpu_units):
             raise ValueError(
                 'Charged paid capacity omits usable paid inventory.')
         if (not isinstance(self.cold_accelerator_order, tuple) or
@@ -972,6 +997,9 @@ class CapacityPlanningSnapshot:
                 any(width <= 0 for _, width in
                     self.physical_gpu_width_by_accelerator.entries)):
             raise ValueError('Every accelerator needs a positive GPU width.')
+        if (self.capacity_unit is CapacityUnit.LOGICAL_GPU and
+                self.backend_num_nodes != 1):
+            raise ValueError('Logical capacity requires single-node backends.')
         if ({
                 card.casefold()
                 for card, _ in self.capacity_per_accelerator.entries
@@ -1094,6 +1122,7 @@ class CapacityPlanningSnapshot:
                 self.configured_reservation_accelerators,
             'demand_witness_scope_sha256': self.demand_witness_scope_sha256,
             'capacity_unit': self.capacity_unit.value,
+            'backend_num_nodes': self.backend_num_nodes,
             'physical_gpu_width_by_accelerator': dataclasses.asdict(
                 self.physical_gpu_width_by_accelerator),
             'capacity_per_accelerator': dataclasses.asdict(
@@ -1164,13 +1193,14 @@ def demand_witness_semantic_sha256(
             'paid_cold_lead_seconds': deadline.paid_cold_lead_seconds,
         }
     payload = {
-        'protocol': 'serve-fill-demand-witness-v1',
+        'protocol': 'serve-fill-demand-witness-v2',
         'scope_sha256': snapshot.demand_witness_scope_sha256,
         'service_version': snapshot.service_version,
         'configured_accelerators': snapshot.configured_accelerators,
         'configured_reservation_accelerators':
             snapshot.configured_reservation_accelerators,
         'capacity_unit': snapshot.capacity_unit.value,
+        'backend_num_nodes': snapshot.backend_num_nodes,
         'physical_gpu_width_by_accelerator': dataclasses.asdict(
             snapshot.physical_gpu_width_by_accelerator),
         'capacity_per_accelerator': dataclasses.asdict(
@@ -1232,6 +1262,7 @@ class CapacityPlanCandidate:
     kind: CapacityPlanKind
     capacity_unit: CapacityUnit
     physical_gpu_width_by_accelerator: AcceleratorCapacity
+    backend_num_nodes: int = 1
     aggregate_demand_target: int
     raw_demand_target: int
     demand_attribution: AcceleratorCapacity
@@ -1291,6 +1322,8 @@ class CapacityPlanCandidate:
         )
         if (not isinstance(self.kind, CapacityPlanKind) or
                 not isinstance(self.capacity_unit, CapacityUnit) or
+                type(self.backend_num_nodes) is not int or
+                self.backend_num_nodes < 1 or
                 type(self.aggregate_demand_target) is not int or
                 self.aggregate_demand_target < 0 or
                 type(self.raw_demand_target) is not int or
@@ -1309,6 +1342,8 @@ class CapacityPlanCandidate:
                 not isinstance(self.infeasible_demand_by_priority, tuple) or
                 not isinstance(self.service_time_sources, tuple)):
             raise ValueError('Capacity plan is malformed.')
+        _validate_physical_shape_accounting(
+            self.physical_gpu_width_by_accelerator, self.backend_num_nodes)
         if (self.demand_witness_sha256 is not None and
             (type(self.demand_witness_sha256) is not str or
              len(self.demand_witness_sha256) != 64 or
@@ -1491,6 +1526,9 @@ class CapacityPlanCandidate:
                self.reserved_launch_target.total() != 0)):
             raise ValueError('A non-demand plan carries demand funding.')
         widths = self.physical_gpu_width_by_accelerator.as_dict()
+        if (self.capacity_unit is CapacityUnit.LOGICAL_GPU and
+                self.backend_num_nodes != 1):
+            raise ValueError('Logical capacity requires single-node backends.')
         launch_cards = (set(reserved_launch) | set(new_reserved) |
                         set(reserved_packing_padding))
         if any(
@@ -1525,7 +1563,7 @@ class CapacityPlanCandidate:
                                  'physical cover of its authorized residual.')
             paid_launch_gpu_units += (launch if self.capacity_unit
                                       is CapacityUnit.LOGICAL_GPU else launch *
-                                      widths[card])
+                                      widths[card] * self.backend_num_nodes)
         if (self.paid_cap.remaining_paid_gpu_units is not None and
                 paid_launch_gpu_units > self.paid_cap.remaining_paid_gpu_units):
             raise ValueError('Paid launch target exceeds paid-cap headroom.')
@@ -1653,7 +1691,7 @@ _POLICY_INPUT_FIELDS = frozenset({
 })
 _SNAPSHOT_FIELDS = frozenset({
     'source_generation', 'service_version', 'configured_accelerators',
-    'capacity_unit', 'physical_gpu_width_by_accelerator',
+    'capacity_unit', 'physical_gpu_width_by_accelerator', 'backend_num_nodes',
     'capacity_per_accelerator', 'floors', 'minimum_capacity',
     'paid_minimum_capacity', 'actuation_minimum_capacity', 'maximum_capacity',
     'demand_profiles', 'explicit_demand_profiles', 'paid_demand_profiles',
@@ -1690,11 +1728,11 @@ _CANDIDATE_CAPACITY_FIELDS = (
 )
 _CANDIDATE_FIELDS = frozenset({
     'kind', 'capacity_unit', 'aggregate_demand_target', 'raw_demand_target',
-    'infeasible_demand_by_priority', 'service_time_sources',
-    'attribution_complete', 'source_generation', 'snapshot_fingerprint',
-    'paid_cap', 'next_policy_state', 'demand_witness_sha256',
-    'reservation_demand_relation', 'statically_disjoint_demand_accelerators',
-    *_CANDIDATE_CAPACITY_FIELDS
+    'backend_num_nodes', 'infeasible_demand_by_priority',
+    'service_time_sources', 'attribution_complete', 'source_generation',
+    'snapshot_fingerprint', 'paid_cap', 'next_policy_state',
+    'demand_witness_sha256', 'reservation_demand_relation',
+    'statically_disjoint_demand_accelerators', *_CANDIDATE_CAPACITY_FIELDS
 })
 _ENVELOPE_FIELDS = frozenset({
     'schema_version', 'snapshot', 'candidate', 'snapshot_fingerprint',
@@ -2050,6 +2088,9 @@ def _decode_snapshot(value: object) -> CapacityPlanningSnapshot:
             'snapshot.configured_accelerators'),
         capacity_unit=_require_enum(payload['capacity_unit'], CapacityUnit,
                                     'snapshot.capacity_unit'),
+        backend_num_nodes=_require_int(payload['backend_num_nodes'],
+                                       'snapshot.backend_num_nodes',
+                                       minimum=1),
         physical_gpu_width_by_accelerator=_decode_capacity(
             payload['physical_gpu_width_by_accelerator'],
             'snapshot.physical_gpu_width_by_accelerator'),
@@ -2165,6 +2206,9 @@ def _decode_candidate(value: object) -> CapacityPlanCandidate:
         kind=_require_enum(payload['kind'], CapacityPlanKind, 'candidate.kind'),
         capacity_unit=_require_enum(payload['capacity_unit'], CapacityUnit,
                                     'candidate.capacity_unit'),
+        backend_num_nodes=_require_int(payload['backend_num_nodes'],
+                                       'candidate.backend_num_nodes',
+                                       minimum=1),
         aggregate_demand_target=_require_int(
             payload['aggregate_demand_target'],
             'candidate.aggregate_demand_target',
@@ -2243,7 +2287,8 @@ class CapacityPlanningEnvelope:
                 raise ValueError('Capacity candidate changes policy identity.')
         if (self.candidate.attribution_complete and
             (self.candidate.capacity_unit is not self.snapshot.capacity_unit or
-             self.candidate.physical_gpu_width_by_accelerator
+             self.candidate.backend_num_nodes != self.snapshot.backend_num_nodes
+             or self.candidate.physical_gpu_width_by_accelerator
              != self.snapshot.physical_gpu_width_by_accelerator)):
             raise ValueError('Capacity candidate changes the snapshot units.')
         if self.candidate.attribution_complete:
@@ -2391,6 +2436,7 @@ def incomplete_capacity_plan(*,
     return CapacityPlanCandidate(
         kind=CapacityPlanKind.INCOMPLETE,
         capacity_unit=CapacityUnit.UNKNOWN,
+        backend_num_nodes=1,
         physical_gpu_width_by_accelerator=empty,
         aggregate_demand_target=0,
         raw_demand_target=0,
@@ -2471,13 +2517,14 @@ class _ActuationTransition:
 
 
 def _capacity_gpu_units(*, capacity_unit: CapacityUnit,
-                        physical_widths: Mapping[str, int],
+                        physical_widths: Mapping[str,
+                                                 int], backend_num_nodes: int,
                         capacity: AcceleratorCapacity) -> int:
     """Charge a capacity projection in physical GPU units."""
     if capacity_unit is CapacityUnit.LOGICAL_GPU:
         return capacity.total()
-    return sum(
-        count * physical_widths[card] for card, count in capacity.entries)
+    return sum(count * physical_widths[card] * backend_num_nodes
+               for card, count in capacity.entries)
 
 
 def _remaining_paid_gpu_units(snapshot: CapacityPlanningSnapshot) -> int | None:
@@ -2505,11 +2552,14 @@ def _project_paid_launch_authority(
         physical_width = physical_widths[card]
         launch_width = (physical_width if snapshot.capacity_unit
                         is CapacityUnit.LOGICAL_GPU else 1)
+        backend_gpu_units = (physical_width if snapshot.capacity_unit
+                             is CapacityUnit.LOGICAL_GPU else physical_width *
+                             snapshot.backend_num_nodes)
         required_backends = math.ceil(residual / launch_width)
         authorized_backends = required_backends
-        if remaining_gpu_units is not None:
+        if remaining_gpu_units is not None and backend_gpu_units > 0:
             authorized_backends = min(required_backends,
-                                      remaining_gpu_units // physical_width)
+                                      remaining_gpu_units // backend_gpu_units)
         if authorized_backends <= 0:
             # A wide exact-card backend may not fit while a later narrower
             # backend does.  Keep the ordered traversal deterministic without
@@ -2521,7 +2571,7 @@ def _project_paid_launch_authority(
         if launch_capacity > authorized_residual:
             packing_padding[card] = launch_capacity - authorized_residual
         if remaining_gpu_units is not None:
-            remaining_gpu_units -= authorized_backends * physical_width
+            remaining_gpu_units -= authorized_backends * backend_gpu_units
     return (AcceleratorCapacity.from_mapping(launch_target),
             AcceleratorCapacity.from_mapping(packing_padding))
 
@@ -3250,6 +3300,7 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
         return CapacityPlanCandidate(
             kind=CapacityPlanKind.GATE_ACQUISITION,
             capacity_unit=snapshot.capacity_unit,
+            backend_num_nodes=snapshot.backend_num_nodes,
             physical_gpu_width_by_accelerator=(
                 snapshot.physical_gpu_width_by_accelerator),
             aggregate_demand_target=demand.total(),
@@ -3460,6 +3511,7 @@ def plan_capacity(snapshot: CapacityPlanningSnapshot) -> CapacityPlanCandidate:
     return CapacityPlanCandidate(
         kind=plan_kind,
         capacity_unit=snapshot.capacity_unit,
+        backend_num_nodes=snapshot.backend_num_nodes,
         physical_gpu_width_by_accelerator=(
             snapshot.physical_gpu_width_by_accelerator),
         aggregate_demand_target=demand.total(),
