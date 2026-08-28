@@ -14,8 +14,11 @@ import datetime
 import enum
 import hashlib
 import json
+import math
 import pickle
 import re
+import threading
+import time
 from typing import Any, TYPE_CHECKING
 import uuid
 
@@ -24,6 +27,7 @@ from sqlalchemy.dialects import postgresql
 
 from sky.adaptors import common as adaptors_common
 from sky.serve import capacity_admission_schema
+from sky.serve import capacity_planning
 from sky.serve import constants
 from sky.serve import demand_state
 from sky.serve import demand_state_schema
@@ -79,6 +83,10 @@ _TERMINAL_REPLICA_STATUSES = frozenset({
     'UNKNOWN',
 })
 
+_FILL_DEMAND_WITNESS_WAKE = threading.Condition()
+_FILL_DEMAND_WITNESS_WAKE_SEQUENCE: dict[str, int] = {}
+_FILL_DEMAND_WITNESS_WAKE_DIGEST: dict[str, str] = {}
+
 
 def replica_state_semantic_sha256_expression(
     replica_state_column: Any,) -> sqlalchemy.ColumnElement[Any]:
@@ -101,7 +109,25 @@ class ReservedFillPlanAuthorityMode(str, enum.Enum):
     NOT_APPLICABLE = 'NOT_APPLICABLE'
     ALLOCATION_BOUND = 'ALLOCATION_BOUND'
     STATICALLY_INCOMPATIBLE = 'STATICALLY_INCOMPATIBLE'
+    GATE_INELIGIBLE = 'GATE_INELIGIBLE'
     UNBOUND_ZERO_REVOCATION = 'UNBOUND_ZERO_REVOCATION'
+
+
+class ReservedSupplyPolicy(str, enum.Enum):
+    """Effective immutable reservation policy for one locked plan."""
+
+    DISABLED = 'DISABLED'
+    STATIC_PREFILL = 'STATIC_PREFILL'
+    DEMAND_GATED = 'DEMAND_GATED'
+
+
+class ReservedSupplyEvidenceState(str, enum.Enum):
+    """Availability of the locked authenticated reservation envelope."""
+
+    NOT_APPLICABLE = 'NOT_APPLICABLE'
+    AUTHENTICATED_SETTLED = 'AUTHENTICATED_SETTLED'
+    AUTHENTICATED_UNSETTLED = 'AUTHENTICATED_UNSETTLED'
+    UNAVAILABLE = 'UNAVAILABLE'
 
 
 class CapacityAdmissionError(RuntimeError):
@@ -137,6 +163,25 @@ def capacity_plan_content_sha256(payload: Any) -> str:
     return _sha256(payload)
 
 
+def locked_planning_source_fingerprint(
+    planning_state_fingerprint: str | None,
+    economic_capacity_graph_sha256: str,
+) -> str:
+    """Bind a planner envelope to replica and scheduler-capacity state."""
+    if (planning_state_fingerprint is not None and
+        (not isinstance(planning_state_fingerprint, str) or
+         _SHA256_RE.fullmatch(planning_state_fingerprint) is None)):
+        raise ValueError('Planning-state fingerprint is malformed.')
+    if (not isinstance(economic_capacity_graph_sha256, str) or
+            _SHA256_RE.fullmatch(economic_capacity_graph_sha256) is None):
+        raise ValueError('Economic capacity graph fingerprint is malformed.')
+    return _sha256({
+        'protocol': 'locked-capacity-planning-source-v1',
+        'planning_state_sha256': planning_state_fingerprint,
+        'economic_capacity_graph_sha256': economic_capacity_graph_sha256,
+    })
+
+
 def _positive_int(value: Any, field: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ValueError(f'{field} must be a positive integer.')
@@ -158,6 +203,213 @@ def _canonical_counts(value: Mapping[str, int], field: str) -> dict[str, int]:
             raise ValueError(f'{field} has invalid or duplicate capacity.')
         result[card] = raw_count
     return dict(sorted(result.items()))
+
+
+def _capacity_for_accounting_cards(
+    value: capacity_planning.AcceleratorCapacity,
+    accounting_cards: set[str],
+    field: str,
+) -> dict[str, int]:
+    """Return one typed planner map in the repository's exact-card domain."""
+    if not isinstance(value, capacity_planning.AcceleratorCapacity):
+        raise ValueError(f'{field} is not typed accelerator capacity.')
+    counts = _canonical_counts(value.as_dict(), field)
+    if set(counts) - accounting_cards:
+        raise ValueError(f'{field} names an unknown accelerator.')
+    return {card: counts.get(card, 0) for card in sorted(accounting_cards)}
+
+
+def _positive_counts(value: Mapping[str, int]) -> dict[str, int]:
+    return {card: count for card, count in value.items() if count > 0}
+
+
+def _decode_planner_payload(
+    value: Any,
+) -> tuple[capacity_planning.CapacityPlanningSnapshot,
+           capacity_planning.CapacityPlanCandidate]:
+    """Decode the one closed planner envelope accepted by admission."""
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError('Capacity plan has no immutable planner envelope.')
+    try:
+        return capacity_planning.decode_planner_envelope(value)
+    except ValueError as error:
+        raise ValueError(
+            'Capacity plan planner payload is malformed.') from error
+
+
+def _validate_prospective_planner_candidate(
+    payload: Mapping[str, Any],
+    *,
+    service_version: int,
+    demand_feed_generation: int,
+    accounting_cards: set[str],
+    capacity_target: Mapping[str, int],
+    existing_zero_cost: Mapping[str, int],
+    pending_zero_cost: Mapping[str, int],
+    allocation_reserved: Mapping[str, int],
+    existing_paid: Mapping[str, int],
+    paid_residual: Mapping[str, int],
+    paid_launch_target: Mapping[str, int],
+) -> tuple[capacity_planning.CapacityPlanningSnapshot,
+           capacity_planning.CapacityPlanCandidate]:
+    """Authenticate the exact persisted planner authority for paid I/O.
+
+    The JSON accounting maps remain useful independent database constraints,
+    but they are not a second launch authority.  A prospective paid claim must
+    name the complete typed candidate that produced those maps, at the exact
+    durable-demand generation, before any provider-side effect is possible.
+    """
+    try:
+        planner_snapshot, candidate = _decode_planner_payload(
+            payload.get('planner'))
+        configured_cards = {
+            card.casefold() for card in planner_snapshot.configured_accelerators
+        }
+        candidate_target = _capacity_for_accounting_cards(
+            candidate.supply_aware_demand_target, accounting_cards,
+            'planner candidate traffic target')
+        candidate_commitment = _capacity_for_accounting_cards(
+            candidate.new_reserved_capacity_committed, accounting_cards,
+            'planner candidate reservation commitment')
+        candidate_paid = _positive_counts(
+            _capacity_for_accounting_cards(candidate.paid_residual,
+                                           accounting_cards,
+                                           'planner candidate paid residual'))
+        candidate_paid_launch = _positive_counts(
+            _capacity_for_accounting_cards(
+                candidate.paid_launch_target, accounting_cards,
+                'planner candidate paid launch target'))
+        reservation_inventory = {
+            'existing_zero_cost': _capacity_for_accounting_cards(
+                planner_snapshot.reservation.existing_zero_cost_capacity,
+                accounting_cards,
+                'planner reservation existing zero-cost capacity'),
+            'pending_zero_cost': _capacity_for_accounting_cards(
+                planner_snapshot.reservation.pending_zero_cost_capacity,
+                accounting_cards,
+                'planner reservation pending zero-cost capacity'),
+            'existing_paid': _capacity_for_accounting_cards(
+                planner_snapshot.reservation.existing_paid_capacity,
+                accounting_cards, 'planner reservation existing paid capacity'),
+        }
+    except (AttributeError, TypeError, ValueError) as error:
+        raise CapacityAdmissionConflict(
+            'Paid claim has no valid immutable planner candidate.') from error
+
+    if (planner_snapshot.service_version != service_version or
+            planner_snapshot.source_generation != demand_feed_generation or
+            candidate.source_generation != demand_feed_generation or
+            candidate.snapshot_fingerprint != planner_snapshot.fingerprint or
+            _SHA256_RE.fullmatch(planner_snapshot.source_fingerprint) is None or
+            configured_cards != accounting_cards):
+        raise CapacityAdmissionConflict(
+            'Paid claim planner generation or fingerprint is stale.')
+    if (not planner_snapshot.attribution_complete or
+            not candidate.attribution_complete or
+            candidate.kind is not capacity_planning.CapacityPlanKind.DEMAND or
+            planner_snapshot.planning_purpose
+            is not capacity_planning.CapacityPlanningPurpose.ECONOMIC_ADMISSION
+            or planner_snapshot.actuation_supply_policy
+            is not capacity_planning.ActuationSupplyPolicy.REUSE_CURRENT_SUPPLY
+       ):
+        raise CapacityAdmissionConflict(
+            'Paid claim planner attribution is incomplete or ineligible.')
+
+    expected_target = {
+        card: capacity_target.get(card, 0) for card in sorted(accounting_cards)
+    }
+    expected_commitment = {
+        card: allocation_reserved.get(card, 0)
+        for card in sorted(accounting_cards)
+    }
+    expected_inventory = {
+        'existing_zero_cost': {
+            card: existing_zero_cost.get(card, 0)
+            for card in sorted(accounting_cards)
+        },
+        'pending_zero_cost': {
+            card: pending_zero_cost.get(card, 0)
+            for card in sorted(accounting_cards)
+        },
+        'existing_paid': {
+            card: existing_paid.get(card, 0) for card in sorted(accounting_cards)
+        },
+    }
+    if (candidate_target != expected_target or
+            candidate_commitment != expected_commitment or
+            candidate_paid != _positive_counts(paid_residual) or
+            candidate_paid_launch != _positive_counts(paid_launch_target) or
+            reservation_inventory != expected_inventory):
+        raise CapacityAdmissionConflict(
+            'Paid claim accounting differs from its immutable planner '
+            'candidate.')
+    return planner_snapshot, candidate
+
+
+def _validate_prospective_reservation_evidence(
+    planner_snapshot: capacity_planning.CapacityPlanningSnapshot,
+    candidate: capacity_planning.CapacityPlanCandidate,
+    *,
+    accounting_cards: set[str],
+    policy: ReservedSupplyPolicy,
+    evidence_state: ReservedSupplyEvidenceState,
+    authenticated_capacity: Mapping[str, int],
+    eligible_capacity: Mapping[str, int],
+    reservation_evidence_sha256: str,
+) -> None:
+    """Bind the persisted candidate to current reservation/gate evidence."""
+    expected_policy = {
+        ReservedSupplyPolicy.DISABLED:
+            capacity_planning.ReservationGatePolicy.NOT_CONFIGURED,
+        ReservedSupplyPolicy.STATIC_PREFILL:
+            capacity_planning.ReservationGatePolicy.UNGATED,
+        ReservedSupplyPolicy.DEMAND_GATED:
+            capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+    }[policy]
+    expected_evidence_state = {
+        ReservedSupplyEvidenceState.NOT_APPLICABLE:
+            capacity_planning.ReservationEvidenceState.NOT_APPLICABLE,
+        ReservedSupplyEvidenceState.AUTHENTICATED_SETTLED:
+            capacity_planning.ReservationEvidenceState.AUTHENTICATED_SETTLED,
+        ReservedSupplyEvidenceState.AUTHENTICATED_UNSETTLED:
+            capacity_planning.ReservationEvidenceState.AUTHENTICATED_UNSETTLED,
+        ReservedSupplyEvidenceState.UNAVAILABLE:
+            capacity_planning.ReservationEvidenceState.UNAVAILABLE,
+    }[evidence_state]
+    reservation = planner_snapshot.reservation
+    try:
+        authenticated = _capacity_for_accounting_cards(
+            reservation.authenticated_capacity, accounting_cards,
+            'planner authenticated reservation capacity')
+        eligible = _capacity_for_accounting_cards(
+            reservation.eligible_capacity, accounting_cards,
+            'planner eligible reservation capacity')
+        launch_target = _capacity_for_accounting_cards(
+            candidate.reserved_launch_target, accounting_cards,
+            'planner reserved launch target')
+        expected_authenticated = _canonical_counts(authenticated_capacity,
+                                                   'authenticated_capacity')
+        expected_eligible = _canonical_counts(eligible_capacity,
+                                              'eligible_capacity')
+    except ValueError as error:
+        raise CapacityAdmissionConflict(
+            'Paid claim reservation planner evidence is malformed.') from error
+    expected_authenticated = {
+        card: expected_authenticated.get(card, 0)
+        for card in sorted(accounting_cards)
+    }
+    expected_eligible = {
+        card: expected_eligible.get(card, 0) for card in sorted(accounting_cards)
+    }
+    if (reservation.gate_policy is not expected_policy or
+            reservation.evidence_state is not expected_evidence_state or
+            reservation.evidence_fingerprint != reservation_evidence_sha256 or
+            authenticated != expected_authenticated or
+            eligible != expected_eligible or any(
+                launch_target.get(card, 0) > expected_eligible.get(card, 0)
+                for card in accounting_cards)):
+        raise CapacityAdmissionConflict(
+            'Paid claim reservation or usage-gate evidence changed.')
 
 
 def _canonical_watermark(value: Any) -> list[dict[str, Any]]:
@@ -197,6 +449,7 @@ class ReservedFillPlanAuthority:
     allocation: ReservedFillAllocationIdentity | None = None
     incompatible_accelerators: tuple[str, ...] = ()
     worker_projection_sha256: str | None = None
+    reservation_evidence_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, ReservedFillPlanAuthorityMode):
@@ -205,6 +458,8 @@ class ReservedFillPlanAuthority:
                             is ReservedFillPlanAuthorityMode.ALLOCATION_BOUND)
         statically_incompatible = (
             self.mode is ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE)
+        reservation_ineligible = (
+            self.mode is ReservedFillPlanAuthorityMode.GATE_INELIGIBLE)
         if allocation_bound != (self.allocation is not None):
             raise ValueError('Only an allocation-bound plan may carry a '
                              'reserved-fill allocation identity.')
@@ -226,6 +481,15 @@ class ReservedFillPlanAuthority:
               self.worker_projection_sha256 is not None):
             raise ValueError('Only statically incompatible authority may carry '
                              'accelerator projection evidence.')
+        if reservation_ineligible:
+            if (not isinstance(self.reservation_evidence_sha256, str) or
+                    _SHA256_RE.fullmatch(
+                        self.reservation_evidence_sha256) is None):
+                raise ValueError('Reservation-ineligible authority has no '
+                                 'immutable reservation evidence.')
+        elif self.reservation_evidence_sha256 is not None:
+            raise ValueError('Only reservation-ineligible authority may carry '
+                             'fill reservation evidence.')
 
     @classmethod
     def not_applicable(cls) -> 'ReservedFillPlanAuthority':
@@ -244,6 +508,23 @@ class ReservedFillPlanAuthority:
         return cls(ReservedFillPlanAuthorityMode.ALLOCATION_BOUND, identity)
 
     @classmethod
+    def gate_ineligible(
+        cls,
+        reservation_evidence_sha256: str,
+    ) -> 'ReservedFillPlanAuthority':
+        """Compatibility spelling for unavailable reservation evidence."""
+        return cls.reservation_ineligible(reservation_evidence_sha256)
+
+    @classmethod
+    def reservation_ineligible(
+        cls,
+        reservation_evidence_sha256: str,
+    ) -> 'ReservedFillPlanAuthority':
+        """Bind paid authority to exact unavailable reservation evidence."""
+        return cls(ReservedFillPlanAuthorityMode.GATE_INELIGIBLE,
+                   reservation_evidence_sha256=(reservation_evidence_sha256))
+
+    @classmethod
     def statically_incompatible(
         cls,
         accelerators: Sequence[str],
@@ -258,7 +539,7 @@ class ReservedFillPlanAuthority:
     def from_mapping(cls, value: Any) -> 'ReservedFillPlanAuthority':
         allowed = {
             'mode', 'allocation', 'incompatible_accelerators',
-            'worker_projection_sha256'
+            'worker_projection_sha256', 'reservation_evidence_sha256'
         }
         if not isinstance(value, Mapping) or set(value) - allowed:
             raise ValueError('Reserved-fill plan authority is malformed.')
@@ -267,6 +548,7 @@ class ReservedFillPlanAuthority:
         except (TypeError, ValueError) as error:
             raise ValueError(
                 'Reserved-fill plan authority mode is invalid.') from error
+        reservation_evidence_digest = None
         if mode is ReservedFillPlanAuthorityMode.ALLOCATION_BOUND:
             if set(value) != {'mode', 'allocation'}:
                 raise ValueError(
@@ -285,6 +567,14 @@ class ReservedFillPlanAuthority:
             allocation = None
             accelerators = tuple(value['incompatible_accelerators'])
             projection_digest = value['worker_projection_sha256']
+        elif mode is ReservedFillPlanAuthorityMode.GATE_INELIGIBLE:
+            if set(value) != {'mode', 'reservation_evidence_sha256'}:
+                raise ValueError(
+                    'Gate-ineligible plan authority is incomplete.')
+            allocation = None
+            accelerators = ()
+            projection_digest = None
+            reservation_evidence_digest = value['reservation_evidence_sha256']
         else:
             if set(value) != {'mode'}:
                 raise ValueError(
@@ -292,7 +582,8 @@ class ReservedFillPlanAuthority:
             allocation = None
             accelerators = ()
             projection_digest = None
-        return cls(mode, allocation, accelerators, projection_digest)
+        return cls(mode, allocation, accelerators, projection_digest,
+                   reservation_evidence_digest)
 
     def to_mapping(self) -> dict[str, Any]:
         result: dict[str, Any] = {'mode': self.mode.value}
@@ -302,6 +593,9 @@ class ReservedFillPlanAuthority:
             result['incompatible_accelerators'] = list(
                 self.incompatible_accelerators)
             result['worker_projection_sha256'] = self.worker_projection_sha256
+        if self.mode is ReservedFillPlanAuthorityMode.GATE_INELIGIBLE:
+            result['reservation_evidence_sha256'] = (
+                self.reservation_evidence_sha256)
         return result
 
 
@@ -328,11 +622,14 @@ class CapacityPlanInput:
     normalized_demand: Mapping[str, Any]
     capacity_target_by_accelerator: Mapping[str, int]
     reserved_fill_authority: ReservedFillPlanAuthority
+    paid_residual: capacity_planning.AcceleratorCapacity
+    paid_launch_target: capacity_planning.AcceleratorCapacity
     allocation_reserved_capacity_by_accelerator: Mapping[str, int] = (
         dataclasses.field(default_factory=dict))
     expected_pending_zero_cost_capacity_by_accelerator: Mapping[str, int] = (
         dataclasses.field(default_factory=dict))
     expected_economic_capacity_graph_sha256: str | None = None
+    planner_payload: Mapping[str, Any] = dataclasses.field(default_factory=dict)
 
     def payload(
         self,
@@ -343,7 +640,6 @@ class CapacityPlanInput:
         allocation_reserved_capacity_by_accelerator: Mapping[str, int] |
         None = None,
         existing_paid_capacity_by_accelerator: Mapping[str, int],
-        paid_residual_by_accelerator: Mapping[str, int],
     ) -> dict[str, Any]:
         if not isinstance(self.service_name, str) or not self.service_name:
             raise ValueError('service_name must be nonempty.')
@@ -378,42 +674,48 @@ class CapacityPlanInput:
         existing_paid = _canonical_counts(
             existing_paid_capacity_by_accelerator,
             'existing_paid_capacity_by_accelerator')
-        paid = _canonical_counts(paid_residual_by_accelerator,
-                                 'paid_residual_by_accelerator')
+        paid_capacity = _capacity_for_accounting_cards(
+            self.paid_residual, set(capacity_target),
+            'paid_residual_by_accelerator')
+        paid = _positive_counts(paid_capacity)
+        paid_launch_capacity = _capacity_for_accounting_cards(
+            self.paid_launch_target, set(capacity_target),
+            'paid_launch_target_by_accelerator')
+        paid_launch = _positive_counts(paid_launch_capacity)
+        planner_payload = json.loads(
+            _canonical_json(dict(self.planner_payload)).decode('utf-8'))
+        if planner_payload:
+            _, candidate = _decode_planner_payload(planner_payload)
+            candidate_paid = _capacity_for_accounting_cards(
+                candidate.paid_residual, set(capacity_target),
+                'planner candidate paid residual')
+            candidate_paid_launch = _capacity_for_accounting_cards(
+                candidate.paid_launch_target, set(capacity_target),
+                'planner candidate paid launch target')
+            if (candidate_paid != paid_capacity or
+                    candidate_paid_launch != paid_launch_capacity):
+                raise ValueError('Capacity plan paid projections differ from '
+                                 'its immutable planner candidate.')
         cards = (set(capacity_target) | set(existing_zero_cost) |
                  set(pending_zero_cost) | set(allocation_reserved) |
-                 set(existing_paid) | set(paid))
+                 set(existing_paid) | set(paid) | set(paid_launch))
         if AGGREGATE_ACCELERATOR in cards and len(cards) != 1:
             raise ValueError('A capacity plan cannot mix aggregate and '
                              'exact-card accounting.')
-        expected_paid = {
-            card: max(
-                0,
-                capacity_target.get(card, 0) - existing_zero_cost.get(card, 0) -
-                pending_zero_cost.get(card, 0) -
-                allocation_reserved.get(card, 0) -
-                existing_paid.get(card, 0)) for card in cards
-        }
-        expected_paid = {
-            card: count for card, count in expected_paid.items() if count > 0
-        }
-        paid = {card: count for card, count in paid.items() if count > 0}
-        if paid != expected_paid:
-            raise ValueError('Paid residual is not the exact post-zero-cost '
-                             'capacity deficit.')
         authority = self.reserved_fill_authority
         if not isinstance(authority, ReservedFillPlanAuthority):
             raise ValueError('Capacity plan has no typed reserved-fill '
                              'authority.')
         economic_graph_sha256 = self.expected_economic_capacity_graph_sha256
-        if authority.mode is ReservedFillPlanAuthorityMode.ALLOCATION_BOUND:
-            if (not isinstance(economic_graph_sha256, str) or
-                    _SHA256_RE.fullmatch(economic_graph_sha256) is None):
-                raise ValueError('Allocation-bound capacity plan has no exact '
-                                 'economic capacity graph digest.')
-        elif economic_graph_sha256 is not None:
-            raise ValueError('An unbound capacity plan must not carry an '
+        if (authority.mode is ReservedFillPlanAuthorityMode.ALLOCATION_BOUND and
+                economic_graph_sha256 is None):
+            raise ValueError('Allocation-bound capacity plan has no exact '
                              'economic capacity graph digest.')
+        if (economic_graph_sha256 is not None and
+            (not isinstance(economic_graph_sha256, str) or
+             _SHA256_RE.fullmatch(economic_graph_sha256) is None)):
+            raise ValueError('Capacity plan has a malformed economic capacity '
+                             'graph digest.')
         positive_target_cards = tuple(
             sorted(
                 card for card, count in capacity_target.items() if count > 0))
@@ -456,8 +758,12 @@ class CapacityPlanInput:
                 (allocation_reserved),
             'existing_paid_capacity_by_accelerator': existing_paid,
             'paid_residual_by_accelerator': paid,
+            'paid_launch_target_by_accelerator': paid_launch,
             'reserved_fill_authority': authority.to_mapping(),
         }
+        if planner_payload:
+            _decode_planner_payload(planner_payload)
+            payload['planner'] = planner_payload
         if economic_graph_sha256 is not None:
             payload['economic_capacity_graph_sha256'] = economic_graph_sha256
         return payload
@@ -475,6 +781,20 @@ class CapacityPlanDecision:
 
     capacity_target_by_accelerator: Mapping[str, int]
     normalized_demand_extensions: Mapping[str, Any]
+    reserved_capacity_commitment_by_accelerator: Mapping[str, int] = (
+        dataclasses.field(default_factory=dict))
+    expected_paid_residual_by_accelerator: Mapping[str, int] | None = None
+    expected_paid_launch_target_by_accelerator: Mapping[str, int] | None = None
+    static_reserved_fill_target_by_accelerator: Mapping[str, int] = (
+        dataclasses.field(default_factory=dict))
+    planner_payload: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+
+    def decode_planner(
+        self,
+    ) -> tuple[capacity_planning.CapacityPlanningSnapshot,
+               capacity_planning.CapacityPlanCandidate]:
+        """Return the only planner snapshot/candidate this decision may name."""
+        return _decode_planner_payload(self.planner_payload)
 
     def canonical_target(self, accounting_cards: set[str]) -> dict[str, int]:
         target = _canonical_counts(self.capacity_target_by_accelerator,
@@ -487,6 +807,83 @@ class CapacityPlanDecision:
                 != _PLAN_DERIVED_DEMAND_FIELDS):
             raise ValueError('Capacity planner demand extensions are '
                              'incomplete or contain authority fields.')
+        commitment = _canonical_counts(
+            self.reserved_capacity_commitment_by_accelerator,
+            'reserved_capacity_commitment_by_accelerator')
+        if set(commitment) - accounting_cards:
+            raise ValueError('Capacity planner reservation commitment names '
+                             'an unknown accelerator.')
+        static_fill = _canonical_counts(
+            self.static_reserved_fill_target_by_accelerator,
+            'static_reserved_fill_target_by_accelerator')
+        if set(static_fill) - accounting_cards:
+            raise ValueError('Capacity planner static fill names an unknown '
+                             'accelerator.')
+        if self.expected_paid_residual_by_accelerator is None:
+            raise ValueError('Capacity planner has no exact paid residual.')
+        paid = _canonical_counts(self.expected_paid_residual_by_accelerator,
+                                 'expected_paid_residual_by_accelerator')
+        if set(paid) - accounting_cards:
+            raise ValueError('Capacity planner paid residual names an '
+                             'unknown accelerator.')
+        if self.expected_paid_launch_target_by_accelerator is None:
+            raise ValueError('Capacity planner has no exact paid launch '
+                             'target.')
+        paid_launch = _canonical_counts(
+            self.expected_paid_launch_target_by_accelerator,
+            'expected_paid_launch_target_by_accelerator')
+        if set(paid_launch) - accounting_cards:
+            raise ValueError('Capacity planner paid launch target names an '
+                             'unknown accelerator.')
+        planner_snapshot, candidate = self.decode_planner()
+        if (not candidate.attribution_complete or candidate.kind
+                is capacity_planning.CapacityPlanKind.INCOMPLETE or
+                candidate.source_generation
+                != planner_snapshot.source_generation):
+            raise ValueError('Capacity planner returned incomplete or stale '
+                             'authority.')
+        candidate_target = _capacity_for_accounting_cards(
+            candidate.supply_aware_demand_target, accounting_cards,
+            'planner candidate supply-aware demand target')
+        candidate_commitment = _capacity_for_accounting_cards(
+            candidate.new_reserved_capacity_committed, accounting_cards,
+            'planner candidate new reservation commitment')
+        candidate_paid = _capacity_for_accounting_cards(
+            candidate.paid_residual, accounting_cards,
+            'planner candidate paid residual')
+        candidate_paid_launch = _capacity_for_accounting_cards(
+            candidate.paid_launch_target, accounting_cards,
+            'planner candidate paid launch target')
+        candidate_static_fill = _capacity_for_accounting_cards(
+            candidate.static_prefill_target, accounting_cards,
+            'planner candidate static prefill target')
+        complete_commitment = {
+            card: commitment.get(card, 0) for card in sorted(accounting_cards)
+        }
+        complete_paid = {
+            card: paid.get(card, 0) for card in sorted(accounting_cards)
+        }
+        complete_paid_launch = {
+            card: paid_launch.get(card, 0) for card in sorted(accounting_cards)
+        }
+        complete_static_fill = {
+            card: static_fill.get(card, 0) for card in sorted(accounting_cards)
+        }
+        if candidate_target != target:
+            raise ValueError('Capacity planner envelope changes its traffic '
+                             'target.')
+        if candidate_commitment != complete_commitment:
+            raise ValueError('Capacity planner envelope changes its new '
+                             'reservation commitment.')
+        if candidate_paid != complete_paid:
+            raise ValueError('Capacity planner envelope changes its paid '
+                             'residual.')
+        if candidate_paid_launch != complete_paid_launch:
+            raise ValueError('Capacity planner envelope changes its paid '
+                             'launch target.')
+        if candidate_static_fill != complete_static_fill:
+            raise ValueError('Capacity planner envelope changes its static '
+                             'prefill target.')
         return target
 
 
@@ -501,20 +898,25 @@ class PaidLaunchAuthority:
     demand_feed_generation: int
     demand_source_epoch: int
     paid_residual_by_accelerator: tuple[tuple[str, int], ...]
+    paid_launch_target_by_accelerator: tuple[tuple[str, int], ...]
     reserved_fill_authority: ReservedFillPlanAuthority
 
-    def remaining(self) -> dict[str, int]:
+    def economic_residual(self) -> dict[str, int]:
         return dict(self.paid_residual_by_accelerator)
+
+    def remaining_launch_capacity(self) -> dict[str, int]:
+        return dict(self.paid_launch_target_by_accelerator)
 
     def claim_values(self, accelerator: str, units: int = 1) -> dict[str, Any]:
         card = accelerator.casefold()
         _positive_int(units, 'units')
-        remaining = self.remaining()
+        remaining = self.remaining_launch_capacity()
         debit_card = (card if remaining.get(card, 0) >= units else
                       AGGREGATE_ACCELERATOR)
         if remaining.get(debit_card, 0) < units:
             raise CapacityAdmissionConflict(
-                f'Capacity plan has no paid residual for {card!r}.')
+                f'Capacity plan has no whole-backend paid launch authority '
+                f'for {card!r}.')
         return {
             'capacity_plan_generation': self.generation,
             'capacity_plan_sha256': self.content_sha256,
@@ -525,28 +927,557 @@ class PaidLaunchAuthority:
         }
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class CommittedFillDemandWitness:
+    """Fresh PostgreSQL-committed demand semantics for the fill gate.
+
+    This witness is deliberately longer-lived than provider-effect authority.
+    ``serve_capacity_plan_heads.valid_until`` continues to fence launches at
+    the short capacity-plan TTL; the fill poller uses ``refreshed_at`` with a
+    separate bounded horizon only to acquire reservation entitlement.  The
+    semantic digest excludes live replica, intent, reservation, and scheduler
+    inventory so materializing the plan cannot invalidate the demand that
+    caused it.
+    """
+
+    service_name: str
+    service_hash: str
+    service_lifecycle_epoch: int
+    service_version: int
+    demand_source_epoch: int
+    demand_feed_generation: int
+    route_generation: int
+    route_sha256: str
+    route_source_epoch: int
+    capacity_plan_generation: int
+    capacity_plan_sha256: str
+    target_capacity: int
+    semantic_sha256: str
+    refreshed_at: datetime.datetime
+
+    def __post_init__(self) -> None:
+        positive = (
+            self.service_lifecycle_epoch,
+            self.service_version,
+            self.demand_source_epoch,
+            self.demand_feed_generation,
+            self.route_generation,
+            self.route_source_epoch,
+            self.capacity_plan_generation,
+        )
+        if (not isinstance(self.service_name, str) or not self.service_name or
+                not isinstance(self.service_hash, str) or
+                not self.service_hash or
+                any(type(value) is not int or value < 1 for value in positive)
+                or type(self.target_capacity) is not int or
+                self.target_capacity < 0 or
+                _SHA256_RE.fullmatch(self.route_sha256) is None or
+                _SHA256_RE.fullmatch(self.capacity_plan_sha256) is None or
+                _SHA256_RE.fullmatch(self.semantic_sha256) is None or
+                not isinstance(self.refreshed_at, datetime.datetime)):
+            raise ValueError('Committed fill-demand witness is malformed.')
+
+
+def _notify_fill_demand_witness(service_name: str,
+                                semantic_sha256: str) -> None:
+    """Wake this process's poller after a committed semantic plan."""
+    if _SHA256_RE.fullmatch(semantic_sha256) is None:
+        raise ValueError('Fill-demand witness wake digest is malformed.')
+    with _FILL_DEMAND_WITNESS_WAKE:
+        if (_FILL_DEMAND_WITNESS_WAKE_DIGEST.get(service_name) ==
+                semantic_sha256):
+            return
+        _FILL_DEMAND_WITNESS_WAKE_DIGEST[service_name] = semantic_sha256
+        _FILL_DEMAND_WITNESS_WAKE_SEQUENCE[service_name] = (
+            _FILL_DEMAND_WITNESS_WAKE_SEQUENCE.get(service_name, 0) + 1)
+        _FILL_DEMAND_WITNESS_WAKE.notify_all()
+
+
+def fill_demand_witness_wake_sequence(service_name: str) -> int:
+    """Return the process-local lost-wakeup token for one service."""
+    with _FILL_DEMAND_WITNESS_WAKE:
+        return _FILL_DEMAND_WITNESS_WAKE_SEQUENCE.get(service_name, 0)
+
+
+def wait_for_fill_demand_witness(
+    service_name: str,
+    after_sequence: int,
+    timeout_seconds: float,
+    stop_event: threading.Event | None = None,
+) -> tuple[int, bool]:
+    """Wait for plan publication without making the wakeup authoritative."""
+    if (not isinstance(service_name, str) or not service_name or
+            type(after_sequence) is not int or after_sequence < 0 or
+            not isinstance(timeout_seconds, (int, float)) or
+            isinstance(timeout_seconds, bool) or timeout_seconds < 0):
+        raise ValueError('Fill-demand witness wait is malformed.')
+    deadline = time.monotonic() + float(timeout_seconds)
+    with _FILL_DEMAND_WITNESS_WAKE:
+        while (_FILL_DEMAND_WITNESS_WAKE_SEQUENCE.get(service_name, 0)
+               <= after_sequence):
+            if stop_event is not None and stop_event.is_set():
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # The stop event does not share this condition. Bound its shutdown
+            # latency without a second event/condition ownership protocol.
+            _FILL_DEMAND_WITNESS_WAKE.wait(timeout=min(remaining, 1.0))
+        current = _FILL_DEMAND_WITNESS_WAKE_SEQUENCE.get(service_name, 0)
+    return current, current > after_sequence
+
+
+@dataclasses.dataclass(frozen=True)
+class CommittedCapacityPlan:
+    """One planner candidate proven committed under the PostgreSQL fence."""
+
+    authority: PaidLaunchAuthority
+    demand_snapshot: demand_state.DurableAutoscalingSnapshot
+    planner_snapshot: capacity_planning.CapacityPlanningSnapshot
+    candidate: capacity_planning.CapacityPlanCandidate
+    allocation_map: AuthenticatedAllocationMap | None
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.authority, PaidLaunchAuthority) or
+                not isinstance(self.demand_snapshot,
+                               demand_state.DurableAutoscalingSnapshot) or
+                not isinstance(self.planner_snapshot,
+                               capacity_planning.CapacityPlanningSnapshot) or
+                not isinstance(self.candidate,
+                               capacity_planning.CapacityPlanCandidate) or
+                self.candidate.snapshot_fingerprint
+                != self.planner_snapshot.fingerprint):
+            raise ValueError('Committed capacity plan is malformed.')
+        if self.allocation_map is not None and not isinstance(
+                self.allocation_map,
+                reserved_fill_planner.AuthenticatedAllocationMap):
+            raise ValueError('Committed capacity plan allocation is malformed.')
+
+
 @dataclasses.dataclass(frozen=True)
 class ReservedSupplyProjection:
-    """Exact additional zero-cost supply used by economic demand placement."""
+    """One PostgreSQL-locked supply and scheduler-capacity projection.
+
+    ``economic_kueue_capacity`` is the complete typed Kueue view produced by
+    the same transaction as ``economic_replica_infos`` and the economic
+    inventory.  Durable local actuation must consume this object directly;
+    a pre-lock controller observation is not launch or retirement authority.
+    """
 
     pending_zero_cost_capacity_by_accelerator: Mapping[str, int]
     allocation_reserved_capacity_by_accelerator: Mapping[str, int]
     economic_replica_infos: tuple[Any, ...]
-    economic_kueue_capacity_by_replica_id: Mapping[
-        int, kueue_lane_capacity.KueueReplicaCapacityClass]
+    economic_kueue_capacity: (kueue_lane_capacity.KueueReplicaCapacitySnapshot)
     economic_capacity_graph_sha256: str
+    existing_zero_cost_capacity_by_accelerator: Mapping[str, int] = (
+        dataclasses.field(default_factory=dict))
+    existing_paid_capacity_by_accelerator: Mapping[str,
+                                                   int] = (dataclasses.field(
+                                                       default_factory=dict))
+    charged_paid_gpu_units: int = 0
+    authenticated_capacity_by_accelerator: Mapping[str,
+                                                   int] = (dataclasses.field(
+                                                       default_factory=dict))
+    eligible_capacity_by_accelerator: Mapping[str, int] = (dataclasses.field(
+        default_factory=dict))
+    policy: ReservedSupplyPolicy = ReservedSupplyPolicy.DISABLED
+    evidence_state: ReservedSupplyEvidenceState = (
+        ReservedSupplyEvidenceState.NOT_APPLICABLE)
+    fill_policy_sha256: str = ''
+    reservation_evidence_sha256: str = ''
+    demand_witness_scope_sha256: str = ''
+    allocation_demand_witness_sha256: str | None = None
+    allocation_demonstrated_need: int | None = None
+    allocation_ceiling: int = 0
+    allocation_map: Any | None = None
     reserved_accelerators: tuple[str, ...] = ()
     allocation_bound: bool = True
 
+    def __post_init__(self) -> None:
+        fields = (
+            'pending_zero_cost_capacity_by_accelerator',
+            'allocation_reserved_capacity_by_accelerator',
+            'existing_zero_cost_capacity_by_accelerator',
+            'existing_paid_capacity_by_accelerator',
+            'authenticated_capacity_by_accelerator',
+            'eligible_capacity_by_accelerator',
+        )
+        canonical: dict[str, dict[str, int]] = {}
+        for field in fields:
+            canonical[field] = _canonical_counts(getattr(self, field), field)
+            object.__setattr__(self, field, canonical[field])
+        if (not isinstance(self.policy, ReservedSupplyPolicy) or
+                not isinstance(self.evidence_state, ReservedSupplyEvidenceState)
+                or type(self.allocation_bound) is not bool or
+                not isinstance(self.economic_replica_infos, tuple) or
+                not isinstance(self.economic_kueue_capacity,
+                               kueue_lane_capacity.KueueReplicaCapacitySnapshot)
+                or not isinstance(self.economic_capacity_graph_sha256, str) or
+                _SHA256_RE.fullmatch(self.economic_capacity_graph_sha256)
+                is None or not isinstance(self.fill_policy_sha256, str) or
+                _SHA256_RE.fullmatch(self.fill_policy_sha256) is None or
+                not isinstance(self.reservation_evidence_sha256, str) or
+                not isinstance(self.demand_witness_scope_sha256, str) or
+            (self.allocation_demand_witness_sha256 is not None and
+             (not isinstance(self.allocation_demand_witness_sha256, str) or
+              _SHA256_RE.fullmatch(
+                  self.allocation_demand_witness_sha256) is None)) or
+            (self.allocation_demonstrated_need is not None and
+             (type(self.allocation_demonstrated_need) is not int or
+              self.allocation_demonstrated_need < 0)) or
+                type(self.allocation_ceiling) is not int or
+                self.allocation_ceiling < 0 or
+                type(self.charged_paid_gpu_units) is not int or
+                self.charged_paid_gpu_units < 0):
+            raise ValueError('Reserved supply projection is malformed.')
+        if (not isinstance(self.reserved_accelerators, tuple) or
+                any(not isinstance(card, str) or not card
+                    for card in self.reserved_accelerators) or
+                tuple(sorted(set(self.reserved_accelerators)))
+                != self.reserved_accelerators):
+            raise ValueError('Reserved supply accelerator catalog is invalid.')
+        if self.allocation_bound != (self.allocation_map is not None):
+            raise ValueError('Reserved supply allocation binding is malformed.')
+        authenticated = canonical['authenticated_capacity_by_accelerator']
+        eligible = canonical['eligible_capacity_by_accelerator']
+        allocation_reserved = canonical[
+            'allocation_reserved_capacity_by_accelerator']
+        if any(count > authenticated.get(card, 0)
+               for card, count in eligible.items()):
+            raise ValueError('Eligible reserved supply exceeds its envelope.')
+        if self.policy is ReservedSupplyPolicy.DISABLED:
+            if (self.evidence_state
+                    is not ReservedSupplyEvidenceState.NOT_APPLICABLE or
+                    self.reservation_evidence_sha256 or self.allocation_bound or
+                    self.demand_witness_scope_sha256 or
+                    self.allocation_demand_witness_sha256 is not None or
+                    self.allocation_demonstrated_need is not None or
+                    self.allocation_ceiling != 0 or
+                    any(authenticated.values()) or any(eligible.values()) or
+                    any(allocation_reserved.values())):
+                raise ValueError('Disabled reserved supply grants authority.')
+        else:
+            if (_SHA256_RE.fullmatch(self.reservation_evidence_sha256) is None):
+                raise ValueError('Enabled reserved supply has malformed '
+                                 'reservation evidence.')
+            if self.evidence_state is (
+                    ReservedSupplyEvidenceState.NOT_APPLICABLE):
+                raise ValueError('Enabled reserved supply has no evidence '
+                                 'state.')
+        if self.policy is ReservedSupplyPolicy.DEMAND_GATED:
+            if (_SHA256_RE.fullmatch(self.demand_witness_scope_sha256) is None
+                    or not self.reserved_accelerators):
+                raise ValueError('Gated reserved supply has no witness scope.')
+            if (self.evidence_state
+                    is ReservedSupplyEvidenceState.AUTHENTICATED_SETTLED and
+                (self.allocation_demand_witness_sha256 is None or
+                 self.allocation_demonstrated_need is None)):
+                raise ValueError(
+                    'Settled gated reserved supply has no demand witness.')
+        elif (self.demand_witness_scope_sha256 or
+              self.allocation_demand_witness_sha256 is not None or
+              self.allocation_demonstrated_need is not None or
+              self.allocation_ceiling != 0):
+            raise ValueError('Ungated reserved supply carries gate evidence.')
+        if self.evidence_state in (
+                ReservedSupplyEvidenceState.AUTHENTICATED_UNSETTLED,
+                ReservedSupplyEvidenceState.UNAVAILABLE) and eligible:
+            raise ValueError('Ineligible reservation evidence grants supply.')
+        if (self.evidence_state is ReservedSupplyEvidenceState.UNAVAILABLE and
+            (self.allocation_bound or authenticated)):
+            raise ValueError('Unavailable reservation evidence is bound.')
+
     def additional_capacity_by_accelerator(self) -> dict[str, int]:
         cards = (set(self.pending_zero_cost_capacity_by_accelerator) |
-                 set(self.allocation_reserved_capacity_by_accelerator))
+                 set(self.eligible_capacity_by_accelerator))
         return {
-            card: (
-                self.pending_zero_cost_capacity_by_accelerator.get(card, 0) +
-                self.allocation_reserved_capacity_by_accelerator.get(card, 0)
-            ) for card in sorted(cards)
+            card: (self.pending_zero_cost_capacity_by_accelerator.get(card, 0) +
+                   self.eligible_capacity_by_accelerator.get(card, 0)
+                  ) for card in sorted(cards)
         }
+
+
+def _validate_planner_against_locked_supply(
+    *,
+    planner_snapshot: capacity_planning.CapacityPlanningSnapshot,
+    candidate: capacity_planning.CapacityPlanCandidate,
+    service_version: int,
+    accounting_cards: set[str],
+    capacity_target: Mapping[str, int],
+    reservation_commitment: Mapping[str, int],
+    static_fill_target: Mapping[str, int],
+    supply_projection: ReservedSupplyProjection | None,
+    expected_planning_state_fingerprint: str | None,
+) -> None:
+    """Bind a pure planner envelope to the PostgreSQL-locked supply facts."""
+    configured_cards = {
+        card.casefold() for card in planner_snapshot.configured_accelerators
+    }
+    if (planner_snapshot.service_version != service_version or
+            configured_cards != accounting_cards):
+        raise CapacityAdmissionConflict(
+            'Planner snapshot names a different service version or card set.')
+    expected_source_fingerprint = expected_planning_state_fingerprint
+    if supply_projection is not None:
+        expected_source_fingerprint = locked_planning_source_fingerprint(
+            expected_planning_state_fingerprint,
+            supply_projection.economic_capacity_graph_sha256)
+    if (expected_source_fingerprint is not None and
+            planner_snapshot.source_fingerprint != expected_source_fingerprint):
+        raise CapacityAdmissionConflict(
+            'Planner snapshot names a different locked planning or scheduler '
+            'capacity state.')
+    if (candidate.source_generation != planner_snapshot.source_generation or
+            candidate.snapshot_fingerprint != planner_snapshot.fingerprint):
+        raise CapacityAdmissionConflict(
+            'Planner candidate names a different snapshot generation.')
+    configured_names = {
+        card.casefold(): card
+        for card in planner_snapshot.configured_accelerators
+    }
+    try:
+        expected_reservation_catalog = (
+            () if supply_projection is None else tuple(
+                sorted((configured_names[card.casefold()]
+                        for card in supply_projection.reserved_accelerators),
+                       key=str.casefold)))
+    except KeyError as error:
+        raise CapacityAdmissionConflict(
+            'Locked reservation catalog names an unconfigured card.') from error
+    expected_witness_scope = ('' if supply_projection is None else
+                              supply_projection.demand_witness_scope_sha256)
+    if (planner_snapshot.configured_reservation_accelerators
+            != expected_reservation_catalog or
+            planner_snapshot.demand_witness_scope_sha256
+            != expected_witness_scope):
+        raise CapacityAdmissionConflict(
+            'Planner reservation catalog or witness scope changed under lock.')
+
+    expected_target = {
+        card: capacity_target.get(card, 0) for card in sorted(accounting_cards)
+    }
+    expected_commitment = {
+        card: reservation_commitment.get(card, 0)
+        for card in sorted(accounting_cards)
+    }
+    expected_static = {
+        card: static_fill_target.get(card, 0)
+        for card in sorted(accounting_cards)
+    }
+    comparisons = (
+        (candidate.supply_aware_demand_target, expected_target,
+         'traffic target'),
+        (candidate.new_reserved_capacity_committed, expected_commitment,
+         'new reservation commitment'),
+        (candidate.static_prefill_target, expected_static,
+         'static prefill target'),
+    )
+    for capacity, expected, subject in comparisons:
+        try:
+            actual = _capacity_for_accounting_cards(
+                capacity, accounting_cards, f'planner candidate {subject}')
+        except ValueError as error:
+            raise CapacityAdmissionConflict(
+                f'Planner candidate {subject} is outside locked accounting.'
+            ) from error
+        if actual != expected:
+            raise CapacityAdmissionConflict(
+                f'Planner candidate {subject} changed before publication.')
+    for field, subject in (
+        ('paid_residual', 'paid residual'),
+        ('paid_launch_target', 'paid launch target'),
+        ('paid_packing_padding_target', 'paid packing padding'),
+    ):
+        try:
+            _capacity_for_accounting_cards(getattr(candidate,
+                                                   field), accounting_cards,
+                                           f'planner candidate {subject}')
+        except ValueError as error:
+            raise CapacityAdmissionConflict(
+                f'Planner candidate {subject} is outside locked accounting.'
+            ) from error
+
+    reservation = planner_snapshot.reservation
+    expected_reservation_capacities: Mapping[str, Mapping[str, int]]
+    if supply_projection is None:
+        expected_policy = (
+            capacity_planning.ReservationGatePolicy.NOT_CONFIGURED)
+        expected_evidence = (
+            capacity_planning.ReservationEvidenceState.NOT_APPLICABLE)
+        expected_fingerprint = ''
+        expected_reservation_capacities = {
+            field: {
+                card: 0 for card in sorted(accounting_cards)
+            } for field in ('authenticated_capacity', 'eligible_capacity',
+                           'pending_zero_cost_capacity',
+                           'existing_zero_cost_capacity',
+                           'existing_paid_capacity')
+        }
+    else:
+        expected_policy = {
+            ReservedSupplyPolicy.DISABLED:
+                capacity_planning.ReservationGatePolicy.NOT_CONFIGURED,
+            ReservedSupplyPolicy.STATIC_PREFILL:
+                capacity_planning.ReservationGatePolicy.UNGATED,
+            ReservedSupplyPolicy.DEMAND_GATED:
+                capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+        }[supply_projection.policy]
+        expected_evidence = {
+            ReservedSupplyEvidenceState.NOT_APPLICABLE:
+                capacity_planning.ReservationEvidenceState.NOT_APPLICABLE,
+            ReservedSupplyEvidenceState.AUTHENTICATED_SETTLED:
+                capacity_planning.ReservationEvidenceState.
+                AUTHENTICATED_SETTLED,
+            ReservedSupplyEvidenceState.AUTHENTICATED_UNSETTLED:
+                capacity_planning.ReservationEvidenceState.
+                AUTHENTICATED_UNSETTLED,
+            ReservedSupplyEvidenceState.UNAVAILABLE:
+                capacity_planning.ReservationEvidenceState.UNAVAILABLE,
+        }[supply_projection.evidence_state]
+        expected_fingerprint = supply_projection.reservation_evidence_sha256
+        expected_reservation_capacities = {
+            'authenticated_capacity':
+                supply_projection.authenticated_capacity_by_accelerator,
+            'eligible_capacity':
+                supply_projection.eligible_capacity_by_accelerator,
+            'pending_zero_cost_capacity':
+                supply_projection.pending_zero_cost_capacity_by_accelerator,
+            'existing_zero_cost_capacity':
+                supply_projection.existing_zero_cost_capacity_by_accelerator,
+            'existing_paid_capacity':
+                supply_projection.existing_paid_capacity_by_accelerator,
+        }
+    expected_charged_paid_gpu_units = (0 if supply_projection is None else
+                                       supply_projection.charged_paid_gpu_units)
+    expected_allocation_witness = (
+        None if supply_projection is None else
+        supply_projection.allocation_demand_witness_sha256)
+    expected_demonstrated_need = (
+        None if supply_projection is None else
+        supply_projection.allocation_demonstrated_need)
+    expected_allocation_ceiling = (0 if supply_projection is None else
+                                   supply_projection.allocation_ceiling)
+    if (reservation.gate_policy is not expected_policy or
+            reservation.evidence_state is not expected_evidence or
+            reservation.evidence_fingerprint != expected_fingerprint or
+            reservation.charged_paid_gpu_units
+            != expected_charged_paid_gpu_units or
+            reservation.allocation_demand_witness_sha256
+            != expected_allocation_witness or
+            reservation.allocation_demonstrated_need
+            != expected_demonstrated_need or
+            reservation.allocation_ceiling != expected_allocation_ceiling):
+        raise CapacityAdmissionConflict(
+            'Planner reservation policy or evidence changed under lock.')
+    for field, expected_counts in expected_reservation_capacities.items():
+        try:
+            actual = _capacity_for_accounting_cards(
+                getattr(reservation, field), accounting_cards,
+                f'planner reservation {field}')
+            expected = _canonical_counts(expected_counts, field)
+        except ValueError as error:
+            raise CapacityAdmissionConflict(
+                'Planner reservation evidence is outside locked accounting.'
+            ) from error
+        expected = {
+            card: expected.get(card, 0) for card in sorted(accounting_cards)
+        }
+        if actual != expected:
+            raise CapacityAdmissionConflict(
+                f'Planner reservation {field} changed under lock.')
+    try:
+        launch_target = _capacity_for_accounting_cards(
+            candidate.reserved_launch_target, accounting_cards,
+            'planner candidate reserved launch target')
+        locked_eligible = _canonical_counts(
+            expected_reservation_capacities['eligible_capacity'],
+            'eligible_capacity')
+    except ValueError as error:
+        raise CapacityAdmissionConflict(
+            'Planner reserved launch target is outside locked accounting.'
+        ) from error
+    locked_eligible = {
+        card: locked_eligible.get(card, 0) for card in sorted(accounting_cards)
+    }
+    if any(
+            launch_target.get(card, 0) > locked_eligible.get(card, 0)
+            for card in accounting_cards):
+        raise CapacityAdmissionConflict(
+            'Planner reserved launch target exceeds locked eligible supply.')
+    if any(
+            expected_commitment.get(card, 0) > launch_target.get(card, 0)
+            for card in accounting_cards):
+        raise CapacityAdmissionConflict(
+            'Planner reservation debit exceeds its physical launch target.')
+
+
+def _validate_committed_plan_row(
+    row: Mapping[str, Any],
+    *,
+    expected_snapshot: capacity_planning.CapacityPlanningSnapshot,
+    expected_candidate: capacity_planning.CapacityPlanCandidate,
+    accounting_cards: set[str],
+    demand_feed_generation: int,
+) -> PaidLaunchAuthority:
+    """Authenticate the SELECT-after-write row before exposing authority."""
+    payload = row.get('payload')
+    digest = row.get('content_sha256')
+    if (not isinstance(payload, Mapping) or not isinstance(digest, str) or
+            _SHA256_RE.fullmatch(digest) is None or
+            capacity_plan_content_sha256(payload) != digest):
+        raise CapacityAdmissionConflict(
+            'Persisted capacity plan content hash is invalid.')
+    required_fields = {
+        'protocol_version', 'service', 'source', 'normalized_demand',
+        'capacity_target_by_accelerator',
+        'existing_zero_cost_capacity_by_accelerator',
+        'pending_zero_cost_capacity_by_accelerator',
+        'allocation_reserved_capacity_by_accelerator',
+        'existing_paid_capacity_by_accelerator', 'paid_residual_by_accelerator',
+        'paid_launch_target_by_accelerator', 'reserved_fill_authority',
+        'planner'
+    }
+    allowed_fields = required_fields | {'economic_capacity_graph_sha256'}
+    if not required_fields.issubset(payload) or set(payload) - allowed_fields:
+        raise CapacityAdmissionConflict(
+            'Persisted capacity plan has an open or incomplete schema.')
+    try:
+        planner_snapshot, candidate = _decode_planner_payload(
+            payload['planner'])
+        target = _canonical_counts(payload['capacity_target_by_accelerator'],
+                                   'capacity_target_by_accelerator')
+        commitment = _canonical_counts(
+            payload['allocation_reserved_capacity_by_accelerator'],
+            'allocation_reserved_capacity_by_accelerator')
+        paid = _canonical_counts(payload['paid_residual_by_accelerator'],
+                                 'paid_residual_by_accelerator')
+        paid_launch = _canonical_counts(
+            payload['paid_launch_target_by_accelerator'],
+            'paid_launch_target_by_accelerator')
+        expected_target = _capacity_for_accounting_cards(
+            candidate.supply_aware_demand_target, accounting_cards,
+            'persisted planner traffic target')
+        expected_commitment = _capacity_for_accounting_cards(
+            candidate.new_reserved_capacity_committed, accounting_cards,
+            'persisted planner reservation commitment')
+        expected_paid = _positive_counts(
+            _capacity_for_accounting_cards(candidate.paid_residual,
+                                           accounting_cards,
+                                           'persisted planner paid residual'))
+        expected_paid_launch = _positive_counts(
+            _capacity_for_accounting_cards(
+                candidate.paid_launch_target, accounting_cards,
+                'persisted planner paid launch target'))
+    except (KeyError, TypeError, ValueError) as error:
+        raise CapacityAdmissionConflict(
+            'Persisted capacity plan planner envelope is invalid.') from error
+    if (planner_snapshot != expected_snapshot or
+            candidate != expected_candidate or target != expected_target or
+            commitment != expected_commitment or paid != expected_paid or
+            paid_launch != expected_paid_launch):
+        raise CapacityAdmissionConflict(
+            'Persisted capacity plan differs from its committed candidate.')
+    return _authority(row, demand_feed_generation=demand_feed_generation)
 
 
 def _authority(
@@ -559,6 +1490,9 @@ def _authority(
         raise CapacityAdmissionConflict('Capacity plan payload is malformed.')
     paid = _canonical_counts(payload.get('paid_residual_by_accelerator', {}),
                              'paid_residual_by_accelerator')
+    paid_launch = _canonical_counts(
+        payload.get('paid_launch_target_by_accelerator', {}),
+        'paid_launch_target_by_accelerator')
     try:
         reserved_fill_authority = ReservedFillPlanAuthority.from_mapping(
             payload.get('reserved_fill_authority'))
@@ -575,6 +1509,7 @@ def _authority(
             None else demand_feed_generation),
         demand_source_epoch=int(row['demand_source_epoch']),
         paid_residual_by_accelerator=tuple(paid.items()),
+        paid_launch_target_by_accelerator=tuple(paid_launch.items()),
         reserved_fill_authority=reserved_fill_authority)
 
 
@@ -613,6 +1548,12 @@ def _validate_reserved_fill_authority_in_connection(
                 'Paid plan no longer proves static incompatibility with the '
                 'current reserved worker projection.')
         return None
+    if authority.mode is ReservedFillPlanAuthorityMode.GATE_INELIGIBLE:
+        # Decode retained rows so recovery can inspect them, but never let the
+        # former no-allocation escape authorize a new provider effect.  A
+        # current writer replaces it through the causal allocation path.
+        raise CapacityAdmissionConflict(
+            'Legacy reservation-ineligible paid authority is fail-closed.')
     binding = authority.allocation
     assert binding is not None
     if not reserved_fill_binding_required:
@@ -651,6 +1592,8 @@ class _ReservedFillServiceConfig:
     capacity_unit: FillCapacityUnit
     reserved_accelerators: tuple[str, ...] | None
     worker_projection_sha256: str | None
+    configured_utilization_gate: bool
+    fill_policy_sha256: str
 
 
 def _reserved_fill_service_config_in_connection(
@@ -685,6 +1628,7 @@ def _reserved_fill_service_config_in_connection(
         maximum = (spec.max_replicas
                    if spec.max_replicas is not None else spec.min_replicas)
         replica_unit = spec.replica_unit
+        configured_utilization_gate = spec.reserved_fill_utilization_gate
     except Exception as error:  # pylint: disable=broad-except
         raise CapacityAdmissionConflict(
             'Current service version reserved-fill spec is malformed.'
@@ -692,6 +1636,9 @@ def _reserved_fill_service_config_in_connection(
     if type(fill_enabled) is not bool:
         raise CapacityAdmissionConflict(
             'Current service version reserved-fill selector is malformed.')
+    if type(configured_utilization_gate) is not bool:
+        raise CapacityAdmissionConflict(
+            'Current service version utilization gate is malformed.')
     mode = service.get('reserved_fill_actuation_mode')
     if mode not in ('DIRECT_REPLICA', 'DURABLE_INTENT'):
         raise CapacityAdmissionConflict(
@@ -721,12 +1668,22 @@ def _reserved_fill_service_config_in_connection(
                 for projection in worker_projections
             }))
         worker_projection_sha256 = _sha256(worker_projections)
+    fill_policy_sha256 = _sha256({
+        'binding_required': fill_enabled and mode == 'DURABLE_INTENT',
+        'max_capacity': maximum,
+        'capacity_unit': capacity_unit.value,
+        'configured_utilization_gate': configured_utilization_gate,
+        'reserved_accelerators': reserved_accelerators,
+        'worker_projection_sha256': worker_projection_sha256,
+    })
     return _ReservedFillServiceConfig(
         binding_required=fill_enabled and mode == 'DURABLE_INTENT',
         max_capacity=maximum,
         capacity_unit=capacity_unit,
         reserved_accelerators=(reserved_accelerators),
-        worker_projection_sha256=(worker_projection_sha256))
+        worker_projection_sha256=(worker_projection_sha256),
+        configured_utilization_gate=configured_utilization_gate,
+        fill_policy_sha256=fill_policy_sha256)
 
 
 def _reserved_fill_binding_required_in_connection(
@@ -736,6 +1693,95 @@ def _reserved_fill_binding_required_in_connection(
     """Read the elected immutable service-spec discriminator under lock."""
     return _reserved_fill_service_config_in_connection(connection,
                                                        service).binding_required
+
+
+def _reservation_evidence_sha256(
+    config: _ReservedFillServiceConfig,
+    allocation: AuthenticatedAllocationMap | None,
+) -> str:
+    """Fingerprint the exact locked allocation presence and fill policy."""
+    if not config.binding_required:
+        # A disabled reservation protocol has no reservation evidence.  Its
+        # locked existing zero-cost and paid inventory remains planner supply,
+        # but it must not be confused with authority for a new fill launch.
+        return ''
+    return _sha256({
+        'schema_version': 1,
+        'fill_policy_sha256': config.fill_policy_sha256,
+        'allocation_identity':
+            (None if allocation is None else allocation.identity.to_mapping()),
+    })
+
+
+def _reserved_supply_policy_and_evidence(
+    config: _ReservedFillServiceConfig,
+    allocation: AuthenticatedAllocationMap | None,
+    allocation_reserved: Mapping[str, int],
+) -> tuple[ReservedSupplyPolicy, ReservedSupplyEvidenceState, dict[str, int],
+           dict[str, int]]:
+    """Classify locked reservation evidence without erasing paid demand."""
+    if not config.binding_required:
+        return (ReservedSupplyPolicy.DISABLED,
+                ReservedSupplyEvidenceState.NOT_APPLICABLE, {}, {})
+    policy = (ReservedSupplyPolicy.DEMAND_GATED
+              if config.configured_utilization_gate else
+              ReservedSupplyPolicy.STATIC_PREFILL)
+    if allocation is None:
+        return (policy, ReservedSupplyEvidenceState.UNAVAILABLE, {}, {})
+    authenticated = _canonical_counts(allocation_reserved,
+                                      'authenticated_capacity_by_accelerator')
+    gate_settled = bool(
+        policy is ReservedSupplyPolicy.STATIC_PREFILL or
+        (allocation.utilization_gate_armed and
+         allocation.utilization_demonstrated_need is not None and
+         allocation.utilization_demand_witness_sha256 is not None and
+         allocation.upward_grants_settled))
+    if not gate_settled:
+        return (policy, ReservedSupplyEvidenceState.AUTHENTICATED_UNSETTLED,
+                authenticated, {})
+    return (policy, ReservedSupplyEvidenceState.AUTHENTICATED_SETTLED,
+            authenticated, dict(authenticated))
+
+
+def _require_demand_causal_allocation(
+    config: _ReservedFillServiceConfig,
+    allocation: AuthenticatedAllocationMap | None,
+    candidate: capacity_planning.CapacityPlanCandidate,
+    *,
+    positive_target: bool,
+) -> None:
+    """Fence compatible paid planning behind the exact utilization witness."""
+    if candidate.kind is capacity_planning.CapacityPlanKind.GATE_ACQUISITION:
+        if positive_target or not config.configured_utilization_gate:
+            raise CapacityAdmissionConflict(
+                'Gate acquisition carries capacity or has no configured gate.')
+        return
+    if not positive_target:
+        return
+    if (candidate.reservation_demand_relation
+            is capacity_planning.ReservationDemandRelation.STATICALLY_DISJOINT):
+        return
+    if (candidate.reservation_demand_relation
+            is not capacity_planning.ReservationDemandRelation.COMPATIBLE):
+        raise CapacityAdmissionConflict(
+            'Positive reservation demand has no typed compatibility proof.')
+    if allocation is None:
+        raise CapacityAdmissionConflict(
+            'Positive reservation-compatible demand has no current reserved '
+            'allocation.')
+    if not config.configured_utilization_gate:
+        return
+    current_target = candidate.aggregate_demand_target
+    if (not allocation.utilization_gate_armed or
+            allocation.utilization_demand_witness_sha256
+            != candidate.demand_witness_sha256 or
+            allocation.utilization_demonstrated_need is None or
+            not allocation.upward_grants_settled or
+            allocation.utilization_demonstrated_need < current_target or
+            allocation.utilization_ceiling < current_target):
+        raise CapacityAdmissionConflict(
+            'Current utilization-gated allocation does not causally cover '
+            'the locked SLA target.')
 
 
 def _require_postgres(connection: sqlalchemy.engine.Connection) -> None:
@@ -789,6 +1835,11 @@ class _LockedCapacityRows:
     live_intent_keys: frozenset[str]
     planned_capacity_by_intent_key: Mapping[str, int]
     capacity_unit_by_intent_key: Mapping[str, str]
+    # Complete same-name intent census across service hashes.  The economic
+    # projection consumes only ``intent_rows`` for the current incarnation,
+    # while recreate fencing must also see a late handler retained by an old
+    # incarnation.
+    all_service_intent_rows: tuple[Mapping[str, Any], ...] = ()
 
 
 def _lock_capacity_rows(
@@ -799,12 +1850,13 @@ def _lock_capacity_rows(
     now: datetime.datetime,
 ) -> _LockedCapacityRows:
     """Lock the complete capacity graph before sorted Kueue admission rows."""
-    intent_rows = connection.execute(
+    all_service_intent_rows = connection.execute(
         sqlalchemy.select(_ZERO_COST_INTENTS).where(
-            _ZERO_COST_INTENTS.c.service_name == service_name,
-            _ZERO_COST_INTENTS.c.service_hash == service_hash).order_by(
+            _ZERO_COST_INTENTS.c.service_name == service_name).order_by(
                 _ZERO_COST_INTENTS.c.intent_idempotency_key).with_for_update()
     ).mappings().all()
+    intent_rows = tuple(row for row in all_service_intent_rows
+                        if row['service_hash'] == service_hash)
     replica_state_sha256 = replica_state_semantic_sha256_expression(
         _REPLICAS.c.replica_state).label('_replica_state_sha256')
     replica_rows = connection.execute(
@@ -867,7 +1919,8 @@ def _lock_capacity_rows(
             provider_present_replica_record_ids),
         live_intent_keys=frozenset(live_intent_keys),
         planned_capacity_by_intent_key=planned_capacity_by_intent_key,
-        capacity_unit_by_intent_key=capacity_unit_by_intent_key)
+        capacity_unit_by_intent_key=capacity_unit_by_intent_key,
+        all_service_intent_rows=tuple(all_service_intent_rows))
 
 
 def _locked_planning_state_fingerprint(service: Mapping[str, Any],
@@ -930,6 +1983,100 @@ def _lock_kueue_projection(
     return projection
 
 
+def _require_recreated_logical_version_is_clean(
+    service: Mapping[str, Any],
+    config: _ReservedFillServiceConfig,
+    locked: _LockedCapacityRows,
+    lane_projection: kueue_lane_capacity.KueueAdmissionCapacityProjection,
+) -> None:
+    """Fence a recreated logical service from an older provider graph.
+
+    Test-only logical services intentionally use delete/recreate instead of a
+    mixed-version migration.  A same-version controller restart must retain
+    its rows, but a new version cannot plan while an older provider-possible
+    replica, nonterminal zero-cost intent, or unresolved Kueue admission still
+    exists.  This check runs after the complete graph is locked and before the
+    planner callback or any capacity-plan write.
+    """
+    if (service.get('demand_source_mode') != DemandSourceMode.DURABLE_FEED.value
+            or config.capacity_unit
+            is not reserved_fill_planner.FillCapacityUnit.LOGICAL):
+        return
+    current_version = service.get('current_version')
+    if type(current_version) is not int or current_version < 1:
+        raise CapacityAdmissionConflict(
+            'Recreated logical service has no current version.')
+
+    for row in locked.replica_rows:
+        version = row.get('version')
+        if type(version) is not int or version < 1:
+            raise CapacityAdmissionConflict(
+                'Recreated logical service has an unattributed replica.')
+        if version == current_version:
+            continue
+        if version > current_version:
+            raise CapacityAdmissionConflict(
+                'Recreated logical service has a future-version replica.')
+        if _replica_service_ceiling_capacity(row, config.capacity_unit) > 0:
+            raise CapacityAdmissionConflict(
+                'Recreated logical service retains provider-possible '
+                'capacity from a prior version.')
+
+    current_hash = service.get('hash')
+    current_lifecycle_epoch = service.get('lifecycle_epoch')
+    if (not isinstance(current_hash, str) or not current_hash or
+            type(current_lifecycle_epoch) is not int or
+            current_lifecycle_epoch < 1):
+        raise CapacityAdmissionConflict(
+            'Recreated logical service has no exact lifecycle identity.')
+
+    for row in locked.all_service_intent_rows:
+        row_hash = row.get('service_hash')
+        row_lifecycle_epoch = row.get('service_lifecycle_epoch')
+        version = row.get('service_version')
+        if (not isinstance(row_hash, str) or not row_hash or
+                type(row_lifecycle_epoch) is not int or
+                row_lifecycle_epoch < 1 or type(version) is not int or
+                version < 1):
+            raise CapacityAdmissionConflict(
+                'Recreated logical service has an unattributed intent.')
+        same_incarnation = (row_hash == current_hash and
+                            row_lifecycle_epoch == current_lifecycle_epoch)
+        if not same_incarnation:
+            if row.get('state') != 'TERMINAL':
+                raise CapacityAdmissionConflict(
+                    'Recreated logical service retains a nonterminal intent '
+                    'from a prior lifecycle.')
+            continue
+        if version == current_version:
+            continue
+        if version > current_version:
+            raise CapacityAdmissionConflict(
+                'Recreated logical service has a future-version intent.')
+        if row.get('state') != 'TERMINAL':
+            raise CapacityAdmissionConflict(
+                'Recreated logical service retains a nonterminal intent '
+                'from a prior version.')
+
+    for row in lane_projection.rows:
+        version = getattr(row, 'service_version', None)
+        if type(version) is not int or version < 1:
+            raise CapacityAdmissionConflict(
+                'Recreated logical service has an unattributed Kueue '
+                'admission.')
+        if version == current_version:
+            continue
+        if version > current_version:
+            raise CapacityAdmissionConflict(
+                'Recreated logical service has a future-version Kueue '
+                'admission.')
+        # The admission table has no terminal state. Provider-free terminal
+        # lineage is deleted transactionally; a retained row is unresolved.
+        raise CapacityAdmissionConflict(
+            'Recreated logical service retains an unresolved Kueue '
+            'admission from a prior version.')
+
+
 def _project_capacity_inventory(
     locked: _LockedCapacityRows,
     *,
@@ -937,7 +2084,7 @@ def _project_capacity_inventory(
     accounting_cards: set[str],
     now: datetime.datetime,
     lane_projection: kueue_lane_capacity.KueueAdmissionCapacityProjection,
-) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+) -> tuple[dict[str, int], dict[str, int], dict[str, int], int]:
     """Project demand supply from one locked replica/admission snapshot."""
     if not accounting_cards:
         raise CapacityAdmissionConflict(
@@ -948,12 +2095,40 @@ def _project_capacity_inventory(
             'Capacity plan mixes aggregate and exact-card accounting.')
     zero_cost = {card: 0 for card in accounting_cards}
     paid = {card: 0 for card in accounting_cards}
-    counted_kueue_intents: set[str] = set()
+    charged_paid_gpu_units = 0
+    counted_zero_cost_intents: set[str] = set()
     for row in locked.replica_rows:
-        if row['status'] in _TERMINAL_REPLICA_STATUSES:
+        terminal = row['status'] in _TERMINAL_REPLICA_STATUSES
+        raw_state = row['replica_state']
+        if (terminal and isinstance(raw_state, Mapping) and
+                raw_state.get('is_zero_cost') is True):
+            # Terminal reserved rows are neither usable nor billable. Keep
+            # the prior tolerance for retained legacy reserved tombstones;
+            # their provider cleanup is owned by the separate exact fence.
             continue
         state, planned_capacity, is_zero_cost, is_scale_down = (
             _validated_replica_attribution(row))
+        status = state['status_property']
+        cleanup_proven = status.get('sky_down_status') == 'SUCCEEDED'
+        if not is_zero_cost:
+            if cleanup_proven:
+                continue
+            # planned_capacity is the immutable physical GPU debit persisted
+            # for every paid backend. Charge every service version: an old
+            # worker may be unusable for current demand while its provider VM
+            # still exists or bills.
+            charged_paid_gpu_units += planned_capacity
+            if row['version'] != service_version:
+                continue
+        # A controller lifecycle label is not provider-cleanup evidence.  A
+        # paid replica can already be SHUTTING_DOWN (or otherwise terminal)
+        # while its VM still exists or bills, so retain it in the purchased
+        # baseline until the durable down operation succeeds.  Reserved rows
+        # stop contributing once terminal because they are no longer usable
+        # demand supply; their provider ownership remains protected by the
+        # separate cleanup/quiescence protocol.
+        if terminal and (is_zero_cost or cleanup_proven):
+            continue
         # A reserved row stops contributing once its scheduler capacity is
         # being yielded.  A paid row is different: until its exact claim and
         # cleanup-proven provider allocation disappear it remains both a cost
@@ -962,6 +2137,14 @@ def _project_capacity_inventory(
         if is_scale_down and is_zero_cost:
             continue
         card = (AGGREGATE_ACCELERATOR if aggregate else _replica_card(state))
+        if (is_zero_cost and row['version'] != service_version and
+                card not in accounting_cards):
+            # A retained old-version reservation on a card removed by the
+            # current service catalog is retirement-only inventory. It still
+            # participates in the exact cleanup/service-ceiling graph, but it
+            # cannot cover current demand and must not make a catalog update
+            # impossible.
+            continue
         if card not in accounting_cards:
             intent_key = row['reserved_fill_intent_idempotency_key']
             if (is_zero_cost and
@@ -975,14 +2158,18 @@ def _project_capacity_inventory(
         if is_zero_cost:
             intent_key = row['reserved_fill_intent_idempotency_key']
             lane_assigned = lane_projection.assigned_gpu_for_intent(intent_key)
+            ordinary_assigned = lane_projection.uses_ordinary_scheduler(
+                intent_key)
             if lane_assigned is False:
                 continue
-            if row['version'] != service_version and lane_assigned is not True:
+            if (row['version'] != service_version and
+                    lane_assigned is not True and not ordinary_assigned):
                 continue
             zero_cost[card] += planned_capacity
-            if lane_assigned is True and isinstance(intent_key, str):
-                counted_kueue_intents.add(intent_key)
-        elif row['version'] == service_version:
+            if ((lane_assigned is True or ordinary_assigned) and
+                    isinstance(intent_key, str)):
+                counted_zero_cost_intents.add(intent_key)
+        else:
             paid[card] += planned_capacity
 
     pending_zero_cost = {card: 0 for card in accounting_cards}
@@ -990,7 +2177,10 @@ def _project_capacity_inventory(
         intent_key = row['intent_idempotency_key']
         lane_assigned = lane_projection.assigned_gpu_for_intent(intent_key)
         if lane_assigned is True:
-            if intent_key in counted_kueue_intents:
+            if intent_key in counted_zero_cost_intents:
+                continue
+        elif lane_projection.uses_ordinary_scheduler(intent_key):
+            if intent_key in counted_zero_cost_intents:
                 continue
         elif lane_assigned is False:
             continue
@@ -1011,7 +2201,7 @@ def _project_capacity_inventory(
             raise CapacityAdmissionConflict(
                 'Pending zero-cost intent accounting is malformed.')
         pending_zero_cost[card] += planned_capacity
-    return zero_cost, paid, pending_zero_cost
+    return zero_cost, paid, pending_zero_cost, charged_paid_gpu_units
 
 
 def _economic_capacity_graph_snapshot(
@@ -1019,8 +2209,8 @@ def _economic_capacity_graph_snapshot(
     lane_projection: kueue_lane_capacity.KueueAdmissionCapacityProjection,
     *,
     service_version: int,
-) -> tuple[tuple[Any, ...], dict[
-        int, kueue_lane_capacity.KueueReplicaCapacityClass], str]:
+) -> tuple[tuple[Any, ...], kueue_lane_capacity.KueueReplicaCapacitySnapshot,
+           str]:
     """Decode supply and fingerprint only reserved-side economic semantics.
 
     Paid replicas are deliberately absent from the fingerprint.  Publishing a
@@ -1077,13 +2267,15 @@ def _economic_capacity_graph_snapshot(
             raise CapacityAdmissionConflict(
                 'Reserved economic replica has a malformed intent edge.')
         admission_class = classes.get(int(info.replica_id))
+        ordinary_scheduler = lane_projection.uses_ordinary_scheduler(intent_key)
         kueue_assigned = (
             admission_class
             is not kueue_lane_capacity.KueueReplicaCapacityClass.FRESH_WAITING)
         terminal = row['status'] in _TERMINAL_REPLICA_STATUSES
         historical = int(row['version']) != service_version
         contributes = (not terminal and not is_scale_down and kueue_assigned and
-                       (not historical or admission_class is not None))
+                       (not historical or admission_class is not None or
+                        ordinary_scheduler))
         reserved_replicas.append({
             'replica_id': int(row['replica_id']),
             'replica_record_id': record_id,
@@ -1097,6 +2289,7 @@ def _economic_capacity_graph_snapshot(
                  'ready' if info.is_ready else 'provisioning'),
             'kueue_capacity_class':
                 (None if admission_class is None else admission_class.value),
+            'ordinary_scheduler': ordinary_scheduler,
             'economic_contribution': (planned_capacity if contributes else 0),
         })
 
@@ -1169,11 +2362,13 @@ def _economic_capacity_graph_snapshot(
         'reserved_replicas': reserved_replicas,
         'zero_cost_intents': intents,
         'kueue_admissions': admissions,
+        'ordinary_scheduler_intent_keys': sorted(
+            lane_projection.ordinary_scheduler_intent_keys),
         'unknown_shapes': sorted(
             [list(shape) for shape in lane_projection.unknown_shapes]),
         'unbounded_unknown': lane_projection.unbounded_unknown,
     })
-    return tuple(replica_infos), classes, digest
+    return tuple(replica_infos), capacity_snapshot, digest
 
 
 def _replica_service_ceiling_capacity(
@@ -1304,32 +2499,22 @@ def _project_allocation_reserved_capacity(
         for (pool_key, accelerator), count in sorted(debit_counts.items()))
     planned_capacity = (materialized_capacity + pending_capacity +
                         unresolved_admission_capacity)
-    allocation_upper_bound = planned_capacity
-    for snapshot in allocation.pool_snapshots:
-        slot_cost = max(
-            config.capacity_unit.intent_cost(location.accelerator_count)
-            for location in snapshot.locations)
-        allocation_upper_bound += (
-            min(snapshot.free_slots, snapshot.grant, snapshot.edge_cap) *
-            slot_cost)
     try:
-        exact = (reserved_fill_planner.ReservedFillPlanner.
-                 project_remaining_capacity_by_accelerator(
-                     allocation_map=allocation,
-                     max_replicas=allocation_upper_bound,
-                     planned_replicas=planned_capacity,
-                     capacity_unit=config.capacity_unit,
-                     committed_fill_debits=debits))
+        exact = (
+            reserved_fill_planner.ReservedFillPlanner.
+            project_remaining_capacity_by_accelerator(
+                allocation_map=allocation,
+                # Use the real locked service ceiling here.  The
+                # canonical planner admits only whole backends that fit
+                # the remaining headroom and skips a wider card without
+                # globally suppressing independent cards.
+                max_replicas=config.max_capacity,
+                planned_replicas=planned_capacity,
+                capacity_unit=config.capacity_unit,
+                committed_fill_debits=debits))
     except ValueError as error:
         raise CapacityAdmissionConflict(
             'Current allocation tail cannot be projected exactly.') from error
-    if sum(exact.values()) > max(0, config.max_capacity - planned_capacity):
-        # The fairness rotation anchor is process-local.  Under a binding
-        # mixed-card ceiling it can change the exact-card tail selected by the
-        # planner, so positive paid authority must wait instead of guessing.
-        raise CapacityAdmissionConflict(
-            'Current allocation tail exceeds rotation-independent service '
-            'headroom.')
     if accounting_cards == {AGGREGATE_ACCELERATOR}:
         return {AGGREGATE_ACCELERATOR: sum(exact.values())}
     if set(exact) - accounting_cards:
@@ -1375,26 +2560,6 @@ def _subtract_counts(total: Mapping[str, int],
                 'Planner claims exceed committed paid capacity.')
         result[card] = remaining
     return dict(sorted(result.items()))
-
-
-def _paid_residual(
-    demand: Mapping[str, int],
-    existing_zero_cost: Mapping[str, int],
-    pending_zero_cost: Mapping[str, int],
-    existing_paid: Mapping[str, int],
-    allocation_reserved: Mapping[str, int] | None = None,
-) -> dict[str, int]:
-    if allocation_reserved is None:
-        allocation_reserved = {}
-    cards = (set(demand) | set(existing_zero_cost) | set(pending_zero_cost) |
-             set(allocation_reserved) | set(existing_paid))
-    return {
-        card: residual for card in sorted(cards) if (residual := max(
-            0,
-            demand.get(card, 0) - existing_zero_cost.get(card, 0) -
-            pending_zero_cost.get(card, 0) - allocation_reserved.get(card, 0) -
-            existing_paid.get(card, 0))) > 0
-    }
 
 
 def _validate_optimistic_capacity_projection(
@@ -1627,6 +2792,159 @@ class CapacityAdmissionRepository:
                 'Ordered capacity admission requires PostgreSQL.')
         return engine
 
+    def read_current_fill_demand_witness(
+        self,
+        service_name: str,
+        expected_service_hash: str,
+        expected_controller_owner: tuple[int | None, str | None],
+        *,
+        max_age_seconds: float,
+    ) -> CommittedFillDemandWitness | None:
+        """Read a current semantic demand witness without effect authority.
+
+        The caller supplies a freshness horizon suitable for the reserved
+        poller (normally several poll intervals).  The short plan
+        ``valid_until`` is intentionally not consulted here: it remains the
+        independent provider-effect fence.  Every current service, demand,
+        route, plan-head, content-hash, and immutable fill-policy identity is
+        nevertheless revalidated in this one PostgreSQL snapshot.
+        """
+        if (not isinstance(service_name, str) or not service_name or
+                not isinstance(expected_service_hash, str) or
+                not expected_service_hash or
+                not isinstance(expected_controller_owner, tuple) or
+                len(expected_controller_owner) != 2 or
+                not isinstance(max_age_seconds, (int, float)) or
+                isinstance(max_age_seconds, bool) or
+                not math.isfinite(float(max_age_seconds)) or
+                max_age_seconds <= 0):
+            raise ValueError('Fill-demand witness read is malformed.')
+        with self.engine.connect() as connection:
+            now = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.clock_timestamp())).scalar_one()
+            service = connection.execute(
+                sqlalchemy.select(_SERVICES).where(
+                    _SERVICES.c.name == service_name)).mappings().one_or_none()
+            if (service is None or service['hash'] != expected_service_hash or
+                (service.get('controller_pid'), service.get('controller_ip'))
+                    != expected_controller_owner or service.get('pool') != 0 or
+                    service.get('demand_source_mode')
+                    != DemandSourceMode.DURABLE_FEED.value or
+                    service.get('demand_authority_capable') is not True or
+                    service.get('demand_authority_controller_incarnation')
+                    != service.get('controller_incarnation') or
+                    service.get('demand_authority_protocol_version')
+                    != PROTOCOL_VERSION or
+                    service.get('route_source_mode') != 'DURABLE_PROJECTED' or
+                    service.get('route_projection_capable') is not True or
+                    service.get('route_projection_controller_incarnation')
+                    != service.get('controller_incarnation') or
+                    service.get('route_projection_protocol_version')
+                    not in (1, 2)):
+                return None
+            head = connection.execute(
+                sqlalchemy.select(_HEADS).where(
+                    _HEADS.c.service_name ==
+                    service_name)).mappings().one_or_none()
+            if head is None:
+                return None
+            plan = connection.execute(
+                sqlalchemy.select(_PLANS).where(
+                    _PLANS.c.service_name == service_name, _PLANS.c.generation
+                    == head['generation'])).mappings().one_or_none()
+            current_demand_generation = connection.execute(
+                sqlalchemy.select(_DEMAND_GENERATIONS.c.generation).where(
+                    _DEMAND_GENERATIONS.c.service_name == service_name,
+                    _DEMAND_GENERATIONS.c.service_hash ==
+                    expected_service_hash)).scalar_one_or_none()
+            route_head = connection.execute(
+                sqlalchemy.select(_ROUTE_HEADS).where(
+                    _ROUTE_HEADS.c.service_name ==
+                    service_name)).mappings().one_or_none()
+            route = (None if route_head is None else connection.execute(
+                sqlalchemy.select(_ROUTE_SNAPSHOTS).where(
+                    _ROUTE_SNAPSHOTS.c.service_name == service_name,
+                    _ROUTE_SNAPSHOTS.c.generation
+                    == route_head['generation'])).mappings().one_or_none())
+            refreshed_at = head['refreshed_at']
+            if (plan is None or route_head is None or route is None or
+                    not isinstance(refreshed_at, datetime.datetime) or
+                    refreshed_at > now or now - refreshed_at
+                    > datetime.timedelta(seconds=float(max_age_seconds)) or
+                    head['demand_feed_generation'] != current_demand_generation
+                    or plan['demand_feed_generation']
+                    != current_demand_generation or
+                    plan['service_hash'] != service['hash'] or
+                    plan['service_lifecycle_epoch']
+                    != service['lifecycle_epoch'] or
+                    plan['service_version'] != service['current_version'] or
+                    plan['demand_source_epoch']
+                    != service['demand_source_epoch'] or
+                    plan['route_generation'] != route_head['generation'] or
+                    plan['route_sha256'] != route['content_sha256'] or
+                    plan['route_source_epoch'] != service['route_source_epoch']
+                    or plan['protocol_version'] != PROTOCOL_VERSION or
+                    route['service_hash'] != service['hash'] or
+                    route['service_lifecycle_epoch']
+                    != service['lifecycle_epoch'] or
+                    route['service_version'] != service['current_version'] or
+                    route['controller_incarnation']
+                    != service['controller_incarnation'] or
+                    route['protocol_version'] != PROTOCOL_VERSION or
+                    route['producer_protocol_version']
+                    != service['route_projection_protocol_version']):
+                return None
+            payload = plan['payload']
+            content_sha256 = plan['content_sha256']
+            if (not isinstance(payload, Mapping) or
+                    _SHA256_RE.fullmatch(content_sha256) is None or
+                    _sha256(payload) != content_sha256):
+                return None
+            try:
+                (route_projection.RouteProjectionRepository.
+                 validate_snapshot_row(route))
+                if not route_projection.snapshot_owner_matches(route, service):
+                    return None
+                planner_snapshot, candidate = _decode_planner_payload(
+                    payload.get('planner'))
+                if (planner_snapshot.service_version
+                        != service['current_version'] or
+                        planner_snapshot.source_generation
+                        != current_demand_generation or
+                        candidate.source_generation != current_demand_generation
+                        or not candidate.attribution_complete or
+                        planner_snapshot.reservation.gate_policy
+                        is not capacity_planning.ReservationGatePolicy.
+                        DEMAND_GATED):
+                    return None
+                semantic_sha256 = candidate.demand_witness_sha256
+                if semantic_sha256 is None:
+                    return None
+                return CommittedFillDemandWitness(
+                    service_name=service_name,
+                    service_hash=str(service['hash']),
+                    service_lifecycle_epoch=int(service['lifecycle_epoch']),
+                    service_version=int(service['current_version']),
+                    demand_source_epoch=int(service['demand_source_epoch']),
+                    demand_feed_generation=int(current_demand_generation),
+                    route_generation=int(route_head['generation']),
+                    route_sha256=str(route['content_sha256']),
+                    route_source_epoch=int(service['route_source_epoch']),
+                    capacity_plan_generation=int(plan['generation']),
+                    capacity_plan_sha256=str(content_sha256),
+                    target_capacity=(
+                        candidate.aggregate_demand_target
+                        if candidate.reservation_demand_relation is
+                        capacity_planning.ReservationDemandRelation.COMPATIBLE
+                        else 0),
+                    semantic_sha256=semantic_sha256,
+                    refreshed_at=refreshed_at)
+            except (KeyError, TypeError, ValueError,
+                    route_projection.RouteProjectionError,
+                    CapacityAdmissionError):
+                return None
+
     @staticmethod
     def _validate_sources(connection: sqlalchemy.engine.Connection,
                           plan: CapacityPlanInput,
@@ -1807,12 +3125,12 @@ class CapacityAdmissionRepository:
                 service_version=service_version,
                 accounting_cards=cards,
                 locked=locked)
-            _, _, pending = _project_capacity_inventory(
-                locked,
-                service_version=service_version,
-                accounting_cards=cards,
-                now=now,
-                lane_projection=lane_projection)
+            full_zero_cost, full_paid, pending, charged_paid = (
+                _project_capacity_inventory(locked,
+                                            service_version=service_version,
+                                            accounting_cards=cards,
+                                            now=now,
+                                            lane_projection=lane_projection))
             tail = _project_allocation_reserved_capacity(
                 allocation,
                 locked,
@@ -1825,12 +3143,49 @@ class CapacityAdmissionRepository:
             economic_infos, economic_kueue, economic_digest = (
                 _economic_capacity_graph_snapshot(
                     locked, lane_projection, service_version=service_version))
+            policy, evidence_state, authenticated, eligible = (
+                _reserved_supply_policy_and_evidence(config, allocation, tail))
+            reservation_enabled = policy is not ReservedSupplyPolicy.DISABLED
+            reservation_catalog = (() if not reservation_enabled else tuple(
+                sorted(config.reserved_accelerators or cards)))
+            gated = policy is ReservedSupplyPolicy.DEMAND_GATED
+            demand_witness_scope_sha256 = (
+                capacity_planning.build_demand_witness_scope_sha256(
+                    service_name=service_name,
+                    service_hash=service_hash,
+                    service_lifecycle_epoch=service_lifecycle_epoch,
+                    service_version=service_version,
+                    demand_source_epoch=service['demand_source_epoch'],
+                    fill_policy_sha256=config.fill_policy_sha256)
+                if gated else '')
         return ReservedSupplyProjection(
             pending_zero_cost_capacity_by_accelerator=pending,
             allocation_reserved_capacity_by_accelerator=tail,
             economic_replica_infos=economic_infos,
-            economic_kueue_capacity_by_replica_id=economic_kueue,
-            economic_capacity_graph_sha256=economic_digest)
+            economic_kueue_capacity=economic_kueue,
+            economic_capacity_graph_sha256=economic_digest,
+            existing_zero_cost_capacity_by_accelerator=full_zero_cost,
+            existing_paid_capacity_by_accelerator=full_paid,
+            charged_paid_gpu_units=charged_paid,
+            authenticated_capacity_by_accelerator=authenticated,
+            eligible_capacity_by_accelerator=eligible,
+            policy=policy,
+            evidence_state=evidence_state,
+            fill_policy_sha256=config.fill_policy_sha256,
+            reservation_evidence_sha256=_reservation_evidence_sha256(
+                config, allocation),
+            demand_witness_scope_sha256=demand_witness_scope_sha256,
+            allocation_demand_witness_sha256=(
+                None if not gated or allocation is None else
+                allocation.utilization_demand_witness_sha256),
+            allocation_demonstrated_need=(
+                None if not gated or allocation is None else
+                allocation.utilization_demonstrated_need),
+            allocation_ceiling=(0 if not gated or allocation is None else
+                                allocation.utilization_ceiling),
+            allocation_map=allocation,
+            reserved_accelerators=reservation_catalog,
+            allocation_bound=allocation is not None)
 
     @staticmethod
     def _write_plan_in_connection(
@@ -1879,10 +3234,7 @@ class CapacityAdmissionRepository:
                 pending_zero_cost_capacity_by_accelerator=pending_zero_cost,
                 allocation_reserved_capacity_by_accelerator=(
                     allocation_reserved),
-                existing_paid_capacity_by_accelerator=prior_paid_baseline,
-                paid_residual_by_accelerator=_paid_residual(
-                    capacity_target, full_zero_cost, pending_zero_cost,
-                    prior_paid_baseline, allocation_reserved))
+                existing_paid_capacity_by_accelerator=prior_paid_baseline)
             duplicate_digest = _sha256(duplicate_payload)
         duplicate = bool(previous is not None and
                          duplicate_digest == previous['content_sha256'])
@@ -1897,10 +3249,7 @@ class CapacityAdmissionRepository:
                 pending_zero_cost_capacity_by_accelerator=pending_zero_cost,
                 allocation_reserved_capacity_by_accelerator=(
                     allocation_reserved),
-                existing_paid_capacity_by_accelerator=full_paid,
-                paid_residual_by_accelerator=_paid_residual(
-                    capacity_target, full_zero_cost, pending_zero_cost,
-                    full_paid, allocation_reserved))
+                existing_paid_capacity_by_accelerator=full_paid)
             digest = _sha256(payload)
             maximum = connection.execute(
                 sqlalchemy.select(sqlalchemy.func.max(_PLANS.c.generation)).
@@ -1970,21 +3319,23 @@ class CapacityAdmissionRepository:
         service_version: int,
         accounting_cards: Mapping[str, int],
         sequenced_reserved_fill: bool,
-        reserved_fill_allocation_map: AuthenticatedAllocationMap | None,
         planner: Callable[[
             demand_state.DurableAutoscalingSnapshot, ReservedSupplyProjection |
             None
         ], CapacityPlanDecision],
         expected_planning_state_fingerprint: str | None = None,
         ttl_seconds: int = constants.CAPACITY_PLAN_TTL_SECONDS,
-    ) -> tuple[PaidLaunchAuthority, demand_state.DurableAutoscalingSnapshot]:
+    ) -> CommittedCapacityPlan:
         """Plan and publish from one PostgreSQL-linearized current graph.
 
         Every potentially conflicting durable input is locked before
         ``planner`` runs.  The callback must therefore be bounded, in-memory,
         and free of database, provider, manager, network, or filesystem I/O.
         Demand reporters lock the service row before replacing a report, so a
-        report is either part of this snapshot or the next generation.
+        report is either part of this snapshot or the next generation.  The
+        current reserved-fill allocation is likewise read only after its
+        protocol and service locks are held; callers cannot nominate or fence
+        the transaction against an optimistic allocation identity.
         """
         canonical_cards = _canonical_counts(accounting_cards,
                                             'accounting_cards')
@@ -1993,9 +3344,6 @@ class CapacityAdmissionRepository:
             raise ValueError('accounting_cards must not be empty.')
         if not isinstance(sequenced_reserved_fill, bool):
             raise ValueError('sequenced_reserved_fill must be boolean.')
-        if (not sequenced_reserved_fill and
-                reserved_fill_allocation_map is not None):
-            raise ValueError('A non-fill plan cannot carry an allocation.')
         if not callable(planner):
             raise ValueError('planner must be callable.')
         if (expected_planning_state_fingerprint is not None and
@@ -2058,7 +3406,9 @@ class CapacityAdmissionRepository:
                 route_source_epoch=snapshot.route_source_epoch,
                 normalized_demand=snapshot.normalized_demand,
                 capacity_target_by_accelerator={card: 0 for card in card_set},
-                reserved_fill_authority=provisional_authority)
+                reserved_fill_authority=provisional_authority,
+                paid_residual=capacity_planning.AcceleratorCapacity(),
+                paid_launch_target=capacity_planning.AcceleratorCapacity())
             # This locks and validates the exact current reporter and route
             # rows.  The service lock already prevents their writers from
             # advancing, but keeping validation centralized avoids a second
@@ -2067,17 +3417,26 @@ class CapacityAdmissionRepository:
 
             validated_allocation = None
             allocation_authority = None
-            if sequenced_reserved_fill and not snapshot.fresh_aggregate_zero:
-                if reserved_fill_allocation_map is not None:
-                    allocation_authority = ReservedFillPlanAuthority.bound(
-                        reserved_fill_allocation_map.identity)
+            if sequenced_reserved_fill:
+                try:
                     validated_allocation = (
-                        _validate_reserved_fill_authority_in_connection(
-                            connection,
-                            service,
-                            allocation_authority,
-                            reserved_fill_binding_required=True,
-                            protocol_and_service_prelocked=True))
+                        reserved_fill_allocation.
+                        ReservedFillAllocationRepository(
+                            connection.engine).read_current_in_connection(
+                                connection,
+                                service_name,
+                                service_hash, (service.get('controller_pid'),
+                                               service.get('controller_ip')),
+                                protocol_and_service_prelocked=True))
+                except (TypeError, ValueError,
+                        reserved_fill_allocation.ReservedFillAllocationError
+                       ) as error:
+                    raise CapacityAdmissionConflict(
+                        'Current reserved-fill allocation could not be read '
+                        'under the capacity-plan lock.') from error
+                if validated_allocation is not None:
+                    allocation_authority = ReservedFillPlanAuthority.bound(
+                        validated_allocation.identity)
 
             now = connection.execute(
                 sqlalchemy.select(
@@ -2100,7 +3459,10 @@ class CapacityAdmissionRepository:
                 service_version=service_version,
                 accounting_cards=card_set,
                 locked=locked_capacity)
-            full_zero_cost, full_paid, pending_zero_cost = (
+            _require_recreated_logical_version_is_clean(service, fill_config,
+                                                        locked_capacity,
+                                                        lane_projection)
+            full_zero_cost, full_paid, pending_zero_cost, charged_paid = (
                 _project_capacity_inventory(locked_capacity,
                                             service_version=service_version,
                                             accounting_cards=card_set,
@@ -2115,24 +3477,63 @@ class CapacityAdmissionRepository:
                 now=now,
                 config=fill_config,
                 lane_projection=lane_projection)
-            supply_projection = None
-            if sequenced_reserved_fill:
-                economic_infos, economic_kueue, economic_digest = (
-                    _economic_capacity_graph_snapshot(
-                        locked_capacity,
-                        lane_projection,
-                        service_version=service_version))
-                supply_projection = ReservedSupplyProjection(
-                    pending_zero_cost_capacity_by_accelerator=(
-                        pending_zero_cost),
-                    allocation_reserved_capacity_by_accelerator=(
-                        allocation_reserved),
-                    economic_replica_infos=economic_infos,
-                    economic_kueue_capacity_by_replica_id=economic_kueue,
-                    economic_capacity_graph_sha256=economic_digest,
-                    reserved_accelerators=(fill_config.reserved_accelerators or
-                                           ()),
-                    allocation_bound=validated_allocation is not None)
+            # The pure planner always receives the complete locked inventory.
+            # Reservation fill being disabled removes only new reservation
+            # authority.  It must not hide existing or already-committed
+            # zero-cost capacity (including pending launches), or paid
+            # replicas, and thereby manufacture a paid residual.
+            economic_infos, economic_kueue, economic_digest = (
+                _economic_capacity_graph_snapshot(
+                    locked_capacity,
+                    lane_projection,
+                    service_version=service_version))
+            policy, evidence_state, authenticated, eligible = (
+                _reserved_supply_policy_and_evidence(fill_config,
+                                                     validated_allocation,
+                                                     allocation_reserved))
+            reservation_enabled = policy is not ReservedSupplyPolicy.DISABLED
+            reservation_catalog = (() if not reservation_enabled else tuple(
+                sorted(fill_config.reserved_accelerators or card_set)))
+            gated = policy is ReservedSupplyPolicy.DEMAND_GATED
+            demand_witness_scope_sha256 = (
+                capacity_planning.build_demand_witness_scope_sha256(
+                    service_name=service_name,
+                    service_hash=service_hash,
+                    service_lifecycle_epoch=service_lifecycle_epoch,
+                    service_version=service_version,
+                    demand_source_epoch=snapshot.demand_source_epoch,
+                    fill_policy_sha256=fill_config.fill_policy_sha256)
+                if gated else '')
+            supply_projection = ReservedSupplyProjection(
+                pending_zero_cost_capacity_by_accelerator=pending_zero_cost,
+                allocation_reserved_capacity_by_accelerator=(
+                    allocation_reserved if reservation_enabled else {}),
+                economic_replica_infos=economic_infos,
+                economic_kueue_capacity=economic_kueue,
+                economic_capacity_graph_sha256=economic_digest,
+                existing_zero_cost_capacity_by_accelerator=full_zero_cost,
+                existing_paid_capacity_by_accelerator=full_paid,
+                charged_paid_gpu_units=charged_paid,
+                authenticated_capacity_by_accelerator=authenticated,
+                eligible_capacity_by_accelerator=eligible,
+                policy=policy,
+                evidence_state=evidence_state,
+                fill_policy_sha256=fill_config.fill_policy_sha256,
+                reservation_evidence_sha256=(_reservation_evidence_sha256(
+                    fill_config, validated_allocation)),
+                demand_witness_scope_sha256=(demand_witness_scope_sha256),
+                allocation_demand_witness_sha256=(
+                    None if not gated or validated_allocation is None else
+                    validated_allocation.utilization_demand_witness_sha256),
+                allocation_demonstrated_need=(
+                    None if not gated or validated_allocation is None else
+                    validated_allocation.utilization_demonstrated_need),
+                allocation_ceiling=(0 if not gated or
+                                    validated_allocation is None else
+                                    validated_allocation.utilization_ceiling),
+                allocation_map=validated_allocation,
+                reserved_accelerators=reservation_catalog,
+                allocation_bound=validated_allocation is not None)
 
             # Lock the current head before invoking mutable in-memory planning.
             # Service ownership prevents a competing publisher, while this row
@@ -2145,28 +3546,93 @@ class CapacityAdmissionRepository:
             if not isinstance(decision, CapacityPlanDecision):
                 raise ValueError('planner returned no typed capacity decision.')
             capacity_target = decision.canonical_target(card_set)
+            planner_snapshot, candidate = decision.decode_planner()
             if snapshot.fresh_aggregate_zero and any(capacity_target.values()):
                 raise CapacityAdmissionConflict(
                     'Fresh aggregate zero produced a positive capacity target.')
             positive_target = any(capacity_target.values())
-            if sequenced_reserved_fill and positive_target:
+            reservation_commitment = _canonical_counts(
+                decision.reserved_capacity_commitment_by_accelerator,
+                'reserved_capacity_commitment_by_accelerator')
+            reservation_commitment = {
+                card: reservation_commitment.get(card, 0) for card in card_set
+            }
+            static_fill_target = _canonical_counts(
+                decision.static_reserved_fill_target_by_accelerator,
+                'static_reserved_fill_target_by_accelerator')
+            static_fill_target = {
+                card: static_fill_target.get(card, 0) for card in card_set
+            }
+            if sequenced_reserved_fill:
+                assert supply_projection is not None
+                locked_eligible = (
+                    supply_projection.eligible_capacity_by_accelerator)
+                if any(
+                        reservation_commitment.get(card, 0) >
+                        locked_eligible.get(card, 0) for card in card_set):
+                    raise CapacityAdmissionConflict(
+                        'Planner committed reservation capacity outside the '
+                        'locked eligible envelope.')
+                if any(static_fill_target.values()):
+                    if (supply_projection.policy
+                            is not ReservedSupplyPolicy.STATIC_PREFILL or
+                            not supply_projection.allocation_bound or any(
+                                static_fill_target.get(card, 0) >
+                                locked_eligible.get(card, 0)
+                                for card in card_set)):
+                        raise CapacityAdmissionConflict(
+                            'Planner static fill exceeds its locked ungated '
+                            'reservation envelope.')
+            elif (any(reservation_commitment.values()) or
+                  any(static_fill_target.values())):
+                raise ValueError('A non-fill planner committed reservations.')
+            _validate_planner_against_locked_supply(
+                planner_snapshot=planner_snapshot,
+                candidate=candidate,
+                service_version=service_version,
+                accounting_cards=card_set,
+                capacity_target=capacity_target,
+                reservation_commitment=reservation_commitment,
+                static_fill_target=static_fill_target,
+                supply_projection=supply_projection,
+                expected_planning_state_fingerprint=(
+                    expected_planning_state_fingerprint))
+            statically_incompatible_cards = None
+            if (sequenced_reserved_fill and positive_target and
+                    candidate.reservation_demand_relation is capacity_planning.
+                    ReservationDemandRelation.STATICALLY_DISJOINT and
+                    not any(reservation_commitment.values()) and
+                    not any(static_fill_target.values())):
                 positive_cards = tuple(
                     sorted(card for card, count in capacity_target.items()
                            if count > 0))
-                statically_incompatible = bool(
-                    AGGREGATE_ACCELERATOR not in positive_cards and
-                    fill_config.reserved_accelerators is not None and
-                    fill_config.worker_projection_sha256 is not None and
-                    set(positive_cards).isdisjoint(
-                        fill_config.reserved_accelerators))
-                if allocation_authority is not None:
-                    final_authority = allocation_authority
-                elif statically_incompatible:
+                if (candidate.statically_disjoint_demand_accelerators
+                        != positive_cards or
+                        fill_config.worker_projection_sha256 is None):
+                    raise CapacityAdmissionConflict(
+                        'Pure planner static incompatibility no longer matches '
+                        'the locked worker projection or exact target cards.')
+                statically_incompatible_cards = positive_cards
+            if sequenced_reserved_fill:
+                _require_demand_causal_allocation(
+                    fill_config,
+                    validated_allocation,
+                    candidate,
+                    positive_target=positive_target)
+            if sequenced_reserved_fill and (positive_target or
+                                            any(static_fill_target.values())):
+                if statically_incompatible_cards is not None:
                     assert fill_config.worker_projection_sha256 is not None
                     final_authority = (
                         ReservedFillPlanAuthority.statically_incompatible(
-                            positive_cards,
+                            statically_incompatible_cards,
                             fill_config.worker_projection_sha256))
+                elif allocation_authority is not None:
+                    final_authority = allocation_authority
+                elif positive_target:
+                    raise CapacityAdmissionConflict(
+                        'Positive reservation-compatible demand has no exact '
+                        'reserved allocation authority.')
                 else:
                     raise CapacityAdmissionConflict(
                         'Positive capacity target has no exact reserved supply '
@@ -2199,30 +3665,41 @@ class CapacityAdmissionRepository:
                 normalized_demand=normalized_demand,
                 capacity_target_by_accelerator=capacity_target,
                 reserved_fill_authority=final_authority,
+                paid_residual=candidate.paid_residual,
+                paid_launch_target=candidate.paid_launch_target,
                 allocation_reserved_capacity_by_accelerator=(
-                    {} if bound_projection is None else
-                    bound_projection.allocation_reserved_capacity_by_accelerator
-                ),
+                    reservation_commitment),
                 expected_pending_zero_cost_capacity_by_accelerator=(
                     {} if bound_projection is None else
                     bound_projection.pending_zero_cost_capacity_by_accelerator),
                 expected_economic_capacity_graph_sha256=(
-                    None if bound_projection is None else
-                    bound_projection.economic_capacity_graph_sha256))
+                    None if supply_projection is None else
+                    supply_projection.economic_capacity_graph_sha256),
+                planner_payload=decision.planner_payload)
             row = self._write_plan_in_connection(
                 connection,
                 plan,
                 full_zero_cost=full_zero_cost,
                 full_paid=full_paid,
                 pending_zero_cost=pending_zero_cost,
-                allocation_reserved=(allocation_reserved
-                                     if bound_projection is not None else {
-                                         card: 0 for card in card_set
-                                     }),
+                allocation_reserved=reservation_commitment,
                 ttl_seconds=ttl_seconds)
-        return (_authority(
-            row,
-            demand_feed_generation=snapshot.demand_feed_generation), snapshot)
+            committed_authority = _validate_committed_plan_row(
+                row,
+                expected_snapshot=planner_snapshot,
+                expected_candidate=candidate,
+                accounting_cards=card_set,
+                demand_feed_generation=snapshot.demand_feed_generation)
+            committed = CommittedCapacityPlan(
+                authority=committed_authority,
+                demand_snapshot=snapshot,
+                planner_snapshot=planner_snapshot,
+                candidate=candidate,
+                allocation_map=validated_allocation)
+            witness_semantic_sha256 = candidate.demand_witness_sha256
+            assert witness_semantic_sha256 is not None
+        _notify_fill_demand_witness(service_name, witness_semantic_sha256)
+        return committed
 
     def publish(
         self,
@@ -2308,7 +3785,10 @@ class CapacityAdmissionRepository:
                 service_version=plan.service_version,
                 accounting_cards=accounting_cards,
                 locked=locked_capacity)
-            full_zero_cost, full_paid, pending_zero_cost = (
+            _require_recreated_logical_version_is_clean(service, fill_config,
+                                                        locked_capacity,
+                                                        lane_projection)
+            full_zero_cost, full_paid, pending_zero_cost, _ = (
                 _project_capacity_inventory(
                     locked_capacity,
                     service_version=plan.service_version,
@@ -2357,6 +3837,10 @@ class CapacityAdmissionRepository:
                 pending_zero_cost=pending_zero_cost,
                 allocation_reserved=allocation_reserved,
                 ttl_seconds=ttl_seconds)
+            _, candidate = _decode_planner_payload(plan.planner_payload)
+            witness_semantic_sha256 = candidate.demand_witness_sha256
+            assert witness_semantic_sha256 is not None
+        _notify_fill_demand_witness(plan.service_name, witness_semantic_sha256)
         return _authority(row,
                           demand_feed_generation=plan.demand_feed_generation)
 
@@ -2446,8 +3930,8 @@ def _validate_committed_paid_claim_in_connection(
             'Committed paid claim has an inconsistent admitted route.')
     try:
         authorized_paid = _canonical_counts(
-            claim_plan_payload.get('paid_residual_by_accelerator', {}),
-            'paid_residual_by_accelerator')
+            claim_plan_payload.get('paid_launch_target_by_accelerator', {}),
+            'paid_launch_target_by_accelerator')
     except (AttributeError, ValueError) as error:
         raise CapacityAdmissionConflict(
             'Committed paid claim debit ledger is malformed.') from error
@@ -2485,6 +3969,7 @@ def validate_paid_claim_in_connection(
     prospective: bool = False,
     require_planner: bool = True,
     protocol_and_service_prelocked: bool = False,
+    _batch_member_units: tuple[int, ...] | None = None,
 ) -> datetime.datetime | None:
     """Revalidate one planner-bound claim before provider I/O."""
     fields = ('capacity_plan_generation', 'capacity_plan_sha256',
@@ -2769,14 +4254,20 @@ def validate_paid_claim_in_connection(
         paid = _canonical_counts(
             payload.get('paid_residual_by_accelerator', {}),
             'paid_residual_by_accelerator')
+        paid_launch = _canonical_counts(
+            payload.get('paid_launch_target_by_accelerator', {}),
+            'paid_launch_target_by_accelerator')
         economic_graph_sha256 = payload.get('economic_capacity_graph_sha256')
         if validated_allocation is not None and (
                 not isinstance(economic_graph_sha256, str) or
                 _SHA256_RE.fullmatch(economic_graph_sha256) is None):
             raise ValueError(
                 'Allocation-bound plan lacks its economic capacity graph.')
-        if validated_allocation is None and economic_graph_sha256 is not None:
-            raise ValueError('Unbound plan carries an economic capacity graph.')
+        if (economic_graph_sha256 is not None and
+            (not isinstance(economic_graph_sha256, str) or
+             _SHA256_RE.fullmatch(economic_graph_sha256) is None)):
+            raise ValueError('Capacity plan has a malformed economic capacity '
+                             'graph.')
     except ValueError as error:
         raise CapacityAdmissionConflict(
             'Capacity plan accounting is malformed.') from error
@@ -2785,9 +4276,35 @@ def validate_paid_claim_in_connection(
             set(baseline_pending_zero) != accounting_cards or
             set(baseline_allocation_reserved) != accounting_cards or
             set(baseline_paid) != accounting_cards or
-            set(paid) - accounting_cards):
+            set(paid) - accounting_cards or
+            set(paid_launch) - accounting_cards):
         raise CapacityAdmissionConflict(
             'Capacity plan accounting classes are inconsistent.')
+    planner_snapshot, planner_candidate = (
+        _validate_prospective_planner_candidate(
+            payload,
+            service_version=int(service['current_version']),
+            demand_feed_generation=int(plan['demand_feed_generation']),
+            accounting_cards=accounting_cards,
+            capacity_target=capacity_target,
+            existing_zero_cost=baseline_zero,
+            pending_zero_cost=baseline_pending_zero,
+            allocation_reserved=baseline_allocation_reserved,
+            existing_paid=baseline_paid,
+            paid_residual=paid,
+            paid_launch_target=paid_launch))
+    launch_width = (
+        1 if planner_candidate.capacity_unit
+        is capacity_planning.CapacityUnit.PHYSICAL_BACKEND else
+        planner_candidate.physical_gpu_width_by_accelerator.get(accelerator))
+    member_units = ((claim_units,)
+                    if _batch_member_units is None else _batch_member_units)
+    if (launch_width <= 0 or not member_units or
+            sum(member_units) != claim_units or any(
+                type(units) is not int or units != launch_width
+                for units in member_units)):
+        raise CapacityAdmissionConflict(
+            'Paid claim does not debit exact whole-backend capacity.')
     locked_capacity = _lock_capacity_rows(connection,
                                           service_name=service['name'],
                                           service_hash=service['hash'],
@@ -2800,16 +4317,16 @@ def validate_paid_claim_in_connection(
         service_version=int(service['current_version']),
         accounting_cards=accounting_cards,
         locked=locked_capacity)
-    if validated_allocation is not None:
+    if economic_graph_sha256 is not None:
         _, _, current_economic_digest = _economic_capacity_graph_snapshot(
             locked_capacity,
             lane_projection,
             service_version=int(service['current_version']))
         if current_economic_digest != economic_graph_sha256:
             raise CapacityAdmissionConflict(
-                'Reserved economic supply changed after the ordered plan '
-                'snapshot.')
-    current_zero, current_paid, current_pending_zero = (
+                'Economic supply or scheduler capacity changed after the '
+                'ordered plan snapshot.')
+    current_zero, current_paid, current_pending_zero, current_charged_paid = (
         _project_capacity_inventory(locked_capacity,
                                     service_version=int(
                                         service['current_version']),
@@ -2825,6 +4342,27 @@ def validate_paid_claim_in_connection(
         now=now,
         config=fill_config,
         lane_projection=lane_projection)
+    (current_reservation_policy, current_reservation_evidence,
+     current_authenticated_reserved,
+     current_eligible_reserved) = _reserved_supply_policy_and_evidence(
+         fill_config, validated_allocation, current_allocation_reserved)
+    _validate_prospective_reservation_evidence(
+        planner_snapshot,
+        planner_candidate,
+        accounting_cards=accounting_cards,
+        policy=current_reservation_policy,
+        evidence_state=current_reservation_evidence,
+        authenticated_capacity=current_authenticated_reserved,
+        eligible_capacity=current_eligible_reserved,
+        reservation_evidence_sha256=_reservation_evidence_sha256(
+            fill_config, validated_allocation))
+    if any(
+            baseline_allocation_reserved.get(card, 0) >
+            current_eligible_reserved.get(card, 0)
+            for card in accounting_cards):
+        raise CapacityAdmissionConflict(
+            'Committed reservation debit exceeds the current locked eligible '
+            'envelope.')
     claim_units_by_card = _claim_units_for_plan(
         connection,
         service_name=service['name'],
@@ -2837,20 +4375,16 @@ def validate_paid_claim_in_connection(
     }
     if (current_zero != baseline_zero or
             current_pending_zero != baseline_pending_zero or
-            current_allocation_reserved != baseline_allocation_reserved or
-            current_paid != expected_paid):
+            current_paid != expected_paid or current_charged_paid
+            != planner_snapshot.reservation.charged_paid_gpu_units +
+            sum(claim_units_by_card.values())):
         raise CapacityAdmissionConflict(
             'Committed capacity changed after the ordered plan snapshot.')
-    if paid != _paid_residual(capacity_target, baseline_zero,
-                              baseline_pending_zero, baseline_paid,
-                              baseline_allocation_reserved):
-        raise CapacityAdmissionConflict(
-            'Paid residual is not the exact post-reserved deficit.')
-    authorized = paid.get(accelerator, 0)
+    authorized = paid_launch.get(accelerator, 0)
     claimed = claim_units_by_card.get(accelerator, 0) + claim_units
     if authorized <= 0 or claimed > authorized:
         raise CapacityAdmissionConflict(
-            'Paid claims exceed the exact post-zero-cost residual.')
+            'Paid claims exceed the exact whole-backend launch target.')
     # The first clock sample selects rows conservatively, but allocation,
     # route, capacity, and claim locks may all wait.  Provider-start authority
     # therefore ends on a fresh database-clock sample taken after every lock.
@@ -2901,6 +4435,7 @@ def validate_prospective_paid_claim_batch_in_connection(
             'Paid claim batch has no exact planner authority.')
 
     units_by_card: dict[str, int] = {}
+    member_units_by_card: dict[str, list[int]] = {}
     representative_by_card: dict[str, Mapping[str, Any]] = {}
     for claim in claims:
         if not isinstance(claim, Mapping):
@@ -2918,6 +4453,7 @@ def validate_prospective_paid_claim_batch_in_connection(
                 'Paid claim batch contains a malformed planner debit.')
         representative_by_card.setdefault(card, claim)
         units_by_card[card] = units_by_card.get(card, 0) + units
+        member_units_by_card.setdefault(card, []).append(units)
 
     freshness_horizons: list[datetime.datetime] = []
     for card in sorted(units_by_card):
@@ -2929,7 +4465,8 @@ def validate_prospective_paid_claim_batch_in_connection(
             aggregate_claim,
             prospective=True,
             require_planner=True,
-            protocol_and_service_prelocked=protocol_and_service_prelocked)
+            protocol_and_service_prelocked=protocol_and_service_prelocked,
+            _batch_member_units=tuple(member_units_by_card[card]))
         if paid_fresh_until is None:
             raise CapacityAdmissionConflict(
                 'Paid claim batch has no exact planner authority.')

@@ -511,7 +511,7 @@ def test_create_builds_proxy_deployment_and_service(monkeypatch):
     assert deployment['metadata']['ownerReferences'] == expected_owner
     pod_spec = deployment['spec']['template']['spec']
     container = pod_spec['containers'][0]
-    assert container['image'] == f'repo/skypilot@{_DIGEST_A}'
+    assert container['image'] == f'repo/skypilot:moving@{_DIGEST_A}'
     assert pod_spec['automountServiceAccountToken'] is False
     assert pod_spec['imagePullSecrets'] == [{'name': 'registry-credentials'}]
     args = container['args']
@@ -1350,16 +1350,30 @@ def test_create_requires_chart_pod_contract(monkeypatch):
 def test_image_policy_and_digest_are_pinned(monkeypatch):
     _install(monkeypatch, image_policy='Always')
     image, policy, digest = lb_k8s._resolve_lb_image('skypilot', 'in-cluster')
-    assert image == f'repo/skypilot@{_DIGEST_A}'
+    assert image == f'repo/skypilot:moving@{_DIGEST_A}'
     assert policy == 'Always'
     assert digest == f'repo/skypilot@{_DIGEST_A}'
 
 
-def test_declared_digest_is_accepted_before_runtime_status(monkeypatch):
-    declared = f'repo/skypilot@{_DIGEST_A}'
+@pytest.mark.parametrize('declared', [
+    f'repo/skypilot@{_DIGEST_A}',
+    f'repo/skypilot:release@{_DIGEST_A}',
+])
+def test_declared_digest_is_accepted_before_runtime_status(
+        monkeypatch, declared):
     _install(monkeypatch, image=declared, image_id=None)
     image, policy, digest = lb_k8s._resolve_lb_image('skypilot', 'in-cluster')
-    assert (image, policy, digest) == (declared, 'Always', declared)
+    assert (image, policy, digest) == (declared, 'Always',
+                                       f'repo/skypilot@{_DIGEST_A}')
+
+
+def test_declared_tag_and_digest_are_preserved_when_runtime_matches(
+        monkeypatch):
+    declared = f'repo/skypilot:release@{_DIGEST_A}'
+    _install(monkeypatch, image=declared, image_id=f'repo/skypilot@{_DIGEST_A}')
+    image, policy, digest = lb_k8s._resolve_lb_image('skypilot', 'in-cluster')
+    assert (image, policy, digest) == (declared, 'Always',
+                                       f'repo/skypilot@{_DIGEST_A}')
 
 
 def test_lb_resources_are_configurable(monkeypatch):
@@ -1378,22 +1392,41 @@ def test_lb_resources_accept_legacy_json_null(monkeypatch):
     assert lb_k8s._lb_resources() == {}
 
 
-@pytest.mark.parametrize(('declared_image', 'image_id', 'expected'), [
-    ('repo/skypilot:moving',
-     f'docker-pullable://registry.example/repo/skypilot@{_DIGEST_A}',
-     f'registry.example/repo/skypilot@{_DIGEST_A}'),
-    ('registry.example:5000/repo/skypilot:moving', f'containerd://{_DIGEST_B}',
-     f'registry.example:5000/repo/skypilot@{_DIGEST_B}'),
-    ('repo/skypilot:moving', f'repo/skypilot@{_DIGEST_A}',
-     f'repo/skypilot@{_DIGEST_A}'),
-])
+@pytest.mark.parametrize(
+    ('declared_image', 'image_id', 'expected_image', 'expected_digest'), [
+        ('registry.example/repo/skypilot:moving',
+         f'docker-pullable://registry.example/repo/skypilot@{_DIGEST_A}',
+         f'registry.example/repo/skypilot:moving@{_DIGEST_A}',
+         f'registry.example/repo/skypilot@{_DIGEST_A}'),
+        ('registry.example:5000/repo/skypilot:moving',
+         f'containerd://{_DIGEST_B}',
+         f'registry.example:5000/repo/skypilot:moving@{_DIGEST_B}',
+         f'registry.example:5000/repo/skypilot@{_DIGEST_B}'),
+        ('repo/skypilot:moving', f'repo/skypilot@{_DIGEST_A}',
+         f'repo/skypilot:moving@{_DIGEST_A}', f'repo/skypilot@{_DIGEST_A}'),
+    ])
 def test_runtime_image_id_formats_are_pinned(monkeypatch, declared_image,
-                                             image_id, expected):
+                                             image_id, expected_image,
+                                             expected_digest):
     _install(monkeypatch, image=declared_image, image_id=image_id)
     image, policy, digest = lb_k8s._resolve_lb_image('skypilot', 'in-cluster')
-    assert image == expected
+    assert image == expected_image
     assert policy == 'Always'
-    assert digest == expected
+    assert digest == expected_digest
+
+
+@pytest.mark.parametrize(('declared_image', 'image_id', 'error'), [
+    (f'repo/skypilot:release@{_DIGEST_A}', f'repo/skypilot@{_DIGEST_B}',
+     'declared digest'),
+    (f'repo/skypilot:release@{_DIGEST_A}', f'other/skypilot@{_DIGEST_A}',
+     'repository'),
+    ('repo/skypilot:moving', f'other/skypilot@{_DIGEST_A}', 'repository'),
+])
+def test_declared_and_runtime_image_mismatch_fails_closed(
+        monkeypatch, declared_image, image_id, error):
+    _install(monkeypatch, image=declared_image, image_id=image_id)
+    with pytest.raises(RuntimeError, match=error):
+        lb_k8s._resolve_lb_image('skypilot', 'in-cluster')
 
 
 @pytest.mark.parametrize('image_id', [
@@ -1401,9 +1434,27 @@ def test_runtime_image_id_formats_are_pinned(monkeypatch, declared_image,
     'repo/skypilot@sha256:abc',
     f'unknown-runtime://{_DIGEST_A}',
     'not-a-digest',
+    f'repo/skypilot@junk@{_DIGEST_A}',
+    f'repo/skypilot:moving@junk@{_DIGEST_A}',
+    f'repo/skypilot@{_DIGEST_B}@{_DIGEST_A}',
+    f'repo/skypilot:bad:tag@{_DIGEST_A}',
 ])
 def test_unparseable_runtime_image_id_fails_closed(monkeypatch, image_id):
     _install(monkeypatch, image='repo/skypilot:moving', image_id=image_id)
+    with pytest.raises(RuntimeError, match='Cannot pin'):
+        lb_k8s._resolve_lb_image('skypilot', 'in-cluster')
+
+
+@pytest.mark.parametrize('declared_image', [
+    f'repo/skypilot@junk@{_DIGEST_A}',
+    f'repo/skypilot:release@junk@{_DIGEST_A}',
+    f'repo/skypilot@{_DIGEST_B}@{_DIGEST_A}',
+    f'repo/skypilot:bad:tag@{_DIGEST_A}',
+])
+def test_malformed_declared_image_fails_closed(monkeypatch, declared_image):
+    _install(monkeypatch,
+             image=declared_image,
+             image_id=f'repo/skypilot@{_DIGEST_A}')
     with pytest.raises(RuntimeError, match='Cannot pin'):
         lb_k8s._resolve_lb_image('skypilot', 'in-cluster')
 

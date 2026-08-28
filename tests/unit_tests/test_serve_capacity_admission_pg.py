@@ -22,6 +22,7 @@ from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
 from sky.serve import capacity_admission
 from sky.serve import capacity_admission_schema
+from sky.serve import capacity_planning
 from sky.serve import constants
 from sky.serve import demand_state
 from sky.serve import demand_state_schema
@@ -98,6 +99,7 @@ def _capacity_service_spec(
     max_replicas: int = 10,
     replica_unit: str = 'physical_backend',
     lb_high_availability: bool = False,
+    utilization_gate: bool = False,
 ) -> service_spec.SkyServiceSpec:
     assert replica_unit in ('physical_backend', 'logical')
     return service_spec.SkyServiceSpec(
@@ -114,7 +116,9 @@ def _capacity_service_spec(
         graceful_drain_async_occupancy=(True
                                         if replica_unit == 'logical' else None),
         lb_high_availability=lb_high_availability,
-        reserved_capacity_fill=reserved_fill_enabled)
+        reserved_capacity_fill=({
+            'utilization_gate': utilization_gate,
+        } if reserved_fill_enabled else False))
 
 
 _COPIED_ADMISSION_MUTATIONS = (
@@ -357,9 +361,19 @@ def _plan(
     expected_pending_zero_cost_capacity_by_accelerator: dict[str, int] |
     None = None,
     expected_economic_capacity_graph_sha256: str | None = None,
+    planner_supply: capacity_admission.ReservedSupplyProjection | None = None,
 ) -> capacity_admission.CapacityPlanInput:
     snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
     assert snapshot is not None
+    target = ({
+        'l4': demand_target
+    } if capacity_target_by_accelerator is None else
+              capacity_target_by_accelerator)
+    decision = _current_decision(snapshot,
+                                 planner_supply,
+                                 demand_target,
+                                 target_by_accelerator=target)
+    _, candidate = decision.decode_planner()
     return capacity_admission.CapacityPlanInput(
         service_name='svc',
         service_hash='svc-hash',
@@ -373,13 +387,13 @@ def _plan(
         route_source_epoch=snapshot.route_source_epoch,
         normalized_demand=(snapshot.normalized_demand
                            if normalized_demand is None else normalized_demand),
-        capacity_target_by_accelerator=({
-            'l4': demand_target
-        } if capacity_target_by_accelerator is None else
-                                        capacity_target_by_accelerator),
+        capacity_target_by_accelerator=(
+            decision.capacity_target_by_accelerator),
         reserved_fill_authority=(
             capacity_admission.ReservedFillPlanAuthority.not_applicable()
             if reserved_fill_authority is None else reserved_fill_authority),
+        paid_residual=candidate.paid_residual,
+        paid_launch_target=candidate.paid_launch_target,
         allocation_reserved_capacity_by_accelerator=(
             {} if allocation_reserved_capacity_by_accelerator is None else
             allocation_reserved_capacity_by_accelerator),
@@ -387,19 +401,185 @@ def _plan(
             {} if expected_pending_zero_cost_capacity_by_accelerator is None
             else expected_pending_zero_cost_capacity_by_accelerator),
         expected_economic_capacity_graph_sha256=(
-            expected_economic_capacity_graph_sha256))
+            expected_economic_capacity_graph_sha256),
+        planner_payload=decision.planner_payload)
 
 
-def _current_decision(target: int) -> capacity_admission.CapacityPlanDecision:
+def _current_decision(
+    demand_snapshot: demand_state.DurableAutoscalingSnapshot,
+    supply: capacity_admission.ReservedSupplyProjection | None,
+    target: int,
+    *,
+    accelerator: str = 'l4',
+    target_by_accelerator: dict[str, int] | None = None,
+    source_fingerprint: str | None = None,
+    prospective_paid_accelerators: tuple[str, ...] | None = None,
+    compatible_accelerators: tuple[str, ...] | None = None,
+    cold_accelerator_order: tuple[str, ...] | None = None,
+    capacity_unit: capacity_planning.CapacityUnit = (
+        capacity_planning.CapacityUnit.PHYSICAL_BACKEND),
+    physical_gpu_width_by_accelerator: dict[str, int] | None = None,
+    provisioning_by_accelerator: dict[str, int] | None = None,
+    max_live_paid_gpu_units: int | None = None,
+) -> capacity_admission.CapacityPlanDecision:
+    """Build a decision through the production typed allocation kernel."""
+
+    def _capacity(values):
+        return capacity_planning.AcceleratorCapacity.from_mapping(values)
+
+    requested_target = ({
+        accelerator: target
+    } if target_by_accelerator is None else {
+        card.casefold(): count for card, count in target_by_accelerator.items()
+    })
+    configured = tuple(
+        sorted(
+            set(requested_target) |
+            (set() if supply is None else set(supply.reserved_accelerators))))
+    if supply is None:
+        policy = capacity_planning.ReservationGatePolicy.NOT_CONFIGURED
+        evidence = capacity_planning.ReservationEvidenceState.NOT_APPLICABLE
+        reservation_capacities = {
+            field: {
+                card: 0 for card in configured
+            } for field in ('authenticated', 'eligible', 'pending', 'zero_cost',
+                           'paid')
+        }
+        evidence_fingerprint = ''
+        planner_source_fingerprint = source_fingerprint or '0' * 64
+    else:
+        policy = {
+            capacity_admission.ReservedSupplyPolicy.DISABLED:
+                capacity_planning.ReservationGatePolicy.NOT_CONFIGURED,
+            capacity_admission.ReservedSupplyPolicy.STATIC_PREFILL:
+                capacity_planning.ReservationGatePolicy.UNGATED,
+            capacity_admission.ReservedSupplyPolicy.DEMAND_GATED:
+                capacity_planning.ReservationGatePolicy.DEMAND_GATED,
+        }[supply.policy]
+        evidence = {
+            capacity_admission.ReservedSupplyEvidenceState.NOT_APPLICABLE:
+                capacity_planning.ReservationEvidenceState.NOT_APPLICABLE,
+            capacity_admission.ReservedSupplyEvidenceState.AUTHENTICATED_SETTLED:
+                capacity_planning.ReservationEvidenceState.
+                AUTHENTICATED_SETTLED,
+            capacity_admission.ReservedSupplyEvidenceState.AUTHENTICATED_UNSETTLED:
+                capacity_planning.ReservationEvidenceState.
+                AUTHENTICATED_UNSETTLED,
+            capacity_admission.ReservedSupplyEvidenceState.UNAVAILABLE:
+                capacity_planning.ReservationEvidenceState.UNAVAILABLE,
+        }[supply.evidence_state]
+        reservation_capacities = {
+            'authenticated': supply.authenticated_capacity_by_accelerator,
+            'eligible': supply.eligible_capacity_by_accelerator,
+            'pending': supply.pending_zero_cost_capacity_by_accelerator,
+            'zero_cost': supply.existing_zero_cost_capacity_by_accelerator,
+            'paid': supply.existing_paid_capacity_by_accelerator,
+        }
+        evidence_fingerprint = supply.reservation_evidence_sha256
+        planner_source_fingerprint = (
+            capacity_admission.locked_planning_source_fingerprint(
+                source_fingerprint, supply.economic_capacity_graph_sha256))
+    reservation = capacity_planning.ReservationPlanningInput(
+        gate_policy=policy,
+        evidence_state=evidence,
+        authenticated_capacity=_capacity(
+            reservation_capacities['authenticated']),
+        eligible_capacity=_capacity(reservation_capacities['eligible']),
+        pending_zero_cost_capacity=_capacity(reservation_capacities['pending']),
+        existing_zero_cost_capacity=_capacity(
+            reservation_capacities['zero_cost']),
+        existing_paid_capacity=_capacity(reservation_capacities['paid']),
+        charged_paid_gpu_units=(0 if supply is None else
+                                supply.charged_paid_gpu_units),
+        evidence_fingerprint=evidence_fingerprint,
+        allocation_demand_witness_sha256=(
+            None
+            if supply is None else supply.allocation_demand_witness_sha256),
+        allocation_demonstrated_need=(None if supply is None else
+                                      supply.allocation_demonstrated_need),
+        allocation_ceiling=(0 if supply is None else supply.allocation_ceiling))
+    profiles = tuple(
+        capacity_planning.CompatibilityDemand(
+            sequence=sequence,
+            priority=50,
+            compatible_accelerators=((card,) if compatible_accelerators is
+                                     None else compatible_accelerators),
+            work=float(count))
+        for sequence, (card,
+                       count) in enumerate(sorted(requested_target.items()))
+        if count > 0)
+    planner_snapshot = capacity_planning.CapacityPlanningSnapshot(
+        source_generation=demand_snapshot.demand_feed_generation,
+        service_version=1,
+        configured_accelerators=configured,
+        capacity_unit=capacity_unit,
+        physical_gpu_width_by_accelerator=_capacity(
+            ({
+                card: 1 for card in configured
+            } if physical_gpu_width_by_accelerator is None else
+             physical_gpu_width_by_accelerator)),
+        capacity_per_accelerator=(
+            capacity_planning.AcceleratorWork.from_mapping(
+                {card: 1 for card in configured})),
+        floors=_capacity({card: 0 for card in configured}),
+        minimum_capacity=0,
+        paid_minimum_capacity=0,
+        actuation_minimum_capacity=0,
+        maximum_capacity=max(10, sum(requested_target.values())),
+        demand_profiles=profiles,
+        explicit_demand_profiles=profiles,
+        paid_demand_profiles=profiles,
+        fixed_work=capacity_planning.AcceleratorWork(),
+        explicit_fixed_work=capacity_planning.AcceleratorWork(),
+        paid_fixed_work=capacity_planning.AcceleratorWork(),
+        retention_work=capacity_planning.AcceleratorWork(),
+        ready_zero_cost=capacity_planning.AcceleratorCapacity(),
+        ready=capacity_planning.AcceleratorCapacity(),
+        provisioning=_capacity({} if provisioning_by_accelerator is
+                               None else provisioning_by_accelerator),
+        reservation=reservation,
+        cold_accelerator_order=(configured if cold_accelerator_order is None
+                                else cold_accelerator_order),
+        prospective_paid_accelerator_order=(
+            configured if prospective_paid_accelerators is None else
+            prospective_paid_accelerators),
+        planning_purpose=(
+            capacity_planning.CapacityPlanningPurpose.ECONOMIC_ADMISSION),
+        actuation_supply_policy=(
+            capacity_planning.ActuationSupplyPolicy.REUSE_CURRENT_SUPPLY),
+        attribution_complete=True,
+        planning_time=1.0,
+        max_live_paid_gpu_units=max_live_paid_gpu_units,
+        retirement_shelter_target=capacity_planning.AcceleratorCapacity(),
+        source_fingerprint=planner_source_fingerprint,
+        configured_reservation_accelerators=(() if supply is None else
+                                             supply.reserved_accelerators),
+        demand_witness_scope_sha256=('' if supply is None else
+                                     supply.demand_witness_scope_sha256))
+    candidate = capacity_planning.plan_capacity(planner_snapshot)
+    candidate_target = candidate.supply_aware_demand_target.as_dict()
+    target_by_accelerator = {
+        card: candidate_target.get(card, 0) for card in configured
+    }
     return capacity_admission.CapacityPlanDecision(
-        capacity_target_by_accelerator={'l4': target},
+        capacity_target_by_accelerator=target_by_accelerator,
         normalized_demand_extensions={
-            'autoscaler_target': target,
-            'replica_unit': 'physical_backend',
-            'demand_target_by_accelerator': {
-                'L4': target,
-            },
-        })
+            'autoscaler_target': sum(requested_target.values()),
+            'replica_unit': ('logical' if capacity_unit
+                             is capacity_planning.CapacityUnit.LOGICAL_GPU else
+                             'physical_backend'),
+            'demand_target_by_accelerator': target_by_accelerator,
+        },
+        reserved_capacity_commitment_by_accelerator=(
+            candidate.new_reserved_capacity_committed.as_dict()),
+        expected_paid_residual_by_accelerator=(
+            candidate.paid_residual.as_dict()),
+        expected_paid_launch_target_by_accelerator=(
+            candidate.paid_launch_target.as_dict()),
+        static_reserved_fill_target_by_accelerator=(
+            candidate.static_prefill_target.as_dict()),
+        planner_payload=capacity_planning.planner_envelope(
+            planner_snapshot, candidate))
 
 
 def _replica_values(replica_id: int,
@@ -818,7 +998,8 @@ def _enable_durable_intent(engine,
                            *,
                            reserved_fill_enabled: bool = True,
                            max_replicas: int = 10,
-                           replica_unit: str = 'physical_backend') -> None:
+                           replica_unit: str = 'physical_backend',
+                           utilization_gate: bool = False) -> None:
     with engine.begin() as connection:
         result = connection.execute(
             sqlalchemy.update(serve_state_schema.services_table).where(
@@ -835,7 +1016,8 @@ def _enable_durable_intent(engine,
                     spec=pickle.dumps(_capacity_service_spec(
                         reserved_fill_enabled,
                         max_replicas=max_replicas,
-                        replica_unit=replica_unit),
+                        replica_unit=replica_unit,
+                        utilization_gate=utilization_gate),
                                       protocol=4)))
     assert result.rowcount == 1
 
@@ -924,6 +1106,11 @@ def _allocation_map(
     *,
     accelerator_count: int = 1,
     valid_until: float | None = None,
+    utilization_gate_armed: bool = False,
+    utilization_demonstrated_need: int | None = None,
+    utilization_demand_witness_sha256: str | None = None,
+    utilization_ceiling: int = 0,
+    upward_grants_settled: bool = True,
 ) -> reserved_fill_planner.AuthenticatedAllocationMap:
     """Build one exact fresh allocation for paid-admission contracts."""
     cards = tuple(card.casefold() for card in free_by_accelerator)
@@ -976,6 +1163,11 @@ def _allocation_map(
         reclaim_fleet_bundle_sha256='a' * 64,
         reclaim_policy_revision='test-policy',
         reclaim_provider_inventory_sha256='b' * 64,
+        utilization_gate_armed=utilization_gate_armed,
+        utilization_demonstrated_need=utilization_demonstrated_need,
+        utilization_demand_witness_sha256=(utilization_demand_witness_sha256),
+        utilization_ceiling=utilization_ceiling,
+        upward_grants_settled=upward_grants_settled,
         pool_snapshots=(snapshot,))
 
 
@@ -1041,8 +1233,11 @@ def _insert_current_allocation_pending(
     return intent_key
 
 
-def _materialize_current_allocation_pending(engine, intent_key: str,
-                                            replica_id: int) -> None:
+def _materialize_current_allocation_pending(engine,
+                                            intent_key: str,
+                                            replica_id: int,
+                                            *,
+                                            accelerator: str = 'H200') -> None:
     """Move one test intent atomically to a provider-possible replica row."""
     intents = (
         zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
@@ -1064,7 +1259,7 @@ def _materialize_current_allocation_pending(engine, intent_key: str,
                     updated_at=now))
         replica = _replica_values(replica_id,
                                   zero_cost=True,
-                                  accelerator='H200')
+                                  accelerator=accelerator)
         replica['replica_state']['replica_record_id'] = str(record_id)
         replica['reserved_fill_intent_idempotency_key'] = intent_key
         connection.execute(sqlalchemy.insert(replicas).values(**replica))
@@ -1101,7 +1296,8 @@ def _allocation_bound_plan(
         expected_pending_zero_cost_capacity_by_accelerator=dict(
             projection.pending_zero_cost_capacity_by_accelerator),
         expected_economic_capacity_graph_sha256=(
-            projection.economic_capacity_graph_sha256))
+            projection.economic_capacity_graph_sha256),
+        planner_supply=projection)
     return plan, projection
 
 
@@ -1168,10 +1364,13 @@ def test_current_planner_uses_demand_committed_before_service_lock(
 
     def _planner(snapshot, supply):
         observed.append(snapshot)
-        assert supply is None
-        return _current_decision(2)
+        assert supply.policy is capacity_admission.ReservedSupplyPolicy.DISABLED
+        return _current_decision(snapshot,
+                                 supply,
+                                 2,
+                                 source_fingerprint=planning_fingerprint)
 
-    authority, snapshot = (capacity_admission.CapacityAdmissionRepository(
+    committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_publish_current(
             service_name='svc',
             service_hash='svc-hash',
@@ -1179,15 +1378,75 @@ def test_current_planner_uses_demand_committed_before_service_lock(
             service_version=1,
             accounting_cards={'l4': 0},
             sequenced_reserved_fill=False,
-            reserved_fill_allocation_map=None,
             planner=_planner,
             expected_planning_state_fingerprint=planning_fingerprint))
+    authority = committed.authority
+    snapshot = committed.demand_snapshot
 
     assert observed == [snapshot]
     assert snapshot.demand_feed_generation == 2
     assert snapshot.normalized_demand['recent_request_count'] == 2
     assert authority.demand_feed_generation == 2
-    assert authority.remaining() == {'l4': 2}
+    assert authority.remaining_launch_capacity() == {'l4': 2}
+
+
+def test_current_planner_never_persists_paid_authority_for_reservation_only_card(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+
+    def commit() -> capacity_admission.CommittedCapacityPlan:
+        return repository.plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'l4': 0},
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot, supply, 1, prospective_paid_accelerators=()))
+
+    committed = commit()
+    duplicate = commit()
+    payload = _capacity_plan_payload(engine, committed.authority.generation)
+    assert committed.candidate.supply_aware_demand_target.as_dict() == {'l4': 1}
+    assert committed.candidate.paid_residual.total() == 0
+    assert committed.authority.remaining_launch_capacity() == {}
+    assert duplicate.authority.generation == committed.authority.generation
+    assert duplicate.authority.remaining_launch_capacity() == {}
+    assert payload['capacity_target_by_accelerator'] == {'l4': 1}
+    assert payload['paid_residual_by_accelerator'] == {}
+
+
+def test_current_planner_persists_one_candidate_without_recomputing_or_livelock(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+
+    def commit() -> capacity_admission.CommittedCapacityPlan:
+        return repository.plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'l4': 0},
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot, supply, 1, prospective_paid_accelerators=()))
+
+    committed = commit()
+    duplicate = commit()
+    payload = _capacity_plan_payload(engine, committed.authority.generation)
+
+    assert committed.candidate.supply_aware_demand_target.as_dict() == {'l4': 1}
+    assert committed.candidate.paid_residual.total() == 0
+    assert committed.authority.remaining_launch_capacity() == {}
+    assert duplicate.authority.generation == committed.authority.generation
+    assert payload['paid_residual_by_accelerator'] == {}
+    assert payload['planner']['candidate']['paid_residual']['entries'] == []
 
 
 def test_current_planner_rejects_stale_prepared_fingerprint(capacity_database):
@@ -1200,7 +1459,8 @@ def test_current_planner_rejects_stale_prepared_fingerprint(capacity_database):
         connection.execute(
             sqlalchemy.insert(serve_state_schema.replicas_table).values(
                 **_replica_values(101, zero_cost=False)))
-    planner = mock.Mock(return_value=_current_decision(1))
+    planner = mock.Mock(side_effect=lambda snapshot, supply: _current_decision(
+        snapshot, supply, 1, source_fingerprint=planning_fingerprint))
 
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
                        match='Prepared planning state changed'):
@@ -1212,7 +1472,6 @@ def test_current_planner_rejects_stale_prepared_fingerprint(capacity_database):
                 service_version=1,
                 accounting_cards={'l4': 0},
                 sequenced_reserved_fill=False,
-                reserved_fill_allocation_map=None,
                 planner=planner,
                 expected_planning_state_fingerprint=planning_fingerprint))
 
@@ -1255,9 +1514,10 @@ def test_current_planner_accepts_semantic_noop_replica_rewrite(
     assert after_revision != before_revision
     assert (serve_state.get_scale_planning_state_fingerprint('svc') ==
             planning_fingerprint)
-    planner = mock.Mock(return_value=_current_decision(1))
+    planner = mock.Mock(side_effect=lambda snapshot, supply: _current_decision(
+        snapshot, supply, 1, source_fingerprint=planning_fingerprint))
 
-    authority, _ = (capacity_admission.CapacityAdmissionRepository(
+    committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_publish_current(
             service_name='svc',
             service_hash='svc-hash',
@@ -1265,12 +1525,12 @@ def test_current_planner_accepts_semantic_noop_replica_rewrite(
             service_version=1,
             accounting_cards={'l4': 0},
             sequenced_reserved_fill=False,
-            reserved_fill_allocation_map=None,
             planner=planner,
             expected_planning_state_fingerprint=planning_fingerprint))
+    authority = committed.authority
 
     planner.assert_called_once()
-    assert not authority.remaining()
+    assert not authority.remaining_launch_capacity()
 
 
 def test_current_planner_serializes_concurrent_report_writer(capacity_database):
@@ -1297,7 +1557,7 @@ def test_current_planner_serializes_concurrent_report_writer(capacity_database):
 
     def _planner(snapshot, supply):
         nonlocal writer_thread
-        assert supply is None
+        assert supply.policy is capacity_admission.ReservedSupplyPolicy.DISABLED
         assert snapshot.demand_feed_generation == 1
         writer_thread = threading.Thread(target=_writer, daemon=True)
         writer_thread.start()
@@ -1305,17 +1565,18 @@ def test_current_planner_serializes_concurrent_report_writer(capacity_database):
         # The reporter takes the service row first.  It cannot publish the
         # next generation while this transaction owns that same row.
         assert not writer_finished.wait(timeout=0.25)
-        return _current_decision(1)
+        return _current_decision(snapshot, supply, 1)
 
-    authority, snapshot = (capacity_admission.CapacityAdmissionRepository(
+    committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_publish_current(service_name='svc',
                                          service_hash='svc-hash',
                                          service_lifecycle_epoch=3,
                                          service_version=1,
                                          accounting_cards={'l4': 0},
                                          sequenced_reserved_fill=False,
-                                         reserved_fill_allocation_map=None,
                                          planner=_planner))
+    authority = committed.authority
+    snapshot = committed.demand_snapshot
     assert writer_thread is not None
     writer_thread.join(timeout=5)
 
@@ -1328,6 +1589,86 @@ def test_current_planner_serializes_concurrent_report_writer(capacity_database):
     assert current is not None
     assert current.demand_feed_generation == 2
     assert current.normalized_demand['recent_request_count'] == 3
+
+
+def test_successor_plan_publisher_serializes_with_prospective_admission(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    first = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 0},
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 1))
+    old_claim = first.authority.claim_values('L4')
+    publisher_holds_service = threading.Event()
+    release_publisher = threading.Event()
+    publisher_done = threading.Event()
+    validator_started = threading.Event()
+    validator_done = threading.Event()
+    publisher_results = []
+    publisher_errors = []
+    validator_errors = []
+
+    def _successor_planner(snapshot, supply):
+        publisher_holds_service.set()
+        assert release_publisher.wait(timeout=5)
+        return _current_decision(snapshot, supply, 2)
+
+    def _publish_successor():
+        try:
+            publisher_results.append(
+                repository.plan_and_publish_current(
+                    service_name='svc',
+                    service_hash='svc-hash',
+                    service_lifecycle_epoch=3,
+                    service_version=1,
+                    accounting_cards={'l4': 0},
+                    sequenced_reserved_fill=False,
+                    planner=_successor_planner))
+        except Exception as error:  # pylint: disable=broad-except
+            publisher_errors.append(error)
+        finally:
+            publisher_done.set()
+
+    def _validate_old_claim():
+        validator_started.set()
+        try:
+            _validate_prospective_claim(engine, old_claim)
+        except Exception as error:  # pylint: disable=broad-except
+            validator_errors.append(error)
+        finally:
+            validator_done.set()
+
+    publisher_thread = threading.Thread(target=_publish_successor)
+    publisher_thread.start()
+    assert publisher_holds_service.wait(timeout=5)
+    validator_thread = threading.Thread(target=_validate_old_claim)
+    validator_thread.start()
+    assert validator_started.wait(timeout=5)
+    # The successor owns the service/head publication prefix.  Prospective
+    # admission cannot pass the old head while that transaction is open.
+    assert not validator_done.wait(timeout=0.2)
+    release_publisher.set()
+    assert publisher_done.wait(timeout=5)
+    assert validator_done.wait(timeout=5)
+    publisher_thread.join(timeout=5)
+    validator_thread.join(timeout=5)
+
+    assert not publisher_thread.is_alive()
+    assert not validator_thread.is_alive()
+    assert not publisher_errors
+    assert len(publisher_results) == 1
+    assert publisher_results[0].authority.generation == (
+        first.authority.generation + 1)
+    assert len(validator_errors) == 1
+    assert isinstance(validator_errors[0],
+                      capacity_admission.CapacityAdmissionConflict)
+    assert 'current fresh capacity-plan authority' in str(validator_errors[0])
 
 
 def test_current_planner_callback_failure_rolls_back(capacity_database):
@@ -1345,7 +1686,6 @@ def test_current_planner_callback_failure_rolls_back(capacity_database):
                                              service_version=1,
                                              accounting_cards={'l4': 0},
                                              sequenced_reserved_fill=False,
-                                             reserved_fill_allocation_map=None,
                                              planner=_planner))
     with engine.connect() as connection:
         assert connection.execute(
@@ -1358,11 +1698,40 @@ def test_current_planner_callback_failure_rolls_back(capacity_database):
         ).scalar_one() == 0
 
 
-def test_current_planner_uses_locked_allocation_supply(capacity_database,
-                                                       monkeypatch):
+def test_gate_covered_plan_commits_reservation_before_paid_residual(
+        capacity_database, monkeypatch):
     engine, incarnation, _ = capacity_database
-    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=True)
-    allocation = _allocation_map({'l4': 1})
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=True,
+                           utilization_gate=True)
+    acquiring_allocation = _allocation_map({'l4': 1},
+                                           utilization_gate_armed=True,
+                                           utilization_demonstrated_need=2,
+                                           utilization_ceiling=2)
+    _mock_current_allocation(monkeypatch, acquiring_allocation)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    acquiring_supply = repository.project_reserved_supply(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 0},
+        authority=capacity_admission.ReservedFillPlanAuthority.bound(
+            acquiring_allocation.identity))
+    snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
+    assert snapshot is not None
+    acquisition = _current_decision(snapshot, acquiring_supply, 2)
+    _, acquisition_candidate = acquisition.decode_planner()
+    assert acquisition_candidate.kind is (
+        capacity_planning.CapacityPlanKind.GATE_ACQUISITION)
+    witness = acquisition_candidate.demand_witness_sha256
+    assert witness is not None
+    allocation = _allocation_map({'l4': 1},
+                                 utilization_gate_armed=True,
+                                 utilization_demonstrated_need=2,
+                                 utilization_demand_witness_sha256=witness,
+                                 utilization_ceiling=2)
     _mock_current_allocation(monkeypatch, allocation)
     observed_supply = []
 
@@ -1371,9 +1740,40 @@ def test_current_planner_uses_locked_allocation_supply(capacity_database,
         assert supply is not None
         observed_supply.append(supply)
         assert supply.allocation_reserved_capacity_by_accelerator == {'l4': 1}
-        return _current_decision(2)
+        return _current_decision(snapshot, supply, 2)
 
-    authority, _ = (capacity_admission.CapacityAdmissionRepository(
+    committed = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 0},
+        sequenced_reserved_fill=True,
+        planner=_planner)
+    authority = committed.authority
+
+    assert len(observed_supply) == 1
+    assert committed.candidate.new_reserved_capacity_committed.as_dict() == {
+        'l4': 1
+    }
+    assert committed.candidate.paid_residual.as_dict() == {'l4': 1}
+    assert authority.remaining_launch_capacity() == {'l4': 1}
+    assert (
+        authority.reserved_fill_authority.mode
+        is capacity_admission.ReservedFillPlanAuthorityMode.ALLOCATION_BOUND)
+
+
+def test_gate_disabled_still_uses_current_reservation_without_witness(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=True,
+                           utilization_gate=False)
+    allocation = _allocation_map({'l4': 1})
+    _mock_current_allocation(monkeypatch, allocation)
+
+    committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_publish_current(
             service_name='svc',
             service_hash='svc-hash',
@@ -1381,14 +1781,436 @@ def test_current_planner_uses_locked_allocation_supply(capacity_database,
             service_version=1,
             accounting_cards={'l4': 0},
             sequenced_reserved_fill=True,
-            reserved_fill_allocation_map=allocation,
-            planner=_planner))
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot, supply, 2)))
 
-    assert len(observed_supply) == 1
-    assert authority.remaining() == {'l4': 1}
-    assert (
-        authority.reserved_fill_authority.mode
-        is capacity_admission.ReservedFillPlanAuthorityMode.ALLOCATION_BOUND)
+    assert committed.candidate.new_reserved_capacity_committed.as_dict() == {
+        'l4': 1
+    }
+    assert committed.candidate.paid_residual.as_dict() == {'l4': 1}
+    assert committed.authority.remaining_launch_capacity() == {'l4': 1}
+
+
+@pytest.mark.parametrize(('utilization_gate', 'allocation_kwargs'), ((True, {
+    'utilization_gate_armed': True,
+    'utilization_demonstrated_need': 2,
+    'utilization_ceiling': 2,
+}), (False, {})),
+                         ids=('utilization-gated', 'ungated'))
+def test_reserved_then_paid_liveness_uses_immutable_gate_policy(
+        capacity_database, monkeypatch, utilization_gate, allocation_kwargs):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=True,
+                           utilization_gate=utilization_gate)
+    allocation = _allocation_map({'l4': 1}, **allocation_kwargs)
+    _mock_current_allocation(monkeypatch, allocation)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    observed_supply = []
+
+    def _planner(snapshot, supply):
+        assert supply is not None
+        observed_supply.append(supply)
+        return _current_decision(snapshot, supply, 2)
+
+    acquisition = None
+    if utilization_gate:
+        acquisition = repository.plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'l4': 0},
+            sequenced_reserved_fill=True,
+            planner=_planner)
+        assert acquisition.candidate.kind is (
+            capacity_planning.CapacityPlanKind.GATE_ACQUISITION)
+        assert acquisition.candidate.reserved_launch_target.total() == 0
+        assert acquisition.candidate.paid_launch_target.total() == 0
+        witness = acquisition.candidate.demand_witness_sha256
+        assert witness is not None
+        allocation = _allocation_map({'l4': 1},
+                                     **allocation_kwargs,
+                                     utilization_demand_witness_sha256=witness)
+        _mock_current_allocation(monkeypatch, allocation)
+
+    first = repository.plan_and_publish_current(service_name='svc',
+                                                service_hash='svc-hash',
+                                                service_lifecycle_epoch=3,
+                                                service_version=1,
+                                                accounting_cards={'l4': 0},
+                                                sequenced_reserved_fill=True,
+                                                planner=_planner)
+
+    assert first.candidate.new_reserved_capacity_committed.as_dict() == {
+        'l4': 1
+    }
+    assert first.candidate.reserved_launch_target.as_dict() == {'l4': 1}
+    assert first.candidate.paid_residual.as_dict() == {'l4': 1}
+    assert first.authority.remaining_launch_capacity() == {'l4': 1}
+    expected_policy = (capacity_admission.ReservedSupplyPolicy.DEMAND_GATED
+                       if utilization_gate else
+                       capacity_admission.ReservedSupplyPolicy.STATIC_PREFILL)
+    assert all(supply.policy is expected_policy for supply in observed_supply)
+    if acquisition is not None:
+        assert first.authority.generation == acquisition.authority.generation + 1
+
+    _insert_current_allocation_pending(engine, allocation)
+    successor = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 0},
+        sequenced_reserved_fill=True,
+        planner=_planner)
+
+    assert len(observed_supply) == (3 if utilization_gate else 2)
+    assert observed_supply[-1].policy is expected_policy
+    assert observed_supply[-1].pending_zero_cost_capacity_by_accelerator == {
+        'l4': 1
+    }
+    assert successor.authority.generation == first.authority.generation + 1
+    assert successor.candidate.reserved_capacity_committed.as_dict() == {
+        'l4': 1
+    }
+    assert successor.candidate.new_reserved_capacity_committed.total() == 0
+    assert successor.candidate.reserved_launch_target.total() == 0
+    assert successor.candidate.paid_residual.as_dict() == {'l4': 1}
+    assert successor.authority.remaining_launch_capacity() == {'l4': 1}
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='no whole-backend paid launch authority'):
+        successor.authority.claim_values('L4', units=2)
+
+    claim = _insert_claim(engine, successor.authority, 210)
+    assert claim['capacity_plan_accelerator'] == 'l4'
+    assert claim['capacity_plan_units'] == 1
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='exceed'):
+        _validate_prospective_claim(engine, {
+            **successor.authority.claim_values('L4'),
+            'replica_id': 211,
+        })
+
+
+@pytest.mark.parametrize('reserved_state', ('pending', 'existing'))
+@pytest.mark.parametrize('allocation_state', ('disappeared', 'unsettled'))
+def test_committed_reservation_survives_gated_entitlement_change(
+        capacity_database, monkeypatch, reserved_state, allocation_state):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=True,
+                           utilization_gate=True)
+    initial = _allocation_map({'l4': 1},
+                              utilization_gate_armed=True,
+                              utilization_demonstrated_need=2,
+                              utilization_ceiling=2)
+    current_allocation = [initial]
+    _mock_current_allocation(monkeypatch, lambda: current_allocation[0])
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    acquisition = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 0},
+        sequenced_reserved_fill=True,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2))
+    assert acquisition.candidate.kind is (
+        capacity_planning.CapacityPlanKind.GATE_ACQUISITION)
+    witness = acquisition.candidate.demand_witness_sha256
+    assert witness is not None
+    initial = _allocation_map({'l4': 1},
+                              utilization_gate_armed=True,
+                              utilization_demonstrated_need=2,
+                              utilization_demand_witness_sha256=witness,
+                              utilization_ceiling=2)
+    current_allocation[0] = initial
+    first = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 0},
+        sequenced_reserved_fill=True,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2))
+    assert first.candidate.new_reserved_capacity_committed.as_dict() == {
+        'l4': 1
+    }
+
+    intent_key = _insert_current_allocation_pending(engine, initial)
+    if reserved_state == 'existing':
+        _materialize_current_allocation_pending(engine,
+                                                intent_key,
+                                                212,
+                                                accelerator='L4')
+    if allocation_state == 'disappeared':
+        current_allocation[0] = _allocation_map(
+            {'l4': 0},
+            utilization_gate_armed=True,
+            utilization_demonstrated_need=2,
+            utilization_demand_witness_sha256=witness,
+            utilization_ceiling=2)
+    else:
+        current_allocation[0] = _allocation_map(
+            {'l4': 1},
+            utilization_gate_armed=True,
+            utilization_demonstrated_need=2,
+            utilization_demand_witness_sha256=witness,
+            utilization_ceiling=2,
+            upward_grants_settled=False)
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='exact current reserved-fill allocation'):
+        _validate_prospective_claim(engine, first.authority.claim_values('L4'))
+
+    observed = []
+
+    def _successor_planner(snapshot, supply):
+        assert supply is not None
+        decision = _current_decision(snapshot, supply, 2)
+        _, candidate = decision.decode_planner()
+        observed.append((supply, candidate))
+        return decision
+
+    def _publish_successor():
+        return repository.plan_and_publish_current(service_name='svc',
+                                                   service_hash='svc-hash',
+                                                   service_lifecycle_epoch=3,
+                                                   service_version=1,
+                                                   accounting_cards={'l4': 0},
+                                                   sequenced_reserved_fill=True,
+                                                   planner=_successor_planner)
+
+    successor = _publish_successor()
+
+    assert len(observed) == 1
+    supply, candidate = observed[0]
+    assert supply.policy is capacity_admission.ReservedSupplyPolicy.DEMAND_GATED
+    expected_evidence = (
+        capacity_admission.ReservedSupplyEvidenceState.AUTHENTICATED_SETTLED
+        if allocation_state == 'disappeared' else
+        capacity_admission.ReservedSupplyEvidenceState.AUTHENTICATED_UNSETTLED)
+    assert supply.evidence_state is expected_evidence
+    expected_pending = 1 if reserved_state == 'pending' else 0
+    expected_existing = 1 if reserved_state == 'existing' else 0
+    assert supply.pending_zero_cost_capacity_by_accelerator.get(
+        'l4', 0) == expected_pending
+    assert supply.existing_zero_cost_capacity_by_accelerator.get(
+        'l4', 0) == expected_existing
+    if allocation_state == 'disappeared':
+        assert candidate.reserved_capacity_committed.as_dict() == {'l4': 1}
+        assert candidate.new_reserved_capacity_committed.total() == 0
+        assert candidate.reserved_launch_target.total() == 0
+        assert candidate.paid_residual.as_dict() == {'l4': 1}
+    else:
+        assert candidate.kind is (
+            capacity_planning.CapacityPlanKind.GATE_ACQUISITION)
+        assert candidate.reserved_launch_target.total() == 0
+        assert candidate.paid_launch_target.total() == 0
+
+    assert successor.authority.generation == first.authority.generation + 1
+    if allocation_state == 'disappeared':
+        assert successor.authority.remaining_launch_capacity() == {'l4': 1}
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                           match='no whole-backend paid launch authority'):
+            successor.authority.claim_values('L4', units=2)
+        _validate_prospective_claim(engine,
+                                    successor.authority.claim_values('L4'))
+    else:
+        # An unsettled observer publishes a durable effect-free acquisition
+        # generation.  This revokes the stale paid authority while preserving
+        # the already materialized reservation rows outside the plan ledger.
+        assert successor.candidate.kind is (
+            capacity_planning.CapacityPlanKind.GATE_ACQUISITION)
+        assert successor.authority.remaining_launch_capacity() == {}
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                           match='no whole-backend paid launch authority'):
+            successor.authority.claim_values('L4')
+        with engine.connect() as connection:
+            # Superseded unclaimed plan rows are collected; only the new
+            # effect-free head remains.  The reservation intent itself is
+            # independent durable state and must survive that collection.
+            retained_plan = connection.execute(
+                sqlalchemy.select(
+                    capacity_admission_schema.serve_capacity_plans_table.c.
+                    generation, capacity_admission_schema.
+                    serve_capacity_plans_table.c.content_sha256)).one()
+            head = connection.execute(
+                sqlalchemy.select(
+                    capacity_admission_schema.serve_capacity_plan_heads_table.c.
+                    generation)).one()
+            expected_head = (successor.authority.generation,
+                             successor.authority.content_sha256)
+            assert tuple(retained_plan) == expected_head
+            assert tuple(head) == (successor.authority.generation,)
+            intent = connection.execute(
+                sqlalchemy.select(
+                    zero_cost_actuation_schema.
+                    serve_zero_cost_actuation_intents_table.c.state).where(
+                        zero_cost_actuation_schema.
+                        serve_zero_cost_actuation_intents_table.c.
+                        intent_idempotency_key == intent_key)).scalar_one()
+            assert intent == ('GRANTED'
+                              if reserved_state == 'pending' else 'COMMITTED')
+
+
+@pytest.mark.parametrize('allocation_kwargs', ({
+    'utilization_gate_armed': False,
+    'utilization_demonstrated_need': None,
+    'utilization_ceiling': 0,
+}, {
+    'utilization_gate_armed': True,
+    'utilization_demonstrated_need': None,
+    'utilization_ceiling': 2,
+}, {
+    'utilization_gate_armed': True,
+    'utilization_demonstrated_need': 2,
+    'utilization_ceiling': 2,
+    'upward_grants_settled': False,
+}, {
+    'utilization_gate_armed': True,
+    'utilization_demonstrated_need': 1,
+    'utilization_ceiling': 2,
+}, {
+    'utilization_gate_armed': True,
+    'utilization_demonstrated_need': 2,
+    'utilization_ceiling': 1,
+}, {
+    'utilization_gate_armed': True,
+    'utilization_demonstrated_need': 2,
+    'utilization_demand_witness_sha256': '0' * 64,
+    'utilization_ceiling': 2,
+}),
+                         ids=('unarmed', 'blind', 'unsettled', 'need-too-small',
+                              'ceiling-too-small', 'wrong-witness'))
+def test_usage_gate_publishes_no_effect_acquisition_for_noncausal_evidence(
+        capacity_database, monkeypatch, allocation_kwargs):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=True,
+                           utilization_gate=True)
+    current_allocation = [
+        _allocation_map({'l4': 1},
+                        utilization_gate_armed=True,
+                        utilization_demonstrated_need=2,
+                        utilization_ceiling=2)
+    ]
+    _mock_current_allocation(monkeypatch, lambda: current_allocation[0])
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+
+    bootstrap = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 0},
+        sequenced_reserved_fill=True,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2))
+    assert bootstrap.candidate.kind is (
+        capacity_planning.CapacityPlanKind.GATE_ACQUISITION)
+    exact_witness = bootstrap.candidate.demand_witness_sha256
+    assert exact_witness is not None
+    current_allocation[0] = _allocation_map(
+        {'l4': 1},
+        utilization_gate_armed=True,
+        utilization_demonstrated_need=2,
+        utilization_demand_witness_sha256=exact_witness,
+        utilization_ceiling=2)
+    positive = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 0},
+        sequenced_reserved_fill=True,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2))
+    assert positive.candidate.kind is capacity_planning.CapacityPlanKind.DEMAND
+    assert positive.authority.remaining_launch_capacity() == {'l4': 1}
+
+    noncausal_kwargs = dict(allocation_kwargs)
+    # Exercise the distinct causal failures precisely.  Armed cases with a
+    # numeric need use the exact committed witness unless the parameter is the
+    # explicit wrong-witness case; otherwise a missing witness would make the
+    # smaller-need/ceiling and unsettled rows indistinguishable from `blind`.
+    if (noncausal_kwargs.get('utilization_gate_armed') and
+            noncausal_kwargs.get('utilization_demonstrated_need') is not None
+            and 'utilization_demand_witness_sha256' not in noncausal_kwargs):
+        noncausal_kwargs['utilization_demand_witness_sha256'] = exact_witness
+    current_allocation[0] = _allocation_map({'l4': 1}, **noncausal_kwargs)
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='exact current reserved-fill allocation'):
+        _validate_prospective_claim(engine,
+                                    positive.authority.claim_values('L4'))
+
+    committed = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 0},
+        sequenced_reserved_fill=True,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2))
+    candidate = committed.candidate
+    assert candidate.kind is (
+        capacity_planning.CapacityPlanKind.GATE_ACQUISITION)
+    assert candidate.demand_witness_sha256 == exact_witness
+    assert candidate.next_policy_state is None
+    no_effect_fields = (
+        'supply_aware_demand_target',
+        'reserved_capacity_committed',
+        'new_reserved_capacity_committed',
+        'reserved_launch_target',
+        'reserved_packing_padding_target',
+        'paid_residual',
+        'paid_launch_target',
+        'paid_packing_padding_target',
+        'zero_cost_padding_target',
+        'static_prefill_target',
+        'retained_existing_target',
+        'transition_retention_target',
+        'wave_limited_actuation_target',
+        'supply_aware_actuation_target',
+        'explicit_demand_attribution',
+        'paid_demand_attribution',
+        'warm_retention_target',
+        'deadline_target',
+        'retirement_floor_target',
+    )
+    assert all(
+        getattr(candidate, field).total() == 0 for field in no_effect_fields)
+    assert committed.authority.remaining_launch_capacity() == {}
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='no whole-backend paid launch authority'):
+        committed.authority.claim_values('L4')
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='current fresh capacity-plan authority'):
+        _validate_prospective_claim(engine,
+                                    positive.authority.claim_values('L4'))
+
+    with engine.connect() as connection:
+        plan = connection.execute(
+            sqlalchemy.select(capacity_admission_schema.
+                              serve_capacity_plans_table)).mappings().one()
+        head = connection.execute(
+            sqlalchemy.select(
+                capacity_admission_schema.serve_capacity_plan_heads_table)
+        ).mappings().one()
+        assert plan['generation'] == committed.authority.generation
+        assert plan['content_sha256'] == committed.authority.content_sha256
+        assert head['generation'] == committed.authority.generation
+        assert plan['payload']['planner']['candidate'][
+            'demand_witness_sha256'] == exact_witness
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                zero_cost_actuation_schema.
+                serve_zero_cost_actuation_intents_table)).scalar_one() == 0
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.replicas_table)).scalar_one() == 0
 
 
 def test_exact_paid_plan_ignores_only_statically_incompatible_reserved_cards(
@@ -1407,20 +2229,24 @@ def test_exact_paid_plan_ignores_only_statically_incompatible_reserved_cards(
                 serve_state_schema.version_specs_table.c.version == 1).values(
                     worker_placement_projections=projections))
 
-    authority, _ = (capacity_admission.CapacityAdmissionRepository(
+    committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_publish_current(
             service_name='svc',
             service_hash='svc-hash',
             service_lifecycle_epoch=3,
             service_version=1,
-            accounting_cards={'l4': 0},
+            accounting_cards={
+                'h200': 0,
+                'l4': 0
+            },
             sequenced_reserved_fill=True,
-            reserved_fill_allocation_map=None,
-            planner=lambda _snapshot, supply:
-            (_current_decision(1) if supply is not None else pytest.fail(
-                'static authority still requires the locked projection'))))
+            planner=lambda snapshot, supply:
+            (_current_decision(snapshot, supply, 1)
+             if supply is not None else pytest.fail(
+                 'static authority still requires the locked projection'))))
+    authority = committed.authority
 
-    assert authority.remaining() == {'l4': 1}
+    assert authority.remaining_launch_capacity() == {'l4': 1}
     assert (authority.reserved_fill_authority.mode is capacity_admission.
             ReservedFillPlanAuthorityMode.STATICALLY_INCOMPATIBLE)
     assert authority.reserved_fill_authority.incompatible_accelerators == (
@@ -1442,8 +2268,47 @@ def test_exact_paid_plan_ignores_only_statically_incompatible_reserved_cards(
         _validate_prospective_claim(engine, authority.claim_values('l4'))
 
 
+def test_flexible_demand_cannot_bypass_reserved_allocation_by_landing_on_l4(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=True)
+    h200_projection = copy.deepcopy(_CAPACITY_KUEUE_PROJECTION)
+    h200_projection['accelerator_name'] = 'H200'
+    h200_projection['accelerator_scheduling']['label_values'] = ['NVIDIA-H200']
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.version_specs_table).where(
+                serve_state_schema.version_specs_table.c.service_name == 'svc',
+                serve_state_schema.version_specs_table.c.version == 1).values(
+                    worker_placement_projections=[h200_projection]))
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='no current reserved allocation'):
+        capacity_admission.CapacityAdmissionRepository(
+            engine).plan_and_publish_current(
+                service_name='svc',
+                service_hash='svc-hash',
+                service_lifecycle_epoch=3,
+                service_version=1,
+                accounting_cards={
+                    'l4': 0,
+                    'h200': 0
+                },
+                sequenced_reserved_fill=True,
+                planner=lambda snapshot, supply: _current_decision(
+                    snapshot,
+                    supply,
+                    1,
+                    target_by_accelerator={
+                        'l4': 1,
+                        'h200': 0
+                    },
+                    compatible_accelerators=('l4', 'h200'),
+                    cold_accelerator_order=('l4', 'h200')))
+
+
 @pytest.mark.parametrize('target', ({'h200': 1}, {'*': 1}))
-def test_paid_plan_without_allocation_stays_closed_for_compatible_or_flexible(
+def test_compatible_or_flexible_paid_plan_requires_current_allocation(
         capacity_database, target):
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=True)
@@ -1457,15 +2322,9 @@ def test_paid_plan_without_allocation_stays_closed_for_compatible_or_flexible(
                 serve_state_schema.version_specs_table.c.version == 1).values(
                     worker_placement_projections=[h200_projection]))
 
-    decision = capacity_admission.CapacityPlanDecision(
-        capacity_target_by_accelerator=target,
-        normalized_demand_extensions={
-            'autoscaler_target': 1,
-            'replica_unit': 'physical_backend',
-            'demand_target_by_accelerator': target,
-        })
+    accelerator = next(iter(target))
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                       match='no exact reserved supply authority'):
+                       match='no current reserved allocation'):
         capacity_admission.CapacityAdmissionRepository(
             engine).plan_and_publish_current(
                 service_name='svc',
@@ -1474,23 +2333,37 @@ def test_paid_plan_without_allocation_stays_closed_for_compatible_or_flexible(
                 service_version=1,
                 accounting_cards={card: 0 for card in target},
                 sequenced_reserved_fill=True,
-                reserved_fill_allocation_map=None,
-                planner=lambda _snapshot, _supply: decision)
+                planner=lambda snapshot, supply: _current_decision(
+                    snapshot, supply, 1, accelerator=accelerator))
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                capacity_admission_schema.serve_capacity_plans_table)
+        ).scalar_one() == 0
 
 
-def test_cleanup_unproven_paid_row_remains_in_current_baseline(
-        capacity_database):
+@pytest.mark.parametrize(
+    'row_status, down_status, expected_existing, expected_residual',
+    [('SHUTTING_DOWN', 'SCHEDULED', 1, 0),
+     ('SHUTTING_DOWN', 'SUCCEEDED', 0, 1)])
+def test_shutting_down_paid_row_leaves_baseline_only_after_cleanup_proof(
+        capacity_database, row_status, down_status, expected_existing,
+        expected_residual):
     engine, incarnation, _ = capacity_database
     _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
     replica = _replica_values(101, zero_cost=False)
+    replica['status'] = row_status
+    replica['replica_state']['status_property'][
+        'sky_launch_status'] = 'SUCCEEDED'
     replica['replica_state']['status_property']['is_scale_down'] = True
-    replica['replica_state']['status_property']['sky_down_status'] = 'SCHEDULED'
+    replica['replica_state']['status_property']['sky_down_status'] = down_status
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.insert(
                 serve_state_schema.replicas_table).values(**replica))
 
-    authority, _ = (capacity_admission.CapacityAdmissionRepository(
+    committed = (capacity_admission.CapacityAdmissionRepository(
         engine).plan_and_publish_current(
             service_name='svc',
             service_hash='svc-hash',
@@ -1498,13 +2371,119 @@ def test_cleanup_unproven_paid_row_remains_in_current_baseline(
             service_version=1,
             accounting_cards={'l4': 0},
             sequenced_reserved_fill=False,
-            reserved_fill_allocation_map=None,
-            planner=lambda _snapshot, _supply: _current_decision(1)))
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot, supply, 1)))
+    authority = committed.authority
     payload = _capacity_plan_payload(engine, authority.generation)
 
-    assert payload['existing_paid_capacity_by_accelerator'] == {'l4': 1}
+    assert payload['existing_paid_capacity_by_accelerator'] == {
+        'l4': expected_existing
+    }
+    assert payload['paid_residual_by_accelerator'] == ({
+        'l4': expected_residual
+    } if expected_residual else {})
+    assert authority.remaining_launch_capacity() == ({
+        'l4': expected_residual
+    } if expected_residual else {})
+
+
+@pytest.mark.parametrize('down_status, expected_charged, expected_launch',
+                         [('SCHEDULED', 1, 0), ('SUCCEEDED', 0, 1)])
+def test_old_version_paid_row_charges_cap_without_covering_current_demand(
+        capacity_database, down_status, expected_charged, expected_launch):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    replica = _replica_values(102, zero_cost=False)
+    replica['version'] = 2
+    replica['replica_state']['version'] = 2
+    replica['status'] = 'SHUTTING_DOWN'
+    replica['replica_state']['status_property'][
+        'sky_launch_status'] = 'SUCCEEDED'
+    replica['replica_state']['status_property']['is_scale_down'] = True
+    replica['replica_state']['status_property']['sky_down_status'] = down_status
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.replicas_table).values(**replica))
+
+    committed = (capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'l4': 0},
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot, supply, 1, max_live_paid_gpu_units=1)))
+
+    assert committed.candidate.paid_residual.as_dict() == {'l4': 1}
+    assert committed.candidate.paid_cap.charged_paid_gpu_units == (
+        expected_charged)
+    assert committed.candidate.paid_launch_target.as_dict() == ({
+        'l4': expected_launch
+    } if expected_launch else {})
+    assert committed.authority.remaining_launch_capacity() == ({
+        'l4': expected_launch
+    } if expected_launch else {})
+
+
+def test_noncurrent_removed_reserved_card_is_retirement_only_inventory(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    replica = _replica_values(103, zero_cost=True, accelerator='L4')
+    replica['version'] = 2
+    replica['replica_state']['version'] = 2
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.replicas_table).values(**replica))
+
+    committed = (capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'a100': 0},
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot, supply, 1, accelerator='a100')))
+
+    payload = _capacity_plan_payload(engine, committed.authority.generation)
+    assert payload['existing_zero_cost_capacity_by_accelerator'] == {'a100': 0}
+    assert committed.candidate.paid_residual.as_dict() == {'a100': 1}
+    assert committed.authority.remaining_launch_capacity() == {'a100': 1}
+
+
+def test_disabled_fill_keeps_surviving_pending_intent_in_economic_baseline(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
+    _install_pending_east_capacity(engine)
+
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(service_name='svc',
+                                         service_hash='svc-hash',
+                                         service_lifecycle_epoch=3,
+                                         service_version=1,
+                                         accounting_cards={'l4': 0},
+                                         sequenced_reserved_fill=False,
+                                         planner=lambda snapshot, supply:
+                                         _current_decision(snapshot, supply, 1))
+    payload = _capacity_plan_payload(engine, committed.authority.generation)
+
+    assert payload['pending_zero_cost_capacity_by_accelerator'] == {'l4': 1}
     assert payload['paid_residual_by_accelerator'] == {}
-    assert not authority.remaining()
+    assert committed.candidate.reserved_capacity_committed.as_dict() == {
+        'l4': 1
+    }
+    assert committed.candidate.new_reserved_capacity_committed.total() == 0
+    assert committed.candidate.reserved_launch_target.total() == 0
+    assert not committed.authority.remaining_launch_capacity()
+    assert (committed.authority.reserved_fill_authority.mode
+            is capacity_admission.ReservedFillPlanAuthorityMode.NOT_APPLICABLE)
 
 
 def test_durable_unknown_replacement_requires_and_persists_plan_tuple(
@@ -2175,7 +3154,9 @@ def test_logical_retirement_serializes_with_next_report(capacity_database,
     else:
         assert durable.status_property.logical_retirement_committed is True
         assert (durable.status_property.sky_down_status ==
-                common_utils.ProcessStatus.RUNNING)
+                common_utils.ProcessStatus.SCHEDULED)
+        assert serve_state.logical_retirement_commit_identity(
+            durable) is not None
 
 
 def test_logical_retirement_commit_lost_ack_is_ambiguous(
@@ -2201,23 +3182,45 @@ def test_logical_retirement_commit_lost_ack_is_ambiguous(
     assert durable is not None
     assert durable.status_property.logical_retirement_committed is True
     assert (durable.status_property.sky_down_status ==
-            common_utils.ProcessStatus.RUNNING)
+            common_utils.ProcessStatus.SCHEDULED)
+    assert serve_state.logical_retirement_commit_identity(durable) is not None
 
 
 def test_heartbeat_refresh_keeps_plan_and_bounded_claims(capacity_database):
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
-    first = repository.publish(_plan(2))
+    first = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={
+            'l4': 0
+        },
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2
+                                                          )).authority
     first_claim = _insert_claim(engine, first, 10)
 
     demand_state.ingest_report(
         'svc', 'svc-hash', _demand_report(time.time(),
                                           route_receipt,
                                           sequence=2))
-    duplicate = repository.publish(_plan(2))
+    successor = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={
+            'l4': 0
+        },
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2
+                                                          )).authority
 
-    assert duplicate.generation == first.generation
-    assert duplicate.demand_feed_generation > first.demand_feed_generation
+    assert successor.generation == first.generation + 1
+    assert successor.demand_feed_generation > first.demand_feed_generation
+    assert successor.remaining_launch_capacity() == {'l4': 1}
     with engine.begin() as connection:
         service = connection.execute(
             sqlalchemy.select(serve_state_schema.services_table).where(
@@ -2228,7 +3231,7 @@ def test_heartbeat_refresh_keeps_plan_and_bounded_claims(capacity_database):
                 **service, 'name': 'svc'
             }, first_claim)
 
-    _insert_claim(engine, duplicate, 11)
+    _insert_claim(engine, successor, 11)
     with engine.begin() as connection:
         service = connection.execute(
             sqlalchemy.select(serve_state_schema.services_table).where(
@@ -2240,7 +3243,7 @@ def test_heartbeat_refresh_keeps_plan_and_bounded_claims(capacity_database):
                 connection, {
                     **service, 'name': 'svc'
                 }, {
-                    **duplicate.claim_values('L4'),
+                    **successor.claim_values('L4'),
                     'replica_id': 12,
                 },
                 prospective=True)
@@ -2426,7 +3429,7 @@ def test_prospective_claim_accepts_later_clock_arrival_expiry(
     authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
         _plan(1))
     claim = authority.claim_values('L4')
-    assert authority.remaining() == {'l4': 1}
+    assert authority.remaining_launch_capacity() == {'l4': 1}
     assert claim['capacity_plan_accelerator'] == 'l4'
     assert claim['capacity_plan_units'] == 1
 
@@ -2444,7 +3447,7 @@ def test_prospective_claim_accepts_later_clock_arrival_expiry(
                        match='exceed'):
         _validate_prospective_claim(engine, claim)
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                       match='no paid residual'):
+                       match='no whole-backend paid launch authority'):
         authority.claim_values('H200')
 
     assert len(observed) == 3
@@ -2454,7 +3457,7 @@ def test_prospective_claim_accepts_later_clock_arrival_expiry(
         assert snapshot.receipt_watermark == planned_snapshot.receipt_watermark
         assert snapshot.route_generation == planned_snapshot.route_generation
         assert snapshot.route_sha256 == planned_snapshot.route_sha256
-    assert authority.remaining() == {'l4': 1}
+    assert authority.remaining_launch_capacity() == {'l4': 1}
 
 
 def test_prospective_claim_batch_sums_same_card_before_writes(
@@ -2489,6 +3492,48 @@ def test_prospective_claim_batch_includes_prior_committed_debits(
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
                        match='Paid claims exceed'):
         _validate_prospective_claim_batch(engine, [claim, claim])
+
+
+def test_logical_paid_residual_authorizes_one_whole_multi_gpu_backend(
+        capacity_database):
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=False,
+                           replica_unit='logical')
+    committed = (capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={'a100': 0},
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot,
+                supply,
+                1,
+                accelerator='a100',
+                capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+                physical_gpu_width_by_accelerator={'a100': 8})))
+    authority = committed.authority
+
+    assert authority.economic_residual() == {'a100': 1}
+    assert authority.remaining_launch_capacity() == {'a100': 8}
+    exact_backend = authority.claim_values('a100', units=8)
+    _validate_prospective_claim(engine, exact_backend)
+
+    for malformed_units in (1, 9):
+        with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                           match='exact whole-backend'):
+            _validate_prospective_claim(engine, {
+                **exact_backend,
+                'capacity_plan_units': malformed_units,
+            })
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='Paid claims exceed'):
+        _validate_prospective_claim_batch(engine,
+                                          [exact_backend, exact_backend])
 
 
 def test_prospective_claim_batch_groups_each_exact_debit_card(
@@ -2546,7 +3591,7 @@ def test_prospective_claim_rejects_nonexpiry_snapshot_change(
     authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
         _plan(1))
     claim = authority.claim_values('L4')
-    assert authority.remaining() == {'l4': 1}
+    assert authority.remaining_launch_capacity() == {'l4': 1}
     assert claim['capacity_plan_accelerator'] == 'l4'
 
     def _mutate(normalized):
@@ -2565,14 +3610,24 @@ def test_prospective_claim_rejects_nonexpiry_snapshot_change(
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
                        match='demand semantics changed before admission'):
         _validate_prospective_claim(engine, claim)
-    assert authority.remaining() == {'l4': 1}
+    assert authority.remaining_launch_capacity() == {'l4': 1}
 
 
 def test_committed_claim_survives_successor_plan_that_accounts_for_it(
         capacity_database):
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
-    first = repository.publish(_plan(2))
+    first = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={
+            'l4': 0
+        },
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2
+                                                          )).authority
     first_claim = _insert_claim(engine, first, 10)
 
     # Persisting the claim also persists its paid replica.  An independent
@@ -2583,9 +3638,19 @@ def test_committed_claim_survives_successor_plan_that_accounts_for_it(
     demand_state.ingest_report(
         'svc', 'svc-hash',
         _demand_report(time.time(), route_receipt, sequence=2, request_count=2))
-    successor = repository.publish(_plan(2))
+    successor = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={
+            'l4': 0
+        },
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2
+                                                          )).authority
     assert successor.generation == first.generation + 1
-    assert successor.remaining() == {'l4': 1}
+    assert successor.remaining_launch_capacity() == {'l4': 1}
 
     with engine.begin() as connection:
         service = connection.execute(
@@ -2601,9 +3666,19 @@ def test_committed_claim_survives_successor_plan_that_accounts_for_it(
     demand_state.ingest_report(
         'svc', 'svc-hash',
         _demand_report(time.time(), route_receipt, sequence=3, request_count=1))
-    fully_committed = repository.publish(_plan(2))
+    fully_committed = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={
+            'l4': 0
+        },
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2
+                                                          )).authority
     assert fully_committed.generation == successor.generation + 1
-    assert not fully_committed.remaining()
+    assert not fully_committed.remaining_launch_capacity()
     with engine.begin() as connection:
         service = connection.execute(
             sqlalchemy.select(serve_state_schema.services_table).where(
@@ -2622,15 +3697,35 @@ def test_committed_claim_survives_successor_plan_that_accounts_for_it(
 def test_paid_claims_survive_unpublished_semantic_heartbeats(capacity_database):
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
-    first = repository.publish(_plan(2))
+    first = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={
+            'l4': 0
+        },
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2
+                                                          )).authority
     first_claim = _insert_claim(engine, first, 10)
 
     demand_state.ingest_report(
         'svc', 'svc-hash',
         _demand_report(time.time(), route_receipt, sequence=2, request_count=2))
-    successor = repository.publish(_plan(2))
+    successor = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={
+            'l4': 0
+        },
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2
+                                                          )).authority
     assert successor.generation == first.generation + 1
-    assert successor.remaining() == {'l4': 1}
+    assert successor.remaining_launch_capacity() == {'l4': 1}
 
     # A heartbeat can advance the live feed again while a large provider-free
     # candidate wave is being prepared. Both the committed debit and a new
@@ -3081,7 +4176,7 @@ def test_committed_claim_survives_high_churn_compatibility_demand(
     # baseline but authorizes no additional claim.  It still cannot revoke the
     # original provider effect.
     successor = repository.publish(_plan(0))
-    assert not successor.remaining()
+    assert not successor.remaining_launch_capacity()
     with engine.begin() as connection:
         service = connection.execute(
             sqlalchemy.select(serve_state_schema.services_table).where(
@@ -3132,9 +4227,9 @@ def test_allocation_bound_claim_survives_unbound_zero_successor(
             reserved_fill_authority=(
                 capacity_admission.ReservedFillPlanAuthority.zero_revocation()
             )))
-    assert not zero.remaining()
+    assert not zero.remaining_launch_capacity()
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                       match='no paid residual'):
+                       match='no whole-backend paid launch authority'):
         zero.claim_values('L4')
 
     with engine.begin() as connection:
@@ -3181,10 +4276,20 @@ def test_only_quota_assigned_kueue_capacity_is_reserved_supply(
     engine, _, _ = capacity_database
     _install_waiting_kueue_capacity(engine, admitted=admitted)
 
-    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
-        _plan(1))
+    authority = (capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={
+                'l4': 0
+            },
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot, supply, 1)).authority)
 
-    assert authority.remaining() == ({
+    assert authority.remaining_launch_capacity() == ({
         'l4': expected_paid
     } if expected_paid else {})
 
@@ -3193,10 +4298,19 @@ def test_only_quota_assigned_kueue_capacity_is_reserved_supply(
                          ids=['final-claim', 'provider-effect'])
 def test_missing_kueue_admission_is_fenced_only_before_claim_commit(
         capacity_database, provider_effect):
-    engine, _, _ = capacity_database
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
     key = _install_waiting_kueue_capacity(engine)
-    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
-        _plan(1))
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(service_name='svc',
+                                         service_hash='svc-hash',
+                                         service_lifecycle_epoch=3,
+                                         service_version=1,
+                                         accounting_cards={'l4': 0},
+                                         sequenced_reserved_fill=False,
+                                         planner=lambda snapshot, supply:
+                                         _current_decision(snapshot, supply, 1))
+    authority = committed.authority
     claim = (authority.claim_values('L4')
              if not provider_effect else _insert_claim(engine, authority, 100))
     with engine.begin() as connection:
@@ -3219,7 +4333,8 @@ def test_missing_kueue_admission_is_fenced_only_before_claim_commit(
                 prospective=not provider_effect)
         else:
             with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                               match='Committed capacity changed'):
+                               match=('Economic supply or scheduler capacity '
+                                      'changed')):
                 capacity_admission.validate_paid_claim_in_connection(
                     connection, {
                         **service, 'name': 'svc'
@@ -3278,11 +4393,20 @@ def test_copied_kueue_identity_is_fenced_only_before_claim_commit(
 
 def test_proven_east_intent_without_admission_allows_final_paid_claim(
         capacity_database):
-    engine, _, _ = capacity_database
+    engine, incarnation, _ = capacity_database
+    _enable_durable_intent(engine, incarnation, reserved_fill_enabled=False)
     _install_pending_east_capacity(engine)
-    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
-        _plan(2))
-    assert authority.remaining() == {'l4': 1}
+    committed = capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(service_name='svc',
+                                         service_hash='svc-hash',
+                                         service_lifecycle_epoch=3,
+                                         service_version=1,
+                                         accounting_cards={'l4': 0},
+                                         sequenced_reserved_fill=False,
+                                         planner=lambda snapshot, supply:
+                                         _current_decision(snapshot, supply, 2))
+    authority = committed.authority
+    assert authority.remaining_launch_capacity() == {'l4': 1}
     with engine.begin() as connection:
         service = connection.execute(
             sqlalchemy.select(serve_state_schema.services_table).where(
@@ -3303,23 +4427,40 @@ def test_cross_card_reserved_capacity_satisfies_supply_aware_target(
         connection.execute(
             sqlalchemy.insert(serve_state_schema.replicas_table).values(
                 **_replica_values(22, zero_cost=True, accelerator='A100')))
-    plan = _plan(2)
-    plan = dataclasses.replace(plan,
-                               normalized_demand={
-                                   **plan.normalized_demand,
-                                   'demand_target_by_accelerator': {
-                                       'L4': 2,
-                                   },
-                               },
-                               capacity_target_by_accelerator={
-                                   'L4': 0,
-                                   'A100': 2,
-                               })
+    committed = (capacity_admission.CapacityAdmissionRepository(
+        engine).plan_and_publish_current(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={
+                'l4': 0,
+                'a100': 0,
+            },
+            sequenced_reserved_fill=False,
+            planner=lambda snapshot, supply: _current_decision(
+                snapshot,
+                supply,
+                2,
+                target_by_accelerator={
+                    'l4': 2,
+                    'a100': 0,
+                },
+                compatible_accelerators=('l4', 'a100'),
+                cold_accelerator_order=('l4', 'a100'),
+                prospective_paid_accelerators=('l4', 'a100'),
+                provisioning_by_accelerator=(
+                    supply.existing_zero_cost_capacity_by_accelerator))))
 
-    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
-        plan)
-
-    assert authority.remaining() == {'a100': 1}
+    assert committed.candidate.supply_aware_actuation_target.as_dict() == {
+        'a100': 1,
+        'l4': 1,
+    }
+    assert committed.candidate.reserved_capacity_committed.as_dict() == {
+        'a100': 1
+    }
+    assert committed.candidate.paid_residual.as_dict() == {'l4': 1}
+    assert committed.authority.remaining_launch_capacity() == {'l4': 1}
 
 
 def test_allocation_tail_satisfies_flexible_demand_before_paid_residual(
@@ -3344,7 +4485,7 @@ def test_allocation_tail_satisfies_flexible_demand_before_paid_residual(
         'h200': 1,
         'l4': 0,
     }
-    assert not authority.remaining()
+    assert not authority.remaining_launch_capacity()
 
 
 def test_allocation_tail_uses_logical_multi_gpu_card_width(
@@ -3368,7 +4509,7 @@ def test_allocation_tail_uses_logical_multi_gpu_card_width(
         'h200': 8,
         'l4': 0,
     }
-    assert not authority.remaining()
+    assert not authority.remaining_launch_capacity()
 
 
 def test_allocation_tail_leaves_only_genuinely_uncovered_paid_residual(
@@ -3385,7 +4526,36 @@ def test_allocation_tail_leaves_only_genuinely_uncovered_paid_residual(
 
     authority = repository.publish(plan)
 
-    assert authority.remaining() == {'l4': 1}
+    assert authority.remaining_launch_capacity() == {'l4': 1}
+    _validate_prospective_claim(engine, authority.claim_values('l4'))
+
+
+def test_nonfitting_h200_tail_does_not_block_exact_l4_paid_claim(
+        capacity_database, monkeypatch):
+    engine, incarnation, _ = capacity_database
+    allocation = _allocation_map({'H200': 1}, accelerator_count=8)
+    # Seven logical slots cannot admit the allocation's eight-GPU H200
+    # backend.  That accelerator-local packing remainder must not suppress an
+    # independent one-GPU L4 paid launch.
+    _enable_durable_intent(engine,
+                           incarnation,
+                           max_replicas=7,
+                           replica_unit='logical')
+    _mock_current_allocation(monkeypatch, allocation)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    plan, projection = _allocation_bound_plan(repository, allocation, {
+        'l4': 1,
+        'h200': 0,
+    })
+
+    authority = repository.publish(plan)
+
+    assert projection.allocation_reserved_capacity_by_accelerator == {
+        'h200': 0,
+        'l4': 0,
+    }
+    assert authority.economic_residual() == {'l4': 1}
+    assert authority.remaining_launch_capacity() == {'l4': 1}
     _validate_prospective_claim(engine, authority.claim_values('l4'))
 
 
@@ -3432,9 +4602,9 @@ def test_tail_to_pending_to_replica_never_double_counts_reserved_supply(
         _reserved_total(payload)
         for payload in (tail_payload, pending_payload, replica_payload)
     ] == [2, 2, 2]
-    assert not tail_authority.remaining()
-    assert not pending_authority.remaining()
-    assert not replica_authority.remaining()
+    assert not tail_authority.remaining_launch_capacity()
+    assert not pending_authority.remaining_launch_capacity()
+    assert not replica_authority.remaining_launch_capacity()
 
 
 @pytest.mark.parametrize('provider_effect', [False, True],
@@ -3471,7 +4641,8 @@ def test_tail_to_pending_change_is_fenced_only_before_claim_commit(
                 protocol_and_service_prelocked=True)
         else:
             with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                               match='Reserved economic supply changed'):
+                               match=('Economic supply or scheduler capacity '
+                                      'changed')):
                 capacity_admission.validate_paid_claim_in_connection(
                     connection,
                     service,
@@ -3565,7 +4736,8 @@ def test_reserved_lifecycle_change_is_fenced_only_before_claim_commit(
                 protocol_and_service_prelocked=True)
         else:
             with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                               match='Reserved economic supply changed'):
+                               match=('Economic supply or scheduler capacity '
+                                      'changed')):
                 capacity_admission.validate_paid_claim_in_connection(
                     connection,
                     service,
@@ -3608,7 +4780,7 @@ def test_running_paid_replica_is_not_mutated_by_future_supply_change(
 
     assert projection.pending_zero_cost_capacity_by_accelerator['h200'] == 1
     assert projection.allocation_reserved_capacity_by_accelerator['h200'] == 0
-    assert not successor.remaining()
+    assert not successor.remaining_launch_capacity()
     with engine.connect() as connection:
         retained = connection.execute(
             sqlalchemy.select(
@@ -3628,7 +4800,7 @@ def test_running_paid_replica_is_not_mutated_by_future_supply_change(
     assert claim_count == 1
 
 
-def test_full_allocation_tail_requires_rotation_independent_headroom(
+def test_full_other_card_does_not_create_allocation_tail(
         capacity_database, monkeypatch):
     engine, incarnation, _ = capacity_database
     allocation = _allocation_map({'H200': 1})
@@ -3641,36 +4813,59 @@ def test_full_allocation_tail_requires_rotation_independent_headroom(
                                for replica_id in range(200, 210)
                            ])
 
-    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                       match='rotation-independent service headroom'):
-        capacity_admission.CapacityAdmissionRepository(
-            engine).project_reserved_supply(
-                service_name='svc',
-                service_hash='svc-hash',
-                service_lifecycle_epoch=3,
-                service_version=1,
-                accounting_cards={
-                    'l4': 10,
-                    'h200': 0,
-                },
-                authority=capacity_admission.ReservedFillPlanAuthority.bound(
-                    allocation.identity))
+    projection = capacity_admission.CapacityAdmissionRepository(
+        engine).project_reserved_supply(
+            service_name='svc',
+            service_hash='svc-hash',
+            service_lifecycle_epoch=3,
+            service_version=1,
+            accounting_cards={
+                'l4': 10,
+                'h200': 0,
+            },
+            authority=capacity_admission.ReservedFillPlanAuthority.bound(
+                allocation.identity))
+
+    assert projection.allocation_reserved_capacity_by_accelerator == {
+        'h200': 0,
+        'l4': 0,
+    }
 
 
 def test_committed_claim_survives_zero_target_successor(capacity_database):
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
-    first = repository.publish(_plan(1))
+    first = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={
+            'l4': 0
+        },
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 1
+                                                          )).authority
     claim = _insert_claim(engine, first, 30)
     demand_state.ingest_report(
         'svc', 'svc-hash',
         _demand_report(time.time(), route_receipt, sequence=2, request_count=0))
-    zero_target = repository.publish(_plan(0))
+    zero_target = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={
+            'l4': 0
+        },
+        sequenced_reserved_fill=False,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 0
+                                                          )).authority
 
     assert zero_target.generation == first.generation + 1
-    assert not zero_target.remaining()
+    assert not zero_target.remaining_launch_capacity()
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
-                       match='no paid residual'):
+                       match='no whole-backend paid launch authority'):
         zero_target.claim_values('L4')
     with engine.begin() as connection:
         service = connection.execute(
@@ -3709,7 +4904,7 @@ def test_protocol2_full_window_zero_revokes_paid_authority_without_exact_cards(
     assert not snapshot.request_information['compatibility_demand_complete']
     repository = capacity_admission.CapacityAdmissionRepository(engine)
     zero = repository.publish(_plan(0))
-    assert not zero.remaining()
+    assert not zero.remaining_launch_capacity()
 
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
                        match='demand receipts'):

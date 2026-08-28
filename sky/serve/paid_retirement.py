@@ -13,6 +13,7 @@ from sqlalchemy.dialects import postgresql
 
 from sky.serve import capacity_admission
 from sky.serve import capacity_admission_schema
+from sky.serve import capacity_planning
 from sky.serve import demand_state
 from sky.serve import demand_state_schema
 from sky.serve import route_projection_schema
@@ -147,6 +148,111 @@ _CAPACITY_PLANS = capacity_admission_schema.serve_capacity_plans_table
 _ROUTE_HEADS = route_projection_schema.serve_route_heads_table
 _ROUTE_LEASES = route_projection_schema.serve_route_replica_leases_table
 
+_CAPACITY_PLAN_REQUIRED_FIELDS = frozenset({
+    'protocol_version',
+    'service',
+    'source',
+    'normalized_demand',
+    'capacity_target_by_accelerator',
+    'existing_zero_cost_capacity_by_accelerator',
+    'pending_zero_cost_capacity_by_accelerator',
+    'allocation_reserved_capacity_by_accelerator',
+    'existing_paid_capacity_by_accelerator',
+    'paid_residual_by_accelerator',
+    'paid_launch_target_by_accelerator',
+    'reserved_fill_authority',
+    'planner',
+})
+_CAPACITY_PLAN_OPTIONAL_FIELDS = frozenset({
+    'economic_capacity_graph_sha256',
+})
+
+
+def _canonical_capacity_counts(value: object, field: str) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f'{field} is not a capacity mapping.')
+    result: dict[str, int] = {}
+    for raw_card, raw_count in value.items():
+        if (not isinstance(raw_card, str) or not raw_card or
+                type(raw_count) is not int or raw_count < 0):
+            raise ValueError(f'{field} has malformed capacity.')
+        card = raw_card.casefold()
+        if card in result:
+            raise ValueError(f'{field} repeats an accelerator.')
+        result[card] = raw_count
+    return dict(sorted(result.items()))
+
+
+def _validate_fresh_zero_planner(
+    payload: Mapping[str, Any],
+    plan: Mapping[str, Any],
+) -> None:
+    """Bind retirement to the exact typed fresh-zero planner candidate."""
+    fields = set(payload)
+    if (not _CAPACITY_PLAN_REQUIRED_FIELDS.issubset(fields) or fields -
+        (_CAPACITY_PLAN_REQUIRED_FIELDS | _CAPACITY_PLAN_OPTIONAL_FIELDS)):
+        raise ValueError('Fresh-zero capacity plan schema is not closed.')
+    expected_service = {
+        'name': plan['service_name'],
+        'hash': plan['service_hash'],
+        'lifecycle_epoch': plan['service_lifecycle_epoch'],
+        'version': plan['service_version'],
+    }
+    expected_source = {
+        'demand_source_epoch': plan['demand_source_epoch'],
+        'route_generation': plan['route_generation'],
+        'route_sha256': plan['route_sha256'],
+        'route_source_epoch': plan['route_source_epoch'],
+    }
+    if (payload.get('protocol_version') != plan['protocol_version'] or
+            payload.get('service') != expected_service or
+            payload.get('source') != expected_source):
+        raise ValueError('Fresh-zero capacity plan source is inconsistent.')
+
+    planner_snapshot, candidate = capacity_planning.decode_planner_envelope(
+        payload['planner'])
+    target = _canonical_capacity_counts(
+        payload['capacity_target_by_accelerator'],
+        'capacity_target_by_accelerator')
+    paid_residual = _canonical_capacity_counts(
+        payload['paid_residual_by_accelerator'], 'paid_residual_by_accelerator')
+    paid_launch = _canonical_capacity_counts(
+        payload['paid_launch_target_by_accelerator'],
+        'paid_launch_target_by_accelerator')
+    configured = {
+        card.casefold() for card in planner_snapshot.configured_accelerators
+    }
+    candidate_demand_target = {
+        card.casefold(): count
+        for card, count in candidate.supply_aware_demand_target.entries
+    }
+    candidate_demand_target = {
+        card: candidate_demand_target.get(card, 0) for card in sorted(configured)
+    }
+    source_fingerprint = planner_snapshot.source_fingerprint
+    if (set(target) != configured or target != candidate_demand_target or
+            any(target.values()) or paid_residual or paid_launch or
+            planner_snapshot.service_version != plan['service_version'] or
+            planner_snapshot.source_generation != plan['demand_feed_generation']
+            or candidate.source_generation != plan['demand_feed_generation'] or
+            planner_snapshot.planning_purpose is not capacity_planning.
+            CapacityPlanningPurpose.FRESH_ZERO_RETENTION or
+            planner_snapshot.actuation_supply_policy
+            is not capacity_planning.ActuationSupplyPolicy.REUSE_CURRENT_SUPPLY
+            or not planner_snapshot.attribution_complete or
+            not candidate.attribution_complete or candidate.kind
+            is not capacity_planning.CapacityPlanKind.FRESH_ZERO_RETENTION or
+            candidate.aggregate_demand_target != 0 or
+            candidate.paid_residual.total() != 0 or
+            candidate.paid_launch_target.total() != 0 or
+            candidate.paid_packing_padding_target.total() != 0 or
+            not isinstance(source_fingerprint, str) or
+            len(source_fingerprint) != 64 or
+            any(character not in '0123456789abcdef'
+                for character in source_fingerprint)):
+        raise ValueError('Fresh-zero planner candidate grants authority or '
+                         'names a different source.')
+
 
 def _canonical_record_id(value: object) -> uuid.UUID:
     if not isinstance(value, str):
@@ -236,6 +342,8 @@ def _lock_authority(
         payload, Mapping) else None)
     paid_residual = (payload.get('paid_residual_by_accelerator') if isinstance(
         payload, Mapping) else None)
+    paid_launch_target = (payload.get('paid_launch_target_by_accelerator')
+                          if isinstance(payload, Mapping) else None)
     try:
         payload_digest = capacity_admission.capacity_plan_content_sha256(
             payload)
@@ -272,9 +380,16 @@ def _lock_authority(
             normalized.get('fresh_aggregate_zero') is not True or
             not isinstance(targets, Mapping) or not targets or any(
                 type(count) is not int or count != 0
-                for count in targets.values()) or paid_residual != {}):
+                for count in targets.values()) or paid_residual != {} or
+            paid_launch_target != {}):
         raise PaidRetirementConflict(
             'Fresh-zero capacity plan is no longer authoritative.')
+    assert isinstance(payload, Mapping)
+    try:
+        _validate_fresh_zero_planner(payload, plan)
+    except (KeyError, TypeError, ValueError) as error:
+        raise PaidRetirementConflict(
+            'Fresh-zero capacity planner authority is invalid.') from error
     snapshot = demand_state.get_autoscaling_snapshot(
         service_name, authority.service_hash, connection=session.connection())
     reconcile = None if snapshot is None else snapshot.reconcile_authority
@@ -319,8 +434,7 @@ def admit_in_session(
     if type(requires_idle_proof) is not bool:
         raise PaidRetirementConflict('Idle-proof requirement is invalid.')
     if (requires_idle_proof and
-            (not isinstance(expected_route_url, str) or
-             not expected_route_url)):
+        (not isinstance(expected_route_url, str) or not expected_route_url)):
         raise PaidRetirementConflict(
             'Idle-proof retirement requires an acknowledged route URL.')
     if not requires_idle_proof and expected_route_url is not None:

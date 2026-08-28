@@ -135,7 +135,7 @@ def _exact_nonnegative_counts(value: Any, subject: str) -> dict[str, int]:
 
 
 def _claim_utilization_authority(
-    set_row: RowMapping,) -> tuple[bool, int | None, bool, int]:
+    set_row: RowMapping,) -> tuple[bool, int | None, str | None, bool, int]:
     """Decode the exact service-wide utilization witness for one map."""
     ceiling = set_row['utilization_ceiling']
     headroom = set_row['global_headroom']
@@ -148,17 +148,19 @@ def _claim_utilization_authority(
         if ceiling != headroom:
             raise ReservedFillAllocationCorruptionError(
                 'An ungated reserved-fill claim has a reduced ceiling.')
-        return False, None, False, ceiling
+        return False, None, None, False, ceiling
     state = _decode_json_object(raw_state, 'Claim utilization state')
-    required = {
+    previous_fields = {
         'cap', 'hot_until', 'stepped_at', 'blind_since', 'demonstrated_need',
         'boot_hold', 'blind'
     }
-    if set(state) != required:
+    current_fields = previous_fields | {'demand_witness_sha256'}
+    if set(state) not in (previous_fields, current_fields):
         raise ReservedFillAllocationCorruptionError(
             'Claim utilization state has an unsupported shape.')
     cap = state['cap']
     need = state['demonstrated_need']
+    demand_witness_sha256 = state.get('demand_witness_sha256')
     boot_hold = state['boot_hold']
     blind = state['blind']
     times = (state['hot_until'], state['stepped_at'])
@@ -173,11 +175,14 @@ def _claim_utilization_authority(
           not isinstance(blind_since, (int, float)) or
           not math.isfinite(float(blind_since)) or blind_since < 0)) or
         (need is not None and (type(need) is not int or need < 0)) or
+        (demand_witness_sha256 is not None and
+         (type(demand_witness_sha256) is not str or
+          _SHA256_PATTERN.fullmatch(demand_witness_sha256) is None)) or
         (blind and
          (need is not None or boot_hold)) or (not blind and need is None)):
         raise ReservedFillAllocationCorruptionError(
             'Claim utilization witness is malformed.')
-    return True, need, boot_hold, ceiling
+    return True, need, demand_witness_sha256, boot_hold, ceiling
 
 
 def _decode_accelerator_names(value: Any) -> tuple[str, ...]:
@@ -793,7 +798,7 @@ class ReservedFillAllocationRepository:
             if set_row['generation'] != claim_generation:
                 return None
             (utilization_gate_armed, utilization_demonstrated_need,
-             utilization_boot_hold,
+             utilization_demand_witness_sha256, utilization_boot_hold,
              utilization_ceiling) = _claim_utilization_authority(set_row)
             if (service_row['current_version'] != set_row['service_version'] or
                     not self._lock_projection_source(
@@ -827,6 +832,8 @@ class ReservedFillAllocationRepository:
                 raise ReservedFillAllocationCorruptionError(
                     'Current allocation publication time is in the future.')
             if current is not None and (
+                    current.schema_version
+                    == reserved_fill_planner.ALLOCATION_MAP_SCHEMA_VERSION and
                     current.allocation_claim_generation == claim_generation and
                     current.service_version == set_row['service_version'] and
                     current.pool_snapshots == pool_snapshots and
@@ -840,6 +847,8 @@ class ReservedFillAllocationRepository:
                     and current.utilization_gate_armed == utilization_gate_armed
                     and current.utilization_demonstrated_need
                     == utilization_demonstrated_need and
+                    current.utilization_demand_witness_sha256
+                    == utilization_demand_witness_sha256 and
                     current.utilization_boot_hold == utilization_boot_hold and
                     current.utilization_ceiling == utilization_ceiling and
                     current.upward_grants_settled == upward_grants_settled and
@@ -868,6 +877,8 @@ class ReservedFillAllocationRepository:
                     protocol_authority['reclaim_provider_inventory_sha256']),
                 utilization_gate_armed=utilization_gate_armed,
                 utilization_demonstrated_need=(utilization_demonstrated_need),
+                utilization_demand_witness_sha256=(
+                    utilization_demand_witness_sha256),
                 utilization_boot_hold=utilization_boot_hold,
                 utilization_ceiling=utilization_ceiling,
                 upward_grants_settled=upward_grants_settled,
@@ -951,6 +962,12 @@ class ReservedFillAllocationRepository:
         allocation = self._decode_current_allocation(allocation_columns)
         if allocation is None:
             return None
+        if (allocation.schema_version
+                != reserved_fill_planner.ALLOCATION_MAP_SCHEMA_VERSION):
+            # Previous maps remain decodable for retained-state inspection,
+            # but cannot authorize a fresh launch or retirement effect. A
+            # current claim heartbeat republishes the authenticated v7 map.
+            return None
         locked_rounds = self._lock_rounds(connection,
                                           allocation.pool_snapshots,
                                           read=True)
@@ -964,7 +981,7 @@ class ReservedFillAllocationRepository:
             return None
         set_row, edges = claim_state
         (utilization_gate_armed, utilization_demonstrated_need,
-         utilization_boot_hold,
+         utilization_demand_witness_sha256, utilization_boot_hold,
          utilization_ceiling) = _claim_utilization_authority(set_row)
         if (service_row['current_version'] != set_row['service_version'] or
                 not self._lock_projection_source(
@@ -1014,6 +1031,8 @@ class ReservedFillAllocationRepository:
                 allocation.utilization_gate_armed != utilization_gate_armed or
                 allocation.utilization_demonstrated_need
                 != utilization_demonstrated_need or
+                allocation.utilization_demand_witness_sha256
+                != utilization_demand_witness_sha256 or
                 allocation.utilization_boot_hold != utilization_boot_hold or
                 allocation.utilization_ceiling != utilization_ceiling or
                 not self._validate_snapshot_topology(allocation.pool_snapshots,

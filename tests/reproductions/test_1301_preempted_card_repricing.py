@@ -19,6 +19,7 @@ tests/unit_tests/test_serve_autoscaler_compatibility_contract.py.
 # pylint: disable=protected-access
 from sky.serve.autoscaler_compatibility import _allocate_compatibility_target
 from sky.serve.autoscaler_compatibility import _revalidate_actuation_target
+from sky.serve.autoscaler_compatibility import SupplyPreference
 
 # Service order, cheapest paid card first.
 _CARDS = ['L4', 'L40S', 'A100', 'A100-80GB', 'H100', 'H200', 'B200']
@@ -185,9 +186,19 @@ class TestTheAllocatorItselfIsCorrect:
             demand_profiles=[(0, tuple(_CARDS), float(_TOTAL))],
             fixed_work_by_accelerator={},
             ready_zero_cost=ready_zero_cost,
-            ready=ready,
-            provisioning={},
+            committed_zero_cost=ready_zero_cost,
             free_reserved={},
+            ready_paid={
+                card: max(0,
+                          ready.get(card, 0) -
+                          ready_zero_cost.get(card, 0)) for card in _CARDS
+            },
+            committed_paid={
+                card: max(0,
+                          ready.get(card, 0) -
+                          ready_zero_cost.get(card, 0)) for card in _CARDS
+            },
+            supply_preference=SupplyPreference.WARM_FIRST,
             cold_order=_CARDS,
             use_existing_supply=use_existing_supply)
 

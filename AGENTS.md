@@ -250,8 +250,16 @@ duplicated implementations, accumulating conditionals, or parallel happy paths.
 
 - Represent cross-module domain state that has multiple fields, invariants, or
   an independent lifecycle with a frozen dataclass (or an equivalently typed
-  record with named fields). Do not use positional tuples plus magic indices
-  for such state.
+  record with named fields). Do not use positional or versioned tuples for such
+  state.
+- Do not use ``Optional[bool]`` as a state machine. Use an explicit enum whose
+  members name every supported state.
+- Produce one immutable planner result per reconciliation generation. All
+  persistence, actuation, and observability consumers for that generation must
+  use that result instead of recomputing it from mutable state.
+- Do not use a process-local environment variable as durable policy authority
+  for a multi-writer controller. Persist policy in the canonical configuration
+  or PostgreSQL state and bind every side effect to that same authority.
 - Do not model internal schema evolution as a union of tuple lengths, optional
   key sets, or branches on ``len()``. Decode an actually supported old API or
   persisted representation once at its boundary, validate it, and immediately

@@ -1,9 +1,64 @@
 # Utilization-gated reserved capacity
 
-- **Status:** implemented; M5 default-on contract correction pending deploy
-- **Last updated:** 2026-08-01
-- **Milestones:** M0 config (operator), M1 persistence, M2 signal (log only), M3
-  gate, M4 staged validation (operator), M5 default-on/full-release semantics
+- **Status:** gate foundation implemented; the promoted durable single-planner
+  integration is source-qualified, not yet merged, built, deployed, or
+  production-proven
+- **Last updated:** 2026-08-28
+- **Historical milestones:** M0 config (operator), M1 persistence, M2 signal
+  (log only), M3 gate, M4 staged validation (operator), M5
+  default-on/full-release semantics
+
+The earlier operator choice making ``boltz-l4-fleet`` permanently ungated was
+superseded on 2026-08-28. The canonical fleet design is
+``serve-multi-pool-reserved-capacity-fill.md``: the production fleet normally
+uses ``utilization_gate: true`` and a bounded East-only canary separately
+proves ``utilization_gate: false``. Both settings use the same reservation-
+first planner; neither changes Kueue policy. Historical measurements and
+discarded rollout recommendations below remain context, not current operator
+instructions.
+
+For a service promoted to the durable demand/capacity protocol, the mutable
+``Autoscaler.fill_demand_sample`` mechanism described in the historical
+implementation sections below is not authoritative: durable load-balancer
+reports intentionally bypass that controller-local state. The current
+contract is the two-phase ``GATE_ACQUISITION`` protocol in the canonical fleet
+design. One immutable planner commits a non-actuating PostgreSQL witness, the
+poller publishes its stable semantic identity to the gate, and only a later
+same-planner result bound to the settled allocation may launch reserved or
+paid capacity. The acquisition witness has a no-effect freshness horizon that
+covers the 60-second poll/settlement cycle, while fresh aggregate zero revokes
+it immediately. Gate-off static prefill and gate-on demand acquisition are
+tagged results of that one planner; neither uses an environment override or a
+second allocator.
+
+The remaining work is deliberately SkyPilot-only and PostgreSQL-only. It adds
+no EFS/PVC correctness path, Kueue policy or object, Terraform/Terragrunt or IAM
+change, KubeRay component, or ``boltz-platform`` application change. The fleet
+runs one homogeneous recreated service version; prior nonterminal lifecycle
+state is recreate-required rather than migrated. Every paid candidate is Spot,
+and ordinary on-demand is forbidden.
+
+The acceptance matrix is:
+
+| Reservation policy | ``utilization_gate`` | Fresh zero demand | Positive demand |
+| --- | --- | --- | --- |
+| Not configured | N/A | No reservation claim or idle fill | Reuse compatible running capacity, then launch only the compatible Spot residual |
+| Configured | ``true`` | Revoke the witness and converge reservation authority to zero | Commit a PostgreSQL non-actuating acquisition witness, wait for a matching settled allocation, then commit compatible reserved capacity before any genuine Spot residual |
+| Configured | ``false`` | Keep authenticated zero-cost static fill warm within the configured floor/envelope | Use the same planner to commit compatible reserved capacity before any genuine Spot residual |
+
+In every row, missing, stale, blind, unsettled, or wrong-owner reservation
+evidence grants no compatible/flexible provider effect. Only a complete
+exact-card demand target proven statically disjoint from every reservation can
+use the bounded Spot exception without waiting for an unrelated allocation.
+
+As of 2026-08-28, the typed planner and durable-witness integration are present
+and source-qualified for the promoted durable logical path in the current
+worktree. Generic non-promoted Serve paths retain their existing local planning
+adapter and are outside this fleet activation. The live ``1.1.1545`` Helm
+revision 664 predates the final integration. Merge, image publication,
+homogeneous service recreation, both gate-mode acceptance rows, the combined
+reserved-plus-Spot campaign, terminal/request UI proof, and HA takeover proof
+remain open production gates.
 
 Reserved-fill capacity is arbitrated by static declared floors and weights. Nothing in the
 allocation math knows whether a claimant is doing any work, so an idle service keeps everything
@@ -22,7 +77,7 @@ All line references are at prod SHA `a0028d62c7be576a97937d8fe7471bfa7c019849` (
 which is an ancestor of the branch this lands on. Read them with
 `git show a0028d62c7be576a97937d8fe7471bfa7c019849:<path>`.
 
-## Blocking dependency: drain proof across load balancer restarts
+## Historical dependency record: drain proof across load balancer restarts
 
 Measured after this design was accepted, and it changes the rollout order.
 `protenixv2-hybrid-v1`'s load balancer Deployment rolled **46 times in 41.9
@@ -38,11 +93,11 @@ repeatedly reverted: any wave lasting more than about an hour is expected to
 span at least one roll. The trajectory in "Release path and end-to-end latency
 budget" below assumes no roll and is therefore a best case, not a typical one.
 
-The gate mechanism is independent, but do not leave it active on
-`protenixv2-hybrid-v1` before Milestones 1 and 2 of
-`serve-drain-proof-across-lb-restarts.md` are deployed. With the M5 default
-flip, such a service must carry an explicit `utilization_gate: false` until
-that dependency is deployed; otherwise it will produce churn without release.
+This was a rollout blocker for the historical ``protenixv2-hybrid-v1`` plan.
+It is not current authorization to change that service, its platform
+definition, or shared scheduler/infra policy. The current fleet qualification
+is confined to SkyPilot and recreates ``boltz-l4-fleet`` only after its own HA
+load-balancer drain evidence is available.
 
 ## Operator decisions on record
 
@@ -55,11 +110,11 @@ the sizing recommendations retained later as historical analysis.
    declared floor cannot be used to hoard idle GPUs; in particular,
    `opendde-10c200s-v4`'s observed `floor_replicas: 70` and `weight: 1000000`
    no longer protect idle fill capacity.
-3. **`boltz-l4-fleet` is the deliberate exception.** Its platform spec must
-   set `utilization_gate: false` using the M5 server, so it retains its
-   always-warm 1-2+ replica availability contract without utilization. Do not
-   apply this update through a pre-M5 serializer, which may omit explicit
-   false from the canonical object form.
+3. **`boltz-l4-fleet` is gated in its canonical production definition.** It
+   uses `utilization_gate: true`, `min_replicas: 0`, and a zero fill floor so
+   compatible reservation starts follow authenticated demand. Explicit false
+   remains supported and is qualified with a bounded East-only canary; it is
+   not the production fleet's permanent policy.
 4. **No utilization proof is armed-but-blind, not confirmed idle.** A current
    gated writer pairs a fresh `activity_ts` with NULL `demonstrated_need` when
    the detailed sample is unavailable. That freezes an existing cap for the
@@ -134,17 +189,25 @@ that a service which does not declare `reserved_capacity_fill` can reach,
 because a non-claimant structurally cannot hold fill rows and never appears in
 `get_reserved_fill_claims` (`serve_state.py:5075-5084`).
 
-## Behavior contract
+## Historical broker behavior contract
+
+The durable fleet does not use this controller-local activity sample as launch
+authority. It uses the ``GATE_ACQUISITION`` contract and immutable planner
+described at the top of this document. Statements below about immediate local
+demand apply only to the historical broker implementation.
 
 1. **Idle is `demonstrated_need == 0`.** `demonstrated_need = max(busy_fill_holdings + pre_ready_fill_holdings, ceil(outstanding_work / work_per_replica))`. It is zero only when: `in_flight_total == 0` (requirement 4), `queue_depth == 0` (requirement 4), no retained rejections in the 360s `LB_REJECT_WINDOW_SECONDS` window, no occupancy-unknown replica, no fill replica reporting in-flight work, and no fill replica in PENDING / PROVISIONING / STARTING.
 2. **No current utilization proof is distinct from both idle and opt-out.** A
    default-gated current writer always publishes `activity_ts`. When
    `fill_demand_sample()` is unavailable, `demonstrated_need` is NULL, which
    means armed-but-blind: freeze for `RESERVED_FILL_BLIND_GRACE_SECONDS`, then
-   resume bounded decay if blindness persists. An all-NULL activity tuple is
-   the explicit/static opt-out (and legacy row shape) and removes prior gate
-   state immediately. A stale non-NULL `activity_ts` remains armed-but-blind,
-   preserving the version-skew guard.
+   resume bounded decay if blindness persists. At broker arbitration, an
+   all-NULL activity tuple is the explicit/static signal shape (and the legacy
+   row shape) and removes prior release state immediately. PostgreSQL capacity
+   admission disambiguates that shape with the immutable service spec: a
+   configured-gated service cannot spend an unarmed map and retries until a
+   current armed map arrives. A stale non-NULL `activity_ts` remains
+   armed-but-blind, preserving the version-skew guard.
 3. **Idleness must persist for 300s before anything is released** (`RESERVED_FILL_IDLE_DWELL_SECONDS`), measured in wall clock, and no release step is taken while any fill replica the service already authorized is still booting.
 4. **A gated claimant's entitlement walks down to zero in bounded steps**, at
    most `max(2, ceil(0.25 * cap))` replicas per
@@ -174,11 +237,12 @@ because a non-claimant structurally cannot hold fill rows and never appears in
    research namespace. It is not a direct handoff or durable reservation for a
    named peer.
 9. **The demand path is never gated by a decayed grant.** `_demand_should_skip_zero_cost` (`replica_managers.py:3633-3675`) reads `max(damped_grant, raw_grant)`, not the ceiling. A bursting claimant's ordinary demand scale-up onto the zero-cost tier is its fastest reacquisition path (immediate, no round, no feed, demand rows exempt from the ceiling) and it stays open.
-10. **The gate is on by default and has two opt-outs.**
+10. **The gate is on by default and has one durable opt-out.**
     `reserved_capacity_fill.utilization_gate` defaults true; explicit false is
-    the durable per-service static-reservation contract.
-    `SKYPILOT_SERVE_RESERVED_FILL_UTILIZATION_GATE=0` remains the emergency
-    process-wide kill switch and ungates every service without a spec redeploy.
+    the per-service static-reservation contract. A process-local environment
+    override is intentionally unsupported because HA writers could observe
+    different values and an unarmed allocation is also the safe mixed-version
+    shape of an older writer.
 
 ## Mechanism
 
@@ -252,7 +316,9 @@ A current gated writer writes `activity_ts` on every heartbeat, including when
 its detailed sample is unavailable; an explicit false writer omits the three
 activity fields. A previously armed row heartbeated by an old binary fails the
 lag check within one poll interval and becomes armed-but-blind, so frozen zero
-is not trusted during the 900s grace. A pre-gate all-NULL row remains ungated.
+is not trusted during the 900s grace. At broker arbitration a pre-gate
+all-NULL row remains unarmed; PostgreSQL admission still requires the current
+immutable service spec to be explicitly ungated before that map is spendable.
 These invariants must be pinned by a real-Postgres test.
 
 `upsert_claim` (`broker.py:253-301`) gains `activity: dict[str, Any] | None = None` after `effective_cap` (`:262`), defaulted so every existing caller and all 133 existing broker tests stay valid, and expands it into the three columns.
@@ -333,7 +399,6 @@ Constants, in `sky/serve/constants.py` next to the reserved-fill block at 490-52
 | `RESERVED_FILL_UTILIZATION_HEADROOM` | 0.25 | growth room so the gate never throttles the autoscaler's own target |
 | `RESERVED_FILL_ACTIVITY_MAX_LAG_SECONDS` | `3 * LB_CONTROLLER_SYNC_INTERVAL_SECONDS` = 60.0 | matches `_staleness_threshold_seconds` (`autoscalers.py:4156-4164`); the version-skew discriminator |
 | `RESERVED_FILL_BLIND_GRACE_SECONDS` | 900.0 | 15 rounds, 3x the claim TTL; a permanently wedged LB must not pin 74 A100s forever |
-| `RESERVED_FILL_UTILIZATION_GATE_ENV_VAR` | `SKYPILOT_SERVE_RESERVED_FILL_UTILIZATION_GATE` | process-wide kill switch, parsed like `claim_ttl_seconds()` (`broker.py:60-70`) |
 
 These are pool-global on purpose. A per-service half-life or dwell would let the slower-decaying service win every contested transient purely by decaying slower, which is the static-priority pathology being removed.
 
@@ -394,7 +459,7 @@ claimant's static floor continues to refill under the existing grant math.
 
 ### Round assembly
 
-`_claim_input` (`broker.py:318-346`) reads the three new columns with the tolerant `.get` pattern already used for `effective_cap` at 319, applies the `heartbeat_ts - activity_ts` lag check and the env kill switch, and returns an `ActivityInput` alongside the `ClaimInput`. It does not compute the cap, which needs the round's `now` and the previous state.
+`_claim_input` (`broker.py:318-346`) reads the three new columns with the tolerant `.get` pattern already used for `effective_cap` at 319, applies the `heartbeat_ts - activity_ts` lag check, and returns an `ActivityInput` alongside the `ClaimInput`. It does not compute the cap, which needs the round's `now` and the previous state.
 
 In `_run_round_locked`, the advance goes **inside the `if query_ok:` branch** (`broker.py:892-957`), after the live-holdings `dataclasses.replace` at 862-868 (so `holdings` is the row-scan-corrected value, not the possibly-stale claim value) and immediately before `compute_entitlements` at 908. Placing it before the `query_ok` split, as an earlier draft did, would let the governor advance on measurement-blackout rounds where grants are never recomputed: N consecutive blackout rounds would silently walk the cap down and then apply the whole drop in one step when the query recovered, possibly with `holdings_shrank` confirmed (927-941) so the immediate-down bypass (`allocation.py:184-185`) skipped the damping entirely.
 
@@ -464,7 +529,7 @@ Seven layers, five of which already exist and are untouched.
 
 A pod dies only when the governor, the damper and the local downscaler all independently agree, on three separate clocks, one of which is the LB's own occupancy proof.
 
-### Configuration and migration surface
+### Implemented PostgreSQL schema history
 
 Schema (`sky/utils/service_schema.py:355-379`, `additionalProperties: False` so it must be declared):
 
@@ -491,7 +556,7 @@ durable contract for static holders and round-trips unchanged.
 
 Migration: new `sky/schemas/db/serve_state/030_reserved_fill_utilization_gate.py`, `down_revision = '029'`, four `db_utils.add_column_to_table_alembic` calls (three on `reserved_fill_claims`, one on `reserved_fill_rounds`) inside `with op.get_context().autocommit_block():`, all `server_default=None`, no-op `downgrade`. Style from `029_restart_safe_placement_policy.py`; single-column-on-a-reserved-fill-table shape from `005_reserved_fill_phantom_streak.py`. Explicitly **not** the `004_reserved_fill_broker.py` precedent (columns folded into a create), because these land on a live table. Bump `SERVE_VERSION` from `'029'` to `'030'` at `sky/utils/db/migration_utils.py:54`.
 
-The serve DB resolves to PostgreSQL in the prod api-server pod (`db_utils.get_engine` returns Postgres when `ENV_VAR_IS_SKYPILOT_SERVER` and `ENV_VAR_DB_CONNECTION_URI` are both set), so the fork's Postgres-only policy applies. Ordering is closed by construction: `charts/skypilot/templates/database-migration-job.yaml` runs to completion before the api-server pod starts, and all controllers live in that pod. The additive `server_default=None` columns also make it safe to run the migration ahead of the binary deploy.
+The serve DB resolves to PostgreSQL in the prod api-server pod (`db_utils.get_engine` returns Postgres when `ENV_VAR_IS_SKYPILOT_SERVER` and `ENV_VAR_DB_CONNECTION_URI` are both set), so the fork's Postgres-only policy applies. Ordering is closed by construction: `charts/skypilot/templates/database-migration-job.yaml` runs to completion before the api-server pod starts, and all controllers live in that pod. Migration `030` is implemented history, not a pending rollout step for this initiative. The recreated fleet uses only the current PostgreSQL schema; no SQLite or filesystem compatibility path is added.
 
 ## Rejected alternatives
 
@@ -522,8 +587,9 @@ capacity warm.** After a full gated release, a burst restores only its
 utilization-proportional cap immediately; the physical GPUs may also have been
 taken and still require the full provisioning/readiness ramp. A service with a hard warm-availability SLA
 must explicitly set `utilization_gate: false` and size `floor_replicas` from
-that SLA. Boltz L4 is the recorded example; gated batch services deliberately
-accept the cold start in exchange for not hoarding idle GPUs.
+that SLA. The canonical Boltz fleet no longer claims that exception; it
+accepts demand-driven reservation startup and proves the ungated behavior only
+with a bounded canary.
 
 **2. Release may be one-way on this cluster (highest severity).** SkyPilot's
 inference pods run below the research tenant in scheduling priority, so a
@@ -537,13 +603,11 @@ donated.
 
 **3. The 7200s `graceful_drain_seconds` on protenix is a cap, not a delay, but it is also the failure mode.** For a genuinely idle replica the drain tracker proves drained in one to two LB syncs (`replica_managers.py:5839-5995`, tracker at 700-795) and `_wait_for_drain` short-circuits (621-656). But with `graceful_drain_async_occupancy: true`, a replica whose occupancy the LB never validity-filters (`controller.py:749-795`) is UNKNOWN, and a current-version logical victim that cannot prove it drained has its retirement **aborted** and rejoins service (5962-5965). Under this design that surfaces as a stalled cap (the actuation gate stops stepping) rather than a runaway release, which is the correct fail-closed behavior but is silent. Mitigation, must ship with the feature: alert when `holdings_fill > cap` persists for more than three consecutive rounds, and when `unknown_replicas > 0` in the Concurrency report for more than an hour.
 
-**4. Version skew.** An old binary heartbeating a previously armed migrated
-claim freezes the activity columns while advancing `heartbeat_ts`; the lag
-check turns that row armed-but-blind within one poll, freezing before any
-blind-grace decay rather than trusting frozen zero. A truly pre-gate all-NULL
-row stays ungated. An old binary driving a round omits `utilization_state`, so
-the state survives its mixed-version publish and a new writer resumes it.
-Schema ordering remains closed by the pre-deploy migration job.
+**4. Historical version skew.** The implemented M5 broker retained defensive
+decoding for old rows. That remains useful background, but the durable fleet
+does not accept mixed-version operation: any nonterminal prior-version graph
+is recreate-required and grants no authority. The current acceptance plan does
+not qualify an old-writer/new-writer matrix.
 
 **5. The no-allocation path removes the ceiling entirely.** `collect_reserved_capacity(0, keys, time.time())` at `reserved_capacity.py:496` and `:502` leaves `grant` at its `None` default, and `autoscalers.py:691` assigns it unconditionally, so a round-lock timeout or a rejected claim un-caps the fill fleet for that cycle. It cannot launch anything (feed is 0 and `_fresh_fill_free_slots` decays, `autoscalers.py:750-758`) and the next successful round re-applies the cap within 60s, so this stays as-is: it is the existing fail-open to pre-broker behavior and changing it is out of scope. Worth knowing when reading logs during a decay.
 
@@ -558,35 +622,34 @@ all gated services idle, SkyPilot fill occupancy falls to only the explicitly
 ungated reservations. That is the intended outcome; GPU-hours-held stops being
 the metric and served-work-per-GPU-hour becomes it.
 
-**8. Constants tuned against one day of traffic.** `step_fraction`, `min_step` and the 25% headroom were chosen against a single 52-request protenix burst at 08:06 and one boltz queue episode at 05:22. They are defensible, not validated. Mitigation: replay `serve_history.serve_request_activity_history_table` (`serve_history.py:107-140`, minute-bucket per-service arrival history, already in the same Postgres DB) through `advance_release_target` offline before enabling on protenix. Blast radius of a bad constant is one env-var flip.
+**8. Constants tuned against one day of traffic.** `step_fraction`, `min_step` and the 25% headroom were chosen against a single 52-request protenix burst at 08:06 and one boltz queue episode at 05:22. They are defensible, not validated. Mitigation: replay `serve_history.serve_request_activity_history_table` (`serve_history.py:107-140`, minute-bucket per-service arrival history, already in the same Postgres DB) through `advance_release_target` offline before selecting a recreated service policy. Policy changes only through the explicit service definition and recreation; there is no process-local environment override.
 
 ## Configuration for the live services
 
-### M5 rollout configuration
+### Current SkyPilot-only rollout configuration
 
 Rollout order is deliberate:
 
-1. Deploy the M5 SkyPilot image. Existing persisted missing-key service specs
-   normalize to legacy false in `__setstate__`, so this restart alone activates
-   no gate.
-2. Through the M5 server, update `boltz-l4-fleet` to the explicit false config
-   below. The new serializer preserves the opt-out durably.
-3. Update `opendde-10c200s-v4` (and other batch claimants) with the gate omitted
-   or true. Intentional reparse adopts the new default and starts release.
+1. Deploy one immutable SkyPilot image across the API, controller, executor,
+   migration/init, and fleet load-balancer roles. The image deploy alone changes
+   no service policy.
+2. Take the test-only ``boltz-l4-fleet`` through exact-zero down and recreate it
+   with the explicit true config below.
+3. Qualify explicit false independently with an East-only service capped at
+   one reserved backend and zero paid GPUs, then tear it down normally.
 
 ```yaml
-# boltz-l4-fleet: online availability exception
+# boltz-l4-fleet: canonical demand-gated reservation policy
 replica_policy:
   reserved_capacity_fill:
-    floor_replicas: 2  # or the operator-selected online warm floor
-    weight: 1
-    utilization_gate: false
+    floor_replicas: 0
+    weight: 100
+    utilization_gate: true
 ```
 
-Batch/research claimants such as `opendde-10c200s-v4` must omit the knob (or
-write `utilization_gate: true`). Their declared floors become
-activity-backed: zero demonstrated utilization eventually yields zero fill
-entitlement even when `floor_replicas` is 70.
+Do not flip the fleet between modes as a test mechanism, and do not update
+``opendde-10c200s-v4``, other platform services, Kueue, or infrastructure as
+part of this rollout.
 
 ### Historical M4 analysis (superseded by M5)
 
@@ -618,7 +681,7 @@ With floors 16/12/0 and weights 4/1/0.1 on an 87-slot pool: floors 28, remainder
 | | `graceful_drain_seconds` | 7200 | **7200** (unchanged) | It is a cap, not a wait, and it is the guard that stops the ceiling from ever evicting a replica the LB cannot vouch for. |
 | `boltz-l4-fleet` | `floor_replicas` | 10 | **12** | Same rule with `T_ramp` = 1200, `B` = 72 (queue 61 + in-flight 11 at 05:22), `D` ~= 180s: `72*180/1200` = 10.8. Validates the existing 10 and raises it modestly, justified because 10 replicas measurably produced a 61-deep queue. |
 | | `weight` | 100 | **1** | The baseline the others are expressed against. Against protenix's 4 this is the intended 4:1. |
-| | `utilization_gate` | n/a | **true** (historical; now **false**) | M5 records Boltz L4 as the explicit always-warm online exception. |
+| | `utilization_gate` | n/a | **true** | Current canonical policy; the former always-warm false exception is superseded. |
 | `boltz-l4-fleet-test` | `floor_replicas` | 0 | **0** (unchanged) | A test service should hold nothing at rest, and under the new model it genuinely does instead of holding whatever it last drifted into. |
 | | `weight` | 0.1 | **0.1** (unchanged) | Already encodes "loses every contention", which stays correct. Its practical path is now the free-slack path, not the grant path. |
 | | `utilization_gate` | n/a | **true** (enable first) | No production traffic; the correct place to validate the full 13-step release chain and, critically, whether a released A100 is reacquirable at all on this cluster. |
@@ -636,9 +699,10 @@ Pool-level constants stay at their defaults. Do not set them per service.
 
 The third row is requirement 2: symmetric borrowing, and it is the exact inversion of the 05:22 incident.
 
-## Milestones
+## Historical milestones
 
-Each is independently shippable and independently valuable.
+These milestones describe how the broker foundation was introduced. They are
+not the current fleet deployment runbook.
 
 **M0. Weights and floors, no code (0.5 day).** Apply the recommended `floor_replicas` and `weight` via `sky serve update` on all three services. Fixes the both-busy starvation immediately. Watch one full traffic cycle. Prerequisite for everything else, because enabling the gate on protenix while its floor is 0 would decay it to zero fill replicas.
 
@@ -649,7 +713,7 @@ Each is independently shippable and independently valuable.
 **M3. The gate (complete).** `advance_release_target`,
 `ClaimInput.utilization_cap`, entitlement cap tightening, durable state,
 single-claimant behavior, blackout carry, demand-gate split, schema/spec knob,
-and the env kill switch. This originally shipped default off.
+and the per-service policy. This originally shipped default off.
 
 **M4. Staged validation (operator).** Historical opt-in rollout and live drain
 validation.
@@ -660,13 +724,12 @@ only for confirmed zero utilization, while a missing detailed sample publishes
 fresh NULL need as armed-but-blind; let the utilization cap clamp the declared
 allocation floor; and use idle release floor 0 with proportional recovery.
 Legacy persisted missing-key specs normalize to false on unpickle; intentional
-updates adopt the new default. Deploy SkyPilot first, then apply the
-boltz-platform explicit-false update through the new server, then intentionally
-update OpenDDE to activate the default gate.
+updates historically adopted the new default. The current durable-fleet
+qualification instead uses one recreated version and the acceptance matrix at
+the top of this document; it changes neither ``boltz-platform`` nor OpenDDE.
 
-The original M0-M4 estimate was ~4.5 days plus staged bake. M5 is a localized
-contract correction with a required server-first, Boltz-opt-out-second,
-OpenDDE-activation-third rollout.
+The original M0-M4 estimate was ~4.5 days plus staged bake. That estimate and
+its multi-service rollout sequence are historical.
 
 ## Test plan
 
@@ -684,7 +747,7 @@ Repo philosophy: the minimum tests that establish logic correctness, never asser
 - `compute_feeds` interaction: a fully released gated claimant has zero feed
   need; an explicitly ungated claimant still refills its static floor.
 - `damp_grants` interaction with a monotone stepwise descent: the published grant lags the raw by exactly one round, and the lag disappears once `holdings_shrank` is confirmed.
-- `_activity_input`: all-NULL activity is unarmed/ungated; fresh NULL need and
+- `_activity_input`: all-NULL activity is unarmed at broker arbitration; fresh NULL need and
   stale non-NULL `activity_ts` are armed-but-blind; paired fresh integer need
   is trusted. Explicit disarm clears prior state even during blackout.
 - Single-claimant fast path: an armed gate publishes an integer grant and a non-empty `raw_grants`; `feeds` equals raw measured free; `utilization_gate: false` restores the `None` grant and the empty `raw_grants` exactly.
@@ -692,11 +755,13 @@ Repo philosophy: the minimum tests that establish logic correctness, never asser
 
 ### `tests/unit_tests/test_reserved_fill_broker_pg.py` (4170 lines, 56 tests today) - real Postgres
 
-- Migration `030` applies to a populated pre-030 `reserved_fill_claims` table; existing rows read as ungated.
+- Migration `030` applies to a populated pre-030 `reserved_fill_claims` table;
+  existing rows read as unarmed at broker arbitration and remain fail-closed
+  for a configured-gated service at PostgreSQL admission.
 - **Skew invariant (mandatory):** write a paired claim with the new writer,
   then simulate an old writer's upsert omitting the activity columns and assert
   it becomes armed-but-blind within one poll. A populated pre-030 all-NULL row
-  remains unarmed/ungated.
+  remains unarmed and cannot override the immutable service policy.
 - `utilization_state` survives writer rotation, is not clobbered by an old-shaped `publish_reserved_fill_round`, and is dropped for claimants whose claims expired.
 - A three-claimant round where one claimant is gated and the others' grants rise, asserting `Sum(entitlements) <= total`.
 
@@ -724,33 +789,20 @@ Repo philosophy: the minimum tests that establish logic correctness, never asser
 
 - `work_per_replica` uses `_effective_logical_capacity_per_gpu()` in logical mode and `target_concurrency_per_replica` otherwise, matching `_outstanding_work`'s own denominator.
 
-### Live validation against the prod pool
+### Historical live-validation record
 
-1. **After M1:** confirm migration `030` applied (`SERVE_VERSION` at startup, and `\d reserved_fill_claims` shows the three columns as NULL on all three live claims). Confirm grants are byte-identical to before.
-2. **After M2, one week:** for each service, plot `demonstrated_need` against the known traffic from `serve_request_activity_history`. Required observations before M3 is enabled anywhere: protenix reaches `need == 0` for at least one continuous 300s window per idle period (if `unknown_replicas` prevents it, stop and reconsider); boltz-l4-fleet's `need` tracks its queue episodes; no claim ever reads blind for more than one poll interval outside a deploy, **and no idle claim blinds more than once per dwell window** (the frequency, not just the duration, of blind rounds is what stalls a release; see the intermittent-blindness limitation above).
-3. **After M4 step 1 (`boltz-l4-fleet-test`, floor 0):** drive one synthetic burst, let it go idle, and record the full 13-step chain with timestamps. Then measure the decisive question: one poll interval after each pod deletion, is the freed A100 still counted free by `list_accelerators_realtime`, or has the research namespace taken it? This single measurement determines whether release is reversible on this cluster and gates everything after it.
-4. **After M4 step 2 (`boltz-l4-fleet`):** confirm the cap walks 22 -> 12 and that a synthetic burst restores full entitlement within 120s and reopens the demand gate (verifiable by observing that new demand replicas land on the zero-cost tier, not on paid capacity).
-5. **After M4 step 3 (`protenixv2-hybrid-v1`):** watch the first idle-to-burst transition end to end. Alert at T+30min on `queue_depth > 0` or `rejected_in_recent_window > 0`. If the floor is undersized, raise it before touching any pool-level constant.
-6. **Standing alerts, shipped with M3:** `holdings_fill > cap` for more than three consecutive rounds (stalled release, usually unknown occupancy); a claim blind for more than one hour while `serve_request_activity_history` shows zero arrivals for the same service over the same period (wedged LB, feature silently inert); a claim whose `cap` has not stepped down across several dwell windows while `demonstrated_need` reads 0 on every non-blind round over the same span (intermittent-blindness stall, feature silently inert -- distinct from the contiguous-blind alert because no single blind streak is long, the blind rounds are merely frequent); `Sum(grants) > total` in any round (conservation violation, should be impossible).
-7. **M5 rollout gate:** deploy the SkyPilot image and verify legacy persisted
-   services remain ungated. Then update `boltz-l4-fleet` through the new server
-   with rendered boltz-platform YAML containing `utilization_gate: false`;
-   confirm its claim has NULL activity fields, no utilization state, and
-   retains its configured static floor with zero traffic. Only then update
-   OpenDDE to adopt default true.
-8. **M5 full-release acceptance:** with `opendde-10c200s-v4` idle, verify fresh
-   paired `demonstrated_need=0`, then observe its cap and physical fill holdings
-   walk from the current level through its declared floor of 70 to zero. Verify
-   the released slots appear as free or as holdings/grants for another
-   claimant, and that Boltz's replicas/grant do not fall below its explicit
-   static floor.
-9. **M5 recovery acceptance:** send one OpenDDE batch after release and verify
-   the raw cap becomes `ceil(demonstrated_need * 1.25)` in one broker round
-   (not 70 merely because the declared floor is 70), the demand gate reads
-   `max(damped, raw)`, and capacity reacquisition is bounded only by physical
-   availability/provisioning rather than the decay schedule.
+The original M1-M5 validation covered migration ordering, broker telemetry,
+bounded release, blind-state alerts, and multi-service rollout. It is retained
+as design history, not as authorization to mutate OpenDDE, Protenix, research
+queues, Kueue, or infrastructure. Current production acceptance is the explicit
+reservation-policy-by-``utilization_gate`` matrix above plus the source,
+deployment, and proof gates in
+``serve-multi-pool-reserved-capacity-fill.md``.
 
-## Open questions
+## Historical open questions
+
+These questions motivated the original multi-service rollout. They do not
+expand the current SkyPilot-only fleet scope.
 
 1. **What is protenix's actual `effective_request_duration_seconds`?** If it is ~600s the recommended floor of 16 stands. If it is ~1800s (which `graceful_drain_seconds: 7200` hints at), `ceil(B*D/T_ramp)` gives ~52 and protenix should barely decay at all, which changes whether M4 should enable the gate there and changes the entire value proposition for the largest holder on the pool. Resolvable from `Autoscaler.info()` or `serve_autoscaler_history` before M3 ships.
 2. **Is a released A100 reacquirable on this cluster?** If the research tenant
@@ -763,9 +815,9 @@ Repo philosophy: the minimum tests that establish logic correctness, never asser
    confirmed that maximizing utilization is the goal. A gated claimant releases
    on sustained zero utilization even if the broker cannot identify who will
    take the slot; online warm capacity is expressed by explicit false.
-4. **Resolved 2026-08-01: `utilization_gate` defaults true and releases the
-   whole fill reservation.** Static online reservations use explicit false;
-   Boltz L4 is the first recorded exception.
+4. **Resolved 2026-08-28: `utilization_gate` defaults true and releases the
+   whole fill reservation.** Static online reservations still use explicit
+   false, but Boltz L4 is no longer an exception; its canonical policy is true.
 5. **Does OpenDDE's drain complete through the old declared floor?** M5 makes
    the broker cap mathematically cross 70 to zero, but physical release still
    depends on drain-proof retirement. A cap below 70 with

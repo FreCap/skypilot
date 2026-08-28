@@ -11480,6 +11480,40 @@ class TestLogicalPendingLaunchAdmission:
 class TestLogicalCapacityPlanning:
     """One manager operation packs whole backend shapes to a slot target."""
 
+    def test_exact_shapes_reject_conflicting_widths_for_same_card(self):
+        resources = [
+            types.SimpleNamespace(accelerators={'L4': 1}),
+            types.SimpleNamespace(accelerators={'l4': 8}),
+        ]
+
+        assert (replica_managers.exact_accelerator_shapes_from_resources(
+            resources) == {})
+
+    def test_logical_preflight_rejects_conflicting_same_card_widths(self):
+        resources = [
+            types.SimpleNamespace(accelerators={'L4': 1}),
+            types.SimpleNamespace(accelerators={'l4': 8}),
+        ]
+        task = types.SimpleNamespace(resources=resources,
+                                     service=types.SimpleNamespace(pool=False),
+                                     num_nodes=1)
+        spec = types.SimpleNamespace(
+            uses_logical_replicas=True,
+            placement_contract=types.SimpleNamespace(enabled=True),
+        )
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_yaml_content',
+                               return_value='service: {}'), \
+             mock.patch.object(replica_managers,
+                               'load_task_with_service_spec',
+                               return_value=task), \
+             mock.patch.object(replica_managers.serve_utils,
+                               'resolve_replica_ingress_port'), \
+             pytest.raises(ValueError,
+                           match='exactly one physical whole-GPU width'):
+            replica_managers.validate_service_update_preflight('svc', 1, spec)
+
     @pytest.mark.parametrize('accelerators,expected', [
         ({
             'L4': 1
@@ -18132,6 +18166,135 @@ class TestPaidLocationLaunchBudget:
         assert not existing
         manager._persist_new_replica.assert_not_called()
 
+    def test_paid_authority_rejects_on_demand_at_launch_handoff(self):
+        on_demand = make_location('us-central1', {'L4': 4},
+                                  use_spot=False,
+                                  cloud_name='GCP')
+        spot = make_location('us-east-1', {'L4': 4}, cloud_name='AWS')
+        manager = self._manager({on_demand: 0.25, spot: 1.0})
+        manager._next_replica_id = 7
+        manager._uses_logical_replicas = True
+        manager._default_planned_capacity = 4
+        manager._logical_exact_accelerator_shapes = {}
+        manager._demand_should_skip_zero_cost = mock.Mock(return_value=False)
+        manager._demand_should_skip_saturated_zero_cost = mock.Mock(
+            return_value=False)
+        manager._persist_new_replica = mock.Mock()
+        budget = paid_capacity.LaunchBudget(remaining_by_location={
+            on_demand: 1,
+            spot: 1
+        },
+                                            pool_key_by_location={},
+                                            states_by_pool_key={},
+                                            globally_managed=False)
+        authority = capacity_admission.PaidLaunchAuthority(
+            service_name='svc',
+            service_hash='svc-hash',
+            generation=8,
+            content_sha256='a' * 64,
+            demand_feed_generation=9,
+            demand_source_epoch=3,
+            paid_residual_by_accelerator=(('l4', 4),),
+            paid_launch_target_by_accelerator=(('l4', 4),),
+            reserved_fill_authority=(
+                capacity_admission.ReservedFillPlanAuthority.not_applicable()))
+        existing = []
+
+        with mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=True), \
+             mock.patch.object(paid_capacity,
+                               'select_location',
+                               return_value=on_demand) as select_location, \
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread') \
+                as launch_thread:
+            result = manager._scale_up_one_locked(
+                {'accelerators': {
+                    'L4': 4
+                }},
+                set(),
+                existing,
+                paid_location_launch_budget=budget,
+                paid_launch_authority=authority)
+
+        assert result is None
+        assert manager._next_replica_id == 7
+        assert not existing
+        allowed_locations = select_location.call_args.kwargs[
+            'allowed_locations']
+        assert on_demand not in allowed_locations
+        assert spot in allowed_locations
+        manager._persist_new_replica.assert_not_called()
+        launch_thread.assert_not_called()
+
+    def test_paid_authority_without_placer_rejects_on_demand_task(self):
+        paid = make_location('us-central1', {'L4': 4},
+                             use_spot=False,
+                             cloud_name='GCP')
+        manager = self._manager({paid: 1.0})
+        manager._spot_placer = None
+        manager._next_replica_id = 7
+        manager._uses_logical_replicas = True
+        manager._default_planned_capacity = 4
+        manager._logical_exact_accelerator_shapes = {}
+        manager._persist_new_replica = mock.Mock()
+        authority = capacity_admission.PaidLaunchAuthority(
+            service_name='svc',
+            service_hash='svc-hash',
+            generation=8,
+            content_sha256='a' * 64,
+            demand_feed_generation=9,
+            demand_source_epoch=3,
+            paid_residual_by_accelerator=(('l4', 4),),
+            paid_launch_target_by_accelerator=(('l4', 4),),
+            reserved_fill_authority=(
+                capacity_admission.ReservedFillPlanAuthority.not_applicable()))
+
+        with mock.patch('sky.serve.replica_managers._should_use_spot',
+                        return_value=False), mock.patch(
+                            'sky.serve.replica_managers._ReplicaLaunchThread'
+                        ) as launch_thread:
+            result = manager._scale_up_one_locked(
+                {'accelerators': {
+                    'L4': 4
+                }},
+                set(), [],
+                paid_launch_authority=authority)
+
+        assert result is None
+        assert manager._next_replica_id == 7
+        manager._persist_new_replica.assert_not_called()
+        launch_thread.assert_not_called()
+
+    def test_promoted_cost_rebalance_rejects_pinned_on_demand_location(self):
+        on_demand = make_location('us-central1', {'L4': 4},
+                                  use_spot=False,
+                                  cloud_name='GCP')
+        manager = self._manager({on_demand: 0.25})
+        manager._ordinary_launch_binding_authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=2,
+            generic=True)
+        manager._next_replica_id = 7
+        manager._uses_logical_replicas = True
+        manager._default_planned_capacity = 4
+        manager._logical_exact_accelerator_shapes = {}
+        manager._persist_new_replica = mock.Mock()
+        override = on_demand.to_dict()
+        override[replica_managers.serve_constants.
+                 COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY] = 3
+
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos') as get_infos, \
+             mock.patch('sky.serve.replica_managers._ReplicaLaunchThread') \
+                     as launch_thread:
+            result = manager._scale_up_one_locked(override, set(), [])
+
+        assert result is None
+        assert manager._next_replica_id == 7
+        get_infos.assert_not_called()
+        manager._persist_new_replica.assert_not_called()
+        launch_thread.assert_not_called()
+
     @pytest.mark.parametrize('unknown_replacement', [False, True])
     def test_paid_launch_binds_exact_planner_tuple_before_persistence(
             self, unknown_replacement):
@@ -18153,6 +18316,7 @@ class TestPaidLocationLaunchBudget:
             demand_feed_generation=9,
             demand_source_epoch=3,
             paid_residual_by_accelerator=(('l4', 4),),
+            paid_launch_target_by_accelerator=(('l4', 4),),
             reserved_fill_authority=(
                 capacity_admission.ReservedFillPlanAuthority.not_applicable()))
 
@@ -18193,7 +18357,7 @@ class TestPaidLocationLaunchBudget:
         assert (persisted.non_pool_launch_authorization ==
                 replacement_authorization)
 
-    def test_paid_plan_race_releases_selection_without_row_or_thread(self):
+    def test_paid_residual_smaller_than_backend_launches_whole_backend(self):
         paid = make_location('us-east-1', {'L4': 4}, cloud_name='AWS')
         manager = self._manager({paid: 1.0})
         manager._next_replica_id = 7
@@ -18212,6 +18376,7 @@ class TestPaidLocationLaunchBudget:
             demand_feed_generation=9,
             demand_source_epoch=3,
             paid_residual_by_accelerator=(('l4', 1),),
+            paid_launch_target_by_accelerator=(('l4', 4),),
             reserved_fill_authority=(
                 capacity_admission.ReservedFillPlanAuthority.not_applicable()))
 
@@ -18220,8 +18385,10 @@ class TestPaidLocationLaunchBudget:
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
              mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'), \
-             mock.patch.object(paid_capacity,
-                               'try_persist_claim') as persist, \
+             mock.patch.object(
+                 paid_capacity,
+                 'try_persist_claim',
+                 return_value=paid_capacity.ClaimResult.ACQUIRED) as persist, \
              mock.patch.object(
                  manager, '_release_unstarted_location_retry') as release:
             result = manager._scale_up_one_locked(
@@ -18231,9 +18398,12 @@ class TestPaidLocationLaunchBudget:
                 set(), [],
                 paid_launch_authority=authority)
 
-        assert result is None
-        release.assert_called_once_with(paid)
-        persist.assert_not_called()
+        assert result == _accepted_launch_result(
+            7, 4, replica_managers._ReplicaLaunchFunding.PAID)
+        release.assert_not_called()
+        persist.assert_called_once()
+        assert persist.call_args.kwargs['capacity_plan_claim'][
+            'capacity_plan_units'] == 4
         manager._persist_new_replica.assert_not_called()
 
     def test_paid_authority_physical_wave_commits_once_before_worker_publish(
@@ -18268,6 +18438,7 @@ class TestPaidLocationLaunchBudget:
             demand_feed_generation=9,
             demand_source_epoch=3,
             paid_residual_by_accelerator=(('l4', 3),),
+            paid_launch_target_by_accelerator=(('l4', 3),),
             reserved_fill_authority=(
                 capacity_admission.ReservedFillPlanAuthority.not_applicable()))
         workers = []
@@ -18373,6 +18544,7 @@ class TestPaidLocationLaunchBudget:
             demand_feed_generation=9,
             demand_source_epoch=3,
             paid_residual_by_accelerator=(('l4', 2),),
+            paid_launch_target_by_accelerator=(('l4', 2),),
             reserved_fill_authority=(
                 capacity_admission.ReservedFillPlanAuthority.not_applicable()))
 

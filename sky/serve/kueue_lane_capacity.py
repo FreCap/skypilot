@@ -18,6 +18,7 @@ import enum
 import hashlib
 import json
 import re
+from types import MappingProxyType
 from typing import Any
 import uuid
 
@@ -58,13 +59,69 @@ class KueueReplicaCapacityClass(str, enum.Enum):
 
 @dataclasses.dataclass(frozen=True)
 class KueueReplicaCapacitySnapshot:
-    """Blocking per-tick input prepared before routing serialization."""
+    """Deeply immutable scheduler-capacity input for one replica snapshot."""
 
     by_replica_id: Mapping[int, KueueReplicaCapacityClass]
     unknown_shapes: frozenset[tuple[str, int]] = frozenset()
     unbounded_unknown: bool = False
     replacement_surge_replica_ids: frozenset[int] = frozenset()
     replacement_surge_shapes: frozenset[tuple[str, int]] = frozenset()
+    ordinary_scheduler_replica_ids: frozenset[int] = frozenset()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.by_replica_id, Mapping):
+            raise ValueError('Kueue capacity classes must be a mapping.')
+        classes = dict(self.by_replica_id)
+        if (any(not isinstance(replica_id, int) or
+                isinstance(replica_id, bool) or replica_id < 0
+                for replica_id in classes) or
+                any(not isinstance(value, KueueReplicaCapacityClass)
+                    for value in classes.values()) or
+                type(self.unbounded_unknown) is not bool):
+            raise ValueError('Kueue capacity classes are malformed.')
+
+        def _shapes(values: Any, *,
+                    allow_unbounded: bool) -> frozenset[tuple[str, int]]:
+            try:
+                raw_shapes = frozenset(values)
+            except TypeError as error:
+                raise ValueError('Kueue capacity shapes are malformed.') from (
+                    error)
+            normalized: set[tuple[str, int]] = set()
+            for shape in raw_shapes:
+                if (not isinstance(shape, tuple) or len(shape) != 2 or
+                        not isinstance(shape[0], str) or not shape[0] or
+                        type(shape[1]) is not int or
+                    (shape[1] < 1 and
+                     not (allow_unbounded and shape == ('*', 0)))):
+                    raise ValueError('Kueue capacity shapes are malformed.')
+                normalized.add((shape[0].casefold(), shape[1]))
+            return frozenset(normalized)
+
+        def _replica_ids(values: Any) -> frozenset[int]:
+            try:
+                result = frozenset(values)
+            except TypeError as error:
+                raise ValueError('Kueue capacity replica IDs are malformed.') \
+                    from error
+            if any(not isinstance(replica_id, int) or
+                   isinstance(replica_id, bool) or replica_id < 0
+                   for replica_id in result):
+                raise ValueError('Kueue capacity replica IDs are malformed.')
+            return result
+
+        surge_ids = _replica_ids(self.replacement_surge_replica_ids)
+        ordinary_ids = _replica_ids(self.ordinary_scheduler_replica_ids)
+        if ordinary_ids & set(classes) or surge_ids - set(classes):
+            raise ValueError('Kueue capacity ownership is contradictory.')
+        object.__setattr__(self, 'by_replica_id', MappingProxyType(classes))
+        object.__setattr__(self, 'unknown_shapes',
+                           _shapes(self.unknown_shapes, allow_unbounded=True))
+        object.__setattr__(
+            self, 'replacement_surge_shapes',
+            _shapes(self.replacement_surge_shapes, allow_unbounded=False))
+        object.__setattr__(self, 'replacement_surge_replica_ids', surge_ids)
+        object.__setattr__(self, 'ordinary_scheduler_replica_ids', ordinary_ids)
 
     @property
     def has_unknown(self) -> bool:
@@ -190,12 +247,12 @@ def decide_zero_cost_replacement_surge(
 class KueueAdmissionCapacityProjection:
     """One locked projection of all admission rows affecting a service.
 
-    ``None`` from either lookup is emitted only when immutable version state
-    proves the intent used the ordinary scheduler path. The projection
-    deliberately returns ``False`` only for a fresh, exact ``POD_WAITING``
-    receipt. Every ambiguous state remains assigned and sets ``has_unknown``.
-    Bounded unknowns suppress only their exact shape; malformed shape identity
-    fails the whole service closed.
+    Ordinary-scheduler ownership is retained as positive immutable evidence;
+    admission-row absence is never itself proof of that path.  The projection
+    deliberately returns ``False`` from the Kueue lookups only for a fresh,
+    exact ``POD_WAITING`` receipt. Every ambiguous state remains assigned and
+    sets ``has_unknown``. Bounded unknowns suppress only their exact shape;
+    malformed shape identity fails the whole service closed.
     """
 
     rows: tuple[Any, ...]
@@ -207,6 +264,7 @@ class KueueAdmissionCapacityProjection:
     admitted_intent_keys: frozenset[str]
     fresh_waiting_replica_record_ids: frozenset[tuple[int, uuid.UUID]]
     admitted_replica_record_ids: frozenset[tuple[int, uuid.UUID]]
+    ordinary_scheduler_intent_keys: frozenset[str]
     unknown_intent_keys: frozenset[str]
     unknown_domains: tuple[str, ...]
     unknown_shapes: frozenset[tuple[str, int]]
@@ -228,6 +286,11 @@ class KueueAdmissionCapacityProjection:
             return None
         return intent_key in self.assigned_gpu_intent_keys
 
+    def uses_ordinary_scheduler(self, intent_key: str | None) -> bool:
+        """Return whether immutable version state proves the non-Kueue path."""
+        return (isinstance(intent_key, str) and
+                intent_key in self.ordinary_scheduler_intent_keys)
+
     @property
     def has_unknown(self) -> bool:
         return self.unbounded_unknown or bool(self.unknown_domains)
@@ -246,12 +309,16 @@ def replica_capacity_snapshot_from_projection(
                    str) and bool(info.reserved_fill_intent_idempotency_key)
     ]
     classes: dict[int, KueueReplicaCapacityClass] = {}
+    ordinary_replica_ids: set[int] = set()
     for info in reserved_infos:
         intent_key = info.reserved_fill_intent_idempotency_key
         if intent_key not in projection.row_by_intent_key:
-            # Existing non-Kueue reserved-fill pools retain their historical
-            # semantics. The atomic grant path guarantees every Kueue intent
-            # has an admission row.
+            if projection.uses_ordinary_scheduler(intent_key):
+                ordinary_replica_ids.add(int(info.replica_id))
+            # Preserve the historical no-override behavior for rows outside
+            # the Kueue projection.  A genuinely expected-but-missing Kueue
+            # admission is represented by the projection's UNKNOWN sentinel
+            # and therefore does not take this branch.
             continue
         try:
             record = (int(info.replica_id),
@@ -273,10 +340,13 @@ def replica_capacity_snapshot_from_projection(
             str(getattr(info, 'replica_record_id', '')) == str(record_id)
             for info in reserved_infos)
     }
-    return KueueReplicaCapacitySnapshot(classes, projection.unknown_shapes,
-                                        projection.unbounded_unknown,
-                                        frozenset(surge_replica_ids),
-                                        projection.replacement_surge_shapes)
+    return KueueReplicaCapacitySnapshot(
+        by_replica_id=classes,
+        unknown_shapes=projection.unknown_shapes,
+        unbounded_unknown=projection.unbounded_unknown,
+        replacement_surge_replica_ids=frozenset(surge_replica_ids),
+        replacement_surge_shapes=projection.replacement_surge_shapes,
+        ordinary_scheduler_replica_ids=frozenset(ordinary_replica_ids))
 
 
 def _db_now(connection: sqlalchemy.engine.Connection) -> datetime.datetime:
@@ -372,6 +442,7 @@ def lock_capacity_projection_in_connection(
     admitted: set[str] = set()
     fresh_waiting_records: set[tuple[int, uuid.UUID]] = set()
     admitted_records: set[tuple[int, uuid.UUID]] = set()
+    ordinary_scheduler_intents: set[str] = set()
     unknown: set[str] = set()
     unknown_intents: set[str] = set()
     unknown_shapes: set[tuple[str, int]] = set()
@@ -478,6 +549,8 @@ def lock_capacity_projection_in_connection(
                 _mark_unknown(intent_key,
                               intent=locked_intent,
                               row=admission_row)
+            else:
+                ordinary_scheduler_intents.add(intent_key)
             continue
         if admission_row is None:
             _mark_unknown(intent_key,
@@ -627,6 +700,7 @@ def lock_capacity_projection_in_connection(
         admitted_intent_keys=frozenset(admitted),
         fresh_waiting_replica_record_ids=frozenset(fresh_waiting_records),
         admitted_replica_record_ids=frozenset(admitted_records),
+        ordinary_scheduler_intent_keys=frozenset(ordinary_scheduler_intents),
         unknown_intent_keys=frozenset(unknown_intents),
         unknown_domains=tuple(sorted(unknown)),
         unknown_shapes=frozenset(unknown_shapes),

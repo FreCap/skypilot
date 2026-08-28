@@ -620,6 +620,28 @@ def test_global_snapshot_uses_shared_headroom_by_exact_pool():
     get_states.assert_called_once()
 
 
+def test_generic_paid_budget_preserves_ordinary_on_demand():
+    on_demand = make_location('us-central1', {'L4': 1},
+                              use_spot=False,
+                              cloud_name='GCP')
+    spot = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')
+    # Planner-authorized reserved-fill launches narrow their candidates at the
+    # ReplicaManager handoff.  The generic shared budget must continue to
+    # support ordinary SkyServe services whose configured paid location is
+    # on-demand.
+    placer = make_placer({on_demand: 0.25, spot: 1.0})
+
+    budget = paid_capacity.build_launch_budget(placer,
+                                               workspace='w',
+                                               existing_replica_infos=[],
+                                               globally_managed=False)
+
+    assert on_demand in budget.remaining_by_location
+    assert on_demand in budget.pool_key_by_location
+    assert spot in budget.remaining_by_location
+    assert paid_capacity.select_location(placer, budget) == on_demand
+
+
 def test_global_budget_uses_exact_profile_and_durable_pool_evidence(
         monkeypatch):
     location = make_location('us-east-1', {'L4': 1}, cloud_name='AWS')

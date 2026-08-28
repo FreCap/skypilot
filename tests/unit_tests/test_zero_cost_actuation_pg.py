@@ -14,8 +14,6 @@ from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
 from sky import clouds
-from sky.serve import capacity_admission
-from sky.serve import constants as serve_constants
 from sky.serve import kubernetes_identity
 from sky.serve import kueue_lane_lineage_schema
 from sky.serve import ordinary_launch_binding
@@ -1733,8 +1731,7 @@ def test_promotion_requires_fleet_barrier_and_is_one_way(
                 participant_barrier_passed=True)
 
 
-def test_pending_grants_enforce_headroom_and_debit_paid_residual(
-        actuation_database) -> None:
+def test_pending_grants_enforce_headroom(actuation_database) -> None:
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
     plan = _plan(free_slots=2)
@@ -1755,10 +1752,6 @@ def test_pending_grants_enforce_headroom_and_debit_paid_residual(
             accounting_cards={'l4'},
             now=now)
     assert pending == {'l4': 1}
-    assert capacity_admission._paid_residual({'l4': 2}, {'l4': 0}, pending,
-                                             {'l4': 0}) == {
-                                                 'l4': 1
-                                             }
 
 
 def test_pending_fill_snapshot_is_global_unit_normalized_and_exact(
@@ -2023,8 +2016,6 @@ def test_idle_gate_controls_width_adjusted_durable_intents_without_paid_spill(
             launchable=True,
             effective_cap=available_slots)
     }
-    monkeypatch.delenv(serve_constants.RESERVED_FILL_UTILIZATION_GATE_ENV_VAR,
-                       raising=False)
     gated_claims, _ = reserved_capacity_broker._apply_utilization_gate(
         claims, {
             'svc': reserved_capacity_broker.ActivityInput(
@@ -2077,11 +2068,6 @@ def test_idle_gate_controls_width_adjusted_durable_intents_without_paid_spill(
     assert replica_count == 0
     assert paid_claim_count == 0
     assert pending == {'l4': expected_intents}
-    assert capacity_admission._paid_residual({'l4': expected_intents},
-                                             {'l4': 0}, pending,
-                                             {'l4': 0}) == {}
-    assert capacity_admission._paid_residual({'l4': 0}, {'l4': 0}, pending,
-                                             {'l4': 0}) == {}
 
 
 def test_pool_leases_are_independent_and_retryable(actuation_database) -> None:

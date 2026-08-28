@@ -444,10 +444,6 @@ class TestProtocolV2DurableRoundBootstrap:
              mock.patch.object(reserved_capacity.serve_state,
                                'get_replica_infos',
                                return_value=[]), \
-             mock.patch.object(
-                 reserved_capacity.reserved_capacity_broker,
-                 'utilization_gate_enabled',
-                 return_value=False), \
              mock.patch.object(reserved_capacity.serve_state,
                                'get_reserved_fill_round',
                                return_value=round_row) as get_round, \

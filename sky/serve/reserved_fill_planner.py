@@ -19,7 +19,8 @@ from sky.serve import reserved_capacity_broker
 from sky.serve import spot_placer
 
 _SHA256_PATTERN = re.compile(r'^[0-9a-f]{64}$')
-ALLOCATION_MAP_SCHEMA_VERSION = 6
+ALLOCATION_MAP_SCHEMA_VERSION = 7
+_PREVIOUS_ALLOCATION_MAP_SCHEMA_VERSION = 6
 _LOCATION_PICKLEABLE_FIELDS = frozenset({
     'cloud',
     'region',
@@ -63,11 +64,15 @@ _AUTHENTICATED_ALLOCATION_MAP_FIELDS = frozenset({
     'reclaim_provider_inventory_sha256',
     'utilization_gate_armed',
     'utilization_demonstrated_need',
+    'utilization_demand_witness_sha256',
     'utilization_boot_hold',
     'utilization_ceiling',
     'upward_grants_settled',
     'pool_snapshots',
 })
+_PREVIOUS_AUTHENTICATED_ALLOCATION_MAP_FIELDS = (
+    _AUTHENTICATED_ALLOCATION_MAP_FIELDS -
+    {'utilization_demand_witness_sha256'})
 
 
 def _canonical_sha256(payload: Mapping[str, Any]) -> str:
@@ -565,6 +570,7 @@ class PoolFillSnapshot:
 class AuthenticatedAllocationMap:
     """One complete ordered allocation input with a self-verifying hash."""
 
+    schema_version: int
     allocation_generation: int
     allocation_input_sha256: str
     allocation_claim_generation: int
@@ -576,6 +582,7 @@ class AuthenticatedAllocationMap:
     reclaim_provider_inventory_sha256: str
     utilization_gate_armed: bool
     utilization_demonstrated_need: int | None
+    utilization_demand_witness_sha256: str | None
     utilization_boot_hold: bool
     utilization_ceiling: int
     upward_grants_settled: bool
@@ -583,6 +590,7 @@ class AuthenticatedAllocationMap:
 
     @staticmethod
     def _input_payload(
+        schema_version: int,
         allocation_generation: int,
         allocation_claim_generation: int,
         service_version: int,
@@ -593,13 +601,14 @@ class AuthenticatedAllocationMap:
         reclaim_provider_inventory_sha256: str,
         utilization_gate_armed: bool,
         utilization_demonstrated_need: int | None,
+        utilization_demand_witness_sha256: str | None,
         utilization_boot_hold: bool,
         utilization_ceiling: int,
         upward_grants_settled: bool,
         pool_snapshots: tuple[PoolFillSnapshot, ...],
     ) -> dict[str, Any]:
-        return {
-            'schema_version': ALLOCATION_MAP_SCHEMA_VERSION,
+        payload = {
+            'schema_version': schema_version,
             'allocation_generation': allocation_generation,
             'allocation_claim_generation': allocation_claim_generation,
             'service_version': service_version,
@@ -617,6 +626,10 @@ class AuthenticatedAllocationMap:
                 snapshot.canonical_payload() for snapshot in pool_snapshots
             ],
         }
+        if schema_version >= ALLOCATION_MAP_SCHEMA_VERSION:
+            payload['utilization_demand_witness_sha256'] = (
+                utilization_demand_witness_sha256)
+        return payload
 
     @classmethod
     def create(
@@ -633,6 +646,7 @@ class AuthenticatedAllocationMap:
         pool_snapshots: tuple[PoolFillSnapshot, ...],
         utilization_gate_armed: bool = False,
         utilization_demonstrated_need: int | None = None,
+        utilization_demand_witness_sha256: str | None = None,
         utilization_boot_hold: bool = False,
         utilization_ceiling: int = 0,
         upward_grants_settled: bool = True,
@@ -660,6 +674,9 @@ class AuthenticatedAllocationMap:
         if utilization_demonstrated_need is not None:
             _require_int(utilization_demonstrated_need,
                          'Utilization demonstrated need')
+        if utilization_demand_witness_sha256 is not None:
+            _require_sha256(utilization_demand_witness_sha256,
+                            'Utilization demand witness hash')
         if type(utilization_boot_hold) is not bool:
             raise ValueError('Utilization boot hold must be a boolean.')
         _require_int(utilization_ceiling, 'Utilization ceiling')
@@ -667,6 +684,7 @@ class AuthenticatedAllocationMap:
             raise ValueError('Upward grants settled must be a boolean.')
         if (not utilization_gate_armed and
             (utilization_demonstrated_need is not None or
+             utilization_demand_witness_sha256 is not None or
              utilization_boot_hold)):
             raise ValueError('An unarmed utilization gate cannot carry a '
                              'demand sample.')
@@ -677,15 +695,16 @@ class AuthenticatedAllocationMap:
                              'PoolFillSnapshot values.')
         input_hash = _canonical_sha256(
             cls._input_payload(
-                allocation_generation, allocation_claim_generation,
-                service_version,
+                ALLOCATION_MAP_SCHEMA_VERSION, allocation_generation,
+                allocation_claim_generation, service_version,
                 ordinary_zero_cost_admission_sequence_high_water,
                 reconciliation_gate_generation, reclaim_fleet_bundle_sha256,
                 reclaim_policy_revision, reclaim_provider_inventory_sha256,
                 utilization_gate_armed, utilization_demonstrated_need,
-                utilization_boot_hold, utilization_ceiling,
-                upward_grants_settled, pool_snapshots))
+                utilization_demand_witness_sha256, utilization_boot_hold,
+                utilization_ceiling, upward_grants_settled, pool_snapshots))
         return cls(
+            schema_version=ALLOCATION_MAP_SCHEMA_VERSION,
             allocation_generation=allocation_generation,
             allocation_input_sha256=input_hash,
             allocation_claim_generation=allocation_claim_generation,
@@ -699,6 +718,8 @@ class AuthenticatedAllocationMap:
                 reclaim_provider_inventory_sha256),
             utilization_gate_armed=utilization_gate_armed,
             utilization_demonstrated_need=utilization_demonstrated_need,
+            utilization_demand_witness_sha256=(
+                utilization_demand_witness_sha256),
             utilization_boot_hold=utilization_boot_hold,
             utilization_ceiling=utilization_ceiling,
             upward_grants_settled=upward_grants_settled,
@@ -714,11 +735,19 @@ class AuthenticatedAllocationMap:
         if type(data) is not dict:
             raise ValueError('Authenticated allocation map must be an exact '
                              'dictionary.')
-        _require_closed_fields(data, _AUTHENTICATED_ALLOCATION_MAP_FIELDS,
-                               'Authenticated allocation map')
-        if data['schema_version'] != ALLOCATION_MAP_SCHEMA_VERSION:
+        if 'schema_version' not in data:
+            raise ValueError('Authenticated allocation map fields must be '
+                             'exact.')
+        schema_version = data.get('schema_version')
+        if schema_version == ALLOCATION_MAP_SCHEMA_VERSION:
+            expected_fields = _AUTHENTICATED_ALLOCATION_MAP_FIELDS
+        elif schema_version == _PREVIOUS_ALLOCATION_MAP_SCHEMA_VERSION:
+            expected_fields = _PREVIOUS_AUTHENTICATED_ALLOCATION_MAP_FIELDS
+        else:
             raise ValueError('Authenticated allocation map schema version is '
                              'unsupported.')
+        _require_closed_fields(data, expected_fields,
+                               'Authenticated allocation map')
         raw_snapshots = data['pool_snapshots']
         if type(raw_snapshots) is not list:
             raise ValueError('Allocation pool snapshots must be an exact '
@@ -727,6 +756,7 @@ class AuthenticatedAllocationMap:
             PoolFillSnapshot.from_mapping(snapshot)
             for snapshot in raw_snapshots)
         return cls(
+            schema_version=schema_version,
             allocation_generation=data['allocation_generation'],
             allocation_input_sha256=data['allocation_input_sha256'],
             allocation_claim_generation=data['allocation_claim_generation'],
@@ -742,6 +772,8 @@ class AuthenticatedAllocationMap:
             utilization_gate_armed=data['utilization_gate_armed'],
             utilization_demonstrated_need=(
                 data['utilization_demonstrated_need']),
+            utilization_demand_witness_sha256=(
+                data.get('utilization_demand_witness_sha256')),
             utilization_boot_hold=data['utilization_boot_hold'],
             utilization_ceiling=data['utilization_ceiling'],
             upward_grants_settled=data['upward_grants_settled'],
@@ -749,6 +781,9 @@ class AuthenticatedAllocationMap:
         )
 
     def __post_init__(self) -> None:
+        if self.schema_version not in (_PREVIOUS_ALLOCATION_MAP_SCHEMA_VERSION,
+                                       ALLOCATION_MAP_SCHEMA_VERSION):
+            raise ValueError('Allocation map schema version is unsupported.')
         _require_int(self.allocation_generation,
                      'Allocation generation',
                      minimum=1)
@@ -774,6 +809,13 @@ class AuthenticatedAllocationMap:
         if self.utilization_demonstrated_need is not None:
             _require_int(self.utilization_demonstrated_need,
                          'Utilization demonstrated need')
+        if self.utilization_demand_witness_sha256 is not None:
+            _require_sha256(self.utilization_demand_witness_sha256,
+                            'Utilization demand witness hash')
+        if (self.schema_version == _PREVIOUS_ALLOCATION_MAP_SCHEMA_VERSION and
+                self.utilization_demand_witness_sha256 is not None):
+            raise ValueError('A previous allocation schema cannot carry the '
+                             'utilization demand witness.')
         if type(self.utilization_boot_hold) is not bool:
             raise ValueError('Utilization boot hold must be a boolean.')
         _require_int(self.utilization_ceiling, 'Utilization ceiling')
@@ -781,6 +823,7 @@ class AuthenticatedAllocationMap:
             raise ValueError('Upward grants settled must be a boolean.')
         if (not self.utilization_gate_armed and
             (self.utilization_demonstrated_need is not None or
+             self.utilization_demand_witness_sha256 is not None or
              self.utilization_boot_hold)):
             raise ValueError('An unarmed utilization gate cannot carry a '
                              'demand sample.')
@@ -822,13 +865,14 @@ class AuthenticatedAllocationMap:
         """Recompute the allocation hash at every authority-use boundary."""
         expected_hash = _canonical_sha256(
             self._input_payload(
-                self.allocation_generation, self.allocation_claim_generation,
-                self.service_version,
+                self.schema_version, self.allocation_generation,
+                self.allocation_claim_generation, self.service_version,
                 self.ordinary_zero_cost_admission_sequence_high_water,
                 self.reconciliation_gate_generation,
                 self.reclaim_fleet_bundle_sha256, self.reclaim_policy_revision,
                 self.reclaim_provider_inventory_sha256,
                 self.utilization_gate_armed, self.utilization_demonstrated_need,
+                self.utilization_demand_witness_sha256,
                 self.utilization_boot_hold, self.utilization_ceiling,
                 self.upward_grants_settled, self.pool_snapshots))
         if self.allocation_input_sha256 != expected_hash:
@@ -837,8 +881,8 @@ class AuthenticatedAllocationMap:
 
     def to_mapping(self) -> dict[str, Any]:
         """Return the exact durable publication shape."""
-        return {
-            'schema_version': ALLOCATION_MAP_SCHEMA_VERSION,
+        result = {
+            'schema_version': self.schema_version,
             'allocation_generation': self.allocation_generation,
             'allocation_input_sha256': self.allocation_input_sha256,
             'allocation_claim_generation': self.allocation_claim_generation,
@@ -860,6 +904,10 @@ class AuthenticatedAllocationMap:
                 snapshot.canonical_payload() for snapshot in self.pool_snapshots
             ],
         }
+        if self.schema_version >= ALLOCATION_MAP_SCHEMA_VERSION:
+            result['utilization_demand_witness_sha256'] = (
+                self.utilization_demand_witness_sha256)
+        return result
 
     @property
     def identity(self) -> 'ReservedFillAllocationIdentity':
@@ -1718,10 +1766,15 @@ class ReservedFillPlanner:
         max_replicas: int,
         planned_replicas: int,
         capacity_unit: FillCapacityUnit,
+        target_capacity_by_accelerator: Mapping[str, int] | None = None,
         committed_fill_debits: tuple[CommittedFillDebit, ...] = (),
         rotation_anchor: str | None = None,
     ) -> FillPlan:
-        """Build a deterministic plan without spending feed or an anchor."""
+        """Build a deterministic plan without spending feed or an anchor.
+
+        The optional exact-card target caps only new intents from this call;
+        committed-fill replay debits do not consume that prospective budget.
+        """
         _require_int(policy_revision, 'Policy revision', minimum=1)
         _require_int(reconcile_generation, 'Reconcile generation', minimum=1)
         if not isinstance(allocation_map, AuthenticatedAllocationMap):
@@ -1737,6 +1790,20 @@ class ReservedFillPlanner:
         _require_int(planned_replicas, 'planned_replicas')
         if not isinstance(capacity_unit, FillCapacityUnit):
             raise ValueError('capacity_unit must be FillCapacityUnit.')
+        remaining_target_by_accelerator: dict[str, int] | None = None
+        if target_capacity_by_accelerator is not None:
+            if not isinstance(target_capacity_by_accelerator, Mapping):
+                raise ValueError('Target capacity by accelerator must be a '
+                                 'mapping.')
+            remaining_target_by_accelerator = {}
+            for raw_card, raw_capacity in (
+                    target_capacity_by_accelerator.items()):
+                card = _require_nonempty_string(
+                    raw_card, 'Target capacity accelerator').casefold()
+                if card in remaining_target_by_accelerator:
+                    raise ValueError('Target capacity repeats an accelerator.')
+                remaining_target_by_accelerator[card] = _require_int(
+                    raw_capacity, 'Target accelerator capacity')
         if type(committed_fill_debits) is not tuple or any(
                 not isinstance(debit, CommittedFillDebit)
                 for debit in committed_fill_debits):
@@ -1759,12 +1826,14 @@ class ReservedFillPlanner:
         locations_by_pool_card: dict[str, dict[str, tuple[LocationSnapshot,
                                                           ...]]] = {}
         remaining_by_pool: dict[str, int] = {}
+        authenticated_cards: set[str] = set()
         for snapshot in ordered_snapshots:
             card_order: list[str] = []
             display_shapes: dict[str, tuple[str, int]] = {}
             locations: dict[str, list[LocationSnapshot]] = {}
             for location in snapshot.locations:
                 card = location.accelerator.casefold()
+                authenticated_cards.add(card)
                 if card not in locations:
                     card_order.append(card)
                     locations[card] = []
@@ -1789,6 +1858,16 @@ class ReservedFillPlanner:
             remaining_by_pool[snapshot.pool_key] = min(snapshot.free_slots,
                                                        snapshot.grant,
                                                        snapshot.edge_cap)
+
+        if remaining_target_by_accelerator is not None:
+            unknown_positive_cards = {
+                card
+                for card, capacity in remaining_target_by_accelerator.items()
+                if capacity > 0 and card not in authenticated_cards
+            }
+            if unknown_positive_cards:
+                raise ValueError('Positive target capacity references a card '
+                                 'outside authenticated pool locations.')
 
         committed_debit_keys: set[tuple[str, str]] = set()
         for debit in committed_fill_debits:
@@ -1833,10 +1912,15 @@ class ReservedFillPlanner:
                         continue
                     _, accelerator_count = (
                         display_shape_by_pool_card[pool_key][card])
-                    if capacity_unit.intent_cost(
-                            accelerator_count) <= hard_headroom:
-                        selected_card = card
-                        break
+                    intent_cost = capacity_unit.intent_cost(accelerator_count)
+                    if intent_cost > hard_headroom:
+                        continue
+                    if (remaining_target_by_accelerator is not None and
+                            intent_cost > remaining_target_by_accelerator.get(
+                                card, 0)):
+                        continue
+                    selected_card = card
+                    break
                 if selected_card is None:
                     continue
                 display_card, accelerator_count = (
@@ -1886,7 +1970,11 @@ class ReservedFillPlanner:
                     ))
                 remaining_by_pool_card[pool_key][selected_card] -= 1
                 remaining_by_pool[pool_key] -= 1
-                hard_headroom -= capacity_unit.intent_cost(accelerator_count)
+                intent_cost = capacity_unit.intent_cost(accelerator_count)
+                hard_headroom -= intent_cost
+                if remaining_target_by_accelerator is not None:
+                    remaining_target_by_accelerator[
+                        selected_card] -= intent_cost
                 made_progress = True
             if not made_progress:
                 break
@@ -1921,8 +2009,10 @@ class ReservedFillPlanner:
         """Return the canonical exact-card tail through the real planner.
 
         Capacity admission has no process-local fairness cursor, so this uses
-        canonical pool order.  The caller must reject a ceiling-clipped
-        mixed-card tail whose totals could depend on the live rotation anchor.
+        canonical pool and card order.  A real service ceiling clips only to
+        complete physical backends.  Later actuation is constrained by this
+        exact-card projection, so a wider non-fitting card is skipped instead
+        of making independent accelerator demand globally unavailable.
         """
         projection = ReservedFillPlanner.plan(
             policy_revision=1,

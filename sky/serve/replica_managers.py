@@ -498,8 +498,10 @@ class LogicalReconcileSnapshot:
     authority: 'demand_state.DurableReconcileAuthority | None' = None
 
 
-LogicalAcceleratorState = autoscaler_decisions.LogicalAcceleratorState
-LogicalCapacityTarget = autoscaler_decisions.LogicalCapacityTarget
+LogicalAcceleratorState: typing.TypeAlias = (
+    autoscaler_decisions.LogicalAcceleratorState)
+LogicalCapacityTarget: typing.TypeAlias = (
+    autoscaler_decisions.LogicalCapacityTarget)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2697,7 +2699,13 @@ def validate_service_update_preflight(
     uses_logical_replicas = service_spec.uses_logical_replicas is True
     default_planned_capacity = _uniform_whole_gpu_capacity(task.resources)
     if uses_logical_replicas:
-        _exact_accelerator_shapes(task.resources)
+        exact_accelerator_shapes = exact_accelerator_shapes_from_resources(
+            task.resources)
+        if not exact_accelerator_shapes:
+            raise ValueError(
+                'Logical replicas require exactly one physical whole-GPU '
+                'width for each configured accelerator. Conflicting widths '
+                'for the same accelerator are not supported.')
     candidate_placer = None
     if service_spec.placement_contract.enabled:
         candidate_placer = _load_spot_placer(service_name, version,
@@ -2912,7 +2920,7 @@ def _uniform_whole_gpu_capacity(
             if len(unique_capacities) == 1 else None)
 
 
-def _exact_accelerator_shapes(
+def exact_accelerator_shapes_from_resources(
         resources: typing.Iterable[resources_lib.Resources]) -> dict[str, int]:
     """Return the distinct exact-card catalog, or empty for legacy shapes."""
     shapes: dict[str, int] = {}
@@ -6129,8 +6137,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._uses_logical_replicas = spec.uses_logical_replicas is True
         self._default_planned_capacity = _uniform_whole_gpu_capacity(
             task.resources)
-        self._logical_exact_accelerator_shapes = (_exact_accelerator_shapes(
-            task.resources) if self._uses_logical_replicas else {})
+        self._logical_exact_accelerator_shapes = (
+            exact_accelerator_shapes_from_resources(task.resources)
+            if self._uses_logical_replicas else {})
         self._spot_placer = _load_spot_placer(service_name, version, spec, task,
                                               self._workspace)
         if self._uses_logical_replicas:
@@ -7280,6 +7289,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                 logger.info('Deferring demand launch without paid authority: '
                             'no placer can prove a zero-cost location.')
             return None
+        if (paid_launch_authority is not None and self._spot_placer is None and
+                not use_spot):
+            # A committed planner residual authorizes prospective Spot only.
+            # Without a placer there is no independent location witness that
+            # can turn an ordinary on-demand task into an exact Spot pin.
+            # Narrow this fence to planner-authorized launches so generic
+            # SkyServe services retain their existing on-demand behavior.
+            logger.error(
+                'Deferring planner-authorized paid launch because no Spot '
+                'placer can prove an exact Spot location.')
+            return None
         # A fill launch must reach the placer even though zero-cost k8s
         # entries are use_spot=False (the _should_use_spot gate above keys
         # on the task/override spot-ness, which says nothing about fill).
@@ -7306,6 +7326,21 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._clean_up_skipped_cost_rebalance_redrive(
                     replica_id, prior_cost_rebalance_for_replica_id)
                 return None
+            binding_authority = self._ordinary_launch_binding_authority
+            if (binding_authority is not None and
+                    binding_authority.generic_launches_required and
+                    location.use_spot is not True):
+                # Cost rebalance predates durable capacity planning and does
+                # not carry PaidLaunchAuthority.  Once protocol-v2 owns every
+                # ordinary launch, its replacement path must obey the same
+                # prospective-Spot-only contract before creating a row or a
+                # launch worker.  Legacy/generic Serve remains unchanged.
+                logger.error(
+                    'Skipping promoted cost-rebalance launch because its '
+                    'pinned paid location is not Spot: %s.', location)
+                self._clean_up_skipped_cost_rebalance_redrive(
+                    replica_id, prior_cost_rebalance_for_replica_id)
+                return None
             if not recovering_existing_replica:
                 if existing_replica_infos is None:
                     existing_replica_infos = serve_state.get_replica_infos(
@@ -7315,7 +7350,6 @@ class SkyPilotReplicaManager(ReplicaManager):
                      if candidate.replica_id == cost_rebalance_for_replica_id
                      and candidate.version == launch_version and
                      not candidate.is_terminal), None)
-                binding_authority = self._ordinary_launch_binding_authority
                 if (binding_authority is not None and
                         binding_authority.generic_launches_required):
                     if predecessor_info is None:
@@ -7409,6 +7443,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                 allowed_locations = (
                     pool_allowed if allowed_locations is None else
                     allowed_locations.intersection(pool_allowed))
+            if paid_launch_authority is not None:
+                # A committed paid residual is prospective Spot authority,
+                # not permission to fall through to ordinary on-demand.  Keep
+                # generic SkyServe placement unchanged by narrowing only the
+                # planner-authorized launch handoff.  Zero-cost Kubernetes is
+                # still eligible on its independent reservation path.
+                zero_cost_locations = set(
+                    self._spot_placer.zero_cost_locations())
+                spot_or_zero_cost = {
+                    candidate
+                    for candidate in self._spot_placer.active_locations()
+                    if candidate in zero_cost_locations or
+                    candidate.use_spot is True
+                }
+                allowed_locations = (
+                    spot_or_zero_cost if allowed_locations is None else
+                    allowed_locations.intersection(spot_or_zero_cost))
             allowed_location_kwargs: dict[str, Any] = (
                 {} if allowed_locations is None else {
                     'allowed_locations': allowed_locations
@@ -7426,6 +7477,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'Deferring demand launch without paid authority: no '
                         'ACTIVE zero-cost location matches exact accelerator '
                         f'override {resources_override["accelerators"]!r}.')
+                    return None
+                if paid_launch_authority is not None:
+                    logger.info(
+                        'Deferring planner-authorized paid launch because no '
+                        'Spot location matches exact accelerator override '
+                        f'{resources_override["accelerators"]!r}.')
                     return None
                 raise ValueError(
                     'No active placement location matches exact accelerator '
@@ -7734,6 +7791,19 @@ class SkyPilotReplicaManager(ReplicaManager):
             if location is None:
                 logger.info('Deferring demand launch because every active paid '
                             'location is awaiting launch feedback.')
+                return None
+            if (paid_launch_authority is not None and
+                    location not in self._spot_placer.zero_cost_locations() and
+                    location.use_spot is not True):
+                # Paid residual is narrowly prospective Spot authority.  Keep
+                # the final handoff fail-closed even if a stale or custom
+                # placer returns an ordinary on-demand cloud entry.  Reserved
+                # zero-cost Kubernetes placement remains a separate path.
+                self._release_unstarted_location_retry(location)
+                logger.error(
+                    'Deferring planner-authorized paid launch because the '
+                    'selected non-zero-cost location is not Spot: %s.',
+                    location)
                 return None
             debit_paid_location_launch_budget = (
                 paid_location_launch_budget is not None and
@@ -10711,10 +10781,29 @@ class SkyPilotReplicaManager(ReplicaManager):
             canonical_by_name = {}
         paid_authority_left: dict[str, int] | None = None
         if cold_launch_authority_by_accelerator is not None:
-            if any(card not in card_targets or isinstance(raw_count, bool) or
-                   not isinstance(raw_count, int) or raw_count < 0 or
-                   raw_count > card_targets.get(card, 0) for card, raw_count in
-                   cold_launch_authority_by_accelerator.items()):
+            malformed = any(
+                card not in card_targets or isinstance(raw_count, bool) or
+                not isinstance(raw_count, int) or raw_count < 0 for card,
+                raw_count in cold_launch_authority_by_accelerator.items())
+            if paid_launch_authority is None:
+                # Unbound/legacy local authority remains an economic ceiling;
+                # it cannot use physical packing to exceed the logical target.
+                malformed = malformed or any(
+                    raw_count > card_targets.get(card, 0) for card, raw_count in
+                    cold_launch_authority_by_accelerator.items())
+            else:
+                expected_launch = {
+                    str(card).casefold(): count for card, count in
+                    paid_launch_authority.remaining_launch_capacity().items()
+                }
+                actual_launch = {
+                    str(card).casefold(): count for card, count in
+                    cold_launch_authority_by_accelerator.items()
+                }
+                malformed = (malformed or actual_launch != expected_launch or
+                             any(count % shapes[card] != 0 for card, count in
+                                 cold_launch_authority_by_accelerator.items()))
+            if malformed:
                 logger.warning(
                     'Discarding malformed logical paid cold-launch authority: '
                     f'target={card_targets}, authority='
@@ -10984,8 +11073,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 observation_generation=reconcile_generation,
                                 observation_service_version=version,
                                 target_capacity=target_capacity,
-                                target_capacity_by_accelerator=(
-                                    card_targets),
+                                target_capacity_by_accelerator=(card_targets),
                                 accelerator_shapes=shapes))
             if paid_launch_authority is not None:
                 # Replacement attribution proves which uncertain backend may
@@ -18335,8 +18423,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         if new_uses_logical_replicas and new_task.num_nodes != 1:
             _validate_logical_capacity_sources(new_default_planned_capacity,
                                                None, new_task.num_nodes)
-        new_logical_exact_accelerator_shapes = (_exact_accelerator_shapes(
-            new_task.resources) if new_uses_logical_replicas else {})
+        new_logical_exact_accelerator_shapes = (
+            exact_accelerator_shapes_from_resources(new_task.resources)
+            if new_uses_logical_replicas else {})
         # A service update may change the placement policy or any_of shape
         # set. Use the preflight placer when provided; otherwise load the
         # committed version's centralized catalog. Neither path rebuilds

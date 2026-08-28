@@ -17,6 +17,7 @@ from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
 from sky.serve import capacity_admission
 from sky.serve import capacity_admission_schema
+from sky.serve import capacity_planning
 from sky.serve import demand_state
 from sky.serve import demand_state_schema
 from sky.serve import paid_retirement
@@ -34,13 +35,84 @@ _OWNER = (123, '10.0.0.5')
 _ROUTE_URL = 'http://replica:8000'
 
 
+def _planner_payload(
+    snapshot: demand_state.DurableAutoscalingSnapshot,
+    target: int,
+    *,
+    retained_paid: int = 0,
+    existing_paid: int = 1,
+) -> tuple[dict, capacity_planning.CapacityPlanCandidate]:
+    capacity = capacity_planning.AcceleratorCapacity.from_mapping
+    work = capacity_planning.AcceleratorWork.from_mapping
+    profiles = (() if target == 0 else (capacity_planning.CompatibilityDemand(
+        sequence=0,
+        priority=50,
+        compatible_accelerators=('l4',),
+        work=float(target)),))
+    planning_snapshot = capacity_planning.CapacityPlanningSnapshot(
+        source_generation=snapshot.demand_feed_generation,
+        service_version=1,
+        configured_accelerators=('l4',),
+        capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+        physical_gpu_width_by_accelerator=capacity({'l4': 1}),
+        capacity_per_accelerator=work({'l4': 1}),
+        floors=capacity({}),
+        minimum_capacity=0,
+        paid_minimum_capacity=0,
+        actuation_minimum_capacity=retained_paid,
+        maximum_capacity=10,
+        demand_profiles=profiles,
+        explicit_demand_profiles=profiles,
+        paid_demand_profiles=profiles,
+        fixed_work=work({}),
+        explicit_fixed_work=work({}),
+        paid_fixed_work=work({}),
+        retention_work=work({}),
+        ready_zero_cost=capacity({}),
+        ready=capacity({'l4': existing_paid}),
+        provisioning=capacity({}),
+        reservation=capacity_planning.ReservationPlanningInput(
+            gate_policy=(
+                capacity_planning.ReservationGatePolicy.NOT_CONFIGURED),
+            evidence_state=(
+                capacity_planning.ReservationEvidenceState.NOT_APPLICABLE),
+            authenticated_capacity=capacity({}),
+            eligible_capacity=capacity({}),
+            pending_zero_cost_capacity=capacity({}),
+            existing_zero_cost_capacity=capacity({}),
+            existing_paid_capacity=capacity({'l4': existing_paid}),
+            charged_paid_gpu_units=existing_paid,
+            evidence_fingerprint=''),
+        cold_accelerator_order=('l4',),
+        prospective_paid_accelerator_order=('l4',),
+        planning_purpose=(
+            capacity_planning.CapacityPlanningPurpose.FRESH_ZERO_RETENTION
+            if target == 0 else
+            capacity_planning.CapacityPlanningPurpose.ECONOMIC_ADMISSION),
+        actuation_supply_policy=(
+            capacity_planning.ActuationSupplyPolicy.REUSE_CURRENT_SUPPLY),
+        attribution_complete=True,
+        planning_time=1.0,
+        max_live_paid_gpu_units=None,
+        retirement_shelter_target=capacity({}),
+        source_fingerprint='f' * 64)
+    candidate = capacity_planning.plan_capacity(planning_snapshot)
+    return (capacity_planning.planner_envelope(planning_snapshot,
+                                               candidate), candidate)
+
+
 def _zero_plan_payload(
     snapshot: demand_state.DurableAutoscalingSnapshot,
     *,
     target: int = 0,
+    retained_paid: int = 0,
+    existing_paid: int = 1,
 ) -> dict:
-    existing_paid = {'l4': 1}
-    paid_residual = {'l4': target - 1} if target > 1 else {}
+    existing_paid_capacity = {'l4': existing_paid}
+    planner_payload, candidate = _planner_payload(snapshot,
+                                                  target,
+                                                  retained_paid=retained_paid,
+                                                  existing_paid=existing_paid)
     plan = capacity_admission.CapacityPlanInput(
         service_name='svc',
         service_hash='svc-hash',
@@ -55,10 +127,13 @@ def _zero_plan_payload(
         normalized_demand=snapshot.normalized_demand,
         capacity_target_by_accelerator={'l4': target},
         reserved_fill_authority=(
-            capacity_admission.ReservedFillPlanAuthority.not_applicable()))
-    return plan.payload(existing_zero_cost_capacity_by_accelerator={'l4': 0},
-                        existing_paid_capacity_by_accelerator=existing_paid,
-                        paid_residual_by_accelerator=paid_residual)
+            capacity_admission.ReservedFillPlanAuthority.not_applicable()),
+        paid_residual=candidate.paid_residual,
+        paid_launch_target=candidate.paid_launch_target,
+        planner_payload=planner_payload)
+    return plan.payload(
+        existing_zero_cost_capacity_by_accelerator={'l4': 0},
+        existing_paid_capacity_by_accelerator=(existing_paid_capacity))
 
 
 @pytest.fixture
@@ -372,11 +447,16 @@ def _refresh_duplicate_zero_plan_head(
     assert snapshot is not None and snapshot.fresh_aggregate_zero
     assert snapshot.demand_feed_generation > original_plan[
         'demand_feed_generation']
-    # demand_feed_generation and its receipt watermark deliberately live in
-    # the mutable plan head.  They do not change the semantic plan payload, so
-    # CapacityAdmissionRepository.publish() retains generation 1 here.
-    assert capacity_admission.capacity_plan_content_sha256(
-        _zero_plan_payload(snapshot)) == original_plan['content_sha256']
+    # Duplicate publication advances only the mutable demand binding.  The
+    # immutable planner candidate remains bound to the source generation at
+    # which it was committed; retirement revalidates the newer live zero
+    # observation before rebasing to that retained candidate.
+    planner_snapshot, candidate = capacity_planning.decode_planner_envelope(
+        original_plan['payload']['planner'])
+    assert planner_snapshot.source_generation == original_plan[
+        'demand_feed_generation']
+    assert candidate.kind is (
+        capacity_planning.CapacityPlanKind.FRESH_ZERO_RETENTION)
     with engine.begin() as connection:
         now = connection.execute(
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
@@ -427,6 +507,68 @@ def test_admission_atomically_revokes_route_and_persists_exact_intent(
     assert intent['state'] == paid_retirement.PaidRetirementState.ACTIVE.value
     assert lease['revocation_reason'] == 'replica_became_route_ineligible'
     assert replica == 'SHUTTING_DOWN'
+
+
+def test_admission_accepts_fresh_zero_retained_paid_actuation(
+        retirement_database):
+    engine, info, authority = retirement_database
+    retained = replica_managers.ReplicaInfo(replica_id=2,
+                                            cluster_name='svc-2',
+                                            replica_port='8000',
+                                            is_spot=True,
+                                            location=None,
+                                            version=1,
+                                            resources_override=None)
+    retained.status_property.sky_launch_status = (
+        common_utils.ProcessStatus.SUCCEEDED)
+    retained.status_property.service_ready_now = True
+    retained.status_property.first_ready_time = time.time()
+    snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
+    assert snapshot is not None and snapshot.fresh_aggregate_zero
+    payload = _zero_plan_payload(snapshot, retained_paid=1, existing_paid=2)
+    planner_snapshot, candidate = capacity_planning.decode_planner_envelope(
+        payload['planner'])
+    assert planner_snapshot.planning_purpose is (
+        capacity_planning.CapacityPlanningPurpose.FRESH_ZERO_RETENTION)
+    assert candidate.supply_aware_demand_target.total() == 0
+    assert candidate.retained_existing_target.as_dict() == {'l4': 1}
+    assert candidate.wave_limited_actuation_target.as_dict() == {'l4': 1}
+    assert candidate.paid_residual.total() == 0
+    assert candidate.paid_launch_target.total() == 0
+    digest = capacity_admission.capacity_plan_content_sha256(payload)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                **serve_state._replica_row_values('svc', 2, retained)))
+        connection.execute(
+            sqlalchemy.update(
+                capacity_admission_schema.serve_capacity_plans_table).where(
+                    capacity_admission_schema.serve_capacity_plans_table.c.
+                    service_name == 'svc',
+                    capacity_admission_schema.serve_capacity_plans_table.c.
+                    generation == 1).values(payload=payload,
+                                            content_sha256=digest))
+    authority = dataclasses.replace(authority, capacity_plan_sha256=digest)
+    _mark_retiring(info)
+
+    record = serve_state.admit_paid_retirement('svc',
+                                               1,
+                                               info,
+                                               authority,
+                                               requires_idle_proof=True,
+                                               expected_route_url=_ROUTE_URL,
+                                               expected_service_hash='svc-hash',
+                                               expected_controller_owner=_OWNER)
+
+    assert record is not None
+    assert record['state'] == paid_retirement.PaidRetirementState.ACTIVE.value
+    with engine.connect() as connection:
+        statuses = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table.c.replica_id,
+                serve_state_schema.replicas_table.c.status).order_by(
+                    serve_state_schema.replicas_table.c.replica_id)).all()
+    assert statuses == [(1, 'SHUTTING_DOWN'), (2, 'READY')]
 
 
 def test_admission_rejects_route_not_acknowledged_by_load_balancer(
@@ -646,6 +788,13 @@ def test_idle_commit_rebases_to_current_duplicate_plan_head(
 
 @pytest.mark.parametrize('mutation', [
     'positive_target',
+    'nonempty_paid_residual',
+    'nonempty_paid_launch_target',
+    'nonempty_planner_paid_residual',
+    'nonempty_planner_paid_launch_target',
+    'nonempty_paid_packing_padding',
+    'planner_wrong_kind',
+    'planner_wrong_source',
     'payload_digest_mismatch',
     'future_plan_demand_generation',
     'plan_route_mismatch',
@@ -675,7 +824,58 @@ def test_idle_commit_rejects_non_equivalent_or_stale_successor(
     with engine.begin() as connection:
         now = connection.execute(
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
-        if mutation == 'payload_digest_mismatch':
+        if mutation in ('nonempty_paid_residual', 'nonempty_paid_launch_target',
+                        'nonempty_planner_paid_residual',
+                        'nonempty_planner_paid_launch_target',
+                        'nonempty_paid_packing_padding', 'planner_wrong_kind',
+                        'planner_wrong_source'):
+            plans = capacity_admission_schema.serve_capacity_plans_table
+            payload = dict(
+                connection.execute(
+                    sqlalchemy.select(plans.c.payload).where(
+                        plans.c.service_name == 'svc',
+                        plans.c.generation == 2)).scalar_one())
+            if mutation == 'nonempty_paid_residual':
+                payload['paid_residual_by_accelerator'] = {'l4': 1}
+            elif mutation == 'nonempty_paid_launch_target':
+                payload['paid_launch_target_by_accelerator'] = {'l4': 1}
+            elif mutation in ('planner_wrong_kind', 'planner_wrong_source'):
+                planner_snapshot, _ = (
+                    capacity_planning.decode_planner_envelope(
+                        payload['planner']))
+                if mutation == 'planner_wrong_kind':
+                    planner_snapshot = dataclasses.replace(
+                        planner_snapshot,
+                        planning_purpose=(
+                            capacity_planning.CapacityPlanningPurpose.
+                            ECONOMIC_ADMISSION))
+                else:
+                    planner_snapshot = dataclasses.replace(
+                        planner_snapshot,
+                        source_generation=(planner_snapshot.source_generation +
+                                           1))
+                candidate = capacity_planning.plan_capacity(planner_snapshot)
+                payload['planner'] = capacity_planning.planner_envelope(
+                    planner_snapshot, candidate)
+            else:
+                planner = dict(payload['planner'])
+                candidate = dict(planner['candidate'])
+                field = {
+                    'nonempty_planner_paid_residual': 'paid_residual',
+                    'nonempty_planner_paid_launch_target': 'paid_launch_target',
+                    'nonempty_paid_packing_padding': 'paid_packing_padding_target',
+                }[mutation]
+                candidate[field] = {'entries': [['l4', 1]]}
+                planner['candidate'] = candidate
+                payload['planner'] = planner
+            connection.execute(
+                sqlalchemy.update(plans).where(
+                    plans.c.service_name == 'svc',
+                    plans.c.generation == 2).values(
+                        payload=payload,
+                        content_sha256=(capacity_admission.
+                                        capacity_plan_content_sha256(payload))))
+        elif mutation == 'payload_digest_mismatch':
             plans = capacity_admission_schema.serve_capacity_plans_table
             payload = dict(
                 connection.execute(
@@ -912,12 +1112,11 @@ def test_positive_demand_batch_cancellation_accepts_newer_positive_generation(
         retirement = dict(
             connection.execute(
                 sqlalchemy.select(
-                    paid_retirement.serve_paid_replica_retirements_table).
-                where(paid_retirement.serve_paid_replica_retirements_table.c.
-                      replica_id == 1)).mappings().one())
+                    paid_retirement.serve_paid_replica_retirements_table).where(
+                        paid_retirement.serve_paid_replica_retirements_table.c.
+                        replica_id == 1)).mappings().one())
         retirement.update(replica_id=2,
-                          replica_record_id=uuid.UUID(
-                              info2.replica_record_id))
+                          replica_record_id=uuid.UUID(info2.replica_record_id))
         connection.execute(
             sqlalchemy.insert(
                 paid_retirement.serve_paid_replica_retirements_table).values(
@@ -932,16 +1131,10 @@ def test_positive_demand_batch_cancellation_accepts_newer_positive_generation(
         datetime.timedelta(seconds=60))
     first_positive = demand_state.ingest_report(
         'svc', 'svc-hash',
-        _demand_report(time.time(),
-                       route_receipt,
-                       sequence=2,
-                       request_count=2))
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=2))
     latest_positive = demand_state.ingest_report(
         'svc', 'svc-hash',
-        _demand_report(time.time(),
-                       route_receipt,
-                       sequence=3,
-                       request_count=3))
+        _demand_report(time.time(), route_receipt, sequence=3, request_count=3))
     assert latest_positive.generation > first_positive.generation
 
     for candidate in (info, info2):
@@ -958,10 +1151,10 @@ def test_positive_demand_batch_cancellation_accepts_newer_positive_generation(
         states = connection.execute(
             sqlalchemy.select(
                 paid_retirement.serve_paid_replica_retirements_table.c.
-                replica_id, paid_retirement.
-                serve_paid_replica_retirements_table.c.state).order_by(
-                    paid_retirement.serve_paid_replica_retirements_table.c.
-                    replica_id)).all()
+                replica_id,
+                paid_retirement.serve_paid_replica_retirements_table.c.state).
+            order_by(paid_retirement.serve_paid_replica_retirements_table.c.
+                     replica_id)).all()
     assert states == [
         (1, paid_retirement.PaidRetirementState.CANCELLED.value),
         (2, paid_retirement.PaidRetirementState.CANCELLED.value),
