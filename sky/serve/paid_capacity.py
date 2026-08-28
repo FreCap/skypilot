@@ -30,6 +30,7 @@ from sky.serve import spot_placer
 from sky.utils import common_utils
 
 if typing.TYPE_CHECKING:
+    from sky.serve import capacity_admission
     from sky.serve import replica_managers
 
 logger = sky_logging.init_logger(__name__)
@@ -69,6 +70,7 @@ _ADMISSION_SUMMARY_LOG_INTERVAL_SECONDS = 5 * 60
 _LEGACY_POOL_KEY_VERSION = 1
 _POOL_KEY_VERSION = 2
 _AWS_ACCOUNT_ID_RE = re.compile(r'[0-9]{12}')
+_SHA256_RE = re.compile(r'[0-9a-f]{64}')
 _UNRESOLVED_STATUS_VALUES = frozenset({'PENDING', 'PROVISIONING'})
 _admission_summary_log_lock = threading.Lock()
 _admission_summary_log_signature: tuple[Any, ...] | None = None
@@ -185,6 +187,7 @@ class LaunchBudget:
     max_live_paid_gpu_units: int | None = None
     live_paid_gpu_units: int | None = None
     paid_gpu_units_remaining: int | None = None
+    plan_bound_cohort: 'PlanBoundAdmissionCohort | None' = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -215,6 +218,74 @@ class ServiceLimitProfile:
     service_hash: str
     max_launch_window: int
     max_exploration_frontier: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class PlanBoundAdmissionTarget:
+    """One exact-card projection of uncommitted capacity-plan authority."""
+
+    frontier_key: FrontierKey
+    remaining_plan_units: int
+    physical_backend_width: int
+    claim_units_per_backend: int
+    backend_claim_count: int
+    frontier_limit: int
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.frontier_key, tuple) or not self.frontier_key or
+                not all(
+                    isinstance(card, str) and card
+                    for card in self.frontier_key) or
+                type(self.remaining_plan_units) is not int or
+                self.remaining_plan_units <= 0 or
+                type(self.physical_backend_width) is not int or
+                self.physical_backend_width <= 0 or
+                type(self.claim_units_per_backend) is not int or
+                self.claim_units_per_backend <= 0 or
+                type(self.backend_claim_count) is not int or
+                self.backend_claim_count <= 0 or
+                type(self.frontier_limit) is not int or
+                self.frontier_limit <= 0 or self.backend_claim_count *
+                self.claim_units_per_backend != self.remaining_plan_units):
+            raise ValueError('Plan-bound paid target is malformed.')
+
+
+@dataclasses.dataclass(frozen=True)
+class PlanBoundAdmissionCohort:
+    """Deterministic Phase-A cohort derived from one immutable paid plan.
+
+    The capacity plan remains the sole aggregate purchase authority. Exact
+    pool limits are independent failure-containment bounds, so the cohort
+    opens only the minimum cost-ordered pool frontier needed to hold the
+    plan-authorized whole backends under those existing bounds.
+    """
+
+    capacity_plan_generation: int
+    capacity_plan_sha256: str
+    targets: tuple[PlanBoundAdmissionTarget, ...]
+
+    def __post_init__(self) -> None:
+        if (type(self.capacity_plan_generation) is not int or
+                self.capacity_plan_generation <= 0 or
+                not isinstance(self.capacity_plan_sha256, str) or
+                _SHA256_RE.fullmatch(self.capacity_plan_sha256) is None or
+                any(not isinstance(target, PlanBoundAdmissionTarget)
+                    for target in self.targets)):
+            raise ValueError('Plan-bound paid cohort identity is malformed.')
+        keys = tuple(target.frontier_key for target in self.targets)
+        if len(set(keys)) != len(keys) or keys != tuple(sorted(keys)):
+            raise ValueError(
+                'Plan-bound paid cohort targets are not canonical.')
+
+    @property
+    def backend_claim_count(self) -> int:
+        return sum(target.backend_claim_count for target in self.targets)
+
+    def frontier_limits(self) -> dict[FrontierKey, int]:
+        return {
+            target.frontier_key: target.frontier_limit
+            for target in self.targets
+        }
 
 
 @functools.cache
@@ -935,6 +1006,162 @@ def _evidence_aware_service_limit(
     return min(ceiling, max(floor, productive_limit))
 
 
+def _plan_bound_admission_cohort(
+    *,
+    authority: 'capacity_admission.PaidLaunchAuthority',
+    service_name: str | None,
+    service_hash: str | None,
+    paid_locations: Sequence[spot_placer.Location],
+    remaining_by_location: Mapping[spot_placer.Location, int],
+    pool_key_by_location: Mapping[spot_placer.Location, str],
+    frontier_key_by_location: Mapping[spot_placer.Location, FrontierKey],
+    owned_pool_keys_by_frontier: Mapping[FrontierKey, set[str]],
+    unknown_owned_pool_keys: set[str],
+    requested_frontier_keys: set[FrontierKey] | None,
+    claimed_plan_units_by_accelerator: Mapping[str, int],
+) -> PlanBoundAdmissionCohort:
+    """Project one plan target onto the smallest safe provider frontier.
+
+    Pool limits remain failure-containment bounds.  They must not be summed
+    into a second service-wide demand authority: a large immutable plan may
+    instead use more exact pools in the placer's canonical price order.
+    """
+    if (authority.service_name != service_name or
+            authority.service_hash != service_hash):
+        raise ValueError(
+            'Paid plan authority does not match the service incarnation.')
+    raw_targets = authority.remaining_launch_capacity()
+    canonical_claimed: dict[str, int] = {}
+    for raw_card, raw_units in claimed_plan_units_by_accelerator.items():
+        if (not isinstance(raw_card, str) or not raw_card or
+                type(raw_units) is not int or raw_units < 0):
+            raise ValueError(
+                'Paid plan committed-debit projection is malformed.')
+        card = raw_card.casefold()
+        canonical_claimed[card] = canonical_claimed.get(card, 0) + raw_units
+    targets_by_frontier: dict[FrontierKey, int] = {}
+    for raw_card, raw_units in raw_targets.items():
+        if (not isinstance(raw_card, str) or not raw_card or raw_card == '*' or
+                type(raw_units) is not int or raw_units < 0):
+            raise ValueError('Paid plan launch target is malformed.')
+        card = raw_card.casefold()
+        claimed_units = canonical_claimed.pop(card, 0)
+        remaining_units = raw_units - claimed_units
+        if remaining_units < 0:
+            raise ValueError('Paid plan committed debits exceed its target.')
+        if remaining_units == 0:
+            continue
+        target_frontier: FrontierKey = (card,)
+        if target_frontier in targets_by_frontier:
+            raise ValueError('Paid plan launch target repeats a card.')
+        if (requested_frontier_keys is not None and
+                target_frontier not in requested_frontier_keys):
+            continue
+        targets_by_frontier[target_frontier] = remaining_units
+    if any(units > 0 for units in canonical_claimed.values()):
+        raise ValueError('Paid plan has debits outside its target cards.')
+
+    if unknown_owned_pool_keys and targets_by_frontier:
+        # An opaque unresolved claim cannot be assigned to one card frontier.
+        # It remains charged by the hard service GPU cap, but no new provider
+        # exposure is safe until its exact pool identity is recovered.
+        raise ValueError(
+            'Plan-bound paid cohort has an opaque owned provider pool.')
+
+    distinct_locations_by_frontier: dict[
+        FrontierKey, list[spot_placer.Location]] = collections.defaultdict(list)
+    seen_pool_keys_by_frontier: dict[FrontierKey,
+                                     set[str]] = collections.defaultdict(set)
+    for location in paid_locations:
+        if location.use_spot is not True:
+            continue
+        location_frontier = frontier_key_by_location.get(
+            location, frontier_key(location))
+        if location_frontier not in targets_by_frontier:
+            continue
+        try:
+            physical_width, _ = authority.backend_claim_shape(
+                location_frontier[0])
+        except Exception:  # pylint: disable=broad-except
+            continue
+        if _location_gpu_units(location) != physical_width:
+            continue
+        pool = pool_key_by_location.get(location)
+        if (pool is None or
+                pool in seen_pool_keys_by_frontier[location_frontier]):
+            continue
+        seen_pool_keys_by_frontier[location_frontier].add(pool)
+        distinct_locations_by_frontier[location_frontier].append(location)
+
+    targets: list[PlanBoundAdmissionTarget] = []
+    default_frontier = exploration_frontier()
+    for target_frontier, target_units in sorted(targets_by_frontier.items()):
+        locations = distinct_locations_by_frontier.get(target_frontier, [])
+        try:
+            physical_width, claim_units = authority.backend_claim_shape(
+                target_frontier[0])
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning('Deferring malformed plan-bound paid card %s: %s',
+                           target_frontier[0],
+                           common_utils.format_exception(error))
+            continue
+        if not locations:
+            logger.info(
+                'Deferring plan-bound paid card %s: no Spot candidate '
+                'has physical backend width %d.', target_frontier[0],
+                physical_width)
+            continue
+        if target_units % claim_units != 0:
+            logger.warning(
+                'Deferring malformed plan-bound paid card %s: '
+                'target %d is not quantized to claim width %d.',
+                target_frontier[0], target_units, claim_units)
+            continue
+        target_claims = target_units // claim_units
+        if target_claims <= 0:
+            continue
+
+        owned = set(owned_pool_keys_by_frontier.get(target_frontier, set()))
+        remaining_claims = target_claims
+        # Existing owned pools consume frontier exposure whether or not they
+        # have current headroom.  Reuse their exact-pool headroom first, then
+        # add only the cheapest unowned pools required for the residual.
+        for location in locations:
+            pool = pool_key_by_location[location]
+            if pool not in owned:
+                continue
+            remaining_claims = max(
+                0, remaining_claims -
+                max(0, int(remaining_by_location.get(location, 0))))
+        new_pool_count = 0
+        for location in locations:
+            if remaining_claims <= 0:
+                break
+            pool = pool_key_by_location[location]
+            if pool in owned:
+                continue
+            remaining = max(0, int(remaining_by_location.get(location, 0)))
+            if remaining <= 0:
+                continue
+            new_pool_count += 1
+            remaining_claims = max(0, remaining_claims - remaining)
+
+        targets.append(
+            PlanBoundAdmissionTarget(frontier_key=target_frontier,
+                                     remaining_plan_units=target_units,
+                                     physical_backend_width=physical_width,
+                                     claim_units_per_backend=claim_units,
+                                     backend_claim_count=target_claims,
+                                     frontier_limit=max(
+                                         default_frontier,
+                                         len(owned) + new_pool_count)))
+
+    return PlanBoundAdmissionCohort(
+        capacity_plan_generation=authority.generation,
+        capacity_plan_sha256=authority.content_sha256,
+        targets=tuple(targets))
+
+
 def build_launch_budget(
     placer: spot_placer.SpotPlacer,
     *,
@@ -946,6 +1173,8 @@ def build_launch_budget(
     requested_frontier_keys: set[FrontierKey] | None = None,
     max_live_paid_gpu_units: int | None = None,
     allow_provider_identity_lookup: bool = True,
+    paid_launch_authority:
+    'capacity_admission.PaidLaunchAuthority | None' = None,
 ) -> LaunchBudget:
     """Read one advisory shared-capacity snapshot for all active paid pools."""
     if (max_live_paid_gpu_units is not None and
@@ -958,8 +1187,46 @@ def build_launch_budget(
         location for location in placer.ranked_active_locations()
         if location not in zero_cost
     ]
+    if paid_launch_authority is not None:
+        # Planner purchase authority is prospective Spot-only. On-demand
+        # locations must not affect either cohort sizing or later selection.
+        paid_locations = [
+            location for location in paid_locations if location.use_spot is True
+        ]
     live_paid_gpu_units = _live_paid_gpu_units(existing_replica_infos)
-    if not globally_managed or not central_authority_available():
+    central_available = globally_managed and central_authority_available()
+    if paid_launch_authority is not None:
+        identity_matches = (
+            isinstance(service_name, str) and bool(service_name) and
+            isinstance(service_hash, str) and bool(service_hash) and
+            paid_launch_authority.service_name == service_name and
+            paid_launch_authority.service_hash == service_hash)
+        if not central_available or not identity_matches:
+            # A committed planner target can only be spent through the shared
+            # PostgreSQL Phase-A transaction for its exact service
+            # incarnation.  It must never degrade to the process-local legacy
+            # window when central authority or identity evidence is absent.
+            logger.warning('Disabling planner-bound paid capacity: exact '
+                           'PostgreSQL service authority is unavailable.')
+            keys = {
+                location: _legacy_pool_key(
+                    location, workspace=workspace,
+                    num_nodes=placer.num_nodes) for location in paid_locations
+            }
+            return LaunchBudget(
+                remaining_by_location={
+                    location: 0 for location in paid_locations
+                },
+                pool_key_by_location=keys,
+                states_by_pool_key={},
+                globally_managed=central_available,
+                service_remaining=0,
+                service_claim_limit=0,
+                max_live_paid_gpu_units=max_live_paid_gpu_units,
+                live_paid_gpu_units=live_paid_gpu_units,
+                paid_gpu_units_remaining=(0 if max_live_paid_gpu_units
+                                          is not None else None))
+    if not central_available:
         # Preserve the pre-account-scope local policy exactly.  It neither has
         # PostgreSQL authority to freeze an account nor needs provider identity
         # to enforce its process-local unresolved-launch window.
@@ -1085,20 +1352,68 @@ def build_launch_budget(
         workspace=workspace,
         service_name=service_name,
         service_hash=service_hash)
-    service_claim_limit = _evidence_aware_service_limit(
-        paid_locations=paid_locations,
-        states_by_pool_key=states,
-        pool_key_by_location=keys,
-        frontier_key_by_location=frontier_keys,
-        owned_pool_keys_by_frontier=owned_by_frontier,
-        unknown_owned_pool_keys=unknown_owned_pool_keys,
-        requested_frontier_keys=requested_frontier_keys,
-        floor=service_limit(),
-        ceiling=max_service_limit(workspace=workspace,
-                                  service_name=service_name,
-                                  service_hash=service_hash),
-        frontier_ceiling=configured_max_frontier)
-    service_remaining = max(0, service_claim_limit - service_claims)
+    cohort = None
+    frontier_limit_overrides: dict[FrontierKey, int] = {}
+    if paid_launch_authority is None:
+        service_claim_limit = _evidence_aware_service_limit(
+            paid_locations=paid_locations,
+            states_by_pool_key=states,
+            pool_key_by_location=keys,
+            frontier_key_by_location=frontier_keys,
+            owned_pool_keys_by_frontier=owned_by_frontier,
+            unknown_owned_pool_keys=unknown_owned_pool_keys,
+            requested_frontier_keys=requested_frontier_keys,
+            floor=service_limit(),
+            ceiling=max_service_limit(workspace=workspace,
+                                      service_name=service_name,
+                                      service_hash=service_hash),
+            frontier_ceiling=configured_max_frontier)
+        service_remaining = max(0, service_claim_limit - service_claims)
+    else:
+        try:
+            claimed_units = serve_state.get_paid_capacity_plan_claimed_units(
+                paid_launch_authority.service_name,
+                paid_launch_authority.service_hash,
+                paid_launch_authority.generation,
+                paid_launch_authority.content_sha256)
+            cohort = _plan_bound_admission_cohort(
+                authority=paid_launch_authority,
+                service_name=service_name,
+                service_hash=service_hash,
+                paid_locations=paid_locations,
+                remaining_by_location=remaining,
+                pool_key_by_location=keys,
+                frontier_key_by_location=frontier_keys,
+                owned_pool_keys_by_frontier=owned_by_frontier,
+                unknown_owned_pool_keys=unknown_owned_pool_keys,
+                requested_frontier_keys=requested_frontier_keys,
+                claimed_plan_units_by_accelerator=claimed_units)
+        except Exception as error:  # pylint: disable=broad-except
+            # The immutable plan, exact physical width, and durable debit
+            # ledger must agree before even preparing provider candidates.
+            logger.warning('Disabling planner-bound paid cohort: %s',
+                           common_utils.format_exception(error))
+            remaining = {location: 0 for location in remaining}
+            service_claim_limit = max(1, service_claims)
+            service_remaining = 0
+        else:
+            service_remaining = cohort.backend_claim_count
+            service_claim_limit = max(1, service_claims + service_remaining)
+            frontier_limit_overrides = cohort.frontier_limits()
+            target_width_by_frontier = {
+                target.frontier_key: target.physical_backend_width
+                for target in cohort.targets
+            }
+            remaining = {
+                location: (
+                    location_remaining
+                    if target_width_by_frontier.get(frontier_keys[location])
+                    == _location_gpu_units(location) else 0
+                ) for location, location_remaining in remaining.items()
+            }
+            if frontier_limit_overrides:
+                configured_max_frontier = max(
+                    configured_frontier, *frontier_limit_overrides.values())
     paid_gpu_units_remaining = (None
                                 if max_live_paid_gpu_units is None else max(
                                     0, max_live_paid_gpu_units -
@@ -1125,9 +1440,11 @@ def build_launch_budget(
         oldest_unknown_claimed_at=oldest_unknown_claimed_at,
         newest_claimed_at_by_pool_key=newest_by_pool_key,
         unknown_claim_age_pool_keys=unknown_claim_age_pool_keys,
+        frontier_limit_overrides=frontier_limit_overrides,
         max_live_paid_gpu_units=max_live_paid_gpu_units,
         live_paid_gpu_units=live_paid_gpu_units,
-        paid_gpu_units_remaining=paid_gpu_units_remaining)
+        paid_gpu_units_remaining=paid_gpu_units_remaining,
+        plan_bound_cohort=cohort)
 
 
 def _owned_pool_keys(budget: LaunchBudget, key: FrontierKey) -> set[str]:
@@ -1512,9 +1829,11 @@ def try_persist_claim_batch(
         raise ValueError('Paid claim batch record identities must be unique.')
 
     if not budget.globally_managed or service_hash is None:
+        has_capacity_plan_claim = any(candidate.capacity_plan_claim is not None
+                                      for candidate in candidates)
         result = (ClaimResult.SERVICE_SATURATED
-                  if budget.max_live_paid_gpu_units is not None else
-                  ClaimResult.LEGACY_LOCAL)
+                  if budget.max_live_paid_gpu_units is not None or
+                  has_capacity_plan_claim else ClaimResult.LEGACY_LOCAL)
         return PaidClaimBatchResult(
             tuple(
                 PaidClaimBatchMemberResult(replica_id, replica_record_id,

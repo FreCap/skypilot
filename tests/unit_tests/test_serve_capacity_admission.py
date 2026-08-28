@@ -824,6 +824,9 @@ def test_persisted_plan_is_redecoded_before_authority_is_returned():
     assert authority.generation == 4
     assert authority.economic_residual() == {'l4': 2}
     assert authority.remaining_launch_capacity() == {'l4': 2}
+    assert authority.capacity_unit is candidate.capacity_unit
+    assert dict(authority.physical_gpu_width_by_accelerator) == (
+        candidate.physical_gpu_width_by_accelerator.as_dict())
     corrupt = copy.deepcopy(row)
     corrupt['payload']['planner']['candidate']['source_generation'] = 10
     corrupt['content_sha256'] = (
@@ -848,6 +851,8 @@ def test_paid_launch_authority_debits_exact_or_aggregate_units():
         demand_source_epoch=2,
         paid_residual_by_accelerator=(('l4', 4),),
         paid_launch_target_by_accelerator=(('l4', 4),),
+        capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+        physical_gpu_width_by_accelerator=(('l4', 4),),
         reserved_fill_authority=(
             capacity_admission.ReservedFillPlanAuthority.not_applicable()))
     claim = exact.claim_values('L4', units=4)
@@ -865,6 +870,8 @@ def test_paid_launch_authority_debits_exact_or_aggregate_units():
         demand_source_epoch=2,
         paid_residual_by_accelerator=(('*', 2),),
         paid_launch_target_by_accelerator=(('*', 2),),
+        capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND,
+        physical_gpu_width_by_accelerator=(('*', 1),),
         reserved_fill_authority=(
             capacity_admission.ReservedFillPlanAuthority.not_applicable()))
     assert aggregate.claim_values('A100',

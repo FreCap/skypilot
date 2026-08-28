@@ -7724,7 +7724,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 None if allowed_locations is None else {
                                     paid_capacity.frontier_key(candidate)
                                     for candidate in allowed_locations
-                                })))
+                                }),
+                            paid_launch_authority=paid_launch_authority))
                 assert paid_location_launch_budget is not None
                 if self._demand_should_skip_zero_cost(existing_replica_infos):
                     # The broker grant or speculative-probe budget says this
@@ -10562,7 +10563,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 max_live_paid_gpu_units=(
                     self._max_live_paid_gpu_units_for_version(batch_version)),
                 requested_frontier_keys=self._requested_paid_frontier_keys(
-                    resources_overrides)))
+                    resources_overrides),
+                paid_launch_authority=paid_launch_authority))
         deferred_paid_overrides: list[dict[str, Any] | None] = []
         accepted: list[_ReplicaLaunchResult] = []
         prepared_paid_launches: list[_PreparedPaidLaunch] = []
@@ -10974,7 +10976,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     self._max_live_paid_gpu_units_for_version(version)),
                 requested_frontier_keys=(None if not card_targets else {
                     (str(card).casefold(),) for card in paid_cards
-                }))
+                }),
+                paid_launch_authority=paid_launch_authority)
         deferred_cards: set[str] = set()
         launched_capacity = 0
         accepted: list[_ReplicaLaunchResult] = []

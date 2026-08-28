@@ -7,6 +7,8 @@ import pytest
 from spot_placer_test_utils import make_location
 from spot_placer_test_utils import make_placer
 
+from sky.serve import capacity_admission
+from sky.serve import capacity_planning
 from sky.serve import constants
 from sky.serve import paid_capacity
 from sky.serve import replica_managers
@@ -57,6 +59,33 @@ def _pending_info(replica_id, location):
                                         location=location,
                                         version=1,
                                         resources_override=location.to_dict())
+
+
+def _paid_launch_authority(
+    targets: dict[str, int],
+    *,
+    widths: dict[str, int] | None = None,
+    capacity_unit: capacity_planning.CapacityUnit = (
+        capacity_planning.CapacityUnit.LOGICAL_GPU),
+) -> capacity_admission.PaidLaunchAuthority:
+    canonical = tuple(
+        sorted((card.casefold(), units) for card, units in targets.items()))
+    if widths is None:
+        widths = {card: 1 for card in targets}
+    return capacity_admission.PaidLaunchAuthority(
+        service_name='svc',
+        service_hash='hash',
+        generation=8,
+        content_sha256='a' * 64,
+        demand_feed_generation=9,
+        demand_source_epoch=3,
+        paid_residual_by_accelerator=canonical,
+        paid_launch_target_by_accelerator=canonical,
+        reserved_fill_authority=(
+            capacity_admission.ReservedFillPlanAuthority.not_applicable()),
+        capacity_unit=capacity_unit,
+        physical_gpu_width_by_accelerator=tuple(
+            sorted((card.casefold(), width) for card, width in widths.items())))
 
 
 def _exploration_budget(locations,
@@ -618,6 +647,401 @@ def test_global_snapshot_uses_shared_headroom_by_exact_pool():
     assert budget.frontier_feedback_delay_seconds == 30
     assert zero not in budget.pool_key_by_location
     get_states.assert_called_once()
+
+
+def _plan_bound_budget(
+        placer,
+        states,
+        *,
+        target,
+        widths,
+        capacity_unit=(capacity_planning.CapacityUnit.LOGICAL_GPU),
+        claimed=None,
+        infos=None):
+    authority = _paid_launch_authority(target,
+                                       widths=widths,
+                                       capacity_unit=capacity_unit)
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=True), mock.patch.object(
+                               paid_capacity.serve_state,
+                               'get_paid_capacity_pool_states',
+                               return_value=states), mock.patch.object(
+                                   paid_capacity.serve_state,
+                                   'get_paid_capacity_plan_claimed_units',
+                                   return_value=claimed or {}):
+        return paid_capacity.build_launch_budget(
+            placer,
+            workspace='w',
+            service_name='svc',
+            service_hash='hash',
+            existing_replica_infos=[] if infos is None else infos,
+            globally_managed=True,
+            requested_frontier_keys={(card.casefold(),) for card in target},
+            paid_launch_authority=authority)
+
+
+def test_plan_target_opens_minimum_cold_frontier_in_first_wave():
+    locations = [
+        make_location(f'us-central-{index}', {'L4': 1}, cloud_name='GCP')
+        for index in range(30)
+    ]
+    placer = make_placer({
+        location: float(index + 1) for index, location in enumerate(locations)
+    })
+    keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in locations
+    }
+    states = {
+        key: {
+            'remaining': 4,
+            'admission_state': 'active',
+            'admission_limit': 4,
+            'last_success_at': None,
+        } for key in keys.values()
+    }
+
+    budget = _plan_bound_budget(placer,
+                                states,
+                                target={'l4': 100},
+                                widths={'l4': 1})
+
+    assert budget.service_remaining == 100
+    assert budget.service_claim_limit == 100
+    assert budget.plan_bound_cohort is not None
+    assert budget.plan_bound_cohort.backend_claim_count == 100
+    assert budget.frontier_limit_overrides == {('l4',): 25}
+    assert paid_capacity._frontier_limits_by_key(budget)[('l4',)] == 25
+
+    selected = []
+    for _ in range(100):
+        location = paid_capacity.select_location(
+            placer,
+            budget,
+            skip_zero_cost_preference=True,
+            allowed_locations=set(locations))
+        assert location is not None
+        selected.append(location)
+        paid_capacity.debit(budget, location)
+    assert paid_capacity.select_location(
+        placer,
+        budget,
+        skip_zero_cost_preference=True,
+        allowed_locations=set(locations)) is None
+    assert set(selected) == set(locations[:25])
+    assert all(selected.count(location) == 4 for location in locations[:25])
+    assert not set(selected).intersection(locations[25:])
+
+    # The generated service and frontier cohort is passed unchanged into the
+    # real Phase-A adapter; it is not recomputed from the legacy cold window.
+    authority = _paid_launch_authority({'l4': 100}, widths={'l4': 1})
+    infos = [
+        _pending_info(replica_id, location)
+        for replica_id, location in enumerate(selected, start=1)
+    ]
+    candidates = tuple(
+        paid_capacity.PaidClaimCandidate(
+            replica_id=info.replica_id,
+            replica_info=info,
+            location=location,
+            priority=20,
+            capacity_plan_claim=authority.claim_values('l4'))
+        for info, location in zip(infos, selected, strict=True))
+    with mock.patch.object(paid_capacity.serve_state,
+                           'try_add_replicas_with_paid_capacity_claims',
+                           return_value=['acquired'] * 100) as persist:
+        persisted = paid_capacity.try_persist_claim_batch(
+            service_name='svc',
+            service_hash='hash',
+            controller_owner=(1, '10.0.0.1'),
+            candidates=candidates,
+            budget=budget)
+
+    assert len(persisted.committed_members) == 100
+    assert persist.call_args.kwargs['service_limit'] == 100
+    assert persist.call_args.kwargs['frontier_limits_by_key'] == {('l4',): 25}
+    assert len(persist.call_args.args[2]) == 100
+
+
+def test_plan_cohort_converts_gpu_units_to_exact_backend_claims():
+    locations = [
+        make_location(f'us-central-{index}', {'L4': 4}, cloud_name='GCP')
+        for index in range(8)
+    ]
+    # A cheaper shape for the same card is deliberately present. The manager
+    # and Phase A require the planner's exact four-GPU backend width.
+    wrong_width = make_location('us-cheap', {'L4': 1}, cloud_name='GCP')
+    placer = make_placer({
+        wrong_width: 0.5,
+        **{
+            location: float(index + 1) for index, location in enumerate(locations)
+        },
+    })
+    all_locations = [wrong_width, *locations]
+    keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in all_locations
+    }
+    states = {
+        key: {
+            'remaining': 4,
+            'admission_state': 'active',
+            'admission_limit': 4,
+            'last_success_at': None,
+        } for key in keys.values()
+    }
+
+    budget = _plan_bound_budget(placer,
+                                states,
+                                target={'l4': 100},
+                                widths={'l4': 4})
+
+    assert budget.plan_bound_cohort is not None
+    assert budget.plan_bound_cohort.targets == (
+        paid_capacity.PlanBoundAdmissionTarget(frontier_key=('l4',),
+                                               remaining_plan_units=100,
+                                               physical_backend_width=4,
+                                               claim_units_per_backend=4,
+                                               backend_claim_count=25,
+                                               frontier_limit=7),)
+    assert budget.service_remaining == 25
+    assert budget.frontier_limit_overrides == {('l4',): 7}
+    assert budget.remaining_by_location[wrong_width] == 0
+
+
+def test_physical_backend_plan_debits_one_unit_on_eight_gpu_locations():
+    locations = [
+        make_location(f'a100-pool-{index}', {'A100': 8}, cloud_name='GCP')
+        for index in range(30)
+    ]
+    placer = make_placer({
+        location: float(index + 1) for index, location in enumerate(locations)
+    })
+    keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in locations
+    }
+    states = {
+        key: {
+            'remaining': 4,
+            'admission_state': 'active',
+            'admission_limit': 4,
+            'last_success_at': None,
+        } for key in keys.values()
+    }
+
+    budget = _plan_bound_budget(
+        placer,
+        states,
+        target={'a100': 100},
+        widths={'a100': 8},
+        capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND)
+
+    assert budget.plan_bound_cohort is not None
+    assert budget.plan_bound_cohort.targets == (
+        paid_capacity.PlanBoundAdmissionTarget(frontier_key=('a100',),
+                                               remaining_plan_units=100,
+                                               physical_backend_width=8,
+                                               claim_units_per_backend=1,
+                                               backend_claim_count=100,
+                                               frontier_limit=25),)
+    assert budget.service_remaining == 100
+    assert budget.frontier_limit_overrides == {('a100',): 25}
+
+
+def test_plan_cohort_subtracts_same_generation_debits_before_preparation():
+    locations = [
+        make_location(f'us-central-{index}', {'L4': 4}, cloud_name='GCP')
+        for index in range(8)
+    ]
+    placer = make_placer({
+        location: float(index + 1) for index, location in enumerate(locations)
+    })
+    keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in locations
+    }
+    states = {
+        key: {
+            'remaining': 4,
+            'admission_state': 'active',
+            'admission_limit': 4,
+            'last_success_at': None,
+        } for key in keys.values()
+    }
+    infos = [_pending_info(replica_id, locations[0]) for replica_id in range(5)]
+    for info in infos:
+        info.paid_capacity_pool_key = keys[locations[0]]
+
+    budget = _plan_bound_budget(placer,
+                                states,
+                                target={'l4': 100},
+                                widths={'l4': 4},
+                                claimed={'l4': 20},
+                                infos=infos)
+
+    assert budget.plan_bound_cohort is not None
+    assert budget.plan_bound_cohort.targets[0].remaining_plan_units == 80
+    assert budget.plan_bound_cohort.backend_claim_count == 20
+    assert budget.service_remaining == 20
+    assert budget.service_claim_limit == 25
+
+
+def test_plan_cohort_skips_closed_cheapest_and_on_demand_pool():
+    on_demand = make_location('on-demand', {'L4': 1},
+                              use_spot=False,
+                              cloud_name='GCP')
+    spots = [
+        make_location(f'spot-{index}', {'L4': 1}, cloud_name='GCP')
+        for index in range(4)
+    ]
+    placer = make_placer({
+        on_demand: 0.1,
+        **{
+            location: float(index + 1) for index, location in enumerate(spots)
+        }
+    })
+    keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in spots
+    }
+    remaining = [0, 4, 4, 4]
+    states = {
+        keys[location]: {
+            'remaining': pool_remaining,
+            'admission_state': 'cooldown' if index == 0 else 'active',
+            'admission_limit': pool_remaining,
+            'last_success_at': None,
+        } for index, (location,
+                     pool_remaining) in enumerate(zip(spots, remaining))
+    }
+
+    budget = _plan_bound_budget(placer,
+                                states,
+                                target={'l4': 9},
+                                widths={'l4': 1})
+
+    assert on_demand not in budget.remaining_by_location
+    assert budget.frontier_limit_overrides == {('l4',): 3}
+    selected = []
+    for _ in range(9):
+        location = paid_capacity.select_location(placer,
+                                                 budget,
+                                                 skip_zero_cost_preference=True,
+                                                 allowed_locations=set(spots))
+        assert location is not None
+        selected.append(location)
+        paid_capacity.debit(budget, location)
+    assert [selected.count(location) for location in spots] == [0, 4, 4, 1]
+
+
+def test_unavailable_plan_card_does_not_block_independent_valid_card():
+    l4_locations = [
+        make_location(f'l4-{index}', {'L4': 1}, cloud_name='GCP')
+        for index in range(2)
+    ]
+    wrong_a100_width = make_location('a100-wrong-width', {'A100': 1},
+                                     cloud_name='GCP')
+    on_demand_a100 = make_location('a100-on-demand', {'A100': 8},
+                                   use_spot=False,
+                                   cloud_name='GCP')
+    paid_locations = [*l4_locations, wrong_a100_width]
+    placer = make_placer({
+        on_demand_a100: 0.1,
+        wrong_a100_width: 0.2,
+        l4_locations[0]: 1.0,
+        l4_locations[1]: 2.0,
+    })
+    keys = {
+        location: paid_capacity.pool_key(location, workspace='w', num_nodes=1)
+        for location in paid_locations
+    }
+    states = {
+        key: {
+            'remaining': 4,
+            'admission_state': 'active',
+            'admission_limit': 4,
+            'last_success_at': None,
+        } for key in keys.values()
+    }
+
+    budget = _plan_bound_budget(placer,
+                                states,
+                                target={
+                                    'a100': 8,
+                                    'l4': 8,
+                                },
+                                widths={
+                                    'a100': 8,
+                                    'l4': 1,
+                                })
+
+    assert budget.plan_bound_cohort is not None
+    assert [target.frontier_key for target in budget.plan_bound_cohort.targets
+           ] == [('l4',)]
+    assert budget.service_remaining == 8
+    assert budget.frontier_limit_overrides == {('l4',): 2}
+    assert budget.remaining_by_location[wrong_a100_width] == 0
+    assert on_demand_a100 not in budget.remaining_by_location
+    selected = []
+    for _ in range(8):
+        location = paid_capacity.select_location(
+            placer,
+            budget,
+            skip_zero_cost_preference=True,
+            allowed_locations=set(paid_locations))
+        assert location in l4_locations
+        selected.append(location)
+        paid_capacity.debit(budget, location)
+    assert {
+        location: selected.count(location) for location in l4_locations
+    } == {
+        l4_locations[0]: 4,
+        l4_locations[1]: 4,
+    }
+
+
+@pytest.mark.parametrize(('globally_managed', 'central_available'),
+                         [(False, True), (True, False)])
+def test_plan_authority_never_falls_back_to_legacy_local_admission(
+        globally_managed, central_available):
+    location = make_location('us-central1', {'L4': 1}, cloud_name='GCP')
+    placer = make_placer({location: 1.0})
+    authority = _paid_launch_authority({'l4': 4}, widths={'l4': 1})
+
+    with mock.patch.object(paid_capacity,
+                           'central_authority_available',
+                           return_value=central_available):
+        budget = paid_capacity.build_launch_budget(
+            placer,
+            workspace='w',
+            service_name='svc',
+            service_hash='hash',
+            existing_replica_infos=[],
+            globally_managed=globally_managed,
+            paid_launch_authority=authority)
+
+    assert budget.remaining_by_location == {location: 0}
+    assert budget.service_remaining == 0
+    assert paid_capacity.select_location(placer,
+                                         budget,
+                                         skip_zero_cost_preference=True,
+                                         allowed_locations={location}) is None
+    info = _pending_info(1, location)
+    persisted = paid_capacity.try_persist_claim_batch(
+        service_name='svc',
+        service_hash='hash',
+        controller_owner=(1, '10.0.0.1'),
+        candidates=(paid_capacity.PaidClaimCandidate(
+            replica_id=1,
+            replica_info=info,
+            location=location,
+            priority=20,
+            capacity_plan_claim=authority.claim_values('l4')),),
+        budget=budget)
+    assert persisted.members[0].claim_result is (
+        paid_capacity.ClaimResult.SERVICE_SATURATED)
 
 
 def test_generic_paid_budget_preserves_ordinary_on_demand():

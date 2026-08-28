@@ -6,6 +6,17 @@ _Last updated: 2026-08-28_
 
 ## Status
 
+Scope amendment (2026-08-28): the fixed service envelope described here is
+authoritative for non-planner paid callers. Planner-bound protocol-v2 Serve
+admission is now governed by the immutable
+``paid_launch_target_by_accelerator`` contract in
+``serve-multi-pool-reserved-capacity-fill.md``. For that path, the committed
+plan is the sole aggregate paid authority and may open the minimum
+price-ordered Spot frontier needed to hold its exact backend cohort; the
+legacy cold limit of 16 is not a second aggregate cap. Exact-pool adaptive
+depth, priority, Spot-only policy, stale-plan rejection, and hard cost/global
+limits in this document remain applicable.
+
 The depth, service-envelope, accelerator-frontier, priority, and durable
 provider-feedback policy in this document is deployed and remains
 authoritative. A 2026-08-26 GCP qualification exposed a transaction-cardinality
@@ -1411,12 +1422,12 @@ capacity without deriving either durable claim envelope from it.
 | A member insert fault rolls back every new replica and claim; transaction-acknowledgement loss fails closed, scopes recovery to exact frozen identities, retires and replans association-less pairs, adopts bound pairs, and never infers a batch manifest | Real-PostgreSQL failpoint, lost-ack, exact-scope in-process recovery, and restart tests |
 | A multi-pool batch acquires the service row then exact-pool rows in canonical sorted order and never exceeds the service envelope, card frontier, adaptive pool depth, plan residual, or global paid cap; later P admission independently prevents started workers from exceeding process capacity | Real-PostgreSQL sorted-lock instrumentation and saturation tests, aggregate summed-debit tests, plus retained cross-pool concurrency and P-reservation regressions |
 | A route, allocation, capacity-graph, or demand-semantic change before the transaction rejects every member; monotonic semantic-equivalent reporter heartbeats do not starve a prepared wave; report expiry, ingestion blackout, and HA-role advancement after commit do not revoke an already committed batch, while an independently fresh current route remains mandatory | Capacity-plan conflict/rollback tests, 100-member equivalent-heartbeat admission, 100-member fresh-zero rollback, post-commit report-expiry/current-ACTIVE-mismatch tests, stale-current-route rejection, plus retained capacity-plan CAS tests |
-| A default cold batch remains clipped to pool depth 4, service envelope 16, and card frontier 2; an explicit isolated qualification requires effective service limit, summed locked pool headroom, accelerator frontier, process/global cap, and aggregate long-worker capacity all at least 100 | Pure configuration, manager integration, rendered-Helm, and real-PostgreSQL qualification-profile tests |
+| A default non-planner cold batch remains clipped to pool depth 4, service envelope 16, and card frontier 2; planner-bound protocol-v2 admission instead derives its aggregate cohort from the committed plan while preserving exact-pool and hard-cap fences | Pure configuration, manager integration, rendered-Helm, plan-cohort, and real-PostgreSQL tests |
 | Default and invalid fallback are 4; maximum is at least bootstrap | Pure configuration tests |
 | Failure cooldown defaults to ten minutes and rejects invalid overrides | Pure configuration tests |
 | Exact keys distinguish workspace, cloud, region, zone, instance type, accelerator shape, Spot mode, and node count | Pool-key equality tests |
 | Combined claims across services never exceed the pool limit | Concurrent PostgreSQL admission test |
-| One service never holds more than 16 valid unresolved paid claims across distinct pools; stale claims do not consume the envelope; legacy overage blocks without revocation | Concurrent PostgreSQL cross-pool admission and reconciliation tests |
+| A non-planner service never holds more than 16 valid unresolved paid claims across distinct pools; a planner-bound service cannot exceed its immutable plan-derived cohort; stale claims consume neither envelope | Concurrent PostgreSQL cross-pool, plan-debit projection, and reconciliation tests |
 | Claim and replica persist atomically under service-owner fencing | Persistence and ownership-loss tests |
 | PENDING and PROVISIONING count; provider success, terminal rows, service replacement, and missing replicas do not | Reconciliation tests |
 | 4, 8, 16, 32, 64, 128, 256, 480 ramp; stale success resets to 4 | Pure policy and state-transition tests |
@@ -1436,8 +1447,8 @@ capacity without deriving either durable claim envelope from it.
 | Exact-card logical demand derives priority independently per accelerator | Autoscaler and replica-manager tests |
 | Instance-aware QPS batches preserve card-specific priority; valid profiles never promote excluded cards; stale evidence falls back to minimum | Autoscaler and controller actuation tests |
 | Restart adoption and recovery preserve every full-frontier claim in relational and serialized state; same-pool re-drive is idempotent, while a cross-pool retry fails before candidate-pool, waiter, or replica mutation | Recovery and PostgreSQL immutability tests |
-| A cold single-card target of 400 persists at most eight paid claims across two pools before feedback rather than touching 100 pools; later proven cohorts deepen those pools, while the service never exceeds 16 unresolved claims across all cards | Replica-manager integration tests |
-| Cheapest selection spills on claim 5 at bootstrap, same-card placement stops after the two-pool cold frontier, and independent-card placement stops when the service envelope is exhausted | Replica-manager integration tests |
+| A non-planner cold single-card target of 400 persists at most eight paid claims across two pools before feedback; a planner-bound target opens only the minimum price-ordered frontier needed for its immutable cohort | Replica-manager integration tests |
+| Non-planner cheapest selection spills on claim 5 at bootstrap and stops at its cold frontier/envelope; planner-bound selection stops at its exact plan-derived cohort | Replica-manager integration tests |
 | A stale selection snapshot loses cleanly at the atomic persist | Cross-controller race test |
 | Owning controllers adopt attributable legacy rows; an unrelated unkeyed row does not debit every pool | Mixed-version compatibility test |
 | Local SQLite retains the unset legacy per-service window of 4 and stays below its 999-bind batch limit | Non-PostgreSQL fallback and constrained SQLite batch tests |

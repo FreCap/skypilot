@@ -879,6 +879,87 @@ def _insert_claim(engine, authority, replica_id: int) -> dict:
     return claim
 
 
+def test_paid_plan_claimed_units_projection_is_exact_and_fails_closed(
+        capacity_database):
+    engine, _, _ = capacity_database
+    pools = serve_state_schema.paid_capacity_pools_table
+    claims = serve_state_schema.paid_capacity_claims_table
+    digest = 'a' * 64
+
+    def _claim_values(*,
+                      replica_id,
+                      units,
+                      generation=8,
+                      service_name='svc',
+                      service_hash='svc-hash',
+                      content_sha256=digest):
+        return {
+            'service_name': service_name,
+            'service_hash': service_hash,
+            'replica_id': replica_id,
+            'pool_key': 'gcp:L4',
+            'priority': 50,
+            'claimed_at': time.time(),
+            'capacity_plan_generation': generation,
+            'capacity_plan_sha256': content_sha256,
+            'demand_feed_generation': 9,
+            'demand_source_epoch': 1,
+            'capacity_plan_accelerator': 'L4',
+            'capacity_plan_units': units,
+        }
+
+    with engine.begin() as connection:
+        connection.execute(
+            postgresql.insert(pools).values(
+                pool_key='gcp:L4',
+                current_limit=10,
+                successes_since_resize=0,
+                updated_at=time.time()).on_conflict_do_nothing())
+        valid_replicas = [
+            _replica_values(replica_id, zero_cost=False)
+            for replica_id in (101, 102, 103)
+        ]
+        retained = _replica_values(108, zero_cost=False)
+        retained.update(status='READY',
+                        ordinary_launch_association_id=uuid.uuid4())
+        connection.execute(sqlalchemy.insert(serve_state_schema.replicas_table),
+                           [*valid_replicas, retained])
+        connection.execute(
+            sqlalchemy.insert(claims),
+            [
+                _claim_values(replica_id=101, units=4),
+                _claim_values(replica_id=102, units=8),
+                _claim_values(replica_id=103, units=16, generation=9),
+                _claim_values(replica_id=104, units=32, service_name='other'),
+                _claim_values(
+                    replica_id=105, units=64, service_hash='other-hash'),
+                # No matching replica row: this stale same-plan debit must not
+                # suppress the next candidate cohort before Phase A can prune it.
+                _claim_values(replica_id=107, units=128),
+                # A provider association retains claim ownership even after the
+                # replica leaves PENDING/PROVISIONING.
+                _claim_values(replica_id=108, units=2),
+            ])
+
+    assert serve_state.get_paid_capacity_plan_claimed_units(
+        'svc', 'svc-hash', 8, digest) == {
+            'l4': 14
+        }
+
+    # A same-generation row carrying a different immutable plan digest is a
+    # corrupt debit ledger, not an ignorable claim from another plan.
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                **_replica_values(106, zero_cost=False)))
+        connection.execute(
+            sqlalchemy.insert(claims).values(**_claim_values(
+                replica_id=106, units=1, content_sha256='b' * 64)))
+    with pytest.raises(ValueError, match='debit ledger is malformed'):
+        serve_state.get_paid_capacity_plan_claimed_units(
+            'svc', 'svc-hash', 8, digest)
+
+
 def _route_record_id(engine) -> str:
     with engine.connect() as connection:
         identity_payload = connection.execute(

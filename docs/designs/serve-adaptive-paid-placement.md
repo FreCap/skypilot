@@ -1,7 +1,7 @@
 # SkyServe Adaptive Paid Placement
 
 _Created: 2026-08-02_
-_Last updated: 2026-08-26_
+_Last updated: 2026-08-28_
 
 ## Status
 
@@ -9,6 +9,14 @@ Proposed. This design extends the deployed global paid-capacity authority in
 `serve-paid-placement-cohort.md`. The existing exact-pool depth ladder,
 per-service envelope, per-card exploration frontier, request-priority protocol,
 and PostgreSQL outcome transaction remain authoritative.
+
+The per-service envelope in this document applies to non-planner callers.
+Planner-bound protocol-v2 admission is superseded by
+`serve-multi-pool-reserved-capacity-fill.md`: its committed paid launch target
+is the sole aggregate authority, while the exact-pool depth, priority,
+Spot-only, price-order, stale-plan, and hard-cap fences remain shared. Thus the
+16-claim cold envelope below must not serialize a larger immutable planner
+cohort.
 
 The atomic paid-batch amendment in the parent design changes transaction
 cardinality, not adaptive policy. One transaction may commit several accepted

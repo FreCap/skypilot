@@ -900,12 +900,33 @@ class PaidLaunchAuthority:
     paid_residual_by_accelerator: tuple[tuple[str, int], ...]
     paid_launch_target_by_accelerator: tuple[tuple[str, int], ...]
     reserved_fill_authority: ReservedFillPlanAuthority
+    capacity_unit: capacity_planning.CapacityUnit
+    physical_gpu_width_by_accelerator: tuple[tuple[str, int], ...]
 
     def economic_residual(self) -> dict[str, int]:
         return dict(self.paid_residual_by_accelerator)
 
     def remaining_launch_capacity(self) -> dict[str, int]:
         return dict(self.paid_launch_target_by_accelerator)
+
+    def backend_claim_shape(self, accelerator: str) -> tuple[int, int]:
+        """Return physical GPU width and plan units debited per backend."""
+        card = accelerator.casefold()
+        widths = {
+            raw_card.casefold(): width
+            for raw_card, width in self.physical_gpu_width_by_accelerator
+        }
+        physical_width = widths.get(card)
+        if (type(physical_width) is not int or physical_width <= 0 or
+                self.capacity_unit
+                not in (capacity_planning.CapacityUnit.PHYSICAL_BACKEND,
+                        capacity_planning.CapacityUnit.LOGICAL_GPU)):
+            raise CapacityAdmissionConflict(
+                f'Capacity plan has no exact backend claim shape for {card!r}.')
+        claim_units = (1 if self.capacity_unit
+                       is capacity_planning.CapacityUnit.PHYSICAL_BACKEND else
+                       physical_width)
+        return physical_width, claim_units
 
     def claim_values(self, accelerator: str, units: int = 1) -> dict[str, Any]:
         card = accelerator.casefold()
@@ -1499,6 +1520,11 @@ def _authority(
     except ValueError as error:
         raise CapacityAdmissionConflict(
             'Capacity plan has no valid reserved-fill authority.') from error
+    try:
+        _, candidate = _decode_planner_payload(payload.get('planner'))
+    except ValueError as error:
+        raise CapacityAdmissionConflict(
+            'Capacity plan has no immutable backend claim shape.') from error
     return PaidLaunchAuthority(
         service_name=str(row['service_name']),
         service_hash=str(row['service_hash']),
@@ -1510,7 +1536,10 @@ def _authority(
         demand_source_epoch=int(row['demand_source_epoch']),
         paid_residual_by_accelerator=tuple(paid.items()),
         paid_launch_target_by_accelerator=tuple(paid_launch.items()),
-        reserved_fill_authority=reserved_fill_authority)
+        reserved_fill_authority=reserved_fill_authority,
+        capacity_unit=candidate.capacity_unit,
+        physical_gpu_width_by_accelerator=tuple(
+            candidate.physical_gpu_width_by_accelerator.entries))
 
 
 def _validate_reserved_fill_authority_in_connection(

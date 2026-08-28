@@ -5637,6 +5637,73 @@ def get_paid_capacity_pool_states(
     return result
 
 
+def get_paid_capacity_plan_claimed_units(
+    service_name: str,
+    service_hash: str,
+    generation: int,
+    content_sha256: str,
+) -> dict[str, int]:
+    """Read capacity-plan units already debited to one immutable paid plan.
+
+    This is an advisory preparation read. Phase A repeats the debit check
+    under the service, plan, and claim locks before committing any replica.
+    """
+    if (not isinstance(service_name, str) or not service_name or
+            not isinstance(service_hash, str) or not service_hash or
+            type(generation) is not int or generation <= 0 or
+            not isinstance(content_sha256, str) or
+            re.fullmatch(r'[0-9a-f]{64}', content_sha256) is None):
+        raise ValueError('Paid capacity plan identity is malformed.')
+    engine = _db_manager.get_engine()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ValueError('Planner-bound paid debits require PostgreSQL.')
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                paid_capacity_claims_table.c.capacity_plan_sha256,
+                paid_capacity_claims_table.c.capacity_plan_accelerator,
+                paid_capacity_claims_table.c.capacity_plan_units,
+                paid_capacity_claims_table.c.pool_key,
+                services_table.c.hash,
+                replicas_table.c.status,
+                replicas_table.c.paid_capacity_pool_key,
+                replicas_table.c.ordinary_launch_association_id,
+            ).select_from(
+                paid_capacity_claims_table.outerjoin(
+                    services_table, services_table.c.name ==
+                    paid_capacity_claims_table.c.service_name).outerjoin(
+                        replicas_table,
+                        sqlalchemy.and_(
+                            replicas_table.c.service_name ==
+                            paid_capacity_claims_table.c.service_name,
+                            replicas_table.c.replica_id ==
+                            paid_capacity_claims_table.c.replica_id))).
+            where(
+                paid_capacity_claims_table.c.service_name == service_name,
+                paid_capacity_claims_table.c.service_hash == service_hash,
+                paid_capacity_claims_table.c.capacity_plan_generation ==
+                generation,
+            )).fetchall()
+    claimed: dict[str, int] = {}
+    for (row_sha256, raw_card, raw_units, claim_pool, current_hash, status,
+         row_pool, association_id) in rows:
+        valid = (current_hash == service_hash and
+                 (status in _PAID_CAPACITY_UNRESOLVED_STATUSES or
+                  association_id is not None) and row_pool == claim_pool)
+        if not valid:
+            # Phase A deletes this stale row after acquiring its canonical
+            # service and exact-pool locks. The advisory projection must
+            # exclude it so it cannot suppress the candidate that triggers
+            # that locked cleanup.
+            continue
+        if (row_sha256 != content_sha256 or not isinstance(raw_card, str) or
+                not raw_card or type(raw_units) is not int or raw_units <= 0):
+            raise ValueError('Paid capacity plan debit ledger is malformed.')
+        card = raw_card.casefold()
+        claimed[card] = claimed.get(card, 0) + raw_units
+    return dict(sorted(claimed.items()))
+
+
 def _replica_has_zero_cost_authority(
         replica_info: 'replica_managers.ReplicaInfo') -> bool:
     """Whether a row carries state forbidden from the paid-claim path."""

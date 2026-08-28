@@ -44,6 +44,7 @@ from sky.events import api_models as event_api_models
 from sky.provision import capacity_policy
 from sky.provision import common as provision_common
 from sky.serve import capacity_admission
+from sky.serve import capacity_planning
 from sky.serve import non_pool_launch_reconciliation
 from sky.serve import ordinary_launch_binding
 from sky.serve import ordinary_launch_handoff
@@ -18026,6 +18027,18 @@ class TestPaidLocationLaunchBudget:
         return manager
 
     @staticmethod
+    def _paid_budget(location):
+        return paid_capacity.LaunchBudget(
+            remaining_by_location={location: 1},
+            pool_key_by_location={location: 'exact-paid-pool'},
+            states_by_pool_key={},
+            globally_managed=True,
+            service_remaining=1,
+            service_claim_limit=1,
+            frontier_limit=2,
+            frontier_key_by_location={location: ('l4',)})
+
+    @staticmethod
     def _info(replica_id, location, status):
         info = replica_managers.ReplicaInfo(
             replica_id=replica_id,
@@ -18196,6 +18209,8 @@ class TestPaidLocationLaunchBudget:
             demand_source_epoch=3,
             paid_residual_by_accelerator=(('l4', 4),),
             paid_launch_target_by_accelerator=(('l4', 4),),
+            capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+            physical_gpu_width_by_accelerator=(('l4', 4),),
             reserved_fill_authority=(
                 capacity_admission.ReservedFillPlanAuthority.not_applicable()))
         existing = []
@@ -18246,6 +18261,8 @@ class TestPaidLocationLaunchBudget:
             demand_source_epoch=3,
             paid_residual_by_accelerator=(('l4', 4),),
             paid_launch_target_by_accelerator=(('l4', 4),),
+            capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+            physical_gpu_width_by_accelerator=(('l4', 4),),
             reserved_fill_authority=(
                 capacity_admission.ReservedFillPlanAuthority.not_applicable()))
 
@@ -18317,6 +18334,8 @@ class TestPaidLocationLaunchBudget:
             demand_source_epoch=3,
             paid_residual_by_accelerator=(('l4', 4),),
             paid_launch_target_by_accelerator=(('l4', 4),),
+            capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+            physical_gpu_width_by_accelerator=(('l4', 4),),
             reserved_fill_authority=(
                 capacity_admission.ReservedFillPlanAuthority.not_applicable()))
 
@@ -18325,6 +18344,10 @@ class TestPaidLocationLaunchBudget:
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
              mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'), \
+             mock.patch.object(
+                 paid_capacity,
+                 'build_launch_budget',
+                 return_value=self._paid_budget(paid)), \
              mock.patch.object(
                  paid_capacity,
                  'try_persist_claim',
@@ -18377,6 +18400,8 @@ class TestPaidLocationLaunchBudget:
             demand_source_epoch=3,
             paid_residual_by_accelerator=(('l4', 1),),
             paid_launch_target_by_accelerator=(('l4', 4),),
+            capacity_unit=capacity_planning.CapacityUnit.LOGICAL_GPU,
+            physical_gpu_width_by_accelerator=(('l4', 4),),
             reserved_fill_authority=(
                 capacity_admission.ReservedFillPlanAuthority.not_applicable()))
 
@@ -18385,6 +18410,10 @@ class TestPaidLocationLaunchBudget:
              mock.patch('sky.serve.replica_managers._get_resources_ports',
                         return_value='8080'), \
              mock.patch('sky.serve.replica_managers._ReplicaLaunchThread'), \
+             mock.patch.object(
+                 paid_capacity,
+                 'build_launch_budget',
+                 return_value=self._paid_budget(paid)), \
              mock.patch.object(
                  paid_capacity,
                  'try_persist_claim',
@@ -18439,6 +18468,8 @@ class TestPaidLocationLaunchBudget:
             demand_source_epoch=3,
             paid_residual_by_accelerator=(('l4', 3),),
             paid_launch_target_by_accelerator=(('l4', 3),),
+            capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND,
+            physical_gpu_width_by_accelerator=(('l4', 1),),
             reserved_fill_authority=(
                 capacity_admission.ReservedFillPlanAuthority.not_applicable()))
         workers = []
@@ -18471,7 +18502,7 @@ class TestPaidLocationLaunchBudget:
                                return_value=existing), \
              mock.patch.object(paid_capacity,
                                'build_launch_budget',
-                               return_value=budget), \
+                               return_value=budget) as build_budget, \
              mock.patch.object(paid_capacity,
                                'try_persist_claim_batch',
                                side_effect=_admit_batch) as admit_batch, \
@@ -18489,6 +18520,8 @@ class TestPaidLocationLaunchBudget:
                 }] * 3, paid_launch_authority=authority)
 
         admit_batch.assert_called_once()
+        assert (build_budget.call_args.kwargs['paid_launch_authority']
+                is authority)
         singleton.assert_not_called()
         manager._persist_new_replica.assert_not_called()
         assert [result.replica_id for result in accepted] == [1, 2]
@@ -18545,6 +18578,8 @@ class TestPaidLocationLaunchBudget:
             demand_source_epoch=3,
             paid_residual_by_accelerator=(('l4', 2),),
             paid_launch_target_by_accelerator=(('l4', 2),),
+            capacity_unit=capacity_planning.CapacityUnit.PHYSICAL_BACKEND,
+            physical_gpu_width_by_accelerator=(('l4', 1),),
             reserved_fill_authority=(
                 capacity_admission.ReservedFillPlanAuthority.not_applicable()))
 
