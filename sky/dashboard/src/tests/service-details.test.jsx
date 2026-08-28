@@ -3263,11 +3263,15 @@ describe('ServiceDetails route ownership rendering', () => {
       serviceHash: 'hash-a',
       requestTelemetryState: 'fresh',
       requestTelemetryReason: 'in_flight_incomplete',
+      requestTelemetryBreakdownAvailable: true,
       requestRate: 0.5,
       recentRequestCount: 30,
       requestWindowSeconds: 60,
       inFlightRequests: null,
       confirmedInFlightRequests: 3,
+      processingRequests: null,
+      confirmedProcessingRequests: 2,
+      httpInFlightRequests: 1,
       unknownInFlightReplicaCount: 1,
       requestQueueDepth: 1,
       rejectedRequests: 0,
@@ -3299,12 +3303,14 @@ describe('ServiceDetails route ownership rendering', () => {
     render(<ServiceDetailsPage />);
 
     expect(
-      await screen.findByText('3 confirmed processing / in-flight')
+      await screen.findByText('2 confirmed async processing')
     ).toBeVisible();
+    expect(screen.getByText('3 confirmed in flight')).toBeVisible();
+    expect(screen.getByText('1 queued / unassigned')).toBeVisible();
     expect(getDetailValue('Endpoint')).toHaveTextContent('Loading...');
     expect(
       screen.getByText(
-        '0.50 req/s recent · 30 requests in 60s · 1 queued · 1 backend with unknown occupancy · 0 rejected · activity report 2s old'
+        'complete reporter-set snapshot · unassigned, selecting, or retry-backoff work · 0.50 req/s recent · 30 requests in 60s · 0 rejected · activity report 2s old'
       )
     ).toBeVisible();
     expect(
@@ -3399,10 +3405,10 @@ describe('ServiceDetails route ownership rendering', () => {
     );
     expect(getDetailValue('Requests now')).toHaveTextContent('-');
     expect(
-      screen.queryByText('2 processing / in-flight')
+      screen.queryByText('2 tracked in flight (legacy aggregate)')
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByText('2 confirmed processing / in-flight')
+      screen.queryByText('2 confirmed tracked in flight (legacy aggregate)')
     ).not.toBeInTheDocument();
   });
 
@@ -4150,7 +4156,9 @@ describe('ServiceDetailCard cost and request estimates', () => {
         'Spot $1.50/hr · On-demand $4.00/hr · 2 active, stopping, or cleanup-uncertain replicas · Current catalog, compute only, not a provider bill'
       )
     ).toBeTruthy();
-    expect(screen.getByText('2 processing / in-flight')).toBeTruthy();
+    expect(
+      screen.getByText('2 tracked in flight (legacy aggregate)')
+    ).toBeTruthy();
     expect(
       screen.getByText(
         '0.50 req/s recent · 30 requests in 60s · 1,234 requests in last hour · 1 queued · 3 rejected · activity report 4s old'
@@ -4158,6 +4166,182 @@ describe('ServiceDetailCard cost and request estimates', () => {
     ).toBeTruthy();
     expect(screen.getByText('$3.0556')).toBeTruthy();
     expect(screen.getByText('Known cloud compute / 1K requests')).toBeTruthy();
+  });
+
+  it('separates processing, HTTP in-flight, queue, and exact terminal telemetry', () => {
+    const now = jest.spyOn(Date, 'now').mockReturnValue(200_000);
+    const observedAt = 198;
+    render(
+      <ServiceDetailCard
+        requestHistory={{ available: true, requestsLastHour: 10 }}
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          replicasReady: 2,
+          replicasTotal: 2,
+          replicasFailed: 0,
+          activeVersions: [1],
+          hourlyCostExcludedReplicaCount: 0,
+          requestTelemetryState: 'fresh',
+          requestTelemetrySource: 'postgresql_lb_demand_reports',
+          requestTelemetryBreakdownAvailable: true,
+          requestTelemetryObservedAt: observedAt,
+          requestStatsAgeSeconds: 2,
+          requestRate: 0.5,
+          recentRequestCount: 30,
+          requestWindowSeconds: 60,
+          processingRequests: 2,
+          confirmedProcessingRequests: 2,
+          httpInFlightRequests: 1,
+          inFlightRequests: 3,
+          confirmedInFlightRequests: 3,
+          unknownInFlightReplicaCount: 0,
+          requestQueueDepth: 4,
+          rejectedRequests: 1,
+          asyncRequestSummary: {
+            available: true,
+            coverage: 'partial',
+            observedAt: 197,
+            stateCounts: {
+              REJECTED_PRE_DISPATCH: 2,
+              DISPATCH_MAY_HAVE_OCCURRED: 1,
+              ACCEPTED: 3,
+              AMBIGUOUS: 1,
+              SUCCEEDED: 5,
+              FAILED: 2,
+              CANCELLED: 1,
+              EXPIRED: 0,
+            },
+            operationalTerminalReceiptTotal: 8,
+            operationalTerminalReceiptsByStatus: {
+              SUCCEEDED: 5,
+              FAILED: 2,
+              CANCELLED: 1,
+              EXPIRED: 0,
+            },
+          },
+        }}
+      />
+    );
+
+    expect(getDetailValue('Async processing now')).toHaveTextContent(
+      '2 async processing'
+    );
+    expect(getDetailValue('Total in flight')).toHaveTextContent(
+      '3 tracked in flight'
+    );
+    expect(getDetailValue('Queued now')).toHaveTextContent(
+      '4 queued / unassigned'
+    );
+    expect(screen.queryByText('Requests now')).toBeNull();
+    expect(
+      screen.getByText(
+        'complete routed-backend occupancy · async backend occupancy only'
+      )
+    ).toBeVisible();
+    expect(
+      screen.getByText(
+        /1 HTTP envelope \+ 2 confirmed async processing · conservative sum/
+      )
+    ).toBeVisible();
+    const queueTelemetry = screen.getByText(/complete reporter-set snapshot/);
+    expect(queueTelemetry).toHaveTextContent(
+      'unassigned, selecting, or retry-backoff work'
+    );
+    expect(queueTelemetry).toHaveTextContent('activity report 2s old');
+    expect(queueTelemetry).toHaveTextContent(
+      `observed ${formatFullTimestamp(new Date(observedAt * 1000))}`
+    );
+    expect(queueTelemetry).toHaveTextContent(
+      'source PostgreSQL load-balancer reports'
+    );
+    expect(
+      getDetailValue('Succeeded / terminal (exact async)')
+    ).toHaveTextContent('5 succeeded / 8 terminal, protocol-covered (partial)');
+    expect(
+      screen.getByText(/protocol-uncovered request count unknown/)
+    ).toBeVisible();
+    now.mockRestore();
+  });
+
+  it('labels split occupancy as partial without fabricating unknown work', () => {
+    render(
+      <ServiceDetailCard
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          replicasReady: 5,
+          replicasTotal: 5,
+          replicasFailed: 0,
+          activeVersions: [1],
+          hourlyCostExcludedReplicaCount: 0,
+          requestTelemetryState: 'fresh',
+          requestTelemetryBreakdownAvailable: true,
+          requestStatsAgeSeconds: 2,
+          processingRequests: null,
+          confirmedProcessingRequests: 0,
+          httpInFlightRequests: 1,
+          inFlightRequests: null,
+          confirmedInFlightRequests: 1,
+          unknownInFlightReplicaCount: 5,
+          requestQueueDepth: 0,
+        }}
+      />
+    );
+
+    expect(getDetailValue('Async processing now')).toHaveTextContent(
+      '0 confirmed async processing'
+    );
+    expect(getDetailValue('Total in flight')).toHaveTextContent(
+      '1 confirmed in flight'
+    );
+    expect(getDetailValue('Queued now')).toHaveTextContent(
+      '0 queued / unassigned'
+    );
+    expect(
+      screen.getByText(
+        /partial routed-backend occupancy; 5 backends with unknown occupancy/
+      )
+    ).toBeVisible();
+    expect(
+      screen.getByText(/partial lower bound; 5 backends with unknown occupancy/)
+    ).toBeVisible();
+    expect(screen.queryByText(/5 unobserved requests/)).toBeNull();
+  });
+
+  it('does not label synchronous HTTP work as async processing', () => {
+    render(
+      <ServiceDetailCard
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          replicasReady: 1,
+          replicasTotal: 1,
+          replicasFailed: 0,
+          activeVersions: [1],
+          hourlyCostExcludedReplicaCount: 0,
+          requestTelemetryState: 'fresh',
+          requestTelemetryBreakdownAvailable: true,
+          processingRequests: 0,
+          confirmedProcessingRequests: 0,
+          httpInFlightRequests: 1,
+          inFlightRequests: 1,
+          confirmedInFlightRequests: 1,
+          unknownInFlightReplicaCount: 0,
+          requestQueueDepth: 0,
+        }}
+      />
+    );
+
+    expect(getDetailValue('Async processing now')).toHaveTextContent(
+      '0 async processing'
+    );
+    expect(getDetailValue('Total in flight')).toHaveTextContent(
+      '1 tracked in flight'
+    );
+    expect(
+      screen.getByText(/1 HTTP envelope \+ 0 confirmed async processing/)
+    ).toBeVisible();
   });
 
   it('labels completion count freshness as unavailable on an old response', () => {
@@ -4198,7 +4382,7 @@ describe('ServiceDetailCard cost and request estimates', () => {
     ).toBeVisible();
   });
 
-  it('keeps aggregate processing primary over exact lifecycle coverage', () => {
+  it('labels an N-1 combined gauge as a legacy in-flight aggregate', () => {
     render(
       <ServiceDetailCard
         requestHistory={{
@@ -4239,14 +4423,15 @@ describe('ServiceDetailCard cost and request estimates', () => {
     );
 
     expect(getDetailValue('Requests now')).toHaveTextContent(
-      '6 processing / in-flight'
+      '6 tracked in flight (legacy aggregate)'
     );
-    expect(getDetailValue('Exact async request lifecycle')).toHaveTextContent(
-      '8 terminal, protocol-covered (partial)'
-    );
+    expect(screen.queryByText('Async processing now')).toBeNull();
+    expect(
+      getDetailValue('Succeeded / terminal (exact async)')
+    ).toHaveTextContent('5 succeeded / 8 terminal, protocol-covered (partial)');
     expect(
       screen.getByText(
-        '2 rejected before dispatch · 3 accepted / dispatch-confirmed (not proven actively processing) · 1 dispatch may have occurred · 1 ambiguous · 5 succeeded · 2 failed · 1 cancelled · 0 expired'
+        '2 rejected before dispatch · 3 accepted / dispatch-confirmed (not proven actively processing) · 1 dispatch may have occurred · 1 ambiguous · 5 succeeded · 2 failed · 1 cancelled · 0 expired · coverage partial; protocol-uncovered request count unknown'
       )
     ).toBeVisible();
   });
@@ -4292,14 +4477,14 @@ describe('ServiceDetailCard cost and request estimates', () => {
     );
 
     expect(getDetailValue('Requests now')).toHaveTextContent(
-      '7 processing / in-flight'
-    );
-    expect(getDetailValue('Exact async request lifecycle')).toHaveTextContent(
-      '1 terminal, protocol-covered (partial)'
+      '7 tracked in flight (legacy aggregate)'
     );
     expect(
+      getDetailValue('Succeeded / terminal (exact async)')
+    ).toHaveTextContent('1 succeeded / 1 terminal, protocol-covered (partial)');
+    expect(
       screen.getByText(
-        '0 rejected before dispatch · 2 accepted / dispatch-confirmed (not proven actively processing) · 1 dispatch may have occurred · 0 ambiguous · 1 succeeded · 0 failed · 0 cancelled · 0 expired'
+        '0 rejected before dispatch · 2 accepted / dispatch-confirmed (not proven actively processing) · 1 dispatch may have occurred · 0 ambiguous · 1 succeeded · 0 failed · 0 cancelled · 0 expired · coverage partial; protocol-uncovered request count unknown'
       )
     ).toBeVisible();
   });
@@ -4449,9 +4634,9 @@ describe('ServiceDetailCard cost and request estimates', () => {
       />
     );
 
-    expect(getDetailValue('Exact async request lifecycle')).toHaveTextContent(
-      '1 terminal, protocol-covered (partial)'
-    );
+    expect(
+      getDetailValue('Succeeded / terminal (exact async)')
+    ).toHaveTextContent('1 succeeded / 1 terminal, protocol-covered (partial)');
     expect(
       screen.getByText('PostgreSQL exact ledger snapshot observed 100s ago.')
     ).toBeVisible();
@@ -4558,16 +4743,16 @@ describe('ServiceDetailCard cost and request estimates', () => {
       />
     );
 
-    expect(getDetailValue('Exact async request lifecycle')).toHaveTextContent(
-      'Unavailable'
-    );
+    expect(
+      getDetailValue('Succeeded / terminal (exact async)')
+    ).toHaveTextContent('Unavailable');
     expect(
       screen.getByText(
         'PostgreSQL exact ledger unavailable: schema unavailable'
       )
     ).toBeVisible();
     expect(
-      getDetailValue('Exact async request lifecycle')
+      getDetailValue('Succeeded / terminal (exact async)')
     ).not.toHaveTextContent('9 terminal');
   });
 
@@ -4906,7 +5091,7 @@ describe('ServiceDetailCard cost and request estimates', () => {
 
     expect(screen.queryByText('0 requests in last hour')).toBeNull();
     expect(
-      screen.getByText('2 last reported processing / in-flight')
+      screen.getByText('2 last reported tracked in flight (legacy aggregate)')
     ).toBeTruthy();
     expect(
       screen.getByText(
@@ -4951,7 +5136,9 @@ describe('ServiceDetailCard cost and request estimates', () => {
     );
 
     expect(screen.getByText('Requests now')).toBeTruthy();
-    expect(screen.getByText('0 processing / in-flight')).toBeTruthy();
+    expect(
+      screen.getByText('0 tracked in flight (legacy aggregate)')
+    ).toBeTruthy();
     expect(
       screen.getByText(
         '0.00 req/s recent · 0 requests in 60s · 0 queued · 0 rejected · activity report 2s old'
@@ -4994,7 +5181,9 @@ describe('ServiceDetailCard cost and request estimates', () => {
       />
     );
 
-    expect(screen.getByText('0 confirmed processing / in-flight')).toBeTruthy();
+    expect(
+      screen.getByText('0 confirmed tracked in flight (legacy aggregate)')
+    ).toBeTruthy();
     expect(
       screen.getByText(
         '0.00 req/s recent · 0 requests in 60s · 0 queued · 5 backends with unknown occupancy · 0 rejected · activity report 2s old'

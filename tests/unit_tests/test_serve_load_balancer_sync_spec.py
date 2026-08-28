@@ -93,6 +93,24 @@ def test_target_qps_ignored_for_non_instance_aware_policy():
     assert lb._stream_timeout_seconds == 60
 
 
+def test_role_payload_preserves_http_accounting_completeness(monkeypatch):
+    monkeypatch.setenv(constants.LB_POD_UID_ENV_VAR, 'lb-pod-uid-a')
+    url = 'http://replica:8080'
+
+    tracked = _make_lb('least_load')
+    tracked._load_balancing_policy.set_ready_replicas([url])
+    tracked_payload = tracked._ha_role_payload()
+    assert tracked_payload['http_in_flight_complete'] is True
+    assert tracked_payload['http_in_flight'] == {url: 0}
+
+    unsupported = _make_lb('round_robin')
+    unsupported._load_balancing_policy.set_ready_replicas([url])
+    unsupported_payload = unsupported._ha_role_payload()
+    assert unsupported_payload['http_in_flight_complete'] is False
+    assert unsupported_payload['http_in_flight'] == {}
+    assert unsupported_payload['unknown_in_flight_urls'] == [url]
+
+
 def test_concurrency_knob_sets_uniform_per_gpu_weight():
     # A concurrency-sized service ships no QPS dict; the knob weights
     # replicas per-GPU so bigger replicas absorb proportional load.

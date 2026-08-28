@@ -449,6 +449,9 @@ def _validate_report(raw: Any) -> tuple[dict[str, Any], str, bool]:
 
     _nonnegative_int(raw.get('local_in_flight'), 'local_in_flight')
     _nonnegative_map(raw.get('http_in_flight'), 'http_in_flight')
+    http_in_flight_complete = raw.get('http_in_flight_complete', False)
+    if not isinstance(http_in_flight_complete, bool):
+        raise DemandReportError('http_in_flight_complete must be a boolean.')
     _nonnegative_map(raw.get('async_occupancy'), 'async_occupancy')
     _nonnegative_map(raw.get('occupancy_sample_generation'),
                      'occupancy_sample_generation')
@@ -788,11 +791,15 @@ def _empty_summary(state: str,
         'request_telemetry_generation': generation,
         'request_telemetry_compatibility_complete': False,
         'request_reporter_count': 0,
+        'request_telemetry_observed_at': None,
         'recent_request_count': None,
         'request_window_seconds': constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS,
         'requests_per_second': None,
         'in_flight_requests': None,
         'confirmed_in_flight_requests': None,
+        'processing_requests': None,
+        'confirmed_processing_requests': None,
+        'http_in_flight_requests': None,
         'unknown_in_flight_replica_count': None,
         'request_queue_depth': None,
         'rejected_requests': None,
@@ -895,7 +902,7 @@ def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
     queue_depth = 0
     rejected = 0
     recent_rejected = 0
-    newest_received_at = min(row['received_at'] for row in rows)
+    oldest_received_at = min(row['received_at'] for row in rows)
     complete = True
     active_report_present = False
     now_epoch = now.timestamp()
@@ -940,7 +947,6 @@ def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
         queue_depth += int(payload.get('queue_depth', 0))
         rejected += int(payload.get('rejected_in_window', 0))
         recent_rejected += int(payload.get('rejected_in_recent_window', 0))
-        newest_received_at = max(newest_received_at, row['received_at'])
         complete = complete and bool(row['complete'])
     if not active_report_present:
         return _empty_summary('stale',
@@ -960,9 +966,14 @@ def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
     # admission count overlaps HTTP dispatch and therefore remains a drain
     # proof, not another additive UI demand unit.
     confirmed_in_flight = sum(aggregate.in_flight.values())
+    confirmed_processing = sum(aggregate.async_occupancy.values())
+    http_in_flight = (sum(aggregate.http_in_flight.values())
+                      if aggregate.http_in_flight_complete else None)
     unknown_in_flight_replica_count = len(aggregate.unknown_urls)
     in_flight = (None
                  if unknown_in_flight_replica_count else confirmed_in_flight)
+    processing = (None
+                  if unknown_in_flight_replica_count else confirmed_processing)
     reason = ('compatibility_incomplete' if not complete else
               'in_flight_incomplete' if aggregate.unknown_urls else 'complete')
     return {
@@ -972,6 +983,12 @@ def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
         'request_telemetry_generation': int(generation or 0),
         'request_telemetry_compatibility_complete': complete,
         'request_reporter_count': len(rows),
+        # PostgreSQL receipt time owns freshness.  The reporter's wall clock
+        # is accepted only for rebasing its rolling buckets and must never be
+        # presented as the source timestamp for operator telemetry.  This is
+        # one composite of every retained reporter, so its honest timestamp is
+        # the oldest contributing receipt, not the newest reporter's liveness.
+        'request_telemetry_observed_at': oldest_received_at.timestamp(),
         'recent_request_count': recent_count,
         'request_window_seconds': window_seconds,
         'requests_per_second': recent_count / window_seconds,
@@ -980,12 +997,20 @@ def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
         # current occupancy proof, but retain the independently proven lower
         # bound and its coverage gap for honest operator observability.
         'confirmed_in_flight_requests': confirmed_in_flight,
+        # Async occupancy is the backend-reported processing subset.  HTTP
+        # envelopes are disjoint across LB processes, while HA copies of async
+        # occupancy are already freshest-generation/max reduced by the
+        # session ledger.  Preserve the historical combined in-flight fields
+        # above for N-1 clients and expose this decomposition additively.
+        'processing_requests': processing,
+        'confirmed_processing_requests': confirmed_processing,
+        'http_in_flight_requests': http_in_flight,
         'unknown_in_flight_replica_count': unknown_in_flight_replica_count,
         'request_queue_depth': queue_depth,
         'rejected_requests': rejected,
         'recent_rejected_requests': recent_rejected,
         'request_stats_age_seconds': max(
-            0.0, (now - newest_received_at).total_seconds()),
+            0.0, (now - oldest_received_at).total_seconds()),
     }
 
 

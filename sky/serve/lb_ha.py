@@ -111,6 +111,7 @@ class LbSessionReport:
     received_at: float
     local_in_flight: int
     http_in_flight: dict[str, int]
+    http_in_flight_complete: bool
     async_occupancy: dict[str, int]
     occupancy_sample_generations: dict[str, int]
     occupancy_sample_ages_seconds: dict[str, float]
@@ -126,6 +127,12 @@ class AggregatedDrainReport:
     complete: bool
     local_in_flight: int
     http_in_flight: dict[str, int]
+    http_in_flight_complete: bool
+    # Replica-global async processing, with HA reporters reduced to the
+    # freshest generation per URL.  Keep this projection separate from the
+    # conservative HTTP + async union below so observability callers never
+    # have to mislabel every in-flight envelope as active model processing.
+    async_occupancy: dict[str, int]
     in_flight: dict[str, int]
     routing_urls: list[str] | None
     unknown_urls: list[str]
@@ -188,6 +195,8 @@ class LbSessionLedger:
             return False
         http_in_flight = self._nonnegative_map(
             request_data.get('http_in_flight'))
+        http_in_flight_complete = request_data.get('http_in_flight_complete',
+                                                   False)
         local_in_flight = request_data.get('local_in_flight')
         async_occupancy = self._nonnegative_map(
             request_data.get('async_occupancy'))
@@ -212,7 +221,9 @@ class LbSessionLedger:
         routing_urls = request_data.get('routing_urls')
         unknown_urls = request_data.get('unknown_in_flight_urls', [])
         draining_urls = request_data.get('draining_urls', [])
-        if (http_in_flight is None or not isinstance(local_in_flight, int) or
+        if (http_in_flight is None or
+                not isinstance(http_in_flight_complete, bool) or
+                not isinstance(local_in_flight, int) or
                 isinstance(local_in_flight, bool) or local_in_flight < 0 or
                 async_occupancy is None or sample_generations is None or
                 sample_ages is None or not isinstance(routing_urls, list) or
@@ -239,6 +250,7 @@ class LbSessionLedger:
             received_at=received_at,
             local_in_flight=local_in_flight,
             http_in_flight=http_in_flight,
+            http_in_flight_complete=http_in_flight_complete,
             async_occupancy=async_occupancy,
             occupancy_sample_generations=sample_generations,
             occupancy_sample_ages_seconds=sample_ages,
@@ -278,6 +290,8 @@ class LbSessionLedger:
                 return AggregatedDrainReport(complete=False,
                                              local_in_flight=0,
                                              http_in_flight={},
+                                             http_in_flight_complete=False,
+                                             async_occupancy={},
                                              in_flight={},
                                              routing_urls=None,
                                              unknown_urls=[],
@@ -288,6 +302,7 @@ class LbSessionLedger:
 
         local_in_flight = 0
         http_in_flight: dict[str, int] = {}
+        http_in_flight_complete = bool(reports)
         routing_urls: set[str] = set()
         unknown_urls: set[str] = set()
         draining_urls: set[str] = set()
@@ -296,6 +311,8 @@ class LbSessionLedger:
         freshest_async: dict[str, tuple[float, int, int]] = {}
         for report in reports:
             local_in_flight += report.local_in_flight
+            http_in_flight_complete = (http_in_flight_complete and
+                                       report.http_in_flight_complete)
             routing_urls.update(report.routing_urls)
             unknown_urls.update(report.unknown_urls)
             draining_urls.update(report.draining_urls)
@@ -320,10 +337,15 @@ class LbSessionLedger:
         in_flight = dict(http_in_flight)
         for url, (_, _, count) in freshest_async.items():
             in_flight[url] = in_flight.get(url, 0) + count
+        async_occupancy = {
+            url: count for url, (_, _, count) in freshest_async.items()
+        }
         return AggregatedDrainReport(
             complete=True,
             local_in_flight=local_in_flight,
             http_in_flight=http_in_flight,
+            http_in_flight_complete=http_in_flight_complete,
+            async_occupancy=async_occupancy,
             in_flight=in_flight,
             routing_urls=sorted(routing_urls),
             unknown_urls=sorted(unknown_urls),

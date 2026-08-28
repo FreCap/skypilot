@@ -233,8 +233,16 @@ def status(
             'request_window_seconds': (Optional[int]) rolling window size,
             'requests_per_second': (Optional[float]) average request rate in
               that rolling window,
+            'request_telemetry_observed_at': (Optional[float]) PostgreSQL
+              receipt timestamp of the oldest contributing demand report,
             'in_flight_requests': (Optional[int]) currently in-flight
               requests when concurrency metrics are available,
+            'processing_requests': (Optional[int]) currently processing async
+              requests when every routed backend has fresh occupancy,
+            'confirmed_processing_requests': (Optional[int]) proven async
+              processing lower bound when occupancy is incomplete,
+            'http_in_flight_requests': (Optional[int]) HTTP proxy envelopes
+              currently in flight across load balancers,
             'request_queue_depth': (Optional[int]) requests waiting for a
               replica,
             'rejected_requests': (Optional[int]) recent capacity rejections,

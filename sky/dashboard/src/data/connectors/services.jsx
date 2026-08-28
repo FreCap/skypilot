@@ -554,6 +554,14 @@ export function normalizeRequestTelemetry(record) {
   )
     ? record.request_telemetry_state
     : null;
+  const breakdownFields = [
+    'processing_requests',
+    'confirmed_processing_requests',
+    'http_in_flight_requests',
+  ];
+  const requestTelemetryBreakdownAvailable = breakdownFields.every((field) =>
+    Object.prototype.hasOwnProperty.call(record || {}, field)
+  );
   return {
     requestTelemetrySource:
       record?.request_telemetry_source === 'postgresql_lb_demand_reports'
@@ -592,6 +600,17 @@ export function normalizeRequestTelemetry(record) {
         : null,
     requestReporterCount: nullableNonnegativeInteger(
       record?.request_reporter_count
+    ),
+    requestTelemetryObservedAt: nullableNonnegativeNumber(
+      record?.request_telemetry_observed_at
+    ),
+    requestTelemetryBreakdownAvailable,
+    processingRequests: nullableNonnegativeInteger(record?.processing_requests),
+    confirmedProcessingRequests: nullableNonnegativeInteger(
+      record?.confirmed_processing_requests
+    ),
+    httpInFlightRequests: nullableNonnegativeInteger(
+      record?.http_in_flight_requests
     ),
   };
 }

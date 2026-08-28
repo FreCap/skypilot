@@ -2227,6 +2227,10 @@ function ServiceDetails() {
             directDemand.requestTelemetryCompatibilityComplete ?? null,
           requestReporterCount: directDemand.requestReporterCount ?? null,
           requestStatsAgeSeconds: directDemand.requestStatsAgeSeconds ?? null,
+          requestTelemetryObservedAt:
+            directDemand.requestTelemetryObservedAt ?? null,
+          requestTelemetryBreakdownAvailable:
+            directDemand.requestTelemetryBreakdownAvailable === true,
           asyncRequestSummary: directDemand.asyncRequestSummary ?? null,
           requestTelemetryRefreshUnavailable:
             directDemand.refreshUnavailable === true,
@@ -2248,6 +2252,10 @@ function ServiceDetails() {
           inFlightRequests: directDemand.inFlightRequests ?? null,
           confirmedInFlightRequests:
             directDemand.confirmedInFlightRequests ?? null,
+          processingRequests: directDemand.processingRequests ?? null,
+          confirmedProcessingRequests:
+            directDemand.confirmedProcessingRequests ?? null,
+          httpInFlightRequests: directDemand.httpInFlightRequests ?? null,
           unknownInFlightReplicaCount:
             directDemand.unknownInFlightReplicaCount ?? null,
           requestQueueDepth: directDemand.requestQueueDepth ?? null,
@@ -2716,6 +2724,18 @@ export function getLatestTerminalObservationReportAgeSeconds(history) {
   return history.windowEnd - history.predictionTimeLatestHourReportedAt;
 }
 
+function ServiceDetailMetric({ label, value, details = [] }) {
+  return (
+    <div>
+      <div className="text-gray-600 font-medium text-base">{label}</div>
+      <div className="text-base mt-1">{value}</div>
+      {details.length > 0 && (
+        <div className="text-xs text-gray-500 mt-1">{details.join(' · ')}</div>
+      )}
+    </div>
+  );
+}
+
 export function ServiceDetailCard({
   serviceData,
   requestHistory = null,
@@ -2777,8 +2797,25 @@ export function ServiceDetailCard({
   });
 
   const requestDetails = [];
+  const requestActivityDetails = [];
   const requestTelemetryIsStale = serviceData.requestTelemetryState === 'stale';
   const lastReportedPrefix = requestTelemetryIsStale ? 'last reported ' : '';
+  const requestTelemetryBreakdownAvailable =
+    serviceData.requestTelemetryBreakdownAvailable === true;
+  const requestObservationAgeSeconds = Number.isFinite(
+    serviceData.requestStatsAgeSeconds
+  )
+    ? Math.max(0, serviceData.requestStatsAgeSeconds)
+    : Number.isFinite(serviceData.requestTelemetryObservedAt)
+      ? Math.max(0, Date.now() / 1000 - serviceData.requestTelemetryObservedAt)
+      : null;
+  const requestObservationTimestamp = Number.isFinite(
+    serviceData.requestTelemetryObservedAt
+  )
+    ? formatFullTimestamp(
+        new Date(serviceData.requestTelemetryObservedAt * 1000)
+      )
+    : null;
   const terminalPredictionObservationSummaryLastHour =
     getTerminalPredictionObservationSummaryLastHour(requestHistory);
   const terminalPredictionObservationsLastHour =
@@ -2865,8 +2902,12 @@ export function ServiceDetailCard({
     usesLogicalReplicas &&
     serviceData.observedReadyReplicas != null &&
     serviceData.observedReadyReplicasFresh === false;
+  const addRequestActivityDetail = (detail) => {
+    requestDetails.push(detail);
+    requestActivityDetails.push(detail);
+  };
   if (serviceData.requestRate != null) {
-    requestDetails.push(
+    addRequestActivityDetail(
       requestTelemetryIsStale
         ? `${lastReportedPrefix}${formatRequestRate(serviceData.requestRate)}`
         : `${formatRequestRate(serviceData.requestRate)} recent`
@@ -2876,7 +2917,7 @@ export function ServiceDetailCard({
     serviceData.recentRequestCount != null &&
     serviceData.requestWindowSeconds != null
   ) {
-    requestDetails.push(
+    addRequestActivityDetail(
       `${lastReportedPrefix}${serviceData.recentRequestCount.toLocaleString()} requests in ${serviceData.requestWindowSeconds}s`
     );
   }
@@ -2884,7 +2925,7 @@ export function ServiceDetailCard({
     requestHistory?.available !== false &&
     requestHistory?.requestsLastHour != null
   ) {
-    requestDetails.push(
+    addRequestActivityDetail(
       `${requestHistory.requestsLastHour.toLocaleString()} requests in last hour`
     );
   }
@@ -2901,33 +2942,139 @@ export function ServiceDetailCard({
     );
   }
   if (serviceData.rejectedRequests != null) {
-    requestDetails.push(
+    addRequestActivityDetail(
       `${lastReportedPrefix}${serviceData.rejectedRequests} rejected`
     );
   }
-  if (serviceData.requestStatsAgeSeconds != null) {
-    requestDetails.push(
-      `activity report ${Math.round(serviceData.requestStatsAgeSeconds)}s old`
+  const requestFreshnessDetails = [];
+  if (requestObservationAgeSeconds != null) {
+    requestFreshnessDetails.push(
+      `activity report ${Math.round(requestObservationAgeSeconds)}s old`
     );
   }
+  if (requestObservationTimestamp != null) {
+    requestFreshnessDetails.push(`observed ${requestObservationTimestamp}`);
+  }
   if (serviceData.requestTelemetrySource === 'postgresql_lb_demand_reports') {
-    requestDetails.push('source PostgreSQL load-balancer reports');
+    requestFreshnessDetails.push('source PostgreSQL load-balancer reports');
   }
   if (
     serviceData.requestTelemetryState != null &&
     serviceData.requestTelemetryState !== 'fresh'
   ) {
-    const legacySuffix =
+    const suffix =
       serviceData.requestTelemetryReason === 'dashboard_refresh_failed'
         ? '; showing last persisted snapshot'
         : serviceData.requestTelemetryReason === 'unsupported' &&
             serviceData.recentRequestCount != null
           ? '; showing controller snapshot'
           : '';
-    requestDetails.push(
-      `request telemetry ${serviceData.requestTelemetryState}${legacySuffix}`
+    requestFreshnessDetails.push(
+      `request telemetry ${serviceData.requestTelemetryState}${suffix}`
     );
   }
+  requestDetails.push(...requestFreshnessDetails);
+  const unavailableRequestMetric = metadataDeferred
+    ? deferredValue
+    : 'Unavailable';
+  const requestCountValue = (exact, confirmed, exactLabel, confirmedLabel) => {
+    if (exact != null) {
+      return `${exact.toLocaleString()} ${lastReportedPrefix}${exactLabel}`;
+    }
+    if (confirmed != null) {
+      return `${confirmed.toLocaleString()} ${
+        requestTelemetryIsStale ? 'last confirmed' : 'confirmed'
+      } ${confirmedLabel}`;
+    }
+    return unavailableRequestMetric;
+  };
+  const unknownOccupancyDetail = `${
+    serviceData.unknownInFlightReplicaCount ?? 'unknown number of'
+  } backend${
+    serviceData.unknownInFlightReplicaCount === 1 ? '' : 's'
+  } with unknown occupancy`;
+  const processingCompleteness =
+    serviceData.processingRequests != null
+      ? 'complete routed-backend occupancy'
+      : serviceData.confirmedProcessingRequests != null
+        ? `partial routed-backend occupancy; ${unknownOccupancyDetail}`
+        : 'occupancy completeness unavailable';
+  const inFlightCompleteness =
+    serviceData.inFlightRequests != null
+      ? 'complete routed-backend occupancy'
+      : serviceData.confirmedInFlightRequests != null
+        ? `partial lower bound; ${unknownOccupancyDetail}`
+        : 'in-flight completeness unavailable';
+  const inFlightComponents =
+    serviceData.httpInFlightRequests != null &&
+    serviceData.confirmedProcessingRequests != null
+      ? `${serviceData.httpInFlightRequests.toLocaleString()} HTTP envelope${
+          serviceData.httpInFlightRequests === 1 ? '' : 's'
+        } + ${serviceData.confirmedProcessingRequests.toLocaleString()} confirmed async processing`
+      : null;
+  const requestBreakdownMetrics = [
+    {
+      label: 'Async processing now',
+      value: requestCountValue(
+        serviceData.processingRequests,
+        serviceData.confirmedProcessingRequests,
+        'async processing',
+        'async processing'
+      ),
+      details: [processingCompleteness, 'async backend occupancy only'],
+    },
+    {
+      label: 'Total in flight',
+      value: requestCountValue(
+        serviceData.inFlightRequests,
+        serviceData.confirmedInFlightRequests,
+        'tracked in flight',
+        'in flight'
+      ),
+      details: [
+        inFlightCompleteness,
+        inFlightComponents,
+        'conservative sum; fast acknowledgement can briefly overlap HTTP and async processing',
+      ].filter(Boolean),
+    },
+    {
+      label: 'Queued now',
+      value:
+        serviceData.requestQueueDepth != null
+          ? `${serviceData.requestQueueDepth.toLocaleString()} ${lastReportedPrefix}queued / unassigned`
+          : unavailableRequestMetric,
+      details: [
+        serviceData.requestQueueDepth != null
+          ? 'complete reporter-set snapshot'
+          : 'queue completeness unavailable',
+        'unassigned, selecting, or retry-backoff work',
+        ...requestActivityDetails,
+        ...requestFreshnessDetails,
+      ],
+    },
+  ];
+  const requestMetrics = requestTelemetryBreakdownAvailable
+    ? requestBreakdownMetrics
+    : [
+        {
+          label: 'Requests now',
+          value:
+            serviceData.inFlightRequests != null
+              ? `${serviceData.inFlightRequests.toLocaleString()} ${lastReportedPrefix}tracked in flight (legacy aggregate)`
+              : serviceData.confirmedInFlightRequests != null
+                ? `${serviceData.confirmedInFlightRequests.toLocaleString()} ${
+                    requestTelemetryIsStale ? 'last confirmed' : 'confirmed'
+                  } tracked in flight (legacy aggregate)`
+                : serviceData.requestRate != null
+                  ? `${lastReportedPrefix}${formatRequestRate(
+                      serviceData.requestRate
+                    )}`
+                  : metadataDeferred
+                    ? deferredValue
+                    : '-',
+          details: requestDetails,
+        },
+      ];
   const terminalObservationDetails = [];
   if (terminalPredictionObservationSummaryLastHour != null) {
     terminalObservationDetails.push(
@@ -3123,42 +3270,16 @@ export function ServiceDetailCard({
                 </div>
               )}
             </div>
+            {requestMetrics.map((metric) => (
+              <ServiceDetailMetric key={metric.label} {...metric} />
+            ))}
             <div>
               <div className="text-gray-600 font-medium text-base">
-                Requests now
-              </div>
-              <div className="text-base mt-1">
-                {serviceData.inFlightRequests != null
-                  ? `${serviceData.inFlightRequests.toLocaleString()} ${
-                      requestTelemetryIsStale ? 'last reported ' : ''
-                    }processing / in-flight`
-                  : serviceData.confirmedInFlightRequests != null
-                    ? `${serviceData.confirmedInFlightRequests.toLocaleString()} ${
-                        requestTelemetryIsStale
-                          ? 'last confirmed processing / in-flight'
-                          : 'confirmed processing / in-flight'
-                      }`
-                    : serviceData.requestRate != null
-                      ? `${lastReportedPrefix}${formatRequestRate(
-                          serviceData.requestRate
-                        )}`
-                      : metadataDeferred
-                        ? deferredValue
-                        : '-'}
-              </div>
-              {requestDetails.length > 0 && (
-                <div className="text-xs text-gray-500 mt-1">
-                  {requestDetails.join(' · ')}
-                </div>
-              )}
-            </div>
-            <div>
-              <div className="text-gray-600 font-medium text-base">
-                Exact async request lifecycle
+                Succeeded / terminal (exact async)
               </div>
               <div className="text-base mt-1">
                 {exactAsyncSummary
-                  ? `${exactAsyncSummary.operationalTerminalReceiptTotal.toLocaleString()} terminal, protocol-covered (partial)`
+                  ? `${exactAsyncSummary.operationalTerminalReceiptsByStatus.SUCCEEDED.toLocaleString()} succeeded / ${exactAsyncSummary.operationalTerminalReceiptTotal.toLocaleString()} terminal, protocol-covered (${exactAsyncSummary.coverage})`
                   : exactAsyncUnavailableSummary
                     ? 'Unavailable'
                     : historyLoading
@@ -3167,7 +3288,7 @@ export function ServiceDetailCard({
               </div>
               {exactAsyncSummary && (
                 <div className="text-xs text-gray-500 mt-1">
-                  {`${exactAsyncSummary.stateCounts.REJECTED_PRE_DISPATCH.toLocaleString()} rejected before dispatch · ${exactAsyncSummary.stateCounts.ACCEPTED.toLocaleString()} accepted / dispatch-confirmed (not proven actively processing) · ${exactAsyncSummary.stateCounts.DISPATCH_MAY_HAVE_OCCURRED.toLocaleString()} dispatch may have occurred · ${exactAsyncSummary.stateCounts.AMBIGUOUS.toLocaleString()} ambiguous · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.SUCCEEDED.toLocaleString()} succeeded · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.FAILED.toLocaleString()} failed · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.CANCELLED.toLocaleString()} cancelled · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.EXPIRED.toLocaleString()} expired`}
+                  {`${exactAsyncSummary.stateCounts.REJECTED_PRE_DISPATCH.toLocaleString()} rejected before dispatch · ${exactAsyncSummary.stateCounts.ACCEPTED.toLocaleString()} accepted / dispatch-confirmed (not proven actively processing) · ${exactAsyncSummary.stateCounts.DISPATCH_MAY_HAVE_OCCURRED.toLocaleString()} dispatch may have occurred · ${exactAsyncSummary.stateCounts.AMBIGUOUS.toLocaleString()} ambiguous · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.SUCCEEDED.toLocaleString()} succeeded · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.FAILED.toLocaleString()} failed · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.CANCELLED.toLocaleString()} cancelled · ${exactAsyncSummary.operationalTerminalReceiptsByStatus.EXPIRED.toLocaleString()} expired · coverage ${exactAsyncSummary.coverage}; protocol-uncovered request count unknown`}
                 </div>
               )}
               {exactAsyncUnavailableSummary && (

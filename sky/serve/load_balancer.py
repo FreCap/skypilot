@@ -5103,12 +5103,14 @@ class SkyServeLoadBalancer:
             _, routing_urls, unknown_urls, sampled_urls = (
                 self._in_flight_with_draining_locked())
             routing_set = set(routing_urls)
-            http_in_flight = self._load_balancing_policy.snapshot_in_flight()
-            if http_in_flight is None:
+            http_in_flight_snapshot = (
+                self._load_balancing_policy.snapshot_in_flight())
+            http_in_flight_complete = http_in_flight_snapshot is not None
+            if http_in_flight_snapshot is None:
                 http_in_flight = {}
                 unknown_urls = sorted(set(unknown_urls) | set(routing_urls))
             else:
-                http_in_flight = dict(http_in_flight)
+                http_in_flight = dict(http_in_flight_snapshot)
             for url, clients in self._draining_clients.items():
                 count = sum(
                     getattr(client, _INFLIGHT_ATTR, 0) for client in clients)
@@ -5187,6 +5189,7 @@ class SkyServeLoadBalancer:
             # bounded-drain signal for a former active slot.
             'local_in_flight': self._active_request_count,
             'http_in_flight': http_in_flight,
+            'http_in_flight_complete': http_in_flight_complete,
             'async_occupancy': async_occupancy,
             'occupancy_sample_generation': sample_generations,
             'occupancy_sample_age_seconds': sample_ages,

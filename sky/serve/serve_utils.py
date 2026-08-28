@@ -3316,6 +3316,10 @@ def _prepare_service_status(
                 'request_telemetry_generation',
                 'request_telemetry_compatibility_complete',
                 'request_reporter_count',
+                'request_telemetry_observed_at',
+                'processing_requests',
+                'confirmed_processing_requests',
+                'http_in_flight_requests',
             }
             for field in telemetry_fields:
                 record[field] = durable_request_summary.get(field)

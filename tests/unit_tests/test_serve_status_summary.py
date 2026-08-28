@@ -264,10 +264,14 @@ class TestGetServiceStatusSummary:
                 'request_telemetry_reason': 'complete',
                 'request_telemetry_generation': 7,
                 'request_reporter_count': 2,
+                'request_telemetry_observed_at': 1234.5,
                 'recent_request_count': 3,
                 'request_window_seconds': 60,
                 'requests_per_second': 0.05,
                 'in_flight_requests': 2,
+                'processing_requests': 1,
+                'confirmed_processing_requests': 1,
+                'http_in_flight_requests': 1,
                 'request_queue_depth': 1,
                 'rejected_requests': 0,
                 'recent_rejected_requests': 0,
@@ -284,6 +288,10 @@ class TestGetServiceStatusSummary:
         assert record['target_num_replicas'] == 4
         assert record['recent_request_count'] == 3
         assert record['in_flight_requests'] == 2
+        assert record['processing_requests'] == 1
+        assert record['confirmed_processing_requests'] == 1
+        assert record['http_in_flight_requests'] == 1
+        assert record['request_telemetry_observed_at'] == 1234.5
         assert record['request_telemetry_state'] == 'fresh'
         assert autoscaler.call_args.kwargs['timeout'] == (
             constants.DURABLE_DEMAND_CONTROLLER_STATUS_TIMEOUT_SECONDS)

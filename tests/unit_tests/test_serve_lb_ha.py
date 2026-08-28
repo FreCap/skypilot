@@ -39,6 +39,7 @@ def _report(http: dict[str, int], asynchronous: dict[str, int],
     report = {
         'local_in_flight': sum(http.values()),
         'http_in_flight': http,
+        'http_in_flight_complete': True,
         'async_occupancy': asynchronous,
         'occupancy_sample_generation': generations,
         'occupancy_sample_age_seconds': ages,
@@ -117,6 +118,9 @@ def test_session_ledger_sums_http_but_uses_freshest_async_observation():
     aggregate = ledger.aggregate({'active', 'draining'}, now=102)
     assert aggregate.complete
     # Three distinct HTTP envelopes plus one replica-global async sample.
+    assert aggregate.http_in_flight == {'replica': 3}
+    assert aggregate.http_in_flight_complete
+    assert aggregate.async_occupancy == {'replica': 4}
     assert aggregate.in_flight == {'replica': 7}
     assert aggregate.occupancy_sampled_urls == ['replica']
 
@@ -140,6 +144,7 @@ def test_session_ledger_uses_conservative_max_for_equal_async_samples():
                          now=101)
 
     aggregate = ledger.aggregate({'a', 'b'}, now=102)
+    assert aggregate.async_occupancy == {'replica': 5}
     assert aggregate.in_flight == {'replica': 5}
 
 
@@ -149,6 +154,7 @@ def test_session_ledger_fails_closed_for_missing_or_stale_evidence():
     missing = ledger.aggregate({'unknown'}, now=50)
     assert not missing.complete
     assert missing.routing_urls is None
+    assert missing.async_occupancy == {}
 
     assert not ledger.update('invalid',
                              lb_ha.LbSlot.A,
@@ -165,6 +171,7 @@ def test_session_ledger_fails_closed_for_missing_or_stale_evidence():
                          now=50)
     stale = ledger.aggregate({'stale'}, now=51)
     assert stale.complete
+    assert stale.async_occupancy == {}
     assert not stale.in_flight
     assert stale.unknown_urls == ['replica']
 
@@ -174,7 +181,8 @@ def test_ha_drain_view_delivers_explicit_off_route_zero_to_tracker():
     manager = object.__new__(replica_managers.ReplicaManager)
     manager._lb_in_flight_report = None
     tracker = replica_managers._ReplicaDrainTracker(
-        manager, url, replica_managers.time.monotonic() - 1)
+        manager, url,
+        replica_managers.time.monotonic() - 1)
     ctrl = _role_controller()
     ctrl._replica_manager = manager
     state = _state(lb_ha.LbCutoverPhase.STABLE, generation=7)
@@ -195,17 +203,19 @@ def test_ha_drain_view_delivers_explicit_off_route_zero_to_tracker():
 @pytest.mark.parametrize('report', [
     None,
     _report({}, {'http://retired:8080': 0}, {'http://retired:8080': 1},
-            {'http://retired:8080': 11.0}, routing_urls=[]),
+            {'http://retired:8080': 11.0},
+            routing_urls=[]),
     _report({}, {'http://retired:8080': 1}, {'http://retired:8080': 1},
-            {'http://retired:8080': 0.0}, routing_urls=[]),
+            {'http://retired:8080': 0.0},
+            routing_urls=[]),
 ])
-def test_ha_drain_view_keeps_missing_stale_or_positive_work_fail_closed(
-        report):
+def test_ha_drain_view_keeps_missing_stale_or_positive_work_fail_closed(report):
     url = 'http://retired:8080'
     manager = object.__new__(replica_managers.ReplicaManager)
     manager._lb_in_flight_report = None
     tracker = replica_managers._ReplicaDrainTracker(
-        manager, url, replica_managers.time.monotonic() - 1)
+        manager, url,
+        replica_managers.time.monotonic() - 1)
     ctrl = _role_controller()
     ctrl._replica_manager = manager
     state = _state(lb_ha.LbCutoverPhase.STABLE, generation=7)

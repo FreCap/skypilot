@@ -37,6 +37,7 @@ def _report(now: float, *, sequence: int = 1) -> dict:
         'http_in_flight': {
             'http://replica': 1
         },
+        'http_in_flight_complete': True,
         'async_occupancy': {
             'http://replica': 2
         },
@@ -153,6 +154,10 @@ def test_report_sequence_idempotency_freshness_and_summary(demand_database):
     assert summary['recent_request_count'] == 1
     assert summary['in_flight_requests'] == 3
     assert summary['confirmed_in_flight_requests'] == 3
+    assert summary['processing_requests'] == 2
+    assert summary['confirmed_processing_requests'] == 2
+    assert summary['http_in_flight_requests'] == 1
+    assert abs(summary['request_telemetry_observed_at'] - now) < 5
     assert summary['unknown_in_flight_replica_count'] == 0
 
     conflict = copy.deepcopy(report)
@@ -172,6 +177,10 @@ def test_report_sequence_idempotency_freshness_and_summary(demand_database):
     stale = demand_state.get_request_summary('svc', 'svc-hash')
     assert stale['request_telemetry_state'] == 'stale'
     assert stale['recent_request_count'] is None
+    assert stale['request_telemetry_observed_at'] is None
+    assert stale['processing_requests'] is None
+    assert stale['confirmed_processing_requests'] is None
+    assert stale['http_in_flight_requests'] is None
 
 
 def test_report_rejects_wrong_service_hash_and_reporter_clock(demand_database):
@@ -221,6 +230,10 @@ def test_unknown_occupancy_never_displays_processing_zero(demand_database):
     # The reporter's own admitted request remains a confirmed lower bound even
     # though occupancy from the backend URL is unavailable.
     assert summary['confirmed_in_flight_requests'] == 1
+    assert summary['processing_requests'] is None
+    assert summary['confirmed_processing_requests'] == 0
+    assert summary['http_in_flight_requests'] == 1
+    assert summary['request_telemetry_observed_at'] is not None
     assert summary['unknown_in_flight_replica_count'] == 1
     assert summary['recent_request_count'] == 1
 
@@ -258,8 +271,64 @@ def test_ha_handoff_adds_disjoint_work_without_double_counting_occupancy(
     # replica-global observation and is selected once (2).
     assert summary['in_flight_requests'] == 7
     assert summary['confirmed_in_flight_requests'] == 7
+    assert summary['processing_requests'] == 2
+    assert summary['confirmed_processing_requests'] == 2
+    assert summary['http_in_flight_requests'] == 5
     assert summary['unknown_in_flight_replica_count'] == 0
     assert summary['request_queue_depth'] == 1
+
+
+def test_ha_summary_freshness_uses_oldest_contributing_receipt(demand_database):
+    assert demand_database is not None
+    now = time.time()
+    draining = _report(now)
+    draining['applied_role'] = 'DRAINING'
+    active = _report(now)
+    active.update(
+        reporter_session_id='process-b',
+        lb_session_id='pod-b',
+        lb_slot='b',
+    )
+    demand_state.ingest_report('svc', 'svc-hash', draining)
+    demand_state.ingest_report('svc', 'svc-hash', active)
+    with demand_database.begin() as connection:
+        reports = demand_state_schema.serve_lb_demand_reports_table
+        connection.execute(
+            sqlalchemy.update(reports).where(
+                reports.c.reporter_session_id == 'process-a').values(
+                    received_at=sqlalchemy.func.clock_timestamp() -
+                    sqlalchemy.text("INTERVAL '10 seconds'"),
+                    valid_until=sqlalchemy.func.clock_timestamp() +
+                    sqlalchemy.text("INTERVAL '5 seconds'")))
+        connection.execute(
+            sqlalchemy.update(reports).where(
+                reports.c.reporter_session_id == 'process-b').values(
+                    received_at=sqlalchemy.func.clock_timestamp() -
+                    sqlalchemy.text("INTERVAL '1 second'"),
+                    valid_until=sqlalchemy.func.clock_timestamp() +
+                    sqlalchemy.text("INTERVAL '14 seconds'")))
+
+    summary = demand_state.get_request_summary('svc', 'svc-hash')
+
+    assert summary['request_telemetry_state'] == 'fresh'
+    assert summary['request_stats_age_seconds'] >= 9
+    assert summary['request_telemetry_observed_at'] <= time.time() - 9
+
+
+def test_unsupported_http_accounting_never_displays_exact_zero(demand_database):
+    assert demand_database is not None
+    report = _report(time.time())
+    report['http_in_flight'] = {}
+    report['http_in_flight_complete'] = False
+    report['unknown_in_flight_urls'] = ['http://replica']
+    demand_state.ingest_report('svc', 'svc-hash', report)
+
+    summary = demand_state.get_request_summary('svc', 'svc-hash')
+
+    assert summary['request_telemetry_state'] == 'fresh'
+    assert summary['http_in_flight_requests'] is None
+    assert summary['in_flight_requests'] is None
+    assert summary['confirmed_in_flight_requests'] == 2
 
 
 def test_fresh_standby_never_hides_an_expired_active_report(demand_database):

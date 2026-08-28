@@ -801,10 +801,15 @@ describe('getServiceDemand', () => {
         request_telemetry_generation: 8,
         request_telemetry_compatibility_complete: true,
         request_reporter_count: 2,
+        request_telemetry_observed_at: 101.5,
         recent_request_count: 12,
         request_window_seconds: 60,
         requests_per_second: 0.2,
         in_flight_requests: 3,
+        confirmed_in_flight_requests: 3,
+        processing_requests: 2,
+        confirmed_processing_requests: 2,
+        http_in_flight_requests: 1,
         request_queue_depth: 1,
         rejected_requests: 0,
         request_stats_age_seconds: 1.5,
@@ -863,9 +868,15 @@ describe('getServiceDemand', () => {
       requestTelemetryState: 'fresh',
       requestTelemetrySource: 'postgresql_lb_demand_reports',
       requestTelemetryGeneration: 8,
+      requestTelemetryObservedAt: 101.5,
+      requestTelemetryBreakdownAvailable: true,
       recentRequestCount: 12,
       requestRate: 0.2,
       inFlightRequests: 3,
+      confirmedInFlightRequests: 3,
+      processingRequests: 2,
+      confirmedProcessingRequests: 2,
+      httpInFlightRequests: 1,
       asyncRequestSummary: {
         available: true,
         source: 'postgresql_async_request_ledger',
@@ -1005,6 +1016,10 @@ describe('getServiceDemand', () => {
         requests_per_second: 0,
         in_flight_requests: -1,
         confirmed_in_flight_requests: 2,
+        request_telemetry_observed_at: 101.5,
+        processing_requests: -1,
+        confirmed_processing_requests: 1,
+        http_in_flight_requests: 1,
         unknown_in_flight_replica_count: 3,
         request_telemetry_compatibility_complete: 'yes',
       })
@@ -1013,8 +1028,25 @@ describe('getServiceDemand', () => {
       requestRate: 0,
       inFlightRequests: null,
       confirmedInFlightRequests: 2,
+      requestTelemetryObservedAt: 101.5,
+      requestTelemetryBreakdownAvailable: true,
+      processingRequests: null,
+      confirmedProcessingRequests: 1,
+      httpInFlightRequests: 1,
       unknownInFlightReplicaCount: 3,
       requestTelemetryCompatibilityComplete: null,
+    });
+    expect(
+      normalizeServiceDemand({
+        service_name: 'svc',
+        service_hash: 'hash-a',
+        request_telemetry_state: 'fresh',
+      })
+    ).toMatchObject({
+      requestTelemetryBreakdownAvailable: false,
+      processingRequests: null,
+      confirmedProcessingRequests: null,
+      httpInFlightRequests: null,
     });
   });
 });
