@@ -683,6 +683,36 @@ class TestDurableCapacityPlannerAdapter(unittest.TestCase):
         })
         self.assertEqual(bound.kueue_blocked_retirement_shapes, frozenset())
 
+    def test_locked_kueue_snapshot_rebinds_equivalent_replica_order(self):
+        first = _replica(1)
+        second = _replica(2)
+        prepared = dataclasses.replace(
+            _durable_inputs((second, first)),
+            gpu_shapes_by_replica_id={
+                2: ('l4', 1),
+                1: ('h200', 1),
+            })
+        locked = kueue_lane_capacity.KueueReplicaCapacitySnapshot({})
+
+        bound = autoscalers.bind_locked_kueue_capacity_snapshot(
+            prepared, [first, second], locked)
+
+        self.assertEqual(bound.replica_ids, (1, 2))
+        self.assertEqual(bound.gpu_shapes_by_replica_id,
+                         prepared.gpu_shapes_by_replica_id)
+
+    def test_locked_kueue_snapshot_rejects_different_replica_ids(self):
+        first = _replica(1)
+        second = _replica(2)
+        third = _replica(3)
+        prepared = _durable_inputs((first, third))
+        locked = kueue_lane_capacity.KueueReplicaCapacitySnapshot({})
+
+        with self.assertRaisesRegex(ValueError,
+                                    'different replica snapshot'):
+            autoscalers.bind_locked_kueue_capacity_snapshot(
+                prepared, [first, second], locked)
+
     def test_bounded_kueue_unknown_is_committed_on_its_exact_card(self):
         unknown = _replica(1, reserved_fill=True)
         unknown.is_zero_cost = True
