@@ -988,7 +988,7 @@ it has merged or been deployed.
 
 | Layer | Current state |
 |---|---|
-| Source base | `origin/improvements` at PR #1788 merge `8044592fc05eae210384dc349bea275cd2fc79f5` (release `1.1.1557` source cohort). It includes PR #1777's immutable planner, PR #1778's complete sparse target, PR #1779's locked-capacity ordering, PR #1781's retained-route demand correction, PR #1783's processing/in-flight telemetry, PR #1784's plan-authoritative paid cohort, and PR #1786's schema-3 multi-node physical debit. PR #1787 locks the intentional four-per-clean-pool cold frontier in a regression; PR #1788 excludes regionless AWS offerings until their exact default AMI exists. |
+| Source base | `origin/improvements` at PR #1789 merge `d9da1b06bafdae3b0ed9137b879f76b882b162b0` (release `1.1.1557` runtime plus documentation/test-only planner audit). It includes PR #1765's capacity-time SLA planner, PR #1777's immutable planner, PR #1778's complete sparse target, PR #1779's locked-capacity ordering, PR #1781's retained-route demand correction, PR #1783's processing/in-flight telemetry, PR #1784's plan-authoritative paid cohort, and PR #1786's schema-3 multi-node physical debit. PR #1787 locks the intentional four-per-clean-pool cold frontier in a regression; PR #1788 excludes regionless AWS offerings until their exact default AMI exists; PR #1789 proves that process-local Kueue and warm-retention state cannot influence or be mutated by durable planning. |
 | Immutable planner correction | **Merged and deployed homogeneously.** One keyword-only frozen snapshot feeds one pure durable logical planner invocation. Its typed candidate separately records cold demand attribution, supply-aware actuation, warm/transition retention, reservation commitments and whole-backend padding, genuine paid residual and cap-bounded cold-launch authority, completeness/infeasibility, source generation, and snapshot/candidate fingerprints. Policy state installs only after the PostgreSQL commit through a generation-and-fingerprint compare-and-swap. PR #1786 extends the same closed envelope to exact per-node width times task-authoritative node count for physical backends. |
 | Deployed control plane | SkyPilot `1.1.1557`, Helm revision 674, public API 93, homogeneous image `sha256:9a5fdfe5e109d6f50ff43f065872ea45e5c0c3ce7ea828322a119e51bb6f3437`, chart `sha256:9351c6f7701c0249422a8e5b1fabf2653e0da2c3081db83ae4957461f8758f36`. All two API, two controller, and three executor replicas were Ready on that exact digest; `/api/health` returned HTTP 200. PostgreSQL remains the sole central store; Helm storage is disabled; no SkyPilot PVC or EFS is present. |
 | Schema-3 activation | **Complete from an empty Serve state.** The cutover inventory contained no Serve rows, so no schema-1/2 capacity plan, claim, or provider effect crossed the strict-current decoder boundary. API, controller, and executor roles first moved to homogeneous `1.1.1555` and are now homogeneous on `1.1.1557`. There was no row rewrite, compatibility decoder, storage migration, or infrastructure change. |
@@ -1005,7 +1005,7 @@ it has merged or been deployed.
 | Reserved teardown projection | Complete. PR #1747 projected all formerly blocked associations and retired 194 rows. PR #1748 normalized current writers to the existing immediate-removal marker and accepted only the exact `1.1.1516` `FAILED/FAILED` shape as an N-1 DB-retirement candidate. Release `1.1.1517` plus the supported orphan purge retired the final two rows through exact PostgreSQL authority and independent owner, record, cluster, and Kueue fences. No provider, Kueue, schema, migration, or manual-cleanup behavior changed. Exact service/control-plane/Kubernetes/GCP zero is production-proven. |
 | PHX access | The controller identity can exact-read the required namespace/queue and manage only worker Pod/Service lifecycle; it cannot list or patch ClusterQueues. The worker ServiceAccount is tokenless and cannot read Pods, queues, or secrets. A historical audit-only group still has an unused broad Kueue LIST grant from platform PR #8800; it is read-only, has no scheduling effect, and is not used or expanded by this rollout. |
 | Paid state at idle | **Production-proven through lifecycle 137.** Normal down reached exact service, replica, claim, waiter, VM, and disk zero, with no on-demand or wrong-shape capacity observed during the lifecycle. This does not turn the roughly 9.5-minute cold scale-out into an accepted performance proof. |
-| Routing and queue | Lifecycle 119's low-priority run produced a small deadline-weighted target; the high-priority run increased the target through 49, 64, 128, and 178 before the paid cap clipped it at 100. The bounded stimulus recorded 2,248 submission starts, 289 accepted requests, 252 completion markers, and definitive queue-full rejections/retries; it is not the separate 10,000-terminal-request ledger proof. The deployed target uses one aggregate duration and applies launch lead uniformly; the capacity-time SLA refinement in this design remains open. A fresh nonzero queued/processing/in-flight/completed UI proof remains part of the final heterogeneous load run. |
+| Routing and queue | Lifecycle 119's low-priority run produced a small deadline-weighted target; the high-priority run increased the target through 49, 64, 128, and 178 before the paid cap clipped it at 100. The bounded stimulus recorded 2,248 submission starts, 289 accepted requests, 252 completion markers, and definitive queue-full rejections/retries; it is not the separate 10,000-terminal-request ledger proof. PR #1765's deployed capacity-time planner uses deadline buckets, exact compatibility, per-card service-time estimates, finite supply availability, and paid cold lead. A fresh current-schema nonzero queued/processing/in-flight/completed UI and heterogeneous capacity-time proof remains open. |
 | Partial mixed proof | Provider/DB censuses at 2026-08-25 19:45:47.538 and 19:45:56.281 UTC bracketed a 72-request completion wave and both had 44 reserved plus 28 paid replicas all `READY`, the same 28 AWS Spot instances—27 `g6.2xlarge` and one `g6.4xlarge`—and zero on-demand. The wave completed from 19:45:48.956 through 19:45:51.187; every request performed 9.533–12.451 seconds of concurrency-one GPU work, so at least 28 necessarily executed on Spot beside the 44 reserved workers. The Spot instances later fully drained at the provider. |
 | GCP Spot lifecycle proof | **Count, no-spill, warm-request, and teardown evidence exists; cold-scale performance remains open.** Lifecycle 137 on `1.1.1554` reached exactly 100 concurrently provider-`RUNNING` one-L4 GCP Spot VMs with zero ordinary on-demand/wrong-shape capacity, served 10,000/10,000 authenticated warm requests with first-attempt HTTP 200, and completed normal exact-zero teardown. Its roughly 9.5-minute cold run does not meet the 3--5 minute objective. |
 | Final load proof | **Warm paid transport is complete; the broader mixed reservation-plus-paid terminal-ledger proof is not.** Lifecycle 137 completed 10,000/10,000 authenticated warm requests at first-attempt HTTP 200. It does not by itself prove the final utilization-gated reserved-first matrix, mixed reserved/Spot execution, current-schema UI telemetry, terminal artifact receipts, or HA takeover. Historical run `final10k-1524-20260827-0246` remains immutable incident evidence and is not rebound to the new schema or service lifecycle. |
@@ -1074,15 +1074,16 @@ paid-authority census.
   slots onto a compatible multi-GPU machine, but every device must expose and
   complete one independent worker slot.
 
-### Capacity-time SLA refinement (open)
+### Capacity-time SLA planning (source complete; live qualification open)
 
-The deployed deadline weighting is a safe first-order backlog target, not the
-final minimum-cost SLA scheduler. It subtracts one effective launch lead from
-the timeout before converting every queued request to concurrent work. That
-is appropriate when the target is entirely cold, but it treats already-ready
-compatible slots as if they also had to launch. It can therefore overstate the
-paid residual for a large backlog that existing capacity can drain before its
-deadline.
+The earlier uniform deadline weighting was a safe first-order backlog target,
+but it treated already-ready compatible slots as if they also had to launch.
+PR #1765 replaced that production path with one discrete capacity-time plan.
+The current planner accounts for each finite slot's availability, uses all
+timely compatible finite supply before prospective paid capacity, and debits
+GPU-time once across strict-priority deadline buckets. It is source-complete
+and deployed in `1.1.1557`; current-schema live heterogeneous qualification is
+still required.
 
 For one newly arrived batch with ``N`` requests, service time ``s``, dispatch
 deadline ``D``, utilization ``u``, and ``R`` already-ready compatible logical
@@ -1101,9 +1102,9 @@ slot with a bounded ready-time estimate ``eta_i``
 ``new_slots = ceil(max(0, demand_seconds - ready_budget - committed_budget) /
 new_slot_budget)``
 
-The implementation must use bounded discrete start capacity at deadline
-boundaries; the equations above state the policy, not a floating-point
-scheduler. With 1,000 ten-second requests, 50 ready slots, and 95% utilization,
+The implementation uses bounded discrete start capacity at deadline
+boundaries; the equations above state the policy rather than its exact loop.
+With 1,000 ten-second requests, 50 ready slots, and 95% utilization,
 the ready budget is already 28,500 GPU-seconds for a 600-second objective, so
 the paid residual is zero. For a 60-second objective it covers 2,850 of 10,000
 GPU-seconds; with zero additional lead the residual is 126 slots. If cold lead
@@ -1186,12 +1187,13 @@ miss visible instead of representing that launch as SLA-compliant.
 
 This replaces the uniform cold-lead queue calculation whenever the elected
 load balancers provide a complete current deadline gauge; it is not an
-operator-selectable second scaler. The recreated durable logical fleet accepts
-only a complete current-version report and produces exactly one capacity-time
-result. Request-age buckets,
-exact-card service-time reads, ready-time observations, autoscaler/UI
-projection, and bounded load tests are therefore one implementation phase and
-are not part of the already-deployed proof recorded above.
+operator-selectable second scaler. The durable logical fleet accepts only a
+complete current-version report and produces exactly one capacity-time result.
+Request-age buckets, exact-card PostgreSQL service-time reads, finite-supply
+ready-time observations, planner integration, and autoscaler projection are
+implemented and unit-tested. The remaining gate is live current-schema proof
+that the projected target, reserved commitment, paid residual, UI fields, and
+provider effects all agree under bounded heterogeneous load.
 
 ### Paid residual
 
