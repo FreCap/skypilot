@@ -1879,6 +1879,80 @@ def test_gate_covered_plan_commits_reservation_before_paid_residual(
         is capacity_admission.ReservedFillPlanAuthorityMode.ALLOCATION_BOUND)
 
 
+def test_fill_demand_witness_rebinds_equivalent_heartbeat(
+        capacity_database, monkeypatch):
+    engine, incarnation, route_receipt = capacity_database
+    # A fresh aggregate-zero proof is only authoritative for the current
+    # projected-route protocol.  The shared fixture intentionally retains a
+    # protocol-1 cohort for compatibility tests, so select protocol 2 for this
+    # current-path regression before publishing the plan.
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_snapshots_table).values(
+                    producer_protocol_version=2))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_projection_protocol_version=2,
+                    route_projection_controller_incarnation=incarnation))
+    _enable_durable_intent(engine,
+                           incarnation,
+                           reserved_fill_enabled=True,
+                           utilization_gate=True)
+    allocation = _allocation_map({'l4': 1},
+                                 utilization_gate_armed=True,
+                                 utilization_demonstrated_need=2,
+                                 utilization_ceiling=2)
+    _mock_current_allocation(monkeypatch, allocation)
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    committed = repository.plan_and_publish_current(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_lifecycle_epoch=3,
+        service_version=1,
+        accounting_cards={'l4': 0},
+        sequenced_reserved_fill=True,
+        planner=lambda snapshot, supply: _current_decision(snapshot, supply, 2))
+    assert committed.candidate.kind is (
+        capacity_planning.CapacityPlanKind.GATE_ACQUISITION)
+    initial = repository.read_current_fill_demand_witness('svc',
+                                                          'svc-hash',
+                                                          (123, '10.0.0.5'),
+                                                          max_age_seconds=60)
+    assert initial is not None
+
+    demand_state.ingest_report(
+        'svc', 'svc-hash', _demand_report(time.time(),
+                                          route_receipt,
+                                          sequence=2))
+    refreshed = repository.read_current_fill_demand_witness('svc',
+                                                            'svc-hash',
+                                                            (123, '10.0.0.5'),
+                                                            max_age_seconds=60)
+
+    assert refreshed is not None
+    assert refreshed.demand_feed_generation > initial.demand_feed_generation
+    assert refreshed.capacity_plan_generation == initial.capacity_plan_generation
+    assert refreshed.semantic_sha256 == initial.semantic_sha256
+    assert refreshed.target_capacity == initial.target_capacity
+
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=3, request_count=2))
+    assert repository.read_current_fill_demand_witness(
+        'svc', 'svc-hash', (123, '10.0.0.5'), max_age_seconds=60) is None
+
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=4, request_count=0))
+    zero_snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
+    assert zero_snapshot is not None
+    assert zero_snapshot.fresh_aggregate_zero
+    assert repository.read_current_fill_demand_witness(
+        'svc', 'svc-hash', (123, '10.0.0.5'), max_age_seconds=60) is None
+
+
 def test_gate_disabled_still_uses_current_reservation_without_witness(
         capacity_database, monkeypatch):
     engine, incarnation, _ = capacity_database

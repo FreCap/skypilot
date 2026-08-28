@@ -1163,6 +1163,103 @@ class CapacityPlanningSnapshot:
         return hashlib.sha256(encoded).hexdigest()
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _DemandWitnessClass:
+    """One stable request class participating in reservation acquisition."""
+
+    source: str
+    priority: int
+    compatible_accelerators: tuple[str, ...]
+    count: int | None = None
+
+    def __post_init__(self) -> None:
+        if (self.source not in {'demand', 'explicit', 'paid', 'deadline'} or
+                type(self.priority) is not int or
+            (self.count is not None and
+             (type(self.count) is not int or self.count < 0))):
+            raise ValueError('Demand witness class is malformed.')
+        compatible = tuple(
+            sorted({
+                card.casefold(): card
+                for card in self.compatible_accelerators
+                if isinstance(card, str) and card
+            }.values(),
+                   key=str.casefold))
+        if not compatible:
+            raise ValueError('Demand witness class has no accelerator.')
+        object.__setattr__(self, 'compatible_accelerators', compatible)
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _DemandWitnessSemantics:
+    """Decision-equivalent reservation-acquisition identity.
+
+    Raw work estimates and deadline countdowns are intentionally absent.  The
+    reduced target and exact-card attribution already capture their capacity
+    consequence; hashing the moving inputs would make equivalent load-balancer
+    heartbeats continuously revoke a reservation grant.
+    """
+
+    scope_sha256: str
+    configured_accelerators: tuple[str, ...]
+    configured_reservation_accelerators: tuple[str, ...]
+    capacity_unit: str
+    backend_num_nodes: int
+    physical_gpu_width_by_accelerator: AcceleratorCapacity
+    request_classes: tuple[_DemandWitnessClass, ...]
+    aggregate_demand_target: int
+    demand_attribution: AcceleratorCapacity
+
+    @property
+    def sha256(self) -> str:
+        payload = dataclasses.asdict(self)
+        payload['protocol'] = 'serve-fill-demand-witness-v3'
+        return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
+def _demand_witness_classes(
+    snapshot: CapacityPlanningSnapshot,) -> tuple[_DemandWitnessClass, ...]:
+    """Return canonical request-class shape without volatile work or clocks."""
+    classes: dict[tuple[str, int, tuple[str, ...], int | None],
+                  _DemandWitnessClass] = {}
+    profile_sources = (
+        ('demand', snapshot.demand_profiles),
+        ('explicit', snapshot.explicit_demand_profiles),
+        ('paid', snapshot.paid_demand_profiles),
+    )
+    for source, profiles in profile_sources:
+        for profile in profiles:
+            if profile.work <= 0:
+                continue
+            item = _DemandWitnessClass(
+                source=source,
+                priority=profile.priority,
+                compatible_accelerators=profile.compatible_accelerators)
+            key = (
+                item.source, item.priority,
+                tuple(card.casefold() for card in item.compatible_accelerators),
+                item.count)
+            classes[key] = item
+    if snapshot.deadline is not None:
+        deadline_counts: dict[tuple[int, tuple[str, ...]], int] = {}
+        for demand in snapshot.deadline.demand:
+            if demand.count <= 0:
+                continue
+            key = (demand.priority, demand.compatible_cards)
+            deadline_counts[key] = deadline_counts.get(key, 0) + demand.count
+        for (priority, cards), count in deadline_counts.items():
+            item = _DemandWitnessClass(source='deadline',
+                                       priority=priority,
+                                       compatible_accelerators=cards,
+                                       count=count)
+            key = (
+                item.source, item.priority,
+                tuple(card.casefold() for card in item.compatible_accelerators),
+                item.count)
+            classes[key] = item
+    return tuple(classes[key] for key in sorted(classes))
+
+
 def demand_witness_semantic_sha256(
     snapshot: CapacityPlanningSnapshot,
     *,
@@ -1181,51 +1278,19 @@ def demand_witness_semantic_sha256(
             not isinstance(demand_attribution, AcceleratorCapacity) or
             demand_attribution.total() != aggregate_demand_target):
         raise ValueError('Demand witness semantics are malformed.')
-    deadline = snapshot.deadline
-    deadline_semantics = None
-    if deadline is not None:
-        deadline_semantics = {
-            'demand': tuple(
-                dataclasses.asdict(item) for item in deadline.demand),
-            'service_seconds_by_accelerator': dataclasses.asdict(
-                deadline.service_seconds_by_accelerator),
-            'utilization': deadline.utilization,
-            'paid_cold_lead_seconds': deadline.paid_cold_lead_seconds,
-        }
-    payload = {
-        'protocol': 'serve-fill-demand-witness-v2',
-        'scope_sha256': snapshot.demand_witness_scope_sha256,
-        'service_version': snapshot.service_version,
-        'configured_accelerators': snapshot.configured_accelerators,
-        'configured_reservation_accelerators':
-            snapshot.configured_reservation_accelerators,
-        'capacity_unit': snapshot.capacity_unit.value,
-        'backend_num_nodes': snapshot.backend_num_nodes,
-        'physical_gpu_width_by_accelerator': dataclasses.asdict(
+    semantics = _DemandWitnessSemantics(
+        scope_sha256=snapshot.demand_witness_scope_sha256,
+        configured_accelerators=snapshot.configured_accelerators,
+        configured_reservation_accelerators=(
+            snapshot.configured_reservation_accelerators),
+        capacity_unit=snapshot.capacity_unit.value,
+        backend_num_nodes=snapshot.backend_num_nodes,
+        physical_gpu_width_by_accelerator=(
             snapshot.physical_gpu_width_by_accelerator),
-        'capacity_per_accelerator': dataclasses.asdict(
-            snapshot.capacity_per_accelerator),
-        'floors': dataclasses.asdict(snapshot.floors),
-        'minimum_capacity': snapshot.minimum_capacity,
-        'paid_minimum_capacity': snapshot.paid_minimum_capacity,
-        'actuation_minimum_capacity': snapshot.actuation_minimum_capacity,
-        'maximum_capacity': snapshot.maximum_capacity,
-        'demand_profiles': tuple(
-            dataclasses.asdict(item) for item in snapshot.demand_profiles),
-        'explicit_demand_profiles': tuple(
-            dataclasses.asdict(item)
-            for item in snapshot.explicit_demand_profiles),
-        'paid_demand_profiles': tuple(
-            dataclasses.asdict(item) for item in snapshot.paid_demand_profiles),
-        'fixed_work': dataclasses.asdict(snapshot.fixed_work),
-        'explicit_fixed_work': dataclasses.asdict(snapshot.explicit_fixed_work),
-        'paid_fixed_work': dataclasses.asdict(snapshot.paid_fixed_work),
-        'cold_accelerator_order': snapshot.cold_accelerator_order,
-        'deadline': deadline_semantics,
-        'aggregate_demand_target': aggregate_demand_target,
-        'demand_attribution': dataclasses.asdict(demand_attribution),
-    }
-    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+        request_classes=_demand_witness_classes(snapshot),
+        aggregate_demand_target=aggregate_demand_target,
+        demand_attribution=demand_attribution)
+    return semantics.sha256
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
