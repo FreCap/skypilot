@@ -25,7 +25,7 @@ def test_hyderabad_region_is_fetched() -> None:
     assert 'ap-south-2' in fetch_aws.ALL_REGIONS
 
 
-def test_malaysia_region_is_a_curated_image_copy_target(monkeypatch) -> None:
+def test_new_regions_are_curated_image_copy_targets(monkeypatch) -> None:
     image_gen_path = (Path(__file__).parents[2] / 'sky' / 'catalog' / 'images' /
                       'aws_utils' / 'image_gen.py')
     monkeypatch.setattr(
@@ -34,7 +34,12 @@ def test_malaysia_region_is_a_curated_image_copy_target(monkeypatch) -> None:
 
     image_gen_globals = runpy.run_path(str(image_gen_path))
 
-    assert 'ap-southeast-5' in image_gen_globals['ALL_REGIONS']
+    assert {
+        'eu-central-2',
+        'sa-east-1',
+        'ap-southeast-5',
+        'ap-south-2',
+    }.issubset(image_gen_globals['ALL_REGIONS'])
 
 
 def test_merge_generated_images_preserves_curated_images() -> None:

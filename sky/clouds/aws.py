@@ -450,6 +450,34 @@ class AWS(clouds.Cloud):
                 assert r.zones is not None, r
                 r.set_zones([z for z in r.zones if z.name == zone])
             regions = [r for r in regions if r.zones]
+
+        # A VM offering alone is not launchable when SkyPilot must supply the
+        # catalog default base image: AWS images are region-specific.  Exclude
+        # regions without the exact default tag while constructing launchable
+        # resources so a durable Serve placement catalog cannot publish an
+        # impossible location.  Explicit cloud images and the live-discovered
+        # EFA image path retain their existing eligibility contracts.
+        requires_default_image = (
+            resources is not None and resources.get_cloud_image_id() is None and
+            not (resources.network_tier == resources_utils.NetworkTier.BEST and
+                 _is_efa_instance_type(instance_type)))
+        if requires_default_image:
+            image_tag = cls._get_default_image_tag(instance_type)
+            missing_image_regions: list[str] = []
+            image_qualified_regions: list[clouds.Region] = []
+            for candidate_region in regions:
+                image_id = catalog.get_image_id_from_tag(image_tag,
+                                                         candidate_region.name,
+                                                         clouds='aws')
+                if image_id is not None:
+                    image_qualified_regions.append(candidate_region)
+                else:
+                    missing_image_regions.append(candidate_region.name)
+            if missing_image_regions:
+                logger.debug(
+                    'Skipping AWS regions without default image tag %r: %s',
+                    image_tag, ', '.join(missing_image_regions))
+            regions = image_qualified_regions
         return regions
 
     @classmethod
@@ -493,43 +521,40 @@ class AWS(clouds.Cloud):
                 yield r.zones
 
     @classmethod
-    def _get_default_ami(cls, region_name: str, instance_type: str) -> str:
+    def _get_default_image_tag(cls, instance_type: str) -> str:
         acc = cls.get_accelerators_from_instance_type(instance_type)
         arch = cls.get_arch_from_instance_type(instance_type)
         if arch == constants.ARM64_ARCH:
-            image_id = catalog.get_image_id_from_tag(
-                _DEFAULT_CPU_ARM64_IMAGE_ID, region_name, clouds='aws')
+            image_tag = _DEFAULT_CPU_ARM64_IMAGE_ID
         else:
-            image_id = catalog.get_image_id_from_tag(_DEFAULT_CPU_IMAGE_ID,
-                                                     region_name,
-                                                     clouds='aws')
+            image_tag = _DEFAULT_CPU_IMAGE_ID
         if acc is not None:
             if arch == constants.ARM64_ARCH:
-                image_id = catalog.get_image_id_from_tag(
-                    _DEFAULT_GPU_ARM64_IMAGE_ID, region_name, clouds='aws')
+                image_tag = _DEFAULT_GPU_ARM64_IMAGE_ID
             else:
-                image_id = catalog.get_image_id_from_tag(_DEFAULT_GPU_IMAGE_ID,
-                                                         region_name,
-                                                         clouds='aws')
+                image_tag = _DEFAULT_GPU_IMAGE_ID
             assert len(acc) == 1, acc
             acc_name = list(acc.keys())[0]
             if acc_name == 'K80':
-                image_id = catalog.get_image_id_from_tag(
-                    _DEFAULT_GPU_K80_IMAGE_ID, region_name, clouds='aws')
+                image_tag = _DEFAULT_GPU_K80_IMAGE_ID
             elif gpu_utils.is_legacy_driver_gpu(acc_name):
                 # Pre-Turing GPUs (V100, M60) are not supported by the open
                 # kernel module in the default image, so fall back to the
                 # legacy proprietary-driver (CUDA 12) image.
-                legacy_tag = (_DEFAULT_GPU_CUDA12_ARM64_IMAGE_ID
-                              if arch == constants.ARM64_ARCH else
-                              _DEFAULT_GPU_CUDA12_IMAGE_ID)
-                image_id = catalog.get_image_id_from_tag(legacy_tag,
-                                                         region_name,
-                                                         clouds='aws')
+                image_tag = (_DEFAULT_GPU_CUDA12_ARM64_IMAGE_ID
+                             if arch == constants.ARM64_ARCH else
+                             _DEFAULT_GPU_CUDA12_IMAGE_ID)
             if acc_name.startswith('Trainium') or acc_name.startswith(
                     'Inferentia'):
-                image_id = catalog.get_image_id_from_tag(
-                    _DEFAULT_NEURON_IMAGE_ID, region_name, clouds='aws')
+                image_tag = _DEFAULT_NEURON_IMAGE_ID
+        return image_tag
+
+    @classmethod
+    def _get_default_ami(cls, region_name: str, instance_type: str) -> str:
+        image_tag = cls._get_default_image_tag(instance_type)
+        image_id = catalog.get_image_id_from_tag(image_tag,
+                                                 region_name,
+                                                 clouds='aws')
         if image_id is not None:
             return image_id
         # Raise ResourcesUnavailableError to make sure the failover in

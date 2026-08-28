@@ -6,6 +6,7 @@ instance types and pricing information for AWS.
 import glob
 import hashlib
 import os
+import re
 import tempfile
 import threading
 import typing
@@ -20,6 +21,7 @@ from sky.catalog import common
 from sky.catalog import config
 from sky.catalog.data_fetchers import fetch_aws
 from sky.clouds import aws
+from sky.utils import annotations
 from sky.utils import common_utils
 from sky.utils import resources_utils
 from sky.utils import rich_utils
@@ -72,6 +74,8 @@ _DEFAULT_MEMORY_CPU_RATIO = 4
 # Keep it synced with the frequency in
 # skypilot-catalog/.github/workflows/update-aws-catalog.yml
 _PULL_FREQUENCY_HOURS = 7
+
+_AMI_ID_PATTERN = re.compile(r'ami-[0-9a-f]{8}(?:[0-9a-f]{9})?')
 
 # The main catalog dataframe.
 #   - _default_df: default non-account-specific catalog
@@ -388,21 +392,33 @@ def list_accelerators(
                                          all_regions)
 
 
+@annotations.lru_cache(scope='request')
+def _fresh_image_catalog() -> common.LazyDataFrame:
+    """Returns one forced-refresh image catalog per request."""
+    return common.read_catalog('aws/images.csv', pull_frequency_hours=0)
+
+
+def _is_ami_id(image_id: str | None) -> bool:
+    return (image_id is not None and
+            _AMI_ID_PATTERN.fullmatch(image_id) is not None)
+
+
 def get_image_id_from_tag(tag: str, region: str | None) -> str | None:
     """Returns the image id from the tag."""
     global _image_df
 
     image_id = common.get_image_id_from_tag_impl(_image_df, tag, region)
-    if image_id is None:
-        # Refresh the image catalog and try again, if the image tag is not
-        # found.
+    if not _is_ami_id(image_id):
+        # Refresh once per request when the tag is absent or contains a
+        # generator placeholder.  Regionless placement checks several regions
+        # together; reusing one refreshed LazyDataFrame prevents one download
+        # for every missing region.
         logger.debug('Refreshing the image catalog and trying again.')
-        _image_df = common.read_catalog('aws/images.csv',
-                                        pull_frequency_hours=0)
+        _image_df = _fresh_image_catalog()
         image_id = common.get_image_id_from_tag_impl(_image_df, tag, region)
-    return image_id
+    return image_id if _is_ami_id(image_id) else None
 
 
 def is_image_tag_valid(tag: str, region: str | None) -> bool:
     """Returns whether the image tag is valid."""
-    return common.is_image_tag_valid_impl(_image_df, tag, region)
+    return get_image_id_from_tag(tag, region) is not None

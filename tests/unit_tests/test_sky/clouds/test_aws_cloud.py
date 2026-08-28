@@ -907,7 +907,7 @@ class TestAwsConfigFileEnvVar:
 
 
 class TestGetDefaultAmi:
-    """Tests for AWS._get_default_ami GPU image selection."""
+    """Tests for AWS default-image selection and regional eligibility."""
 
     def _patch(self, monkeypatch, acc, arch):
         # Echo the requested tag back so we can assert which image was chosen.
@@ -940,3 +940,102 @@ class TestGetDefaultAmi:
         self._patch(monkeypatch, {'GH200': 1}, 'arm64')
         result = aws_mod.AWS._get_default_ami('us-east-1', 'g5g.xlarge')
         assert result == aws_mod._DEFAULT_GPU_ARM64_IMAGE_ID
+
+    @pytest.mark.parametrize(('accelerators', 'arch', 'expected_tag'), [
+        (None, 'x86_64', aws_mod._DEFAULT_CPU_IMAGE_ID),
+        (None, 'arm64', aws_mod._DEFAULT_CPU_ARM64_IMAGE_ID),
+        ({
+            'Trainium2': 1
+        }, 'x86_64', aws_mod._DEFAULT_NEURON_IMAGE_ID),
+        ({
+            'Inferentia2': 1
+        }, 'x86_64', aws_mod._DEFAULT_NEURON_IMAGE_ID),
+    ])
+    def test_cpu_and_neuron_default_tags(self, monkeypatch, accelerators, arch,
+                                         expected_tag):
+        self._patch(monkeypatch, accelerators, arch)
+
+        result = aws_mod.AWS._get_default_image_tag('instance-type')
+
+        assert result == expected_tag
+
+    def test_regions_without_required_default_image_are_excluded(
+            self, monkeypatch):
+        self._patch(monkeypatch, {'L4': 1}, 'x86_64')
+        regions = [
+            aws_mod.clouds.Region('qualified'),
+            aws_mod.clouds.Region('missing'),
+        ]
+        monkeypatch.setattr(aws_mod.catalog,
+                            'get_region_zones_for_instance_type',
+                            lambda *args: regions)
+        checked = []
+
+        def _get_image_id_from_tag(tag, region, clouds):
+            checked.append((tag, region, clouds))
+            if region == 'qualified':
+                return 'ami-0123456789abcdef0'
+            return None
+
+        monkeypatch.setattr(aws_mod.catalog, 'get_image_id_from_tag',
+                            _get_image_id_from_tag)
+        resources = mock.Mock()
+        resources.get_cloud_image_id.return_value = None
+        resources.network_tier = None
+
+        result = aws_mod.AWS.regions_with_offering('g6.xlarge', {'L4': 1}, True,
+                                                   None, None, resources)
+
+        assert [region.name for region in result] == ['qualified']
+        assert checked == [
+            (aws_mod._DEFAULT_GPU_IMAGE_ID, 'qualified', 'aws'),
+            (aws_mod._DEFAULT_GPU_IMAGE_ID, 'missing', 'aws'),
+        ]
+
+    def test_explicit_cloud_image_bypasses_default_image_eligibility(
+            self, monkeypatch):
+        regions = [aws_mod.clouds.Region('custom-image-region')]
+        monkeypatch.setattr(aws_mod.catalog,
+                            'get_region_zones_for_instance_type',
+                            lambda *args: regions)
+        image_check = mock.Mock(
+            side_effect=AssertionError('default image must not be checked'))
+        monkeypatch.setattr(aws_mod.catalog, 'get_image_id_from_tag',
+                            image_check)
+        resources = mock.Mock()
+        resources.get_cloud_image_id.return_value = {
+            None: 'ami-customer-supplied'
+        }
+        resources.network_tier = None
+
+        result = aws_mod.AWS.regions_with_offering('g6.xlarge', {'L4': 1}, True,
+                                                   None, None, resources)
+
+        assert [region.name for region in result] == ['custom-image-region']
+        image_check.assert_not_called()
+
+    @pytest.mark.parametrize('resources_kind', ['efa', 'provisioning'])
+    def test_non_default_image_paths_preserve_vm_offerings(
+            self, monkeypatch, resources_kind):
+        regions = [aws_mod.clouds.Region('offered')]
+        monkeypatch.setattr(aws_mod.catalog,
+                            'get_region_zones_for_instance_type',
+                            lambda *args: regions)
+        image_check = mock.Mock(
+            side_effect=AssertionError('default image must not be checked'))
+        monkeypatch.setattr(aws_mod.catalog, 'get_image_id_from_tag',
+                            image_check)
+        if resources_kind == 'efa':
+            resources = mock.Mock()
+            resources.get_cloud_image_id.return_value = None
+            resources.network_tier = resources_utils.NetworkTier.BEST
+        else:
+            # zones_provision_loop() deliberately calls without Resources: the
+            # selected region was already qualified during planning.
+            resources = None
+
+        result = aws_mod.AWS.regions_with_offering('g6.xlarge', {'L4': 1}, True,
+                                                   None, None, resources)
+
+        assert [region.name for region in result] == ['offered']
+        image_check.assert_not_called()
