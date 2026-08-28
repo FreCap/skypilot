@@ -33,6 +33,69 @@ def _logical_contract():
 class TestCentralPlacementCatalog:
     """One immutable complete catalog drives every runtime lookup."""
 
+    def test_regionless_aws_catalog_requires_region_default_image(
+            self, monkeypatch):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        from sky.clouds import aws as aws_cloud
+        from sky.utils import resources_utils
+
+        def _feasible(self, resources, num_nodes=1):
+            del self, num_nodes
+            return resources_utils.FeasibleResources([resources], [], None)
+
+        regions = [
+            aws_cloud.clouds.Region('qualified').set_zones(
+                [aws_cloud.clouds.Zone('qualified-a')]),
+            aws_cloud.clouds.Region('missing').set_zones(
+                [aws_cloud.clouds.Zone('missing-a')]),
+        ]
+        monkeypatch.setattr(aws_cloud.AWS, 'instance_type_exists',
+                            lambda self, instance_type: True)
+        monkeypatch.setattr(aws_cloud.AWS, 'get_feasible_launchable_resources',
+                            _feasible)
+        monkeypatch.setattr(aws_cloud.catalog,
+                            'get_region_zones_for_instance_type',
+                            lambda *args: regions)
+        monkeypatch.setattr(aws_cloud.AWS,
+                            'get_accelerators_from_instance_type',
+                            classmethod(lambda cls, instance_type: {'L4': 1}))
+        monkeypatch.setattr(aws_cloud.AWS, 'get_arch_from_instance_type',
+                            classmethod(lambda cls, instance_type: 'x86_64'))
+
+        def _get_image_id_from_tag(tag, region, clouds):
+            assert tag == aws_cloud._DEFAULT_GPU_IMAGE_ID
+            assert clouds == 'aws'
+            if region == 'qualified':
+                return 'ami-0123456789abcdef0'
+            return None
+
+        monkeypatch.setattr(aws_cloud.catalog, 'get_image_id_from_tag',
+                            _get_image_id_from_tag)
+
+        image_ref = 'registry.example/model@sha256:' + 'a' * 64
+        task = sky.Task.from_yaml_str(f"""
+resources:
+  infra: aws
+  instance_type: g6.xlarge
+  accelerators: L4:1
+  use_spot: true
+  container_image: {image_ref}
+run: echo hi
+""")
+
+        locations = spot_placer._get_possible_location_from_task(task)
+
+        assert len(locations) == 1
+        location = locations[0]
+        assert location.region == 'qualified'
+        assert location.zone == 'qualified-a'
+        assert location.accelerators == {'L4': 1}
+        assert location.instance_type == 'g6.xlarge'
+        assert location.use_spot is True
+        assert location.container_image is not None
+        assert location.container_image.ref == image_ref
+
     def test_explicit_instance_types_remain_launchable_for_feasibility(
             self, monkeypatch):
         # pylint: disable=import-outside-toplevel

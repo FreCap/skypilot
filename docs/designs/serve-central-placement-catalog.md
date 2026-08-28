@@ -1,7 +1,7 @@
 # SkyServe centralized placement catalog
 
 _Status: implementation and local verification complete; pull request and
-production deployment pending. Created and last updated: 2026-07-24._
+production deployment pending. Created: 2026-07-24. Last updated: 2026-08-28._
 
 ## Decision summary
 
@@ -124,6 +124,34 @@ already immutable. A new service update creates a new catalog, even when its
 resources happen to match the preceding version. This bounds staleness to the
 service version and avoids unsafe cross-version fingerprint inference.
 
+Provider eligibility is part of construction, not a runtime fallback. For AWS,
+a VM offering that relies on SkyPilot's catalog default is eligible only when
+the exact region also has the default image tag selected for that instance
+type. This includes the x86 CUDA 13 image for L4 instances. A VM-catalog row
+without a syntactically valid AMI ID in that image-catalog row is not launchable
+and must not become a durable location. An explicitly configured cloud image
+bypasses the SkyPilot-default-image check and retains its existing regional
+validation contract. A container image does not bypass the check because its
+VM still needs a base image. The `network_tier: best` EFA path is also exempt:
+it live-discovers an AWS-owned EFA image before falling back to the catalog
+default, so this change preserves its existing launch-time contract.
+
+An absent or placeholder image causes at most one forced image-catalog refresh
+per API request. This lets a service version constructed immediately after
+publication observe a new regional AMI without waiting for the ordinary
+seven-hour cache interval or downloading the catalog once per missing region.
+
+A syntactically valid image row is local eligibility evidence, not proof of the
+AMI's live state. The hosted-catalog release process separately owns image
+qualification: before publication, an operator must prove the AMI is public,
+available, architecture-compatible, and launchable cross-account. The current
+CSV schema does not encode those attestations and catalog construction performs
+no live AWS call. Those checks are explicit publication gates below. Publishing
+a new AWS VM region therefore cannot make standard regionless Serve placement
+select that region before its required default image row is published. The
+region becomes eligible only in a subsequently constructed service-version
+catalog.
+
 At runtime `SpotPlacer.location2cost` is complete for every key in
 `location2status`. `cost_per_hour()` returns the materialized value or infinity
 for an unknown location. `zero_cost_locations()` filters the materialized
@@ -189,7 +217,13 @@ disagree about one version's placement identity.
 6. A catalog does not grant capacity or prove availability. Provider launch
    results, reserved-capacity observations, and paid-capacity admission remain
    separate authorities.
-7. Rollback to an older binary remains possible because the new column is
+7. Every AWS location that relies on a SkyPilot default image has a valid
+   AMI-shaped image-catalog mapping for the exact region and
+   instance-type-selected tag at construction time.
+8. AWS EFA placement and explicit cloud images retain their pre-existing image
+   selection and validation paths; neither is rejected for lacking the
+   SkyPilot catalog default.
+9. Rollback to an older binary remains possible because the new column is
    nullable and ignored by older code. The migration downgrade is intentionally
    non-destructive.
 
@@ -229,6 +263,12 @@ replica rows. Do not drop the column during emergency rollback.
 - Prove compare-and-set backfill cannot overwrite an existing catalog.
 - Prove update preflight returns one persisted placer and `update_version()`
   publishes it without a second `SpotPlacer.from_task()` call.
+- Prove regionless AWS construction excludes a real VM offering when the exact
+  default image tag is absent or a placeholder in that region, retains it when
+  present for a container-backed VM, and does not apply the default-image check
+  to an explicit cloud image, EFA placement, or provisioning after selection.
+- Prove a missing regional image forces only one refresh per request and a
+  newly published AMI can participate immediately after that refresh.
 - Run focused Serve state, placer, controller, replica-manager, paid-capacity,
   reserved-capacity, and concurrency autoscaler tests.
 - After deployment, verify migration revision 028, non-null catalog for the
@@ -246,6 +286,12 @@ The implementation passed:
 - Focused catalog, state, parent recovery, controller update-handoff,
   replica-manager, autoscaler, reserved-capacity, paid-capacity, preemption,
   cheapest-first, and migration-utils unit suites.
+- The AWS provider, image-catalog, catalog-source, and hybrid-placement suites,
+  including hermetic regionless default-image qualification (`152 passed`).
+- The regionless test also passed with an empty temporary runtime directory and
+  an intentionally unreachable hosted-catalog URL, creating no catalog files.
+- The generic catalog, catalog-source-override, and resource suites
+  (`130 passed`).
 - A combined regression run of the 13 affected unit-test modules with
   `pytest -q -n 0 ... -x`.
 
@@ -254,7 +300,7 @@ because no disposable PostgreSQL test URI is available in this workspace.
 
 ## Adversarial review
 
-The 2026-07-24 review was run against this exact repository design after the
+The initial 2026-07-24 review was run against the placement-catalog
 implementation. It found and corrected four contract gaps:
 
 1. region-independent image IDs use a Python `None` map key, which generic
@@ -267,9 +313,27 @@ implementation. It found and corrected four contract gaps:
 4. a pre-version legacy service cannot own an immutable version catalog and
    now fails explicitly instead of running a non-durable compatibility path.
 
-No unresolved implementation/design divergence remains.
+The 2026-08-28 follow-up review covered AWS regional image eligibility. It
+found and corrected four additional gaps:
+
+1. EFA uses a live-discovered AWS image and is now explicitly exempt from the
+   catalog-default filter;
+2. a miss now forces one shared refresh per request rather than remaining stale
+   for seven hours or downloading once per missing region;
+3. generator placeholders and malformed IDs are rejected instead of counting
+   as image availability; and
+4. the regionless container-backed test installs all catalog mocks before task
+   parsing, so it is hermetic and cannot download hosted catalogs.
+
+No unresolved source/design divergence remains. Live AMI qualification and
+hosted publication remain explicit operational gates.
 
 ## Open gates
 
 - Pull-request review and CI.
 - Production deployment and post-deploy stability observation.
+- Before activating a newly published AWS region, attest that its default AMI
+  is public, available, architecture-compatible, and launchable from a separate
+  account.
+- Verify the generated VM catalog contains real G6/L4 Spot rows with non-null
+  prices and that the GitHub and S3 v8 catalog objects converge byte-for-byte.
