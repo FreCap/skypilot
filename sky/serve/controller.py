@@ -6565,7 +6565,16 @@ class SkyServeController:
                 logical_retirement_floor=retirement_floor,
                 retirement_shelter=retirement_shelter,
                 invalidate_logical_target=False)
-            capacity_target = candidate.supply_aware_demand_target.as_dict()
+            # The pure planner intentionally stores sparse capacity maps.  The
+            # PostgreSQL admission boundary, however, requires an exact value
+            # for every configured accounting card so a missing card can never
+            # be confused with an omitted observation.  Static prefill at zero
+            # demand is the important edge case: its traffic target is empty
+            # while its reserved launch target is positive.
+            capacity_target = {
+                card: candidate.supply_aware_demand_target.get(card)
+                for card, _ in configured_shapes.entries
+            }
             actuation_target = (
                 candidate.wave_limited_actuation_target.as_dict())
             if (sum(actuation_target.values())
